@@ -561,6 +561,31 @@ describe("github.reference-repos", () => {
     const limited = await run("github.reference-repos", withRefs([{ repo: "https://github.com/other/x", path: "a" }], { installation: async () => null, publicRepository: async () => ({ status: 403, refExists: null }) }));
     expect(limited).toEqual([expect.objectContaining({ state: "cannot-verify", detail: "Some of acme/app's reference repositories could not be read: other/x could not be read (HTTP 403)" })]);
   });
+
+  // One limit refuses every read without the App, so the repositories it refused share one reason and one time, the latest GitHub gave.
+  it("names GitHub's rate limit once, with the repositories it refused and when to run again", async () => {
+    const until = (at: string) => ({ status: 403, refExists: null, rateLimitedUntil: Date.parse(at) });
+    const rows = await run("github.reference-repos", withRefs([{ repo: "https://github.com/other/x", path: "a" }, { repo: "https://github.com/other/y", path: "b" }], {
+      installation: async () => null,
+      publicRepository: async (_owner, repo) => (repo === "x" ? until("2026-11-17T08:00:00Z") : until("2026-11-17T08:05:00Z")),
+    }));
+    expect(rows).toEqual([expect.objectContaining({
+      state: "cannot-verify",
+      detail: "Some of acme/app's reference repositories could not be read: other/x, other/y (GitHub limited the orchestrator's reads without the App until 08:05 UTC)",
+      fix: "Run the checks again after 08:05 UTC.",
+    })]);
+  });
+
+  it("gives both fixes when one read met the limit and another failed for another reason", async () => {
+    const rows = await run("github.reference-repos", withRefs([{ repo: "https://github.com/other/x", path: "a" }, { repo: "https://github.com/other/z", path: "b" }], {
+      installation: async () => null,
+      publicRepository: async (_owner, repo) => (repo === "x" ? { status: 403, refExists: null, rateLimitedUntil: Date.parse("2026-11-17T08:00:00Z") } : { status: 502, refExists: null }),
+    }));
+    expect(rows).toEqual([expect.objectContaining({
+      detail: "Some of acme/app's reference repositories could not be read: other/z could not be read (HTTP 502), other/x (GitHub limited the orchestrator's reads without the App until 08:00 UTC)",
+      fix: "Run the checks again after 08:00 UTC. Check that the orchestrator can reach api.github.com.",
+    })]);
+  });
 });
 
 describe("github.skills-repo", () => {
@@ -583,7 +608,19 @@ describe("github.skills-repo", () => {
     const missing = await run("github.skills-repo", withSkills("https://github.com/other/skills", { installation: async () => null, publicRepository: async () => ({ status: 404, refExists: null }) }));
     expect(missing).toEqual([expect.objectContaining({ state: "fail", detail: "The skills repository other/skills does not exist, or is private, so its skills never install" })]);
     const limited = await run("github.skills-repo", withSkills("https://github.com/other/skills", { installation: async () => null, publicRepository: async () => ({ status: 403, refExists: null }) }));
-    expect(limited).toEqual([expect.objectContaining({ state: "cannot-verify" })]);
+    expect(limited).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "Check that the orchestrator can reach api.github.com." })]);
+  });
+
+  it("names GitHub's rate limit and when to run again, for a read the limit refused", async () => {
+    const rows = await run("github.skills-repo", withSkills("https://github.com/other/skills", {
+      installation: async () => null,
+      publicRepository: async () => ({ status: 429, refExists: null, rateLimitedUntil: Date.parse("2026-11-17T08:00:00Z") }),
+    }));
+    expect(rows).toEqual([expect.objectContaining({
+      state: "cannot-verify",
+      detail: "The skills repository other/skills could not be read: GitHub limited the orchestrator's reads without the App until 08:00 UTC",
+      fix: "Run the checks again after 08:00 UTC.",
+    })]);
   });
 });
 

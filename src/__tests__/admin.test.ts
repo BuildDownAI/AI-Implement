@@ -5705,6 +5705,14 @@ describe("per-page grants", () => {
         expect([validate.statusCode, JSON.parse(validate.body)]).toEqual([save.statusCode, JSON.parse(save.body)]);
       });
 
+      // Each body is wrapped, since it.each spreads an array into the test's arguments.
+      it.each([["hello"], [42], [[]], [null]])("answers that %j is not a project, as the save and the unsaved project's checks do", async (body) => {
+        for (const path of ["/api/mappings/validate", "/api/mappings", "/api/setup-checks/candidate"]) {
+          const res = await requestWithDeps(path, "POST", adminSsoSession(), { runCandidateChecks: vi.fn(async () => RUN) }, body);
+          expect([path, res.statusCode, JSON.parse(res.body)]).toEqual([path, 400, { error: "Invalid request body" }]);
+        }
+      });
+
       // A form shows a refusal beside the field it names, so each refusal names the body field the operator changes to clear it.
       it.each([
         [{ teamKey: "" }, "teamKey"],
@@ -5806,6 +5814,16 @@ describe("per-page grants", () => {
       expect((await requestWithDeps("/api/setup-checks/project", "POST", userSession(), { runProjectSetupChecks: project }, { project: "ENG" })).statusCode).toBe(403);
       expect(candidate).not.toHaveBeenCalled();
       expect(project).not.toHaveBeenCalled();
+    });
+
+    // An unhandled rejection would exit Node, so a route whose dependency throws answers instead.
+    it.each([
+      ["/api/setup-checks", "GET", { readSetupChecks: async () => { throw new Error("boom"); } }, undefined],
+      ["/api/setup-checks/run", "POST", { startSetupChecks: async () => { throw new Error("boom"); } }, undefined],
+      ["/api/setup-checks/project", "POST", { runProjectSetupChecks: async () => { throw new Error("boom"); } }, { project: "ENG" }],
+    ] as const)("%s %s answers 500 when its dependency throws", async (path, method, deps, body) => {
+      const res = await requestWithDeps(path, method, adminSsoSession(), deps, body);
+      expect([res.statusCode, JSON.parse(res.body)]).toEqual([500, { error: "internal error" }]);
     });
 
     // Both routes run the save's builder before answering, so a body it cannot read or a database fault must still answer the request.

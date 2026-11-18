@@ -1284,12 +1284,12 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/setup-checks" && method === "GET") {
-      handleGetSetupChecks(res, deps);
+      runAsync(res, handleGetSetupChecks(res, deps));
       return true;
     }
 
     if (url === "/api/setup-checks/run" && method === "POST") {
-      handleStartSetupChecks(res, deps);
+      runAsync(res, handleStartSetupChecks(res, deps));
       return true;
     }
 
@@ -1299,7 +1299,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/setup-checks/project" && method === "POST") {
-      handleProjectSetupChecks(req, res, deps);
+      runAsync(res, handleProjectSetupChecks(req, res, deps));
       return true;
     }
 
@@ -3439,6 +3439,8 @@ export interface UpsertMappingBody {
 export function buildMappingFromBody(
   body: UpsertMappingBody,
 ): { key: string; mapping: RepoMapping; warnings: string[] } | { status: number; body: Record<string, unknown> } {
+  // A body parsed from JSON can be any value, and only an object can describe a project.
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return { status: 400, body: { error: "Invalid request body" } };
   if (!body.teamKey || !body.owner || !body.repo) {
     return refuse(!body.teamKey ? "teamKey" : !body.owner ? "owner" : "repo", "teamKey, owner, and repo are required");
   }

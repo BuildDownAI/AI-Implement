@@ -245,6 +245,14 @@ describe("projects page setup columns", () => {
     await win.loadMappings();
     expect(marker(required()).title).toContain("1h ago");
   });
+
+  // A recheck refreshes one row, so the project's other rows can be older than its newest.
+  it("dates the markers by the project's oldest row", async () => {
+    const rechecked = row("github.installation", "fail", { checkedAt: CHECKED + 50 * 60 * 1000 });
+    const { win, required } = mountWithRun({ checkedAt: CHECKED, results: [rechecked, row("github.permissions", "pass")] });
+    await win.loadMappings();
+    expect(marker(required()).title).toContain("1h ago");
+  });
 });
 
 describe("projects page sync poll — the project's setup checks", () => {

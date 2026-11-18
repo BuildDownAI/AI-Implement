@@ -1256,8 +1256,8 @@ function printNextSteps(io: Io, client: ClientFile, answers: Answers, stillToRun
       ]),
     );
   }
-  const events = GITHUB_APP_EVENTS.map((event) => event.title);
-  io.explain(`Set the GitHub App's webhook to this address, with the ${events.slice(0, -1).join(", ")} and ${events.at(-1)} events:`);
+  const events = new Intl.ListFormat("en", { type: "conjunction" }).format(GITHUB_APP_EVENTS.map((event) => event.title));
+  io.explain(`Set the GitHub App's webhook to this address, with the ${events} events:`);
   // As the redirect addresses: a callback base kept on Fly and never remembered here is unknown.
   const callbackBase =
     answers.env.RUNNER_CALLBACK_BASE_URL ??

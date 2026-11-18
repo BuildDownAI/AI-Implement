@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { FilesystemSetupFacts, JiraSetupFacts } from "../../providers/types.js";
-import type { SetupCheck, SetupCheckContext, SetupCheckResult } from "../../setup-checks/index.js";
+import type { SetupCheck, SetupCheckContext, SetupCheckId, SetupCheckResult, SetupCheckRun, SetupCheckRunKind, SetupCheckScope } from "../../setup-checks/index.js";
 import { waitOn } from "../../setup-checks/contract.js";
 import { makeAccessEntry, makeAppPrivateKey, makeMapping, makeProvider } from "../helpers/builders.js";
 import { makeGitHubSetupFacts, makeLinearSetupFacts, makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
@@ -379,6 +379,18 @@ describe("a run for one project", () => {
     expect(ids).toContain("github.installation");
   });
 
+  it("names its scope: every check it ran but tracker.provider, for its project alone", async () => {
+    const run = await checks.runProjectSetupChecks(linearProject(), "ENG", ["github.workflow-default-branch"]);
+    const ran = [...idsOf(run)].filter((id) => id !== "tracker.provider");
+    expect(run.scope?.projects).toEqual(["ENG"]);
+    expect(run.scope?.checks).not.toContain("tracker.provider");
+    expect(run.scope?.checks).not.toContain("github.workflow-default-branch");
+    // Every check it ran is in scope, including one that answered no row, so the merge can clear that check's stored row.
+    expect(run.scope?.checks).toEqual(expect.arrayContaining(ran));
+    expect(ran).not.toContain("tracker.filesystem.directory");
+    expect(run.scope?.checks).toContain("tracker.filesystem.directory");
+  });
+
   it("stamps the run with when it began and finished, as a full run is", async () => {
     const ticks = [100, 200];
     const run = await checks.runProjectSetupChecks(linearProject(), "ENG", [], () => ticks.shift()!);
@@ -412,10 +424,11 @@ describe("a fault every project on a dependency shares", () => {
   });
 });
 
-describe("merging a project run into the stored run", () => {
+describe("merging a partial run into the stored run", () => {
   const row = (overrides: Partial<SetupCheckResult>): SetupCheckResult => ({
     id: "tracker.linear.team-access", title: "Linear team access", group: "tracker", tier: "core", onAdminPath: false, state: "pass", ...overrides,
   });
+  const MAPPED = ["ENG", "OPS"];
   // Built per test, so a merge that changed its input could not hide behind an earlier test's change.
   const storedRun = () => ({
     startedAt: 10,
@@ -426,10 +439,12 @@ describe("merging a project run into the stored run", () => {
       row({ id: "github.app-identity", group: "github" }),
       row({ project: "ENG", state: "fail" }),
       row({ id: "github.reference-repos", group: "github", project: "ENG", state: "warn" }),
+      row({ id: "github.workflow-default-branch", group: "github", project: "ENG", state: "fail" }),
       row({ project: "OPS", state: "fail" }),
     ],
   });
-  const projectRun = () => ({
+  // A project run that read github.reference-repos, which answered nothing for ENG this time, and left out the workflow-file checks.
+  const projectRun = (): SetupCheckRun => ({
     startedAt: 90,
     checkedAt: 99,
     results: [
@@ -437,32 +452,68 @@ describe("merging a project run into the stored run", () => {
       row({ id: "github.app-identity", group: "github", state: "fail" }),
       row({ project: "ENG" }),
     ],
+    scope: { checks: ["github.app-identity", "tracker.linear.team-access", "github.reference-repos"], projects: ["ENG"] },
   });
 
-  it("replaces the project's rows and the orchestrator-wide rows the run read, each dated by the run, and leaves every other row as it was", () => {
+  it("replaces the rows the run answers for, each dated by the run, and leaves every other row as it was", () => {
     const stored = storedRun();
-    expect(checks.mergeProjectRun(stored, "ENG", projectRun())).toEqual({
+    expect(checks.mergeSetupCheckRun(stored, projectRun(), MAPPED)).toEqual({
       startedAt: 10,
       checkedAt: 20,
       results: [
         stored.results[0],
         stored.results[1],
         stored.results[5],
+        stored.results[6],
         row({ id: "github.app-identity", group: "github", state: "fail", checkedAt: 99 }),
         row({ project: "ENG", checkedAt: 99 }),
       ],
     });
   });
 
+  it("leaves no row for a check in its scope that answered nothing, and keeps the project's rows of checks outside it", () => {
+    const merged = checks.mergeSetupCheckRun(storedRun(), projectRun(), MAPPED);
+    expect(merged.results.some((r) => r.id === "github.reference-repos")).toBe(false);
+    expect(merged.results.filter((r) => r.id === "github.workflow-default-branch")).toEqual([storedRun().results[5]]);
+  });
+
   // Its row names every project on the provider, and a project run's names only the one project.
-  it("keeps the stored tracker.provider row, which a project run reads for one project only", () => {
-    const merged = checks.mergeProjectRun(storedRun(), "ENG", projectRun());
+  it("keeps the stored tracker.provider row, which a project run leaves out of its scope", () => {
+    const merged = checks.mergeSetupCheckRun(storedRun(), projectRun(), MAPPED);
     expect(merged.results.filter((r) => r.id === "tracker.provider")).toEqual([storedRun().results[1]]);
   });
 
+  // A per-project check that threw in a full run answers one row with no project, which belongs to every project.
+  it("keeps a full run's row with no project of a per-project check when its scope names projects, and replaces it when it names none", () => {
+    const thrown = row({ id: "github.installation", group: "github", state: "cannot-verify" });
+    const stored = { ...storedRun(), results: [...storedRun().results, thrown] };
+    const forEng = { ...projectRun(), scope: { checks: ["github.installation" as const], projects: ["ENG"] }, results: [row({ id: "github.installation", group: "github", project: "ENG" })] };
+    expect(checks.mergeSetupCheckRun(stored, forEng, MAPPED).results).toContainEqual(thrown);
+    const everywhere = { ...forEng, scope: { checks: ["github.installation" as const] } };
+    expect(checks.mergeSetupCheckRun(stored, everywhere, MAPPED).results).not.toContainEqual(thrown);
+  });
+
+  it("drops the rows of a project no longer mapped, and keeps every row with no project", () => {
+    const merged = checks.mergeSetupCheckRun(storedRun(), projectRun(), ["ENG"]);
+    expect(merged.results.some((r) => r.project === "OPS")).toBe(false);
+    expect(merged.results.filter((r) => r.project === undefined).map((r) => r.id)).toEqual(["restate", "tracker.provider", "github.app-identity"]);
+  });
+
+  it("replaces only the orchestrator-wide rows for an orchestrator-wide run", async () => {
+    const run = await checks.runOrchestratorWideSetupChecks(makeSetupCheckContext(), () => 99);
+    const merged = checks.mergeSetupCheckRun(storedRun(), run, MAPPED);
+    expect(merged.results.filter((r) => r.project !== undefined)).toEqual(storedRun().results.filter((r) => r.project !== undefined));
+    expect(merged.results.find((r) => r.id === "restate")?.checkedAt).toBe(99);
+  });
+
+  it("answers a full run whole, since it carries no scope", () => {
+    const full = { checkedAt: 99, results: [row({ project: "ENG" })] };
+    expect(checks.mergeSetupCheckRun(storedRun(), full, MAPPED)).toBe(full);
+  });
+
   // With no stored provider row to keep, the run's own is the only one saying whether the provider can be built.
-  it("starts the stored run from the whole project run when none is stored, its tracker.provider row included", () => {
-    expect(checks.mergeProjectRun(null, "ENG", projectRun())).toStrictEqual({
+  it("starts the stored run from the whole partial run when none is stored, its tracker.provider row included", () => {
+    expect(checks.mergeSetupCheckRun(null, projectRun(), MAPPED)).toStrictEqual({
       checkedAt: 99,
       results: projectRun().results.map((r) => ({ ...r, checkedAt: 99 })),
     });
@@ -471,8 +522,500 @@ describe("merging a project run into the stored run", () => {
   it("changes neither run it is given", () => {
     const stored = storedRun();
     const run = projectRun();
-    checks.mergeProjectRun(stored, "ENG", run);
+    checks.mergeSetupCheckRun(stored, run, MAPPED);
     expect({ stored, run }).toEqual({ stored: storedRun(), run: projectRun() });
+  });
+});
+
+describe("an orchestrator-wide run", () => {
+  it("runs every check that is not per project, and names them as its scope", async () => {
+    const run = await checks.runOrchestratorWideSetupChecks(makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping() }) }));
+    const wide = checks.SETUP_CHECKS.filter((check) => !check.perProject).map((check) => check.id);
+    expect(run.scope).toEqual({ checks: wide });
+    expect(run.results.every((row) => wide.includes(row.id))).toBe(true);
+    expect(run.results.some((row) => row.project !== undefined && row.id !== "tracker.provider")).toBe(false);
+  });
+
+  // Its rows are the credentials checks' alone, which judge only whether the app is accepted.
+  it("reads each ticketing system's setup facts for no project, once", async () => {
+    const fetchSetupFacts = vi.fn(async () => makeLinearSetupFacts({ teams: {} }));
+    const ctx = makeSetupCheckContext({
+      mappings: () => ({ ENG: makeMapping(), APP: makeMapping() }),
+      trackerProvider: async () => makeProvider({ fetchSetupFacts }),
+      trackerSetupFacts: async () => { throw new Error("the shared read reads every project"); },
+    });
+    const run = await checks.runOrchestratorWideSetupChecks(ctx);
+    expect(fetchSetupFacts.mock.calls).toEqual([[[]]]);
+    expect(run.results.find((row) => row.id === "tracker.linear.credentials")?.state).toBe("pass");
+  });
+});
+
+describe("the run before Restate serves", () => {
+  it("runs the orchestrator's own checks, less the two that read what only Restate fills", async () => {
+    const run = await checks.runSetupChecksBeforeRestate(makeSetupCheckContext());
+    const own = checks.SETUP_CHECKS.filter((check) => check.group === "orchestrator").map((check) => check.id).filter((id) => id !== "restate" && id !== "runner.fly-sessions");
+    expect(new Set(run.results.map((row) => row.id))).toEqual(new Set(own));
+  });
+});
+
+describe("setup-check log lines", () => {
+  const row = (overrides: Partial<SetupCheckResult>): SetupCheckResult => ({ id: "env.github-app", title: "", group: "orchestrator", tier: "core", onAdminPath: false, state: "fail", ...overrides });
+
+  it("writes one line for each row that needs attention, and none for a row that passes or does not apply", () => {
+    const lines = checks.setupCheckLogLines([
+      row({ state: "fail", detail: "GITHUB_APP_ID is not set", fix: "Set GITHUB_APP_ID." }),
+      row({ id: "callback.reachable", state: "cannot-verify" }),
+      row({ id: "env.poll-interval", state: "warn" }),
+      row({ id: "restate", state: "pass" }),
+      row({ id: "admin.path", state: "not-applicable" }),
+    ]);
+    expect(lines.map((line) => line.split(" ")[1])).toEqual(["env.github-app", "callback.reachable", "env.poll-interval"]);
+  });
+
+  it("names the check, its project, its state, what was found and the fix", () => {
+    const [line] = checks.setupCheckLogLines([row({ id: "github.installation", project: "ENG", detail: "The App is not installed on acme", fix: "Install the App." })]);
+    expect(line).toMatch(/^\[setup-checks\] github\.installation \(ENG\) fail:/);
+    expect(line).toContain("The App is not installed on acme.");
+    expect(line).toContain("Install the App.");
+  });
+
+  it("carries no secret's value, from any check boot runs", async () => {
+    const ctx = makeSentinelSetupCheckContext();
+    const runs = [await checks.runSetupChecksBeforeRestate(ctx), await checks.runOrchestratorWideSetupChecks(ctx)];
+    expect(runs.flatMap((run) => checks.setupCheckLogLines(run.results)).join("\n")).not.toContain("sentinel-");
+  });
+});
+
+describe("boot's setup-check runs", () => {
+  const row = (id: SetupCheckResult["id"], state: SetupCheckResult["state"] = "fail"): SetupCheckResult => ({ id, title: "", group: "orchestrator", tier: "core", onAdminPath: false, state });
+  const runOf = (...results: SetupCheckResult[]): SetupCheckRun => ({ checkedAt: 1, results });
+  function boot(deps: Partial<Parameters<typeof checks.createBootSetupChecks>[0]> = {}) {
+    const lines: string[] = [];
+    const runs = checks.createBootSetupChecks({
+      runBeforeRestate: async () => runOf(row("env.github-app")),
+      storeOrchestratorWide: async () => runOf(),
+      log: (line) => { lines.push(line); },
+      ...deps,
+    });
+    return { runs, lines };
+  }
+
+  it("logs the rows of the run before Restate serves", async () => {
+    const { runs, lines } = boot();
+    await runs.beforeRestate();
+    expect(lines).toEqual([expect.stringContaining("env.github-app fail")]);
+  });
+
+  // The stored run holds every row; the first log covered the orchestrator's own checks but the two that need Restate.
+  it("logs only the stored rows the first log could not, once Restate serves", async () => {
+    const stored = runOf(row("env.github-app"), row("restate"), row("runner.fly-sessions"), row("tracker.linear.credentials"), { ...row("tracker.linear.team-access"), project: "ENG" });
+    const { runs, lines } = boot({ storeOrchestratorWide: async () => stored });
+    await runs.afterServing();
+    expect(lines.map((line) => line.split(" ")[1])).toEqual(["restate", "runner.fly-sessions", "tracker.linear.credentials"]);
+  });
+
+  it("logs nothing once Restate serves when the run could not be stored, which the ingress already logged", async () => {
+    const { runs, lines } = boot({ storeOrchestratorWide: async () => null });
+    await runs.afterServing();
+    expect(lines).toEqual([]);
+  });
+
+  it.each([
+    ["before Restate serves", "beforeRestate", { runBeforeRestate: async () => { throw new Error("the database is locked"); } }],
+    ["once Restate serves", "afterServing", { storeOrchestratorWide: async () => { throw new Error("the ingress is gone"); } }],
+  ] as const)("logs one line, and never throws, when the run %s cannot run", async (when, phase, deps) => {
+    const { runs, lines } = boot(deps);
+    await expect(runs[phase]()).resolves.toBeUndefined();
+    expect(lines).toEqual([expect.stringMatching(new RegExp(`^\\[setup-checks\\] the checks ${when} could not run: `))]);
+  });
+});
+
+describe("the saved setup", () => {
+  it("is the same across reads with nothing saved between them", () => {
+    const ctx = makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping() }) });
+    expect(checks.readSavedSetup(ctx)).toEqual(checks.readSavedSetup(ctx));
+  });
+
+  // The sync worker rewrites updatedAt as it runs, and a first sign-in writes an address's bindings, neither of which is a save.
+  it("leaves out what the orchestrator writes for itself: a sync's update time, and an address's sign-in bindings", () => {
+    const at = (updatedAt: number, bindings: Array<{ provider: string; subject: string }>) => checks.readSavedSetup(makeSetupCheckContext({
+      mappings: () => ({ ENG: makeMapping() }),
+      githubSetupFacts: () => makeGitHubSetupFacts({ workflowSync: () => ({ id: 1, teamKey: "ENG", status: "running", result: null, error: null, createdAt: 1, updatedAt }) }),
+      effectiveAllowlist: () => ({ entries: [makeAccessEntry({ bindings })], source: "db" }),
+    }));
+    expect(at(2, [])).toEqual(at(3, [{ provider: "google", subject: "sub-1" }]));
+  });
+
+  it("holds each project's mapping and sync apart from what the orchestrator-wide checks read", () => {
+    const at = (overrides: Partial<SetupCheckContext>) => checks.readSavedSetup(makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping() }), ...overrides }));
+    const base = at({});
+    const synced = at({ githubSetupFacts: () => makeGitHubSetupFacts({ workflowSync: () => ({ id: 1, teamKey: "ENG", status: "completed", result: null, error: null, createdAt: 1, updatedAt: 1 }) }) });
+    expect(synced.perProject.ENG.sync).not.toBe(base.perProject.ENG.sync);
+    expect(synced.orchestratorWide).toBe(base.orchestratorWide);
+    const adopted = at({ projectStageConfig: () => ({ configRevisionId: "rev-2", revision: 2, config: {} as never, createdAt: 1, createdBy: null, supersedesRevisionId: null }) });
+    expect(adopted.orchestratorWide).not.toBe(base.orchestratorWide);
+    expect(adopted.perProject).toEqual(base.perProject);
+  });
+
+  // A check that reads one of these must see its change, so each part is pinned on its own.
+  it.each([
+    ["an allowlist entry's kind", { effectiveAllowlist: () => ({ entries: [makeAccessEntry({ kind: "domain", value: "example.com" })], source: "db" as const }) }],
+    ["an allowlist entry's address", { effectiveAllowlist: () => ({ entries: [makeAccessEntry({ value: "other@example.com" })], source: "db" as const }) }],
+    ["an allowlist entry's role", { effectiveAllowlist: () => ({ entries: [makeAccessEntry({ role: "user" })], source: "db" as const }) }],
+    ["where the allowlist comes from", { effectiveAllowlist: () => ({ entries: [makeAccessEntry()], source: "env" as const }) }],
+    ["whether the allowlist can be read", { allowlistReadAvailable: () => false }],
+    ["the agent defaults' revision", { orchestratorDefaults: () => ({ configRevisionId: "rev-2", revision: 2, config: {} as never, createdAt: 1, createdBy: null, supersedesRevisionId: null }) }],
+    ["the Fly sessions app", { flySessions: () => ({ token: null, app: "other-sessions", region: "iad", source: { app: "restate" as const, region: "restate" as const } }) }],
+    ["the Fly sessions region", { flySessions: () => ({ token: null, app: "sessions", region: "lhr", source: { app: "restate" as const, region: "restate" as const } }) }],
+    ["where the Fly sessions settings come from", { runnerBackendSource: () => "not-loaded" as const }],
+    ["a seed-once setting", { readSetting: (key: string) => (key === "kg_base_repo" ? "acme/other-kg-base" : null) }],
+  ] as const)("changes what the orchestrator-wide checks read when %s changes", (_part, change) => {
+    const base: Partial<SetupCheckContext> = {
+      mappings: () => ({ ENG: makeMapping() }),
+      effectiveAllowlist: () => ({ entries: [makeAccessEntry()], source: "db" }),
+      flySessions: () => ({ token: null, app: "sessions", region: "iad", source: { app: "restate", region: "restate" } }),
+    };
+    const before = checks.readSavedSetup(makeSetupCheckContext(base));
+    const after = checks.readSavedSetup(makeSetupCheckContext({ ...base, ...change }));
+    expect(after.orchestratorWide).not.toBe(before.orchestratorWide);
+    expect(after.perProject).toEqual(before.perProject);
+  });
+
+  it("puts the runner mode and the pickup label with what reaches checks of both kinds", () => {
+    const base = checks.readSavedSetup(makeSetupCheckContext());
+    const local = checks.readSavedSetup(makeSetupCheckContext({ runnerMode: () => ({ mode: "local", source: "db" }) }));
+    const relabeled = checks.readSavedSetup(makeSetupCheckContext({ readSetting: (key) => (key === "linear_pickup_label" ? "Pick-Me" : null) }));
+    expect(local.allChecks).not.toBe(base.allChecks);
+    expect(relabeled.allChecks).not.toBe(base.allChecks);
+  });
+
+  // Each seed-once variable is set to a value that seeds, so settings.seeded reads its row.
+  it("reads every settings row a check reads", async () => {
+    const read = new Set<string>();
+    const ctx = makeSetupCheckContext({
+      env: { KG_BASE_REPO: "acme/kg-base", KG_MATERIALIZE_DIRECT: "true", KG_EXECUTION_MODE: "fly-machines", LINEAR_PICKUP_LABEL: "AI-Implement", RUNNER_IMAGE_ALLOWED_PREFIXES: "ghcr.io/acme/", RUNNER_MODE: "fly", FLY_PROCESS_LEVEL_SECRETS: "true" },
+      readSetting: (key) => { read.add(key); return null; },
+    });
+    await checks.runSetupChecks(ctx);
+    expect(read.size).toBeGreaterThan(0);
+    expect([...read].filter((key) => !checks.SAVED_SETUP_SETTINGS.includes(key))).toEqual([]);
+  });
+});
+
+describe("what a change since the last cycle sends", () => {
+  type Saved = SetupChecksModule.SavedSetup;
+  const base: Saved = { perProject: { ENG: { mapping: "m1", sync: "s1" } }, orchestratorWide: "o1", allChecks: "a1" };
+  const after = (changes: Partial<Saved>): Saved => ({ ...base, ...changes });
+
+  it.each([
+    ["nothing", after({}), []],
+    ["a project's mapping, which three orchestrator-wide checks list", after({ perProject: { ENG: { mapping: "m2", sync: "s1" } } }), [{ kind: "project", project: "ENG" }, { kind: "orchestrator-wide" }]],
+    ["a new project", after({ perProject: { ...base.perProject, OPS: { mapping: "m1", sync: "s1" } } }), [{ kind: "project", project: "OPS" }, { kind: "orchestrator-wide" }]],
+    ["a project's workflow sync", after({ perProject: { ENG: { mapping: "m1", sync: "s2" } } }), [{ kind: "project", project: "ENG" }]],
+    ["a deleted project, whose rows the merge drops", after({ perProject: {} }), [{ kind: "orchestrator-wide" }]],
+    ["what only the orchestrator-wide checks read", after({ orchestratorWide: "o2" }), [{ kind: "orchestrator-wide" }]],
+    ["what reaches checks of both kinds", after({ allChecks: "a2", orchestratorWide: "o2" }), [{ kind: "full" }]],
+  ] as const)("for %s", (_change, current, runs) => {
+    expect(checks.runsForSavedChange(base, current)).toEqual(runs);
+  });
+});
+
+describe("the change detector", () => {
+  type Saved = SetupChecksModule.SavedSetup;
+  const at = (projects: Record<string, string>, orchestratorWide = "o1", allChecks = "a1"): Saved => ({
+    perProject: Object.fromEntries(Object.entries(projects).map(([project, mapping]) => [project, { mapping, sync: "s1" }])),
+    orchestratorWide,
+    allChecks,
+  });
+  // Each cycle reads the next saved setup, and the last one again once the list runs out, as cycles with nothing saved do.
+  function detect(reads: Saved[], accept: (run: SetupCheckRunKind) => boolean = () => true) {
+    let clock = 0;
+    const sent: SetupCheckRunKind[] = [];
+    const lines: string[] = [];
+    const queue = [...reads];
+    const detector = checks.createSetupCheckChangeDetector({
+      readSavedSetup: () => (queue.length > 1 ? queue.shift()! : queue[0]),
+      send: async (run) => { if (!accept(run)) return false; sent.push(run); return true; },
+      log: (line) => { lines.push(line); },
+      now: () => clock,
+    });
+    return { detector, sent, lines, advance: (ms: number) => { clock += ms; } };
+  }
+
+  it("sends nothing on its first call, so a restart is not a change", async () => {
+    const { detector, sent } = detect([at({ ENG: "m1" })]);
+    await detector.onPollCycle();
+    expect(sent).toEqual([]);
+  });
+
+  it("sends each run a change needs once, and logs a line for each", async () => {
+    const { detector, sent, lines, advance } = detect([at({ ENG: "m1" }), at({ ENG: "m2" })]);
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    // Past the interval, so only a change could send again.
+    advance(checks.MIN_SETUP_CHECK_RUN_INTERVAL_MS);
+    await detector.onPollCycle();
+    expect(sent).toEqual([{ kind: "project", project: "ENG" }, { kind: "orchestrator-wide" }]);
+    expect(lines).toEqual(["[setup-checks] started the checks of ENG after a saved change", "[setup-checks] started the orchestrator-wide checks after a saved change"]);
+  });
+
+  it("holds a change within its run's interval until the interval has passed, then sends it once", async () => {
+    const { detector, sent, advance } = detect([at({}, "o1"), at({}, "o2"), at({}, "o3")]);
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    advance(checks.MIN_SETUP_CHECK_RUN_INTERVAL_MS - 1);
+    await detector.onPollCycle();
+    expect(sent).toHaveLength(1);
+    advance(1);
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    expect(sent).toEqual([{ kind: "orchestrator-wide" }, { kind: "orchestrator-wide" }]);
+  });
+
+  it("tries a run that was not sent again on the next call", async () => {
+    let accept = false;
+    const { detector, sent } = detect([at({}, "o1"), at({}, "o2")], () => accept);
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    accept = true;
+    await detector.onPollCycle();
+    expect(sent).toEqual([{ kind: "orchestrator-wide" }]);
+  });
+
+  it.each([
+    ["three projects changed, a run for each", ["A", "B", "C"], ["project", "project", "project", "orchestrator-wide"]],
+    ["four projects changed, one full run", ["A", "B", "C", "D"], ["full"]],
+  ] as const)("sends, for %s", async (_case, changed, kinds) => {
+    const before = { A: "m1", B: "m1", C: "m1", D: "m1" };
+    const { detector, sent } = detect([at(before), at({ ...before, ...Object.fromEntries(changed.map((key) => [key, "m2"])) })]);
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    expect(sent.map((run) => run.kind)).toEqual(kinds);
+  });
+
+  it("lets a full run waiting within its interval answer for every change after it", async () => {
+    const { detector, sent, advance } = detect([at({ ENG: "m1" }, "o1", "a1"), at({ ENG: "m1" }, "o1", "a2"), at({ ENG: "m1" }, "o1", "a3"), at({ ENG: "m2" }, "o2", "a3")]);
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    expect(sent).toEqual([{ kind: "full" }]);
+    advance(checks.MIN_SETUP_CHECK_RUN_INTERVAL_MS);
+    await detector.onPollCycle();
+    expect(sent).toEqual([{ kind: "full" }, { kind: "full" }]);
+  });
+
+  it("logs one line and sends nothing when the saved setup cannot be read, then compares with the last one it read", async () => {
+    const reads: Array<Saved | Error> = [at({}, "o1"), new Error("the database is locked"), at({}, "o2")];
+    const sent: SetupCheckRunKind[] = [];
+    const lines: string[] = [];
+    const detector = checks.createSetupCheckChangeDetector({
+      readSavedSetup: () => { const next = reads.shift()!; if (next instanceof Error) throw next; return next; },
+      send: async (run) => { sent.push(run); return true; },
+      log: (line) => { lines.push(line); },
+    });
+    await detector.onPollCycle();
+    await detector.onPollCycle();
+    expect(lines).toEqual(["[setup-checks] the saved setup could not be read, so no change was looked for: the database is locked"]);
+    expect(sent).toEqual([]);
+    await detector.onPollCycle();
+    expect(sent).toEqual([{ kind: "orchestrator-wide" }]);
+  });
+
+  describe("its record, which outlives the process", () => {
+    // A detector over one shared record, standing in for the settings row a process writes and the next one reads.
+    type Store = { record: SetupChecksModule.ChangeDetectorRecord | null; writes: number };
+    function processOver(store: Store, read: () => Saved, accept = () => true) {
+      const sent: SetupCheckRunKind[] = [];
+      const lines: string[] = [];
+      const detector = checks.createSetupCheckChangeDetector({
+        readSavedSetup: read,
+        send: async (run) => { if (!accept()) return false; sent.push(run); return true; },
+        log: (line) => { lines.push(line); },
+        readRecord: () => store.record,
+        writeRecord: (record) => { store.record = record; store.writes++; },
+      });
+      return { detector, sent, lines };
+    }
+    const fresh = (): Store => ({ record: null, writes: 0 });
+
+    it("lets the next process send a run that was still waiting when this one stopped", async () => {
+      const store = fresh();
+      let current = at({}, "o1");
+      const first = processOver(store, () => current, () => false);
+      await first.detector.onPollCycle();
+      current = at({}, "o2");
+      await first.detector.onPollCycle();
+      expect(first.sent).toEqual([]);
+      const next = processOver(store, () => current);
+      await next.detector.onPollCycle();
+      expect(next.sent).toEqual([{ kind: "orchestrator-wide" }]);
+    });
+
+    it("sends the run a save needs when the save came after this process's last cycle", async () => {
+      const store = fresh();
+      await processOver(store, () => at({ ENG: "m1" })).detector.onPollCycle();
+      const next = processOver(store, () => at({ ENG: "m2" }));
+      await next.detector.onPollCycle();
+      expect(next.sent).toEqual([{ kind: "project", project: "ENG" }, { kind: "orchestrator-wide" }]);
+    });
+
+    it("sends nothing after a restart with nothing saved", async () => {
+      const store = fresh();
+      await processOver(store, () => at({ ENG: "m1" })).detector.onPollCycle();
+      const next = processOver(store, () => at({ ENG: "m1" }));
+      await next.detector.onPollCycle();
+      expect(next.sent).toEqual([]);
+    });
+
+    it("writes the record only in a cycle that changes it", async () => {
+      const store = fresh();
+      const { detector } = processOver(store, () => at({ ENG: "m1" }));
+      await detector.onPollCycle();
+      await detector.onPollCycle();
+      expect(store.writes).toBe(1);
+      await processOver(store, () => at({ ENG: "m1" })).detector.onPollCycle();
+      expect(store.writes).toBe(1);
+    });
+
+    it("holds fingerprints of the saved setup, never the setup itself", async () => {
+      const store = fresh();
+      await processOver(store, () => at({ ENG: "a-mapping-read-in-full" }, "the-orchestrator-wide-part")).detector.onPollCycle();
+      const kept = JSON.stringify(store.record);
+      expect(kept).not.toContain("a-mapping-read-in-full");
+      expect(kept).not.toContain("the-orchestrator-wide-part");
+      expect(store.record!.savedSetup).toEqual(checks.fingerprintSavedSetup(at({ ENG: "a-mapping-read-in-full" }, "the-orchestrator-wide-part")));
+    });
+
+    it("only reads on its first cycle, and logs a line, when the record cannot be read", async () => {
+      const sent: SetupCheckRunKind[] = [];
+      const lines: string[] = [];
+      const detector = checks.createSetupCheckChangeDetector({
+        readSavedSetup: () => at({}, "o2"),
+        send: async (run) => { sent.push(run); return true; },
+        log: (line) => { lines.push(line); },
+        readRecord: () => { throw new Error("the database is locked"); },
+        writeRecord: () => {},
+      });
+      await detector.onPollCycle();
+      expect(sent).toEqual([]);
+      expect(lines).toEqual(["[setup-checks] the last process's record could not be read, so this cycle only reads: the database is locked"]);
+    });
+
+    it("keeps the record in a settings row, and reads a row that is not one as none", () => {
+      expect(checks.readChangeDetectorRecord()).toBeNull();
+      const record = { savedSetup: checks.fingerprintSavedSetup(at({ ENG: "m1" })), waiting: [{ kind: "full" as const }] };
+      checks.writeChangeDetectorRecord(record);
+      expect(checks.readChangeDetectorRecord()).toEqual(record);
+      dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run("setup_checks_change_detector", JSON.stringify({ waiting: [] }));
+      expect(checks.readChangeDetectorRecord()).toBeNull();
+    });
+  });
+});
+
+describe("the saved setup's fingerprints", () => {
+  const saved = { perProject: { ENG: { mapping: "m1", sync: "s1" } }, orchestratorWide: "o1", allChecks: "a1" };
+
+  it("match for the same saved setup, and change only the part that changed", () => {
+    expect(checks.fingerprintSavedSetup(saved)).toEqual(checks.fingerprintSavedSetup({ ...saved }));
+    const before = checks.fingerprintSavedSetup(saved);
+    const after = checks.fingerprintSavedSetup({ ...saved, perProject: { ENG: { mapping: "m1", sync: "s2" } } });
+    expect(after.perProject.ENG.sync).not.toBe(before.perProject.ENG.sync);
+    expect(after.perProject.ENG.mapping).toBe(before.perProject.ENG.mapping);
+    expect([after.orchestratorWide, after.allChecks]).toEqual([before.orchestratorWide, before.allChecks]);
+  });
+});
+
+describe("a recheck", () => {
+  const HOUR = 60 * 60_000;
+  const stored = (state: SetupCheckResult["state"], checkedAt: number, project?: string): SetupCheckRun => ({
+    checkedAt: 0,
+    results: [{ id: "tracker.linear.team-access", title: "", group: "tracker", tier: "core", onAdminPath: false, state, checkedAt, ...(project ? { project } : {}) }],
+  });
+
+  it("is scoped to one project's rows of a per-project check, every row of a check given none, and an orchestrator-wide check's rows whatever project is given", () => {
+    expect(checks.recheckScope("tracker.linear.team-access", "ENG")).toEqual({ checks: ["tracker.linear.team-access"], projects: ["ENG"] });
+    expect(checks.recheckScope("tracker.linear.team-access")).toEqual({ checks: ["tracker.linear.team-access"] });
+    expect(checks.recheckScope("github.app-identity", "ENG")).toEqual({ checks: ["github.app-identity"] });
+    expect(checks.recheckScope("no.such-check")).toBeNull();
+  });
+
+  it.each([
+    ["a recheck of them ran within the hour", null, HOUR - 1, true],
+    ["the last recheck of them was an hour ago", null, 0, false],
+    ["every stored row fails and was checked within the hour", stored("fail", 1, "ENG"), undefined, true],
+    ["every stored row warns or cannot be verified, within the hour", stored("cannot-verify", 1, "ENG"), undefined, true],
+    ["the stored row passes", stored("pass", 1, "ENG"), undefined, false],
+    ["the failing stored row was checked an hour ago", stored("fail", 0, "ENG"), undefined, false],
+    ["no stored row answers for the project", stored("fail", 1, "OPS"), undefined, false],
+    ["nothing is stored", null, undefined, false],
+  ] as const)("is held when %s: %s", (_case, run, lastRecheckAt, held) => {
+    expect(checks.recheckHeld(run, { checks: ["tracker.linear.team-access"], projects: ["ENG"] }, lastRecheckAt, HOUR)).toBe(held);
+  });
+
+  it("keeps each project's recheck time apart, and the check's own for rows with no project", () => {
+    expect(new Set([
+      checks.recheckKey({ checks: ["tracker.linear.team-access"], projects: ["ENG"] }),
+      checks.recheckKey({ checks: ["tracker.linear.team-access"], projects: ["OPS"] }),
+      checks.recheckKey({ checks: ["tracker.linear.team-access"] }),
+    ]).size).toBe(3);
+  });
+
+  it("keeps only the recheck times within the hour, and adds the new one", () => {
+    expect(checks.rememberRecheck({ old: 0, recent: 1 }, "new", HOUR)).toEqual({ recent: 1, new: HOUR });
+  });
+
+  describe("of the checks a rechecked run's rows wait on", () => {
+    const waiting = (id: SetupCheckId, waitsOn?: SetupCheckId): SetupCheckResult =>
+      ({ id, title: "", group: "tracker", tier: "core", onAdminPath: false, state: "cannot-verify", ...(waitsOn ? { waitsOn } : {}) });
+    const runOf = (...results: SetupCheckResult[]): SetupCheckRun => ({ checkedAt: 0, results });
+    // Answers each check's canned run with no hold, so only the chain's own guard can end it. Throws rather than loop without end.
+    function rerunning(answers: Partial<Record<SetupCheckId, SetupCheckRun | null>>) {
+      const asked: Array<[SetupCheckId, string | undefined]> = [];
+      const rerun = async (dependency: SetupCheckScope, waited: SetupCheckId) => {
+        if (asked.length > 10) throw new Error("the chain did not end");
+        asked.push([waited, dependency.projects?.[0]]);
+        expect(dependency.checks).toEqual([waited]);
+        return answers[waited] ?? null;
+      };
+      return { asked, rerun };
+    }
+    const pickupLabel: SetupCheckScope = { checks: ["tracker.linear.pickup-label"], projects: ["ENG"] };
+
+    it("rechecks each check the answered rows wait on in turn, for the project when the check is per-project", async () => {
+      const { asked, rerun } = rerunning({
+        "tracker.linear.team-access": runOf(waiting("tracker.linear.team-access", "tracker.linear.credentials")),
+        "tracker.linear.credentials": runOf(waiting("tracker.linear.credentials", "tracker.provider")),
+        "tracker.provider": null,
+      });
+      await checks.recheckWaitedOn(pickupLabel, runOf(waiting("tracker.linear.pickup-label", "tracker.linear.team-access")), rerun);
+      expect(asked).toEqual([["tracker.linear.team-access", "ENG"], ["tracker.linear.credentials", undefined], ["tracker.provider", undefined]]);
+    });
+
+    // A flapping read, or a waitsOn added later, could lead the chain back to a check it already ran.
+    it("runs each scope once, so a chain that leads back to one it ran ends", async () => {
+      const { asked, rerun } = rerunning({
+        "tracker.linear.team-access": runOf(waiting("tracker.linear.team-access", "tracker.linear.pickup-label"), waiting("tracker.linear.team-access", "tracker.linear.credentials")),
+        "tracker.linear.credentials": runOf(waiting("tracker.linear.credentials", "tracker.linear.team-access")),
+      });
+      const run = runOf(waiting("tracker.linear.pickup-label", "tracker.linear.team-access"), waiting("tracker.linear.pickup-label", "tracker.linear.team-access"));
+      await checks.recheckWaitedOn(pickupLabel, run, rerun);
+      expect(asked).toEqual([["tracker.linear.team-access", "ENG"], ["tracker.linear.credentials", undefined]]);
+    });
+
+    it("runs nothing when no row waits on another check", async () => {
+      const { asked, rerun } = rerunning({});
+      await checks.recheckWaitedOn(pickupLabel, runOf(waiting("tracker.linear.pickup-label")), rerun);
+      expect(asked).toEqual([]);
+    });
+  });
+
+  // A check that throws answers one row with no project, which in a run for one project is that project's.
+  it("runs only the checks its scope names, and gives one project the row of a per-project check that threw", async () => {
+    const ctx = makeSetupCheckContext({ mappings: () => { throw new Error("the database is locked"); } });
+    const run = await checks.runSetupChecksInScope(ctx, { checks: ["tracker.linear.team-access"], projects: ["ENG"] });
+    expect(run.scope).toEqual({ checks: ["tracker.linear.team-access"], projects: ["ENG"] });
+    expect(run.results.map((answered) => [answered.id, answered.state, answered.project])).toEqual([["tracker.linear.team-access", "cannot-verify", "ENG"]]);
   });
 });
 
@@ -553,14 +1096,14 @@ describe("the recorded run", () => {
   it("keeps its own copy, so neither the run it was given nor one read back can change it", () => {
     const row: SetupCheckResult = { id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "pass" };
     const run = { checkedAt: 1, results: [row] };
-    checks.recordSetupCheckRun(run);
+    checks.cacheSetupCheckRun(run);
 
     run.checkedAt = 2;
     row.state = "fail";
-    const readBack = checks.getLastSetupCheckRun();
+    const readBack = checks.getCachedSetupCheckRun();
     if (readBack) readBack.results[0].state = "warn";
 
-    expect(checks.getLastSetupCheckRun()).toEqual({ checkedAt: 1, results: [{ ...row, state: "pass" }] });
+    expect(checks.getCachedSetupCheckRun()).toEqual({ checkedAt: 1, results: [{ ...row, state: "pass" }] });
   });
 });
 

@@ -153,14 +153,24 @@ async function projectRepository(ctx: SetupCheckContext, { owner, repo }: RepoMa
 
 const fileList = (files: string[]) => files.join(" and ");
 
-/** Whether a repository a run reads can be cloned as the run clones it, or a problem or an unread reason when it cannot be said. */
-async function cloneable(ctx: SetupCheckContext, owner: string, repo: string, ref?: string): Promise<{ problem?: string; unread?: string }> {
+/** A time of day as an operator reads it in a detail or fix, in UTC. */
+const utcTime = (epochMs: number) => `${new Date(epochMs).toISOString().slice(11, 16)} UTC`;
+
+/** Why reads without the App were refused: GitHub's one limit on them, shared by every such read from this host. */
+const rateLimitReason = (until: number) => `GitHub limited the orchestrator's reads without the App until ${utcTime(until)}`;
+
+/**
+ * Whether a repository a run reads can be cloned as the run clones it, or a problem or an unread reason when it cannot be said,
+ * or, when GitHub's rate limit refused the read, until when.
+ */
+async function cloneable(ctx: SetupCheckContext, owner: string, repo: string, ref?: string): Promise<{ problem?: string; unread?: string; limitedUntil?: number }> {
   const github = ctx.githubSetupFacts();
   const name = `${owner}/${repo}`;
   const installation = await github.installation(owner);
   if (!installation) {
     // A run clones it without a token, as for any repository on an owner the App is not installed on.
     const read = await github.publicRepository(owner, repo, ref);
+    if (read.rateLimitedUntil !== undefined) return { limitedUntil: read.rateLimitedUntil };
     if (read.status === 404) return { problem: `${name} is private or missing, and the App is not installed on ${owner}` };
     if (read.status !== 200) return { unread: `${name} could not be read (HTTP ${read.status})` };
     return read.refExists === false ? { problem: `${name} has no ref ${ref}` } : {};
@@ -499,6 +509,9 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
           : Promise.resolve({ problem: `${entry.repo} is not a GitHub repository` })));
       const problems = results.flatMap((r) => ("problem" in r && r.problem ? [r.problem] : []));
       const unread = results.flatMap((r) => ("unread" in r && r.unread ? [r.unread] : []));
+      // One limit refuses every read without the App, so the refused repositories share one reason, until the latest time GitHub gave.
+      const limited = results.flatMap((r, i) => ("limitedUntil" in r && r.limitedUntil !== undefined ? [{ name: `${entries[i].parts!.owner}/${entries[i].parts!.repo}`, until: r.limitedUntil }] : []));
+      const limitedUntil = Math.max(...limited.map((l) => l.until));
       if (problems.length > 0) {
         return {
           state: "fail",
@@ -506,7 +519,14 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
           fix: "Add each repository to the App's installation or make it public, and correct each ref named, under Reference Repositories at /admin#projects.",
         };
       }
-      if (unread.length > 0) return { state: "cannot-verify", detail: `Some of ${owner}/${repo}'s reference repositories could not be read: ${unread.join(", ")}`, fix: "Check that the orchestrator can reach api.github.com." };
+      if (unread.length > 0 || limited.length > 0) {
+        const reasons = [...unread, ...(limited.length > 0 ? [`${limited.map((l) => l.name).join(", ")} (${rateLimitReason(limitedUntil)})`] : [])];
+        const fixes = [
+          ...(limited.length > 0 ? [`Run the checks again after ${utcTime(limitedUntil)}.`] : []),
+          ...(unread.length > 0 ? ["Check that the orchestrator can reach api.github.com."] : []),
+        ];
+        return { state: "cannot-verify", detail: `Some of ${owner}/${repo}'s reference repositories could not be read: ${reasons.join(", ")}`, fix: fixes.join(" ") };
+      }
       return { state: "pass", detail: `Runs of ${owner}/${repo} can clone all ${entries.length} of its reference repositories` };
     }, ({ owner, repo, referenceRepos }) => ((referenceRepos ?? []).length === 0 ? { state: "not-applicable", detail: `${owner}/${repo} reads no reference repositories` } : null)),
   },
@@ -532,6 +552,9 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
         visibility = !facts?.visible ? "missing" : facts.private ? "private" : "public";
       } else {
         const read = await github.publicRepository(parts.owner, parts.repo);
+        if (read.rateLimitedUntil !== undefined) {
+          return { state: "cannot-verify", detail: `The skills repository ${name} could not be read: ${rateLimitReason(read.rateLimitedUntil)}`, fix: `Run the checks again after ${utcTime(read.rateLimitedUntil)}.` };
+        }
         visibility = read.status === 200 ? "public" : read.status === 404 ? "missing" : { unread: read.status };
       }
       if (visibility === "public") return { state: "pass", detail: `The skills repository ${name} is public, so every run can clone it` };
