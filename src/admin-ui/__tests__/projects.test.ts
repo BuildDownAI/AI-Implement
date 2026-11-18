@@ -807,3 +807,50 @@ describe("projects page agents tab", () => {
     expect(puts(m)).toHaveLength(0);
   });
 });
+
+describe("projects Fly CPU kind", () => {
+  it.each(["performance", undefined] as const)("loads %s and saves the selected kind", async (machineCpuKind) => {
+    const { win, doc, posts } = mountProjects(makeMapping({ executionMode: "fly-machines", machineCpuKind }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    const select = doc.querySelector<HTMLSelectElement>("#md-cpu-kind")!;
+    expect(select.value).toBe(machineCpuKind ?? "shared");
+    expect(select.closest("#md-fly-fields")?.classList.contains("hidden")).toBe(false);
+    expect(Array.from(select.options, (o) => o.value)).toEqual(["shared", "performance"]);
+    expect(select.nextElementSibling?.textContent).toBe("Fly limits a shared CPU. Use performance for a project whose tests use the CPU for more than some minutes. Performance needs 2048 MB or more for each CPU.");
+    select.value = "performance";
+    await save(win);
+    expect(posts[0]).toMatchObject({ machineCpuKind: "performance", machineCpus: 2, machineMemoryMb: 4096 });
+  });
+
+  it("retains Fly values after a server refusal and allows correction", async () => {
+    const { win, doc, posts } = mountProjects(makeMapping({ executionMode: "fly-machines" }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    const field = (id: string) => doc.getElementById(id) as HTMLInputElement;
+    field("md-cpu-kind").value = "performance";
+    field("md-cpus").value = "4";
+    field("md-mem").value = "2048";
+    const api = win.api;
+    const error = "Performance needs more memory <b>per CPU</b>";
+    win.api = async () => ({ ok: false, status: 400, json: async () => ({ error }) });
+    await save(win);
+    expect(doc.getElementById("md-error")?.textContent).toContain(error);
+    expect(doc.querySelector("#md-error b")).toBeNull();
+    expect(doc.querySelector<HTMLDialogElement>("#mapping-dialog")!.open).toBe(true);
+    expect(["md-cpu-kind", "md-cpus", "md-mem"].map((id) => field(id).value)).toEqual(["performance", "4", "2048"]);
+    field("md-mem").value = "8192";
+    win.api = api;
+    await save(win);
+    expect(posts[0]).toMatchObject({ machineCpuKind: "performance", machineCpus: 4, machineMemoryMb: 8192 });
+  });
+
+  it.each(["github-actions", "filesystem"])("hides the kind with Fly fields for %s", async (mode) => {
+    const { win, doc } = mountProjects(makeMapping(mode === "filesystem"
+      ? { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tickets" } }
+      : { executionMode: "github-actions" }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    expect(doc.getElementById("md-cpu-kind")!.closest("#md-fly-fields")!.classList.contains("hidden")).toBe(true);
+  });
+});
