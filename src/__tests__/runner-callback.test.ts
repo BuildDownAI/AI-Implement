@@ -6817,8 +6817,11 @@ describe("roll-up review follow-up children", () => {
     dedup.getDb().prepare("UPDATE comment_gapfill_queue SET status = 'completed'").run();
     const second = await prepare("a", [], "failure", failures.map(r => r.reviewerId), failures);
     expect((await second.deliver()).status).toBe(200);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(1);
     // A replay of the same callback token is refused and queues nothing.
-    expect((await second.deliver()).status).toBe(409);
+    const replay = await second.deliver();
+    expect(replay.status).toBe(409);
+    expect(replay.body.error).toBe("already_consumed");
     expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(1);
     expect(update.mock.calls.at(-1)?.[4]).toContain("no retry is left; a person decides");
   });
