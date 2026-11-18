@@ -4,8 +4,8 @@ End-to-end shape of the knowledge graph: the two repositories it spans, the tech
 lifecycle stage, and the single fact that governs every operational decision — **the orchestrator
 and the KG are one deployable unit.**
 
-Reference for the configured KG source repository (set via `KG_SOURCE_REPO`; unset builds without a
-sidecar — `/mcp` serves without the `kg_*` tools), its `kg_ingest/`, `kg_query/`,
+Reference for the configured KG source repository (set via `KG_SOURCE_REPO`; unset builds with base code for Stardog,
+inactive until stored Stardog values exist), its `kg_ingest/`, `kg_query/`,
 and `snapshot/` directories, the KG stages of `Dockerfile`, `docker-entrypoint.sh`, and
 `src/deploy.ts`. For the `/mcp` endpoint, the OAuth flow, and the ways a build ships degraded, see
 [kg-sidecar.md](kg-sidecar.md). For deploy paths and their flags, see [deployment.md](deployment.md).
@@ -31,9 +31,31 @@ either waits or fails.
 Refreshing the graph is an operational event on the pipeline, not a data-only change. Plan it like
 a release.
 
+### Base code for a remote store
+
+With no `KG_SOURCE_REPO`, the image downloads the public `KG_BASE_REPO` (default
+`BuildDownAI/bd-knowledge-graph-base`) main branch using a remote Dockerfile `ADD`.
+The artifact stage is selected from `KG_SOURCE_REPO`, so customer builds skip the
+base download. BuildKit checks the tar content on each base build. Extraction
+strips the top directory
+and copies `kg_query`, `kg_ingest` (imported by query code), and `requirements.txt`;
+no snapshot, `sources.yml`, or Git checkout is included. The tar's pax comment
+records the commit in `/app/kg/.base-commit`, and `.base-only` marks this mode.
+The tar is removed, and the common start script and venv steps apply.
+
+The marker selects the remote store. Startup logs the base commit and starts the
+sidecar only with a stored database, namespace, and decryptable token. Without
+those values, no sidecar starts or gets probed, and `/mcp` has no KG tools.
+First boot seeds graph source (only exact `KG_BACKEND=stardog_run`), database,
+endpoint, console, namespace, and encrypted token from the environment. Stored
+values govern subsequent starts; the dataset remains an environment fallback
+when there is no stored graph name. Token encryption requires `RUNNER_TOKEN_SECRET`;
+if storage fails, boot continues with a warning and no token row, and the next boot
+retries the seed.
+
 ### A code deploy is a data refresh
 
-The Dockerfile clones the KG repository with `git clone --depth 1` and **no ref pin**, so every build
+With a customer `KG_SOURCE_REPO`, the Dockerfile clones the KG repository with `git clone --depth 1` and **no ref pin**, so every build
 takes whatever is on that repository's default branch (`main`) at that moment.
 
 An orchestrator release that touches nothing about the KG will still re-materialize the graph from

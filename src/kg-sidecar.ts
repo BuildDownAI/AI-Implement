@@ -1,5 +1,6 @@
+import { getKgGraphSource, getStardogValues, stardogChildEnv } from "./kg-graph-source.js";
 import http from "node:http";
-import { existsSync, accessSync, constants } from "node:fs";
+import { existsSync, accessSync, constants, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -7,8 +8,10 @@ import type { ChildProcess } from "node:child_process";
 import { stopChildWithBackstop } from "./process-stop.js";
 
 /** Whether the selected backend serves the graph from a remote store. */
-export function isRemoteKgStore(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.KG_BACKEND === "stardog_run";
+export function isRemoteKgStore(env: NodeJS.ProcessEnv = process.env, kgDir: string = KG_DIR): boolean {
+  if (existsSync(join(kgDir, ".base-only"))) return true;
+  try { return getKgGraphSource() === "stardog_run"; }
+  catch { return env.KG_BACKEND === "stardog_run"; }
 }
 
 /** Default directory where the baked KG graph lives inside the image. */
@@ -133,6 +136,17 @@ export class KgSidecar {
     const entry = this._findEntryPoint();
     if (!entry) return;
 
+    if (existsSync(join(this._kgDir, ".base-only"))) {
+      try {
+        const commit = readFileSync(join(this._kgDir, ".base-commit"), "utf8").trim();
+        if (/^[a-f0-9]{40}$/.test(commit)) console.error(`[kg] base commit ${commit}`);
+      } catch { /* Older images may lack the receipt. */ }
+      try {
+        const values = getStardogValues();
+        if (!values.db || !values.namespace || !values.tokenSet) return;
+      } catch { return; }
+    }
+
     const childEnv = this._resolveChildEnv();
 
     const child = this._spawn(entry.executable, entry.args, {
@@ -162,7 +176,7 @@ export class KgSidecar {
     process.env.KG_SIDECAR_URL = SIDECAR_URL;
     console.error(`[kg] KG_SIDECAR_URL set to ${SIDECAR_URL}`);
 
-    if (!isRemoteKgStore(childEnv) && checkDegraded(this._kgDir)) {
+    if (!isRemoteKgStore(childEnv, this._kgDir) && checkDegraded(this._kgDir)) {
       console.error("[kg] WARNING: embeddings missing — hybrid search is lexical-only");
       process.env.KG_EMBEDDINGS_DEGRADED = "1";
     }
@@ -214,12 +228,19 @@ export class KgSidecar {
   private _resolveChildEnv(): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env };
 
-    if (isRemoteKgStore(env)) {
+    if (isRemoteKgStore(env, this._kgDir)) {
+      try { Object.assign(env, stardogChildEnv(), { KG_BACKEND: "stardog_run" }); }
+      catch { /* Database unavailable: retain the legacy environment fallback. */ }
       delete env.KG_DATA_DIR;
       delete env.KG_PARTS_DIR;
       console.error("[kg] serving remote store stardog_run");
       return env;
     }
+
+    for (const key of Object.keys(env)) {
+      if (key.startsWith("KG_STARDOG_")) delete env[key];
+    }
+    if (env.KG_BACKEND === "stardog_run") delete env.KG_BACKEND;
 
     if (existsSync(this._runtimeDataDir)) {
       const markerPath = join(this._runtimeDataDir, COMPLETION_MARKER);

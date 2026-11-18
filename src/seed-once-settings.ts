@@ -7,6 +7,7 @@
  * which many tests mock in part; neither of those modules loads the other.
  */
 
+import { KG_GRAPH_SOURCE_SETTING_KEY, KG_NAMESPACE_SETTING_KEY, setStardogValues, STARDOG_RUN_TOKEN_REF } from "./kg-graph-source.js";
 import { getDb } from "./dedup.js";
 import {
   KG_BASE_REPO_KEY,
@@ -34,6 +35,13 @@ const trimmed = (raw: string | undefined): string | null => raw?.trim() || null;
 
 /** In the order `main()` seeds them. */
 export const SEED_ONCE_SETTINGS: readonly SeedOnceSetting[] = [
+  { variable: "KG_BACKEND", key: KG_GRAPH_SOURCE_SETTING_KEY, page: "/admin#kg-pipelines", seedValue: (raw) => raw === "stardog_run" ? raw : null },
+  ...[
+    ["KG_STARDOG_DB", "kg_stardog_db"],
+    ["KG_STARDOG_RUN_ENDPOINT", "kg_stardog_run_endpoint"],
+    ["KG_STARDOG_RUN_CONSOLE", "kg_stardog_run_console"],
+    ["KG_NAMESPACE", KG_NAMESPACE_SETTING_KEY],
+  ].map(([variable, key]) => ({ variable, key, page: "/admin#kg-pipelines", seedValue: trimmed })),
   { variable: "KG_BASE_REPO", key: KG_BASE_REPO_KEY, page: "/admin#settings", seedValue: trimmed },
   {
     variable: "KG_MATERIALIZE_DIRECT",
@@ -65,6 +73,16 @@ export const SEED_ONCE_SETTINGS: readonly SeedOnceSetting[] = [
 /** Writes each `SEED_ONCE_SETTINGS` row from `env` where none exists yet. Call once at boot, after `initSettingsTable()`. */
 export function seedSettingsFromEnv(env: Readonly<Record<string, string | undefined>> = process.env): void {
   const db = getDb();
+  if (env.KG_STARDOG_RUN_TOKEN &&
+      !db.prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(STARDOG_RUN_TOKEN_REF)) {
+    try {
+      setStardogValues({ token: env.KG_STARDOG_RUN_TOKEN });
+    } catch {
+      // Keep boot available and leave the row absent so the next boot can retry.
+      // Never log the token or exception text from the secret-storage boundary.
+      console.warn("[settings] KG_STARDOG_RUN_TOKEN could not be stored; check RUNNER_TOKEN_SECRET and retry at next boot");
+    }
+  }
   for (const setting of SEED_ONCE_SETTINGS) {
     const seed = setting.seedValue(env[setting.variable]);
     if (seed === null) continue;
