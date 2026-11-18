@@ -1,4 +1,3 @@
-import { runCheckSetup } from "../../check-setup.js";
 import { countFailingCore, runSetupChecks } from "../../setup-checks/index.js";
 import { generateKeyPairSync } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -107,73 +106,36 @@ describe("env.runner-mode", () => {
 
 
 describe("kg.remote-store", () => {
-  const complete = {
-    KG_BACKEND: "stardog_run",
-    KG_STARDOG_RUN_TOKEN: "stardog-token-sentinel",
-    KG_STARDOG_DB: "graph",
-    KG_NAMESPACE: "https://example.com/graph",
-  };
-  const fix = "Set the listed variables in the orchestrator environment and restart.";
+  async function storedCheck() {
+    vi.stubEnv("RUNNER_TOKEN_SECRET", "test-key");
+    const f = await testDb({ modules: {
+      kg: () => import("../../kg-graph-source.js"),
+      checks: () => import("../../setup-checks/orchestrator-config.js"),
+    } });
+    f.modules.kg.setKgGraphSource("stardog_run");
+    const check = f.modules.checks.ORCHESTRATOR_CONFIG_CHECKS.find((c) => c.id === "kg.remote-store")!;
+    return { ...f.modules, check };
+  }
 
-  it.each([undefined, "", "local", "STARDOG_RUN"])("does not apply for backend %j", async (backend) => {
-    expect(await run("kg.remote-store", { env: { KG_BACKEND: backend } })).toEqual([{
-      state: "not-applicable", detail: "The knowledge graph is served from the local sidecar store",
-    }]);
+  it("reads stored values without ambient credentials and never exposes the token", async () => {
+    const { kg, check } = await storedCheck();
+    kg.setStardogValues({ db: "graph", namespace: "https://kg.example/", token: "token-sentinel" });
+    const result = await check.run(makeSetupCheckContext({ env: {} }));
+    expect(result).toEqual([{ state: "pass", detail: "The Stardog store values are set" }]);
+    expect(JSON.stringify(result)).not.toContain("token-sentinel");
+    kg.setKgGraphSource("sidecar");
+    expect(await check.run(makeSetupCheckContext({ env: { KG_BACKEND: "stardog_run" } })))
+      .toMatchObject([{ state: "not-applicable" }]);
   });
 
-  it("passes with required values and no optional values", async () => {
-    expect(await run("kg.remote-store", { env: complete })).toEqual([{
-      state: "pass", detail: "The Stardog store values are set",
-    }]);
-  });
-
-  it.each(["KG_STARDOG_RUN_TOKEN", "KG_STARDOG_DB", "KG_NAMESPACE"])("names missing or empty %s", async (name) => {
-    for (const value of [undefined, ""]) {
-      expect(await run("kg.remote-store", { env: { ...complete, [name]: value } })).toEqual([{
-        state: "fail", detail: `Missing: ${name}`, fix,
-      }]);
-    }
-  });
-
-  it("names multiple missing values in stable order", async () => {
-    expect(await run("kg.remote-store", { env: { KG_BACKEND: "stardog_run" } })).toEqual([{
-      state: "fail", detail: "Missing: KG_STARDOG_RUN_TOKEN, KG_STARDOG_DB, KG_NAMESPACE", fix,
-    }]);
-  });
-
-  it.each([complete, { ...complete, KG_STARDOG_DB: "" }])("reads only the supplied environment and never exposes the token (%j)", async (env) => {
-    const ctx = new Proxy(makeSetupCheckContext({ env }), {
-      get(target, key, receiver) {
-        if (key !== "env") throw new Error(`Unexpected context read: ${String(key)}`);
-        return Reflect.get(target, key, receiver);
-      },
-    });
-    const check = ORCHESTRATOR_CONFIG_CHECKS.find((c) => c.id === "kg.remote-store")!;
-    const result = await runSetupChecks(ctx, [check]);
-    expect(result.results[0].state).toBe(env.KG_STARDOG_DB ? "pass" : "fail");
-    expect(JSON.stringify(result)).not.toContain(complete.KG_STARDOG_RUN_TOKEN);
-  });
-
-  it("keeps a feature failure out of the core count and exits the setup command successfully", async () => {
-    const check = ORCHESTRATOR_CONFIG_CHECKS.find((c) => c.id === "kg.remote-store")!;
-    const ctx = makeSetupCheckContext({ env: { KG_BACKEND: "stardog_run" } });
-    const result = await runSetupChecks(ctx, [check]);
-    expect(result.results).toMatchObject([{
-      id: "kg.remote-store", title: "KG remote store values", group: "orchestrator",
-      tier: "feature", onAdminPath: false, state: "fail",
-    }]);
+  it("ignores ambient credentials and retains feature-tier classification", async () => {
+    const { check } = await storedCheck();
+    const result = await runSetupChecks(makeSetupCheckContext({ env: {
+      KG_BACKEND: "stardog_run", KG_STARDOG_DB: "ambient", KG_NAMESPACE: "https://ambient/", KG_STARDOG_RUN_TOKEN: "ambient-token",
+    } }), [check]);
+    expect(result.results).toMatchObject([{ tier: "feature", state: "fail",
+      detail: "Missing: KG_STARDOG_RUN_TOKEN, KG_STARDOG_DB, KG_NAMESPACE" }]);
     expect(countFailingCore(result)).toBe(0);
-    expect(await runCheckSetup([], {
-      checks: [check],
-      useReadOnlyDb: () => {},
-      configureTrackers: () => {},
-      createContext: () => ctx,
-      refreshRunnerBackend: async () => {},
-      fetch: async () => { throw new Error("orchestrator offline"); },
-      port: 8080,
-      writeStdout: () => {},
-      writeStderr: () => {},
-    })).toBe(0);
   });
 });
 

@@ -54,11 +54,11 @@ COPY workflows/ ./workflows/
 #   docker build --build-arg KG_SOURCE_REPO=owner/repo --secret id=kg_token,env=GH_TOKEN .
 #   fly deploy --remote-only --build-secret kg_token="$(gh auth token)"
 #
-# To build WITHOUT the sidecar (sidecar-less / /mcp without kg_* tools):
+# To build base code for Stardog (inactive until stored credentials exist):
 #   docker build .
 #   fly deploy --remote-only
 #
-# When KG_SOURCE_REPO is unset the build succeeds and logs "building without a knowledge graph".
+# When KG_SOURCE_REPO is unset the public base code is baked without graph data.
 # When the secret is absent the build succeeds and logs "sidecar-less build".
 # All other routes remain healthy; /mcp serves without the kg_* tools.
 #
@@ -69,13 +69,20 @@ COPY workflows/ ./workflows/
 # which exports KG_EMBEDDINGS_DEGRADED=1 and surfaces the fact via GET / and the
 # deploy notification. The || true copy guards below are exempt: they are part of
 # the deliberate sidecar-less mode, not unexpected failures.
+ARG KG_BASE_REPO=BuildDownAI/bd-knowledge-graph-base
+ADD https://codeload.github.com/${KG_BASE_REPO}/tar.gz/refs/heads/main /tmp/kg-base.tgz
 ARG KG_SOURCE_REPO
 ENV KG_SOURCE_REPO=$KG_SOURCE_REPO
 COPY kg/ /app/kg/
 RUN --mount=type=secret,id=kg_token,required=false \
     if [ -z "$KG_SOURCE_REPO" ]; then \
-        echo "[kg] KG_SOURCE_REPO not set — building without a knowledge graph; set it to serve one"; \
-        exit 0; \
+        mkdir -p /tmp/kg-base \
+        && tar -xzf /tmp/kg-base.tgz -C /tmp/kg-base --strip-components=1 \
+        && cp -r /tmp/kg-base/kg_query /tmp/kg-base/kg_ingest /tmp/kg-base/requirements.txt /app/kg/ \
+        && python3 -c 'import sys,tarfile;print(tarfile.open(sys.argv[1]).pax_headers["comment"])' /tmp/kg-base.tgz > /app/kg/.base-commit \
+        && touch /app/kg/.base-only \
+        && rm -rf /tmp/kg-base /tmp/kg-base.tgz; \
+        exit $?; \
     fi \
     && kg_owner="${KG_SOURCE_REPO%%/*}" \
     && kg_repo="${KG_SOURCE_REPO#*/}" \
@@ -100,11 +107,14 @@ RUN --mount=type=secret,id=kg_token,required=false \
         && for f in requirements.txt sources.yml; do \
                [ -f /tmp/kg-src/$f ] && cp /tmp/kg-src/$f /app/kg/ || true; \
            done \
-        && printf '#!/bin/sh\ncd "$(dirname "$0")"\nexport KG_HTTP=1 KG_HTTP_PORT=8765 KG_HTTP_HOST=127.0.0.1 KG_BACKEND="${KG_BACKEND:-rdflib}" PYTHONPATH=. FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache\nexec .venv/bin/python -m kg_query.server\n' > /app/kg/start.sh \
-        && chmod +x /app/kg/start.sh \
         && rm -rf /tmp/kg-src; \
     else \
         echo "[kg] sidecar-less build — kg_token secret absent or empty, /mcp will serve without kg_* tools"; \
+    fi
+RUN rm -f /tmp/kg-base.tgz
+RUN if [ -d /app/kg/kg_query ]; then \
+        printf '#!/bin/sh\ncd "$(dirname "$0")"\nexport KG_HTTP=1 KG_HTTP_PORT=8765 KG_HTTP_HOST=127.0.0.1 KG_BACKEND="${KG_BACKEND:-rdflib}" PYTHONPATH=. FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache\nexec .venv/bin/python -m kg_query.server\n' > /app/kg/start.sh \
+        && chmod +x /app/kg/start.sh; \
     fi
 RUN if [ -f /app/kg/requirements.txt ]; then \
         echo "[kg] installing Python dependencies into /app/kg/.venv" \
