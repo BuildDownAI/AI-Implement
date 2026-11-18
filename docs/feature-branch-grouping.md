@@ -289,7 +289,20 @@ two, including completed or cancelled children. Each terminal result is given a
 follow-up notice naming the filed child or stating that no child was filed. Incomplete notices name the failed reviewers (or explain
 that no failed reviewer was identified for a failure before review). Once the
 two-child limit is reached, every notice, including an incomplete review, says a
-person must decide further fixes. A notice can still be lost: when the verdict comment update fails after the child is reserved, the callback is acknowledged and the notice is not retried (AII-2011). Existing settings rows
+person must decide further fixes. Callbacks sharing a notice identity serialize
+preparation through delivery, including child creation, so overlapping deliveries
+preserve the child identifier and edit the verdict only once. Before reading or
+updating the verdict comment, the callback saves the exact notice
+text, reviewed head, and verdict comment ID in SQLite settings. A failed comment
+read, missing verdict, or failed edit leaves that notice pending and returns 503
+without consuming the callback credential or completing the job. The runner's
+existing bounded result-delivery retries replay the saved notice without filing
+another child or regenerating its wording. A delivery receipt prevents later
+callbacks for the same complete head/verdict from posting it again; a comment
+read also detects an edit that succeeded remotely before its response was lost.
+Pending records survive restarts, but there is no independent scheduled drain:
+after the sender exhausts its retry budget, recovery needs another authenticated
+callback delivery while its credential is valid. Existing settings rows
 reserve creation attempts atomically, including ambiguous tracker failures (which
 require a person to check the tracker); no new table is used. Tracker enumeration
 must finish successfully before filing, so an unreadable page cannot reset the cap.
