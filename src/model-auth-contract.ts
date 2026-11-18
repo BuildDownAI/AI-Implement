@@ -1011,8 +1011,10 @@ export function parseModelAuthContext(raw: unknown): ValidationResult<ModelAuthC
 
 /**
  * Operator-approved execution policy (AII-1437). The only authority source for Codex implementation full access:
- * a versioned, dispatcher-authored value that travels in the protected credential namespace beside the model-auth
- * context and must match it. Never part of `agentConfig`, repository config, the generic run_config or diagnostics.
+ * a versioned, dispatcher-authored value that travels in the protected credential namespace.
+ * A `gha` policy must match `modelAuthContext`. A `fly` policy requires a sealed Fly `modelAuthGrant`
+ * with the same `dispatchId` and no `modelAuthContext`; the runner checks `projectKey` after it opens the grant.
+ * Never part of `agentConfig`, repository config, the generic run_config or diagnostics.
  * Configured Codex implementation defaults to this policy on GHA. The v2 workflow proves the actual
  * runner.environment is github-hosted before projection; executor non-root/socket admission still applies.
  */
@@ -1031,7 +1033,7 @@ export interface ExecutionPolicyV1 {
   readonly implementationSandbox: typeof EPHEMERAL_FULL_ACCESS_POLICY;
   readonly dispatchId: string;
   readonly projectKey: string;
-  readonly backend: "gha";
+  readonly backend: "gha" | "fly";
   readonly ephemeralRunnerAsserted: true;
 }
 
@@ -1052,14 +1054,14 @@ export function parseExecutionPolicy(raw: unknown): ValidationResult<ExecutionPo
   if (!dispatchId.ok) return dispatchId;
   const projectKey = validateIdString(obj.value.projectKey, "execution policy projectKey");
   if (!projectKey.ok) return projectKey;
-  if (obj.value.backend !== "gha") return err("execution policy backend must be gha");
+  if (obj.value.backend !== "gha" && obj.value.backend !== "fly") return err("execution policy backend must be gha or fly");
   if (obj.value.ephemeralRunnerAsserted !== true) return err("execution policy requires an ephemeral runner assertion");
   return ok({
     version: 1,
     implementationSandbox: EPHEMERAL_FULL_ACCESS_POLICY,
     dispatchId: dispatchId.value,
     projectKey: projectKey.value,
-    backend: "gha",
+    backend: obj.value.backend,
     ephemeralRunnerAsserted: true,
   });
 }

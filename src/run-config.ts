@@ -210,7 +210,12 @@ export interface RunCredentialsV1 {
   modelAuthGrant?: ModelAuthGrantBootstrapV1 | SealedModelAuthBootstrapV1;
   /** Dispatcher-authored GHA launch context (AII-1427), independent of the grant. Protected-only. */
   modelAuthContext?: ModelAuthContextV1;
-  /** Operator-approved ephemeral full-access policy (AII-1437). Protected-only; must match `modelAuthContext`. */
+  /**
+   * Operator-approved ephemeral full-access policy (AII-1437). Protected-only.
+   * A `gha` policy must match `modelAuthContext`. A `fly` policy requires a sealed Fly
+   * `modelAuthGrant` with the same `dispatchId` and no `modelAuthContext`; the runner
+   * checks `projectKey` after it opens the grant.
+   */
   executionPolicy?: ExecutionPolicyV1;
 }
 
@@ -388,10 +393,19 @@ export function validateRunCredentials(value: unknown): RunCredentialsV1 {
     const parsed = parseExecutionPolicy(value.executionPolicy);
     if (!parsed.ok) credentialsFail(".executionPolicy", "is invalid");
     const ctx = out.modelAuthContext;
-    // The policy is bound to the trusted launch context: no context, or a different dispatch/project, is refused.
-    if (!ctx || ctx.dispatchId !== parsed.value.dispatchId || ctx.projectKey !== parsed.value.projectKey
-        || ctx.backend !== parsed.value.backend) {
-      credentialsFail(".executionPolicy", "does not match the launch context");
+    const policy = parsed.value;
+    if (policy.backend === "gha") {
+      if (!ctx || ctx.dispatchId !== policy.dispatchId || ctx.projectKey !== policy.projectKey
+          || ctx.backend !== policy.backend) {
+        credentialsFail(".executionPolicy", "does not match the launch context");
+      }
+    } else {
+      const grant = out.modelAuthGrant;
+      // The sealed wrapper binds dispatch/backend; project binding is checked after opening it.
+      if (ctx || !grant || !("algorithm" in grant) || grant.backend !== "fly"
+          || grant.dispatchId !== policy.dispatchId) {
+        credentialsFail(".executionPolicy", "does not match the sealed launch grant");
+      }
     }
     out.executionPolicy = parsed.value;
   }

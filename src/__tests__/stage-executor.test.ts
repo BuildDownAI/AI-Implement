@@ -223,6 +223,18 @@ describe("Claude selected env isolation", () => {
     });
   }
 
+  it("keeps Claude argv unchanged with the implementation policy", async () => {
+    const argv: unknown[] = [];
+    for (const implementationFullAccess of [undefined, true] as const) {
+      const spawnMock = claudeSpawn(0);
+      const claude = new ClaudeCliExecutor("/tmp", "summary", true, spawnMock as unknown as typeof spawn);
+      const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(), createClaude: () => claude, implementationFullAccess });
+      await ex.invoke({ ...base, agentStage: "implementation" });
+      argv.push((spawnMock.mock.calls[0] as unknown as [string, string[]])[1]);
+    }
+    expect(argv[1]).toEqual(argv[0]);
+  });
+
   it("spawns with the selected env only, checkpoints before returning, and leaves process.env untouched", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.stubEnv("ANTHROPIC_API_KEY", "ambient-key-must-not-leak");
