@@ -39,10 +39,21 @@ Review each difference and record the action or the reason to accept it:
 | Group | Action before the upgrade |
 |---|---|
 | GraphQL-only name | Treat the name as stale. The new build will not see it at launch. If it is no longer needed, remove it with the script's suggested `fly secrets unset <name> -a <sessions app>` command. If it is still needed, set it through the project's Secrets panel at `/admin` and compare again to confirm that the Machines API holds it. |
-| Machines-API-only project name | Confirm the team prefix and the project that must receive it. Keep it if that project needs it. Otherwise, remove it through the project's Secrets panel before you upgrade. The new build will see it at launch. |
-| Machines-API-only global name | Decide if every session machine may receive it. In process-level mode, a global name passes to every implementation, planning and gap-fill machine. If that access is intended, record and accept the difference. Otherwise, remove the global name with `fly secrets unset <name> -a <sessions app>`. If one project needs it, set a project secret instead and compare again. |
+| Machines-API-only project name | Confirm the team prefix and the project that must receive it. Keep it if that project needs it. Otherwise, remove it directly through the Machines API with the command below, then compare again to confirm it is absent before you upgrade. The new build will see any name left in this store at launch. |
+| Machines-API-only global name | Decide if every session machine may receive it. In process-level mode, a global name passes to every implementation, planning and gap-fill machine. If that access is intended, record and accept the difference. Otherwise, remove the global name directly through the Machines API with the command below, then compare again to confirm it is absent before you upgrade. If one project needs it, set a project secret instead and compare again. |
 | Protection key | Take no action. Ordinary launch skips this key. Do not remove or replace it to make the lists match. |
 | Name in both lists with different digests | Confirm which stored version is intended with the secret owner. After the upgrade, launch uses the Machines API store. Resolve the difference or record why you accept it. |
+
+To remove an unwanted Machines-API-only name, replace `<sessions app>` and `<name>` with the app and exact secret name reported by the comparison. This uses the same DELETE endpoint as `unsetAppSecret` in `src/fly-machines.ts`; it works before the upgrade, when the Secrets panel still lists names through GraphQL. Never use it for the protection key.
+
+```bash
+curl --fail --silent --show-error --output /dev/null \
+  --request DELETE \
+  --header "Authorization: Bearer ${FLY_SESSIONS_TOKEN}" \
+  'https://api.machines.dev/v1/apps/<sessions app>/secrets/<name>'
+```
+
+Run the comparison again for that app with the same `--prefixes`. Confirm the removed name is absent from the Machines API list before upgrading; review any remaining differences as above. A successful DELETE alone is not the verification.
 
 On 2026-11-13, `ai-implement-testing-sessions` was compared. Its only REST-only (Machines-API-only) name was the protection key. This observation does not replace a comparison of your deployment.
 
