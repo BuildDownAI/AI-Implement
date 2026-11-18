@@ -55,6 +55,21 @@ describe("backfillLinksFromJobRows", () => {
     expect(log).toHaveBeenCalledExactlyOnceWith("Backfilled 1 pull request links from job rows");
   });
 
+  it("keeps the backfill source when a later job setter reports the same pull request", async () => {
+    const f = await fixture();
+    const log = await import("../log.js");
+    f.seed();
+    const { id } = f.modules.dedup.getDb().prepare("SELECT id FROM dispatch_log").get() as { id: number };
+
+    expect(f.modules.links.listLinksByOutcome("open")).toEqual([
+      expect.objectContaining({ repository: "owner/repo", number: 12, source: "backfill" }),
+    ]);
+
+    log.updateJobPrUrl(id, "https://github.com/owner/repo/pull/12");
+
+    expect(f.modules.links.findLinkByPr("owner/repo", 12)?.source).toBe("backfill");
+  });
+
   it("skips invalid URLs and unresolved mappings and uses recorded tracker kind before mapping kind", async () => {
     const f = await fixture();
     for (const prUrl of [null, "https://github.com/o/r/actions/runs/1", "http://github.com/o/r/pull/1",

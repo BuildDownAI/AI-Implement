@@ -81,6 +81,7 @@ it("keeps a link with a null identifier tracked", async () => {
     .toMatchObject({ tracked: true, teamKey: "APP", issue: null, lastJob: null, pr: { role: "implementation" } });
 });
 it("does not recover identity from surviving jobs or grouping branches", async () => {
+  links.listLinksByOutcome("open");
   job({ pr_url: pull().url, completed_at: 90 });
   job({ pr_url: pull(12).url, completed_at: 91 });
   const entry = (await api.listOpenPulls({
