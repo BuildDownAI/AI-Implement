@@ -602,11 +602,12 @@ describe("ImplementationRun gap-fill ingress", () => {
   it("no mapping skips", async () => {
     await checkNoSubmit(makeBaseDrainOpts(), seedItem(), "skipped");
   });
-  it("unreadable PR without a dispatch stays pending without a reply", async () => {
+  it("unreadable PR without a dispatch fails and replies", async () => {
     prLookup(42, githubError(404, "Not Found"));
     const opts = optsFor();
-    await checkNoSubmit(opts, seedItem(), "pending");
-    expect(opts.postComment).not.toHaveBeenCalled();
+    await checkNoSubmit(opts, seedItem(), "failed");
+    expect(opts.postComment).toHaveBeenCalledExactlyOnceWith("gh-token", "acme", "billing", 42,
+      "AI-Implement could not read this PR from GitHub just now. Please try again in a moment.");
   });
   it("readable PR without an identity fails and replies", async () => {
     prLookup(42, openPrWithHead("unrelated"));
@@ -862,18 +863,41 @@ it.each(["none", "parked", "running"] as const)("token refresh failure preserves
   expect(opts.postTrackerComment).not.toHaveBeenCalled();
 });
 
-it.each([false, true])("failed PR read preserves the entire row (dispatch: %s)", async hasDispatch => {
-  if (hasDispatch) seedOrigin();
-  const id = seedItem();
-  const opts = optsFor();
-  const before = queue.getCommentGapfillItem(id);
-  for (const reply of [githubError(503, "Unavailable"), (() => { throw new Error("network failure"); })] satisfies Reply[]) {
+describe.each(["null", "throw"] as const)("failed PR read (%s)", failure => {
+  it.each(["none", "completed", "running", "parked"] as const)("preserves legacy handling with %s dispatch", async dispatchState => {
+    if (dispatchState !== "none") seedOrigin(dispatchState === "running" ? "running" : "completed");
+    if (dispatchState === "parked") breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    const id = dispatchState === "parked"
+      ? queue.enqueueConflictResolution({ owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/aii-1554" })
+      : seedItem();
+    const opts = optsFor();
+    const before = queue.getCommentGapfillItem(id);
+    const reply: Reply = failure === "null"
+      ? githubError(503, "Unavailable")
+      : () => { throw new Error("network failure"); };
     const http = prLookup(42, reply);
-    await checkNoSubmit(opts, id, "pending");
-    expect(queue.getCommentGapfillItem(id)).toEqual(before);
+
+    await drain.drainCommentGapfillQueue(opts);
+
     expect(http.calls).toHaveLength(1);
-  }
-  expect(opts.postComment).not.toHaveBeenCalled();
+    if (dispatchState === "none") {
+      expect(queue.getCommentGapfillItem(id)?.status).toBe("failed");
+      expect(opts.postComment).toHaveBeenCalledExactlyOnceWith("gh-token", "acme", "billing", 42,
+        "AI-Implement could not read this PR from GitHub just now. Please try again in a moment.");
+      expect(submit).not.toHaveBeenCalled();
+    } else if (dispatchState === "completed") {
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(queue.getCommentGapfillItem(id)?.status).toBe("dispatched");
+      expect(opts.postComment).not.toHaveBeenCalled();
+    } else if (dispatchState === "parked") {
+      expect(queue.getCommentGapfillItem(id)).toMatchObject({ status: "pending", refusalCount: 1, lastRefusalReason: "parked" });
+      expect(submit).not.toHaveBeenCalled();
+    } else {
+      expect(queue.getCommentGapfillItem(id)).toEqual(before);
+      expect(submit).not.toHaveBeenCalled();
+      expect(opts.postComment).not.toHaveBeenCalled();
+    }
+  });
 });
 
 it("open in-flight PR preserves the entire row and reads once", async () => {

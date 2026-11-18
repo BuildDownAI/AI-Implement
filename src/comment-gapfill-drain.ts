@@ -328,16 +328,19 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 
       // Share one read between terminal-state detection and branch identity recovery.
       let ghToken: string;
-      let pr: Awaited<ReturnType<typeof getPullRequestState>>;
       try {
         ghToken = await opts.getInstallationToken(item.owner);
-        pr = await getPullRequestState(ghToken, item.owner, item.repo, item.prNumber);
       } catch (err) {
         console.warn(`[comment-gapfill] could not read PR #${item.prNumber} in ${fullRepo}:`, err);
         continue;
       }
-      if (!pr) continue;
-      if (pr.merged || pr.state === "closed") {
+      let pr: Awaited<ReturnType<typeof getPullRequestState>> = null;
+      try {
+        pr = await getPullRequestState(ghToken, item.owner, item.repo, item.prNumber);
+      } catch (err) {
+        console.warn(`[comment-gapfill] could not read PR #${item.prNumber} in ${fullRepo}:`, err);
+      }
+      if (pr && (pr.merged || pr.state === "closed")) {
         const reason = pr.merged ? "pr_merged" : "pr_closed";
         getDb().prepare(`UPDATE comment_gapfill_queue SET status = 'skipped',
           last_refusal_reason = ?, processed_at = MAX(?, COALESCE(processed_at + 1, 0))
@@ -348,6 +351,14 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 
       let prLog = getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
       if (!prLog) {
+        if (!pr) {
+          await opts.postComment(
+            ghToken, item.owner, item.repo, item.prNumber,
+            "AI-Implement could not read this PR from GitHub just now. Please try again in a moment.",
+          );
+          markCommentGapfillProcessed(item.id, "failed");
+          continue;
+        }
         const headRef = pr.headRef;
         // Roll-up fallback: the top-of-tree feature→base PR is opened by merge-up, not
         // by a dispatch, so it has no row of its own — but its head branch encodes the

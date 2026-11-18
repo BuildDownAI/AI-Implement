@@ -10,7 +10,9 @@ flowchart TD
   Q --> D[drain]
   D --> S{Read PR state once}
   S -->|merged or closed| T[item skipped with reason]
-  S -->|read failed| P
+  S -->|read failed| F{Dispatch row exists?}
+  F -->|yes| G
+  F -->|no| R2
   S -->|open| L{PR lookup}
   L -->|row found| G{canDispatch}
   L -->|no row| R2[reply, item failed]
@@ -44,7 +46,7 @@ The probe and the permission check each retry once with no sleep (GitHub's deliv
 
 ## Drain and PR lookup
 
-For each claimed item with a repository mapping, the drain reads `getPullRequestState` before admission gates. Merged PRs immediately become `skipped` with `last_refusal_reason = pr_merged`; closed, unmerged PRs use `pr_closed`. This emits one terminal log line, consumes no refusal count, and posts no reply or budget notice. Subsequent ticks do not read the skipped row. A token acquisition failure or a null or thrown PR read leaves the entire row unchanged for retry.
+For each claimed item with a repository mapping, the drain reads `getPullRequestState` before admission gates. Merged PRs immediately become `skipped` with `last_refusal_reason = pr_merged`; closed, unmerged PRs use `pr_closed`. This emits one terminal log line, consumes no refusal count, and posts no reply or budget notice. Subsequent ticks do not read the skipped row. A token acquisition failure leaves the entire row unchanged for retry. A null or thrown PR read continues to the dispatch gates when the PR has a dispatch row. Without a dispatch row, it posts the existing unreadable-PR reply and marks the item `failed`. Each item reads the PR at most once per tick.
 
 For an open PR, the drain resolves its dispatch row in this order:
 
@@ -77,7 +79,9 @@ When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left 
 | Condition | Reply | Item |
 |---|---|---|
 | PR merged or closed | no reply (one log line) | `skipped`, reason `pr_merged` or `pr_closed` |
-| PR token acquisition fails or PR cannot be read (null or throw) | no reply; retry next tick | unchanged |
+| PR token acquisition fails | no reply; retry next tick | unchanged |
+| PR cannot be read (null or throw), dispatch row exists | continue to the existing dispatch gates | normal admission handling |
+| PR cannot be read (null or throw), no dispatch row | "AI-Implement could not read this PR from GitHub just now. Please try again in a moment." | `failed` |
 | No dispatch row, no roll-up parent, no in-flight match; comment from a person | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
 | Same, but the commenter is `ROLLUP_REVIEW_COMMENTER` | no reply (one log line) | `skipped` |
 | PR dispatch budget reached | budget park message (once per park, also when the dispatch breaker parked the PR first) | `pending` |
