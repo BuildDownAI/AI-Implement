@@ -9,7 +9,7 @@ import { getDb } from "../dedup.js";
 import { LINEAR_PICKUP_LABEL_KEY } from "../orchestrator-settings.js";
 import { FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, RUNNER_MODE_SETTING_KEY } from "../runner-mode.js";
 import { SEED_ONCE_SETTINGS } from "../seed-once-settings.js";
-import type { SetupCheckContext } from "./contract.js";
+import type { GitHubSetupFacts, SetupCheckContext } from "./contract.js";
 
 // The setup checks' time in this module. The recheck hold is in index.ts, the ingress bounds in src/restate/setup-checks.ts, the Setup page's polls in its own module.
 /** The least time between two runs of one kind, so a burst of saves is checked once it settles, and the last save is always checked. */
@@ -58,6 +58,47 @@ export function readSavedSetup(ctx: SetupCheckContext): SavedSetup {
     allChecks: JSON.stringify([ctx.runnerMode().mode, ctx.readSetting(LINEAR_PICKUP_LABEL_KEY)]),
   };
 }
+
+/** A context reader's place in the saved setup: read by readSavedSetup, or left out for the reason given. */
+type SavedSetupReader = "saved" | { leftOut: string };
+
+/**
+ * Every reader a check can call, and its place in the saved setup, so a reader added to the context does not compile until it is placed.
+ * A reader is placed whole: which settings rows readSetting covers is SAVED_SETUP_SETTINGS and the pickup label.
+ */
+export const SAVED_SETUP_READERS: { [K in Exclude<keyof SetupCheckContext, "githubSetupFacts">]: SavedSetupReader } & {
+  githubSetupFacts: Record<keyof GitHubSetupFacts, SavedSetupReader>;
+} = {
+  env: { leftOut: "A variable changes only with a restart, and boot runs the checks." },
+  readSetting: "saved",
+  orchestratorDefaults: "saved",
+  projectStageConfig: "saved",
+  runnerMode: "saved",
+  flySessions: "saved",
+  runnerBackendSource: "saved",
+  mappings: "saved",
+  storedAccessEntries: { leftOut: "A check reads only whether the saved list holds entries, which effectiveAllowlist's source says." },
+  effectiveAllowlist: "saved",
+  allowlistReadAvailable: "saved",
+  restateStatus: { leftOut: "The process's own state, not a save." },
+  databasePath: { leftOut: "Resolved once per process, from a variable." },
+  onSeparateFilesystem: { leftOut: "The machine's mounts, not a save." },
+  trackerProvider: { leftOut: "Built from the variables and the mappings, which are placed already." },
+  trackerSetupFacts: { leftOut: "Read from the ticketing system, where no save here changes it." },
+  orchestratorHealthAt: { leftOut: "A network read, which no save changes." },
+  orchestratorInstanceId: { leftOut: "Fixed for the process's life." },
+  githubSetupFacts: {
+    app: { leftOut: "Read from GitHub, where no save here changes it." },
+    installation: { leftOut: "Read from GitHub, where no save here changes it." },
+    installationRepositories: { leftOut: "Read from GitHub, where no save here changes it." },
+    repositories: { leftOut: "Read from GitHub, where no save here changes it." },
+    publicRepository: { leftOut: "Read from GitHub, where no save here changes it." },
+    deliveries: { leftOut: "Read from GitHub, where no save here changes it." },
+    kgSourceRepo: { leftOut: "Set by KG_SOURCE_REPO, a variable." },
+    kgPreflight: { leftOut: "Read from GitHub, where no save here changes it." },
+    workflowSync: "saved",
+  },
+};
 
 /** The runs a change from one saved setup to the next needs. */
 export function runsForSavedChange(before: SavedSetup, after: SavedSetup): SetupCheckRunKind[] {

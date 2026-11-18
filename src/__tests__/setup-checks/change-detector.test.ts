@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type * as ChangeDetectorModule from "../../setup-checks/change-detector.js";
-import type { SetupCheckContext } from "../../setup-checks/index.js";
+import type { GitHubSetupFacts, SetupCheckContext } from "../../setup-checks/index.js";
 import type { SetupCheckRunKind } from "../../setup-checks/change-detector.js";
 import { makeAccessEntry, makeMapping } from "../helpers/builders.js";
 import { makeGitHubSetupFacts, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
@@ -96,6 +96,23 @@ describe("the saved setup", () => {
     await checks.runSetupChecks(ctx);
     expect(read.size).toBeGreaterThan(0);
     expect([...read].filter((key) => !detection.SAVED_SETUP_SETTINGS.includes(key))).toEqual([]);
+  });
+
+  // The type makes every reader placed; this holds each placement to what readSavedSetup does, a GitHub read named as githubSetupFacts.<read>.
+  it("reads exactly the context readers placed in the saved setup", () => {
+    const read = new Set<string>();
+    const recording = <T extends object>(target: T, prefix: string): T => new Proxy(target, {
+      get(on, name, receiver) {
+        const value = Reflect.get(on, name, receiver);
+        if (typeof name !== "string") return value;
+        if (name !== "githubSetupFacts") read.add(prefix + name);
+        return name === "githubSetupFacts" ? () => recording((value as () => GitHubSetupFacts)(), "githubSetupFacts.") : value;
+      },
+    });
+    detection.readSavedSetup(recording(makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping() }) }), ""));
+    const { githubSetupFacts, ...readers } = detection.SAVED_SETUP_READERS;
+    const placed = [...Object.entries(readers), ...Object.entries(githubSetupFacts).map(([name, place]) => [`githubSetupFacts.${name}`, place] as const)];
+    expect([...read].sort()).toEqual(placed.filter(([, place]) => place === "saved").map(([name]) => name).sort());
   });
 });
 
