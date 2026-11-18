@@ -1,3 +1,10 @@
+import { listParked, unpark } from "../dispatch-breaker.js";
+import { resolveDefaultRunnerImage } from "../repo-image.js";
+import { STAGE_NAMES } from "../agent-config.js";
+import { createAgentConfigAdminDeps } from "../model-auth-runtime.js";
+import { importEnvironmentCredential } from "../model-account-cli.js";
+import { createModelProtectedSecrets } from "../model-protected-secrets.js";
+import { modelPrices } from "./model-prices.js";
 // The tools service skeleton (AII-710): a tool() wrapper that attaches a zod input
 // schema, the fixed ToolResponse output shape, and the "mcp.type"/"mcp.role" metadata
 // Restate's admin API surfaces to src/restate/tools-client.ts's discoverTools(). The
@@ -16,10 +23,20 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
-import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
-import { getMappings, type RepoMapping } from "../config.js";
-import { getInFlightJobs, getRunRecordMergeVerdict } from "../log.js";
+import { effectiveAccessCode } from "../admin-session.js";
+import { getRunnerMode, resolveExecutionPath, getFlyProcessLevelSecrets, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
+import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
+import { getLatestIssueIdForIdentifier, getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
+import {
+  classifyFlySecretNames, listAppSecrets, FlyApiError, getMachine, listMachines, fetchMachineLogs, readMachineExit,
+  type Machine,
+} from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import { getOrchestratorDefaults, isProjectConfigured } from "../agent-config-store.js";
+import { summarizeSetupChecks } from "../setup-checks/index.js";
+import { listOpenPulls } from "../open-pulls.js";
+import { listIssueStatuses } from "../issue-statuses.js";
+import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
   listHeldReservations,
   read as readDispatchAdmission,
@@ -28,15 +45,26 @@ import {
 } from "../dispatch-admission.js";
 import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
+import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./retention.js";
 import { getRestateStatus } from "./status.js";
+import { SETUP_CHECKS_KEY, SetupChecks } from "./setup-checks.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
+import type { StepStatus } from "../pipeline/types.js";
+import { FlyMachineProfile } from "./fly-machine-profile.js";
+import { RUN_PROFILE_OBJECTS, isRunProfileBackend, type RunProfileBackend } from "./run-profile.js";
+import { RunnerBackend } from "./runner-backend.js";
+import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
-import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
-import { getIssueReportCard, getFleetReport } from "../report-card.js";
-import { getDeployPosture } from "../deploy-posture.js";
+import { getOrchestratorSettings, getFlySessionsConfig, getRunnerBackendSource, getLinearPickupLabel } from "../orchestrator-settings.js";
+import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
+import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
+import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
+  createModelAccountAction,
+  putProjectAgentConfigAction,
+  setProjectAgentModeAction,
   setRunnerModeAction,
   pauseProjectAction,
   upsertMappingAction,
@@ -49,9 +77,10 @@ import {
 import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
 
 const CallerSchema = z.object({
-  kind: z.enum(["human", "system"]),
+  kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
+  grants: z.array(z.enum(["deploy", "projects", "secrets"])).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -71,6 +100,8 @@ interface ToolOptions<I extends z.ZodType> {
   description: string;
   input: I;
   role: AccessRole;
+  /** Alternate authority, accepted only by tools that explicitly request it. */
+  grant?: "deploy" | "projects" | "secrets";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
@@ -82,7 +113,7 @@ interface ToolOptions<I extends z.ZodType> {
    */
   retryPolicy?: restate.RetryPolicy;
   /** Extra `key=value` text appended to this tool's write-audit line, for a write whose audit must name its target. */
-  auditDetail?: (input: WireInput<I>) => string;
+  auditDetail?: (input: WireInput<I>, response?: ToolResponse) => string;
 }
 
 function wireInputSchema<I extends z.ZodType>(input: I) {
@@ -98,12 +129,17 @@ function wireInputSchema<I extends z.ZodType>(input: I) {
  */
 export type WireInput<I extends z.ZodType> = z.infer<ReturnType<typeof wireInputSchema<I>>>;
 
+/** The audit actor for a caller: its email, `control-plane` for a service caller, else `fallback`. */
+export function auditActor(caller: { email: string | null; kind: string }, fallback: string): string {
+  return caller.email ?? (caller.kind === "service" ? "control-plane" : fallback);
+}
+
 /**
  * Wraps `restate.handlers.handler` with a zod input/output serde and the discovery
  * metadata (`mcp.type`, `mcp.role`) tools-client.ts's discoverTools() reads back. The
  * wire input is `{ caller, args }` — the credential never travels with the request
- * (the ingress journals bodies), only the already-verified `Caller`. A caller whose role
- * doesn't satisfy `role` (equal, or admin) is refused before `handler` runs. A handler
+ * (the ingress journals bodies), only the already-verified `Caller`. A caller must satisfy
+ * `role` (equal, or admin) or hold the explicitly requested grant before `handler` runs. A handler
  * that throws is caught here and returned as an `isError` result rather than rethrown —
  * Restate retries a thrown non-terminal error indefinitely, which would turn a bug or a
  * transient failure into a hanging `tools/call` instead of the error result `/mcp` expects.
@@ -135,12 +171,12 @@ export function tool<I extends z.ZodType>(
     async (ctx: restate.Context, input: WireInput<I>): Promise<ToolResponse> => {
       const name = ctx.request().target.handler;
       const operation = opts.operation ?? (opts.role === "admin" ? "write" : "read");
-      const audit = (result: "forbidden" | "ok" | "error"): void => {
+      const audit = (result: "forbidden" | "ok" | "error", response?: ToolResponse): void => {
         if (operation !== "write") return;
-        const actor = input.caller.email ?? "system";
+        const actor = auditActor(input.caller, "system");
         let detail = "";
         try {
-          detail = opts.auditDetail ? ` ${opts.auditDetail(input)}` : "";
+          detail = opts.auditDetail ? ` ${opts.auditDetail(input, response)}` : "";
         } catch {
           detail = "";
         }
@@ -148,7 +184,7 @@ export function tool<I extends z.ZodType>(
           `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}${detail}`,
         );
       };
-      if (!roleAllows(input.caller.role, opts.role)) {
+      if (!roleAllows(input.caller.role, opts.role) && !(opts.grant && input.caller.grants.includes(opts.grant))) {
         audit("forbidden");
         return {
           isError: true,
@@ -157,7 +193,7 @@ export function tool<I extends z.ZodType>(
       }
       try {
         const result = await handler(ctx, input);
-        audit(result.isError ? "error" : "ok");
+        audit(result.isError ? "error" : "ok", result);
         return result;
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) {
@@ -175,22 +211,36 @@ export function tool<I extends z.ZodType>(
 }
 
 export const GET_TENANT_HEALTH_DESCRIPTION =
-  "Returns an orchestrator health summary: runner mode, in-flight job count, pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.";
+  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, stage agent modes (`stageAgents`: defaultsMode and projects with teamKey and agentMode only, sorted by teamKey; missing defaults or project rows mean legacy; only mapped projects appear), and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
+
+export const GetTenantHealthArgsSchema = z.object({});
 
 export const getTenantHealth = tool(
   {
     description: GET_TENANT_HEALTH_DESCRIPTION,
-    input: z.object({}),
+    input: GetTenantHealthArgsSchema,
     role: "user",
   },
-  async (): Promise<ToolResponse> => {
+  async (ctx): Promise<ToolResponse> => {
     const { mode, source } = getRunnerMode();
     const inFlight = getInFlightJobs();
     const db = getDb();
     const { n: pendingGapfillCount } = db
       .prepare("SELECT COUNT(*) as n FROM comment_gapfill_queue WHERE status = 'pending'")
       .get() as { n: number };
-    const projectCount = Object.keys(getMappings()).length;
+    const { n: awaitingDecisionCount } = db
+      .prepare("SELECT COUNT(*) as n FROM dispatch_log WHERE phase = 'kg-refresh' AND status = 'completed' AND conclusion = 'awaiting_decision'")
+      .get() as { n: number };
+    const projectKeys = Object.keys(getMappings()).sort();
+    const projectCount = projectKeys.length;
+    // Explicit projection: mapping values can contain runner environment secrets.
+    const stageAgents = {
+      defaultsMode: getOrchestratorDefaults()?.config.mode ?? "legacy",
+      projects: projectKeys.map(teamKey => ({
+        teamKey,
+        agentMode: isProjectConfigured(teamKey) ? "configured" : "legacy",
+      })),
+    };
     const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
     const kgRefreshPreflight = kgSourceRepo
       ? await runKgRefreshPreflight({
@@ -200,15 +250,21 @@ export const getTenantHealth = tool(
           kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         })
       : null;
+    const setupChecks = summarizeSetupChecks(await ctx.objectClient(SetupChecks, SETUP_CHECKS_KEY).get());
     const result = {
       runnerMode: { mode, source },
       inFlightJobCount: inFlight.length,
+      awaitingDecisionCount,
       pendingGapfillCount,
       projectCount,
+      stageAgents,
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
       restate: getRestateStatus(),
+      restateRetentionDays: getRestateRetentionDays(),
+      volumeSnapshotRetentionDays: getVolumeSnapshotRetentionDays(),
       kgRefreshPreflight,
+      setupChecks,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -257,19 +313,22 @@ export const listProjects = tool(
       dependencyTokenScope: m.dependencyTokenScope,
       sensitiveAddPatterns: m.sensitiveAddPatterns,
       sensitiveAllowPatterns: m.sensitiveAllowPatterns,
+      machineCpuKind: m.machineCpuKind,
       machineCpus: m.machineCpus,
       machineMemoryMb: m.machineMemoryMb,
       awsRegion: m.awsRegion,
       planningWorkflowFile: m.planningWorkflowFile,
       autoApprovePlans: m.autoApprovePlans,
       reviewers: m.reviewers,
+      trustedReviewAuthors: m.trustedReviewAuthors,
+      reviewProcess: resolveReviewProcessId(m),
     }));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
 
 export const GET_PROJECT_BINDING_DESCRIPTION =
-  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
+  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the resolved review process (reviewProcess: ai-implement, claude-code-review, claude-code-review-repository-fix, or codex-code-review), the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
 
 export const getProjectBinding = tool(
   {
@@ -304,6 +363,7 @@ export const getProjectBinding = tool(
       defaultBranch: m.defaultBranch,
       tracker: { kind: m.ticketingConfig.kind, team: key },
       pickupLabel: m.ticketingConfig.kind === "linear" ? getLinearPickupLabel() : null,
+      reviewProcess: resolveReviewProcessId(m),
       kg,
     });
 
@@ -329,7 +389,7 @@ export const getProjectBinding = tool(
 );
 
 export const LIST_IN_FLIGHT_JOBS_DESCRIPTION =
-  "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch.";
+  "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch. A kg-refresh held for a decision is not in flight; it appears in `get_kg_status`.";
 
 export const listInFlightJobs = tool(
   { description: LIST_IN_FLIGHT_JOBS_DESCRIPTION, input: z.object({}), role: "user" },
@@ -342,10 +402,205 @@ export const listInFlightJobs = tool(
       repo: j.repo,
       phase: j.phase,
       status: j.status,
+      machineId: j.machineId,
       dispatchedAt: j.dispatchedAt,
       elapsedSeconds: Math.round((now - j.dispatchedAt) / 1000),
     }));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+const RUNNING_MACHINE_STATES = new Set(["started", "starting", "created"]);
+const MAX_MACHINE_LOG_LINES = 200;
+
+/** A Fly 404 (machine destroyed). fly-machines throws plain Errors, so match the status in the text. */
+function isFlyNotFound(err: unknown): boolean {
+  return err instanceof Error && /\(404\)/.test(err.message);
+}
+
+/**
+ * Exit details for a stopped machine; null while it is still running. `probableOom` covers the
+ * case where Fly does not set oom_killed: a kill shows as signal 9 or exit code -1 / 137.
+ */
+function describeMachineExit(machine: Machine) {
+  if (RUNNING_MACHINE_STATES.has(machine.state)) return null;
+  const exit = readMachineExit(machine);
+  const probableOom =
+    exit.oomKilled === true || exit.signal === 9 || exit.exitCode === -1 || exit.exitCode === 137;
+  return { ...exit, probableOom };
+}
+
+function latestJobForIssue(issueIdentifier: string): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT id FROM dispatch_log WHERE issue_identifier = ? AND machine_id IS NOT NULL ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    )
+    .get(issueIdentifier) as { id: number } | undefined;
+  return row ? getJobById(row.id) : null;
+}
+
+function toolError(text: string): ToolResponse {
+  return { isError: true, content: [{ type: "text", text }] };
+}
+
+export const GET_SESSION_MACHINE_DESCRIPTION =
+  "Reads one session machine from the Fly Machines API. Answers 'did the machine run out of memory' (exit.oomKilled, exit.probableOom, exit signal/code) and 'what memory size did it get' (guest.memoryMb). Also returns state, region, CPUs, and the matching issue, phase, and job status. Pass issueIdentifier (e.g. 'AII-123', newest job) or machineId. exit is null while the machine runs; a destroyed machine returns state 'destroyed'. Optional logLines (0-200) returns the last log lines.";
+
+export const getSessionMachine = tool(
+  {
+    description: GET_SESSION_MACHINE_DESCRIPTION,
+    input: z.object({
+      issueIdentifier: z.string().optional(),
+      machineId: z.string().optional(),
+      logLines: z.number().int().min(0).max(MAX_MACHINE_LOG_LINES).optional(),
+    }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const { issueIdentifier, machineId: machineIdArg } = input.args;
+    const logLines = Math.min(Math.max(input.args.logLines ?? 0, 0), MAX_MACHINE_LOG_LINES);
+    if (!!issueIdentifier === !!machineIdArg) {
+      return toolError("Provide exactly one of issueIdentifier or machineId");
+    }
+    const config = mcpAdminConfig();
+    if (!config.flySessionsToken || !config.flySessionsApp) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Fly sessions app is not configured" }, null, 2) }] };
+    }
+
+    let job: Job | null = null;
+    let machineId = machineIdArg as string | undefined;
+    if (issueIdentifier) {
+      job = latestJobForIssue(issueIdentifier);
+      if (!job?.machineId) return toolError(`No job with a session machine found for ${issueIdentifier}`);
+      machineId = job.machineId;
+    } else if (machineId) {
+      job = getJobByMachineId(machineId);
+    }
+    if (!machineId) return toolError("machineId is required");
+
+    const jobFields = {
+      issueIdentifier: job?.issueIdentifier ?? null,
+      phase: job?.phase ?? null,
+      jobStatus: job?.status ?? null,
+    };
+
+    let machine: Machine;
+    try {
+      machine = await getMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    } catch (err) {
+      if (isFlyNotFound(err)) {
+        const result = {
+          machineId, name: null, state: "destroyed", region: null, createdAt: null, updatedAt: null,
+          guest: null, exit: null, ...jobFields,
+        };
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+      return toolError(`Failed to read machine ${machineId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const result: Record<string, unknown> = {
+      machineId: machine.id,
+      name: machine.name,
+      state: machine.state,
+      region: machine.region,
+      createdAt: machine.created_at,
+      updatedAt: machine.updated_at,
+      guest: {
+        cpus: machine.config?.guest?.cpus ?? null,
+        cpuKind: machine.config?.guest?.cpu_kind ?? null,
+        memoryMb: machine.config?.guest?.memory_mb ?? null,
+      },
+      exit: describeMachineExit(machine),
+      ...jobFields,
+    };
+    if (logLines > 0) {
+      try {
+        result.logs = await fetchMachineLogs(config.flySessionsToken, config.flySessionsApp, machineId, logLines);
+      } catch (err) {
+        result.logsError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const GetFlySetupArgsSchema = z.object({}).strict();
+
+export const getFlySetup = tool(
+  {
+    description: "Reports live Fly sessions connectivity and secret names by group, never values.",
+    input: GetFlySetupArgsSchema,
+    role: "admin",
+    grant: "secrets",
+    operation: "read",
+  },
+  async (): Promise<ToolResponse> => {
+    const config = mcpAdminConfig();
+    const mappings = getMappings();
+    const appSource = getRunnerBackendSource();
+    const configured = appSource !== "not-loaded" && !!config.flySessionsToken && !!config.flySessionsApp;
+    const result = {
+      usedBy: Object.keys(mappings).filter((key) => {
+        const path = resolveExecutionPath(getRunnerMode().mode, mappings[key].executionMode);
+        return path === "fly-machines" || path === "both";
+      }).sort(),
+      appSource, configured, app: config.flySessionsApp || null,
+      processLevelSecrets: getFlyProcessLevelSecrets(),
+      reachable: null as boolean | null,
+      reachError: null as string | null,
+      names: [] as Array<{ name: string; group: string; projects: string[]; createdAt: string }>,
+    };
+    if (configured) {
+      try {
+        const secrets = await listAppSecrets(config.flySessionsToken!, config.flySessionsApp!, 10_000);
+        result.names = secrets.map((secret) => {
+          const { group, projects } = classifyFlySecretNames([secret.name], Object.keys(mappings))[0];
+          return { name: secret.name, group, projects, createdAt: secret.created_at };
+        }).sort((a, b) => a.name.localeCompare(b.name));
+        result.reachable = true;
+      } catch (err) {
+        result.reachable = false;
+        result.reachError = err instanceof FlyApiError ? `http-${err.status}`
+          : err instanceof Error && err.name === "AbortError" ? "timeout" : "error";
+      }
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const LIST_SESSION_MACHINES_DESCRIPTION =
+  "Lists the newest session machines in the Fly sessions app (default 10, newest first) with state, createdAt, memoryMb (the memory size each got), oomKilled (did the machine run out of memory), and the matching issueIdentifier when a job recorded the machine. Use get_session_machine for one machine's full exit details.";
+
+export const listSessionMachines = tool(
+  {
+    description: LIST_SESSION_MACHINES_DESCRIPTION,
+    input: z.object({ limit: z.number().int().min(1).max(50).optional() }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const limit = input.args.limit ?? 10;
+    const config = mcpAdminConfig();
+    if (!config.flySessionsToken || !config.flySessionsApp) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Fly sessions app is not configured" }, null, 2) }] };
+    }
+    let machines: Machine[];
+    try {
+      machines = await listMachines(config.flySessionsToken, config.flySessionsApp);
+    } catch (err) {
+      return toolError(`Failed to list session machines: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const rows = [...machines]
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+      .slice(0, limit)
+      .map((m) => ({
+        machineId: m.id,
+        state: m.state,
+        createdAt: m.created_at,
+        memoryMb: m.config?.guest?.memory_mb ?? null,
+        oomKilled: readMachineExit(m).oomKilled,
+        issueIdentifier: getJobByMachineId(m.id)?.issueIdentifier ?? null,
+      }));
+    return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
   },
 );
 
@@ -367,7 +622,7 @@ export const getIssueDispatchStatus = tool(
     const db = getDb();
     const recentRows = db
       .prepare(
-        "SELECT id, status, dispatched_at, repo, phase, pr_url, conclusion FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
+        "SELECT id, status, dispatched_at, repo, phase, pr_url, conclusion, failure_json FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
       )
       .all(identifier) as Array<{
         id: number;
@@ -377,6 +632,7 @@ export const getIssueDispatchStatus = tool(
         phase: string | null;
         pr_url: string | null;
         conclusion: string | null;
+        failure_json: string | null;
       }>;
     const dedupRow = db
       .prepare("SELECT issue_id, dispatched_at FROM dispatched WHERE issue_identifier = ?")
@@ -400,6 +656,7 @@ export const getIssueDispatchStatus = tool(
         phase: j.phase,
         prUrl: j.pr_url,
         conclusion: j.conclusion,
+        failureMessage: parseFailureJson(j.failure_json)?.message ?? null,
       })),
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -407,7 +664,7 @@ export const getIssueDispatchStatus = tool(
 );
 
 export const GET_ISSUE_REPORT_CARD_DESCRIPTION =
-  "Returns a full report card for a specific issue: all dispatch runs with per-pass telemetry, totals (dispatches, passes, cost), approval/merge/escape status, gap-fill rounds, and review-fix rounds. Use this to understand the full history and outcome of an issue.";
+  "Returns a full report card for a specific issue: all dispatch runs with per-pass telemetry, totals (dispatches, passes, reported costUsd, estimated estimatedCostUsd, unpricedCalls), approval/merge/escape status, gap-fill rounds, and review-fix rounds. Use this to understand the full history and outcome of an issue.";
 
 export const getIssueReportCardTool = tool(
   {
@@ -415,13 +672,14 @@ export const getIssueReportCardTool = tool(
     input: z.object({ issue: z.string().optional() }),
     role: "user",
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     const issue = input.args.issue;
     if (typeof issue !== "string" || !issue) {
       const result = { error: "issue is required and must be a non-empty string" };
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
-    const card = getIssueReportCard(issue);
+    const { prices } = await ctx.objectClient(modelPrices, "builddown").current();
+    const card = getIssueReportCard(issue, prices);
     const result = card ?? { error: `No dispatch records found for issue: ${issue}` };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -430,10 +688,12 @@ export const getIssueReportCardTool = tool(
 export const GET_FLEET_REPORT_DESCRIPTION =
   "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.";
 
+export const GetFleetReportArgsSchema = z.object({ days: z.number().optional() });
+
 export const getFleetReportTool = tool(
   {
     description: GET_FLEET_REPORT_DESCRIPTION,
-    input: z.object({ days: z.number().optional() }),
+    input: GetFleetReportArgsSchema,
     role: "user",
   },
   async (_ctx, input): Promise<ToolResponse> => {
@@ -443,25 +703,82 @@ export const getFleetReportTool = tool(
   },
 );
 
+export const getReviewerScorecardTool = tool(
+  {
+    description: "Counts findings per source over a first-seen look-back window (days default 30), optionally filtered by repo. Returns total, fixed (explicit disposition), rejected, deferred, ignored (open on a merged PR or resolved without fixed evidence), and rejectedRate (rejected / total). Active open findings count only in total. No paging.",
+    input: z.object({ days: z.number().finite().nonnegative().optional(), repo: z.string().optional() }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => ({
+    content: [{ type: "text", text: JSON.stringify(getReviewerScorecard(input.args), null, 2) }],
+  }),
+);
+
+/** What `get_deploy_posture` serves: the posture plus the SelfDeploy record (null when none or unreadable). */
+type DeployPostureReport = DeployPosture & { selfDeploy: SelfDeployRecord | null };
+
 export const GET_DEPLOY_POSTURE_DESCRIPTION =
-  "Returns the current deploy posture: whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.";
+  "Returns the current deploy posture: selfDeploy (the SelfDeploy record: deployId, phase, target, requestedBy, times, reason; null when none or unreadable), whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.";
+
+export const GetDeployPostureArgsSchema = z.object({});
 
 export const getDeployPostureTool = tool(
-  { description: GET_DEPLOY_POSTURE_DESCRIPTION, input: z.object({}), role: "user" },
-  async (): Promise<ToolResponse> => {
+  { description: GET_DEPLOY_POSTURE_DESCRIPTION, input: GetDeployPostureArgsSchema, role: "user" },
+  async (ctx): Promise<ToolResponse> => {
     // No defaultImage passed: getDeployPosture's own fallback re-derives it from
     // process.env the same way config.sessionImage was computed at boot (AII-711) — a
     // Restate handler has no per-request injection the way handleMcpRequest did.
-    const result = await getDeployPosture({});
+    const posture = await getDeployPosture({});
+    // Additive: an unreadable SelfDeploy object must not take the whole posture down, so it reads as null.
+    let selfDeploy: SelfDeployRecord | null = null;
+    try {
+      selfDeploy = (await ctx.objectClient(SelfDeploy, selfDeployKey()).status()).deploy;
+    } catch (err) {
+      if (restate.internal.isSuspendedError(err)) throw err;
+    }
+    const result: DeployPostureReport = { ...posture, selfDeploy };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
 
+export const START_DEPLOY_DESCRIPTION =
+  "Start a self-deploy of this orchestrator to the published build of the head of `branch` (testing | main) (admin role, or the control plane's deploy-scoped token). Args: branch, requestedBy (1..200 characters). Returns { deployId, commit, image, alreadyActive }. Shared SelfDeploy.status is read first: during draining, applying or verifying, returns the active deploy immediately with alreadyActive true without calling SelfDeploy.start. Otherwise calls SelfDeploy.start, which retains its alreadyActive race check. A refusal is one fixed code as the error text: image-not-published, head-unknown or not-configured. Progress is get_deploy_posture's selfDeploy record.";
+
+/** The SelfDeploy object key: the same fallback as createSelfDeployIngressClient, so the tool and the admin routes address one object. */
+const selfDeployKey = (): string => process.env.FLY_APP_NAME ?? "orchestrator";
+
+export const StartDeployArgsSchema = z.object({ branch: z.enum(["testing", "main"]), requestedBy: z.string().min(1).max(200) }).strict();
+
+export const startDeployTool = tool(
+  {
+    description: START_DEPLOY_DESCRIPTION,
+    input: StartDeployArgsSchema,
+    role: "admin",
+    grant: "deploy",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `branch=${input.args.branch}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const client = ctx.objectClient(SelfDeploy, selfDeployKey());
+    // Shared status stays available while exclusive apply holds the object.
+    const { deploy } = await client.status();
+    if (isActiveSelfDeploy(deploy)) {
+      const result = { deployId: deploy.deployId, commit: deploy.target.commit, image: deploy.target.image, alreadyActive: true };
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    }
+    const result = await client.start(input.args);
+    if ("reason" in result) return toolError(result.reason);
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+  },
+);
+
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate, and lastDryRun (verdict and part table of the last dry-run with no PR report target, or null). The served stamp falls back to a live read when the last-refresh record carries none. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), or [\"cancel\"] for a blocked hold (held.acceptBlocked), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
+const SelfDeploy: SelfDeployDefinition = { name: "SelfDeploy" } as SelfDeployDefinition;
 const KgRepo: KgRepoDefinition = { name: "KgRepo" } as KgRepoDefinition;
 const KgRefresh: KgRefreshDefinition = { name: "KgRefresh" } as KgRefreshDefinition;
 
@@ -480,13 +797,120 @@ export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
 export function kgStageForStep(step: string | null): KgRefreshStage {
   if (step === null || step === "reserve" || step === "dispatch") return "checking";
   if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
-  if (step === "merge" || step === "delete-branch") return "snapshot-landed";
+  if (step === "decision" || step === "held") return "awaiting-decision";
+  // `resume` is a decided hold's run: it merges, or closes the held PR.
+  if (step === "merge" || step === "delete-branch" || step === "resume") return "snapshot-landed";
   // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
   // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.
   return "staging";
 }
 
+/**
+ * Maps the in-flight runner step onto a stage (AII-1134). Full table (id x status):
+ *   clone, kg-scope-reconcile, dependency-auth, clone-code-repo,
+ *   clone-secondary-repos, kg-tracker-data -> checking, for every status
+ *   kg-ingest                              -> ingest-running, for every status
+ *   kg-snapshot-push                       -> snapshot-landed when passed; ingest-running otherwise
+ *   any other id                           -> ingest-running (the runner phase is in flight)
+ */
+export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshStage {
+  switch (id) {
+    case "clone":
+    case "kg-scope-reconcile":
+    case "dependency-auth":
+    case "clone-code-repo":
+    case "clone-secondary-repos":
+    case "kg-tracker-data":
+      return "checking";
+    case "kg-ingest":
+      return "ingest-running";
+    case "kg-snapshot-push":
+      return status === "passed" ? "snapshot-landed" : "ingest-running";
+    default:
+      return "ingest-running";
+  }
+}
+
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
+
+export const DECIDE_KG_REFRESH_DESCRIPTION =
+  "Decide the current KG refresh (admin role). Acts only on the run KgRepo reports in flight; a past run cannot be decided. A snapshot held at the decision gate is a KgRepo record, not a running workflow: `accept` lands it and `cancel` drops it, each as a new KgRefresh run. Pass `triggerId` (the held run's trigger id from get_kg_status) to decide only that hold; a hold that is gone or replaced answers no-decision-open. When no decision is open, `accept` answers no-decision-open and `cancel` stops the run in flight through the cancel signal. `accept` on a blocked hold answers accept-blocked. A second accept answers no-decision-open (the hold is marked decided). A `cancel` after an accept stops the run until the merge starts and answers past-merge from then on (the merge is the point of no return; the run finishes). With no run in flight the answer is no-refresh-in-flight.";
+
+export const decideKgRefreshTool = tool(
+  {
+    description: DECIDE_KG_REFRESH_DESCRIPTION,
+    input: z.object({
+      action: z.enum(["accept", "cancel"]).describe("accept lands the held snapshot; cancel drops it (or stops the run when no decision is open)."),
+      triggerId: z.string().min(1).optional().describe("The trigger id of the hold being decided, as get_kg_status shows it. Omit to decide the current hold."),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const toolDeps = kgRefreshToolDeps;
+    if (!toolDeps) return toolError("KG refresh is not configured");
+    const repo = ctx.objectClient(KgRepo, toolDeps.kgSourceRepo);
+    if ((await repo.status()) == null) return toolError("no-refresh-in-flight");
+    const { action, triggerId: heldTrigger } = input.args;
+    const actor = auditActor(input.caller, input.caller.kind === "system" ? "system" : "unknown");
+    try {
+      await repo.decide({ action, actor, ...(heldTrigger !== undefined ? { triggerId: heldTrigger } : {}) });
+      return reply({ decided: action });
+    } catch (err) {
+      if (!(err instanceof restate.TerminalError) || err.code !== 409) throw err;
+      if (err.message === "accept-blocked") return toolError("accept-blocked");
+      if (err.message !== "no-decision-open") throw err;
+    }
+    // A caller that named a hold meant that hold only: never fall back to whatever runs now.
+    if (action === "accept" || heldTrigger !== undefined) return toolError("no-decision-open");
+    // No decision is open, so `cancel` stops the run in flight. Read it again: an accept may have resumed it as a new run.
+    const current = await repo.status();
+    if (current == null) return toolError("no-refresh-in-flight");
+    if (current.held) {
+      // The hold was stored after the first decide: the run has ended, so only the decision door can stop it.
+      try {
+        await repo.decide({ action: "cancel", actor, triggerId: current.triggerId });
+      } catch (err) {
+        if (err instanceof restate.TerminalError && err.code === 409) return toolError("no-decision-open");
+        throw err;
+      }
+      return reply({ cancelled: true });
+    }
+    try {
+      await ctx.workflowClient(KgRefresh, current.triggerId).cancel({ reason: "operator_cancelled" });
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 409 && err.message === "past-merge") return toolError("past-merge");
+      // The run finished between the status read and the signal.
+      if (err instanceof restate.TerminalError && (err.code === 404 || err.code === 409)) {
+        // A gate run that stored its hold and ended in between left a hold, not nothing (AII-1493): the decision door stops it.
+        const after = await repo.status();
+        if (after?.held) {
+          try {
+            await repo.decide({ action: "cancel", actor, triggerId: after.triggerId });
+          } catch (decideErr) {
+            if (decideErr instanceof restate.TerminalError && decideErr.code === 409) return toolError("no-decision-open");
+            throw decideErr;
+          }
+          return reply({ cancelled: true });
+        }
+        return toolError("no-refresh-in-flight");
+      }
+      throw err;
+    }
+    // A kill after the signal may have reopened a hold the signal never reached: the decision door stops it.
+    const reopened = await repo.status();
+    if (reopened?.held) {
+      try {
+        await repo.decide({ action: "cancel", actor, triggerId: reopened.triggerId });
+      } catch (err) {
+        if (err instanceof restate.TerminalError && err.code === 409) return toolError("no-decision-open");
+        throw err;
+      }
+    }
+    return reply({ cancelled: true });
+  },
+);
 
 function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefreshStage {
   if (!last) return "idle";
@@ -505,11 +929,8 @@ export const getKgStatusTool = tool(
       return { content: [{ type: "text", text: JSON.stringify({ error: "KG refresh is not configured" }, null, 2) }] };
     }
     const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+    const flyProfile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
     const lastRefresh = toolDeps.readStatusRecord();
-    const dryRun = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).lastAdminDryRun();
-    const lastDryRun = dryRun
-      ? { ok: dryRun.ok, at: dryRun.at, detail: dryRun.detail, ...(dryRun.partTable ? { partTable: dryRun.partTable } : {}) }
-      : null;
     let recordStamp = lastRefresh ? (lastRefresh.ok ? lastRefresh.stampAfter : lastRefresh.stampBefore) : null;
     if (!recordStamp) {
       // A failure before the rail leaves no stamp on the record while a graph still serves.
@@ -522,20 +943,53 @@ export const getKgStatusTool = tool(
       });
     }
     let stage: KgRefreshStage;
+    let runnerStep: KgRefreshStatus["runnerStep"];
+    let currentRun: KgRefreshStatus["currentRun"] = null;
     if (inFlight === null || inFlight === undefined) {
       stage = kgStageFromLastRefresh(lastRefresh);
     } else {
-      try {
-        const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
-        stage = kgStageForStep(wf.step);
-      } catch (err) {
-        // A retained-but-finished or unreachable workflow: the marker is the truth.
-        if (!kgStatusFallbackLogged) {
-          kgStatusFallbackLogged = true;
-          console.warn(`[kg-refresh] workflow status unavailable for ${inFlight.triggerId}; reporting ingest-running: ${String(err)}`);
+      if (inFlight.held) {
+        // A hold is a `KgRepo` record: no run is in flight, so there is no workflow to read.
+        const held = inFlight.held;
+        currentRun = {
+          triggerId: inFlight.triggerId,
+          step: "decision",
+          decisions: held.acceptBlocked ? ["cancel"] : ["accept", "cancel"],
+          held: { ...held, snapshotPrUrl: `https://github.com/${toolDeps.kgSourceRepo}/pull/${held.snapshotPr}` },
+        };
+        stage = "awaiting-decision";
+      } else {
+        try {
+          const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
+          currentRun = { triggerId: inFlight.triggerId, step: wf.step, decisions: [], held: null };
+          if (wf.runnerStep) {
+            runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
+            stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
+          } else {
+            stage = kgStageForStep(wf.step);
+          }
+        } catch (err) {
+          // A retained-but-finished or unreachable workflow: the marker is the truth.
+          if (!kgStatusFallbackLogged) {
+            kgStatusFallbackLogged = true;
+            console.warn(`[kg-refresh] workflow status unavailable for ${inFlight.triggerId}; reporting ingest-running: ${String(err)}`);
+          }
+          stage = "ingest-running";
         }
-        stage = "ingest-running";
       }
+    }
+    const restateKey = inFlight?.triggerId ?? lastRefresh?.dispatchId;
+    const flyCfg = mcpAdminConfig();
+    const flyConfigured = !!(flyCfg.flySessionsToken && flyCfg.flySessionsApp);
+    const kgSetting = getKgExecutionMode(flyConfigured);
+    const kgBackend = resolveKgBackend(getRunnerMode().mode, kgSetting, flyConfigured);
+    // The effective backend's profile; local-docker has none.
+    let runProfile: { backend: RunProfileBackend; config: unknown; source: "profile" | "default" } | undefined;
+    if (isRunProfileBackend(kgBackend.mode)) {
+      const view = kgBackend.mode === "fly-machines"
+        ? flyProfile
+        : await ctx.objectClient(RUN_PROFILE_OBJECTS["github-actions"], "kg-refresh").get();
+      if (view) runProfile = { backend: kgBackend.mode, config: view.config, source: view.source };
     }
     const result: KgRefreshStatus = {
       running: inFlight !== null && inFlight !== undefined,
@@ -544,9 +998,14 @@ export const getKgStatusTool = tool(
       ...sidecarHealthFields(),
       servedStamp: recordStamp ?? null,
       lastRefresh,
-      lastDryRun,
       stage,
-      materialize: getKgMaterializeDirect() ? "direct" : "rdflib",
+      currentRun,
+      ...(runnerStep ? { runnerStep } : {}),
+      materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
+      executionMode: { effective: kgBackend.mode, source: kgBackend.source, setting: kgSetting.mode },
+      ...(runProfile ? { runProfile } : {}),
+      ...(flyProfile ? { flyMachine: { ...flyProfile.config, source: flyProfile.source } } : {}),
+      restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -590,7 +1049,7 @@ function reviewFixCaller(input: { caller: { role: AccessRole | null; email: stri
 }
 
 export const GET_REVIEW_FIX_ATTEMPT_DESCRIPTION =
-  "Returns one Restate review-fix attempt detail by attemptId: owner, execution, deadline, pending feedback, snapshot, state, evidenceComplete, terminationConfirmed, and cycle summaries. Admin read.";
+  "Returns one Restate review-fix attempt detail by attemptId: owner, execution, deadline, pending feedback, snapshot, state, evidenceComplete, terminationConfirmed, cycle summaries, and nullable snapshot-validated invocation attribution. Admin read.";
 
 export const getReviewFixAttemptTool = tool(
   {
@@ -631,6 +1090,62 @@ export const getReviewFixActivityTool = tool(
   },
 );
 
+export const LIST_OPEN_PULLS_DESCRIPTION =
+  "One entry per open PR in every mapped repository. Returns a JSON array. GitHub lists are cached for 60 s; a failed refresh serves the last good repository copy only while it is less than 5 minutes old, otherwise the whole call fails. workflow is absent when the orchestrator has no verdict; workflow.state is active when work remains and settled when it does not. Times are epoch ms. Read.";
+
+export const listOpenPullsTool = tool(
+  {
+    description: LIST_OPEN_PULLS_DESCRIPTION,
+    input: z.object({}),
+    role: "user",
+    operation: "read",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    const entries = await ctx.run("list-open-pulls", () => listOpenPulls(), { maxRetryAttempts: 1 });
+    return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+  },
+);
+
+export const LIST_ISSUE_STATUSES_DESCRIPTION =
+  "Returns a JSON array with one entry per in-scope issue: open issues matching the pickup query in any state, plus merged and failed issues from the last 7 days. States: ready, planning, awaiting-approval, plan-approved, implementing, pr-ready, merged, failed, unknown. changedAt is the tracker's last-updated time, or a newer job time when there is one (epoch ms). Breaker parks mark nonmerged issues failed; jobs supply missing failure phase and newer changedAt. Tracker reads are cached for 60 s; a failed refresh serves the last good team copy only while it is less than 5 minutes old, otherwise the whole call fails. Linear and filesystem never report awaiting-approval. Read.";
+
+export const listIssueStatusesTool = tool(
+  {
+    description: LIST_ISSUE_STATUSES_DESCRIPTION,
+    input: z.object({}),
+    role: "user",
+    operation: "read",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    const entries = await ctx.run("list-issue-statuses", () => listIssueStatuses({
+      providerFor: (m) => providerRegistryForTools().forMapping(m),
+      now: Date.now,
+    }), { maxRetryAttempts: 1 });
+    return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+  },
+);
+
+export const LIST_JOB_ACCOUNTING_DESCRIPTION =
+  "Returns one page of finished-job accounting records, oldest change first: dispatch id, phase, status, conclusion, lifecycle owner, times, changedAt, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). A job that changes after it was served (a second terminal write, a late review conclusion, a late invocation row) is served again with a newer changedAt: the newest copy of a job replaces older ones. usage is reported only when the runner's invocation list arrived whole, partial when some invocation rows exist without that, unknown when none exist. Args: optional cursor { changedAt, dispatchId }, optional pageSize 1..200 (default 100), optional includeUnsettled (boolean; also serves jobs that changed in the last 10 minutes — only for a caller about to lose the orchestrator; such records may still change and are replaced by changedAt). Returns records, nextCursor, oldestRetainedCompletedAt (information only) and prunedThrough ({ changedAt, dispatchId } of the newest finished job pruned, or null). Without includeUnsettled a record is returned 10 minutes after its last change. Read.";
+
+export const listJobAccountingTool = tool(
+  {
+    description: LIST_JOB_ACCOUNTING_DESCRIPTION,
+    input: JobAccountingArgsSchema,
+    role: "user",
+    operation: "read",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const page = listJobAccounting({
+      cursor: input.args.cursor,
+      pageSize: input.args.pageSize,
+      includeUnsettled: input.args.includeUnsettled,
+    });
+    // Compact, to keep the page small. A full page can still pass the consumer's 2 MiB limit; it halves the page size.
+    return { content: [{ type: "text", text: JSON.stringify(page) }] };
+  },
+);
+
 const KG_TOOL_DESCRIPTIONS: Record<string, string> = {
   kg_hybrid_search: "Hybrid (lexical + vector) search over the knowledge graph. Falls back to lexical-only when embeddings are degraded (see get_tenant_health's kgDegraded).",
   kg_search: "Lexical search over the knowledge graph.",
@@ -638,6 +1153,8 @@ const KG_TOOL_DESCRIPTIONS: Record<string, string> = {
   kg_neighbors: "Returns the immediate neighbors of a graph node by IRI.",
   kg_path: "Returns a path between two graph nodes by IRI.",
   kg_provenance: "Returns the provenance (source commit/file) of a graph node by IRI.",
+  kg_repo_history:
+    "Returns a repository's commits and merged PRs. Args: repo, and optionally branch, since, until, pr, kind, limit.",
 };
 
 /**
@@ -677,6 +1194,7 @@ export const kgSemanticSearch = kgTool("kg_semantic_search");
 export const kgNeighbors = kgTool("kg_neighbors");
 export const kgPath = kgTool("kg_path");
 export const kgProvenance = kgTool("kg_provenance");
+export const kgRepoHistory = kgTool("kg_repo_history");
 
 // ---- Writes (AII-713): moved verbatim off WRITE_TOOLS in src/mcp.ts. Each admin action
 // call, its args validation, and its status-to-text mapping are unchanged — only the caller
@@ -691,11 +1209,12 @@ export const kgProvenance = kgTool("kg_provenance");
  * boot warnings and configures OAuth/Linear auth as a side effect and must run exactly once.
  */
 function mcpAdminConfig(): AdminConfig {
+  const fly = getFlySessionsConfig();
   return {
-    adminAccessCode: process.env.ADMIN_ACCESS_CODE || null,
-    flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
-    flySessionsApp: process.env.FLY_SESSIONS_APP || getOrchestratorSettings().flySessionsApp,
-    flySessionsRegion: process.env.FLY_SESSIONS_REGION || getOrchestratorSettings().flySessionsRegion,
+    adminAccessCode: effectiveAccessCode(process.env.ADMIN_ACCESS_CODE),
+    flySessionsToken: fly.token,
+    flySessionsApp: fly.app,
+    flySessionsRegion: fly.region,
     githubAppId: process.env.GITHUB_APP_ID ?? "",
     githubAppPrivateKey: process.env.GITHUB_APP_PRIVATE_KEY ?? "",
     notifyWebhookUrl: process.env.NOTIFY_WEBHOOK_URL || null,
@@ -727,18 +1246,14 @@ function providerRegistryForTools(): ProviderRegistry {
 }
 
 export const TRIGGER_KG_REFRESH_DESCRIPTION =
-  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status as lastDryRun (the last dry-run with no PR report target; it never writes lastRefresh), but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
+  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. There is no dry-run and no trigger-time accept: dryRun=true and acceptNewBaseline=true are refused with the error option-removed. A refresh whose snapshot shrinks holds the run at a decision gate (get_kg_status shows it as awaiting-decision, with the snapshot PR and its part table); decide it with decide_kg_refresh.";
 
 export const triggerKgRefreshTool = tool(
   {
     description: TRIGGER_KG_REFRESH_DESCRIPTION,
     input: z.object({
-      dryRun: z.boolean().optional().describe(
-        "Run the rail without pushing the snapshot or touching the served graph; reports the guard table via get_kg_status.",
-      ),
-      acceptNewBaseline: z.boolean().optional().describe(
-        "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only.",
-      ),
+      dryRun: z.boolean().optional().describe("Removed: true is refused with option-removed. Omit it."),
+      acceptNewBaseline: z.boolean().optional().describe("Removed: true is refused with option-removed. Decide a held run with decide_kg_refresh."),
       ref: z.string().optional().describe(
         "Dispatch against this branch instead of the KG source repo's default branch (used to run the rail against a PR head).",
       ),
@@ -749,6 +1264,10 @@ export const triggerKgRefreshTool = tool(
   async (ctx, input): Promise<ToolResponse> => {
     const answer = (status: number, body: Record<string, unknown>): ToolResponse =>
       ({ content: [{ type: "text", text: JSON.stringify({ status, body }, null, 2) }] });
+    // Refuse before any side effect: zod would strip an unknown key, and a real refresh pushes to the KG repo.
+    for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+      if (input.args[option] === true) return answer(400, { error: "option-removed", option });
+    }
     const toolDeps = kgRefreshToolDeps;
     const deployHeld = await ctx.run("deploy-held", () => toolDeps ? toolDeps.isDeployHeld() : false);
     if (deployHeld) {
@@ -796,10 +1315,9 @@ export const triggerKgRefreshTool = tool(
       return answer(422, { error: "preflight-failed", precondition: "preflight-failed", detail: preflightFailure });
     }
     const opts = {
-      dryRun: input.args.dryRun === true,
-      acceptNewBaseline: input.args.acceptNewBaseline === true,
       ...(input.args.ref !== undefined ? { kgSourceRef: input.args.ref } : {}),
       actorEmail: input.caller.email ?? undefined,
+      trigger: input.caller.kind === "human" ? "manual" as const : "schedule" as const,
     };
     const result = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).trigger(opts);
     if ("status" in result) return answer(409, { error: "refresh-in-progress" });
@@ -831,6 +1349,181 @@ export const setRunnerModeTool = tool(
     const mode = input.args.mode;
     const result = await ctx.run("set-runner-mode", () => setRunnerModeAction(config, { mode }), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const SET_FLY_MACHINE_PROFILE_DESCRIPTION =
+  "Set a pipeline's Fly machine profile (admin role): pipeline (kg-refresh), cpuKind (shared, performance), cpus (1, 2, 4, 8, 16), memoryMb (256-65536), idleTimeoutMs (at least 60000). Given fields merge into the stored profile; the merged result must be valid (performance needs 2048 MB per CPU). Applies to the next run, not one in flight. Returns the profile as { config, source }.";
+
+export const setFlyMachineProfileTool = tool(
+  {
+    description: SET_FLY_MACHINE_PROFILE_DESCRIPTION,
+    input: z.object({
+      pipeline: z.string().describe("The pipeline phase whose profile to set, e.g. kg-refresh"),
+      cpuKind: z.enum(["shared", "performance"]).optional().describe("CPU kind: shared or performance"),
+      cpus: z.number().optional().describe("CPUs: one of 1, 2, 4, 8, 16"),
+      memoryMb: z.number().optional().describe("Memory in MB: an integer from 256 to 65536"),
+      idleTimeoutMs: z.number().optional().describe("Idle timeout in ms: at least 60000"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const { pipeline, cpuKind, cpus, memoryMb, idleTimeoutMs } = input.args;
+    const fields = {
+      ...(cpuKind !== undefined ? { cpuKind } : {}),
+      ...(cpus !== undefined ? { cpus } : {}),
+      ...(memoryMb !== undefined ? { memoryMb } : {}),
+      ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
+    };
+    return reply(await runProfileSet(() => ctx.objectClient(FlyMachineProfile, pipeline).set(fields)));
+  },
+);
+
+/** Runs a run-profile `set`; a 400 comes back as a reply body, as the other set tools do. */
+async function runProfileSet(set: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return await set();
+  } catch (err) {
+    if (err instanceof restate.TerminalError && err.code === 400) return { status: 400, body: { error: err.message } };
+    throw err;
+  }
+}
+
+export const SET_RUN_PROFILE_DESCRIPTION =
+  "Set a pipeline's run profile on one backend (admin role): pipeline (kg-refresh), backend (fly-machines, github-actions) and patch. fly-machines takes cpuKind, cpus, memoryMb, idleTimeoutMs; github-actions takes jobTimeoutMinutes (an integer from 10 to 360). Given fields merge into the stored profile; an unknown field or out-of-range value is refused with 400. Applies to the next run, not one in flight. Returns the profile as { config, source }.";
+
+export const setRunProfileTool = tool(
+  {
+    description: SET_RUN_PROFILE_DESCRIPTION,
+    input: z.object({
+      pipeline: z.string().describe("The pipeline phase whose profile to set, e.g. kg-refresh"),
+      backend: z.enum(["fly-machines", "github-actions"]).describe("The backend whose profile to set"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge, e.g. { jobTimeoutMinutes } for github-actions"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { pipeline, backend, patch } = input.args;
+    const result = await runProfileSet(() => ctx.objectClient(RUN_PROFILE_OBJECTS[backend], pipeline).set(patch));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const SET_RUNNER_BACKEND_DESCRIPTION =
+  "Set a runner backend's deployment-wide settings (admin role): backend (fly-machines, github-actions) and patch. fly-machines takes app and region (a string or null); github-actions takes no fields. Given fields merge into the stored state; an unknown backend or field is refused with 400. No secret is accepted. Returns the stored state.";
+
+export const setRunnerBackendTool = tool(
+  {
+    description: SET_RUNNER_BACKEND_DESCRIPTION,
+    input: z.object({
+      backend: z.string().describe("The backend whose settings to set: fly-machines or github-actions"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge, e.g. { app, region } for fly-machines"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const { backend, patch } = input.args;
+    try {
+      return reply(await ctx.objectClient(RunnerBackend, backend).set(patch));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
+  },
+);
+
+export const GET_RUNNER_BACKEND_DESCRIPTION =
+  "Returns a runner backend's deployment-wide settings (fly-machines: app, region), or null when none were stored yet.";
+
+export const getRunnerBackendTool = tool(
+  {
+    description: GET_RUNNER_BACKEND_DESCRIPTION,
+    input: z.object({ backend: z.string().describe("The backend to read: fly-machines or github-actions") }),
+    role: "user",
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    try {
+      return reply(await ctx.objectClient(RunnerBackend, input.args.backend).get());
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
+  },
+);
+
+export const SET_PIPELINE_SCHEDULE_DESCRIPTION =
+  "Set a pipeline's daily schedule (admin role): pipeline (kg-refresh) and patch { enabled, time, zone }. time is HH:MM, zone an IANA zone name such as America/Denver. Given fields merge into the stored schedule; enabling needs both time and zone. A bad time, bad zone, unknown pipeline or unknown field is refused with 400 naming the field. Returns the stored schedule.";
+
+export const setPipelineScheduleTool = tool(
+  {
+    description: SET_PIPELINE_SCHEDULE_DESCRIPTION,
+    input: z.object({
+      pipeline: z.string().describe("The scheduled pipeline, e.g. kg-refresh"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge: { enabled?: boolean, time?: \"HH:MM\", zone?: IANA zone }"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const { pipeline, patch } = input.args;
+    // PipelineSchedule is bound only with the KG composition; without it there is no service to call.
+    if (kgRefreshToolDeps === null) return reply({ status: 501, body: { error: "kg-source-repo-not-configured" } });
+    try {
+      return reply(await ctx.objectClient(PipelineSchedule, pipeline).set(patch));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
+  },
+);
+
+export const GET_PIPELINE_SCHEDULE_DESCRIPTION =
+  "Returns a pipeline's schedule as { pipeline, schedule, nextOccurrence }. schedule is null when none was set, which means off; nextOccurrence is the next fire time (ISO), or null when the schedule is off. When no KG source repo is configured the answer carries available: false and a null schedule.";
+
+export const getPipelineScheduleTool = tool(
+  {
+    description: GET_PIPELINE_SCHEDULE_DESCRIPTION,
+    input: z.object({ pipeline: z.string().describe("The scheduled pipeline, e.g. kg-refresh") }),
+    role: "user",
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { pipeline } = input.args;
+    if (kgRefreshToolDeps === null) {
+      const unbound = { pipeline, schedule: null, nextOccurrence: null, available: false };
+      return { content: [{ type: "text", text: JSON.stringify(unbound, null, 2) }] };
+    }
+    const state = await ctx.objectClient(PipelineSchedule, pipeline).get();
+    const { nextOccurrence, ...schedule } = state ?? {};
+    const result = { pipeline, schedule: state ? schedule : null, nextOccurrence: nextOccurrence ?? null };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const importEnvironmentCredentialTool = tool(
+  {
+    description: "Import the orchestrator environment credential into an account profile without changing stage defaults (admin role).",
+    input: z.object({}),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx): Promise<ToolResponse> => {
+    let reply;
+    try {
+      const body = await ctx.run("import-environment-credential", () => importEnvironmentCredential(process.env, createModelProtectedSecrets({ env: process.env })), { maxRetryAttempts: 1 });
+      reply = { status: body.result === "created" ? 201 : 200, body };
+    } catch (error) {
+      if (restate.internal.isSuspendedError(error)) throw error;
+      reply = { status: error instanceof restate.TerminalError ? error.code : 500,
+        body: { error: error instanceof restate.TerminalError ? error.message : "could not import the environment credential" } };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(reply, null, 2) }] };
   },
 );
 
@@ -867,8 +1560,9 @@ export const ADD_PROJECT_DESCRIPTION =
 /**
  * Exported so the unit tier can `safeParse` the documented "pass null to reset" contract
  * without going through the Restate ingress (AII-720). The nullable fields here must match
- * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers and the four
- * caps, branchPrefix, skillsRepo, dependencyTokenScope, and the two sensitive-glob fields.
+ * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers,
+ * trustedReviewAuthors, reviewProcess, and the four caps, branchPrefix, skillsRepo, dependencyTokenScope,
+ * and the two sensitive-glob fields.
  */
 export const addProjectArgsSchema = z.object({
   teamKey: z.string().optional().describe("Team key, e.g. the Linear team key or Jira project key"),
@@ -879,6 +1573,7 @@ export const addProjectArgsSchema = z.object({
   maxInProgressAiIssues: z.number().optional(),
   executionMode: z.enum(["github-actions", "fly-machines"]).optional(),
   sessionMode: z.enum(["autonomous", "interactive", "hybrid"]).optional(),
+  machineCpuKind: z.enum(["shared", "performance"]).optional(),
   machineCpus: z.number().optional(),
   machineMemoryMb: z.number().optional(),
   planningEnabled: z.boolean().optional(),
@@ -910,7 +1605,95 @@ export const addProjectArgsSchema = z.object({
   })).nullable().optional().describe(
     "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
   ),
+  trustedReviewAuthors: z.array(z.string()).nullable().optional().describe(
+    "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
+  ),
+  reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix", "codex-code-review"]).nullable().optional().describe(
+    "The project's review process. Restate coordinates AI-Implement fixes for every project. Omit to keep the stored value; pass null or \"ai-implement\" for the default. All review processes apply to every project.",
+  ),
 });
+
+function modelAdminDeps() {
+  return { agentConfig: createAgentConfigAdminDeps({
+    ...mcpAdminConfig(), sessionImage: resolveDefaultRunnerImage(process.env).image,
+  }) };
+}
+
+export const AddModelAccountArgsSchema = z.object({
+  profileId: z.string(), identity: z.string(), agent: z.string(),
+  provider: z.string(), authMode: z.string(),
+}).strict();
+
+export const SetProjectStageArgsSchema = z.object({
+  teamKey: z.string(),
+  stage: z.enum(STAGE_NAMES),
+  agent: z.string().nullable().optional(),
+  provider: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  fallbackModel: z.string().nullable().optional(),
+  accountProfileId: z.string().nullable().optional(),
+  invocationTimeoutMs: z.number().int().positive().nullable().optional(),
+  preferOpenModel: z.boolean().optional(),
+}).strict();
+
+export const addModelAccountTool = tool(
+  {
+    description: "Create an active model account profile. No credential values are accepted; use Set key on /admin#models.",
+    input: AddModelAccountArgsSchema,
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("add-model-account", () =>
+      createModelAccountAction(input.args, modelAdminDeps()), { maxRetryAttempts: 1 });
+    if (result.status >= 400) return toolError(JSON.stringify(result));
+    return { content: [{ type: "text", text: JSON.stringify(result.body) }] };
+  },
+);
+
+export const setProjectStageTool = tool(
+  {
+    description: "Overlay one project agent stage, preserving other stages and mode, with the admin UI readiness checks.",
+    input: SetProjectStageArgsSchema,
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { teamKey, stage, ...patch } = input.args;
+    const result = await ctx.run("set-project-stage", () =>
+      putProjectAgentConfigAction(teamKey, modelAdminDeps(), auditActor(input.caller, "system"), {
+        stages: { [stage]: patch },
+      }), { maxRetryAttempts: 1 });
+    if (result.status >= 400) return toolError(JSON.stringify(result));
+    return { content: [{ type: "text", text: JSON.stringify(result.body) }] };
+  },
+);
+
+export const SetProjectAgentModeArgsSchema = z.object({
+  teamKey: z.string(),
+  mode: z.enum(["configured", "legacy"]),
+}).strict();
+
+export const setProjectAgentModeTool = tool(
+  {
+    description: "Change a project's agent mode to configured or legacy without readiness inspection. Refusals: mapping-not-found, resolution-failed.",
+    input: SetProjectAgentModeArgsSchema,
+    grant: "projects",
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `teamKey=${input.args.teamKey} mode=${input.args.mode}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("set-project-agent-mode", () =>
+      setProjectAgentModeAction(input.args.teamKey, input.args.mode, auditActor(input.caller, "system")),
+    { maxRetryAttempts: 1 });
+    if (!result.ok) return toolError(result.code);
+    return { content: [{ type: "text", text: JSON.stringify({ teamKey: result.teamKey, agentMode: result.agentMode }) }] };
+  },
+);
 
 export const addProjectTool = tool(
   {
@@ -1035,6 +1818,36 @@ export const releaseDispatchReservationTool = tool(
   },
 );
 
+export const unparkIssueTool = tool(
+  {
+    description: "Unpark an issue by its tracker identifier, resolved case-insensitively from its newest dispatch across all repositories. Omit phase to clear all phases. Returns { identifier, issueId, unparked }; a nonparked issue is unchanged.",
+    input: z.object({
+      identifier: z.string().min(1),
+      phase: z.string().optional(),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input, response) => {
+      const issueId = response && !response.isError ? JSON.parse(response.content[0].text).issueId : "none";
+      return `identifier=${input.args.identifier} issue=${issueId} phase=${input.args.phase ?? "all"}`;
+    },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { identifier, phase } = input.args;
+    const result = await ctx.run("unpark-issue", () => {
+      const issueId = getLatestIssueIdForIdentifier(identifier);
+      if (issueId === null) return null;
+      // unpark also resets nonparked rows; call it only when a matching phase is parked.
+      const parked = listParked().some(row => row.issueId === issueId && (phase === undefined || row.phase === phase));
+      return { identifier, issueId, unparked: parked ? unpark(issueId, phase) : false };
+    }, { maxRetryAttempts: 1 });
+    if (result === null) {
+      return { isError: true, content: [{ type: "text", text: `no dispatch record for ${identifier}` }] };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+  },
+);
+
 export const orchestratorTools = restate.service({
   name: "orchestratorTools",
   handlers: {
@@ -1043,26 +1856,47 @@ export const orchestratorTools = restate.service({
     list_projects: listProjects,
     get_project_binding: getProjectBinding,
     list_in_flight_jobs: listInFlightJobs,
+    get_session_machine: getSessionMachine,
+    list_session_machines: listSessionMachines,
+    get_fly_setup: getFlySetup,
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
     get_fleet_report: getFleetReportTool,
+    get_reviewer_scorecard: getReviewerScorecardTool,
     get_deploy_posture: getDeployPostureTool,
     get_kg_status: getKgStatusTool,
     get_review_fix_attempt: getReviewFixAttemptTool,
     get_review_fix_activity: getReviewFixActivityTool,
+    list_job_accounting: listJobAccountingTool,
+    list_open_pulls: listOpenPullsTool,
+    list_issue_statuses: listIssueStatusesTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,
     kg_neighbors: kgNeighbors,
     kg_path: kgPath,
     kg_provenance: kgProvenance,
+    kg_repo_history: kgRepoHistory,
     trigger_kg_refresh: triggerKgRefreshTool,
+    decide_kg_refresh: decideKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
+    set_fly_machine_profile: setFlyMachineProfileTool,
+    set_run_profile: setRunProfileTool,
+    set_runner_backend: setRunnerBackendTool,
+    get_runner_backend: getRunnerBackendTool,
+    set_pipeline_schedule: setPipelineScheduleTool,
+    get_pipeline_schedule: getPipelineScheduleTool,
+    import_environment_credential: importEnvironmentCredentialTool,
     pause_project: pauseProjectTool,
+    start_deploy: startDeployTool,
     add_project: addProjectTool,
+    add_model_account: addModelAccountTool,
+    set_project_stage: setProjectStageTool,
+    set_project_agent_mode: setProjectAgentModeTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
     list_dispatch_reservations: listDispatchReservationsTool,
     release_dispatch_reservation: releaseDispatchReservationTool,
+    unpark_issue: unparkIssueTool,
   },
 });

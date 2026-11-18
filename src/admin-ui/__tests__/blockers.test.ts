@@ -1,43 +1,28 @@
-import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 import { blockersHtml, blockersScript } from "../pages/blockers.js";
+import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 type CapacityByMapping = Record<string, { used: number; cap: number; source: "reservations" }>;
 
-function escapeText(value: unknown): string {
-  return String(value == null ? "" : value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mountBlockers(fixtures: {
   ok?: boolean;
   reject?: boolean;
   totals?: { teams: number; issues: number; byReason: Record<string, number> };
   capacityByMapping?: CapacityByMapping | null;
-}): { win: any; doc: Document } {
-  const { ok = true, reject = false, totals = { teams: 0, issues: 0, byReason: {} }, capacityByMapping = {} } = fixtures;
-  const dom = new JSDOM(`<!DOCTYPE html><body>${blockersHtml}</body>`, {
-    runScripts: "dangerously",
-    url: "http://localhost/admin#blockers",
+  failedTrackers?: Array<{ provider: string; error: string }>;
+}) {
+  const { ok = true, reject = false, totals = { teams: 0, issues: 0, byReason: {} }, capacityByMapping = {}, failedTrackers = [] } = fixtures;
+  return mountAdminPage({
+    html: blockersHtml,
+    script: blockersScript,
+    route: "blockers",
+    api: async (url) => {
+      if (url !== "/api/blockers") return { ok: true, status: 200, json: async () => ({}) };
+      if (reject) throw new Error("network unavailable");
+      if (!ok) return { ok: false, status: 502, json: async () => ({ error: "upstream unavailable" }) };
+      return { ok: true, status: 200, json: async () => ({ blockers: [], totals, capacityByMapping, failedTrackers }) };
+    },
   });
-  const win = dom.window as any;
-  win.esc = escapeText;
-  win.escAttr = escapeText;
-  win.safeUrl = (value: unknown) => String(value == null ? "#" : value);
-  win.registerPage = () => {};
-  win.api = async (url: string) => {
-    if (url !== "/api/blockers") return { ok: true, status: 200, json: async () => ({}) };
-    if (reject) throw new Error("network unavailable");
-    if (!ok) return { ok: false, status: 502, json: async () => ({ error: "upstream unavailable" }) };
-    return { ok: true, status: 200, json: async () => ({ blockers: [], totals, capacityByMapping }) };
-  };
-  const script = dom.window.document.createElement("script");
-  script.textContent = blockersScript;
-  dom.window.document.head.appendChild(script);
-  return { win, doc: dom.window.document as Document };
 }
 
 describe("blockers page", () => {
@@ -110,5 +95,23 @@ describe("blockers page capacity projection (AII-797)", () => {
     await win.loadBlockers();
     expect((doc.getElementById("blockers-kpis") as HTMLElement).hidden).toBe(true);
     expect((doc.getElementById("blockers-error") as HTMLElement).textContent).toContain("Capacity data unavailable");
+  });
+});
+
+describe("blockers page with a tracker that did not answer (AII-1549)", () => {
+  it("names the tracker and its error beside the rows the others returned", async () => {
+    const { win, doc } = mountBlockers({ failedTrackers: [{ provider: "jira", error: "Jira search failed (500)" }] });
+    await win.loadBlockers();
+    const banner = doc.getElementById("blockers-partial") as HTMLElement;
+    expect(banner.hidden).toBe(false);
+    expect(banner.textContent).toContain("jira");
+    expect(banner.textContent).toContain("Jira search failed (500)");
+    expect((doc.getElementById("blockers-kpis") as HTMLElement).hidden).toBe(false);
+  });
+
+  it("shows no banner when every tracker answered", async () => {
+    const { win, doc } = mountBlockers({});
+    await win.loadBlockers();
+    expect((doc.getElementById("blockers-partial") as HTMLElement).hidden).toBe(true);
   });
 });

@@ -1,107 +1,46 @@
-// Shared setup for every Restate container test (AII-716). A test file under this
-// folder never declares its own container, variants, start/stop hooks, or fetch
-// helper — it imports them from here. See docs/restate.md § Testing for the rule.
-import { RestateContainer, RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
-import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } from "@restatedev/restate-sdk-testcontainers";
+// Shared setup for every Restate test (AII-716). A test file under this folder never
+// declares its own server, variants, start/stop hooks, or fetch helper — it imports them
+// from here. See docs/restate.md § Testing for the rule. Every environment is the
+// `restate-server` binary the product runs (AII-1195).
+import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import * as http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { accessSync, constants } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { startBinaryEnvironment } from "./binary-environment.js";
+import type { BinaryEnvironment, BinaryEnvironmentOptions } from "./binary-environment.js";
 
-// Pinned (not `latest`) to match the image cached by .github/workflows/unit-tests.yml's
-// restate-tests job (`RESTATE_IMAGE_TAG`), which keys its image cache on this same value.
-export const RESTATE_IMAGE_VERSION = "1.7.10";
+/** The environment type the scenario files import: the binary environment. */
+export type RestateEnvironment = BinaryEnvironment;
 
 type RestateServices = Array<
   ServiceDefinition<string, unknown> | VirtualObjectDefinition<string, unknown> | WorkflowDefinition<string, unknown>
 >;
 
 // Both variants are proven for AII-683: each environment boots the same services with
-// one of the two test options RestateTestEnvironment.start supports. RestateTestEnvironment
-// .start() only translates `alwaysReplay`/`disableRetries` into container config in its own
-// default container-factory branch — supplying a custom `container` factory (needed here to
-// pin the image version) bypasses that wiring, so each variant's factory must call the
-// corresponding RestateContainer method itself.
-export const VARIANTS = [
-  ["alwaysReplay", (container: RestateContainer) => container.alwaysReplay()],
-  ["disableRetries", (container: RestateContainer) => container.disableRetries()],
-] satisfies Array<[string, (container: RestateContainer) => RestateContainer]>;
+// one of the two server options (see startBinaryEnvironment's `variant`). Each entry is a
+// one-element tuple, `[label]`, which is the shape the scenario files destructure.
+export const VARIANTS = [["alwaysReplay"], ["disableRetries"]] as const satisfies ReadonlyArray<readonly ["alwaysReplay" | "disableRetries"]>;
 
-export type RestateTestRuntime = "container" | "binary";
-
-function containerRuntimeReachable(): boolean {
-  if (process.env.DOCKER_HOST) return true;
-  const candidates = [
-    "/var/run/docker.sock",
-    path.join(os.homedir(), ".docker", "run", "docker.sock"),
-    ...(process.env.XDG_RUNTIME_DIR ? [path.join(process.env.XDG_RUNTIME_DIR, "docker.sock")] : []),
-  ];
-  // The socket must be usable by this user: a runner mounts it but `coder` cannot open it.
-  return candidates.some((socket) => {
-    try {
-      accessSync(socket, constants.R_OK | constants.W_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  });
-}
-
-let loggedRuntime = false;
-
-/** `RESTATE_TEST_RUNTIME` wins when it is `container` or `binary`; otherwise the container
- * runtime when a container socket is usable (a synchronous probe of what testcontainers
- * looks for), else the `restate-server` binary. Logs the choice once per process. */
-export function restateTestRuntime(): RestateTestRuntime {
-  const forced = process.env.RESTATE_TEST_RUNTIME;
-  const runtime: RestateTestRuntime =
-    forced === "container" || forced === "binary" ? forced : containerRuntimeReachable() ? "container" : "binary";
-  if (!loggedRuntime) {
-    loggedRuntime = true;
-    console.error(`[restate-tests] runtime: ${runtime}${forced === runtime ? " (RESTATE_TEST_RUNTIME)" : ""}`);
-  }
-  return runtime;
-}
-
-// The binary environment implements only the members the scenario files use, so it is
-// typed as RestateTestEnvironment here and the scenario files compile unchanged.
-function asTestEnvironment(env: Awaited<ReturnType<typeof startBinaryEnvironment>>): RestateTestEnvironment {
-  return env as unknown as RestateTestEnvironment;
-}
-
-export async function startVariants(services: RestateServices): Promise<Map<string, RestateTestEnvironment>> {
-  const binary = restateTestRuntime() === "binary";
+export async function startVariants(
+  services: RestateServices,
+  options: Pick<BinaryEnvironmentOptions, "invokerTimeouts"> = {},
+): Promise<Map<string, RestateEnvironment>> {
   const started = await Promise.all(
-    VARIANTS.map(async ([label, configure]) => {
-      if (binary) return [label, asTestEnvironment(await startBinaryEnvironment({ services, variant: label as "alwaysReplay" | "disableRetries" }))] as const;
-      const env = await RestateTestEnvironment.start({
-        services,
-        container: () => configure(new RestateContainer(RESTATE_IMAGE_VERSION)),
-      });
-      return [label, env] as const;
-    }),
+    VARIANTS.map(async ([variant]) => [variant, await startBinaryEnvironment({ ...options, services, variant })] as const),
   );
   return new Map(started);
 }
 
-/** Fault-injection scenarios need the engine's normal retry policy. Disk storage
- * keeps the same journal across a restart of the pinned sidecar container. */
-export async function startRetryEnabled(services: RestateServices): Promise<RestateTestEnvironment> {
-  if (restateTestRuntime() === "binary") return asTestEnvironment(await startBinaryEnvironment({ services, storage: "disk" }));
-  return RestateTestEnvironment.start({
-    services,
-    storage: "disk",
-    container: () => new RestateContainer(RESTATE_IMAGE_VERSION),
-  });
+/** Fault-injection scenarios need the engine's normal retry policy. The binary keeps
+ * its journal on disk across a restart of the server. */
+export async function startRetryEnabled(services: RestateServices): Promise<RestateEnvironment> {
+  return startBinaryEnvironment({ services, storage: "disk" });
 }
 
-/** Replace only the SDK endpoint, keeping the Restate container and its journal.
- * A sidecar restart after this closes its old HTTP/2 sessions and reconnects to
+/** Replace only the SDK endpoint, keeping the Restate server and its journal.
+ * A server restart after this closes its old HTTP/2 sessions and reconnects to
  * the replacement endpoint at the same address. */
-export async function replaceEndpoint(env: RestateTestEnvironment, services: RestateServices): Promise<http2.Http2Server> {
+export async function replaceEndpoint(env: RestateEnvironment, services: RestateServices): Promise<http2.Http2Server> {
   const old = env.startedRestateHttpServer;
   const address = old.address() as AddressInfo;
   old.close();
@@ -113,7 +52,7 @@ export async function replaceEndpoint(env: RestateTestEnvironment, services: Res
   return replacement;
 }
 
-export async function stopAll(environments: Map<string, RestateTestEnvironment> | undefined): Promise<void> {
+export async function stopAll(environments: Map<string, RestateEnvironment> | undefined): Promise<void> {
   if (!environments) return;
   await Promise.all([...environments.values()].map((env) => env.stop()));
 }
@@ -188,6 +127,13 @@ export async function attachWorkflow<T>(baseUrl: string, workflow: string, key: 
   });
 }
 
+/** Waits for one invocation, by id, to complete; a failed invocation rejects. Used where the id comes from the admin query, not a workflow key. */
+export async function attachInvocation(baseUrl: string, invocationId: string): Promise<void> {
+  const response = await fetch(`${baseUrl}/restate/invocation/${invocationId}/attach`);
+  const text = await response.text();
+  if (!response.ok) throw new Error(`attach ${invocationId} failed: ${response.status} ${text}`);
+}
+
 /** Poll `read` until `accept` approves the value, and return that value. On timeout the
  *  error names `label` and prints the last value read, so a flake reads as a diagnosis
  *  rather than a bare assertion diff. State produced by a one-way send, a schedule, or a
@@ -227,10 +173,117 @@ export async function queryInvocations(adminBaseUrl: string, where: string): Pro
   return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
 }
 
+/**
+ * Waits until `count` invocations of `handler` matching `invokedBy` (a `sys_invocation` condition on the sender,
+ * for example `invoked_by_id = '<id>'`) exist, then attaches to each so the caller reads state only after they ran.
+ * A barrier call to the target does not order a send another invocation made; waiting on the send itself does.
+ */
+export async function awaitSentInvocations(
+  adminBaseUrl: string,
+  baseUrl: string,
+  target: { service: string; key: string; handler: string },
+  invokedBy: string,
+  count = 1,
+): Promise<number> {
+  const rows = await eventually(
+    () => queryInvocations(adminBaseUrl, `target_service_name = '${target.service}' AND target_service_key = '${target.key}' AND target_handler_name = '${target.handler}' AND ${invokedBy}`),
+    (found) => found.length >= count,
+    { label: `${count} ${target.service}/${target.handler} sent by ${invokedBy}` },
+  );
+  // An invocation that ended in failure (for example a refused `decide` answering 409) has still run: only completion matters here.
+  for (const row of rows) await attachInvocation(baseUrl, String(row.id)).catch(() => undefined);
+  return rows.length;
+}
+
+/** The full `sys_journal` rows of one invocation. A test that must prove a value is absent from the journal searches these. */
+export async function journalEntries(adminBaseUrl: string, invocationId: string): Promise<Array<Record<string, unknown>>> {
+  const response = await fetch(`${adminBaseUrl}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ query: `SELECT * FROM sys_journal WHERE id = '${invocationId}'` }),
+  });
+  if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
+  return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
+}
+
+/** The journal rows as searchable text: JSON as given, plus every byte array in it (Restate stores payloads as
+ *  `[123,34,...]`) decoded as UTF-8. A "this value is not in the journal" assertion searches this, not the raw JSON. */
+export function journalText(entries: Array<Record<string, unknown>>): string {
+  const parts: string[] = [];
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      if (value.length > 0 && value.every((n) => Number.isInteger(n) && (n as number) >= 0 && (n as number) < 256)) {
+        parts.push(Buffer.from(value as number[]).toString("utf8"));
+      } else {
+        value.forEach(visit);
+      }
+    } else if (value && typeof value === "object") {
+      Object.values(value).forEach(visit);
+    }
+  };
+  for (const entry of entries) {
+    parts.push(JSON.stringify(entry));
+    if (typeof entry.entry_json === "string") visit(JSON.parse(entry.entry_json));
+  }
+  return parts.join("\n");
+}
+
+/** The JSON value a named `ctx.run` step journaled: the `Run` command's completion id, matched to its completion notification. */
+export function journaledRunResult(entries: Array<Record<string, unknown>>, stepName: string): unknown {
+  const parsed = entries.map((e) => JSON.parse(String(e.entry_json ?? "null")) as Record<string, any> | null);
+  const command = parsed.find((e) => e?.Command?.Run?.name === stepName);
+  if (!command) throw new Error(`no journal entry for step ${stepName}`);
+  const completionId = command.Command.Run.completion_id;
+  const done = parsed.find((e) => e?.Notification?.Completion?.Run?.completion_id === completionId);
+  const success = done?.Notification?.Completion?.Run?.result?.Success as number[] | undefined;
+  if (!success) throw new Error(`step ${stepName} has no journaled success result`);
+  return success.length === 0 ? undefined : JSON.parse(Buffer.from(success).toString("utf8"));
+}
+
+/** The names of an invocation's journal entries, in journal order: `ctx.run` step names show the order a workflow ran its steps. */
+export async function journalEntryNames(adminBaseUrl: string, invocationId: string): Promise<string[]> {
+  const response = await fetch(`${adminBaseUrl}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ query: `SELECT name FROM sys_journal WHERE id = '${invocationId}'` }),
+  });
+  if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
+  const rows = ((await response.json()) as { rows: Array<{ name?: string | null }> }).rows;
+  return rows.map((r) => r.name ?? "").filter((n) => n !== "");
+}
+
 /** Cancels one invocation through the admin API (`PATCH /invocations/<id>/cancel`); `id` is a `sys_invocation` row id. */
 export async function cancelInvocation(adminBaseUrl: string, id: string): Promise<void> {
   const response = await fetch(`${adminBaseUrl}/invocations/${encodeURIComponent(id)}/cancel`, { method: "PATCH" });
   if (!response.ok) throw new Error(`cancel of invocation ${id} failed: HTTP ${response.status}`);
+}
+
+/** Cleanup cancellation: an invocation that finished since the last query may return HTTP 409. */
+export async function cancelInvocationIfLive(adminBaseUrl: string, id: string): Promise<void> {
+  const response = await fetch(`${adminBaseUrl}/invocations/${encodeURIComponent(id)}/cancel`, { method: "PATCH" });
+  if (!response.ok && response.status !== 409) throw new Error(`cancel of invocation ${id} failed: HTTP ${response.status}`);
+}
+
+/** Kills one invocation through the admin API (`PATCH /invocations/<id>/kill`): no `finally` runs and callers attached to it see a 409. */
+export async function killInvocation(adminBaseUrl: string, id: string): Promise<void> {
+  const response = await fetch(`${adminBaseUrl}/invocations/${encodeURIComponent(id)}/kill`, { method: "PATCH" });
+  if (!response.ok) throw new Error(`kill of invocation ${id} failed: HTTP ${response.status}`);
+}
+
+/** Overwrites one Virtual Object state entry through the admin API, to plant a marker shape an older release wrote. */
+export async function setObjectState(adminBaseUrl: string, service: string, key: string, stateKey: string, value: unknown): Promise<void> {
+  await setObjectStates(adminBaseUrl, service, key, { [stateKey]: value });
+}
+
+/** Replaces an object's whole state with these keys (the admin API's `new_state` is not a merge). */
+export async function setObjectStates(adminBaseUrl: string, service: string, key: string, state: Record<string, unknown>): Promise<void> {
+  const newState = Object.fromEntries(Object.entries(state).map(([k, v]) => [k, [...Buffer.from(JSON.stringify(v))]]));
+  const response = await fetch(`${adminBaseUrl}/services/${encodeURIComponent(service)}/state`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ object_key: key, new_state: newState }),
+  });
+  if (!response.ok) throw new Error(`state write for ${service}/${key} failed: HTTP ${response.status} ${await response.text()}`);
 }
 
 /** The one permitted wait: use it only before a NEGATIVE assertion ("nothing more

@@ -1,3 +1,4 @@
+import { keyBinding } from "./key-binding.js";
 // The SDK endpoint for the run lifecycle's durable-execution engine (ADR 017, ADR 018),
 // the `Operator` Virtual Object (AII-709), and the `orchestratorTools` service /mcp
 // discovers and calls tools through (AII-710). kg-refresh is migrated: `src/index.ts`
@@ -15,6 +16,11 @@ import type {
 import { RESTATE_ADMIN_BASE_URL } from "./server.js";
 import { operatorObject } from "./operator-object.js";
 import { orchestratorTools } from "./tools.js";
+import { runnerBackend } from "./runner-backend.js";
+import { chatGptPlanAccount } from "./chatgpt-plan-account.js";
+import { modelPrices } from "./model-prices.js";
+import { accessBinding } from "./access-binding.js";
+import { setupChecks } from "./setup-checks.js";
 
 export type RestateService =
   | ServiceDefinition<string, unknown>
@@ -23,8 +29,8 @@ export type RestateService =
 
 // `Operator` (AII-709) is the first bound object, `orchestratorTools` (AII-710) the first
 // bound service; a run kind's workflow module joins them here once one migrates (ADR 018
-// case 1: kg-refresh).
-export const RESTATE_SERVICES: RestateService[] = [operatorObject, orchestratorTools];
+// case 1: kg-refresh); the `PlanningRun` and `ImplementationRun` workflows are passed in by `src/index.ts`. `ChatGptPlanAccount` (AII-1200) refreshes hosted ChatGPT plan tokens.
+export const RESTATE_SERVICES: RestateService[] = [keyBinding, operatorObject, orchestratorTools, runnerBackend, chatGptPlanAccount, accessBinding, modelPrices, setupChecks];
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9080;
@@ -98,6 +104,7 @@ export type QueryNonCompletedInvocations = (
   fetchImpl: typeof fetch,
   adminBaseUrl: string,
   uri: string,
+  excludeInvocationId?: string,
 ) => Promise<number | null>;
 
 /** For testing: override the admin API base URL, the fetch implementation, and the drain check. */
@@ -116,7 +123,7 @@ interface IntrospectionRow {
   [column: string]: unknown;
 }
 
-async function runIntrospectionQuery(
+export async function runIntrospectionQuery(
   fetchImpl: typeof fetch,
   adminBaseUrl: string,
   sql: string,
@@ -137,7 +144,22 @@ async function runIntrospectionQuery(
   return body.rows as IntrospectionRow[];
 }
 
-function sqlQuote(value: string): string {
+/**
+ * Purges one completed invocation (journal and all) through the admin API
+ * (`PATCH /invocations/{id}/purge`, restate-server 1.7.10). A 404/409 means it is already gone
+ * or not purgeable-as-completed; both are treated as done so callers stay idempotent.
+ */
+export async function purgeInvocation(fetchImpl: typeof fetch, adminBaseUrl: string, invocationId: string): Promise<void> {
+  const response = await fetchImpl(`${adminBaseUrl}/invocations/${encodeURIComponent(invocationId)}/purge`, {
+    method: "PATCH",
+    signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
+  });
+  if (!response.ok && response.status !== 404 && response.status !== 409) {
+    throw new Error(`admin API purge of ${invocationId} failed: HTTP ${response.status}`);
+  }
+}
+
+export function sqlQuote(value: string): string {
   return value.replace(/'/g, "''");
 }
 
@@ -148,8 +170,8 @@ function sqlQuote(value: string): string {
  * this repo already depends on): `POST {adminBaseUrl}/query` with an `Accept: application/json`
  * header runs a DataFusion SQL statement over the server's introspection tables and answers
  * `{ rows: [...] }` as plain JSON — omitting that header answers Arrow IPC instead, which would
- * need `apache-arrow`, an undeclared transitive dependency (pulled in only by the testcontainers
- * devDependency) this production module has no business on.
+ * need `apache-arrow`, an undeclared transitive dependency (once pulled in only by a
+ * since-removed test devDependency) this production module has no business on.
  *
  * `sys_deployment.endpoint` holds the registered URI with a trailing slash this module's own
  * `uri` never carries, so both forms are matched. Restate 1.7.10 does not always set
@@ -162,8 +184,8 @@ function sqlQuote(value: string): string {
  * comparison rather than an enumerated allowlist. `scheduled` is deliberately excluded: it is
  * a delayed send whose timer has not fired, so it has no journal and no pinned deployment, and
  * when it fires it starts as a new invocation on whichever deployment then serves the service.
- * Counting it would hold a deploy for the whole delay — `KgRepo.expire` is scheduled
- * 4 h 10 min out on every refresh trigger (AII-1031). Persistent Virtual Object state lives in the separate
+ * Counting it would hold a deploy for the whole delay (AII-1031). A suspended `KgRepo.watch`
+ * is not scheduled but non-completed, so it counts: a live or paused refresh holds the drain (AII-1297). Persistent Virtual Object state lives in the separate
  * `state` table and never appears in `sys_invocation`, so it is never counted — durable state
  * alone is not active work (AII-721).
  *
@@ -175,6 +197,7 @@ export async function queryNonCompletedInvocations(
   fetchImpl: typeof fetch,
   adminBaseUrl: string,
   uri: string,
+  excludeInvocationId?: string,
 ): Promise<number | null> {
   try {
     const normalized = uri.replace(/\/+$/, "");
@@ -184,7 +207,8 @@ export async function queryNonCompletedInvocations(
     const rows = await runIntrospectionQuery(
       fetchImpl,
       adminBaseUrl,
-      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND status != 'scheduled' AND (" +
+      (excludeInvocationId ? `SELECT COUNT(*) AS count FROM sys_invocation WHERE id != '${sqlQuote(excludeInvocationId)}' AND ` : "SELECT COUNT(*) AS count FROM sys_invocation WHERE ") +
+      "status != 'completed' AND status != 'scheduled' AND (" +
         `pinned_deployment_id IN ${oldDeployments} OR ` +
         `last_attempt_deployment_id IN ${oldDeployments} OR ` +
         "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +
@@ -208,8 +232,9 @@ export async function queryNonCompletedInvocations(
  * replacement with active invocations could strand their journals. The deploy
  * interlock normally drains them first; a caller that finds registration
  * declined should retry on a timer (createRestateRegistrationGate, src/index.ts).
- * Every path is logged once. Boot never fails on the result: the kg-refresh trigger seam
- * (AII-683) answers 503 restate-unavailable while no successful registration has completed.
+ * Every path is logged once. Boot waits for successful registration and its hook;
+ * unreachable is fatal, while declined conflicts retry. Per-call checks still answer
+ * 503 restate-unavailable during the boot wait and runtime transients.
  */
 export async function register(deps: RegisterDeps = {}): Promise<RestateRegisterResult> {
   const adminBaseUrl = deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL;

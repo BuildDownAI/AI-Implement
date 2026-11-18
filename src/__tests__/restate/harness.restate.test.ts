@@ -1,13 +1,13 @@
-// Restate harness (AII-612): boots RestateTestEnvironment and proves the durable-execution
+// Restate harness (AII-612): boots the binary Restate environment and proves the durable-execution
 // engine works end to end before any run kind migrates onto it (ADR 017, ADR 018). No live
 // callback URL or credential is used anywhere here — the suite setup
 // (src/__tests__/setup/clear-runner-credentials.ts) clears RUN_TOKEN, RUNNER_CALLBACK_URL,
 // and RUN_PROGRESS_TOKEN before every test (AII-567).
 //
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate`; excluded from `npm test`.
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
-import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { VARIANTS, callService, callWorkflow, gate, settle, startVariants, stopAll, waitForStep } from "./harness.js";
 
@@ -140,7 +140,7 @@ const gatedWorkflow = restate.workflow({
 });
 
 describe("Restate harness", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
 
   beforeAll(async () => {
     environments = await startVariants([echoService, probeWorkflow, gatedWorkflow]);

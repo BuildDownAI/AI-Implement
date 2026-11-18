@@ -1,6 +1,6 @@
 # 031. Control review-fix attempts with Restate
 
-**Status:** Accepted — design approved on 2026-09-24; live pilot evaluation pending.
+**Status:** Accepted — design approved on 2026-09-24; amended on 2026-11-07 to require Restate.
 **Date:** 2026-09-24
 **References:** ADR 018, ADR 026, ADR 027, ADR 028; [pilot research](../research/2026-09-23-restate-review-fix-explained.md)
 
@@ -36,8 +36,8 @@ The following defaults were approved with the architecture at Gate 1 on 2026-09-
 
 | Situation | Required behavior |
 | --- | --- |
-| Duplicate authenticated event | One durable delivery record and one application of findings. |
-| Restate unavailable | Keep accepted feedback pending in SQLite; retry delivery. Never acknowledge data held only in process memory. |
+| Duplicate authenticated event | One application of findings; Restate ingress absorbs a repeated sender event id. |
+| Restate unavailable | Restate ingress with the sender's event id: answer the sender non-2xx so the redelivery sweep or a manual redelivery retries under the same id. Never acknowledge data held only in process memory. |
 | Invalid webhook or unavailable SQLite | Reject acceptance. Do not claim durability. Failed GitHub delivery requires the documented redelivery path. |
 | Feedback burst | Check after a fixed five-second coalescing window. Later arrivals do not extend the window indefinitely. |
 | PR already active, capacity full, or project paused | Preserve pending feedback. Do not create another runner. |
@@ -117,3 +117,38 @@ Rollback stops new Restate admissions and drains owned work before routing new w
 Operators can see which system owns an attempt and why it waits. The pilot favors an explicit blocked state over an uncertain second execution.
 
 An unknown launch or unconfirmed termination can hold capacity and delay incompatible deployment. Evidence collection adds a runner-to-orchestrator contract and requires bounded storage. The operating defaults above were approved at Gate 1 on 2026-09-24.
+
+## Amendment (2026-10-09): admission is the one atomic SQLite step; every other write projects a journaled value
+
+Admission stays one atomic SQLite step. Legacy and Restate owners share `dispatch_admissions` (`acquireGapfillAdmission` in `src/index.ts`), so only an atomic SQLite reservation can arbitrate between them; `store.admit` computes the attempt id, `deadlineAt`, the task snapshot and the reservation inside one transaction. Every other review-fix write is a projection of a journaled value: the workflow reads `ctx.date.now()` and passes it through the step's input, and the store writes the value it receives (`completed_at`, `result_conflict_at`, `authority_revoked_at`). The step-by-step table is in `docs/restate-feature-map.md` § 2.1.
+
+## Amendment (2026-10-10): the delivery mechanism is Restate ingress with the sender's event id
+
+The SQLite delivery record (`review_fix_inbox`, AII-781) and its pump (AII-802) are retired (AII-1187). Feedback, runner results and cancellations now go straight to Restate ingress, each keyed by the sender's event id: the GitHub delivery id, the attempt result key, and the cancel keys. The drain's periodic nudge uses the same client with a `<queue id>.<event id>.<30 s bucket>` key. The operating-contract rows for a duplicate event and for Restate being unavailable read accordingly.
+
+The reason for the inbox, "GitHub does not automatically redeliver a failed webhook", is answered two ways. The redelivery sweep (AII-1178) redelivers failed GitHub App webhook deliveries once Restate registers, and the one-route pattern (ADR 023 amendment, 2026-09-29) lets the route answer non-2xx without holding data only in memory. Validated review events are still committed to the SQLite event/finding queue before the forward, so no accepted data is lost. Existing `review_fix_inbox` tables are left in place for history, as this ADR requires of SQLite records; nothing creates, reads or drops them.
+
+## Amendment (2026-11-07): Restate is the only review-fix owner
+
+**Decision.** The operator requires Restate as the only review-fix owner on every backend. In [Gates, Not Inspectors](https://linear.app/eudoxus/project/gates-not-inspectors-85011c2b1f67), the per-project switch (`reviewFixLifecycle`) is being removed, and the Legacy review-fix path is being removed. Stage 2 cuts review fix over to Restate on GitHub Actions, Fly Machines and local Docker. Stage 3 deletes the Legacy drain and the switch. This supersedes the Legacy default, optional project rollout, local-execution exclusion and rollback-to-Legacy policy above; it records scheduled changes, not completed removal or a successful live pilot evaluation.
+
+**Rejection reasons re-checked (standing rule 3).**
+
+| Alternative and quoted reason | Assessment and evidence |
+| --- | --- |
+| Relaunch after an uncertain response: “The pilot first reconciles the original execution instead of knowingly admitting duplicate launches.” | **still holds** — The required-owner decision does not establish whether an uncertain external launch executed, so reconciliation remains necessary. |
+| Release capacity before termination: “GitHub can still be running the cancelled execution.” | **still holds** — Stage 2 changes ownership on all backends but does not make a cancellation request proof of external termination. |
+| One global lifecycle switch: “A project setting permits an isolated rollout while other projects continue on Legacy.” | **no longer holds** — The operator requires Restate for every project and backend, so neither a project switch nor a global owner switch is part of the end state. |
+| Keep multiple endpoint versions (deferred): “It adds infrastructure to the first run-lifecycle pilot.” | **no longer holds** — ADR 018's 2026-10-01 amendment records two migrations and closes the evaluation gate, so the first-pilot scope no longer justifies deferral; this decision adds no endpoint-version infrastructure. |
+| Keep only cycle summaries and GitHub log links: “An investigation needs retained activity and explicit evidence gaps.” | **still holds** — Required Restate ownership does not replace the retained activity and explicit evidence gaps required by the evidence contract above. |
+| Begin the next migration after CI and one live success: “It omits restart recovery and the agreed operating observation period.” | **no longer holds** — ADR 018's 2026-09-28 and 2026-10-01 amendments explicitly permit further migrations on integrated evidence without that live-evaluation gate. |
+| Reject feedback whenever Restate is down: “GitHub does not automatically redeliver a failed webhook. A durable delivery record preserves accepted events across a sidecar outage.” | **no longer holds** — The 2026-10-10 amendment replaces the SQLite inbox with Restate ingress and the failed-delivery sweep, allowing non-2xx responses and redelivery under the sender's event id. |
+| Infer approval from GitHub success: “A successful execution does not establish the runner's review result.” | **still holds** — The valid-result approval contract above remains required regardless of lifecycle owner or backend. |
+
+**Rollback.** Revert this documentation amendment; the Stage 2 and Stage 3 implementation changes carry their own rollout and recovery contracts.
+
+## Amendment (2026-11-09): admit non-managed review-fix on Fly and local Docker
+
+AII-1336 implements the admission slice of AII-1308 branch 3, using the backend identity tree from AII-1332 (stored backend) and AII-1334 (backend-neutral results and publication). Eligible non-managed Restate projects can now admit on Fly Machines with a sessions token and app, or on local Docker with a configured image. Both require a non-Bedrock provider. GitHub Actions, including shadow mode's authoritative path, retains its workflow capability probe; every backend retains installation, open-PR and callback checks. Filesystem projects require local runner mode and otherwise have their queue row skipped.
+
+Under standing rule 3, this supersedes “additional execution backends” remaining outside the pilot and “Unsupported local execution remains on its existing path” for this admission slice. It implements part of the November 7 required-owner decision, without removing the lifecycle switch or Legacy drain. Managed Fly/local admission remains deferred as `managed_backend_unsupported` until AII-1770. Managed GHA admission, transport, uncertainty and existing shadow behavior remain unchanged. Admin saving, attempt display and budget parking remain AII-1766, AII-1767 and AII-1765 respectively. Live backend proof and deployment remain gated by AII-1338/1775; this amendment authorizes no live settings or credential adoption and no broader D10 release.

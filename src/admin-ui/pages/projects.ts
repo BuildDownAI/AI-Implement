@@ -72,6 +72,7 @@ export const projectsHtml = `
         <button type="button" class="btn btn-sm" data-md-tab="capacity" onclick="switchMappingTab('capacity')">Capacity</button>
         <button type="button" class="btn btn-sm" data-md-tab="guardrails" onclick="switchMappingTab('guardrails')">Guardrails</button>
         <button type="button" class="btn btn-sm" data-md-tab="provider" onclick="switchMappingTab('provider')">Provider</button>
+        <button type="button" class="btn btn-sm" data-md-tab="agents" id="md-tab-agents" onclick="switchMappingTab('agents')">Agents</button>
       </span>
     </div>
     <div class="md-body">
@@ -266,7 +267,7 @@ export const projectsHtml = `
               </select>
             </div>
           </div>
-          <div id="md-fly-fields" class="hidden" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div id="md-fly-fields" class="hidden" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
             <div class="field">
               <label class="field-label">CPUs</label>
               <input class="input" id="md-cpus" type="number" min="1" value="2">
@@ -275,14 +276,29 @@ export const projectsHtml = `
               <label class="field-label">Memory (MB)</label>
               <input class="input" id="md-mem" type="number" min="256" step="256" value="4096">
             </div>
+            <div class="field">
+              <label class="field-label" for="md-cpu-kind">CPU kind</label>
+              <select class="select" id="md-cpu-kind">
+                <option value="shared">shared</option>
+                <option value="performance">performance</option>
+              </select>
+              <div class="field-hint">Fly limits a shared CPU. Use performance for a project whose tests use the CPU for more than some minutes. Performance needs 2048 MB or more for each CPU.</div>
+            </div>
           </div>
           <div class="field">
-            <label class="field-label">Review-fix &amp; Planning Lifecycle</label>
-            <select class="select" id="md-review-fix-lifecycle">
-              <option value="legacy">Legacy</option>
-              <option value="restate">Restate (pilot)</option>
+            <label class="field-label">Review process</label>
+            <select class="select" id="md-review-process">
+              <option value="ai-implement">AI-Implement</option>
+              <option value="claude-code-review">Claude Code Review</option>
+              <option value="codex-code-review">Codex Code Review</option>
+              <option value="claude-code-review-repository-fix">Claude Code Review, repository auto-fix</option>
             </select>
-            <div class="field-hint">Also selects the planning lifecycle: with Restate, each planning dispatch (any backend) is owned by a PlanningRun workflow with a deadline. Coordinates this project's automatic GitHub Actions review-fix runs. Local review-fix (the dev harness) and human comment-triggered gap-fill runs always stay on Legacy regardless of this selection &mdash; this control cannot move those paths to Restate. Changing this does not cancel or migrate anything already in flight: an attempt already dispatched keeps the lifecycle that dispatched it, and only future automatic dispatches follow the new selection. Restate needs the current workflow file in the target repo (use Sync workflows and merge its PR) and the GitHub Actions execution mode.</div>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Applies to every project; Restate coordinates AI-Implement fix attempts on every backend.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Trusted Review Authors</label>
+            <textarea class="textarea" id="md-trusted-review-authors" rows="3" placeholder="topia-ai-implement-bot[bot]"></textarea>
+            <div class="field-hint">Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.</div>
           </div>
           <div class="field">
             <label class="field-label">Extra Env</label>
@@ -327,7 +343,7 @@ export const projectsHtml = `
           <div class="field">
             <label class="field-label">Job Timeout (min)</label>
             <input class="input" id="md-max-job-min" type="number" min="1" step="1" placeholder="90">
-            <div class="field-hint">GitHub Actions only. Blank = 90.</div>
+            <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
           </div>
         </div>
       </div>
@@ -383,6 +399,20 @@ export const projectsHtml = `
               <input class="input mono" id="md-planning-wf" value="claude-plan.yml">
             </div>
           </div>
+        </div>
+      </div>
+      <div data-md-panel="agents" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Agents</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 12px">Each field inherits the orchestrator default or overrides it for this project only. Legacy runs ignore these overrides until the project becomes configured.</p>
+        <div id="md-agents-new" class="field-hint hidden">Save the mapping first. Agent settings attach to an existing project key.</div>
+        <div id="md-agents-body">
+          <div id="md-agents-mode" class="field-hint"></div>
+          <div id="md-agents-profiles" style="margin:12px 0"></div>
+          <div id="md-agents-stages"></div>
+          <div class="field-hint" style="margin-top:12px">Changes apply to the next run only; runs already in flight keep their settings. Prompts and review rules stay in the repository, and there is no per-issue override. Agent settings are saved with their own button, separately from the mapping.</div>
+          <div id="md-agents-error" class="error hidden" role="alert" style="margin-top:10px"></div>
+          <div id="md-agents-ok" class="field-hint hidden" style="margin-top:10px"></div>
+          <div style="margin-top:12px"><button type="button" id="md-agents-save" class="btn btn-accent" onclick="saveAgentConfig()">Save agent settings</button></div>
         </div>
       </div>
     </div>
@@ -751,6 +781,321 @@ export const projectsScript = `
     return refRepoDraft.length ? refRepoDraft : null;
   }
 
+
+  // ---- Agents tab: mode and inherited stage settings (AII-968) ----
+  var AG_STAGES = ['planning', 'implementation', 'review'];
+  var AG_FIELDS = ['agent', 'provider', 'model', 'fallbackModel', 'accountProfileId', 'invocationTimeoutMs'];
+  var AG_LABELS = { agent: 'Agent', provider: 'Provider', model: 'Model', fallbackModel: 'Fallback model', accountProfileId: 'Account profile', invocationTimeoutMs: 'Invocation timeout (ms)' };
+  var AG_ERRORS = {
+    resolution_failed: 'These settings do not resolve to a usable configuration. Check that every stage has an agent, provider, model, profile and timeout.',
+    readiness_unavailable: 'Readiness could not be checked right now. Nothing was changed; try again later.',
+    stale_inputs: 'Defaults, a profile or this project changed while saving. The view was refreshed; review it and save again.',
+    runner_incompatible: 'The project runner is not compatible with configured agents yet.',
+    retired_workflow_present: 'The project still carries a retired workflow file.',
+    delivery_unreadable: 'The workflow files could not be read. Run the workflow sync and try again.'
+  };
+  var agentState = null;
+  var agentLoadPromise = Promise.resolve();
+
+  function agText(v) { return v === undefined || v === null ? '' : String(v); }
+
+  function agStoredValue(stage, field) {
+    var st = agentState.stored[stage];
+    var v = st ? st[field] : undefined;
+    return v === undefined || v === null ? undefined : v;
+  }
+
+  function agDefaultValue(stage, field) {
+    var st = agentState.defaults[stage];
+    var v = st ? st[field] : undefined;
+    return v === undefined || v === null ? undefined : v;
+  }
+
+  function agDraft(stage, field) { return agentState.draft[stage][field]; }
+
+  function agEffective(stage, field) {
+    var d = agDraft(stage, field);
+    if (d.mode === 'override' && agText(d.value) !== '') return { value: d.value, source: 'project' };
+    var dv = agDefaultValue(stage, field);
+    return dv === undefined ? { value: undefined, source: 'unset' } : { value: dv, source: 'orchestrator default' };
+  }
+
+  function agEligibleProfiles(stage) {
+    var agent = agEffective(stage, 'agent').value;
+    var provider = agEffective(stage, 'provider').value;
+    return agentState.accounts.filter(function (a) {
+      return a.profileStatus === 'active'
+        && a.agent === agent && a.provider === provider;
+    });
+  }
+
+  function agStageProblem(stage) {
+    var profile = agEffective(stage, 'accountProfileId').value;
+    if (profile === undefined) return 'No account profile is selected for ' + stage + '.';
+    var ok = agEligibleProfiles(stage).some(function (a) { return a.profileId === profile; });
+    return ok ? '' : 'The profile for ' + stage + ' is not active, or does not match the agent and provider.';
+  }
+
+  function agPreviewText(stage, field) {
+    var e = agEffective(stage, field);
+    return 'Effective: ' + (e.value === undefined ? 'not set' : String(e.value)) + ' (source: ' + e.source + ')';
+  }
+
+  function agValueControl(stage, field) {
+    var d = agDraft(stage, field);
+    var dis = d.mode === 'inherit' ? ' disabled' : '';
+    var attrs = ' data-ag-value data-stage="' + window.escAttr(stage) + '" data-field="' + window.escAttr(field) + '" aria-label="' + window.escAttr(AG_LABELS[field] + ' for ' + stage) + '"' + dis;
+    if (field === 'agent' || field === 'provider') {
+      var opts = field === 'agent' ? ['claude', 'codex'] : ['anthropic', 'bedrock', 'openai', 'openrouter'];
+      var shown = d.mode === 'inherit' ? agText(agDefaultValue(stage, field)) : agText(d.value);
+      return '<select class="select"' + attrs + '><option value=""' + (opts.indexOf(shown) === -1 ? ' selected' : '') + ' disabled>Inherited</option>' + opts.map(function (o) {
+        return '<option value="' + window.escAttr(o) + '"' + (shown === o ? ' selected' : '') + '>' + window.esc(o) + '</option>';
+      }).join('') + '</select>';
+    }
+    if (field === 'accountProfileId') {
+      var eligible = agEligibleProfiles(stage);
+      var html = '<select class="select"' + attrs + '><option value=""></option>';
+      html += eligible.map(function (a) {
+        return '<option value="' + window.escAttr(a.profileId) + '"' + (String(d.value) === a.profileId ? ' selected' : '') + '>' + window.esc(a.identity + ' (' + a.profileId + ')') + '</option>';
+      }).join('');
+      return html + '</select>';
+    }
+    return '<input class="input mono"' + (field === 'invocationTimeoutMs' ? ' inputmode="numeric"' : '') + attrs + ' value="' + window.escAttr(agText(d.value)) + '">';
+  }
+
+  function agRenderProfiles() {
+    var el = document.getElementById('md-agents-profiles');
+    var rows = agentState.accounts.filter(function (a) {
+      return a.profileStatus === 'active';
+    });
+    if (!rows.length) {
+      el.innerHTML = '<div class="field-hint">No active account profile exists. Add one under model accounts first.</div>';
+      return;
+    }
+    el.innerHTML = '<div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:6px">Active account profiles</div>' + rows.map(function (a) {
+      var acct = a.account || {};
+      var line = a.identity + ' (' + a.profileId + ') · ' + a.agent + '/' + a.provider + ' · ' + a.authMode + ' · readiness: ' + agText(acct.readiness || 'unknown');
+      if (acct.failureCode) line += ' (' + acct.failureCode + ')';
+      return '<div class="field-hint" data-ag-profile="' + window.escAttr(a.profileId) + '">' + window.esc(line) + '</div>';
+    }).join('');
+  }
+
+  function agRender() {
+    if (!agentState) return;
+    document.getElementById('md-agents-mode').textContent = 'Mode: ' + agentState.mode + '. An admin changes it with the tool set_project_agent_mode.';
+    agRenderProfiles();
+    document.getElementById('md-agents-stages').innerHTML = AG_STAGES.map(function (stage) {
+      var rows = AG_FIELDS.map(function (field) {
+        var d = agDraft(stage, field);
+        var sel = '<select class="select" data-ag-mode data-stage="' + window.escAttr(stage) + '" data-field="' + window.escAttr(field) + '" aria-label="' + window.escAttr(AG_LABELS[field] + ' mode for ' + stage) + '">'
+          + '<option value="inherit"' + (d.mode === 'inherit' ? ' selected' : '') + '>Inherit</option>'
+          + '<option value="override"' + (d.mode === 'override' ? ' selected' : '') + '>Override</option></select>';
+        return '<div style="display:grid;grid-template-columns:150px 110px 1fr;gap:8px;align-items:center;margin-bottom:6px">'
+          + '<label class="field-label" style="margin:0">' + window.esc(AG_LABELS[field]) + '</label>' + sel
+          + '<div>' + agValueControl(stage, field) + (field === 'fallbackModel' ? '<div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div>' : '') + '<div class="field-hint" data-ag-preview="' + window.escAttr(stage + '.' + field) + '">' + window.esc(agPreviewText(stage, field)) + '</div></div></div>';
+      }).join('');
+      if (stage === 'implementation') rows += '<label><input type="checkbox" id="md-agents-open-model"' + (agentState.preferOpenModel ? ' checked' : '') + '> Use the open model for implementation</label><div class="field-hint">Not active yet. The value is saved, and no run uses it.</div>';
+      var problem = agStageProblem(stage);
+      return '<div style="margin-bottom:14px"><div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:8px">' + window.esc(stage) + '</div>' + rows
+        + (problem ? '<div class="field-hint" data-ag-problem="' + window.escAttr(stage) + '">' + window.esc(problem) + '</div>' : '') + '</div>';
+    }).join('');
+  }
+
+  function agUpdatePreviews() {
+    for (var i = 0; i < AG_STAGES.length; i++) {
+      for (var j = 0; j < AG_FIELDS.length; j++) {
+        var el = document.querySelector('[data-ag-preview="' + AG_STAGES[i] + '.' + AG_FIELDS[j] + '"]');
+        if (el) el.textContent = agPreviewText(AG_STAGES[i], AG_FIELDS[j]);
+      }
+    }
+  }
+
+  function agBuildState(key, cfg, defaults, accounts) {
+    var stored = (cfg && cfg.stages && typeof cfg.stages === 'object') ? cfg.stages : {};
+    var defs = (defaults && defaults.stages && typeof defaults.stages === 'object') ? defaults.stages : {};
+    agentState = { key: key, mode: cfg && cfg.mode === 'configured' ? 'configured' : 'legacy', stored: stored, defaults: defs, accounts: Array.isArray(accounts) ? accounts : [], draft: {} };
+    agentState.preferOpenModel = !!(stored.implementation && stored.implementation.preferOpenModel);
+    AG_STAGES.forEach(function (stage) {
+      agentState.draft[stage] = {};
+      AG_FIELDS.forEach(function (field) {
+        var v = agStoredValue(stage, field);
+        agentState.draft[stage][field] = v === undefined ? { mode: 'inherit', value: '' } : { mode: 'override', value: v };
+      });
+    });
+  }
+
+  async function agFetchJson(url) {
+    var res = await window.api(url);
+    if (!res.ok) throw new Error('http ' + res.status);
+    return res.json();
+  }
+
+  function agShowLoadError() {
+    agentState = null;
+    var err = document.getElementById('md-agents-error');
+    err.textContent = 'Agent settings could not be loaded. Close and reopen the project to retry.';
+    err.classList.remove('hidden');
+    document.getElementById('md-agents-save').disabled = true;
+  }
+
+  async function loadAgentConfig(key) {
+    agentState = null;
+    document.getElementById('md-agents-stages').innerHTML = '';
+    document.getElementById('md-agents-profiles').innerHTML = '';
+    var err = document.getElementById('md-agents-error');
+    err.classList.add('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+    document.getElementById('md-agents-save').disabled = true;
+    try {
+      var results = await Promise.all([
+        agFetchJson('/api/mappings/' + encodeURIComponent(key) + '/agent-config'),
+        agFetchJson('/api/agent-defaults'),
+        agFetchJson('/api/model-accounts')
+      ]);
+      if (document.getElementById('md-team-key-orig').value !== key) return;
+      agBuildState(key, results[0], results[1], results[2].accounts);
+      document.getElementById('md-agents-save').disabled = false;
+      agRender();
+    } catch (_) {
+      if (document.getElementById('md-team-key-orig').value === key) agShowLoadError();
+    }
+  }
+  window.loadAgentConfig = loadAgentConfig;
+  window.agentConfigLoaded = function () { return agentLoadPromise; };
+
+  function agDiff() {
+    var body = {};
+    var stages = {};
+    AG_STAGES.forEach(function (stage) {
+      AG_FIELDS.forEach(function (field) {
+        var d = agDraft(stage, field);
+        var stored = agStoredValue(stage, field);
+        var next;
+        if (d.mode === 'inherit') {
+          if (stored === undefined) return;
+          next = null;
+        } else {
+          next = field === 'invocationTimeoutMs' ? Number(d.value) : String(d.value).trim();
+          if (stored === next) return;
+        }
+        stages[stage] = stages[stage] || {};
+        stages[stage][field] = next;
+      });
+    });
+    if (agentState.preferOpenModel !== !!agStoredValue('implementation', 'preferOpenModel')) {
+      stages.implementation = stages.implementation || {};
+      stages.implementation.preferOpenModel = agentState.preferOpenModel;
+    }
+    if (Object.keys(stages).length) body.stages = stages;
+    return body;
+  }
+
+  function agOverrideProblem() {
+    for (var i = 0; i < AG_STAGES.length; i++) {
+      for (var j = 0; j < AG_FIELDS.length; j++) {
+        var d = agDraft(AG_STAGES[i], AG_FIELDS[j]);
+        if (d.mode !== 'override') continue;
+        var raw = String(d.value == null ? '' : d.value).trim();
+        if (AG_FIELDS[j] === 'invocationTimeoutMs') {
+          var n = Number(raw);
+          if (!raw || !Number.isInteger(n) || n <= 0) return AG_STAGES[i] + ': ' + AG_LABELS[AG_FIELDS[j]] + ' must be a positive whole number, or switch it to Inherit.';
+        } else if (!raw) {
+          return AG_STAGES[i] + ': ' + AG_LABELS[AG_FIELDS[j]] + ' is blank. Enter a value or switch it to Inherit.';
+        }
+      }
+    }
+    return '';
+  }
+
+  function agShowError(message) {
+    var err = document.getElementById('md-agents-error');
+    err.textContent = message;
+    err.classList.remove('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+  }
+
+  async function saveAgentConfig() {
+    if (!agentState) return;
+    var key = agentState.key;
+    var saveBtn = document.getElementById('md-agents-save');
+    if (saveBtn.disabled) return;
+    document.getElementById('md-agents-error').classList.add('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+    var overrideProblem = agOverrideProblem();
+    if (overrideProblem) { agShowError(overrideProblem); return; }
+    var body = agDiff();
+    if (!Object.keys(body).length) { agShowError('Nothing to save: no agent setting changed.'); return; }
+    saveBtn.disabled = true;
+    var res, data = {};
+    try {
+      res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/agent-config', { method: 'PUT', body: JSON.stringify(body) });
+      try { data = await res.json(); } catch (_) {}
+    } catch (_) {
+      saveBtn.disabled = false;
+      agRender();
+      agShowError('Could not confirm the save. Reload and check the project before retrying.');
+      return;
+    }
+    saveBtn.disabled = false;
+    if (!res.ok) {
+      var code = data && typeof data.code === 'string' ? data.code : '';
+      var msg = AG_ERRORS[code]
+        || (data && typeof data.error === 'string' ? data.error : (res.status === 400 ? AG_ERRORS.resolution_failed : 'Could not save agent settings (HTTP ' + res.status + ').'));
+      if (code === 'stale_inputs') await loadAgentConfig(key);
+      else agRender();
+      agShowError(msg + (data && typeof data.action === 'string' ? ' ' + data.action : ''));
+      return;
+    }
+    await loadAgentConfig(key);
+    var ok = document.getElementById('md-agents-ok');
+    ok.textContent = 'Agent settings saved. They apply to the next run.';
+    ok.classList.remove('hidden');
+  }
+  window.saveAgentConfig = saveAgentConfig;
+
+  function agPrepareTab(isNew, key) {
+    var tab = document.getElementById('md-tab-agents');
+    tab.disabled = isNew;
+    document.getElementById('md-agents-new').classList.toggle('hidden', !isNew);
+    document.getElementById('md-agents-body').classList.toggle('hidden', isNew);
+    agentState = null;
+    agentLoadPromise = isNew ? Promise.resolve() : loadAgentConfig(key);
+  }
+
+  (function wireAgentPanel() {
+    var panel = document.getElementById('md-agents-body');
+    if (!panel) return;
+    panel.addEventListener('change', function (ev) {
+      if (!agentState) return;
+      var t = ev.target;
+      if (t.id === 'md-agents-open-model') {
+        agentState.preferOpenModel = t.checked;
+        return;
+      }
+      var stage = t.dataset.stage, field = t.dataset.field;
+      if (!stage || !field) return;
+      var d = agDraft(stage, field);
+      if (t.hasAttribute('data-ag-mode')) {
+        if (t.value === 'inherit') { d.mode = 'inherit'; d.value = ''; }
+        else {
+          d.mode = 'override';
+          var seed = agStoredValue(stage, field);
+          d.value = seed !== undefined ? seed : agText(agDefaultValue(stage, field));
+        }
+      } else if (t.hasAttribute('data-ag-value')) {
+        d.value = t.value;
+      }
+      agRender();
+    });
+    panel.addEventListener('input', function (ev) {
+      if (!agentState) return;
+      var t = ev.target;
+      if (!t.hasAttribute || !t.hasAttribute('data-ag-value') || t.tagName !== 'INPUT') return;
+      agDraft(t.dataset.stage, t.dataset.field).value = t.value;
+      agUpdatePreviews();
+    });
+  })();
+
   function openMappingDialog(key) {
     const isNew = !key;
     document.getElementById('md-title').textContent = isNew ? 'Add Mapping' : 'Edit Mapping: ' + key;
@@ -767,6 +1112,7 @@ export const projectsScript = `
     document.getElementById('md-max-ai').value = String(m.maxInProgressAiIssues ?? 3);
     document.getElementById('md-exec-mode').value = m.executionMode || 'github-actions';
     document.getElementById('md-session-mode').value = m.sessionMode || 'autonomous';
+    document.getElementById('md-cpu-kind').value = m.machineCpuKind ?? 'shared';
     document.getElementById('md-cpus').value = String(m.machineCpus ?? 2);
     document.getElementById('md-mem').value = String(m.machineMemoryMb ?? 4096);
     document.getElementById('md-env').value = envToText(m.extraEnv);
@@ -789,9 +1135,8 @@ export const projectsScript = `
     document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
     document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
     document.getElementById('md-dep-token-scope').value = m.dependencyTokenScope || '';
-    // Absent/null means the backend resolves it to "legacy" (resolveReviewFixLifecycle) —
-    // default the control to match rather than leaving it on whichever option is first.
-    document.getElementById('md-review-fix-lifecycle').value = m.reviewFixLifecycle || 'legacy';
+    document.getElementById('md-review-process').value = m.reviewProcess || 'ai-implement';
+    document.getElementById('md-trusted-review-authors').value = (m.trustedReviewAuthors || []).join('\\n');
     // slice() so editing the draft never mutates the cached mapping behind it.
     refRepoDraft = (m.referenceRepos || []).slice();
     // The add row survives a Cancel, so an abandoned attempt would reappear on the next open.
@@ -839,6 +1184,7 @@ export const projectsScript = `
     onProviderChange();
     onPlanningChange();
     onTicketingProviderChange();
+    agPrepareTab(isNew, key);
     switchMappingTab('ticketing');
 
     document.getElementById('mapping-dialog').showModal();
@@ -1196,6 +1542,7 @@ export const projectsScript = `
       maxInProgressAiIssues: Number(document.getElementById('md-max-ai').value.trim() || NaN),
       executionMode: document.getElementById('md-exec-mode').value,
       sessionMode: document.getElementById('md-session-mode').value,
+      machineCpuKind: document.getElementById('md-cpu-kind').value,
       machineCpus: parseInt(document.getElementById('md-cpus').value, 10),
       machineMemoryMb: parseInt(document.getElementById('md-mem').value, 10),
       planningEnabled: document.getElementById('md-planning').checked,
@@ -1214,7 +1561,8 @@ export const projectsScript = `
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
       dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
-      reviewFixLifecycle: document.getElementById('md-review-fix-lifecycle').value,
+      reviewProcess: document.getElementById('md-review-process').value,
+      trustedReviewAuthors: (function(){ var l = document.getElementById('md-trusted-review-authors').value.split('\\n').map(function(x){ return x.trim(); }).filter(Boolean); return l.length ? l : null; })(),
       referenceRepos: refRepoValue(),
       reviewers: reviewerValue(),
     };

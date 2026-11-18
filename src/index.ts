@@ -1,3 +1,12 @@
+// Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
+import "./restate/log-level-boot.js";
+import { bindKey, clearKeyBinding } from "./restate/key-binding.js";
+import { initKeyBindingsTable } from "./key-bindings.js";
+import { checkTrackerWrites } from "./tracker-write-gate.js";
+import { buildHealthBody } from "./health-body.js";
+import { createSetupCheckContext, getLastSetupCheckRun } from "./setup-checks/index.js";
+import { managedRunConfigFields } from "./managed-dispatch-auth.js";
+import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -7,10 +16,9 @@ import {
   getMappings,
   initMappingsTable,
   resolvePrDispatchBudget,
-  resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
-import { markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
+import { recordReaperAction, markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
 import { reconcileDispatched } from "./dedup-reconcile.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
 import {
@@ -23,7 +31,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, listAllOpenPullRequests, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -31,29 +39,52 @@ import { dispatchLocalGapfill } from "./local-gapfill.js";
 import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
 import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { rememberCandidates, mappingForProvider, mergeProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
-import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
+import { isKgDegraded, onSelfDeployOutcome, postAvailableNotice, postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
-import { clearDeployHold, getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
+import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
-import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
-import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
+import { canSelfDeploy, createRestateDrainProbes, readKgSourceRepo, parseKgSourceRepo, runSelfDeployFlyctl } from "./deploy.js";
+import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, githubImagePublished, type SelfDeployClient } from "./restate/self-deploy.js";
+import { getInFlightWork } from "./in-flight-work.js";
+import { remediateStuckJob } from "./stuck-watchdog.js";
+import { finalizeImplementation } from "./implementation-finalize.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
-import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
+import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
+import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
+import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor, claimPrBudgetNotice, prBudgetMarker, releasePrBudgetNotice, prBudgetTrackerCommentOwed, markTripNotified } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
-import { configureLinearAuth } from "./linear-app-auth.js";
-import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
+import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
+import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
+import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
+import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
+import { createSetupChecksHydration, readSetupChecksViaObject, runSetupChecksViaObject } from "./restate/setup-checks.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
 import { initAccessPageGrantsTable } from "./access-page-grants.js";
+import { createModelAuthRoutes } from "./model-auth-routes.js";
+import { createAgentConfigAdminDeps, getModelAuthRuntime, type ModelAuthRuntime } from "./model-auth-runtime.js";
+import {
+  classifyLaunchError,
+  ghaLaunchOutcome,
+  ghaManagedCredentials,
+  isManagedProject,
+  prepareManagedDispatch,
+  refusalText,
+  settleLaunch,
+  type ManagedDispatchDecision,
+} from "./managed-dispatch-auth.js";
+import { readChatGptPlanState, requestChatGptPlanRefresh } from "./restate/chatgpt-plan-account.js";
+import { PAIRING_OPERATOR, handlePairingUpload, latestPlanSequence, orchestratorHostId } from "./chatgpt-pairing.js";
+import { getAccountProfile } from "./agent-config-store.js";
+import { createModelSessionStore } from "./model-session-store.js";
+import { createModelSessionKeyProvider } from "./model-session-keys.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationAuthorityCheck, handlePublicationTokenRequest } from "./publication-token-vending.js";
@@ -61,83 +92,103 @@ import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
-import { classifyFlyMachine, classifyLocalContainer } from "./backend-run.js";
-import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
-import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
+import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } from "./backend-run.js";
+import { getMachine, listMachines, updateMachine, generateSessionToken, generateMachineNonce, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
+import { reconcileRestateMachine, reconcileRestateLocalContainers, isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
-import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
-import { handleGitHubWebhook } from "./webhook.js";
-import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
+import { getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
+import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
+import { initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
-import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
+import { resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { getOrchestratorSettings, getFlySessionsConfig, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { seedSettingsFromEnv } from "./seed-once-settings.js";
+import { handleRunnerReviewPublication, createReviewPublicationIngressClient, handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
-import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintLaunchTokens, implementationTtlSeconds, type LaunchTokens } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { acceptDelivery as acceptReviewFixDelivery, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
-import { withRequestErrorBoundary } from "./http-server.js";
-import {
-  initMcpOAuthTables,
-  handleMcpProtectedResourceMetadata,
-  handleMcpAuthorizationServerMetadata,
-  handleMcpClientRegistration,
-  handleMcpAuthorize,
-  handleMcpOidcCallback,
-  handleMcpTokenRequest,
-} from "./mcp-oauth.js";
+import { parseHealthPort, withRequestErrorBoundary } from "./http-server.js";
+import { initMcpOAuthTables, routeMcpOAuth } from "./mcp-oauth.js";
 import { preparePlanningLaunch, launchPlanningRun, launchPlanningSession } from "./planning-launch.js";
+import { prepareImplementationLaunch, launchImplementationRun, launchImplementationFlySession, launchImplementationLocalSession } from "./implementation-launch.js";
 import {
   fetchLocalContainerLogs,
   inspectLocalContainer,
   removeLocalContainer,
   startLocalRunnerContainer,
-  sweepExitedLocalContainers,
 } from "./local-docker.js";
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
-import { type RunConfigV1, encodeRunConfig, buildImplRunConfig } from "./run-config.js";
+import { type RunCredentialsV1 } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
-import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
-import { runGroupingBranchAutoMerge } from "./auto-merge.js";
-import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
+import { runMergeUps, reconcileRollupReviewChildren, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
+import { runAutoMerges } from "./auto-merge.js";
+import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, prepareReviewFixTask, previewReviewFixText } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
-import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
-import { githubActionsWatchdogDecision, jobTtlDecision } from "./github-actions-watchdog.js";
+import { sweepUnlinkedPulls } from "./pr-link-sweep.js";
+import { detectMergedPrs } from "./poll-merged-prs.js";
+import {
+  githubActionsWatchdogDecision,
+  jobTtlDecision,
+  normalizeGithubActionsJobTimeoutMinutes,
+} from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
+import { handleRestateUiRequest } from "./restate/ui-proxy.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
+import {
+  getRestateRetentionDays,
+  getVolumeSnapshotRetentionDays,
+  RESTATE_RETENTION_DAYS_DEFAULT,
+  RESTATE_RETENTION_DAYS_MAX,
+  RESTATE_RETENTION_DAYS_MIN,
+  setRestateRetentionDays,
+  setVolumeSnapshotRetentionDays,
+} from "./restate/retention.js";
+import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
+import { sweepOnRegistered } from "./webhook-redelivery.js";
+import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
+import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
+import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
+import { checkKgSidecarHealth, probeKgSidecarAfterBoot } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
-import { getRestateStatus, setRestateStatus } from "./restate/status.js";
-import type { RestateRegistrationStatus } from "./restate/status.js";
+import { resolveReviewProcess } from "./review-process.js";
+import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
+import { MAX_PUBLICATION_BYTES, createPostPushReviewPublication, createProductionPostPushReviewPublicationDependencies } from "./restate/post-push-review-publication.js";
+import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
+import { getRestateStatus, restateCanServe, setRestateStatus } from "./restate/status.js";
+import type { RestateStatus, RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
-import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { beginCycle, isCurrentCycle, getPollStats, parsePollIntervalMs, runWithDeadline } from "./poll-cycle.js";
+import { effectiveAccessCode, PLACEHOLDER_ACCESS_CODE } from "./admin-session.js";
+import { scrubOperatorLegacyTokens } from "./restate/operator-legacy-scrub.js";
 
 /**
  * The reaper's helper callbacks. The KgRefresh workflow owns kg-refresh rows, so the
@@ -204,18 +255,14 @@ function loadConfig(): AppConfig {
     return val;
   };
   
-  // Microsoft's tid-based "email verified" only holds for a single-tenant issuer
-  // so it's dropped as an OAuth provider if a multi-tenant env value is provided
-  let oauthProviders = providersFromEnv(process.env);
-  const msMultiTenant = oauthProviders.some((p) => p.id === "microsoft") &&
-    ["common", "organizations", "consumers"].includes((process.env.MICROSOFT_OAUTH_TENANT || "").toLowerCase());
-  if (msMultiTenant) {
-    oauthProviders = oauthProviders.filter((p) => p.id !== "microsoft");
-    console.warn("[main] MICROSOFT_OAUTH_TENANT is a multi-tenant value — Microsoft SSO disabled. Pin a specific tenant GUID (single-tenant).");
-  }
+  const { providers: oauthProviders, dropped: droppedProviders } = resolveProviders(process.env);
+  for (const { id, reason } of droppedProviders) console.warn(`[main] ${id} sign-in disabled: ${reason}`);
   
   // Resolved admin-auth posture — now that both access-code and SSO are known.
-  const adminAccessCode = process.env.ADMIN_ACCESS_CODE || null;
+  const adminAccessCode = effectiveAccessCode(process.env.ADMIN_ACCESS_CODE);
+  if (process.env.ADMIN_ACCESS_CODE === PLACEHOLDER_ACCESS_CODE) {
+    console.warn("[main] ADMIN_ACCESS_CODE is the published .env.example placeholder, so it is refused. Set a real code, or sign in with SSO.");
+  }
   const oauthConfigured = oauthProviders.length > 0; // derive from the list, not the not-yet-seeded singleton
   if (!adminAccessCode && !oauthConfigured) {
     console.warn("[main] admin UI disabled — set ADMIN_ACCESS_CODE and/or configure OAuth providers");
@@ -265,12 +312,8 @@ function loadConfig(): AppConfig {
     console.warn("[main] runner callback path disabled (RUNNER_CALLBACK_BASE_URL or RUNNER_TOKEN_SECRET not set)");
   }
 
-  const linearClientId = process.env.LINEAR_CLIENT_ID || null;
-  const linearClientSecret = process.env.LINEAR_CLIENT_SECRET || null;
-  if (!linearClientId || !linearClientSecret) {
+  if (!configureLinearAuthFromEnv()) {
     console.warn("[main] LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET not set — Linear mappings will be skipped (the ProviderRegistry tolerates missing per-provider config)");
-  } else {
-    configureLinearAuth(linearClientId, linearClientSecret);
   }
 
   return {
@@ -280,20 +323,18 @@ function loadConfig(): AppConfig {
     notifyType,
     adminAccessCode,
     oauthRedirectBaseUrl,
-    pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
+    pollIntervalMs: parsePollIntervalMs(process.env.POLL_INTERVAL_MS),
     pollCycleTimeoutMs: Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000,
-    healthPort: parseInt(process.env.PORT || "8080", 10),
-    flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
-    flySessionsApp: (() => {
-      const envVal = process.env.FLY_SESSIONS_APP || null;
-      if (envVal) return envVal;
-      return getOrchestratorSettings().flySessionsApp;
-    })(),
-    flySessionsRegion: (() => {
-      const envVal = process.env.FLY_SESSIONS_REGION || null;
-      if (envVal) return envVal;
-      return getOrchestratorSettings().flySessionsRegion;
-    })(),
+    healthPort: parseHealthPort(process.env.PORT),
+    get flySessionsToken() {
+      return getFlySessionsConfig().token;
+    },
+    get flySessionsApp() {
+      return getFlySessionsConfig().app;
+    },
+    get flySessionsRegion() {
+      return getFlySessionsConfig().region;
+    },
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     flyDeployToken: process.env.FLY_DEPLOY_TOKEN || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
@@ -393,7 +434,36 @@ export async function guardOpenPrBeforeImplementationDispatch(
   return false;
 }
 
-async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+/**
+ * Mint the GitHub token a Fly or local-Docker child runner boots with, scoped to the
+ * mapping's target repository alone. Throws on failure so the launch aborts; there is
+ * deliberately no fallback to the installation-wide token.
+ */
+async function getTargetRepoToken(
+  config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">,
+  owner: string,
+  repo: string,
+): Promise<string> {
+  const scoped = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner, {
+    repositories: [repo],
+  });
+  return scoped.token;
+}
+
+/** True once the KG composition (and so the `PipelineSchedule` service) is bound at boot. */
+let kgScheduleBound = false;
+
+/** Tracker kind and issue URL for a review-fix job row; a lookup failure never blocks the row. */
+async function reviewFixAccounting(
+  registry: ProviderRegistry,
+  mapping: RepoMapping,
+  fix: { issueId: string; issueIdentifier?: string | null },
+): Promise<TrackerAccounting> {
+  const provider = await registry.forMapping(mapping).catch(() => null);
+  return trackerAccounting(mapping, provider, { id: fix.issueId, identifier: fix.issueIdentifier });
+}
+
+export async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const cycle = beginCycle();
   if (!cycle) {
     console.log(`[poll] Skipping poll cycle — previous poll still running`);
@@ -403,7 +473,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   console.log(`[poll] Starting poll cycle #${cycleId}`);
 
   const timeoutMs = config.pollCycleTimeoutMs;
-
+  await refreshRunnerBackendCache();
+  // Outside the cycle deadline: the check has its own timeout and never throws. Only bound when the KG composition exists.
+  if (kgScheduleBound) {
+    await checkPipelineSchedules(["kg-refresh"]);
+    await checkKgSidecarHealth();
+  }
   await runWithDeadline(
     cycleId,
     started,
@@ -426,11 +501,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
     // Act on what the refresh above found.
     try {
-      // A factory over config with no state of its own, so building one per tick is
-      // free and behaves identically to the server's — the hold that actually
-      // serializes deploys lives in SQLite, not in this closure.
       const resolvedConfig = { ...config, selfDeployTarget: resolvedPollTarget };
-      const startDeploy = makeStartDeploy({ ...resolvedConfig, onBuildFailure: onDeployBuildFailure });
       const availability = getAvailability();
       const head = availability?.headCommit ?? null;
 
@@ -444,24 +515,26 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       });
 
       if (action !== "none" && head) {
-        // Recorded before acting, not after. A successful self-deploy kills this
-        // process inside the await below, so a write afterwards would never land and
-        // every boot would retry the same commit forever.
+        // Recorded before acting, not after: it bounds the automatic attempt, which a
+        // failing deploy must not repeat every cycle. A new push re-arms it.
         setLastActedCommit(head);
 
         if (action === "deploy") {
           console.log(`[deploy] Auto-deploying ${head.slice(0, 7)} — dispatch pauses now`);
-          const result = await startDeploy?.();
-          if (result && !result.started) {
-            console.warn(`[deploy] Auto-deploy did not start: ${result.reason}`);
-          }
-          // The starter resolves HEAD itself, one round trip after the cached read
-          // above. A push landing in that window means the commit recorded as acted on
-          // is not the commit being deployed — so correct it to what actually went out,
-          // or a later poll would retry the commit that really failed.
-          if (result?.started && result.commit !== head) {
-            console.log(`[deploy] head moved during the trigger: deploying ${result.commit.slice(0, 7)}`);
-            setLastActedCommit(result.commit);
+          const branch = resolvedPollTarget.branch;
+          if (branch !== "testing" && branch !== "main") {
+            console.warn(`[deploy] Auto-deploy skipped: watched ref '${branch}' has no published image channel`);
+          } else {
+            const result = await selfDeployClient.start({ branch, requestedBy: "auto-deploy" });
+            if ("reason" in result) {
+              console.warn(`[deploy] Auto-deploy did not start: ${result.reason}`);
+            } else if (!result.alreadyActive && result.commit !== head) {
+              // The object resolves HEAD itself, one round trip after the cached read above. A push
+              // landing in that window means the commit recorded as acted on is not the commit being
+              // deployed, so correct it to what actually went out.
+              console.log(`[deploy] head moved during the trigger: deploying ${result.commit.slice(0, 7)}`);
+              setLastActedCommit(result.commit);
+            }
           }
         } else {
           await postAvailableNotice(config, head);
@@ -501,30 +574,43 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   }
 
   try {
-    const snapshots = providers.length === 0
-      ? []
-      : await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
-
-    const entries = providers.map((p, i) => ({ providerId: p.id, snapshot: snapshots[i] }));
+    // Parking changes pickup eligibility. Reconcile before taking either planning or
+    // implementation snapshots so this poll cannot dispatch a child just handed to a person.
+    const reconciliationFailedScopes = new Set<string>();
+    for (const provider of providers) {
+      for (const [scopeKey, mapping] of Object.entries(getMappings())) {
+        if (mapping.ticketingProvider !== provider.id) continue;
+        try {
+          await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config);
+        } catch (err) {
+          reconciliationFailedScopes.add(scopeKey);
+          console.error(`[roll-up-review] ${provider.id}/${scopeKey} reconciliation failed; its issues sit out this cycle:`, err);
+        }
+      }
+    }
+    const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
+    for (const { providerId, error } of failed) {
+      console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle:`, error);
+    }
 
     // Finalize empty grouping parents (all children terminal, blank spec) — markMerged so the
     // existing roll-up path opens the top-of-tree PR without dispatching a junk implement pass.
-    for (let i = 0; i < providers.length; i++) {
-      for (const entry of snapshots[i].parentsToFinalize) {
+    for (const { provider, snapshot } of entries) {
+      for (const entry of snapshot.parentsToFinalize) {
+        if (reconciliationFailedScopes.has(entry.scopeKey)) continue;
         // An entry whose key belongs to another tracker's mapping must not touch that repo.
-        if (getMappings()[entry.scopeKey] && !mappingForProvider(providers[i].id, entry.scopeKey, getMappings())) continue;
-        console.log(`[${providers[i].id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
+        if (getMappings()[entry.scopeKey] && !mappingForProvider(provider.id, entry.scopeKey, getMappings())) continue;
+        console.log(`[${provider.id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
         // AII-349 reopen re-arm: clear any stale handled markers so merge-up re-runs and opens
         // a new roll-up PR when the parent was previously finalized and then reopened.
         const m = getMappings()[entry.scopeKey];
         if (m) clearRollUpHandledMarkersByIdentifier(m.owner, m.repo, entry.identifier);
-        await providers[i].markMerged(entry.issueId, entry.scopeKey).catch((err) => {
-          console.error(`[${providers[i].id}] Failed to finalize empty grouping parent ${entry.identifier}:`, err);
+        await provider.markMerged(entry.issueId, entry.scopeKey).catch((err) => {
+          console.error(`[${provider.id}] Failed to finalize empty grouping parent ${entry.identifier}:`, err);
         });
       }
     }
 
-    const { snapshot: mergedSnapshot, foreign } = mergeProviderSnapshots(entries, getMappings());
     for (const f of foreign) {
       console.log(`[poll] ${f.issue.identifier} (${f.providerId}) matches ${f.mappingProvider} mapping ${f.issue.scopeKey}; skipped`);
     }
@@ -544,6 +630,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const allMappingsForDispatch = getMappings();
     const teamRepoMap: Record<string, RepoMapping> = {};
     for (const [k, m] of Object.entries(allMappingsForDispatch)) {
+      if (reconciliationFailedScopes.has(k)) continue;
       if (m.paused) {
         console.log(`[poll] Skipping paused project ${k} (${m.owner}/${m.repo})`);
         continue;
@@ -577,12 +664,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     }
 
     // Merge approved child PRs into grouping branches (cascade self-healing). Runs for all
-    // non-paused projects — the top-of-tree feature→base PR still requires human review.
-    // (AII-349: always-on so a reopened parent's approved children merge without per-project opt-in.)
+    // non-paused projects whose Auto-merge setting is on (runAutoMerges checks the flag); a project
+    // with it off leaves approved children for a person. The top-of-tree feature→base PR still requires human review.
     try {
       const nonPausedMappings = Object.values(teamRepoMap);
       if (nonPausedMappings.length > 0) {
-        await runGroupingBranchAutoMerge(nonPausedMappings, {
+        await runAutoMerges(nonPausedMappings, {
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
           notify: config.notifyWebhookUrl
@@ -601,12 +688,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
     const inFlightIssueIds = getInFlightIssueIds();
     const candidateScopeKeyById = new Map(allCandidates.map((issue) => [issue.id, issue.scopeKey]));
-    const isDispatchBlocked = (issueId: string) => {
-      const kind: DispatchKind = needsPlanningIds.has(issueId) ? "planning" : "implementation";
+    const dispatchDecision = (issueId: string) => {
+      const kind: DispatchKind = needsPlanningIds.has(issueId) && teamRepoMap[candidateScopeKeyById.get(issueId) ?? ""]?.planningEnabled ? "planning" : "implementation";
       const teamKey = candidateScopeKeyById.get(issueId) ?? "";
       const maxInProgressAiIssues = teamRepoMap[teamKey]?.maxInProgressAiIssues ?? 0;
-      return !canDispatch({ issueId, kind, teamKey, maxInProgressAiIssues }).ok;
+      return { kind, decision: canDispatch({ issueId, kind, teamKey, maxInProgressAiIssues }) };
     };
+    const isDispatchBlocked = (issueId: string) => !dispatchDecision(issueId).decision.ok;
 
     // A deploy is holding new work back. Skipping selection cannot lose work:
     // selectIssuesToDispatch is pure, and markDispatched runs only after a
@@ -632,6 +720,24 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           admissionCountsByTeam,
           isDispatchBlocked,
         );
+
+    // Log each candidate's skip reason once, when it starts or changes (and when it clears).
+    {
+      const reasons = allCandidates.map((issue) => {
+        const { kind, decision } = dispatchDecision(issue.id);
+        return { issue, kind, reason: decision.ok ? null : decision.reason };
+      });
+      const parkedRows = reasons.some((r) => r.reason === "parked") ? listParked() : [];
+      for (const line of logSkipReasons(
+        reasons.map(({ issue, kind, reason }) => ({
+          id: issue.id,
+          identifier: issue.identifier,
+          phase: kind === "planning" ? "planning" : "implementation",
+          reason,
+          failures: parkedRows.find((p) => p.issueId === issue.id && p.phase === kind)?.failures,
+        })), { pruneAbsent: failed.length === 0 })
+      ) console.log(line);
+    }
 
     // AII-278 Finding 3: in-flight issues carry AI-Working and drop OUT of the
     // candidate snapshot, so filtering allCandidates made the in-flight set
@@ -675,6 +781,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         };
         const issueProvider = await registry.forMapping(mapping);
         const isPlanning = needsPlanningIds.has(issue.id) && mapping.planningEnabled;
+
+        if (await checkTrackerWrites({
+          provider: issueProvider, issue, phase: isPlanning ? "planning" : "implementation",
+          park: parkIssue, comment: (id, body) => issueProvider.postComment(id, body),
+          log: (message) => console.log(message),
+        }) === "skip") continue;
 
         if (isPlanning) {
           const planningCtx = await preparePlanningDispatch(config, issueProvider, issue, mapping);
@@ -770,17 +882,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           // feature-branch-grouping fallback and must not trigger a comment).
           const implFieldValue = implValidated.branch;
 
-          if (execPath === "both") {
-            // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue, true);
-          } else if (execPath === "local-docker") {
-            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          } else if (execPath === "fly-machines") {
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          } else {
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          }
+          await submitImplementationRun(config, issue, mapping, {
+            execPath, runnerMode, baseBranch, baseBranchFieldValue: implFieldValue,
+          });
         }
       } catch (err) {
         console.error(`[poll] Error processing ${issue.identifier}:`, err);
@@ -794,6 +898,22 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // Monitor in-flight jobs and send completion notifications
   await monitorJobs(config, registry);
 
+  // AII-1304: retry LateExternalReview for gap-fill rows submitted while Restate was not ready.
+  try {
+    await resubmitPendingGapFillReviews({
+      ready: restateCanServe,
+      submit: lateExternalReviewSubmitHook,
+      getState: (key) => lateExternalReviewIngress.getState(key),
+      getPrClosed: async ({ owner, repo, prNumber }) => {
+        const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+        const pr = await getPullRequestState(token, owner, repo, prNumber);
+        return pr ? pr.merged || pr.state !== "open" : null;
+      },
+    });
+  } catch (err) {
+    console.error("[poll] late-review sweep failed:", err);
+  }
+
   // Local mode: reap exited containers no in-flight job owns. A planning job
   // finalized by the runner callback goes terminal before the monitor's
   // completion pass, so the monitor never removes its container.
@@ -801,10 +921,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const inFlightMachineIds = getInFlightJobs()
       .map((j) => j.machineId)
       .filter((id): id is string => Boolean(id));
-    const swept = await sweepExitedLocalContainers(inFlightMachineIds);
-    for (const name of swept) {
-      console.log(`[monitor] Swept exited local container ${name}`);
-    }
+    await reconcileRestateLocalContainers(reaperConfig(config, registry), inFlightMachineIds);
   }
 
   // Sweep for orphaned/stale/aged-out Fly machines
@@ -833,22 +950,60 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Bounded cleanup of Restate review-fix pilot evidence (AII-795): purges activity/cycle
   // rows past the 7-day-since-completion retention floor, skipping any attempt whose
-  // ownership is still unresolved (pending delivery, active reservation, result conflict,
-  // or unbound execution). SQLite-only and synchronous — safe on every poll regardless of
+  // ownership is still unresolved (active reservation, result conflict, or unbound
+  // execution). SQLite-only and synchronous — safe on every poll regardless of
   // runner mode.
   const evidenceSweep = sweepExpiredReviewFixEvidence();
   if (evidenceSweep.purgedAttemptIds.length > 0) {
     console.log(`[review-fix-evidence] expired ${evidenceSweep.purgedAttemptIds.length} attempt(s): ${evidenceSweep.purgedAttemptIds.join(", ")}`);
   }
 
+  try {
+    let appBotLogin: string | undefined;
+    try {
+      appBotLogin = `${await getAppSlug(config.githubAppId, config.githubAppPrivateKey)}[bot]`;
+    } catch {
+      // Unknown App identity prevents new branch-based links; existing links still reopen.
+    }
+    await sweepUnlinkedPulls({
+      mappings: getMappings(),
+      appBotLogin,
+      providerFor: (mapping) => registry.forMapping(mapping),
+      listRepoPulls: async (owner, repo) => listAllOpenPullRequests(
+        await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner), owner, repo,
+      ),
+    });
+  } catch (err) {
+    console.error("[poll] PR link sweep failed:", err);
+  }
+
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
   // for merged PRs the webhook may have missed.
   await detectMergedPrs({
+    cancelIssue: async (link) => {
+      const entry = resolvePrMapping(getMappings(), link.repository, link.number);
+      if (!entry) {
+        throw new Error(`No mapping resolves for ${link.issue.identifier} (${link.repository} #${link.number}); not cancelling`);
+      }
+      const provider = await registry.forMapping(entry.mapping);
+      return provider.markPrClosedUnmerged(link.issue.trackerIssueId, entry.scopeKey, link.url);
+    },
     mappingForRepo: (repo) =>
       Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repo),
     tokenForOwner: (owner) =>
       getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
     getPullRequestState,
+    // AII-1294: a parent's own PR closed unmerged must not block its roll-up.
+    finalizeGroupingParent: async (link) => {
+      const entry = resolvePrMapping(getMappings(), link.repository, link.number);
+      if (!entry) {
+        console.error(`[merge-poll] No mapping resolves for grouping parent ${link.issue.identifier} (${link.repository} #${link.number}); not finalizing`);
+        return false;
+      }
+      const provider = await registry.forMapping(entry.mapping);
+      await provider.markMerged(link.issue.trackerIssueId, entry.scopeKey);
+      return true;
+    },
   });
 
   // Process any pending reconciliation jobs triggered by merged PRs
@@ -864,7 +1019,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const state = await getPullRequestState(token, owner, repo, active.prNumber);
       if (state && shouldSkipReviewFix(state)) {
-        queueReviewFixCancellationForClosedPr(active.repository, active.prNumber);
+        await queueReviewFixCancellationForClosedPr(active.repository, active.prNumber, reviewFixIngressClient);
       }
     } catch (err) {
       console.warn(`[review-fix] Could not reconcile PR closure for ${active.repository}#${active.prNumber}:`, err);
@@ -888,15 +1043,18 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
       runnerTokenSecret: config.runnerTokenSecret,
       getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      getTargetRepoToken: (owner, repo) => getTargetRepoToken(config, owner, repo),
       getInstallationId: (owner) => getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner),
       resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
       checkContract: (params) => resolveWorkflowCapabilities(params),
       dispatch: dispatchWorkflow,
       postComment: postPrComment,
+      listPrComments: (token, owner, repo, prNumber) => listPrComments(token, owner, repo, prNumber, { strict: true }),
       postTrackerComment: async (mapping, issueId, body) => {
         const provider = await registry.forMapping(mapping);
         await provider.postComment(issueId, body);
       },
+      trackerAccounting: async (mapping, issue) => trackerAccounting(mapping, await registry.forMapping(mapping), issue),
       onDispatchFailure: surfaceDispatchFailure,
       flySessionsToken: config.flySessionsToken,
       flySessionsApp: config.flySessionsApp,
@@ -908,6 +1066,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       sessionImage: config.sessionImage,
       localRunnerImage: config.localRunnerImage,
       localRunnerOrchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+      modelAuthRuntime: getModelAuthRuntime(config),
     });
   }
 
@@ -962,11 +1121,15 @@ async function fireBreakerTrip(
       : []),
     ``,
     `Unpark: admin → Runners → Unpark, or ask the operator.`,
+    ...(phase === "gap-analysis"
+      ? [``, `A person can still comment \`/ai-implement\` on the pull request to start one fix run.`]
+      : []),
   ];
 
   if (provider) {
     try {
       await provider.postComment(issueId, commentLines.join("\n"));
+      markTripNotified(issueId, phase);
     } catch (err) {
       console.error(`[breaker] Failed to post park comment for ${issueIdentifier ?? issueId}:`, err);
     }
@@ -976,7 +1139,7 @@ async function fireBreakerTrip(
     try {
       await notifyText(
         config.notifyWebhookUrl,
-        `⛔ AI-Implement parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, last: ${conclusion}). Unpark: admin → Runners → Unpark.`,
+        `⛔ AI-Implement parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, last: ${conclusion}). Unpark: admin → Runners → Unpark.${phase === "gap-analysis" ? " A person can still comment /ai-implement on the pull request to run one fix run." : ""}`,
       );
     } catch (err) {
       console.error(`[breaker] Failed to send park notification for ${issueIdentifier ?? issueId}:`, err);
@@ -985,10 +1148,10 @@ async function fireBreakerTrip(
 }
 
 /**
- * Fires when the gate's `pr_budget` reason for a gap-fill dispatch is the one
- * that actually parks the PR (parkIssue returns true exactly once, on that
- * transition). Posts one PR comment and one tracker comment, both best-effort.
- * Never throws.
+ * Fires whenever the gate returns `pr_budget` for a gap-fill dispatch, whoever
+ * parked the row. Posts one PR comment per park (also when the breaker parked
+ * first) and a tracker comment unless the breaker's trip comment already reached
+ * the tracker, both best-effort. Never throws.
  */
 async function firePrBudgetPark(
   config: AppConfig,
@@ -999,26 +1162,63 @@ async function firePrBudgetPark(
   prNumber: number,
   budget: number,
 ): Promise<void> {
-  if (!parkIssue(issueId, "gap-analysis", "pr_budget")) return;
+  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget");
+  const parkedAt = claimPrBudgetNotice(issueId, "gap-analysis");
+  if (parkedAt == null) return;
 
-  console.warn(`[dispatch-gate] Parked PR #${prNumber} in ${repo} at its dispatch budget (${budget}/24h)`);
+  console.warn(
+    newlyParked
+      ? `[dispatch-gate] Parked PR #${prNumber} in ${repo} at its dispatch budget (${budget}/24h)`
+      : `[dispatch-gate] PR #${prNumber} in ${repo} is at its dispatch budget (${budget}/24h); already parked, posting the budget notice`,
+  );
 
   const body = prBudgetParkMessage(budget);
+  const marker = prBudgetMarker(parkedAt);
   const [owner, repoName] = repo.split("/");
 
   try {
     const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-    await postPrComment(ghToken, owner, repoName, prNumber, `<!-- ai-implement pr-budget -->\n${body}`);
+    // A previous tick of this park may have posted the comment and then failed on the tracker.
+    // The strict read throws on an unreadable list, so a retry never posts blind.
+    const existing = await listPrComments(ghToken, owner, repoName, prNumber, { strict: true });
+    if (!existing.some((c) => c.body.includes(marker))) {
+      await postPrComment(ghToken, owner, repoName, prNumber, `${marker}\n${body}`);
+    }
   } catch (err) {
     console.error(`[dispatch-gate] Failed to post PR budget comment on ${repo}#${prNumber}:`, err);
+    // Give the claim back so the next tick retries the notice.
+    releasePrBudgetNotice(issueId, "gap-analysis");
+    return;
   }
+
+  // The breaker's trip comment already told the tracker when it parked the row first.
+  if (!prBudgetTrackerCommentOwed(issueId, "gap-analysis")) return;
 
   try {
     const provider = await registry.forMapping(mapping);
     await provider.postComment(issueId, body);
   } catch (err) {
     console.error(`[dispatch-gate] Failed to post tracker comment for PR budget park (${issueId}):`, err);
+    // Retry next tick; the PR comment's marker keeps that retry from posting it twice.
+    releasePrBudgetNotice(issueId, "gap-analysis");
   }
+}
+
+/** Preserve the proven park/notice mechanism for PRs with no tracker identity. */
+export async function parkRestatePrBudget(
+  config: AppConfig, registry: ProviderRegistry, mapping: RepoMapping,
+  trackerIssueId: string | null, repo: string, prNumber: number, budget: number,
+): Promise<void> {
+  // Only tracker delivery is suppressed. No provider needs to be configured for
+  // an issueless PR; the stable PR identity still owns its park and notice claim.
+  const noticeRegistry = trackerIssueId ? registry : new Proxy(registry, {
+    get(target, property, receiver) {
+      if (property === "forMapping") return async () => ({ postComment: async () => {} });
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  await firePrBudgetPark(config, noticeRegistry, mapping, trackerIssueId || `${repo}#${prNumber}`,
+    repo, prNumber, budget);
 }
 
 // ---------- Dispatch: GitHub Actions ----------
@@ -1051,6 +1251,24 @@ async function resolveDispatchRunnerImage(
 // Exported for direct testing of the pre-launch-failure release path — see
 // "real entry-point/monitor regressions" in dispatch-routing.test.ts. Not part of the
 // module's public API otherwise; every production call site is within this file.
+/** "both" mode: GHA is primary, Fly the shadow. Decision 6: an opted-in project gets no Fly shadow
+ *  (the GHA primary refused it), so the shadow is skipped rather than promoted. */
+export async function dispatchBothMode(
+  config: AppConfig,
+  provider: TicketingProvider,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  prior: { count: number; lastDispatchedAt: number | null },
+  runnerMode: string,
+  baseBranch: string,
+  baseBranchFieldValue: string | null,
+): Promise<void> {
+  await dispatchGitHubActions(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue);
+  if (!isManagedProject(issue.scopeKey)) {
+    await dispatchFlyMachine(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue, true);
+  }
+}
+
 export async function dispatchGitHubActions(
   config: AppConfig,
   provider: TicketingProvider,
@@ -1062,6 +1280,10 @@ export async function dispatchGitHubActions(
   /** The validated "AI-Implement Base Branch" field value, or null when unset. Distinct
    *  from baseBranch, which also covers the feature-branch-grouping fallback. */
   baseBranchFieldValue: string | null,
+  /** Typed trusted-preparation seam (AII-958 composes it): private credentials such as a
+   *  model-auth grant. Requires supportsPrivateRunConfig at the exact workflow/ref; an
+   *  unsupported reader fails before launch rather than dropping them. */
+  trustedCredentials?: RunCredentialsV1,
 ): Promise<void> {
   // Final admission authority: one transaction reserves team capacity and per-issue
   // occupancy before any credential mint or launch call. canDispatch (checked earlier,
@@ -1078,169 +1300,65 @@ export async function dispatchGitHubActions(
   });
   if (!admission.ok) return;
 
+  // Managed model authentication (AII-1420): decided after admission and before any run token is minted.
+  // The decision carries the frozen snapshot and the one-shot bootstrap; a refusal launches nothing.
+  const managedRuntime = getModelAuthRuntime(config);
+  let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+  if (isManagedProject(issue.scopeKey, dispatchId)) {
+    let decision: ManagedDispatchDecision;
+    try {
+      decision = await prepareManagedDispatch(
+        { dispatchId, projectKey: issue.scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+        managedRuntime,
+      );
+    } catch (err) {
+      admission.release("launch_rejected");
+      throw err;
+    }
+    console.log(`[poll] Managed dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+    if (decision.kind === "legacy" || decision.kind === "launch") {
+      managedDecision = decision;
+    } else {
+      admission.release("launch_rejected");
+      if (decision.kind === "refuse") {
+        await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision));
+        // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code);
+        if (breakerRefuse.tripped) {
+          await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breakerRefuse.failures, decision.code);
+        }
+      } else {
+        console.log(`[poll] ${refusalText(decision)} (${issue.identifier})`);
+      }
+      return;
+    }
+  }
+
   // True whenever base_branch is forwarded as a legacy workflow input — set by the
   // field OR by feature-branch grouping. Used only to attribute a 422 below.
   const implSentBaseBranch = baseBranch !== mapping.defaultBranch;
 
-  // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
-  // here (e.g. an installation-token mint failure) is by construction a definitive
-  // non-launch, so it's wrapped in one block and released unconditionally, unlike the
-  // postWorkflowDispatch call after it, whose failure modes are deliberately not all
-  // treated as definitive (see the comment below).
-  const { ghToken, runnerImage, contract, dispatchInputs } =
-    await (async () => {
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-
-      let runnerCallbackUrl = "";
-      let runToken = "";
-      let runProgressToken = "";
-      if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-        const minted = mintRunToken({
-          issueId: issue.id,
-          mappingTeamKey: issue.scopeKey,
-          phase: "implementation",
-          audience: "result",
-          dispatchId,
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        const progressMinted = mintRunToken({
-          issueId: issue.id,
-          mappingTeamKey: issue.scopeKey,
-          phase: "implementation",
-          audience: "progress",
-          dispatchId,
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
-      }
-
-      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-
-      const workflowCapabilities = await resolveWorkflowCapabilities({
-        owner: mapping.owner,
-        repo: mapping.repo,
-        workflowFile: mapping.workflowFile,
-        token: ghToken,
-        ref: mapping.defaultBranch,
-      });
-      const { contract } = workflowCapabilities;
-      const runPublicationToken = contract === "envelope"
-        && workflowCapabilities.supportsRunPublicationToken
-        && dispatchId
-        && config.runnerCallbackBaseUrl
-        && config.runnerTokenSecret
-        ? mintRunToken({
-            issueId: issue.id,
-            mappingTeamKey: issue.scopeKey,
-            phase: "implementation",
-            audience: "publication",
-            dispatchId,
-            repository: `${mapping.owner}/${mapping.repo}`,
-            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-            secret: config.runnerTokenSecret,
-          }).token
-        : undefined;
-
-      const dispatchInputs = contract === "envelope"
-        ? buildEnvelopeDispatchInputs(mapping, issue, {
-            runnerPhase: "implementation",
-            baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken,
-            runProgressToken,
-            runPublicationToken,
-            runnerImage,
-            groupingParent: isGroupingParentDispatch(issue) || undefined,
-            retryPolicy: getRetryPolicy(),
-          })
-        : {
-            issue_id: issue.id,
-            issue_identifier: issue.identifier,
-            issue_title: issue.title,
-            issue_description: issue.description || issue.title,
-            runner_phase: "implementation" as const,
-            ...providerDispatchFields(mapping),
-            // Only forward base_branch when grouping moved it off the repo default: GitHub
-            // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
-            // re-synced the workflow keep working for the common (non-grouped) path.
-            ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
-            ...capDispatchFields(mapping),
-            ...branchPrefixDispatchFields(mapping),
-            ...skillsRepoDispatchFields(mapping),
-            ...profilesDispatchFields(issue),
-            runner_callback_url: runnerCallbackUrl,
-            run_token: runToken,
-            run_progress_token: runProgressToken,
-            ...(runnerImage ? { runner_image: runnerImage } : {}),
-          };
-
-      return { ghToken, runnerCallbackUrl, runToken, runProgressToken, runnerImage, contract, dispatchInputs };
-    })().catch((err) => {
-      admission.release("launch_rejected");
-      throw err;
-    });
-
-  // returnRunDetails (AII-778) gets us result.outcome: "rejected" means GitHub's API
-  // itself refused the request (a 4xx before any run started) — the one signal precise
-  // enough to treat as a definitive non-launch. Anything else (a thrown network error,
-  // a 5xx, "unknown") stays uncertain and must not release the reservation below.
-  const result = await postWorkflowDispatch({
-    token: ghToken,
-    owner: mapping.owner,
-    repo: mapping.repo,
-    workflowFile: mapping.workflowFile,
-    ref: mapping.defaultBranch,
-    inputs: dispatchInputs,
-    returnRunDetails: true,
+  // Pure prep — no launch call has fired yet. A throw anywhere in here (e.g. an
+  // installation-token mint failure) is by construction a definitive non-launch, so
+  // the grant is revoked by the prep and the reservation is released here, unlike the
+  // launch call after it, whose failure modes are deliberately not all definitive.
+  const launch = await prepareImplementationLaunch({
+    config, issue, mapping, dispatchId, baseBranch, managedDecision, managedRuntime,
+    trustedCredentials,
+    resolveRunnerImage: resolveDispatchRunnerImage,
+    isGroupingParentDispatch,
+  }).catch((err) => {
+    admission.release("launch_rejected");
+    throw err;
   });
+  const { ghToken, runnerImage, contract } = launch;
 
-  if (!result.success) {
-    await surfaceDispatchFailure(
-      result,
-      config.notifyType,
-      config.notifyWebhookUrl,
-      {
-        site: "poll",
-        issueId: issue.id,
-        issueIdentifier: issue.identifier,
-        issueTitle: issue.title,
-        teamKey: issue.scopeKey,
-        repo: `${mapping.owner}/${mapping.repo}`,
-        workflowFile: mapping.workflowFile,
-        contract,
-        issueUrl: provider.issueUrl(issue),
-        issueState: issue.nativeStatus,
-        phase: "implementation",
-      },
-    );
-    if (result.outcome === "rejected") {
-      admission.release("launch_rejected");
-    }
-    // Only reachable on the legacy contract — under the envelope base_branch is not a
-    // workflow input at all (it rides inside run_config), so a 422 can never be about
-    // it. implSentBaseBranch is also true for the pre-existing feature-branch grouping
-    // path, and a 422 has many possible causes, so also require the error body itself
-    // to mention base_branch before attributing it to a stale claude-implement.yml.
-    if (contract === "legacy" && result.status === 422 && implSentBaseBranch && /base_branch/.test(result.error ?? "")) {
-      await provider.markImplementationFailed(
-        issue.id,
-        issue.scopeKey,
-        "dispatch rejected (422): base_branch was not accepted. Either the target repo has not "
-          + "re-synced claude-implement.yml, or the workflow-contract probe cached \"legacy\" for a repo "
-          + "that has since re-synced to the envelope contract (that cache is short-lived — retry first).",
-      );
-    }
-    // No dedup row was written at this point (markDispatched is called only on success below).
-    const _brImpl = recordDispatchFailure(issue.id, "implementation", "workflow_dispatch_failed");
-    if (_brImpl.tripped) {
-      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", _brImpl.failures, "workflow_dispatch_failed");
-    }
-    return;
-  }
+  const launched = await launchImplementationRun({
+    config, provider, issue, mapping, launch, implSentBaseBranch, managedDecision, managedRuntime,
+    fireBreakerTrip,
+    onRejected: () => admission.release("launch_rejected"),
+  });
+  if (launched.outcome !== "accepted") return;
 
   markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
   const jobId = appendLog({
@@ -1258,6 +1376,8 @@ export async function dispatchGitHubActions(
     sessionImage: runnerImage ?? null,
     contract,
     groupingParent: isGroupingParentDispatch(issue),
+    trackerKind: mapping.ticketingProvider ?? null,
+    issueUrl: provider.issueUrl(issue),
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -1391,102 +1511,101 @@ export async function preparePlanningDispatch(
   return { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue: planningValidated.branch };
 }
 
-// Exported for direct testing of the GHA result-based admission release/hold branch —
-// see "dispatchPlanning GHA path" in dispatch-routing.test.ts. Not part of the module's
-// public API otherwise; the only production call site is poll(), via
-// preparePlanningDispatch's resolved context.
+// Submit only safe launch context; credentials are resolved by the workflow at launch.
+export async function submitImplementationRun(
+  _config: AppConfig,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  ctx: {
+    execPath: ReturnType<typeof resolveExecutionPath>;
+    runnerMode: string;
+    baseBranch: string;
+    baseBranchFieldValue: string | null;
+  },
+): Promise<void> {
+  if (!restateCanServe()) {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: Restate unavailable`);
+    return;
+  }
+  const dispatchId = crypto.randomUUID();
+  const backend = ctx.execPath === "fly-machines" || ctx.execPath === "local-docker" ? ctx.execPath : "github-actions";
+  // Advisory only: the workflow's reserve step owns admission and deduplication.
+  const decision = canDispatch({
+    issueId: issue.id,
+    kind: "implementation",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+  });
+  if (!decision.ok) return;
+  const launchContext: Record<string, string> = {
+    [IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY]: ctx.baseBranch,
+    [IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY]: ctx.runnerMode,
+    [IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY]: String(isGroupingParentDispatch(issue)),
+  };
+  if (ctx.baseBranchFieldValue) {
+    launchContext[IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY] = ctx.baseBranchFieldValue;
+  }
+  const submitted = await createImplementationRunIngressClient().submit(dispatchId, {
+    dispatchId, teamKey: issue.scopeKey, issueId: issue.id, issueIdentifier: issue.identifier,
+    launchContext, maxJobMinutes: normalizeGithubActionsJobTimeoutMinutes(mapping.maxJobMinutes), backend,
+  });
+  if (submitted.status === "unavailable") {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: Restate unavailable`);
+    return;
+  }
+  if (submitted.status === "not-found") {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: the ImplementationRun service is not registered`);
+    return;
+  }
+  console.log(`[poll] Submitted ImplementationRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+  if (submitted.status === "conflict") {
+    console.log(`[poll] Existing ImplementationRun owns dispatch=${dispatchId}`);
+  }
+}
+
+// The poll submits safe context; PlanningRun owns reservation and launch on every backend.
 export async function dispatchPlanning(
-  config: AppConfig,
-  provider: TicketingProvider,
+  _config: AppConfig,
+  _provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
   ctx: PlanningDispatchContext,
 ): Promise<void> {
-  const { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue } = ctx;
+  const { execPath, resolvedPlanningBranch, planningFieldValue } = ctx;
 
-  // Pilot lifecycle: the PlanningRun workflow owns the reservation and launches the run.
-  if (resolveReviewFixLifecycle(mapping) === "restate") {
-    const restate = getRestateStatus();
-    if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
-      return;
-    }
-    const dispatchId = crypto.randomUUID();
-    const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
-    // Non-binding pre-check only: the workflow takes the reservation in its first step, so a crash here leaves no row.
-    const decision = canDispatch({
-      issueId: issue.id,
-      kind: "planning",
-      teamKey: issue.scopeKey,
-      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-    });
-    if (!decision.ok) return;
-    const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
-    if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
-    const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
-      dispatchId,
-      teamKey: issue.scopeKey,
-      issueId: issue.id,
-      issueIdentifier: issue.identifier,
-      backend,
-      planningContext,
-    });
-    if (submitted.status === "unavailable") {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
-      return;
-    }
-    if (submitted.status === "not-found") {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: the PlanningRun service is not registered`);
-      return;
-    }
-    console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+  if (!restateCanServe()) {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
     return;
   }
-
-  if (execPath === "fly-machines" || execPath === "local-docker") {
-    await launchPlanningSession({
-      config, provider, issue, mapping, execPath, runnerMode, resolvedPlanningBranch, planningFieldValue,
-      deps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
-    });
-    return;
-  }
-
-  // ---------- GHA path (also handles shadow → GHA-only via resolvePlanningExecutionPath) ----------
-  // Final admission authority — see the matching comment in dispatchGitHubActions.
   const dispatchId = crypto.randomUUID();
-  const planningAdmission = acquireDispatch({
-    dispatchId,
+  const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
+  // Non-binding pre-check only: the workflow takes the reservation in its first step, so a crash here leaves no row.
+  const decision = canDispatch({
     issueId: issue.id,
-    issueIdentifier: issue.identifier,
     kind: "planning",
     teamKey: issue.scopeKey,
     maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-    backend: "github-actions",
   });
-  if (!planningAdmission.ok) return;
-
-  // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
-  // here is by construction a definitive non-launch — see the matching comment in
-  // dispatchGitHubActions.
-  const launch = await preparePlanningLaunch({
-    config, provider, issue, mapping, dispatchId, resolvedPlanningBranch,
-    resolveRunnerImage: resolveDispatchRunnerImage,
-  }).catch((err) => {
-    planningAdmission.release("launch_rejected");
-    throw err;
+  if (!decision.ok) return;
+  const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
+  if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
+  const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
+    dispatchId,
+    teamKey: issue.scopeKey,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    backend,
+    planningContext,
   });
-
-  const launched = await launchPlanningRun({
-    ...launch,
-    config, provider, issue, mapping, dispatchId,
-    admissionGeneration: planningAdmission.admissionGeneration,
-    planningFieldValue,
-    fireBreakerTrip,
-    onRejected: () => planningAdmission.release("launch_rejected"),
-  });
-  if (launched.outcome !== "accepted") return;
-
-  console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${launch.runnerImage ?? "workflow-default"})`);
+  if (submitted.status === "unavailable") {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
+    return;
+  }
+  if (submitted.status === "not-found") {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: the PlanningRun service is not registered`);
+    return;
+  }
+  console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
 }
 
 // ---------- Shared session-dispatch core ----------
@@ -1524,6 +1643,8 @@ interface SessionBackendResult {
   executionMode: "fly-machines" | "local-docker";
   statusComment: { machineName: string; logsUrl?: string } | null;
   dispatchedLogLine?: string;
+  machineSize?: MachineSize;
+  computeStartedAt?: number;
 }
 
 /**
@@ -1552,7 +1673,7 @@ export interface HeldReservation {
 /** What `dispatchSession` reports to a caller that cares (the shadow and implementation
  * callers ignore it). `admitted: false` means `acquireDispatch` refused and nothing ran. */
 export type DispatchSessionResult =
-  | { admitted: false }
+  | { admitted: false; refusal?: string }
   | { admitted: true; machineId: string; executionMode: "fly-machines" | "local-docker" };
 
 export async function dispatchSession(
@@ -1571,6 +1692,9 @@ export async function dispatchSession(
      *  the shadow Fly dispatch mirrors an already-admitted GHA primary and must not
      *  compete for (or be blocked by) the same issue's reservation. */
     backendKind: "fly-machines" | "local-docker";
+    /** Managed model authentication (AII-958). Absent means the caller is not wired: an
+     *  opted-in project then refuses with `phase_not_wired` instead of launching legacy. */
+    managedAuth?: { runtime: ModelAuthRuntime; workflowFile: string };
     /** Classifies a thrown backend() error, once the backend has called
      *  `markLaunchAttempted`, as a proven non-launch (safe to release the reservation)
      *  versus an ambiguous failure (must stay held for the matching Legacy monitor to
@@ -1584,6 +1708,10 @@ export async function dispatchSession(
       machineNonce: string;
       runnerCallbackUrl: string;
       runToken: string;
+      runProgressToken: string;
+      runPublicationToken?: string;
+      /** `legacy` for today's path; `launch` carries the snapshot and the one-shot bootstrap. */
+      managedAuth: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
       /** Call immediately before the actual launch call (createMachine / the local
        *  Docker spawn) — everything the backend does before this point (minting a
        *  credential, resolving an image) is provably side-effect-free for the
@@ -1631,20 +1759,46 @@ export async function dispatchSession(
     admission = decision;
   }
 
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: opts.phase,
-      audience: "result",
-      dispatchId,
-      ttlSeconds: opts.tokenTtlSeconds,
-      secret: config.runnerTokenSecret,
-    });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
+  // Managed model authentication: decided before any run token is minted. Only an
+  // admission acquired here is released; a caller-held reservation is never ours to free.
+  let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+  if (!opts.managedAuth) {
+    if (isManagedProject(issue.scopeKey, dispatchId)) {
+      admission?.release("launch_rejected");
+      console.warn(`[poll] Managed dispatch for ${issue.identifier}: phase_not_wired (${opts.phase}); nothing launched`);
+      return { admitted: false, refusal: "phase_not_wired" };
+    }
+  } else if (opts.shadow && isManagedProject(issue.scopeKey, dispatchId)) {
+    return { admitted: false };
+  } else {
+    const decision = await prepareManagedDispatch(
+      { dispatchId, projectKey: issue.scopeKey, backend: opts.backendKind, owner: mapping.owner, repo: mapping.repo, workflowFile: opts.managedAuth.workflowFile },
+      opts.managedAuth.runtime,
+    );
+    console.log(
+      `[poll] Managed dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`,
+    );
+    if (decision.kind === "legacy" || decision.kind === "launch") {
+      managedDecision = decision;
+    } else {
+      admission?.release("launch_rejected");
+      if (decision.kind === "refuse") {
+        const text = refusalText(decision);
+        if (opts.phase === "implementation") {
+          await provider.markImplementationFailed(issue.id, issue.scopeKey, text);
+        } else {
+          await provider.markPlanningFailed(issue.id, issue.scopeKey, text);
+        }
+        // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code);
+        if (breakerRefuse.tripped) {
+          await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, breakerRefuse.failures, decision.code);
+        }
+      } else {
+        console.log(`[poll] ${refusalText(decision)} (${issue.identifier})`);
+      }
+      return { admitted: false, refusal: decision.code };
+    }
   }
 
   let launchAttempted = false;
@@ -1654,8 +1808,34 @@ export async function dispatchSession(
 
   let result: SessionBackendResult;
   try {
-    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted });
+    let runnerCallbackUrl = "";
+    let tokens: Partial<LaunchTokens> = {};
+    if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+      tokens = mintLaunchTokens({
+        issueId: issue.id,
+        mappingTeamKey: issue.scopeKey,
+        phase: opts.phase,
+        dispatchId,
+        repository: `${mapping.owner}/${mapping.repo}`,
+        ttlSeconds: opts.tokenTtlSeconds,
+        secret: config.runnerTokenSecret,
+      });
+      runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    }
+    result = await opts.backend({
+      sessionToken,
+      machineNonce,
+      runnerCallbackUrl,
+      runToken: tokens.runToken ?? "",
+      runProgressToken: tokens.runProgressToken ?? "",
+      runPublicationToken: tokens.runPublicationToken,
+      managedAuth: managedDecision,
+      markLaunchAttempted,
+    });
   } catch (err) {
+    if (managedDecision.kind === "launch" && opts.managedAuth) {
+      settleLaunch(managedDecision, classifyLaunchError(opts.backendKind, launchAttempted, err), opts.managedAuth.runtime);
+    }
     if (admission && shouldReleaseAdmissionOnDispatchError(launchAttempted, err, opts.isDefinitiveLaunchFailure)) {
       admission.release("launch_rejected");
     }
@@ -1686,6 +1866,10 @@ export async function dispatchSession(
       sessionImage: result.sessionImage,
       phase: opts.phase,
       groupingParent: opts.phase === "implementation" && isGroupingParentDispatch(issue),
+      trackerKind: mapping.ticketingProvider ?? null,
+      issueUrl: provider.issueUrl(issue),
+      machineSize: result.machineSize ?? null,
+      computeStartedAt: result.computeStartedAt ?? null,
     });
 
     if (!opts.shadow) {
@@ -1732,7 +1916,9 @@ export async function dispatchSession(
 
 // ---------- Dispatch: Fly Machines ----------
 
-async function dispatchFlyMachine(
+// Exported for direct testing of the launch contract — see the matching comment on
+// dispatchGitHubActions. Not part of the module's public API otherwise.
+export async function dispatchFlyMachine(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -1758,107 +1944,25 @@ async function dispatchFlyMachine(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
     const level = shadow ? "warn" : "error";
     console[level](`[poll] ${shadow ? "Shadow Fly dispatch skipped" : "Cannot dispatch"} ${issue.identifier} via Fly Machines: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
   }
 
-  // Capture at call time so the non-null assertion inside the closure is sound
-  // (the pre-checks above have already verified these are non-null).
-  const flyToken = config.flySessionsToken;
-  const flyApp = config.flySessionsApp;
-
   await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
     phase: "implementation",
-    tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
+    tokenTtlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
     doMarkDispatched: !shadow,
     shadow,
     backendKind: "fly-machines",
+    managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.workflowFile },
     isDefinitiveLaunchFailure: isDefinitiveFlyRejectionError,
     branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
-      const minSecretsVersion = getFlySecretsMinVersion();
-
-      let allSecretNames: string[] = [];
-      try {
-        const secrets = await listAppSecrets(flyToken, flyApp);
-        allSecretNames = secrets.map((s) => s.name);
-      } catch (err) {
-        console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
-      }
-
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-
-      const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
-        owner: mapping.owner,
-        repo: mapping.repo,
-        token: ghToken,
-        defaultImage: config.sessionImage,
-      });
-
-      const implRunConfig: RunConfigV1 = buildImplRunConfig({
-        issue,
-        mapping,
-        baseBranch,
-        runnerCallbackUrl,
-        groupingParent: isGroupingParentDispatch(issue),
-        retryPolicy: getRetryPolicy(),
-      });
-
-      const machineConfig = buildSessionMachineConfig({
-        image: resolvedImage,
-        issueId: issue.id,
-        issueIdentifier: issue.identifier,
-        issueTitle: issue.title,
-        issueDescription: issue.description || issue.title,
-        owner: mapping.owner,
-        repo: mapping.repo,
-        defaultBranch: baseBranch,
-        anthropicApiKey: config.anthropicApiKey ?? undefined,
-        claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-        githubToken: ghToken,
-        sessionToken,
-        machineNonce,
-        sessionMode: mapping.sessionMode,
-        region: config.flySessionsRegion ?? undefined,
-        cpus: mapping.machineCpus,
-        memoryMb: mapping.machineMemoryMb,
-        teamKey: issue.scopeKey,
-        teamSecretNames: allSecretNames,
-        allTeamKeys: Object.keys(getMappings()),
-        flyProcessLevelSecrets: getFlyProcessLevelSecrets().enabled,
-        minSecretsVersion: minSecretsVersion ?? undefined,
-        orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
-        runnerCallbackUrl: runnerCallbackUrl || undefined,
-        runToken: runToken || undefined,
-        orchestratorApp: config.flyOrchestratorApp ?? undefined,
-        tenantId: config.tenantId ?? undefined,
-        expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
-        extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implRunConfig) };
-          return Object.keys(merged).length > 0 ? merged : undefined;
-        })(),
-      });
-      if (getFlyProcessLevelSecrets().enabled) {
-        const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
-        console.log(`[poll] process-level secrets for ${issue.identifier}: [${secretNames.join(", ")}]`);
-      }
-
-      markLaunchAttempted();
-      const machine = await createMachine(flyToken, flyApp, machineConfig);
-
-      const tag = shadow ? "shadow fly-machines" : "fly-machines";
-      console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${tag}, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
-
-      const machineLogsUrl = `https://fly.io/apps/${flyApp}/machines/${machine.id}`;
-      return {
-        machineId: machine.id,
-        sessionImage: resolvedImage,
-        ghToken,
-        executionMode: "fly-machines",
-        statusComment: shadow ? null : { machineName: machine.name, logsUrl: machineLogsUrl },
-      };
+    backend: async (input) => {
+      const launched = await launchImplementationFlySession({ config, issue, mapping, baseBranch, shadow, input, isGroupingParentDispatch });
+      // postDispatch reads ghToken only for GitHub Actions, so the session result never carries one.
+      return { ...launched, ghToken: "" };
     },
   });
 }
@@ -1884,71 +1988,24 @@ export async function dispatchLocalDocker(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
     console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
   }
 
   await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
     phase: "implementation",
-    tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
+    tokenTtlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
     doMarkDispatched: true,
     shadow: false,
     backendKind: "local-docker",
+    managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.workflowFile },
     isDefinitiveLaunchFailure: isDefinitiveLocalDockerLaunchFailure,
     branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
-      const localOrchestratorUrl =
-        config.localRunnerOrchestratorUrl ??
-        config.runnerCallbackBaseUrl ??
-        `http://host.docker.internal:${config.healthPort}`;
-
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-
-      const localImplRunConfig: RunConfigV1 = buildImplRunConfig({
-        issue,
-        mapping,
-        baseBranch,
-        runnerCallbackUrl,
-        groupingParent: isGroupingParentDispatch(issue),
-        retryPolicy: getRetryPolicy(),
-      });
-
-      markLaunchAttempted();
-      const container = await startLocalRunnerContainer({
-        image: config.localRunnerImage,
-        issueId: issue.id,
-        issueIdentifier: issue.identifier,
-        issueTitle: issue.title,
-        issueDescription: issue.description || issue.title,
-        owner: mapping.owner,
-        repo: mapping.repo,
-        defaultBranch: baseBranch,
-        anthropicApiKey: config.anthropicApiKey ?? undefined,
-        claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-        githubToken: ghToken,
-        sessionToken,
-        machineNonce,
-        sessionMode: mapping.sessionMode,
-        orchestratorUrl: localOrchestratorUrl,
-        runnerCallbackUrl: runnerCallbackUrl || undefined,
-        runToken: runToken || undefined,
-        extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) };
-          return Object.keys(merged).length > 0 ? merged : undefined;
-        })(),
-      });
-
-      return {
-        machineId: container.containerId,
-        sessionImage: config.localRunnerImage,
-        ghToken: "",
-        executionMode: "local-docker",
-        statusComment: {
-          machineName: container.containerName || container.containerId.slice(0, 12),
-        },
-        dispatchedLogLine: `[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (local-docker, container: ${container.containerId}, image: ${config.localRunnerImage})`,
-      };
+    backend: async (input) => {
+      const launched = await launchImplementationLocalSession({ config, issue, mapping, baseBranch, input, isGroupingParentDispatch });
+      // postDispatch reads ghToken only for GitHub Actions, so the session result never carries one.
+      return { ...launched, ghToken: "" };
     },
   });
 }
@@ -2017,8 +2074,11 @@ async function postDispatch(
 /** Maximum age (ms) before a dispatched job without a run ID is marked timed_out. */
 const RUN_ID_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-/** Maximum age (ms) for a Fly Machine job before it's considered timed out. */
-const FLY_MACHINE_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
+/** Job age limit (ms) for the Fly and local-docker monitors: the mapping's Job Timeout, same as GHA. */
+function jobTimeoutMs(job: Job): number {
+  const mapping = mappingForJob(getMappings(), job);
+  return normalizeGithubActionsJobTimeoutMinutes(mapping?.maxJobMinutes) * 60_000;
+}
 
 /** Maximum characters to include in a Linear "Session Logs" comment. */
 const LOG_MAX_CHARS = 5_000;
@@ -2029,7 +2089,7 @@ const LOG_MAX_CHARS = 5_000;
  * on successful sessions.
  *
  * Note: when a machine was already auto-destroyed (machineConclusion ===
- * "destroyed") the Fly API returns 404 and no log dump is possible.  Callers
+ * "destroyed") the logs lookup may fail with 404 and no log dump is possible.  Callers
  * must skip this function for that path.
  */
 async function postSessionLogs(
@@ -2146,13 +2206,11 @@ function isRestateOwnedJob(job: Job): boolean {
 function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolean>) | undefined {
   if (job.executionMode === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return undefined;
-    const token = config.flySessionsToken;
-    const app = config.flySessionsApp;
     const machineId = job.machineId;
     return async () => {
       let confirmed = false;
       try {
-        await destroyMachine(token, app, machineId);
+        await destroyMachineRecorded(config, machineId, "ttl-stop", { issueIdentifier: job.issueIdentifier });
         confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${machineId}`);
       } catch (err) {
@@ -2272,6 +2330,7 @@ export async function confirmAdmissionTerminated(
 
     try {
       const status = await getWorkflowRunStatus(token, owner, repo, runId);
+      if (status) recordGhaRunCompleted(runId, status);
       return status?.status === "completed";
     } catch (err) {
       console.error(`[admission] Failed to check GHA run status for dispatch=${candidate.dispatchId}:`, err);
@@ -2292,51 +2351,8 @@ export async function confirmAdmissionTerminated(
   return false;
 }
 
-/**
- * Fast-path companion to `confirmAdmissionTerminated` for the planning callback
- * (AII-783 review, third round, on PR #681): the callback marks the job row
- * `completed` with `skipAdmissionRelease` because its own self-report is not proof the
- * backend has exited, but that write also drops the job out of `getInFlightJobs()`'s
- * `dispatched`/`running` set — the set every per-poll-cycle monitor (GHA run-status
- * poll, Fly/local monitor) reads from. Relying solely on `sweepStaleAdmissions`'s
- * 6-hour floor to eventually notice an already-finished backend would strand the common
- * case — a planning run that finishes in minutes — at full team capacity for hours,
- * reversing the very "accelerate the planning→implementation handoff" optimization the
- * callback exists for.
- *
- * This runs the same termination oracle once, immediately, right after the callback
- * records the job as completed. A backend already confirmed terminal releases the
- * reservation right away; a still-running or unconfirmable backend is a no-op here —
- * the reservation then stays held exactly as `skipAdmissionRelease` left it, for a
- * later monitor tick or the stale-admission sweep to resolve.
- */
-export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatchId: string): Promise<void> {
-  const record = readAdmission(dispatchId);
-  if (!record || record.releasedAt !== null) return;
-
-  let confirmed: boolean;
-  try {
-    confirmed = await confirmAdmissionTerminated(config, {
-      dispatchId: record.dispatchId,
-      mappingKey: record.mappingKey,
-      backend: record.backend,
-      lifecycleOwner: record.lifecycleOwner,
-      generation: record.generation,
-      ageMs: Date.now() - record.createdAt,
-    });
-  } catch (err) {
-    console.error(`[admission] Fast-path confirmAdmissionTerminated threw for dispatch=${dispatchId}:`, err);
-    return;
-  }
-  if (!confirmed) return;
-
-  const outcome = releaseAdmission(record.dispatchId, record.lifecycleOwner, record.generation, "finalized");
-  if (outcome.status === "released") {
-    console.log(`[admission] Fast-released planning admission dispatch=${dispatchId} mapping=${record.mappingKey}`);
-  }
-}
-
-const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved"]);
+// stuck_review_fix: remediateStuckJob already closed out a review-fix run and alerted the human.
+const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending", "stuck_review_fix"]);
 
 export async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
@@ -2364,15 +2380,10 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
       // its own terminal branch.
       if (job.phase !== "kg-refresh" && !isRestateOwnedJob(job)) {
         const mapping = mappingForJob(teamRepoMap, job);
-        // maxJobMinutes is a GHA-only setting (docs/pipeline: Job Timeout (min)); Fly and
-        // local-docker jobs have their own timeout (FLY_MACHINE_TIMEOUT_MS) and must not
-        // inherit a GHA value that could be shorter than their actual machine timeout.
-        const isFlyOrLocal =
-          job.executionMode === "fly-machines" || job.executionMode === "local-docker";
         const ttl = jobTtlDecision({
           dispatchedAtMs: job.dispatchedAt,
           nowMs: Date.now(),
-          maxJobMinutes: isFlyOrLocal ? FLY_MACHINE_TIMEOUT_MS / 60_000 : mapping?.maxJobMinutes,
+          maxJobMinutes: mapping?.maxJobMinutes,
         });
         // A runner callback can set conclusion to operator_cancelled/runner_approved
         // concurrently with this tick reading the (now-stale) in-flight snapshot.
@@ -2517,6 +2528,7 @@ async function monitorGitHubActionsJob(
     return;
   }
   if (!isMonitorRunIdStillCurrent(job)) return;
+  recordGhaRunCompleted(job.runId, runStatus);
 
   // Detect stuck: non-terminal past the configured workflow timeout plus reconciliation grace.
   const watchdog = githubActionsWatchdogDecision({
@@ -2574,7 +2586,7 @@ async function monitorGitHubActionsJob(
     // AII-264 r6: the run's PR already merged (auto-merge beat this check) — route straight
     // to the Done-reconcile so the ticket completes even if the merge-poll never sees it.
     if (fallbackPrMatch?.merged && prUrl) {
-      reconcileAlreadyMergedPr(job, prUrl);
+      await finalizeImplementation({ kind: "merged", prUrl }, null, watchdogConfig, job);
     }
 
     // AII-264 r5: a grouping parent's clean GHA run with no PR is Case-B (the runner's push
@@ -2583,13 +2595,13 @@ async function monitorGitHubActionsJob(
     if (jobStatus === "completed" && !prUrl && job.phase !== "planning" && job.groupingParent) {
       const provider = await providerForJob(registry, job);
       if (!isMonitorRunIdStillCurrent(job)) return;
-      await finalizeNoOpGroupingParent(provider, job);
+      await finalizeImplementation({ kind: "no_work" }, provider, watchdogConfig, job);
     }
 
     if (jobStatus === "failed") {
       const provider = await providerForJob(registry, job);
       if (!isMonitorRunIdStillCurrent(job)) return;
-      await remediateFailedJob(watchdogConfig, provider, job, runStatus.conclusion ?? "failure");
+      await finalizeImplementation({ kind: "failed", conclusion: runStatus.conclusion ?? "failure" }, provider, watchdogConfig, job);
     }
   }
   // If status is queued or in_progress, ensure job is marked running
@@ -2657,7 +2669,7 @@ async function monitorFlyMachineJob(
   if (isRestateOwnedJob(job)) return;
 
   // Check machine age timeout — also destroy the machine to stop accruing cost
-  if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
+  if (Date.now() - job.dispatchedAt > jobTimeoutMs(job)) {
     // Fetch logs before destroying so the machine is still accessible
     if (job.runnerMode !== "shadow") {
       await postSessionLogs(config, provider, job, "machine_timeout");
@@ -2686,7 +2698,7 @@ async function monitorFlyMachineJob(
     const stopRunner = async () => {
       let confirmed = false;
       try {
-        await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        await destroyMachineRecorded(config, job.machineId!, "monitor-timeout", { issueIdentifier: job.issueIdentifier });
         confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
       } catch (err) {
@@ -2738,7 +2750,7 @@ async function monitorFlyMachineJob(
 
   if (machineDone) {
     // Determine success/failure before destroying: move findPrForIssue before
-    // destroyMachine so we can decide whether to fetch logs while the machine
+    // destroyMachineRecorded so we can decide whether to fetch logs while the machine
     // is still accessible.
     const matchedPr = await findPrForIssue(config, job.repo, job.issueIdentifier);
     const prUrl = matchedPr?.url ?? null;
@@ -2781,7 +2793,7 @@ async function monitorFlyMachineJob(
       }
 
       try {
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
+        await destroyMachineRecorded(config, job.machineId, "monitor-stopped", { issueIdentifier: job.issueIdentifier });
         console.log(`[monitor] Destroyed stopped machine ${job.machineId}`);
       } catch (err) {
         if (!(err instanceof Error && err.message.includes("404"))) {
@@ -2795,8 +2807,14 @@ async function monitorFlyMachineJob(
     invalidateNonce(job.id);
     clearPrNotFoundGrace(job.id);
     console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (${machineConclusion}, PR: ${prUrl || "none"})`);
+    const flyWatchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
     if (decision.finalizeGroupingParent) {
-      await finalizeNoOpGroupingParent(provider, job);
+      await finalizeImplementation({ kind: "no_work" }, provider, flyWatchdogConfig, job);
     }
 
     // Post machine_destroyed status comment to Linear (best-effort, skip shadow jobs)
@@ -2813,7 +2831,7 @@ async function monitorFlyMachineJob(
     if (matchedPr?.merged && prUrl) {
       // AII-264 r6: the PR already merged — Ready for Review would be a lie and a reset
       // would loop an already-landed child. Route straight to the Done-reconcile.
-      reconcileAlreadyMergedPr(job, prUrl);
+      await finalizeImplementation({ kind: "merged", prUrl }, provider, flyWatchdogConfig, job);
     } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
       if (isDraftPr) {
         // Unapproved run: the runner callback (or, absent one, this job row + the
@@ -2826,16 +2844,10 @@ async function monitorFlyMachineJob(
         // label for Ready for Review, post a PR-link comment). The poller won't
         // re-dispatch issues with Ready for Review, so we don't need to clear
         // the dedup entry.
-        await markReadyForReview(provider, job, prUrl);
+        await finalizeImplementation({ kind: "ready", prUrl }, provider, flyWatchdogConfig, job);
       }
     } else if (jobStatus === "failed") {
-      const flyWatchdogConfig: StuckWatchdogConfig = {
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
-        notifyType: config.notifyType,
-        notifyWebhookUrl: config.notifyWebhookUrl,
-      };
-      await remediateFailedJob(flyWatchdogConfig, provider, job, machineConclusion);
+      await finalizeImplementation({ kind: "failed", conclusion: machineConclusion }, provider, flyWatchdogConfig, job);
     }
   }
 }
@@ -2851,7 +2863,7 @@ async function monitorLocalDockerJob(
   // matter what the container itself reports.
   if (isRestateOwnedJob(job)) return;
 
-  if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
+  if (Date.now() - job.dispatchedAt > jobTimeoutMs(job)) {
     await postLocalContainerLogs(provider, job, "container_timeout");
 
     const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
@@ -2948,95 +2960,28 @@ async function monitorLocalDockerJob(
     });
   }
 
+  const localWatchdogConfig: StuckWatchdogConfig = {
+    githubAppId: config.githubAppId,
+    githubAppPrivateKey: config.githubAppPrivateKey,
+    notifyType: config.notifyType,
+    notifyWebhookUrl: config.notifyWebhookUrl,
+  };
   if (decision.finalizeGroupingParent) {
-    await finalizeNoOpGroupingParent(provider, job);
+    await finalizeImplementation({ kind: "no_work" }, provider, localWatchdogConfig, job);
   } else if (matchedPr?.merged && prUrl) {
     // AII-264 r6: the PR already merged — route straight to the Done-reconcile,
     // never Ready for Review, never reset.
-    reconcileAlreadyMergedPr(job, prUrl);
+    await finalizeImplementation({ kind: "merged", prUrl }, provider, localWatchdogConfig, job);
   } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
     if (isDraftPr) {
       // Unapproved run: the runner callback (or, absent one, this job row + the
       // status comment already posted above) owns the ticket transition for a
       // draft PR — don't override it with Ready for Review.
     } else {
-      await markReadyForReview(provider, job, prUrl);
+      await finalizeImplementation({ kind: "ready", prUrl }, provider, localWatchdogConfig, job);
     }
   } else {
-    const localWatchdogConfig: StuckWatchdogConfig = {
-      githubAppId: config.githubAppId,
-      githubAppPrivateKey: config.githubAppPrivateKey,
-      notifyType: config.notifyType,
-      notifyWebhookUrl: config.notifyWebhookUrl,
-    };
-    await remediateFailedJob(localWatchdogConfig, provider, job, `exit_${state.exitCode}`);
-  }
-}
-
-/**
- * AII-264 r5: finalize a grouping parent whose closing run produced no changes (Case B).
- * Mirrors the runner-callback `noWork` path: markMerged clears AI-Working and completes the
- * issue, so fetchFeatureNodeRollUps finds the feature node done and merge-up.ts opens the
- * feature→base roll-up PR — after which the r3 roll-up hold keeps the parent parked. The
- * stuck-attempt counter is reset so a prior pr_not_found streak can't re-arm the watchdog.
- */
-async function finalizeNoOpGroupingParent(provider: TicketingProvider | null, job: Job): Promise<void> {
-  if (!provider || !job.issueId) return;
-  if (!job.teamKey) {
-    console.error(`[monitor] Cannot finalize grouping parent ${job.issueIdentifier}: job has no teamKey`);
-    return;
-  }
-  try {
-    await provider.markMerged(job.issueId, job.teamKey);
-    resetStuckAttempts(job.issueId);
-    console.log(`[monitor] Grouping parent ${job.issueIdentifier}: closing run produced no changes — finalized for roll-up (no reset)`);
-  } catch (err) {
-    console.error(`[monitor] Failed to finalize grouping parent ${job.issueIdentifier}:`, err);
-  }
-}
-
-/**
- * AII-264 r6: the run's PR was already merged (auto-merge beat the monitor's first
- * post-exit check — routine for fast children). That is a SUCCESS with the review stage
- * already over: route straight to the Done-reconcile (same queue the merge-poll and
- * webhook feed) instead of markReadyForReview, and never reset. Keyed by repo+PR, so a
- * later job-row mangling cannot orphan the ticket — the queue row survives independently.
- */
-function reconcileAlreadyMergedPr(job: Job, prUrl: string): void {
-  const prNumber = prNumberFromUrl(prUrl);
-  if (prNumber === null || !job.repo) return;
-  if (hasReconciliationForPr(job.repo, prNumber)) return;
-  enqueueReconciliation({
-    issueId: job.issueId,
-    issueIdentifier: job.issueIdentifier,
-    prNumber,
-    repo: job.repo,
-    mergeCommitSha: "",
-  });
-  resetStuckAttempts(job.issueId);
-  console.log(`[monitor] PR #${prNumber} for ${job.issueIdentifier} already merged — queued Done-reconcile (no reset)`);
-}
-
-/** Mark a Linear issue as Ready for Review after a successful job. */
-async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: string): Promise<void> {
-  if (!job.issueId) return;
-  // teamKey is the authoritative scope (set to issue.scopeKey at job creation).
-  // It's always present here, but guard rather than pass "" — an empty scope
-  // makes Jira's fields("") throw and leaves the ticket stuck.
-  if (!job.teamKey) {
-    console.error(`[monitor] Cannot mark ${job.issueIdentifier} as Ready for Review: job has no teamKey`);
-    return;
-  }
-  try {
-    const applied = await provider.markPrReady(job.issueId, job.teamKey, prUrl);
-    resetStuckAttempts(job.issueId);
-    if (applied) {
-      console.log(`[monitor] Marked ${job.issueIdentifier} as Ready for Review (PR: ${prUrl})`);
-    } else {
-      console.log(`[monitor] ${job.issueIdentifier} already Merged — Ready for Review suppressed (PR: ${prUrl})`);
-    }
-  } catch (err) {
-    console.error(`[monitor] Failed to mark ${job.issueIdentifier} as Ready for Review:`, err);
+    await finalizeImplementation({ kind: "failed", conclusion: `exit_${state.exitCode}` }, provider, localWatchdogConfig, job);
   }
 }
 
@@ -3049,7 +2994,7 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
     return;
   }
   try {
-    const applied = await provider.clearWorkingState(job.issueId, job.teamKey);
+    const applied = await provider.clearWorkingState(job.issueId, job.teamKey, job.phase === "planning" ? "planning" : "implementation");
 
     // Clear the dedup entry so the issue can be re-dispatched. Safe even when the
     // reset was refused (issue already Merged): the dispatch bucket only selects
@@ -3095,17 +3040,25 @@ export async function reportTerminalJob(
   // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
   const recordBreaker = (): void => {
     if (job.issueId && job.phase !== "kg-refresh") {
-      const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
+      // A fix run counts in the bucket the fix-run dispatch gate reads (isParked(…, "gap-analysis")).
+      const breakerPhase = breakerPhaseFor(job.phase);
       if (job.status === "completed") {
         recordDispatchSuccess(job.issueId, breakerPhase);
-      } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
+      } else if (
+        job.status === "failed" ||
+        job.status === "timed_out" ||
+        // review_failed on a fix run is the normal outcome of a round that pushed but still has
+        // findings; the PR Dispatch Budget limits that loop, not the breaker.
+        (job.status === "review_failed" && breakerPhase !== "gap-analysis")
+      ) {
         // Skip the breaker entirely for operator_cancelled — it was a human decision,
         // not a system failure. Recording it could park the issue and permanently
         // suppress future genuine-failure alerts even after the breaker trips from
         // accumulated operator-cancel events (alreadyParked stays true forever).
         if (job.conclusion !== "operator_cancelled") {
           const breakerConclusion = job.conclusion ?? job.status;
-          // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
+          // stuck_giveup already fires notifyStuckGiveUp — don't double-fire. A stuck_review_fix
+          // alert says the run stopped; the trip notice says fix runs are now paused, so it is sent.
           const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
           // A classified transient failure (provider overload) is the provider's outage, not
           // the ticket's — don't count it toward the breaker, or three unlucky retries against
@@ -3124,10 +3077,46 @@ export async function reportTerminalJob(
   if (opts?.ownerCall) getDb().transaction(() => { recordBreaker(); markJobNotified(job.id); })();
   else recordBreaker();
 
+  // Resolve provider via the job's teamKey -> mapping so the URL matches
+  // the issue's ticketing system. Fall back to the legacy Linear URL if
+  // the mapping is gone (orphaned job).
+  const identifier = job.issueIdentifier || job.issueId;
+  let issueUrl = `https://linear.app/issue/${identifier}`;
+  let provider: TicketingProvider | null = null;
+  const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
+  if (mapping) {
+    try {
+      provider = await registry.forMapping(mapping);
+      issueUrl = provider.issueUrl({
+        id: job.issueId,
+        identifier,
+        title: job.issueTitle || "",
+        description: null,
+        scopeKey: job.teamKey ?? "",
+        nativeStatus: "",
+      });
+    } catch (err) {
+      console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
+    }
+  }
+
   // Suppress ordinary completion notice for stuck conclusions — stuck_giveup
   // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
-  // requeue that will produce its own dispatch notice on the next cycle.
-  if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
+  // requeue that will produce its own dispatch notice on the next cycle, and
+  // stuck_review_fix already alerted a human from the watchdog.
+  if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued" || job.conclusion === "stuck_review_fix") {
+    // A stuck fix run that tripped the gap-analysis breaker still sends the trip notice.
+    if (pendingBreakerTrip && job.issueId) {
+      await fireBreakerTrip(
+        config,
+        provider,
+        job.issueId,
+        job.issueIdentifier,
+        pendingBreakerTrip.phase,
+        pendingBreakerTrip.failures,
+        pendingBreakerTrip.conclusion,
+      );
+    }
     markJobNotified(job.id);
     return;
   }
@@ -3164,29 +3153,6 @@ export async function reportTerminalJob(
 
   const durationMs =
     job.completedAt != null ? job.completedAt - job.dispatchedAt : null;
-
-  // Resolve provider via the job's teamKey -> mapping so the URL matches
-  // the issue's ticketing system. Fall back to the legacy Linear URL if
-  // the mapping is gone (orphaned job).
-  const identifier = job.issueIdentifier || job.issueId;
-  let issueUrl = `https://linear.app/issue/${identifier}`;
-  let provider: TicketingProvider | null = null;
-  const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
-  if (mapping) {
-    try {
-      provider = await registry.forMapping(mapping);
-      issueUrl = provider.issueUrl({
-        id: job.issueId,
-        identifier,
-        title: job.issueTitle || "",
-        description: null,
-        scopeKey: job.teamKey ?? "",
-        nativeStatus: "",
-      });
-    } catch (err) {
-      console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
-    }
-  }
 
   // Fire breaker trip notification now that provider is resolved.
   if (pendingBreakerTrip && job.issueId) {
@@ -3291,6 +3257,9 @@ function reaperConfig(config: AppConfig, registry: ProviderRegistry) {
 }
 
 async function startupReconciliation(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+  if (getRunnerMode().mode === "local") {
+    await reconcileRestateLocalContainers(reaperConfig(config, registry));
+  }
   if (!config.flySessionsToken || !config.flySessionsApp) return;
 
   console.log("[startup] Running machine reconciliation...");
@@ -3322,6 +3291,26 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
       continue;
     }
 
+    // A durable-runner machine is owned by a FlyMachineProfile object, not a dispatch_log
+    // row: a missing or terminal row is its normal state, so neither rule below may see it.
+    // Only the object's expire and the reaper's durable-expired may destroy it.
+    if (isDurableRunnerMachine(machine)) {
+      console.log(`[startup] Keeping durable-runner machine ${machine.id} (owned by FlyMachineProfile)`);
+      try {
+        recordReaperAction({
+          ruleMatched: "durable-skip:startup-reconcile",
+          machineId: machine.id,
+          tenantId: null,
+          issueIdentifier: null,
+          ageSeconds: Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000),
+          dryRun: config.reaperDryRun,
+        });
+      } catch (err) {
+        console.error("[startup] Failed to record durable-skip:", err);
+      }
+      continue;
+    }
+
     const job = getJobByMachineId(machine.id);
 
     if (!job) {
@@ -3334,7 +3323,8 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
     // AII-791: boot recovery never finalizes a Restate-owned attempt, even one that
     // looks orphaned or stale from this row's own status — Restate's own workflow
     // owns confirming its termination.
-    if (isRestateOwnedJob(job)) continue;
+    if (await reconcileRestateMachine(reaperConfig(config, registry), job, machine.id,
+      Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000), "startup-stale-terminal")) continue;
 
     const isTerminal =
       job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";
@@ -3421,7 +3411,69 @@ function acquireGapfillAdmission(input: {
   });
 }
 
-export async function processReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+export async function processReviewFixQueue(config: AppConfig, _registry: ProviderRegistry): Promise<void> {
+  const pending = getPendingReviewFixes();
+  if (pending.length === 0) return;
+
+  console.log(`[review-fix] Processing ${pending.length} pending review fix run(s)`);
+
+  const teamRepoMap = getMappings();
+
+  for (const fix of pending) {
+    try {
+      const [fixOwner, fixRepo] = fix.repo.split("/");
+      const previousDispatch = getLatestDispatchForPr(fixOwner, fixRepo, fix.prNumber);
+      const mappingEntry = Object.entries(teamRepoMap).find(
+        ([key, mapping]) => `${mapping.owner}/${mapping.repo}` === fix.repo &&
+          (!previousDispatch?.teamKey || key === previousDispatch.teamKey),
+      );
+
+      if (!mappingEntry) {
+        console.warn(`[review-fix] No mapping found for repo ${fix.repo}, skipping review fix #${fix.id}`);
+        updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
+
+      const [, mapping] = mappingEntry;
+      {
+        if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
+        if (!restateCanServe()) continue;
+        try {
+          const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
+          if (!prState) continue;
+          if (shouldSkipReviewFix(prState)) {
+            updateReviewFixStatus(fix.id, "skipped");
+            continue;
+          }
+          const installationId = await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const lastEvent = listReviewFixEvents(fix.id).at(-1);
+          if (!lastEvent) continue;
+          // Periodic, identity-stable nudges repair a missed signal or a project
+          // unpaused while the same queue row waits.
+          // ReviewFixPR's existing wake never extends its first 5-second window.
+          const nudge = await reviewFixIngressClient.feedback(
+            { installationId, repository: fix.repo, prNumber: fix.prNumber },
+            undefined,
+            { idempotencyKey: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}` },
+          );
+          if (nudge.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${nudge.status}`);
+        } catch (err) {
+          console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
+        }
+        continue;
+      }
+    } catch (err) {
+      console.warn(`[review-fix] Could not process feedback for #${fix.id}; keeping pending:`, err);
+    }
+  }
+}
+
+// C7a rollback boundary: retained without a caller until C7b removes the Legacy drain.
+// Referencing the function keeps noUnusedLocals enabled without invoking it.
+void processLegacyReviewFixQueue;
+
+async function processLegacyReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const pending = getPendingReviewFixes();
   if (pending.length === 0) return;
 
@@ -3446,40 +3498,11 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
 
       const [scopeKey, mapping] = mappingEntry;
       const runnerMode = getRunnerMode().mode;
-      const selectedExecutionPath = resolveExecutionPath(runnerMode, mapping.executionMode);
-      if (resolveReviewFixLifecycle(mapping) === "restate" && selectedExecutionPath !== "local-docker") {
-        if (selectedExecutionPath !== "github-actions") {
-          console.warn(`[review-fix] Restate pilot runner mode unavailable for ${fix.repo}; keeping #${fix.id} pending`);
-          continue;
-        }
-        if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
-        const restate = getRestateStatus();
-        if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") continue;
-        try {
-          const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-          const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
-          if (!prState) continue;
-          if (shouldSkipReviewFix(prState)) {
-            updateReviewFixStatus(fix.id, "skipped");
-            continue;
-          }
-          const installationId = await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-          const lastEvent = listReviewFixEvents(fix.id).at(-1);
-          if (!lastEvent) continue;
-          // Periodic, identity-stable nudges repair a missed signal or a project
-          // toggled away from and back to Restate while the same queue row waits.
-          // ReviewFixPR's existing wake never extends its first 5-second window.
-          const delivery = acceptReviewFixDelivery({
-            authenticatedSource: "review-fix-queue",
-            deliveryId: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}`,
-            kind: "feedback",
-            destination: { installationId, repository: fix.repo, prNumber: fix.prNumber },
-            payload: {},
-          });
-          if (delivery.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${delivery.status}`);
-        } catch (err) {
-          console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
-        }
+      // The repository's auto-fix owns the PR: the ledger findings stay for LateExternalReview, nothing dispatches.
+      if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository") {
+        updateReviewFixStatus(fix.id, "skipped");
+        console.log(`[review-fix] Project ${fix.repo} delegates fixes to the repository `
+          + `(${resolveReviewProcess(mapping.reviewProcess).id}), skipping review fix #${fix.id}`);
         continue;
       }
       if (mapping.ticketingProvider === "filesystem" && runnerMode !== "local") {
@@ -3514,17 +3537,12 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let mintedPublicationToken: string | undefined;
       let dispatchId: string | undefined;
       // This snapshot defines the findings this specific gap-fill dispatch is
       // allowed to resolve. Findings that arrive after the snapshot remain open
       // for a later queue event rather than being cleared by an older run.
       const openFindings = listOpenReviewFindings(fix.repo, fix.prNumber);
-      // Must match the slice buildReviewFixTaskDescription renders into the task text
-      // below: a finding beyond MAX_TASK_FINDINGS is never shown to the agent, so it
-      // has to stay "open" rather than being resolved by this dispatch's callback.
-      const taskFindings = openFindings.slice(0, MAX_TASK_FINDINGS);
-      const dispatchFindingIds = taskFindings.map((finding) => finding.id);
-
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const installationId = String(await getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner));
@@ -3563,7 +3581,11 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         }
       }
 
-      const taskDescription = buildReviewFixTaskDescription({
+      // One admission contract shared with the durable path: every open finding is rendered
+      // in full or the item stays pending. The installation token above is for repository
+      // reads only; preparation precedes admission and runner launch-token minting, so an
+      // overflow leaks neither, and dispatchFindingIds is exactly the rendered set.
+      const prepared = prepareReviewFixTask({
         prNumber: fix.prNumber,
         reason: fix.reason,
         findings: openFindings.map((finding) => ({
@@ -3577,32 +3599,31 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         })),
         issueDescription,
       });
+      if (prepared.status === "incomplete") {
+        console.warn(`[review-fix] Incomplete feedback (${prepared.category}) for PR #${fix.prNumber}; keeping review fix #${fix.id} pending: ${previewReviewFixText(prepared.reason)}`);
+        continue;
+      }
+      const taskDescription = prepared.text;
+      const dispatchFindingIds = openFindings.map((finding) => finding.id);
 
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
         // Gap-fill dispatches run the implementation workflow and can take as
         // long as the initial implementation, even though they report back as
         // gap-analysis so Linear status does not regress.
-        const minted = mintRunToken({
+        dispatchId = crypto.randomUUID();
+        const minted = mintLaunchTokens({
           issueId: fix.issueId,
           mappingTeamKey: scopeKey,
           phase: "gap-analysis",
-          audience: "result",
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        dispatchId = minted.dispatchId;
-        const progressMinted = mintRunToken({
-          issueId: fix.issueId,
-          mappingTeamKey: scopeKey,
-          phase: "gap-analysis",
-          audience: "progress",
           dispatchId,
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          ttlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
           secret: config.runnerTokenSecret,
+          repository: `${mapping.owner}/${mapping.repo}`,
         });
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        mintedPublicationToken = minted.runPublicationToken;
       }
 
       if (runnerMode === "local") {
@@ -3631,9 +3652,35 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           console.log(`[review-fix] Deferring local review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
           continue;
         }
+        let reviewFixDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+        const reviewFixRuntime = getModelAuthRuntime(config);
+        if (isManagedProject(scopeKey)) {
+          let decision: ManagedDispatchDecision;
+          try {
+            decision = await prepareManagedDispatch(
+              { dispatchId, projectKey: scopeKey, backend: "local-docker", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+              reviewFixRuntime,
+            );
+          } catch (err) {
+            releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+            throw err;
+          }
+          console.log(`[review-fix] Managed dispatch for review fix #${fix.id}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+          if (decision.kind === "legacy" || decision.kind === "launch") {
+            reviewFixDecision = decision;
+          } else {
+            releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+            console.log(`[review-fix] ${refusalText(decision)} (${fix.issueIdentifier ?? fix.issueId})`);
+            if (decision.kind === "refuse") updateReviewFixStatus(fix.id, "failed");
+            continue;
+          }
+        }
         let launchStarted = false;
+        let localMachineNonce: string | undefined;
         let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
         try {
+          // The child boots repo-scoped; a mint failure aborts the launch (no broad fallback).
+          const childToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
           container = await dispatchLocalGapfill({
             mapping,
             issue: {
@@ -3643,18 +3690,28 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               description: taskDescription,
             },
             prNumber: fix.prNumber,
-            githubToken: ghToken,
+            githubToken: childToken,
             image: config.localRunnerImage,
             orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
             runProgressToken: runProgressToken || undefined,
-            anthropicApiKey: config.anthropicApiKey,
-            claudeOAuthToken: config.claudeOAuthToken,
+            runPublicationToken: mintedPublicationToken,
+            anthropicApiKey: reviewFixDecision.kind === "launch" ? undefined : config.anthropicApiKey,
+            claudeOAuthToken: reviewFixDecision.kind === "launch" ? undefined : config.claudeOAuthToken,
             retryPolicy: getRetryPolicy(),
-            onBeforeLaunch: () => { launchStarted = true; },
+            onBeforeLaunch: (nonce) => { localMachineNonce = nonce; launchStarted = true; },
+            ...(reviewFixDecision.kind === "launch"
+              ? {
+                  managed: {
+                    decision: reviewFixDecision,
+                    modelAuthUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+                  },
+                }
+              : {}),
           });
         } catch (err) {
+          settleLaunch(reviewFixDecision, classifyLaunchError("local-docker", launchStarted, err), reviewFixRuntime);
           if (!launchStarted) releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
           throw err;
         }
@@ -3671,9 +3728,11 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           executionMode: "local-docker",
           runnerMode,
           sessionImage: config.localRunnerImage,
-          machineNonce: container.machineNonce,
+          machineNonce: localMachineNonce,
           machineId: container.containerId,
+          computeStartedAt: Date.now(),
           phase: "gap-analysis",
+          ...(await reviewFixAccounting(registry, mapping, fix)),
         });
         updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
         if (dispatchId) {
@@ -3711,6 +3770,31 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         continue;
       }
 
+      // Managed model authentication (AII-1420): decided after admission and before any launch call.
+      let ghaFixDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+      const ghaFixRuntime = getModelAuthRuntime(config);
+      if (isManagedProject(scopeKey, dispatchId)) {
+        let decision: ManagedDispatchDecision;
+        try {
+          decision = await prepareManagedDispatch(
+            { dispatchId, projectKey: scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+            ghaFixRuntime,
+          );
+        } catch (err) {
+          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          throw err;
+        }
+        console.log(`[review-fix] Managed dispatch for review fix #${fix.id}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+        if (decision.kind === "legacy" || decision.kind === "launch") {
+          ghaFixDecision = decision;
+        } else {
+          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          console.log(`[review-fix] ${refusalText(decision)} (${fix.issueIdentifier ?? fix.issueId})`);
+          if (decision.kind === "refuse") updateReviewFixStatus(fix.id, "failed");
+          continue;
+        }
+      }
+
       // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
       // here (e.g. a workflow-capabilities probe failure) is by construction a definitive
       // non-launch, so it releases the reservation and rethrows for the outer per-item catch
@@ -3730,21 +3814,17 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           ref: mapping.defaultBranch,
         });
         reviewFixContract = reviewFixCapabilities.contract;
-        const runPublicationToken = reviewFixContract === "envelope"
-          && reviewFixCapabilities.supportsRunPublicationToken
-          && dispatchId
-          && config.runnerCallbackBaseUrl
-          && config.runnerTokenSecret
-          ? mintRunToken({
-              issueId: fix.issueId,
-              mappingTeamKey: scopeKey,
-              phase: "gap-analysis",
-              audience: "publication",
-              dispatchId,
-              repository: `${mapping.owner}/${mapping.repo}`,
-              ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-              secret: config.runnerTokenSecret,
-            }).token
+        const ghaFixCredentials = ghaManagedCredentials(ghaFixDecision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
+        assertPrivateTransportForCredentials(
+          ghaFixCredentials, reviewFixCapabilities,
+          `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+        );
+        assertExecutionPolicyCapability(
+          ghaFixCredentials, reviewFixCapabilities,
+          `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+        );
+        const runPublicationToken = reviewFixContract === "envelope" && reviewFixCapabilities.supportsRunPublicationToken
+          ? mintedPublicationToken
           : undefined;
 
         const fixIssue = {
@@ -3762,6 +3842,9 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               runToken,
               runProgressToken,
               runPublicationToken,
+              privateTransport: reviewFixCapabilities.supportsPrivateRunConfig === true,
+              credentials: ghaFixCredentials,
+              ...managedRunConfigFields(ghaFixDecision),
               runnerImage,
               retryPolicy: getRetryPolicy(),
             })
@@ -3785,11 +3868,19 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               ...(runnerImage ? { runner_image: runnerImage } : {}),
             };
       } catch (err) {
+        settleLaunch(ghaFixDecision, "rejected", ghaFixRuntime);
         releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
         throw err;
       }
 
-      const result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs, { returnRunDetails: true });
+      let result: Awaited<ReturnType<typeof dispatchWorkflow>>;
+      try {
+        result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs, { returnRunDetails: true });
+      } catch (err) {
+        settleLaunch(ghaFixDecision, "unknown", ghaFixRuntime);
+        throw err;
+      }
+      settleLaunch(ghaFixDecision, ghaLaunchOutcome(result), ghaFixRuntime);
 
       if (!result.success) {
         if (result.outcome !== "rejected") {
@@ -3809,6 +3900,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             runnerMode: "default",
             contract: reviewFixContract,
             phase: "gap-analysis",
+            ...(await reviewFixAccounting(registry, mapping, fix)),
           });
           updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
           recordReviewFixDispatch({ queueId: fix.id, dispatchId, repo: fix.repo,
@@ -3830,6 +3922,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
                 workflowFile: mapping.workflowFile,
                 contract: reviewFixContract,
                 phase: "gap-analysis",
+                ...(await reviewFixAccounting(registry, mapping, fix)),
               },
             );
           } catch (err) {
@@ -3856,6 +3949,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         runnerMode: "default",
         contract: reviewFixContract,
         phase: "gap-analysis",
+        ...(await reviewFixAccounting(registry, mapping, fix)),
       });
       updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
       if (dispatchId) {
@@ -3899,10 +3993,6 @@ function readBodyLimited(req: http.IncomingMessage, maxBytes: number): Promise<s
     req.on("end", () => resolve(bytes > maxBytes ? null : Buffer.concat(chunks).toString()));
     req.on("error", reject);
   });
-}
-
-function onDeployBuildFailure(commit: string, err: unknown): void {
-  recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
 }
 
 async function handleKgRefreshOutcome(
@@ -3982,112 +4072,32 @@ async function handleKgRefreshOutcome(
   }
 }
 
-async function dispatchKgRefreshRun(
-  config: AppConfig,
-  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string },
-): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string }> {
-  if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
-  const repo = parseKgSourceRepo(config.kgSourceRepo);
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
-  const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
-  const executionPath = opts.executionPath;
-  if (executionPath === "fly-machines") {
-    if (!config.flySessionsToken || !config.flySessionsApp) {
-      throw new Error(
-        "[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured",
-      );
-    }
-    const sessionToken = generateSessionToken();
-    const machineNonce = generateMachineNonce();
-    const extraEnv: Record<string, string> = {
-      AI_IMPLEMENT_RUN_CONFIG: opts.runConfig,
-      RUN_PROGRESS_TOKEN: opts.runProgressToken,
-    };
-    const flySessionImage = await resolveRunnerImageForDispatch({
-      owner: repo.owner,
-      repo: repo.repo,
-      token: ghToken,
-      defaultImage: config.sessionImage,
-      runnerImageExplicit: config.runnerImageExplicit,
-    }) ?? config.sessionImage;
-    const machineConfig = buildSessionMachineConfig({
-      image: flySessionImage,
-      issueId: "kg-refresh",
-      issueIdentifier: "KG-REFRESH",
-      issueTitle: "KG ingest",
-      issueDescription: "",
-      owner: repo.owner,
-      repo: repo.repo,
-      defaultBranch,
-      anthropicApiKey: config.anthropicApiKey ?? undefined,
-      claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
-      sessionToken,
-      machineNonce,
-      phase: "kg-refresh",
-      orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runToken: opts.runToken,
-      orchestratorApp: process.env.FLY_APP_NAME,
-      expectedTtlSeconds: 4 * 60 * 60,
-      extraEnv,
-    });
-    const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
-    console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
-    return { machineId: machine.id, machineNonce, logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${machine.id}` };
-
-  } else if (executionPath === "local-docker") {
-    if (!config.localRunnerImage) {
-      throw new Error(
-        "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
-      );
-    }
-    const sessionToken = generateSessionToken();
-    const machineNonce = generateMachineNonce();
-    const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig, RUN_PROGRESS_TOKEN: opts.runProgressToken };
-    const localOrchestratorUrl =
-      config.localRunnerOrchestratorUrl ??
-      config.runnerCallbackBaseUrl ??
-      `http://host.docker.internal:${config.healthPort}`;
-    const { containerId } = await startLocalRunnerContainer({
-      image: config.localRunnerImage,
-      issueId: "kg-refresh",
-      issueIdentifier: "KG-REFRESH",
-      issueTitle: "KG ingest",
-      issueDescription: "",
-      owner: repo.owner,
-      repo: repo.repo,
-      defaultBranch,
-      anthropicApiKey: config.anthropicApiKey ?? undefined,
-      claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
-      sessionToken,
-      machineNonce,
-      phase: "kg-refresh",
-      orchestratorUrl: localOrchestratorUrl,
-      runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runToken: opts.runToken,
-      extraEnv,
-    });
-    console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${opts.dispatchId})`);
-    return { machineId: containerId, machineNonce };
-  } else {
-    throw new Error(`[kg-refresh] unsupported execution path "${String(executionPath)}": the GitHub Actions run is dispatched by the KgRefresh workflow`);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Restate review-fix pilot callback wiring (AII-769/AII-803): the injected,
-// non-SDK seams handleRunnerResult/handleRunnerActivity call. Both persist to
-// SQLite (the sole authority an ACK depends on) before ever touching Restate —
-// delivery to the sidecar is the pre-existing async pump (ReviewFixDeliveryPump,
-// src/restate/review-fix-client.ts), so a sidecar outage never blocks or fails
-// an ACK that SQLite already accepted, while a SQLite failure here throws and
-// is never acknowledged (caught by the route wrapper below as a 500).
+// non-SDK seams handleRunnerResult/handleRunnerActivity call. Results and
+// cancellations reach Restate through the ingress client with the sender's
+// event id as the idempotency key; an unavailable sidecar answers the caller
+// rather than being stored for later.
 // ---------------------------------------------------------------------------
 
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
+const selfDeployClient = createSelfDeployIngressClient();
+const trackerExportClient = createTrackerExportIngressClient();
+const reviewPublicationIngress = createReviewPublicationIngressClient();
+const lateExternalReviewIngress = createLateExternalReviewIngressClient();
+const submitLateExternalReview = createLateExternalReviewSubmitHook({
+  ingress: lateExternalReviewIngress,
+  // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
+  restateReady: restateCanServe,
+});
+// A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
+const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
+  const mapping = Object.values(getMappings()).find((m) => m.owner === input.owner && m.repo === input.repo);
+  const followHead = resolveReviewProcess(mapping?.reviewProcess).fixer === "repository";
+  return submitLateExternalReview(followHead ? { ...input, followHead } : input);
+};
+const reviewFixIngressClient = createReviewFixIngressClient();
 
 /** Maps a `callToolAsSystem` result carrying `{ status, body }` text onto the REST shape (AII-901). */
 function kgToolAnswer(
@@ -4117,6 +4127,27 @@ export function deployHealth(): { held: boolean; startedAt: number | null } {
 }
 
 /**
+ * The KG-repo PR webhook's `enqueueDryRun` dependency (AII-1405). It answers `unavailable` with no
+ * KG source repo, and while Restate is not ready (sidecar not `ready` or registration not
+ * `registered`) it skips the dry run: `submit` sends the new `KgRepo.watch` handler, which a
+ * declined registration cannot serve, so the send would retry forever and block the key.
+ */
+export function makeKgDryRunEnqueue(
+  kgSourceRepo: string | null | undefined,
+  ingress: Pick<KgRefreshIngressClient, "enqueueDryRun">,
+  ready: () => boolean,
+): KgPrCheckConfig["enqueueDryRun"] {
+  return async (key, entry, opts) => {
+    if (!kgSourceRepo) return { status: "unavailable" as const };
+    if (!ready()) {
+      console.warn(`[kg-refresh] skipping dry run for ${key}: Restate registration is not registered`);
+      return { status: "unavailable" as const };
+    }
+    return ingress.enqueueDryRun(parseKgSourceRepo(kgSourceRepo).fullName, { key, ...entry }, opts);
+  };
+}
+
+/**
  * `AdminDeps.kgRefresh` over the Restate services: trigger and status go through the tool
  * handlers as the in-process system caller; cancel calls the `cancel` of the workflow keyed
  * by the clicked row's `dispatchId` (a kg-refresh row's dispatchId is its trigger id) and
@@ -4128,9 +4159,12 @@ export function makeKgRefreshAdminDeps(
   client: KgRefreshIngressClient,
   callAsSystem: typeof callToolAsSystem = callToolAsSystem,
   deployHeld: () => boolean = isDeployHeld,
+  callAsCaller: typeof callTool = callTool,
 ): NonNullable<AdminDeps["kgRefresh"]> {
   return {
-    trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts }), deployHeld),
+    trigger: async (opts, caller) => kgToolAnswer(await (caller
+      ? callAsCaller("trigger_kg_refresh", { ...opts }, caller)
+      : callAsSystem("trigger_kg_refresh", { ...opts })), deployHeld),
     status: async () => {
       const r = await callAsSystem("get_kg_status", {});
       if (r.status === "unavailable" || r.status === "deploy-held") {
@@ -4148,7 +4182,16 @@ export function makeKgRefreshAdminDeps(
       if (!dispatchId) return { status: 409, body: { error: "no-refresh-in-flight" } };
       const out = await client.cancel(dispatchId, reason);
       if (out.status === "unavailable") return kgUnavailableAnswer(deployHeld);
-      if (out.status === "not-found") return { status: 409, body: { error: "no-refresh-in-flight" } };
+      const noRun = out.status === "not-found" || (out.status === "conflict" && out.error === "no-refresh-in-flight");
+      if (noRun) {
+        // The gate run has ended once its snapshot is held, and the hold is a KgRepo record: the Stop goes through the
+        // decision door, naming this row's trigger id so it never stops a different hold.
+        const decided = await callAsSystem("decide_kg_refresh", { action: "cancel", triggerId: dispatchId });
+        if (decided.status === "unavailable" || decided.status === "deploy-held") return kgUnavailableAnswer(deployHeld);
+        if (!decided.isError) return { status: 200, body: { cancelled: true } };
+        return { status: 409, body: { error: "no-refresh-in-flight" } };
+      }
+      if (out.status === "conflict") return { status: 409, body: { error: out.error ?? "conflict" } };
       return { status: 200, body: { cancelled: true } };
     },
   };
@@ -4173,23 +4216,15 @@ export function sweepLegacyKgRefreshRows(): number {
   return rows.length;
 }
 
-async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
-  // The accepted result and its delivery entry commit together. The callback
-  // also runs on an identical retry, repairing an older result that somehow
-  // lacks its inbox row; a rejected or conflicted identity aborts the write.
-  // This callback performs synchronous SQLite work only, never a Restate call.
-  return reviewFixAttemptStore.recordResult(result.attemptId, result, () => {
-    const delivery = acceptReviewFixDelivery({
-      authenticatedSource: "runner-callback",
-      deliveryId: `${result.attemptId}.result`,
-      kind: "result",
-      destination: { installationId: result.installationId, repository: result.repository, prNumber: result.prNumber },
-      payload: result,
-    });
-    if (delivery.status !== "accepted") {
-      throw new Error(`review-fix result delivery was ${delivery.status}`);
-    }
-  });
+async function onReviewFixResult(result: ReviewFixResultMetadataV1 & { usage?: import("./agent-usage.js").RecordedUsage }, opts: { idempotencyKey: string }): Promise<ResultIntakeOutcome> {
+  // Verify-only (AII-1185): the callback forwards the validated result to
+  // ReviewFixAttempt.result, whose `store-result` step is the sole SQLite writer.
+  // Restate unreachable throws, which the route answers 503 with nothing written;
+  // the runner retries the same body under the same key.
+  const out = await reviewFixIngressClient.result(result.attemptId, result, opts);
+  const outcome = reviewFixResultIntakeFromForward(result.attemptId, out);
+  if (!outcome) throw new ReviewFixIntakeUnavailableError();
+  return outcome;
 }
 
 function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
@@ -4221,18 +4256,62 @@ function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
   return { status: "accepted", attemptId: batch.attemptId };
 }
 
+/** HTTP boundary shared by the production route and route-level tests. */
+export function handleReviewPublicationRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  deps: {
+    secret: string | null | undefined;
+    ingress: Parameters<typeof handleRunnerReviewPublication>[0]["ingress"];
+    restateReady: () => boolean;
+  },
+): void {
+  (async () => {
+    if (!deps.secret) {
+      res.writeHead(501, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Runner callback not configured" }));
+      return;
+    }
+    const body = await readBodyLimited(req, MAX_PUBLICATION_BYTES + 1024);
+    if (body === null) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Review publication too large" }));
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+      return;
+    }
+    const result = await handleRunnerReviewPublication({
+      authorization: req.headers.authorization, secret: deps.secret,
+      body: parsed, ingress: deps.ingress, restateReady: deps.restateReady,
+    });
+    res.writeHead(result.status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result.body));
+  })().catch((err) => {
+    console.error("[runner-review-publication] Unhandled error:", err);
+    if (!res.headersSent) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal server error" }));
+    }
+  });
+}
+
 function startServer(
   config: AppConfig,
   registry: ProviderRegistry,
   memoryProvider: MemoryProvider | null,
   memoryProviderDiagnostic: string | null,
 ): http.Server {
-  const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
   const kgRefreshAdminDeps = config.kgSourceRepo ? makeKgRefreshAdminDeps(config.kgSourceRepo, kgRefreshIngressClient) : undefined;
   const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
     credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
-  }));
+  }), reviewFixIngressClient);
   setReviewFixAttemptsFacade(reviewFixAttempts);
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     githubAppId: config.githubAppId,
@@ -4241,6 +4320,11 @@ function startServer(
     dryRunOutcomes: kgRefreshIngressClient,
   });
   migrateLegacyDryRunOutcomes();
+  const modelAuthRoutes = createModelAuthRoutes({
+    runtime: getModelAuthRuntime(config),
+    onFly: config.flyOrchestratorApp !== null,
+    requestPlanRefresh: (id) => requestChatGptPlanRefresh(id),
+  });
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -4248,18 +4332,33 @@ function startServer(
 
     // Health check
     if (url === "/" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      const { pollCount: polls, lastPollStartedAt, lastPollFinishedAt } = getPollStats();
-      res.end(JSON.stringify({
-        status: "ok",
-        polls,
-        kgDegraded: isKgDegraded(),
-        ...sidecarHealthFields(),
-        restate: getRestateStatus(),
-        deploy: deployHealth(),
-        lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
-        lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
-      }));
+      return buildHealthBody({
+        sourceCommit: () => process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
+        pollStats: getPollStats,
+        kgDegraded: isKgDegraded,
+        sidecarHealthFields,
+        restateStatus: getRestateStatus,
+        deployHealth,
+        lastSetupCheckRun: getLastSetupCheckRun,
+        setupCheckContext: () => createSetupCheckContext({ restateStatus: getRestateStatus }),
+      }).then((body) => {
+        const json = JSON.stringify(body);
+        res.writeHead(body.status === "unavailable" ? 503 : 200, { "Content-Type": "application/json" });
+        res.end(json);
+      });
+    }
+
+    // Model-auth routes — every method is routed so the handler answers 405; before the general runner routes.
+    if (modelAuthRoutes.matches(pathname)) {
+      void modelAuthRoutes.handle(req, res).catch((err) => {
+        console.error("[model-auth] Unhandled error:", err instanceof Error ? err.name : "unknown");
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ error: "Internal error" }));
+        } else {
+          res.end();
+        }
+      });
       return;
     }
 
@@ -4393,6 +4492,7 @@ function startServer(
           cursor,
           teamKey,
           getMappings,
+          trackerExport: trackerExportClient,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
@@ -4468,13 +4568,9 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        reportDryRun: (report) => kgRefresh.reportDryRun(report),
-        enqueueDryRun: (key, entry, opts) =>
-          config.kgSourceRepo
-            ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
-            : Promise.resolve({ status: "unavailable" as const }),
+        enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateCanServe),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }).catch((err) => {
+      }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -4561,8 +4657,13 @@ function startServer(
           },
           checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({
             ingress: createPlanningRunIngressClient(),
-            legacy: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
           }),
+          checkImplementationAdmissionTermination: createImplementationAdmissionTerminationHook({
+            ingress: createImplementationRunIngressClient(),
+            // The Legacy monitors own a reservation no workflow holds; the callback never releases it.
+            legacy: async () => {},
+          }),
+          submitLateExternalReview: lateExternalReviewSubmitHook,
           onReviewFixResult,
           kgRefreshClient: kgRefreshIngressClient,
           kgSourceRepo: config.kgSourceRepo,
@@ -4607,6 +4708,12 @@ function startServer(
           res.end(JSON.stringify({ error: "Internal server error" }));
         }
       });
+      return;
+    }
+
+    // Publish a post-push review through the durable publication object.
+    if (url === "/runner/review-publication" && req.method === "POST") {
+      handleReviewPublicationRequest(req, res, { secret: config.runnerTokenSecret, ingress: reviewPublicationIngress, restateReady: restateCanServe });
       return;
     }
 
@@ -4697,76 +4804,9 @@ function startServer(
       return;
     }
 
-    // MCP well-known metadata endpoints (public — no auth required)
-    if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
-      return;
-    }
-    if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
-      return;
-    }
-
-    // MCP OAuth routes — dynamic client registration, authorization, token exchange
-    if (pathname.startsWith("/mcp/")) {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      if (pathname === "/mcp/register" && req.method === "POST") {
-        handleMcpClientRegistration(req, res).catch((err) => {
-          console.error("[mcp-oauth] register error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      if (pathname === "/mcp/authorize" && req.method === "GET") {
-        handleMcpAuthorize(req, res, config.oauthRedirectBaseUrl).catch((err) => {
-          console.error("[mcp-oauth] authorize error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
-      if (callbackMatch && req.method === "GET") {
-        const [, providerId] = callbackMatch;
-        handleMcpOidcCallback(req, res, providerId, config.oauthRedirectBaseUrl).catch((err) => {
-          console.error("[mcp-oauth] callback error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      if (pathname === "/mcp/token" && req.method === "POST") {
-        handleMcpTokenRequest(req, res).catch((err) => {
-          console.error("[mcp-oauth] token error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-    }
+    // MCP well-known metadata and OAuth routes (public — no auth required): dynamic client
+    // registration, authorization, OIDC callback, token exchange.
+    if (routeMcpOAuth(req, res, pathname, config.oauthRedirectBaseUrl)) return;
 
     // MCP endpoint — OAuth bearer token authenticated. The six write tools used to be wired
     // in here as bound closures over this request's config/registry; AII-713 moved them onto
@@ -4830,6 +4870,39 @@ function startServer(
       return;
     }
 
+    // ChatGPT plan pairing upload (AII-1501): authenticated by the single-use bearer code alone, so it sits before the admin gate.
+    if (pathname === "/api/chatgpt-pairing/upload" && req.method === "POST") {
+      handlePairingUpload(req, res, {
+        env: process.env,
+        now: () => Date.now(),
+        import: {
+          store: () => createModelSessionStore({
+            keys: createModelSessionKeyProvider(),
+            verifyOwner: () => false,
+            authorizeOperator: (operator) => operator === PAIRING_OPERATOR,
+            db: () => getDb(),
+          }),
+          hostId: () => orchestratorHostId(),
+          planSequence: (id) => latestPlanSequence(id),
+          getProfile: getAccountProfile,
+          requestRefresh: (id) => requestChatGptPlanRefresh(id),
+          readState: (id) => readChatGptPlanState(id),
+          now: () => Date.now(),
+          operator: PAIRING_OPERATOR,
+        },
+      }).catch((err) => {
+        console.error("[chatgpt-pairing] Unhandled error:", err instanceof Error ? err.name : "unknown");
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Restate UI, its admin API paths and ingress (AII-1261, ADR 040): admin role only.
+    if (handleRestateUiRequest(req, res, { adminConfigured: Boolean(config.adminAccessCode) || isOAuthConfigured() })) return;
+
     // Admin routes - match on the path only, so query params can still be read when needed
     if (url.split("?")[0] === "/admin" || url.startsWith("/api/")) {
       if (!config.adminAccessCode && !isOAuthConfigured()) {
@@ -4854,8 +4927,24 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, getRestateStatus,
-        reviewFixAttempts })) return;
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, bindKey, clearKeyBinding, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
+        retention: {
+          getRestateDays: getRestateRetentionDays,
+          setRestateDays: setRestateRetentionDays,
+          getVolumeDays: getVolumeSnapshotRetentionDays,
+          setVolumeDays: setVolumeSnapshotRetentionDays,
+          applyVolume: async (days) => {
+            if (!config.flyDeployToken || !process.env.FLY_APP_NAME) {
+              return { applied: [], skipped: !config.flyDeployToken ? "FLY_DEPLOY_TOKEN is not set" : "FLY_APP_NAME is not set" };
+            }
+            return applyVolumeSnapshotRetention(config.flyDeployToken, process.env.FLY_APP_NAME, days);
+          },
+          default: RESTATE_RETENTION_DAYS_DEFAULT,
+          min: RESTATE_RETENTION_DAYS_MIN,
+          max: RESTATE_RETENTION_DAYS_MAX,
+        },
+        reviewFixAttempts,
+        agentConfig: createAgentConfigAdminDeps(config) })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -4890,9 +4979,47 @@ function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateR
 export interface RestateEndpointWireDeps {
   startRestateEndpoint: () => Promise<unknown>;
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
+  /** Runs after any non-conflict registration outcome, including `unreachable`; must not throw. */
+  onRegistered?: () => Promise<void>;
+}
+
+/** Recover legacy/crashed deploys only after this boot has successfully registered with Restate. */
+export async function releaseUnownedDeployHoldAtBoot(
+  client: Pick<SelfDeployClient, "releaseUnownedHold"> = selfDeployClient,
+): Promise<void> {
+  if (!isDeployHeld()) return;
+  try {
+    const { released } = await client.releaseUnownedHold();
+    if (released) console.log("[self-deploy] released an unowned deploy hold at boot");
+  } catch (err) {
+    console.error("[self-deploy] keeping deploy hold at boot: hold ownership could not be checked:", err);
+  }
+}
+
+/** Production registration hook; only successful registration may recover the hold. */
+export async function onRestateRegistered(deps: {
+  releaseHold?: () => Promise<void>;
+  armPrices?: () => Promise<void>;
+  sweep: () => void;
+  scrub: () => Promise<void>;
+  seed: () => Promise<void>;
+  refresh: () => Promise<void>;
+}): Promise<void> {
+  await (deps.releaseHold ?? releaseUnownedDeployHoldAtBoot)();
+  await (deps.armPrices ?? armModelPricesSchedule)();
+  deps.sweep();
+  await deps.scrub();
+  await deps.seed();
+  await deps.refresh();
 }
 
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
+/** Adapt transient apply diagnostics to the notice without changing the durable record. */
+export function createSelfDeployOutcomeHandler(config: Parameters<typeof onSelfDeployOutcome>[0]) {
+  return (record: import("./restate/self-deploy.js").SelfDeployRecord, detail?: string) =>
+    onSelfDeployOutcome(config, detail ? { ...record, reason: `${record.reason}: ${detail}` } : record);
+}
+
 const RESTATE_REGISTRATION_RETRY_MS = 60_000;
 
 /**
@@ -4920,6 +5047,8 @@ export function createRestateRegistrationGate(
   isShuttingDown: () => boolean,
   deps: RestateEndpointWireDeps = { startRestateEndpoint, registerRestateEndpoint },
 ) {
+  let settle!: (result: RestateGateResult) => void;
+  const settled = new Promise<RestateGateResult>(resolve => { settle = resolve; });
   let attempted = false;
   let retryTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -4931,6 +5060,7 @@ export function createRestateRegistrationGate(
   }
 
   async function attemptRegistration(label: string): Promise<void> {
+    let hookStarted = false;
     try {
       const result = await deps.registerRestateEndpoint();
       if (isShuttingDown()) return;
@@ -4945,15 +5075,25 @@ export function createRestateRegistrationGate(
         }
       } else {
         clearRetry();
+        if (result.outcome === "unreachable") {
+          settle("unreachable");
+        } else {
+          hookStarted = true;
+          await deps.onRegistered?.();
+          settle("serving");
+        }
       }
     } catch (err) {
       if (isShuttingDown()) return;
       setRestateStatus({ registration: { state: "unreachable" } });
+      clearRetry();
+      settle(hookStarted ? "hook-failed" : "unreachable");
       console.error(`[restate] ${label} failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   return {
+    whenSettled: () => settled,
     async attempt(): Promise<void> {
       if (attempted || isShuttingDown()) return;
       attempted = true;
@@ -4966,6 +5106,7 @@ export function createRestateRegistrationGate(
       } catch (err) {
         if (isShuttingDown()) return;
         setRestateStatus({ registration: { state: "unreachable" } });
+        settle("unreachable");
         console.error(`[restate] SDK endpoint failed to start: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
@@ -4976,12 +5117,144 @@ export function createRestateRegistrationGate(
   };
 }
 
+export const RESTATE_BOOT_DEADLINE_MS = 5 * 60_000;
+export type RestateGateResult = "serving" | "unreachable" | "hook-failed";
+
+/** Wait for the registration hook as well as readiness; conflicts may drain beyond the deadline. */
+export async function waitForRestateServing(deps: {
+  status: () => RestateStatus;
+  gate: { whenSettled(): Promise<RestateGateResult> };
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  deadlineMs?: number;
+  isShuttingDown?: () => boolean;
+}): Promise<RestateGateResult | "deadline" | "missing-binary" | "exited" | "shutdown"> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const deadline = now() + (deps.deadlineMs ?? RESTATE_BOOT_DEADLINE_MS);
+  let settled: RestateGateResult | undefined;
+  void deps.gate.whenSettled().then(result => { settled = result; });
+  for (;;) {
+    if (deps.isShuttingDown?.()) return "shutdown";
+    const status = deps.status();
+    if (status.sidecar.state === "missing-binary" || status.sidecar.state === "exited") return status.sidecar.state;
+    if (settled === "hook-failed" || settled === "unreachable") return settled;
+    if (status.sidecar.state === "ready" && settled === "serving") return "serving";
+    if (status.registration.state !== "declined-conflict" && now() >= deadline) return "deadline";
+    await sleep(50);
+  }
+}
+
 /** For testing: stops both sidecars concurrently rather than one after the other, so neither's stopTimeoutMs adds to the other's inside the shutdown budget. */
 export async function stopSidecarsConcurrently(
   sidecar: { stop(): Promise<void> },
   restateSidecar: { stop(): Promise<void> },
 ): Promise<void> {
   await Promise.all([sidecar.stop(), restateSidecar.stop()]);
+}
+
+/** Shared shutdown path for signals and fatal Restate boot outcomes. */
+export function createMainShutdown(deps: {
+  isShuttingDown: () => boolean;
+  markShuttingDown: () => void;
+  stopPolling: () => void;
+  stopRetrying: () => void;
+  recordShutdown: () => void;
+  postShutdownNotice: () => Promise<void>;
+  stopSidecars: () => Promise<void>;
+  closeServer: (done: () => void) => void;
+  closeDb: () => void;
+  exit: (code: number) => void;
+}) {
+  const SHUTDOWN_BUDGET_MS = 10_000;
+  return async (reason: string, exitCode = 0, notify = exitCode === 0): Promise<void> => {
+    if (deps.isShuttingDown()) {
+      console.log(`[main] Received ${reason} while already shutting down; ignoring`);
+      return;
+    }
+    deps.markShuttingDown();
+    if (exitCode === 0) console.log(`[main] Received ${reason}, shutting down...`);
+    deps.stopPolling();
+    deps.stopRetrying();
+
+    // Arm before awaiting: a hanging notice, child, or HTTP connection cannot prevent exit.
+    const forcedExit = setTimeout(() => {
+      console.error(`[main] Forced shutdown after timeout`);
+      deps.closeDb();
+      deps.exit(1);
+    }, SHUTDOWN_BUDGET_MS);
+    forcedExit.unref();
+
+    if (notify) {
+      deps.recordShutdown();
+      await Promise.race([
+        deps.postShutdownNotice(),
+        new Promise(resolve => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
+      ]);
+    }
+    await deps.stopSidecars();
+    deps.closeServer(() => {
+      clearTimeout(forcedExit);
+      deps.closeDb();
+      console.log(`[main] Shutdown complete`);
+      deps.exit(exitCode);
+    });
+  };
+}
+
+/** Arm only after boot serves: early exits remain fatal boot outcomes. */
+export function createRestateExitHandler() {
+  let shutdown: ReturnType<typeof createMainShutdown> | undefined;
+  return {
+    arm: (handler: ReturnType<typeof createMainShutdown>): void => { shutdown = handler; },
+    onUnexpectedExit: ({ code }: { code: number | null; signal: string | null }): void => {
+      if (!shutdown) return;
+      console.error(`[main] Restate sidecar exited (code=${code ?? "null"}); shutting down`);
+      void shutdown("restate-exited", 1, true);
+    },
+  };
+}
+
+/** The production boot sequence, with effects injected for ordering and shutdown tests. */
+export async function runMainBoot(deps: {
+  registerSignal: (signal: "SIGTERM" | "SIGINT", handler: () => void) => void;
+  startServer: () => void;
+  wait: () => ReturnType<typeof waitForRestateServing>;
+  isShuttingDown: () => boolean;
+  shutdown: (reason: string, exitCode?: number) => Promise<void>;
+  onServing?: () => void;
+  logFly: () => void;
+  refreshCache: () => Promise<void>;
+  reconcile: () => Promise<void>;
+  postBootNotice: () => void;
+  poll: () => Promise<void>;
+  startInterval: () => void;
+  now?: () => number;
+}): Promise<void> {
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    deps.registerSignal(signal, () => { void deps.shutdown(signal); });
+  }
+  deps.startServer();
+  const now = deps.now ?? Date.now;
+  const started = now();
+  const result = await deps.wait();
+  if (deps.isShuttingDown() || result === "shutdown") return;
+  if (result !== "serving") {
+    console.error(`[main] Restate boot failed: ${result}`);
+    await deps.shutdown(`Restate ${result}`, 1);
+    return;
+  }
+  deps.onServing?.();
+  console.log(`[main] Restate serving after ${now() - started} ms`);
+  deps.logFly();
+  await deps.refreshCache();
+  if (deps.isShuttingDown()) return;
+  await deps.reconcile();
+  if (deps.isShuttingDown()) return;
+  deps.postBootNotice();
+  await deps.poll();
+  if (deps.isShuttingDown()) return;
+  deps.startInterval();
 }
 
 // ---------- Main ----------
@@ -4999,9 +5272,9 @@ async function main(): Promise<void> {
   initDispatchBreakerTable();
   sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
-  seedKgBaseRepoFromEnv(process.env.KG_BASE_REPO); // AII-633: seeds once, inert thereafter
-  seedLinearPickupLabelFromEnv(process.env.LINEAR_PICKUP_LABEL); // AII-694: seeds once, inert thereafter
+  seedSettingsFromEnv(); // SEED_ONCE_SETTINGS: each seeds once, inert thereafter (ADR 022)
   initAccessEntriesTable();
+  initKeyBindingsTable();
   initReconciliationTable();
   initStepLogTable();
   initMcpOAuthTables();
@@ -5015,22 +5288,17 @@ async function main(): Promise<void> {
     console.error("[kg-refresh] boot sweep failed; continuing boot:", err);
   }
 
-  // A process that died mid-deploy must not leave dispatch paused forever.
-  const holdWasSet = clearDeployHold();
-  if (holdWasSet) {
-    console.warn("[main] Cleared a hold left by the previous deployment process, resuming paused dispatches...");
-  }
+  // The deploy hold is deliberately not cleared here: a boot during a drain would re-open dispatch
+  // in the middle of a deploy. After registration we check SelfDeploy ownership (docs/deployment.md).
 
   // Start sidecar before loadConfig() so KG_SIDECAR_URL and KG_EMBEDDINGS_DEGRADED are
   // in process.env when loadConfig() reads them. Failure is non-fatal (logged, /mcp degraded).
   const sidecar = new KgSidecar();
   await sidecar.start();
 
-  // Restate sidecar (AII-627, ADR 023): a second child process, started the same way and
-  // just as non-fatal on failure. A missing binary, an early exit, or a failed registration
-  // logs one warning and boot continues; the kg-refresh trigger seam (AII-683) answers 503
-  // restate-unavailable while no successful registration has completed.
-  const restateSidecar = new RestateSidecar();
+  // Restate is required: HTTP routes open below, but dispatch waits for registration and its hook.
+  const restateExit = createRestateExitHandler();
+  const restateSidecar = new RestateSidecar({ onUnexpectedExit: restateExit.onUnexpectedExit });
   await restateSidecar.start();
 
   const config = loadConfig();
@@ -5046,14 +5314,12 @@ async function main(): Promise<void> {
   // below — have no per-request dependency injection; sharing this instance means they
   // negotiate the same MCP session rather than a second, independent one.
   setKgMemoryProvider(memoryProvider);
-  let sidecarProbeError: string | null = null;
   if (memoryProvider instanceof SidecarMemoryProvider) {
     const health = await probeWithTimeout(memoryProvider);
-    if (health.lastError) {
-      sidecarProbeError = health.lastError;
+    if (health.lastError !== null) {
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
     } else {
-      console.error(`[kg] sidecar probe: ok (${Object.keys(KG_TOOL_CAPABILITY).length} tools)`);
+      console.error(`[kg] sidecar probe: ok (${REQUIRED_KG_TOOL_COUNT} required tools)`);
     }
   }
 
@@ -5071,7 +5337,11 @@ async function main(): Promise<void> {
   // Compose the production adapters after configuration and provider setup. The
   // services are registered even with every mapping on the Legacy default;
   // selecting Restate later only changes ownership of *new* automatic GHA work.
-  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
+  console.log(`[restate] retention ${getRestateRetentionDays()} days`);
+  // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
+  void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
+  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config),
+    (mapping, issueId, repo, prNumber, budget) => parkRestatePrBudget(config, registry, mapping, issueId, repo, prNumber, budget));
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;
@@ -5093,16 +5363,22 @@ async function main(): Promise<void> {
       setCommitStatusFn: setCommitStatus,
       mergePullRequestFn: mergePullRequest,
       closePullRequestFn: closePullRequest,
+      getPullRequestStateFn: getPullRequestState,
       deleteBranchFn: deleteBranch,
-      dispatchKgRefreshRun: (opts) => dispatchKgRefreshRun(config, opts),
+      getInstallationToken,
+      getScopedInstallationToken,
+      resolveRunnerImage: resolveRunnerImageForDispatch,
+      postWorkflowDispatch,
+      keptMachineFly: () => bindKeptMachineFly(config.flySessionsToken!, config.flySessionsApp!),
+      startLocalRunnerContainer,
       updateJobStatus,
-      recordDispatch: recordKgDispatchDetails,
       getWorkflowRunStatus: async (runId) => {
         const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
         if (!run) throw new Error(`workflow run ${runId} status unavailable`);
+        recordGhaRunCompleted(runId, run);
         return { status: run.status, conclusion: run.conclusion };
       },
-      findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken, recordDetails: recordKgDispatchDetails }),
+      findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken }),
       cancelWorkflowRun: async (runId) => cancelWorkflowRun(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId),
       persistLastRefresh: defaultPersistLastRefresh,
       handleKgRefreshOutcome: (outcome, data) => handleKgRefreshOutcome(config, registry, outcome, data),
@@ -5117,8 +5393,9 @@ async function main(): Promise<void> {
     })
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
+  kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
-  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for a project on the Restate lifecycle.
+  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every project on every backend.
   const planningRunServices = createProductionPlanningRunServices({
     config,
     resolveProvider: (mapping) => registry.forMapping(mapping),
@@ -5130,17 +5407,74 @@ async function main(): Promise<void> {
     reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
+  // The ImplementationRun workflow (AII-1557): registered; the poll submits first-time implementations for every project; comment gap-fill also submits this workflow.
+  const implementationRunServices = createProductionImplementationRunServices({
+    config,
+    resolveProvider: (mapping, recoveryScopeKey) => recoveryScopeKey ? registry.forRecovery(mapping, recoveryScopeKey) : registry.forMapping(mapping),
+    resolveRunnerImage: resolveDispatchRunnerImage,
+    isGroupingParentDispatch,
+    fireBreakerTrip,
+    prepareImplementationLaunch,
+    launchImplementationRun,
+    launchImplementationFlySession,
+    launchImplementationLocalSession,
+    postDispatch,
+    finalizeImplementation,
+    remediateStuckJob,
+    reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
+  }).services;
+  const postPushReviewPublication = createPostPushReviewPublication(createProductionPostPushReviewPublicationDependencies(config));
+  const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
+  const trackerExportServices = createProductionTrackerExportServices().services;
+  const selfDeployServices = [selfDeployRecovery, createSelfDeploy({
+    config: () => ({
+      flyDeployToken: config.flyDeployToken ?? undefined,
+      flyOrchestratorApp: config.flyOrchestratorApp ?? undefined,
+      selfDeployTarget: config.selfDeployTarget,
+      imageApp: process.env.FLY_IMAGE_APP || undefined,
+      kgSourceRepo: config.kgSourceRepo,
+    }),
+    head: async (target, branch) => {
+      const { token } = await mintSourceTokenOrJwt(config.githubAppId, config.githubAppPrivateKey, target.owner, { permissions: { contents: "read" }, repositories: [target.repo] });
+      return getRefSha(token, target.owner, target.repo, branch);
+    },
+    getDeployPolicy,
+    imagePublished: (target, commit) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, target, commit),
+    fly: { listMachines, getMachine, updateMachine },
+    flyctl: async (record, args, token, signal) => {
+      const [owner, repo] = record.target.repo.split("/");
+      await runSelfDeployFlyctl({ owner, repo, commit: record.target.commit, githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, args, flyDeployToken: token, signal });
+    },
+    kgToken: async () => {
+      const kg = parseKgSourceRepo(config.kgSourceRepo);
+      return (await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, kg.owner, { permissions: { contents: "read" }, repositories: [kg.repo] })).token;
+    },
+    getInFlightWork,
+    drainProbes: createRestateDrainProbes,
+    setHold: async (held) => { if (held) setDeployHold(); else clearDeployHold(); },
+    sourceCommit: () => process.env.AI_IMPLEMENT_SOURCE_COMMIT || undefined,
+    // Only the notification/outcome copy carries diagnostic text; the durable record stays stable.
+    onOutcome: createSelfDeployOutcomeHandler(config),
+  })];
+  const hydrateSetupChecks = createSetupChecksHydration();
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
+    onRegistered: async () => {
+      await hydrateSetupChecks();
+      await onRestateRegistered({
+        sweep: () => sweepOnRegistered(config),
+        scrub: async () => { await scrubOperatorLegacyTokens(); },
+        seed: seedRunnerBackends,
+        refresh: refreshRunnerBackendCache,
+      });
+    },
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.
   void restateSidecar.whenReady().then((ready) => {
     if (ready) void restateRegistration.attempt();
   });
-  const reviewFixPump = new ReviewFixDeliveryPump();
-  reviewFixPump.start();
 
   const teamRepoMap = getMappings();
 
@@ -5169,82 +5503,57 @@ async function main(): Promise<void> {
     console.log(`[main] Local Docker runner image: ${config.localRunnerImage}`);
   }
 
-  // Check if Fly config is needed
-  const hasFlyMappings = Object.values(teamRepoMap).some((m) => m.executionMode === "fly-machines");
-  if (hasFlyMappings) {
-    if (!config.flySessionsToken || !config.flySessionsApp) {
-      console.warn("[main] WARNING: fly-machines mappings exist but FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP is not set");
-    } else {
-      console.log(`[main] Fly sessions app: ${config.flySessionsApp}`);
-      console.log(`[main] Session image: ${config.sessionImage}`);
-    }
-  }
+  let interval: ReturnType<typeof setInterval> | null = null;
 
-  const server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic);
+  const shutdown = createMainShutdown({
+    isShuttingDown: () => shuttingDown,
+    markShuttingDown: () => { shuttingDown = true; },
+    stopPolling: () => { if (interval !== null) clearInterval(interval); },
+    stopRetrying: () => restateRegistration.stopRetrying(),
+    recordShutdown,
+    postShutdownNotice: () => postShutdownNotice(config),
+    stopSidecars: () => stopSidecarsConcurrently(sidecar, restateSidecar),
+    closeServer: done => { server.close(done); },
+    closeDb,
+    exit: code => { process.exit(code); },
+  });
 
-  // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
-  // Every write postBootNotice makes — LAST_IMAGE_REF_KEY, LAST_SHUTDOWN_AT_KEY and
-  // DEPLOY_OUTCOME_KEY — happens synchronously before its first await, so nothing is lost
-  // if the webhook never answers. Keep it that way: a write moved below an await here stops
-  // persisting silently and misclassifies every later boot. The sidecar probe above has
-  // already resolved by this point, so the recorded outcome reflects it rather than racing it.
-  void postBootNotice(config, { holdWasSet, sidecarProbeError });
-
-  // Reconcile machines from any previous run before starting the poll loop
-  await startupReconciliation(config, registry);
-
-  // Run first poll immediately
-  await poll(config, registry);
-
-  // Schedule subsequent polls
-  const interval = setInterval(() => {
-    poll(config, registry);
-  }, config.pollIntervalMs);
-
-  // total amount of time allotted for a graceful shutdown, otherwise the shutdown is forced
-  const SHUTDOWN_BUDGET_MS = 10_000; // 10s
-  // `shuttingDown` is declared at the top of main() (see comment there) so the Restate
-  // late-readiness continuation can read it too. The latch needs no reset: the forced-exit
-  // timer below is armed before any await, so the process always dies.
-  const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
-    if (shuttingDown) {
-      console.log(`[main] Received ${signal} while already shutting down; ignoring`);
-      return;
-    }
-    shuttingDown = true;
-    console.log(`[main] Received ${signal}, shutting down...`);
-    clearInterval(interval);
-    restateRegistration.stopRetrying();
-    reviewFixPump.stop();
-
-    // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
-    setTimeout(() => {
-      console.error(`[main] Forced shutdown after timeout`);
-      closeDb();
-      process.exit(1);
-    }, SHUTDOWN_BUDGET_MS).unref();
-
-    // Written before closeDb() so the next boot can measure how long we were gone.
-    recordShutdown();
-    await Promise.race([
-      postShutdownNotice(config),
-      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
-    ]);
-
-    // Concurrent: each sidecar's own stopTimeoutMs must not add to the other's inside the
-    // shutdown budget above (AII-807 — was sequential, which could exceed SHUTDOWN_BUDGET_MS
-    // and hit the forced-exit path instead of a clean shutdown).
-    await stopSidecarsConcurrently(sidecar, restateSidecar);
-
-    server.close(() => {
-      closeDb();
-      console.log(`[main] Shutdown complete`);
-      process.exit(0);
-    });
-  };
-
-  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
-  process.on("SIGINT", () => { void shutdown("SIGINT"); });
+  let server: ReturnType<typeof startServer>;
+  await runMainBoot({
+    registerSignal: (signal, handler) => { process.on(signal, handler); },
+    startServer: () => { server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic); },
+    wait: () => waitForRestateServing({
+      status: getRestateStatus,
+      gate: restateRegistration,
+      isShuttingDown: () => shuttingDown,
+    }),
+    isShuttingDown: () => shuttingDown,
+    shutdown,
+    onServing: () => restateExit.arm(shutdown),
+    logFly: () => {
+      // Check if Fly config is needed
+      const hasFlyMappings = Object.values(teamRepoMap).some((m) => m.executionMode === "fly-machines");
+      if (hasFlyMappings) {
+        if (!config.flySessionsToken || !config.flySessionsApp) {
+          console.warn("[main] WARNING: fly-machines mappings exist but FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP is not set");
+        } else {
+          console.log(`[main] Fly sessions app: ${config.flySessionsApp}`);
+          console.log(`[main] Session image: ${config.sessionImage}`);
+        }
+      }
+    },
+    refreshCache: refreshRunnerBackendCache,
+    reconcile: () => startupReconciliation(config, registry),
+    // Notice settings writes happen synchronously before its first await.
+    // A hanging webhook must not delay the first poll.
+    postBootNotice: () => { void postBootNotice(config, memoryProvider instanceof SidecarMemoryProvider
+      ? { probe: remainingMs => probeKgSidecarAfterBoot(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
+      : undefined); },
+    poll: () => poll(config, registry),
+    startInterval: () => {
+      interval = setInterval(() => { void poll(config, registry); }, config.pollIntervalMs);
+    },
+  });
 }
 
 // True only when this file is the process entrypoint (`tsx src/index.ts`, `node dist/index.js`).

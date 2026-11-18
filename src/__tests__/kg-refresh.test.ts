@@ -1,15 +1,23 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { postDryRunReport } from "../kg-refresh-rail.js";
 import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type RefreshOutcome, migrateLegacyDryRunOutcomes } from "../kg-refresh.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
+
+const materializeState = vi.hoisted(() => ({ direct: false }));
+vi.mock("../runner-mode.js", async (orig) => ({
+  ...(await orig<typeof import("../runner-mode.js")>()),
+  getKgMaterializeDirect: () => ({ enabled: materializeState.direct, source: "db" as const }),
+}));
 
 const NAMESPACE = "https://kg.test.example/";
 
 function makeTarball(dir: string): Buffer {
   // extractSource strips one leading component, so wrap in a top-level dir.
-  const wrap = mkdtempSync(join(tmpdir(), "kgtar-"));
+  const wrap = testDir("kgtar");
   const top = join(wrap, "repo");
   mkdirSync(top, { recursive: true });
   // `dir/.` copies CONTENTS on both BSD (macOS) and GNU (Linux) cp — a bare
@@ -30,18 +38,18 @@ describe("kg-refresh", () => {
   // AII-599: KG_MATERIALIZE_DIRECT gates the low-memory --direct path.
   describe("KG_MATERIALIZE_DIRECT", () => {
     afterEach(() => {
-      vi.unstubAllEnvs();
+      materializeState.direct = false;
       vi.restoreAllMocks();
     });
 
     it("appends --direct to materializeArgs() when the flag is true", () => {
-      vi.stubEnv("KG_MATERIALIZE_DIRECT", "true");
+      materializeState.direct = true;
       expect(materializeArgs()).toEqual(["-m", "kg_ingest.materialize", "--direct"]);
       expect(materializeArgs().join(" ")).not.toMatch(/embed|cli/);
     });
 
-    it("leaves materializeArgs() unchanged when the flag is unset or any other value", () => {
-      vi.stubEnv("KG_MATERIALIZE_DIRECT", "false");
+    it("leaves materializeArgs() unchanged when the setting is off", () => {
+      materializeState.direct = false;
       expect(materializeArgs()).toEqual(["-m", "kg_ingest.materialize"]);
     });
 
@@ -53,8 +61,8 @@ describe("kg-refresh", () => {
   });
 
   // ---- The dry-run PR-check surface (AII-633, AII-636, AII-640, AII-977) --------
-  // The refresh lifecycle runs in the KgRefresh workflow; the outcome lives on the KgRepo
-  // object. The handle reads and evicts it through the ingress client, faked here.
+  // The refresh lifecycle runs in the KgRefresh workflow; no outcome is stored. The handle
+  // only evicts the PR's held head through the ingress client, faked here.
 
   describe("dry-run report surface", () => {
     const REPORT = { repo: "TestOrg/test-kg", prNumber: 42, sha: "deadbeef" };
@@ -78,34 +86,32 @@ describe("kg-refresh", () => {
     };
     let postOrUpdateStickyCommentFn: ReturnType<typeof vi.fn>;
     let setCommitStatusFn: ReturnType<typeof vi.fn>;
-    let dryRunOutcome: ReturnType<typeof vi.fn>;
     let forgetPrCall: ReturnType<typeof vi.fn>;
 
-    /** `result` is what the KgRepo object answers `dryRunOutcome` with, whatever the PR asked. */
-    function buildHandle(result: unknown = { status: "accepted", value: null }): KgRefreshHandle {
+    function buildHandle(): KgRefreshHandle {
       postOrUpdateStickyCommentFn = vi.fn(async () => {});
       setCommitStatusFn = vi.fn(async () => {});
-      dryRunOutcome = vi.fn(async () => result);
       forgetPrCall = vi.fn(async () => ({ status: "accepted" }));
       return makeKgRefresh({
         githubAppId: "1",
         githubAppPrivateKey: "key",
         kgSourceRepo: "TestOrg/test-kg",
-        mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
-        postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as never,
-        setCommitStatusFn: setCommitStatusFn as never,
-        dryRunOutcomes: { dryRunOutcome, forgetPr: forgetPrCall } as never,
+        dryRunOutcomes: { forgetPr: forgetPrCall } as never,
       });
     }
 
-    const stored = (sha: string, outcome: RefreshOutcome) => ({ status: "accepted", value: { sha, outcome } });
+    const reportDeps = () => ({
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
+      postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as never,
+      setCommitStatusFn: setCommitStatusFn as never,
+    });
 
-    it("reportDryRun() re-posts the stored outcome's comment and status", async () => {
-      const handle = buildHandle(stored(REPORT.sha, okOutcome));
+    it("postDryRunReport() posts the outcome's comment and status", async () => {
+      buildHandle();
+      await postDryRunReport(reportDeps(), REPORT, okOutcome);
 
-      await expect(handle.reportDryRun({ ...REPORT, acceptBaseline: true })).resolves.toBe("reported");
-
-      expect(dryRunOutcome).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
       const [, owner, repo, prNumber, marker, body] = postOrUpdateStickyCommentFn.mock.calls[0] as [string, string, string, number, string, string];
       expect(owner).toBe("TestOrg");
@@ -114,40 +120,8 @@ describe("kg-refresh", () => {
       expect(marker).toBe("## kg-refresh dry-run");
       expect(body).toContain("## kg-refresh dry-run — deadbeef");
       expect(body).toContain("comment.nt");
-      // Outcome was a success (no shrink), so the label has no wording effect here.
-      expect(body).not.toContain("accepted by label");
+      expect(body).not.toContain("decision gate");
       expect(setCommitStatusFn).toHaveBeenCalledTimes(1);
-    });
-
-    it("reportDryRun() is a no-op when the stored outcome ran against a different sha", async () => {
-      const handle = buildHandle(stored(REPORT.sha, okOutcome));
-
-      // A label applied after a new push superseded the stored outcome's sha.
-      await expect(handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" })).resolves.toBe("no-outcome");
-      expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
-      expect(setCommitStatusFn).not.toHaveBeenCalled();
-    });
-
-    it("reportDryRun() logs a debug line and posts nothing when the object holds no outcome", async () => {
-      const handle = buildHandle({ status: "accepted", value: null });
-      const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
-      try {
-        await expect(handle.reportDryRun({ repo: "TestOrg/test-kg", prNumber: 999, sha: "nope" })).resolves.toBe("no-outcome");
-        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
-        expect(setCommitStatusFn).not.toHaveBeenCalled();
-        expect(debugSpy).toHaveBeenCalledWith(
-          "[kg-refresh] dry-run report skipped: no outcome for TestOrg/test-kg#999",
-        );
-      } finally {
-        debugSpy.mockRestore();
-      }
-    });
-
-    it("reportDryRun() reports unavailable when the store answers unavailable (AII-1014)", async () => {
-      const handle = buildHandle({ status: "unavailable" });
-
-      await expect(handle.reportDryRun(REPORT)).resolves.toBe("unavailable");
-      expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
     });
 
     it("forgetPr() asks the KgRepo object to drop the PR", async () => {
@@ -158,15 +132,16 @@ describe("kg-refresh", () => {
       expect(forgetPrCall).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
     });
 
-    it("reportDryRun({ acceptBaseline: false }) reports plain-refusal wording, even for a PR the label was previously applied to (AII-640)", async () => {
-      const handle = buildHandle(stored(REPORT.sha, refusedOutcome));
+    it("a refused dry-run reads refused, points at the refresh decision gate, and fails the status even with a stale acceptBaseline", async () => {
+      buildHandle();
 
-      // Simulates the webhook's `unlabeled` branch: it always forces acceptBaseline:false.
-      await handle.reportDryRun({ ...REPORT, acceptBaseline: false });
+      // A queued input stored before the label was removed may still carry acceptBaseline.
+      await postDryRunReport(reportDeps(), { ...REPORT, acceptBaseline: true } as typeof REPORT, refusedOutcome);
 
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
       const body = postOrUpdateStickyCommentFn.mock.calls[0]![5] as string;
       expect(body).toContain("guard refused");
+      expect(body).toContain("A shrink is accepted at the decision gate of the refresh that runs after this PR merges.");
       expect(body).not.toContain("accepted by label");
       const statusCall = setCommitStatusFn.mock.calls[0] as [string, string, string, string, { state: string }];
       expect(statusCall[4].state).toBe("failure");
@@ -243,7 +218,7 @@ describe("kg-refresh", () => {
 
     function buildPreflight() {
       // Build a fixture tarball whose sources.yml includes code_repo and a secondary repo.
-      const pfRepo = mkdtempSync(join(tmpdir(), "kgpf-"));
+      const pfRepo = testDir("kgpf");
       writeFileSync(
         join(pfRepo, "sources.yml"),
         [
@@ -255,7 +230,6 @@ describe("kg-refresh", () => {
       );
       mkdirSync(join(pfRepo, "snapshot"), { recursive: true });
       preflightTarball = makeTarball(pfRepo);
-      rmSync(pfRepo, { recursive: true, force: true });
 
       // mintTokenPf always succeeds; overrides can make specific calls fail.
       mintTokenPf = vi.fn(async () => ({ token: "tok", expiresAt: "" }));
@@ -395,7 +369,7 @@ describe("kg-refresh", () => {
     });
 
     it("custom base_repo: — row's repo field reflects the configured slug", async () => {
-      const pfRepo = mkdtempSync(join(tmpdir(), "kgpf-base-"));
+      const pfRepo = testDir("kgpf-base");
       writeFileSync(
         join(pfRepo, "sources.yml"),
         [
@@ -406,7 +380,6 @@ describe("kg-refresh", () => {
       );
       mkdirSync(join(pfRepo, "snapshot"), { recursive: true });
       const customTarball = makeTarball(pfRepo);
-      rmSync(pfRepo, { recursive: true, force: true });
 
       const result = await runKgRefreshPreflight({
         githubAppId: "1",
@@ -507,27 +480,60 @@ describe("kg-refresh production wiring (AII-901)", () => {
   let idx: IndexModule;
   let logMod: typeof import("../log.js");
   let dedupMod: typeof import("../dedup.js");
-  let dbPath: string;
+  let hold: typeof import("../deploy-hold.js");
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = join(tmpdir(), `kg-wiring-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath;
-    idx = await import("../index.js");
-    logMod = await import("../log.js");
-    dedupMod = await import("../dedup.js");
-    logMod.initLogTable();
-    dedupMod.getDb().exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  });
-
-  afterEach(() => {
-    dedupMod.closeDb();
-    rmSync(dbPath, { force: true });
+    ({ idx, logMod, dedupMod, hold } = (
+      await testDb({
+        modules: {
+          idx: () => import("../index.js"),
+          logMod: () => import("../log.js"),
+          dedupMod: () => import("../dedup.js"),
+          hold: () => import("../deploy-hold.js"),
+        },
+      })
+    ).modules);
   });
 
 
   const unavailable = { status: "unavailable" as const, content: [] };
   const held = (v: boolean) => () => v;
+
+  it("makeKgDryRunEnqueue skips the ingress while Restate is not ready (AII-1405)", async () => {
+    const ingress = { enqueueDryRun: vi.fn().mockResolvedValue({ status: "accepted" }) };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const entry = { prNumber: 3 } as never;
+    expect(await idx.makeKgDryRunEnqueue("Org/kg", ingress as never, () => false)("k-1", entry, { idempotencyKey: "d" })).toEqual({ status: "unavailable" });
+    expect(ingress.enqueueDryRun).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("k-1");
+    warn.mockRestore();
+  });
+
+  it("makeKgDryRunEnqueue calls the ingress when ready and answers unavailable with no slug", async () => {
+    const ingress = { enqueueDryRun: vi.fn().mockResolvedValue({ status: "accepted" }) };
+    const entry = { prNumber: 3 } as never;
+    const opts = { idempotencyKey: "d" };
+    expect(await idx.makeKgDryRunEnqueue("Org/kg", ingress as never, () => true)("k-1", entry, opts)).toEqual({ status: "accepted" });
+    expect(ingress.enqueueDryRun).toHaveBeenCalledWith("Org/kg", { key: "k-1", prNumber: 3 }, opts);
+    ingress.enqueueDryRun.mockClear();
+    for (const r of [true, false]) {
+      expect(await idx.makeKgDryRunEnqueue(undefined, ingress as never, () => r)("k-1", entry, opts)).toEqual({ status: "unavailable" });
+    }
+    expect(ingress.enqueueDryRun).not.toHaveBeenCalled();
+  });
+
+  it.each([null, "operator@example.com"])("forwards the admin caller to the refresh tool (%s)", async (email) => {
+    const callAsSystem = vi.fn();
+    const callAsCaller = vi.fn().mockResolvedValue({
+      status: "ok", content: [{ type: "text", text: JSON.stringify({ status: 202, body: { refreshing: true, triggerId: "manual-1" } }) }],
+    });
+    const caller = { kind: "human", email, role: "admin", grants: [] } as const;
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", {} as never, callAsSystem, held(false), callAsCaller);
+    expect(await deps.trigger(undefined, caller)).toEqual({ status: 202, body: { refreshing: true, triggerId: "manual-1" } });
+    expect(callAsCaller).toHaveBeenCalledWith("trigger_kg_refresh", {}, caller);
+    expect(callAsSystem).not.toHaveBeenCalled();
+  });
 
   it("cancel cancels the clicked row's dispatchId and reads no marker", async () => {
     const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "accepted" }) };
@@ -539,11 +545,22 @@ describe("kg-refresh production wiring (AII-901)", () => {
 
   it("cancel answers 409 for not-found and for a row without a dispatchId", async () => {
     const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "not-found" }) };
-    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never, held(false));
+    const decide = vi.fn().mockResolvedValue({ status: "ok", isError: true, content: [{ type: "text", text: "no-decision-open" }] });
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, decide as never, held(false));
     expect(await deps.cancel({ jobId: 1, dispatchId: "t-1", reason: "r" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
     client.cancel.mockClear();
+    decide.mockClear();
     expect(await deps.cancel({ jobId: 1, dispatchId: null, reason: "r" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
     expect(client.cancel).not.toHaveBeenCalled();
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("a Stop on a held row, whose gate run has ended, cancels the hold through decide_kg_refresh with that row's trigger id", async () => {
+    const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "conflict", error: "no-refresh-in-flight" }) };
+    const decide = vi.fn().mockResolvedValue({ status: "ok", content: [{ type: "text", text: "{\"decided\":\"cancel\"}" }] });
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, decide as never, held(false));
+    expect(await deps.cancel({ jobId: 1, dispatchId: "t-held", reason: "operator_cancelled" })).toEqual({ status: 200, body: { cancelled: true } });
+    expect(decide).toHaveBeenCalledWith("decide_kg_refresh", { action: "cancel", triggerId: "t-held" });
   });
 
   it("an unavailable Restate answers 409 deploy-in-progress during a hold", async () => {
@@ -565,8 +582,7 @@ describe("kg-refresh production wiring (AII-901)", () => {
     expect((await after.status()).status).toBe(503);
   });
 
-  it("deployHealth reports false/null with no hold and true/number once held", async () => {
-    const hold = await import("../deploy-hold.js");
+  it("deployHealth reports false/null with no hold and true/number once held", () => {
     expect(idx.deployHealth()).toEqual({ held: false, startedAt: null });
     hold.setDeployHold();
     try {

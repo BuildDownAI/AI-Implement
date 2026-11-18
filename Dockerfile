@@ -54,13 +54,13 @@ COPY workflows/ ./workflows/
 #   docker build --build-arg KG_SOURCE_REPO=owner/repo --secret id=kg_token,env=GH_TOKEN .
 #   fly deploy --remote-only --build-secret kg_token="$(gh auth token)"
 #
-# To build WITHOUT the sidecar (sidecar-less / degraded /mcp 503):
+# To build WITHOUT the sidecar (sidecar-less / /mcp without kg_* tools):
 #   docker build .
 #   fly deploy --remote-only
 #
 # When KG_SOURCE_REPO is unset the build succeeds and logs "building without a knowledge graph".
 # When the secret is absent the build succeeds and logs "sidecar-less build".
-# All other routes remain healthy; only /mcp returns 503.
+# All other routes remain healthy; /mcp serves without the kg_* tools.
 #
 # Receipt rule: any fail-soft build step that skips a meaningful piece of work must
 # write /app/kg/.embeddings-failed into the image. Using || echo alone is a
@@ -104,7 +104,7 @@ RUN --mount=type=secret,id=kg_token,required=false \
         && chmod +x /app/kg/start.sh \
         && rm -rf /tmp/kg-src; \
     else \
-        echo "[kg] sidecar-less build — kg_token secret absent or empty, /mcp will return 503"; \
+        echo "[kg] sidecar-less build — kg_token secret absent or empty, /mcp will serve without kg_* tools"; \
     fi
 RUN if [ -f /app/kg/requirements.txt ]; then \
         echo "[kg] installing Python dependencies into /app/kg/.venv" \

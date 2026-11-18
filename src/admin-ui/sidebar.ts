@@ -14,6 +14,8 @@ const groups: NavGroup[] = [
     { key: "pulls",    label: "Pull requests", icon: "git",     count: "pulls" },
     { key: "blockers", label: "Blockers",      icon: "alert",   count: "blockers" },
     { key: "reports",  label: "Reports",       icon: "layers" },
+    { key: "kg-pipelines", label: "Knowledge Graph Pipelines", icon: "refresh",
+      grantBlocker: "Starts knowledge-graph refreshes and changes the materialize setting." },
   ]},
   { label: "Configure", items: [
     { key: "projects",  label: "Projects",            icon: "folder",

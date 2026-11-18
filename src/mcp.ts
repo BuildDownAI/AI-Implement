@@ -6,6 +6,7 @@ import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 import type { Caller } from "./mcp-identity.js";
 import { discoverTools, callTool } from "./restate/tools-client.js";
+import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -83,30 +84,50 @@ export function scopeIdempotencyKey(callerId: string, supplied: string): string 
 const RESTATE_TOOL_NAMES = new Set([
   "get_tenant_health",
   "get_runner_mode",
+  "get_runner_backend",
+  "get_pipeline_schedule",
   "list_projects",
   "get_project_binding",
   "list_in_flight_jobs",
+  "get_session_machine",
+  "list_session_machines",
+  "get_fly_setup",
   "get_issue_dispatch_status",
   "get_issue_report_card",
   "get_fleet_report",
+  "get_reviewer_scorecard",
   "get_deploy_posture",
   "get_kg_status",
   "get_review_fix_attempt",
   "get_review_fix_activity",
+  "list_job_accounting",
+  "list_open_pulls",
+  "list_issue_statuses",
   "kg_hybrid_search",
   "kg_search",
   "kg_semantic_search",
   "kg_neighbors",
   "kg_provenance",
   "kg_path",
+  "kg_repo_history",
   "trigger_kg_refresh",
+  "decide_kg_refresh",
   "set_runner_mode",
+  "set_fly_machine_profile",
+  "set_runner_backend",
+  "set_pipeline_schedule",
+  "set_run_profile",
   "pause_project",
+  "start_deploy",
   "add_project",
+  "add_model_account",
+  "set_project_stage",
+  "set_project_agent_mode",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
   "list_dispatch_reservations",
   "release_dispatch_reservation",
+  "unpark_issue",
 ]);
 
 // The subset of RESTATE_TOOL_NAMES that mutates state. Not a role declaration — that lives on
@@ -116,12 +137,22 @@ const RESTATE_TOOL_NAMES = new Set([
 // re-poll return a stale cached answer instead of running again, which reads never wanted.
 export const RESTATE_WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
+  "decide_kg_refresh",
   "set_runner_mode",
+  "set_fly_machine_profile",
+  "set_runner_backend",
+  "set_pipeline_schedule",
+  "set_run_profile",
   "pause_project",
+  "start_deploy",
   "add_project",
+  "add_model_account",
+  "set_project_stage",
+  "set_project_agent_mode",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
   "release_dispatch_reservation",
+  "unpark_issue",
 ]);
 
 // admin is a strict superset of user (docs/access-model.md § Roles): an entry's role satisfies
@@ -288,7 +319,7 @@ export async function handleMcpRequest(
     }
 
     if (RESTATE_TOOL_NAMES.has(toolName)) {
-      const caller: Caller = { kind: identity.kind, email: identity.email, role };
+      const caller: Caller = { kind: identity.kind, email: identity.email, role, grants: [] };
       // A write carries an idempotency key only when the caller states one explicitly via
       // the MCP `_meta` extension point (see IDEMPOTENCY_KEY_SHAPE above) — the server never
       // derives one, but it does scope the caller's key by the caller's identity
@@ -319,6 +350,11 @@ export async function handleMcpRequest(
       if (callResult.status === "unavailable") {
         json(res, 503, { error: "restate-unavailable" });
         return;
+      }
+      // The process cache behind getFlySessionsConfig() is filled by polling; refresh it here so
+      // a write through /mcp takes effect at the next dispatch, as the admin Settings path does.
+      if (toolName === "set_runner_backend" && callResult.status === "ok" && !callResult.isError) {
+        await refreshRunnerBackendCache();
       }
       json(res, 200, {
         jsonrpc: "2.0",

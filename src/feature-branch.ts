@@ -48,6 +48,28 @@ export function nonTerminalDesignatedChildren(children: FeatureChildState[]): Fe
   return children.filter((c) => c.designated && !c.terminal);
 }
 
+/** Refuse grouped dispatch when a grouping ancestor will roll up in another repo.
+ * Missing mappings also fail closed; an ungrouped issue needs no such lookup. */
+export function hasCompatibleFeatureMapping(
+  child: { identifier: string; scopeKey: string },
+  ancestor: { identifier: string; scopeKey: string } | undefined,
+  mappings: Record<string, RepoMapping>,
+): boolean {
+  if (!ancestor) return true;
+  const childMapping = mappings[child.scopeKey];
+  const ancestorMapping = mappings[ancestor.scopeKey];
+  if (childMapping && ancestorMapping &&
+      childMapping.owner === ancestorMapping.owner && childMapping.repo === ancestorMapping.repo) return true;
+
+  const describe = (scopeKey: string, mapping: RepoMapping | undefined) =>
+    `${scopeKey} → ${mapping ? `${mapping.owner}/${mapping.repo}` : "unmapped"}`;
+  console.log(
+    `[linear] Refusing to dispatch ${child.identifier} (${describe(child.scopeKey, childMapping)}): ` +
+    `grouping ancestor ${ancestor.identifier} (${describe(ancestor.scopeKey, ancestorMapping)}) has a different or missing repository mapping`,
+  );
+  return false;
+}
+
 /**
  * Resolves the branch a dispatched issue's PR should target, creating any feature
  * branches in `issue.featureBranchChain` that don't yet exist.

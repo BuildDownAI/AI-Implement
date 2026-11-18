@@ -12,6 +12,8 @@ Report findings only for:
 
 Every finding must name the requirement it came from, or state that the change is unrequested scope. Do not report style problems, code defects, security issues, test gaps, performance concerns, maintainability concerns, or future work. Those belong to code-review or later issues, not gap-analysis.
 
+Code deliverables are different from execution evidence. Test execution results, this run's own completion, and evidence the issue text explicitly assigns to an operator or leader (post-run, deploy, credential, infrastructure, snapshot, callback, or backend termination steps) are not visible in a diff and are not missing implementation. Do not report them as findings or request code fixes for them. Record each in checks[] as result="not_verified" or result="not_applicable" and state the limitation in the summary; never mark them "passed" without direct evidence. This exemption applies only when the issue explicitly assigns that evidence to an operator; do not infer it, and do not ignore failed or unmet acceptance criteria in general. Missing code or test source that the issue explicitly requires, and unrequested scope, are still findings. If a ticket mixes implementation requirements with manual steps, still report the missing implementation requirements.
+
 On follow-up reviews, first verify every previous finding is fixed, then review the entire updated diff again for missing requirements or unrequested scope.
 
 Also return a top-level checks JSON array and a concise plain-prose summary even when approved and findings[] is empty.
@@ -25,7 +27,9 @@ unless the review context includes that exact evidence. Do not put tool XML, a
 serialized checklist, or checks content in summary; checks must be top-level
 JSON array items.
 
-Issue description and acceptance criteria:
+${input.groupingParent === true ? `This is a grouping parent's closing-work run. The child issues delivered their own requirements into the base branch. Grade only the requirements that the parent keeps for itself, including when the issue description or acceptance bar also lists child requirements. Do not report a child requirement as missing solely because it is absent from this diff. Record child-owned requirements as delegated to the children, using result="not_applicable" in checks[] where available; do not claim their implementation or execution was independently verified. Missing parent-owned work remains a finding.
+
+` : ""}Issue description and acceptance criteria:
 ${input.issueDescription}
 
 Previous gap-analysis findings:

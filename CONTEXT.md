@@ -164,6 +164,12 @@ A review-fix attempt is one authorized runner execution that addresses review fe
 
 **Not to be confused with:** A review-fix run, which is the orchestrator dispatch that may contain a Restate-tracked attempt; or an internal review/fix cycle within the runner.
 
+## Implementation attempt
+
+An implementation attempt is one dispatch of one issue for implementation: one dispatch id, one reservation, and, on a `restate` project, one `ImplementationRun`. A stuck attempt is stopped; a retry is a new attempt with a new dispatch id.
+
+**Not to be confused with:** An implementation pass, which is one implement-and-review cycle inside the runner; or a gap-fill run, which is dispatched from a PR comment.
+
 ## Lifecycle owner
 
 The lifecycle owner is the system responsible for coordinating one attempt from admission to its final outcome. An attempt keeps its owner when an operator changes the setting for future attempts.
@@ -181,3 +187,39 @@ A coordinator object is the Restate virtual object that holds the single in-flig
 A rail gate is one journaled step of the kg-refresh rail (fetch, stage, swap, verify) that either passes or fails the refresh. A failed gate triggers the `revert` compensation, and `status` names the gate that did not finish.
 
 **Not to be confused with:** The auto-merge gate, which decides whether a child PR merges; or the review gate, which is the check that holds a PR until review approves.
+
+## ChatGPT plan account
+
+A ChatGPT plan account is an account profile whose `codex-subscription` credential is a ChatGPT plan record from "Sign in with ChatGPT". Its refresh token is held by one refresher.
+
+**Not to be confused with:** A Claude subscription account, which keeps reservations and recovery holds; or an OpenAI API key account.
+
+## Refresher
+
+The refresher is the single holder of a ChatGPT plan account's refresh token: the host-side credential port on a local run, one Restate Virtual Object per account profile on a hosted run. It serializes refreshes and saves each rotated token before it hands out an access token.
+
+**Not to be confused with:** A runner, which never sees the refresh token; or the `Operator` object, which refreshes other credentials.
+
+## Access-token grant
+
+An access-token grant is one checkout of the `chatgpt-access-token` secret kind: an access token and its expiry, valid for about an hour. Renewing is another checkout.
+
+**Not to be confused with:** The refresh token, which stays with the refresher; or a reservation, which hosted ChatGPT plan accounts do not take.
+
+## Self-deploy
+
+A self-deploy is the orchestrator moving itself to a newer build of its watched branch. It drains work, changes the image of its own machine, and checks after the restart that it runs the target commit.
+
+**Not to be confused with:** A KG refresh, which changes the knowledge graph and not the orchestrator's code.
+
+## Deploy hold
+
+The deploy hold is the flag that stops new work while a self-deploy drains. The self-deploy sets it at the start and clears it when the deploy ends, whether it succeeds, fails, or is cancelled.
+
+**Not to be confused with:** A KG hold, which pauses one KG refresh for an operator decision.
+
+## Pull request link
+
+The pull request link is the stored record that a pull request belongs to one issue. It holds the pull request's role (implementation or roll-up) and its outcome (open, merged, or closed without a merge). The orchestrator writes it when the pull request opens, and never prunes it.
+
+**Not to be confused with:** The run record, which is the row for one dispatched run. Run records are pruned; a pull request link is not.

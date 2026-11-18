@@ -1,15 +1,20 @@
 // Real Restate 1.7.10 coordination tests for AII-796. The fake business state is
 // outside the SDK endpoint, as the later SQLite adapters will be in production.
-import { randomUUID } from "node:crypto";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createHash, randomUUID } from "node:crypto";
+import type { RestateEnvironment } from "./harness.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import * as contract from "../../review-fix-contract.js";
 import type { ReviewFixResultMetadataV1, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../../review-fix-ports.js";
-import { createReviewFixAttempt, REVIEW_FIX_RETENTION_MS, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
-import { VARIANTS, attachWorkflow, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
+import { VARIANTS, eventually, gate, type Gate, attachWorkflow, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { getDb } from "../../dedup.js";
+import { toRecordedUsage } from "../../agent-usage.js";
+import { registerOwnedRunContract, type OwnedRunAdapter } from "./owned-run-contract.js";
+import { makeReviewFixResult } from "../helpers/builders.js";
 
 const SHA = "a".repeat(40);
-const EXECUTION = { githubRunId: 782, githubRunAttempt: 1 };
+const EXECUTION = { backend: "github-actions" as const, githubRunId: 782, githubRunAttempt: 1 };
 
 type LaunchMode = "accepted" | "response_lost" | "rejected" | "unresolved";
 interface FakeAttempt {
@@ -24,11 +29,16 @@ interface FakeAttempt {
   terminal: WorkerTerminalOutcome | null;
   outcome: WorkerTerminalOutcome | null;
   approvalEffects: number;
+  approvalCalls: number;
+  evidenceCalls: number;
+  outcomeCalls: number;
   releaseEffects: number;
   cancelCalls: number;
-  holdBinding: boolean;
+  holdBinding: Gate | null;
   loadFailures: number;
   loadCalls: number;
+  usageDispatchId?: string;
+  legacyLaunch?: boolean;
 }
 
 function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
@@ -44,26 +54,40 @@ function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
     },
     mode, authority: true, occupied: true, intent: false, bound: false,
     launchEffects: 0, result: null, terminal: null, outcome: null,
-    approvalEffects: 0, releaseEffects: 0, cancelCalls: 0,
-    holdBinding: false, loadFailures: 0, loadCalls: 0,
+    approvalEffects: 0, approvalCalls: 0, evidenceCalls: 0, outcomeCalls: 0, releaseEffects: 0, cancelCalls: 0,
+    holdBinding: null, loadFailures: 0, loadCalls: 0,
   };
 }
 
-function resultOf(fake: FakeAttempt, overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
-  return {
-    version: 1, attemptId: fake.prepared.attemptId,
-    ...fake.prepared.scope, deadlineAt: fake.prepared.deadlineAt,
-    ...EXECUTION, outputCommit: SHA, ...overrides,
-  };
+function resultOf(fake: FakeAttempt, overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
+  return makeReviewFixResult({
+    attemptId: fake.prepared.attemptId, ...fake.prepared.scope, deadlineAt: fake.prepared.deadlineAt,
+    githubRunId: EXECUTION.githubRunId, githubRunAttempt: EXECUTION.githubRunAttempt,
+    outputCommit: SHA, ...overrides,
+  });
 }
 
-async function until(predicate: () => boolean, timeoutMs = 8_000): Promise<void> {
-  const stop = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= stop) throw new Error("timed out waiting for fake worker effect");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
+function seedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
+  const snapshotId = `snapshot-${dispatchId}`;
+  const selection = { agent: "claude", provider: "anthropic", model: "claude-model", accountProfileId: "planning-profile", invocationTimeoutMs: 60_000 };
+  const profile = { id: "planning-profile", identity: "account", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
+  getDb().prepare(`INSERT OR IGNORE INTO run_agent_config_snapshots
+    (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+    VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snapshotId, dispatchId,
+      JSON.stringify({ stages: { planning: selection, implementation: selection, review: selection }, profiles: { planning: profile, implementation: profile, review: profile } }),
+      JSON.stringify(Object.fromEntries(["planning", "implementation", "review"].map((stage) => [stage, Object.fromEntries(Object.keys(selection).map((field) => [field, "project"]))]))),
+      JSON.stringify({ orchestratorDefault: { configRevisionId: "r1", revision: 1 }, project: { configRevisionId: "r2", revision: 1 } }));
+  return toRecordedUsage({ invocations: items.map((item) => ({ attribution: {
+    version: 1, invocationId: `${dispatchId}-inv-${item}`, snapshotId, stage: "planning",
+    agent: selection.agent, provider: selection.provider, model: selection.model,
+    profileId: profile.id, authMode: profile.authMode, limit: null, outcome: "success",
+    usage: { availability: "complete", tokensIn: tokens, tokensOut: 2, costUsd: cost, costStatus: "reported" },
+  } })) });
 }
+
+const storedRows = (dispatchId: string) => getDb().prepare(
+  "SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id",
+).all(dispatchId);
 
 describe("ReviewFixAttempt durable workflow", () => {
   const attempts = new Map<string, FakeAttempt>();
@@ -90,7 +114,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       },
       bindExecution: async (id, execution) => {
         const fake = get(id);
-        while (fake.holdBinding) await new Promise((resolve) => setTimeout(resolve, 20));
+        await fake.holdBinding?.wait();
         if (!fake.occupied) return { status: "not_owner" } as const;
         if (fake.bound) return { status: "already_bound", execution: EXECUTION } as const;
         expect(execution).toEqual(EXECUTION);
@@ -108,6 +132,10 @@ describe("ReviewFixAttempt durable workflow", () => {
             : { status: "conflict", attemptId: id, reason: "different result" } as const;
         }
         fake.result = result;
+        if (fake.usageDispatchId) {
+          getDb().prepare("UPDATE review_fix_attempts SET accepted_result_json = ?, accepted_result_hash = ? WHERE attempt_id = ?")
+            .run(JSON.stringify(result), createHash("sha256").update(JSON.stringify(result)).digest("hex"), id);
+        }
         return { status: "stored", result } as const;
       },
       releaseOwner: async (id) => {
@@ -127,7 +155,8 @@ describe("ReviewFixAttempt durable workflow", () => {
         fake.launchEffects++;
         if (fake.mode === "response_lost") throw new Error("response lost after backend accepted");
         if (fake.mode === "unresolved") return { status: "unknown" } as const;
-        return { status: "accepted", execution: EXECUTION } as const;
+        return { status: "accepted", execution: fake.legacyLaunch
+          ? { githubRunId: EXECUTION.githubRunId, githubRunAttempt: EXECUTION.githubRunAttempt } : EXECUTION } as const;
       },
       reconcile: async (id) => get(id).mode === "unresolved"
         ? { status: "unknown" } as const : { status: "found", execution: EXECUTION } as const,
@@ -142,16 +171,18 @@ describe("ReviewFixAttempt durable workflow", () => {
       },
     },
     finalizer: {
-      recordOutcome: async (outcome) => {
+      recordOutcome: async (outcome, now) => {
         const fake = get(outcome.attemptId);
+        fake.outcomeCalls++;
         if (fake.outcome) return { status: "already_recorded", outcome: {
           attemptId: outcome.attemptId, scope: outcome.scope, terminal: fake.outcome,
         } } as const;
         fake.outcome = outcome.terminal;
-        return { status: "recorded" } as const;
+        return { status: "recorded", completedAt: now } as const;
       },
       applyApproval: async (input) => {
         const fake = get(input.attemptId);
+        fake.approvalCalls++;
         if (!input.currentAuthority || !fake.authority || !input.policyAllows
           || input.currentPrHeadSha !== input.result.outputCommit
           || input.findingDispositions.length !== fake.prepared.findings.length) {
@@ -162,20 +193,139 @@ describe("ReviewFixAttempt durable workflow", () => {
         return { status: "applied", effectId: input.attemptId } as const;
       },
     },
-    loadApprovalEvidence: async (attempt) => ({ currentPrHeadSha: SHA,
+    loadApprovalEvidence: async (attempt) => {
+      get(attempt.attemptId).evidenceCalls++;
+      return { currentPrHeadSha: SHA,
       findingDispositions: attempt.findings.map((finding) => ({ findingKey: finding.findingKey,
-        disposition: "addressed" as const })), policyAllows: true }),
+        disposition: "addressed" as const })), policyAllows: true, dispositionsComplete: true };
+    },
   });
 
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
   beforeAll(async () => { environments = await startVariants([workflow]); }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
 
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = environments.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   }
+
+  // Scenarios 1–5 wait for AII-1627's owned-run lifecycle migration.
+  const contractAdapter: OwnedRunAdapter = {
+    name: "ReviewFixAttempt",
+    scenarios: [6],
+    start(baseUrl, key) {
+      const fake = newFake("accepted", 60_000);
+      fake.prepared = { ...fake.prepared, attemptId: key, owner: key };
+      const dispatchId = `dispatch-${key}`;
+      fake.usageDispatchId = dispatchId;
+      attempts.set(key, fake);
+      const db = getDb();
+      db.prepare(`INSERT INTO dispatch_admissions
+        (dispatch_id, mapping_key, issue_scope, issue_id, lifecycle_owner, phase, backend, created_at)
+        VALUES (?, 'test', 'test', ?, ?, 'review_fix', 'github-actions', 1)`)
+        .run(dispatchId, key, `restate:${key}`);
+      db.prepare(`INSERT INTO review_fix_attempts
+        (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+         issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+        VALUES (?, ?, 'test', '7', 'BuildDownAI/AI-Implement', 42, 'test', ?, ?, 'running', 1, ?, '{}', '[]')`)
+        .run(key, dispatchId, key, key, fake.prepared.deadlineAt);
+      // Exercise only the shared handler: retain admission after done for the
+      // contract's duplicate/conflict probes, without changing production stale rules.
+      let finish!: () => void;
+      const done = new Promise<void>((resolve) => { finish = resolve; });
+      return {
+        runId: dispatchId, done,
+        read: async () => ({ step: "waiting" }),
+        finish: async () => { finish(); },
+        report: async (value) => {
+          const { usage, items } = value as { usage: { tokens: number; cost: number }; items: number[] };
+          const recorded = seedUsage(dispatchId, usage.tokens, usage.cost, [items.reduce((a, b) => a + b, 0)]);
+          // Scenario 6 reverses the source usage keys on its equivalent repeat.
+          // Carry that difference through the actual RecordedUsage wire payload.
+          const reverseKeys = (value: unknown): unknown => {
+            if (Array.isArray(value)) return value.map(reverseKeys);
+            if (value !== null && typeof value === "object") {
+              return Object.fromEntries(Object.entries(value).reverse().map(([key, item]) => [key, reverseKeys(item)]));
+            }
+            return value;
+          };
+          const reordered = reverseKeys(recorded);
+          expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(recorded));
+          expect(reordered).toEqual(recorded);
+          const payload = Object.keys(usage)[0] === "cost" ? reordered : recorded;
+          const before = storedRows(dispatchId);
+          const result = await callWorkflow<{ status: string }>(baseUrl, "ReviewFixAttempt", key, "result",
+            { ...resultOf(fake), usage: payload });
+          if (before.length) {
+            expect(result.status).toBe("duplicate");
+            expect(storedRows(dispatchId)).toEqual(before);
+          }
+          finish();
+          return { status: result.status === "stored" ? "accepted" : "duplicate" };
+        },
+        acceptedCount: () => storedRows(dispatchId).length,
+      };
+    },
+    calls: () => [],
+  };
+  registerOwnedRunContract(contractAdapter, envFor);
+
+  it.each(VARIANTS.map(([label]) => label))("refused and metadata-conflicting results record no usage (%s)", async (label) => {
+    const key = `refused-${label}-${randomUUID()}`;
+    const url = envFor(label).baseUrl();
+    const handle = contractAdapter.start(url, key, { faults: {}, totalMs: 60_000 });
+    const fake = get(key);
+    const body = { ...resultOf(fake), usage: seedUsage(handle.runId) };
+    await expect(callWorkflow(url, "ReviewFixAttempt", key, "result", { ...body, version: 99 }))
+      .rejects.toThrow();
+    await expect(callWorkflow(url, "ReviewFixAttempt", key, "result", { ...body, attemptId: "another-attempt" }))
+      .rejects.toThrow();
+    fake.occupied = false;
+    expect(await callWorkflow(url, "ReviewFixAttempt", key, "result", body)).toMatchObject({ status: "stale" });
+    fake.occupied = true;
+    await callWorkflow(url, "ReviewFixAttempt", key, "result", resultOf(fake));
+    expect(await callWorkflow(url, "ReviewFixAttempt", key, "result", { ...body, outputCommit: "b".repeat(40) }))
+      .toMatchObject({ status: "conflict" });
+    expect(fake.authority).toBe(false);
+    expect(storedRows(handle.runId)).toEqual([]);
+  }, 20_000);
+
+  it("usage storage failure propagates and a retry records usage once", async () => {
+    const key = `usage-failure-${randomUUID()}`;
+    const env = envFor("disableRetries");
+    const url = env.baseUrl();
+    // Observe durable promise state directly: the adapter's done is synthetic
+    // and cannot prove that the result handler withheld the workflow wake.
+    const resolvedPromises = async (): Promise<string[]> => {
+      const response = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: durable promise state read
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT key, completed FROM sys_promise WHERE service_name = 'ReviewFixAttempt' AND service_key = '${key}'` }),
+      });
+      expect(response.ok).toBe(true);
+      const { rows } = await response.json() as { rows: Array<{ key: string; completed: boolean }> };
+      return rows.filter((row) => row.completed).map((row) => row.key).filter((name) => name === "report" || name === "wake").sort();
+    };
+    const handle = contractAdapter.start(url, key, { faults: {}, totalMs: 60_000 });
+    const body = { ...resultOf(get(key)), usage: seedUsage(handle.runId) };
+    getDb().exec(`CREATE TRIGGER fail_review_fix_usage BEFORE INSERT ON model_invocation_attribution
+      BEGIN SELECT RAISE(ABORT, 'injected usage storage failure'); END`);
+    try {
+      await expect(callWorkflow(url, "ReviewFixAttempt", key, "result", body)).rejects.toThrow();
+      expect(storedRows(handle.runId)).toEqual([]);
+      expect(await resolvedPromises()).toEqual([]);
+    } finally {
+      getDb().exec("DROP TRIGGER fail_review_fix_usage");
+    }
+    expect(await callWorkflow(url, "ReviewFixAttempt", key, "result", body)).toMatchObject({ status: "duplicate" });
+    expect(await resolvedPromises()).toEqual(["report", "wake"]);
+    const recorded = storedRows(handle.runId);
+    expect(recorded).toHaveLength(2);
+    expect(await callWorkflow(url, "ReviewFixAttempt", key, "result", body)).toMatchObject({ status: "duplicate" });
+    expect(storedRows(handle.runId)).toEqual(recorded);
+  }, 30_000);
 
   it.each(VARIANTS.map(([label]) => label))("response loss reconciles one execution and one launch effect (%s)", async (label) => {
     const fake = newFake("response_lost");
@@ -183,15 +333,35 @@ describe("ReviewFixAttempt durable workflow", () => {
     const env = envFor(label);
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.bound);
-    fake.terminal = { status: "succeeded", outputCommit: SHA };
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
     expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake)))
-      .toEqual({ status: "stored", result: resultOf(fake) });
+      .toMatchObject({ status: "stored", result: resultOf(fake) });
+    fake.terminal = { status: "succeeded", outputCommit: SHA };
     expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "applied" });
     expect([fake.launchEffects, fake.approvalEffects, fake.releaseEffects, fake.occupied]).toEqual([1, 1, 1, false]);
   }, 20_000);
 
-  it.each(VARIANTS.map(([label]) => label))("success without a valid result waits to deadline and never approves (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("withholds approval when confirmed terminal and accepted result heads differ (%s)", async (label) => {
+    const fake = newFake("accepted", 60_000);
+    attempts.set(fake.prepared.attemptId, fake);
+    const env = envFor(label);
+    const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+      "run", { attemptId: fake.prepared.attemptId });
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
+    const accepted = resultOf(fake, { outputCommit: "b".repeat(40) });
+    expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", accepted))
+      .toMatchObject({ status: "stored", result: accepted });
+    expect([fake.occupied, fake.releaseEffects, fake.outcome]).toEqual([true, 0, null]);
+    fake.terminal = { status: "succeeded", outputCommit: SHA };
+    expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "withheld",
+      approvalReason: "terminal_result_head_mismatch" });
+    expect(fake.result).toEqual(accepted);
+    expect(fake.outcome).toEqual(fake.terminal);
+    expect([fake.outcomeCalls, fake.releaseEffects, fake.occupied]).toEqual([1, 1, false]);
+    expect([fake.evidenceCalls, fake.approvalCalls, fake.approvalEffects]).toEqual([0, 0, 0]);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("success without a valid result never approves (%s)", async (label) => {
     const fake = newFake("accepted", 2_500);
     fake.terminal = { status: "succeeded", outputCommit: SHA };
     attempts.set(fake.prepared.attemptId, fake);
@@ -201,20 +371,37 @@ describe("ReviewFixAttempt durable workflow", () => {
     expect([fake.approvalEffects, fake.releaseEffects]).toEqual([0, 1]);
   }, 20_000);
 
-  it.each(VARIANTS.map(([label]) => label))("an early result waits for exact execution binding before approval (%s)", async (label) => {
-    const fake = newFake("accepted");
-    fake.holdBinding = true;
+  it.each(VARIANTS.map(([label]) => label))("releases at once when the run ends without a result (%s)", async (label) => {
+    // Deadline far away: only the status read can end the wait. The binding gate holds the
+    // attempt until the backend reports terminal, so the first status read sees `ended`.
+    const fake = newFake("accepted", 10 * 60_000);
+    fake.holdBinding = gate("execution binding");
     attempts.set(fake.prepared.attemptId, fake);
     const env = envFor(label);
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.launchEffects === 1);
+    await eventually(() => fake.launchEffects === 1, Boolean, { label: "fake.launchEffects === 1" });
+    expect(fake.occupied).toBe(true);
+    fake.terminal = { status: "succeeded", outputCommit: SHA };
+    fake.holdBinding.release();
+    expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "not_applicable" });
+    expect([fake.approvalEffects, fake.releaseEffects, fake.occupied, fake.result]).toEqual([0, 1, false, null]);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("an early result waits for exact execution binding before approval (%s)", async (label) => {
+    const fake = newFake("accepted");
+    fake.holdBinding = gate("execution binding");
+    attempts.set(fake.prepared.attemptId, fake);
+    const env = envFor(label);
+    const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+      "run", { attemptId: fake.prepared.attemptId });
+    await eventually(() => fake.launchEffects === 1, Boolean, { label: "fake.launchEffects === 1" });
     expect(fake.bound).toBe(false);
     expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake)))
       .toMatchObject({ status: "stored" });
     expect(fake.approvalEffects).toBe(0);
     fake.terminal = { status: "succeeded", outputCommit: SHA };
-    fake.holdBinding = false;
+    fake.holdBinding?.release();
     expect((await done).status).toBe("finalized");
     expect([fake.bound, fake.approvalEffects, fake.launchEffects]).toEqual([true, 1, 1]);
   }, 20_000);
@@ -225,7 +412,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     const env = envFor(label);
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.bound);
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake));
     const duplicate = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake));
     expect(duplicate).toMatchObject({ status: "duplicate" });
@@ -244,10 +431,10 @@ describe("ReviewFixAttempt durable workflow", () => {
     const env = envFor(label);
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.bound);
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "cancel",
       { attemptId: fake.prepared.attemptId });
-    await until(() => fake.cancelCalls > 0);
+    await eventually(() => fake.cancelCalls > 0, Boolean, { label: "fake.cancelCalls > 0" });
     expect([fake.authority, fake.occupied, fake.releaseEffects]).toEqual([false, true, 0]);
     fake.terminal = { status: "cancelled" };
     expect((await done).status).toBe("finalized");
@@ -261,7 +448,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     const run = callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
     void run.catch(() => undefined);
-    await until(() => !fake.authority, 5_000);
+    await eventually(() => !fake.authority, Boolean, { timeoutMs: 5_000, label: "!fake.authority" });
     expect([fake.launchEffects, fake.occupied, fake.releaseEffects]).toEqual([1, true, 0]);
     // Keep the invocation suspended; this fixture has no exact execution to bind.
   }, 10_000);
@@ -277,13 +464,13 @@ describe("ReviewFixAttempt durable workflow", () => {
 
   it.each(VARIANTS.map(([label]) => label))("binding cannot displace a departed owner (%s)", async (label) => {
     const fake = newFake("accepted");
-    fake.holdBinding = true;
+    fake.holdBinding = gate("execution binding");
     attempts.set(fake.prepared.attemptId, fake);
     const done = callWorkflow<ReviewFixAttemptCompletion>(envFor(label).baseUrl(), "ReviewFixAttempt",
       fake.prepared.attemptId, "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.launchEffects === 1);
+    await eventually(() => fake.launchEffects === 1, Boolean, { label: "fake.launchEffects === 1" });
     fake.occupied = false; // another owner won the guarded SQLite binding
-    fake.holdBinding = false;
+    fake.holdBinding?.release();
     expect(await done).toEqual({ status: "not_owner" });
     expect([fake.approvalEffects, fake.releaseEffects]).toEqual([0, 0]);
   }, 20_000);
@@ -302,8 +489,17 @@ describe("ReviewFixAttempt durable workflow", () => {
     expect(metadata).toContain("workflow_completion_retention");
     expect(metadata).toContain("journal_retention");
     expect(metadata).toContain("idempotency_retention");
-    expect(REVIEW_FIX_RETENTION_MS).toBe(604_800_000);
   }, 20_000);
+
+  it("rejects a launch plan that changes the frozen backend", async () => {
+    const fake = newFake("accepted");
+    fake.prepared = { ...fake.prepared, executionBackend: "fly-machines" };
+    attempts.set(fake.prepared.attemptId, fake);
+    const env = environments.values().next().value!;
+    await expect(callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+      "run", { attemptId: fake.prepared.attemptId })).rejects.toThrow();
+    expect(fake.launchEffects).toBe(0);
+  });
 
   it("engine retries a transient store read, then an endpoint and retained sidecar restart resume the same attempt", async () => {
     // This is intentionally outside the disableRetries variant: the failed
@@ -316,29 +512,45 @@ describe("ReviewFixAttempt durable workflow", () => {
       attempts.set(retry.prepared.attemptId, retry);
       const retried = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
         retry.prepared.attemptId, "run", { attemptId: retry.prepared.attemptId });
-      await until(() => retry.bound, 20_000);
-      retry.terminal = { status: "succeeded", outputCommit: SHA };
+      await eventually(() => retry.bound, Boolean, { timeoutMs: 20_000, label: "retry.bound" });
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", retry.prepared.attemptId, "result", resultOf(retry));
+      retry.terminal = { status: "succeeded", outputCommit: SHA };
       expect((await retried).status).toBe("finalized");
       expect([retry.loadCalls, retry.launchEffects, retry.approvalEffects]).toEqual([2, 1, 1]);
 
       const recovering = newFake("accepted", 60_000);
+      recovering.legacyLaunch = true;
+      // Simulate the old validator while writing launch-once, then restore the
+      // deployed validator before replay. The persisted outcome has no backend.
+      const validateLaunch = contract.validateWorkerLaunchOutcome;
+      const legacyValidator = vi.spyOn(contract, "validateWorkerLaunchOutcome").mockImplementationOnce((raw) => {
+        const checked = validateLaunch(raw);
+        if (checked.ok && checked.value.status === "accepted") {
+          const identity = contract.normalizeExecutionIdentity(checked.value.execution);
+          if (identity.backend === "github-actions") return { ok: true, value: {
+            status: "accepted", execution: { githubRunId: identity.githubRunId, githubRunAttempt: identity.githubRunAttempt },
+          } };
+        }
+        return checked;
+      });
       attempts.set(recovering.prepared.attemptId, recovering);
       const originalCall = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
         recovering.prepared.attemptId, "run", { attemptId: recovering.prepared.attemptId });
       void originalCall.catch(() => undefined); // ingress may disconnect during restart
-      await until(() => recovering.bound, 10_000);
+      await eventually(() => recovering.bound, Boolean, { timeoutMs: 10_000, label: "recovering.bound" });
+      legacyValidator.mockRestore();
       replacement = await replaceEndpoint(env, [workflow]);
-      await env.startedRestateContainer.restart(); // same disk-backed container/journal
-      recovering.terminal = { status: "succeeded", outputCommit: SHA };
+      await env.startedRestateServer.restart(); // same disk-backed server/journal
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", recovering.prepared.attemptId,
         "result", resultOf(recovering));
+      recovering.terminal = { status: "succeeded", outputCommit: SHA };
       const attached = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
         recovering.prepared.attemptId);
       expect(attached).toMatchObject({ status: "finalized", approval: "applied" });
       expect([recovering.launchEffects, recovering.approvalEffects, recovering.releaseEffects])
         .toEqual([1, 1, 1]);
     } finally {
+      vi.restoreAllMocks();
       replacement?.close();
       await env.stop();
     }

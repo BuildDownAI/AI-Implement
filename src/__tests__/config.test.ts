@@ -1,67 +1,22 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as ConfigModule from "../config.js";
-import type * as DedupModule from "../dedup.js";
-import type { RepoMapping, ReviewerSelection } from "../config.js";
+import type { ReviewerSelection } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 let dbPath: string;
 let config: typeof ConfigModule;
-let dedup: typeof DedupModule;
 
-// Helper: create a RepoMapping with defaults for new fields
-function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "repo">): RepoMapping {
-  return {
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    referenceRepos: null,
-    reviewers: null,
-    reviewFixLifecycle: null,
-    ...overrides,
-  };
-}
-
+// Left without tables: these tests run initMappingsTable themselves, some over an older schema.
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `config-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  config = await import("../config.js");
-  dedup = await import("../dedup.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  const db = await testDb({ tables: "none", modules: { config: () => import("../config.js") } });
+  dbPath = db.path;
+  ({ config } = db.modules);
 });
 
 describe("config", () => {
-  it("adds a nullable review-fix lifecycle column on fresh and repeated initialization, resolving to Legacy", () => {
+  it("adds a nullable review-fix lifecycle column on fresh and repeated initialization, retained as historical metadata", () => {
     config.initMappingsTable();
     config.initMappingsTable();
     const db = new Database(dbPath);
@@ -74,11 +29,10 @@ describe("config", () => {
       expect(db.prepare("SELECT review_fix_lifecycle FROM mappings WHERE team_key = ?").get("NEW"))
         .toEqual({ review_fix_lifecycle: null });
       expect(config.getMappings().NEW.reviewFixLifecycle).toBeNull();
-      expect(config.resolveReviewFixLifecycle(config.getMappings().NEW)).toBe("legacy");
     } finally { db.close(); }
   });
 
-  it("migrates old mappings twice without enabling Restate or losing stored rows", () => {
+  it("migrates old mappings twice without changing historical metadata or losing rows", () => {
     const db = new Database(dbPath);
     db.exec(`CREATE TABLE mappings (
       team_key TEXT PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL,
@@ -89,6 +43,7 @@ describe("config", () => {
     db.close();
 
     config.initMappingsTable();
+    expect(config.getMappings().LEG.machineCpuKind).toBe("shared");
     config.initMappingsTable();
     const reopened = new Database(dbPath);
     try {
@@ -97,15 +52,18 @@ describe("config", () => {
       expect((reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }> )
         .filter((item) => item.name === "review_fix_lifecycle")).toHaveLength(1);
       expect(config.getMappings().LEG.reviewFixLifecycle).toBeNull();
-      expect(config.resolveReviewFixLifecycle(config.getMappings().LEG)).toBe("legacy");
+      expect(config.getMappings().LEG.machineCpuKind).toBe("shared");
+      expect((reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>)
+        .filter((column) => column.name === "machine_cpu_kind")).toEqual([
+          expect.objectContaining({ type: "TEXT", notnull: 1, dflt_value: "'shared'" }),
+        ]);
     } finally { reopened.close(); }
   });
 
   it("upsertMapping stores and retrieves an explicit review-fix lifecycle", () => {
     config.initMappingsTable();
-    config.upsertMapping("RES", mapping({ owner: "org", repo: "res", reviewFixLifecycle: "restate" }));
+    config.upsertMapping("RES", makeMapping({ owner: "org", repo: "res", reviewFixLifecycle: "restate" }));
     expect(config.getMappings().RES.reviewFixLifecycle).toBe("restate");
-    expect(config.resolveReviewFixLifecycle(config.getMappings().RES)).toBe("restate");
   });
 
   it("initialises an empty mappings table", () => {
@@ -115,7 +73,7 @@ describe("config", () => {
 
   it("upsertMapping stores and retrieves a mapping", () => {
     config.initMappingsTable();
-    config.upsertMapping("APP", mapping({ owner: "my-org", repo: "my-app", maxInProgressAiIssues: 4 }));
+    config.upsertMapping("APP", makeMapping({ owner: "my-org", repo: "my-app", maxInProgressAiIssues: 4 }));
     const mappings = config.getMappings();
     expect(mappings.APP.owner).toBe("my-org");
     expect(mappings.APP.repo).toBe("my-app");
@@ -124,8 +82,8 @@ describe("config", () => {
 
   it("upsertMapping overwrites an existing entry", () => {
     config.initMappingsTable();
-    config.upsertMapping("APP", mapping({ owner: "old", repo: "old-repo", maxInProgressAiIssues: 2 }));
-    config.upsertMapping("APP", mapping({ owner: "new", repo: "new-repo", maxInProgressAiIssues: 5 }));
+    config.upsertMapping("APP", makeMapping({ owner: "old", repo: "old-repo", maxInProgressAiIssues: 2 }));
+    config.upsertMapping("APP", makeMapping({ owner: "new", repo: "new-repo", maxInProgressAiIssues: 5 }));
     const mappings = config.getMappings();
     expect(mappings.APP.owner).toBe("new");
     expect(mappings.APP.maxInProgressAiIssues).toBe(5);
@@ -133,7 +91,7 @@ describe("config", () => {
 
   it("updateMappingCap updates the cap and returns true", () => {
     config.initMappingsTable();
-    config.upsertMapping("APP", mapping({ owner: "org", repo: "app", maxInProgressAiIssues: 2 }));
+    config.upsertMapping("APP", makeMapping({ owner: "org", repo: "app", maxInProgressAiIssues: 2 }));
     expect(config.updateMappingCap("APP", 10)).toBe(true);
     expect(config.getMappings().APP.maxInProgressAiIssues).toBe(10);
   });
@@ -145,7 +103,7 @@ describe("config", () => {
 
   it("deleteMapping removes the entry and returns true", () => {
     config.initMappingsTable();
-    config.upsertMapping("APP", mapping({ owner: "org", repo: "app" }));
+    config.upsertMapping("APP", makeMapping({ owner: "org", repo: "app" }));
     expect(config.deleteMapping("APP")).toBe(true);
     expect(config.getMappings().APP).toBeUndefined();
   });
@@ -176,27 +134,30 @@ describe("config", () => {
 
   it("stores and retrieves v2 machine config fields", () => {
     config.initMappingsTable();
-    config.upsertMapping("FLY", mapping({
+    config.upsertMapping("FLY", makeMapping({
       owner: "org",
       repo: "fly-repo",
       executionMode: "fly-machines",
       sessionMode: "hybrid",
+      machineCpuKind: "performance",
       machineCpus: 4,
       machineMemoryMb: 8192,
     }));
     const m = config.getMappings().FLY;
     expect(m.executionMode).toBe("fly-machines");
     expect(m.sessionMode).toBe("hybrid");
+    expect(m.machineCpuKind).toBe("performance");
     expect(m.machineCpus).toBe(4);
     expect(m.machineMemoryMb).toBe(8192);
   });
 
   it("returns default v2 fields for mappings created without them", () => {
     config.initMappingsTable();
-    config.upsertMapping("DEF", mapping({ owner: "org", repo: "default-repo" }));
+    config.upsertMapping("DEF", makeMapping({ owner: "org", repo: "default-repo" }));
     const m = config.getMappings().DEF;
     expect(m.executionMode).toBe("github-actions");
     expect(m.sessionMode).toBe("autonomous");
+    expect(m.machineCpuKind).toBe("shared");
     expect(m.machineCpus).toBe(2);
     expect(m.machineMemoryMb).toBe(4096);
   });
@@ -220,59 +181,60 @@ describe("config", () => {
     const m = config.getMappings().OLD;
     expect(m.executionMode).toBe("github-actions");
     expect(m.sessionMode).toBe("autonomous");
+    expect(m.machineCpuKind).toBe("shared");
     expect(m.machineCpus).toBe(2);
     expect(m.machineMemoryMb).toBe(4096);
   });
 
   it("stores and retrieves extraEnv", () => {
     config.initMappingsTable();
-    config.upsertMapping("ENV", mapping({ owner: "org", repo: "repo", extraEnv: { FOO: "bar", BAZ: "qux" } }));
+    config.upsertMapping("ENV", makeMapping({ owner: "org", repo: "repo", extraEnv: { FOO: "bar", BAZ: "qux" } }));
     const m = config.getMappings().ENV;
     expect(m.extraEnv).toEqual({ FOO: "bar", BAZ: "qux" });
   });
 
   it("returns empty extraEnv when field is null", () => {
     config.initMappingsTable();
-    config.upsertMapping("ENV2", mapping({ owner: "org", repo: "repo" }));
+    config.upsertMapping("ENV2", makeMapping({ owner: "org", repo: "repo" }));
     const m = config.getMappings().ENV2;
     expect(m.extraEnv).toEqual({});
   });
 
   it("autoApprovePlans round-trips true when upserted", () => {
     config.initMappingsTable();
-    config.upsertMapping("APR", mapping({ owner: "org", repo: "repo", autoApprovePlans: true }));
+    config.upsertMapping("APR", makeMapping({ owner: "org", repo: "repo", autoApprovePlans: true }));
     expect(config.getMappings().APR.autoApprovePlans).toBe(true);
   });
 
   it("autoApprovePlans round-trips false when upserted", () => {
     config.initMappingsTable();
-    config.upsertMapping("APR", mapping({ owner: "org", repo: "repo", autoApprovePlans: false }));
+    config.upsertMapping("APR", makeMapping({ owner: "org", repo: "repo", autoApprovePlans: false }));
     expect(config.getMappings().APR.autoApprovePlans).toBe(false);
   });
 
   it("autoMerge round-trips true when upserted", () => {
     config.initMappingsTable();
-    config.upsertMapping("AMT", mapping({ owner: "org", repo: "repo", autoMerge: true }));
+    config.upsertMapping("AMT", makeMapping({ owner: "org", repo: "repo", autoMerge: true }));
     expect(config.getMappings().AMT.autoMerge).toBe(true);
   });
 
   it("autoMerge round-trips false when upserted", () => {
     config.initMappingsTable();
-    config.upsertMapping("AMF", mapping({ owner: "org", repo: "repo", autoMerge: false }));
+    config.upsertMapping("AMF", makeMapping({ owner: "org", repo: "repo", autoMerge: false }));
     expect(config.getMappings().AMF.autoMerge).toBe(false);
   });
 
   it("planningEnabled round-trips both values", () => {
     config.initMappingsTable();
-    config.upsertMapping("PON", mapping({ owner: "org", repo: "repo", planningEnabled: true }));
+    config.upsertMapping("PON", makeMapping({ owner: "org", repo: "repo", planningEnabled: true }));
     expect(config.getMappings().PON.planningEnabled).toBe(true);
-    config.upsertMapping("POFF", mapping({ owner: "org", repo: "repo", planningEnabled: false }));
+    config.upsertMapping("POFF", makeMapping({ owner: "org", repo: "repo", planningEnabled: false }));
     expect(config.getMappings().POFF.planningEnabled).toBe(false);
   });
 
   it("stores and retrieves provider=bedrock with awsRegion", () => {
     config.initMappingsTable();
-    config.upsertMapping("BED", mapping({
+    config.upsertMapping("BED", makeMapping({
       owner: "org", repo: "repo", provider: "bedrock", awsRegion: "us-west-2",
     }));
     const m = config.getMappings().BED;
@@ -282,7 +244,7 @@ describe("config", () => {
 
   it("defaults to provider=anthropic with null awsRegion when not specified", () => {
     config.initMappingsTable();
-    config.upsertMapping("DEF", mapping({ owner: "org", repo: "repo" }));
+    config.upsertMapping("DEF", makeMapping({ owner: "org", repo: "repo" }));
     const m = config.getMappings().DEF;
     expect(m.provider).toBe("anthropic");
     expect(m.awsRegion).toBeNull();
@@ -359,7 +321,7 @@ describe("config", () => {
     config.initMappingsTable();
     config.upsertMapping(
       "JIR",
-      mapping({
+      makeMapping({
         owner: "org",
         repo: "repo",
         ticketingProvider: "jira",
@@ -372,7 +334,7 @@ describe("config", () => {
 
   it("defaults to ticketingProvider='linear' when not specified", () => {
     config.initMappingsTable();
-    config.upsertMapping("LIN", mapping({ owner: "org", repo: "repo" }));
+    config.upsertMapping("LIN", makeMapping({ owner: "org", repo: "repo" }));
     const m = config.getMappings().LIN;
     expect(m.ticketingProvider).toBe("linear");
   });
@@ -418,7 +380,7 @@ describe("config", () => {
 
     it("round-trips a Jira ticketingConfig", () => {
       config.initMappingsTable();
-      config.upsertMapping("JIR", mapping({
+      config.upsertMapping("JIR", makeMapping({
         owner: "acme",
         repo: "x",
         ticketingProvider: "jira",
@@ -445,8 +407,8 @@ describe("config", () => {
 
     it("drops the mapping from getMappings on malformed JSON in the column", () => {
       config.initMappingsTable();
-      config.upsertMapping("GOOD", mapping({ owner: "org", repo: "good" }));
-      config.upsertMapping("BAD", mapping({ owner: "org", repo: "repo" }));
+      config.upsertMapping("GOOD", makeMapping({ owner: "org", repo: "good" }));
+      config.upsertMapping("BAD", makeMapping({ owner: "org", repo: "repo" }));
       // Direct SQL update to corrupt the JSON.
       const db = new Database(dbPath);
       db.prepare("UPDATE mappings SET ticketing_config = ? WHERE team_key = ?").run("{bad json", "BAD");
@@ -464,7 +426,7 @@ describe("config", () => {
       config.initMappingsTable();
       config.upsertMapping(
         "JIR-BAD",
-        mapping({
+        makeMapping({
           owner: "org",
           repo: "jira-repo",
           ticketingProvider: "jira",
@@ -490,19 +452,19 @@ describe("config", () => {
 
   it("upsertMapping defaults paused to false when not set", () => {
     config.initMappingsTable();
-    config.upsertMapping("PAU", mapping({ owner: "org", repo: "p" }));
+    config.upsertMapping("PAU", makeMapping({ owner: "org", repo: "p" }));
     expect(config.getMappings().PAU.paused).toBe(false);
   });
 
   it("upsertMapping round-trips paused=true", () => {
     config.initMappingsTable();
-    config.upsertMapping("PAU", mapping({ owner: "org", repo: "p", paused: true }));
+    config.upsertMapping("PAU", makeMapping({ owner: "org", repo: "p", paused: true }));
     expect(config.getMappings().PAU.paused).toBe(true);
   });
 
   it("setMappingPaused toggles the column and returns true on success", () => {
     config.initMappingsTable();
-    config.upsertMapping("PAU", mapping({ owner: "org", repo: "p" }));
+    config.upsertMapping("PAU", makeMapping({ owner: "org", repo: "p" }));
     expect(config.setMappingPaused("PAU", true)).toBe(true);
     expect(config.getMappings().PAU.paused).toBe(true);
     expect(config.setMappingPaused("PAU", false)).toBe(true);
@@ -548,8 +510,8 @@ describe("config", () => {
 
   it("round-trips maxTurns, maxIterations, maxJobMinutes (including null)", () => {
     config.initMappingsTable();
-    config.upsertMapping("CAPS", mapping({ owner: "org", repo: "repo", maxTurns: 40, maxIterations: 2, maxJobMinutes: 30 }));
-    config.upsertMapping("NULLS", mapping({ owner: "org", repo: "repo", maxTurns: null, maxIterations: null, maxJobMinutes: null }));
+    config.upsertMapping("CAPS", makeMapping({ owner: "org", repo: "repo", maxTurns: 40, maxIterations: 2, maxJobMinutes: 30 }));
+    config.upsertMapping("NULLS", makeMapping({ owner: "org", repo: "repo", maxTurns: null, maxIterations: null, maxJobMinutes: null }));
 
     const all = config.getMappings();
     expect(all.CAPS.maxTurns).toBe(40);
@@ -562,8 +524,8 @@ describe("config", () => {
 
   it("round-trips prDispatchBudget (including null)", () => {
     config.initMappingsTable();
-    config.upsertMapping("BUDGET", mapping({ owner: "org", repo: "repo", prDispatchBudget: 6 }));
-    config.upsertMapping("NOBUDGET", mapping({ owner: "org", repo: "repo", prDispatchBudget: null }));
+    config.upsertMapping("BUDGET", makeMapping({ owner: "org", repo: "repo", prDispatchBudget: 6 }));
+    config.upsertMapping("NOBUDGET", makeMapping({ owner: "org", repo: "repo", prDispatchBudget: null }));
 
     const all = config.getMappings();
     expect(all.BUDGET.prDispatchBudget).toBe(6);
@@ -609,10 +571,87 @@ describe("config", () => {
     expect(config.DEFAULT_PR_DISPATCH_BUDGET).toBe(4);
   });
 
+  it("round-trips trustedReviewAuthors (including null)", () => {
+    config.initMappingsTable();
+    config.upsertMapping("TRUSTED", makeMapping({ owner: "org", repo: "repo", trustedReviewAuthors: ["codex-reviewer[bot]"] }));
+    config.upsertMapping("UNTRUSTED", makeMapping({ owner: "org", repo: "repo", trustedReviewAuthors: null }));
+
+    const all = config.getMappings();
+    expect(all.TRUSTED.trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+    expect(all.UNTRUSTED.trustedReviewAuthors).toBeNull();
+  });
+
+  it("migrates a pre-existing mappings table to include the trusted_review_authors column, reading back null", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        max_in_progress_ai_issues INTEGER NOT NULL DEFAULT 3,
+        execution_mode TEXT NOT NULL DEFAULT 'github-actions',
+        session_mode TEXT NOT NULL DEFAULT 'autonomous',
+        machine_cpus INTEGER NOT NULL DEFAULT 2,
+        machine_memory_mb INTEGER NOT NULL DEFAULT 4096,
+        planning_enabled INTEGER NOT NULL DEFAULT 0,
+        planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
+        auto_approve_plans INTEGER NOT NULL DEFAULT 1,
+        extra_env TEXT,
+        provider TEXT NOT NULL DEFAULT 'anthropic',
+        ticketing_provider TEXT NOT NULL DEFAULT 'linear',
+        ticketing_config TEXT NOT NULL DEFAULT '{"kind":"linear"}',
+        aws_region TEXT
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.trustedReviewAuthors).toBeNull();
+  });
+
+  it("round-trips reviewProcess and resolves it to a process id", () => {
+    config.initMappingsTable();
+    config.upsertMapping("CCR", makeMapping({ owner: "org", repo: "repo", reviewProcess: "claude-code-review" }));
+    config.upsertMapping("DEF", makeMapping({ owner: "org", repo: "repo", reviewProcess: null }));
+
+    const all = config.getMappings();
+    expect(all.CCR.reviewProcess).toBe("claude-code-review");
+    expect(config.resolveReviewProcessId(all.CCR)).toBe("claude-code-review");
+    expect(all.DEF.reviewProcess).toBeNull();
+    expect(config.resolveReviewProcessId(all.DEF)).toBe("ai-implement");
+  });
+
+  it("resolveReviewProcessId reads an unknown stored string as the default", () => {
+    expect(config.resolveReviewProcessId({ reviewProcess: "future" as never })).toBe("ai-implement");
+  });
+
+  it("migrates a pre-existing mappings table to include the review_process column, reading back null", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.reviewProcess).toBeNull();
+  });
+
   it("round-trips branchPrefix (including null)", () => {
     config.initMappingsTable();
-    config.upsertMapping("PFX", mapping({ owner: "org", repo: "repo", branchPrefix: "pr" }));
-    config.upsertMapping("NOPFX", mapping({ owner: "org", repo: "repo", branchPrefix: null }));
+    config.upsertMapping("PFX", makeMapping({ owner: "org", repo: "repo", branchPrefix: "pr" }));
+    config.upsertMapping("NOPFX", makeMapping({ owner: "org", repo: "repo", branchPrefix: null }));
 
     const all = config.getMappings();
     expect(all.PFX.branchPrefix).toBe("pr");
@@ -645,8 +684,8 @@ describe("config", () => {
 
   it("round-trips skillsRepo (including null)", () => {
     config.initMappingsTable();
-    config.upsertMapping("SR", mapping({ owner: "org", repo: "repo", skillsRepo: "owner/skills" }));
-    config.upsertMapping("NSR", mapping({ owner: "org", repo: "repo", skillsRepo: null }));
+    config.upsertMapping("SR", makeMapping({ owner: "org", repo: "repo", skillsRepo: "owner/skills" }));
+    config.upsertMapping("NSR", makeMapping({ owner: "org", repo: "repo", skillsRepo: null }));
 
     const all = config.getMappings();
     expect(all.SR.skillsRepo).toBe("owner/skills");
@@ -679,12 +718,12 @@ describe("config", () => {
 
   it("round-trips sensitiveAddPatterns and sensitiveAllowPatterns", () => {
     config.initMappingsTable();
-    config.upsertMapping("SAP", mapping({
+    config.upsertMapping("SAP", makeMapping({
       owner: "org", repo: "repo",
       sensitiveAddPatterns: ["*.secrets.toml", "**/.env.local"],
       sensitiveAllowPatterns: [".env", ".env.*"],
     }));
-    config.upsertMapping("SAP_NULL", mapping({
+    config.upsertMapping("SAP_NULL", makeMapping({
       owner: "org", repo: "repo",
       sensitiveAddPatterns: null,
       sensitiveAllowPatterns: null,
@@ -699,14 +738,14 @@ describe("config", () => {
 
   it("round-trips referenceRepos, preserving order and the optional ref", () => {
     config.initMappingsTable();
-    config.upsertMapping("RR", mapping({
+    config.upsertMapping("RR", makeMapping({
       owner: "org", repo: "repo",
       referenceRepos: [
         { repo: "https://github.com/acme/docs", path: "docs-source", ref: "v1.1.0" },
         { repo: "https://github.com/acme/api", path: "api-source" },
       ],
     }));
-    config.upsertMapping("RR_NULL", mapping({ owner: "org", repo: "repo", referenceRepos: null }));
+    config.upsertMapping("RR_NULL", makeMapping({ owner: "org", repo: "repo", referenceRepos: null }));
 
     const all = config.getMappings();
     expect(all.RR.referenceRepos).toEqual([
@@ -718,7 +757,7 @@ describe("config", () => {
 
   it("reads referenceRepos as null when the stored JSON is malformed", () => {
     config.initMappingsTable();
-    config.upsertMapping("RR_BAD", mapping({ owner: "org", repo: "repo" }));
+    config.upsertMapping("RR_BAD", makeMapping({ owner: "org", repo: "repo" }));
 
     const db = new Database(dbPath);
     db.prepare("UPDATE mappings SET reference_repos = ? WHERE team_key = ?").run("{not json", "RR_BAD");
@@ -785,8 +824,8 @@ describe("config", () => {
 
   it("round-trips dependencyTokenScope (including null)", () => {
     config.initMappingsTable();
-    config.upsertMapping("DTS", mapping({ owner: "org", repo: "repo", dependencyTokenScope: "installation" }));
-    config.upsertMapping("DTSNULL", mapping({ owner: "org", repo: "repo", dependencyTokenScope: null }));
+    config.upsertMapping("DTS", makeMapping({ owner: "org", repo: "repo", dependencyTokenScope: "installation" }));
+    config.upsertMapping("DTSNULL", makeMapping({ owner: "org", repo: "repo", dependencyTokenScope: null }));
 
     const all = config.getMappings();
     expect(all.DTS.dependencyTokenScope).toBe("installation");
@@ -850,9 +889,9 @@ describe("config", () => {
       { id: "gap-analysis", gates: false, maxTurns: 45 },
       { id: "custom", gates: true },
     ];
-    config.upsertMapping("REV", mapping({ owner: "org", repo: "repo", reviewers: selection }));
-    config.upsertMapping("REV_NULL", mapping({ owner: "org", repo: "repo", reviewers: null }));
-    config.upsertMapping("REV_EMPTY", mapping({ owner: "org", repo: "repo", reviewers: [] }));
+    config.upsertMapping("REV", makeMapping({ owner: "org", repo: "repo", reviewers: selection }));
+    config.upsertMapping("REV_NULL", makeMapping({ owner: "org", repo: "repo", reviewers: null }));
+    config.upsertMapping("REV_EMPTY", makeMapping({ owner: "org", repo: "repo", reviewers: [] }));
 
     const all = config.getMappings();
     expect(all.REV.reviewers).toEqual(selection);
@@ -864,7 +903,7 @@ describe("config", () => {
 
   it("reads reviewers as null when the stored JSON is malformed", () => {
     config.initMappingsTable();
-    config.upsertMapping("REV_BAD", mapping({ owner: "org", repo: "repo" }));
+    config.upsertMapping("REV_BAD", makeMapping({ owner: "org", repo: "repo" }));
 
     const db = new Database(dbPath);
     db.prepare("UPDATE mappings SET reviewers = ? WHERE team_key = ?").run("{not json", "REV_BAD");

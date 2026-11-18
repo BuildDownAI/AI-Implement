@@ -1,6 +1,7 @@
 import { getDb } from "./dedup.js";
 import type { ProviderId } from "./providers/types.js";
 import type { ReferenceRepo } from "./reference-repos.js";
+import { resolveReviewProcess, type ReviewProcessId } from "./review-process.js";
 import {
   type TicketingMappingConfig,
   validateTicketingConfig,
@@ -25,6 +26,8 @@ export const DEFAULT_PROVIDER: ClaudeProvider = "anthropic";
 const DEFAULT_TICKETING_PROVIDER: ProviderId = "linear";
 
 export interface RepoMapping {
+  /** The mapping's key in `getMappings()`. Not stored or populated by `getMappings()`; `TrackerExport` stamps it so a provider's `listIssuesPage` can name the team without a second lookup. */
+  teamKey?: string;
   owner: string;
   repo: string;
   workflowFile: string;
@@ -32,6 +35,7 @@ export interface RepoMapping {
   maxInProgressAiIssues: number;
   executionMode: ExecutionMode;
   sessionMode: SessionMode;
+  machineCpuKind: "shared" | "performance";
   machineCpus: number;
   machineMemoryMb: number;
   /** Whether to run the planning phase before implementation. Default true. */
@@ -76,12 +80,9 @@ export interface RepoMapping {
   /** Token scope for dependency access. NULL means off (default); "installation" grants read access to all repos the App can see. */
   dependencyTokenScope: "installation" | null;
   /**
-   * Which lifecycle coordinates this project's *automatic GitHub Actions review-fix* runs.
-   * NULL (including an old row predating this column) means Legacy — see
-   * resolveReviewFixLifecycle(). Local review-fix and human comment-triggered runs always
-   * stay on Legacy admission regardless of this setting. Selecting "restate" is validated at
-   * save time (src/admin.ts's upsertMappingAction) and applies only to new attempts; it never
-   * changes the owner of an attempt already in flight.
+   * Historical lifecycle metadata retained for deploy rollback. Mapping saves ignore
+   * this input and preserve the stored value; every mapped run uses Restate.
+   * An attempt already in flight keeps its recorded owner.
    */
   reviewFixLifecycle: "legacy" | "restate" | null;
   /** Memory provider ID for this mapping. NULL means use the orchestrator default (sidecar). JSON-ready text column. */
@@ -94,11 +95,15 @@ export interface RepoMapping {
   reviewers: ReviewerSelection[] | null;
   /** Max gap-fill runs the orchestrator may start on one PR in 24 hours. NULL means use DEFAULT_PR_DISPATCH_BUDGET. Enforced by `canDispatch` (src/dispatch-gate.ts): at the limit the PR is parked and a human is notified — see [AII-757](https://linear.app/eudoxus/issue/AII-757/park-a-pr-at-its-dispatch-budget-and-ask-for-a-human). */
   prDispatchBudget?: number | null;
+  /** Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (`ai-implement`, `ai-implement[bot]`, and the Claude logins — `github-actions[bot]` is trusted separately). NULL means built-ins only. */
+  trustedReviewAuthors?: string[] | null;
+  /** The project's review process (ADR 038). NULL means `ai-implement`; read it through resolveReviewProcessId(). Applies to every project; Restate coordinates AI-Implement fix attempts on every backend. */
+  reviewProcess?: ReviewProcessId | null;
 }
 
 /** Which reviewers run on this project's PRs, and which of them may hold a merge. */
 export interface ReviewerSelection {
-  /** Reviewer id. Built-ins are "gap-analysis" and "code-review". */
+  /** Reviewer id. Built-ins are "gap-analysis", "code-review", and "integration-review". */
   id: string;
   /** false runs the reviewer and shows its findings without ever blocking a merge. */
   gates: boolean;
@@ -132,15 +137,11 @@ export function resolvePrDispatchBudget(mapping: { prDispatchBudget?: number | n
   return mapping.prDispatchBudget ?? DEFAULT_PR_DISPATCH_BUDGET;
 }
 
-/**
- * Resolves a mapping's stored review-fix lifecycle, applying the NULL-means-default rule:
- * NULL (or an old row that predates the column) resolves to "legacy", mirroring
- * resolveReviewerSelection() above.
- */
-export function resolveReviewFixLifecycle(
-  mapping: Pick<RepoMapping, "reviewFixLifecycle">,
-): "legacy" | "restate" {
-  return mapping.reviewFixLifecycle ?? "legacy";
+/** Resolves a mapping's stored review process id; NULL or an unknown value resolves to `ai-implement`. */
+export function resolveReviewProcessId(
+  mapping: Pick<RepoMapping, "reviewProcess">,
+): ReviewProcessId {
+  return resolveReviewProcess(mapping.reviewProcess).id;
 }
 
 // Seed mappings are only applied on first run (empty DB).
@@ -166,6 +167,9 @@ function ensureMappingsColumns(): void {
   }
   if (!names.has("session_mode")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN session_mode TEXT NOT NULL DEFAULT '${DEFAULT_SESSION_MODE}'`);
+  }
+  if (!names.has("machine_cpu_kind")) {
+    db.exec("ALTER TABLE mappings ADD COLUMN machine_cpu_kind TEXT NOT NULL DEFAULT 'shared'");
   }
   if (!names.has("machine_cpus")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN machine_cpus INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_CPUS}`);
@@ -247,6 +251,16 @@ function ensureMappingsColumns(): void {
   if (!names.has("review_fix_lifecycle")) {
     db.exec("ALTER TABLE mappings ADD COLUMN review_fix_lifecycle TEXT");
   }
+  if (!names.has("trusted_review_authors")) {
+    // NULL means built-ins only (ai-implement, ai-implement[bot], and the Claude
+    // logins — github-actions[bot] is trusted separately) — this list is additive,
+    // not a replacement.
+    db.exec(`ALTER TABLE mappings ADD COLUMN trusted_review_authors TEXT`);
+  }
+  if (!names.has("review_process")) {
+    // NULL means `ai-implement` (the default process); no backfill.
+    db.exec(`ALTER TABLE mappings ADD COLUMN review_process TEXT`);
+  }
 }
 
 export function initMappingsTable(): void {
@@ -261,6 +275,7 @@ export function initMappingsTable(): void {
       max_in_progress_ai_issues INTEGER NOT NULL DEFAULT ${DEFAULT_MAX_IN_PROGRESS_AI_ISSUES},
       execution_mode TEXT NOT NULL DEFAULT '${DEFAULT_EXECUTION_MODE}',
       session_mode TEXT NOT NULL DEFAULT '${DEFAULT_SESSION_MODE}',
+      machine_cpu_kind TEXT NOT NULL DEFAULT 'shared',
       machine_cpus INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_CPUS},
       machine_memory_mb INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_MEMORY_MB},
       planning_enabled INTEGER NOT NULL DEFAULT 1,
@@ -287,7 +302,12 @@ export function initMappingsTable(): void {
       -- gating), not an empty list — see resolveReviewerSelection().
       reviewers TEXT,
       pr_dispatch_budget INTEGER,
-      review_fix_lifecycle TEXT
+      review_fix_lifecycle TEXT,
+      -- NULL means built-ins only (ai-implement, ai-implement[bot], and the
+      -- Claude logins — github-actions[bot] is trusted separately) — this
+      -- list is additive, not a replacement.
+      trusted_review_authors TEXT,
+      review_process TEXT
     )
   `);
   ensureMappingsColumns();
@@ -296,10 +316,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId, m.reviewers ? JSON.stringify(m.reviewers) : null, m.prDispatchBudget ?? null, m.reviewFixLifecycle);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpuKind, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId, m.reviewers ? JSON.stringify(m.reviewers) : null, m.prDispatchBudget ?? null, m.reviewFixLifecycle, m.trustedReviewAuthors ? JSON.stringify(m.trustedReviewAuthors) : null, m.reviewProcess ?? null);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -308,7 +328,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -319,6 +339,7 @@ export function getMappings(): Record<string, RepoMapping> {
       max_in_progress_ai_issues: number;
       execution_mode: string;
       session_mode: string;
+      machine_cpu_kind: "shared" | "performance";
       machine_cpus: number;
       machine_memory_mb: number;
       planning_enabled: number;
@@ -344,6 +365,8 @@ export function getMappings(): Record<string, RepoMapping> {
       reviewers: string | null;
       pr_dispatch_budget: number | null;
       review_fix_lifecycle: string | null;
+      trusted_review_authors: string | null;
+      review_process: string | null;
     }>;
 
   const result: Record<string, RepoMapping> = {};
@@ -366,6 +389,7 @@ export function getMappings(): Record<string, RepoMapping> {
       maxInProgressAiIssues: row.max_in_progress_ai_issues ?? DEFAULT_MAX_IN_PROGRESS_AI_ISSUES,
       executionMode: (row.execution_mode as ExecutionMode) ?? DEFAULT_EXECUTION_MODE,
       sessionMode: (row.session_mode as SessionMode) ?? DEFAULT_SESSION_MODE,
+      machineCpuKind: row.machine_cpu_kind ?? "shared",
       machineCpus: row.machine_cpus ?? DEFAULT_MACHINE_CPUS,
       machineMemoryMb: row.machine_memory_mb ?? DEFAULT_MACHINE_MEMORY_MB,
       planningEnabled: Boolean(row.planning_enabled ?? DEFAULT_PLANNING_ENABLED),
@@ -391,6 +415,8 @@ export function getMappings(): Record<string, RepoMapping> {
       reviewers: (() => { try { return row.reviewers ? JSON.parse(row.reviewers) as ReviewerSelection[] : null; } catch { return null; } })(),
       prDispatchBudget: row.pr_dispatch_budget,
       reviewFixLifecycle: row.review_fix_lifecycle as "legacy" | "restate" | null,
+      trustedReviewAuthors: (() => { try { return row.trusted_review_authors ? JSON.parse(row.trusted_review_authors) as string[] : null; } catch { return null; } })(),
+      reviewProcess: row.review_process as ReviewProcessId | null,
     };
   }
   return result;
@@ -399,7 +425,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -410,6 +436,7 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.maxInProgressAiIssues,
       mapping.executionMode,
       mapping.sessionMode,
+      mapping.machineCpuKind,
       mapping.machineCpus,
       mapping.machineMemoryMb,
       mapping.planningEnabled ? 1 : 0,
@@ -435,6 +462,8 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.reviewers ? JSON.stringify(mapping.reviewers) : null,
       mapping.prDispatchBudget ?? null,
       mapping.reviewFixLifecycle,
+      mapping.trustedReviewAuthors ? JSON.stringify(mapping.trustedReviewAuthors) : null,
+      mapping.reviewProcess ?? null,
     );
 }
 

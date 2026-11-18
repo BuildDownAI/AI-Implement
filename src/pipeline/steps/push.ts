@@ -1,6 +1,8 @@
+import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary, openOrFindPullRequest, PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
+import { recordPushedCommits } from "../job-accounting.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
 import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
@@ -9,6 +11,7 @@ import { classifyGitFailure, envSecrets, oneLinerMessage, type FailureRecord } f
 import { computeBackoffMs, normalizeRetryPolicy, sleepAsync } from "../retry-backoff.js";
 import { dependenciesMissing } from "../pipeline-loader.js";
 import { neutralizeFences } from "../../completion-classification.js";
+import { formatPassRow, STATS_TABLE_DIVIDER, STATS_TABLE_HEADER, type StatsPass } from "../../run-autopsy.js";
 
 // Waits between ls-remote attempts (attempts = delays + 1). A freshly minted installation
 // token is not accepted by git over HTTPS for a few seconds (AII-936), so a refreshed
@@ -22,16 +25,7 @@ export interface ReviewSummary extends Record<string, unknown> {
   terminationReason: string;
   iterations: number;
   finalFeedback: string;
-  passes: Array<{
-    iteration: number;
-    implementTurns: number | null;
-    implementOutcome: string;
-    costUsd: number | null;
-    reviewApproved: boolean | null;
-    attempts?: number;
-    reviewAttempts?: number;
-    reviewCostUsd?: number | null;
-  }>;
+  passes: Array<StatsPass & { reviewAttempts?: number }>;
   postMortem?: string;
 }
 
@@ -88,6 +82,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       // so a push would sweep their in-progress work into the commit. Changes are
       // left in the mount for inspection with `git diff`; shipping them is the
       // user's call. Skip push and PR creation.
+      recordPushedCommits([]);
       return { prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false };
     }
 
@@ -118,12 +113,17 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       "git checkout",
     );
 
+    if (hasWorkingTreeChanges(workspaceDir, githubToken)) {
+      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+    }
+    removeScratchFromIndex(workspaceDir);
     const hasWTChanges = hasWorkingTreeChanges(workspaceDir, githubToken);
     // Only check commits-ahead when working tree is clean: if there ARE working-tree changes
     // we always take the standard add→commit path regardless of prior commits.
     const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseRef, githubToken);
 
     if (!hasWTChanges && !agentCommitted) {
+      recordPushedCommits([]);
       if (existingPrNumber) {
         return {
           prUrl: null,
@@ -152,8 +152,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
 
     let commitSha: string | null;
     if (hasWTChanges) {
-      // Standard path: stage all changes → sensitive-file guard → commit.
-      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+      // Standard path: changes are staged and scratch removed before change detection.
       // --diff-filter=d excludes staged deletions: removing an accidentally-committed
       // secret (e.g. deleting a .env) is exactly what the guard wants to allow.
       const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only", "--diff-filter=d"], {
@@ -465,7 +464,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       // long as attempts remain.
       if (attempt >= maxPushAttempts) {
         // Exhausted retries get their own code and are never retryable — an
-        // orchestrator rail keying off `retryable` must not re-dispatch a run that
+        // orchestrator rail keying off `retryable` must not start a run again that
         // already spent its whole push-retry budget. `category` stays "transient"
         // since that is still the accurate classification of what happened.
         const exhaustedSuffix = ` (exhausted after ${attempt} attempt${attempt === 1 ? "" : "s"})`;
@@ -531,6 +530,11 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       }
       attempt++;
     }
+
+    // The push landed: report the SHAs this job published, oldest first (AII-1562). baseRef is the
+    // clone-time commit, or on a gap-fill the PR branch tip the run started from.
+    const pushedShas = listPushedCommits(workspaceDir, baseRef);
+    if (pushedShas) recordPushedCommits(pushedShas);
 
     if (existingPrNumber) {
       return {
@@ -618,6 +622,7 @@ function buildPullRequestBody(
   // A provider outage is not a review verdict — the reviewer may never have run, so this
   // fallback must not claim the review loop rejected the change (BAC-27201).
   const providerUnavailableForTestsSummary = inputs.reviewSummary?.terminationReason === "provider_unavailable";
+  const verifyFailedForTestsSummary = inputs.reviewSummary?.terminationReason === "verify_failed";
   // A failed install (after the retry) is a more specific reason than a review rejection —
   // preflight/verify never ran either way, but the install failure is the actual cause.
   const testsSummary = dependenciesFailed
@@ -628,8 +633,10 @@ function buildPullRequestBody(
       explicitTestsSummary ??
       (inputs.reviewSummary
         ? providerUnavailableForTestsSummary
-          ? "Automated verification was skipped — the model provider was unavailable and the run was interrupted."
-          : "Automated verification was skipped — the review loop did not approve this change."
+          ? "Automated verification was skipped — the AI service was not available and the run was interrupted."
+          : verifyFailedForTestsSummary
+            ? "Automated verification ran and failed — the repository's verify hook did not pass."
+            : "Automated verification was skipped — the review loop did not approve this change."
         : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
   const testsSummaryChecked = dependenciesFailed ? false : explicitTestsSummary != null || !inputs.reviewSummary;
 
@@ -640,6 +647,12 @@ function buildPullRequestBody(
       )
     : null;
   const unapprovedSection = buildUnapprovedSection(inputs.reviewSummary as ReviewSummary | undefined, inputs.draft === true);
+
+  // A configured run names the implementation stage's harness and provider; the context `provider`
+  // is a narrowed legacy label (anthropic | bedrock) and would show `openai` as anthropic.
+  const implementationStage = context.data.agentConfig?.stages.implementation;
+  const footerHarness = implementationStage ? (implementationStage.agent === "codex" ? "Codex" : "Claude Code") : "Claude Code";
+  const footerProvider = implementationStage?.provider ?? context.data.provider ?? "anthropic";
 
   return [
     ...(dependencyInstallSection ? [dependencyInstallSection, ""] : []),
@@ -654,14 +667,23 @@ function buildPullRequestBody(
     "",
     "## Test plan",
     `- [${testsSummaryChecked ? "x" : " "}] ${testsSummary}`,
+    // Blank line first: a non-blank line right after a list item is a lazy continuation in GFM
+    // and would render on the checkbox line itself.
+    "",
+    TEST_VERDICT_SENTENCE,
+    "",
     ...(retrySucceeded ? ["- [x] Initial dependency install failed; it succeeded after this change."] : []),
     "- [ ] Manual: review the changed behavior against the ticket acceptance criteria.",
     "",
     `Fixes ${issueIdentifier}`,
     "",
-    `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
+    `Generated with AI-Implement · harness: ${footerHarness} · model: ${context.data.model ?? "unknown"} · provider: ${footerProvider}`,
   ].join("\n");
 }
+
+/** Plain text under the Test plan checkbox: CI, not the runner's preflight line, is the verdict. */
+const TEST_VERDICT_SENTENCE =
+  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push report.";
 
 /**
  * Leads the PR body (before the unapproved section, per the "why first" rationale:
@@ -683,38 +705,36 @@ function buildDependencyInstallSection(installMethod: string, installError: stri
 
 function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boolean): string | null {
   if (!summary) return null;
-  const passRows = summary.passes
-    .map((p) => {
-      // Pattern anchor: statsFromFeedbackLoop (src/report-card.ts) — a pass's cost is
-      // implement + in-loop review, not implement alone (BAC-27201).
-      const passCost = p.costUsd != null || p.reviewCostUsd != null ? (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0) : null;
-      const cost = passCost != null ? `$${passCost.toFixed(2)}` : "—";
-      const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
-    })
-    .join("\n");
+  const passRows = summary.passes.map(p => formatPassRow(p)).join("\n");
   // A provider outage is not a review verdict: the reviewer may never have run, so the
   // heading, the sentence and the feedback label must not claim it rejected anything.
   const providerUnavailable = summary.terminationReason === "provider_unavailable";
+  // A failing verify hook is not a review verdict either: the review never examined the last pass.
+  const verifyFailed = summary.terminationReason === "verify_failed";
   return [
-    providerUnavailable ? "## 🟠 The model provider was unavailable during this run" : "## ⚠️ Automated review did not approve",
+    verifyFailed
+      ? "## ⚠️ The verify hook failed"
+      : providerUnavailable ? "## 🟠 The AI service was not available during this run" : "## ⚠️ Automated review did not approve",
     "",
-    providerUnavailable
-      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the model provider was unavailable and the AI-Implement loop stopped after ${summary.iterations} iteration(s); the work completed so far is preserved here and was not reviewed.`
+    verifyFailed
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the repository's verify hook still failed after ${summary.iterations} iteration(s); the review did not examine the last pass.`
+      : providerUnavailable
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI service was not available and the AI-Implement loop stopped after ${summary.iterations} iteration(s); the work completed so far is preserved here and was not reviewed.`
       : `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
     "",
-    providerUnavailable ? "**Run notes:**" : "**Reviewer's final feedback:**",
+    verifyFailed ? "**Verify hook result:**" : providerUnavailable ? "**Run notes:**" : "**Reviewer's final feedback:**",
     "",
     ...summary.finalFeedback.split("\n").map((l) => `> ${l}`),
     "",
     "**Run stats:**",
     "",
-    "| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |",
-    "|---|---|---|---|---|---|",
+    STATS_TABLE_HEADER,
+    STATS_TABLE_DIVIDER,
     passRows,
     ...(summary.postMortem ? ["", "<details><summary><strong>Post-mortem</strong></summary>", "", summary.postMortem, "", "</details>"] : []),
     "",
-    providerUnavailable ? "_Preflight and verify hooks were skipped because the run was interrupted._" : "_Preflight and verify hooks were skipped for this unapproved run._",
+    // The verify hook runs inside the feedback loop, so only preflight is skipped here.
+    providerUnavailable ? "_Preflight was skipped because the run was interrupted._" : "_Preflight was skipped for this unapproved run._",
   ].join("\n");
 }
 
@@ -950,6 +970,16 @@ function hasWorkingTreeChanges(workspaceDir: string, githubToken: string): boole
     throw new Error(`git status failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
   return result.stdout.toString().trim().length > 0;
+}
+
+/** `git rev-list --reverse <baseRef>..HEAD`; null when git cannot answer (the list is then unknown, not empty). */
+function listPushedCommits(workspaceDir: string, baseRef: string): string[] | null {
+  const result = spawnSync("git", ["rev-list", "--reverse", `${baseRef}..HEAD`], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) return null;
+  return result.stdout.toString().split("\n").map((l) => l.trim()).filter(Boolean);
 }
 
 function resolveCommitSha(workspaceDir: string): string | null {

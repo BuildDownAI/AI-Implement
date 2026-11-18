@@ -117,12 +117,10 @@ export async function handlePublicationTokenRequest(
 }
 
 function publicationExecution(input: HandlePublicationTokenInput): {
-  repository: string; githubRunId: number; githubRunAttempt: number;
+  repository: string; githubRunId?: number; githubRunAttempt?: number;
 } | null {
-  if (!input.repository?.match(/^[^/\s]+\/[^/\s]+$/)
-    || !Number.isSafeInteger(input.githubRunId) || (input.githubRunId ?? 0) <= 0
-    || !Number.isSafeInteger(input.githubRunAttempt) || (input.githubRunAttempt ?? 0) <= 0) return null;
-  return { repository: input.repository, githubRunId: input.githubRunId!, githubRunAttempt: input.githubRunAttempt! };
+  if (!input.repository?.match(/^[^/\s]+\/[^/\s]+$/)) return null;
+  return { repository: input.repository, githubRunId: input.githubRunId, githubRunAttempt: input.githubRunAttempt };
 }
 
 /** Recheck current pilot authority before each external write, including later

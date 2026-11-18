@@ -1,15 +1,15 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import http from "node:http";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as DeployNotifyModule from "../deploy-notify.js";
 import type * as NotifyModule from "../notify.js";
 import type * as KgProviderModule from "../kg-provider.js";
+import { testDb } from "./helpers/test-db.js";
 
 // The formatters are covered by notify.test.ts; here we only care that the right
 // payload reaches them, so the whole notify module is replaced by a spy.
-vi.mock("../notify.js", () => ({ notifyDeploy: vi.fn() }));
+vi.mock("../notify.js", () => ({ notifyDeploy: vi.fn(), notifyKgRecovery: vi.fn() }));
 
 const IMAGE_A = "registry.fly.io/orch:deployment-AAA";
 const IMAGE_B = "registry.fly.io/orch:deployment-BBB";
@@ -20,29 +20,27 @@ const SIDECAR = "http://127.0.0.1:8765";
 
 const config = { notifyType: "slack", notifyWebhookUrl: "https://hook.example.com", kgSidecarUrl: SIDECAR };
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let deployNotify: typeof DeployNotifyModule;
 let notify: typeof NotifyModule;
 let kgProvider: typeof KgProviderModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `deploy-notify-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  const runnerMode = await import("../runner-mode.js");
-  runnerMode.initSettingsTable();
-  deployNotify = await import("../deploy-notify.js");
-  notify = await import("../notify.js");
-  kgProvider = await import("../kg-provider.js");
+  ({ dedup, deployNotify, notify, kgProvider } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        deployNotify: () => import("../deploy-notify.js"),
+        notify: () => import("../notify.js"),
+        kgProvider: () => import("../kg-provider.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
   vi.unstubAllEnvs();
   vi.clearAllMocks();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 /** Puts the process in "running as a Fly Machine on this image" state. */
@@ -122,69 +120,52 @@ describe("recordShutdown", () => {
   });
 });
 
-describe("decideDeployOutcome", () => {
-  const base: DeployNotifyModule.DeployOutcomeInput = {
-    holdWasSet: true,
-    prevImageRef: IMAGE_A,
-    currentImageRef: IMAGE_B,
-    kgSidecarUrl: SIDECAR,
-    sidecarProbeError: null,
-    commit: "abc1234",
-    now: 1_700_000_000_000,
-  };
-
-  it("is null when no hold was set — nothing was deploying", () => {
-    expect(deployNotify.decideDeployOutcome({ ...base, holdWasSet: false })).toBeNull();
+describe("outcomeFromDeployRecord and onSelfDeployOutcome", () => {
+  const record = (phase: "succeeded" | "failed" | "cancelled", reason: "drain-timeout" | "apply-failed" | "verify-timeout" | null = null) => ({
+    deployId: "d1",
+    phase,
+    target: { repo: "owner/repo", branch: "testing" as const, commit: "abc1234def", image: "registry.fly.io/app:testing-abc1234", source: "published" as const },
+    requestedBy: "admin@example.com",
+    startedAt: 1_700_000_000_000,
+    finishedAt: 1_700_000_100_000,
+    reason,
   });
 
-  it("is null on a fresh volume, where a replacement cannot be distinguished from a first boot", () => {
-    expect(deployNotify.decideDeployOutcome({ ...base, prevImageRef: null })).toBeNull();
+  it("maps succeeded to deployed-ok", () => {
+    expect(deployNotify.outcomeFromDeployRecord(record("succeeded"))).toEqual({ kind: "deployed-ok", commit: "abc1234def", timestamp: 1_700_000_100_000 });
   });
 
-  it("is null when the image is unchanged — a crash and restart, not a release", () => {
-    expect(deployNotify.decideDeployOutcome({ ...base, currentImageRef: IMAGE_A })).toBeNull();
-  });
-
-  it("is deployed-ok when the sidecar URL is present and the probe succeeded", () => {
-    expect(deployNotify.decideDeployOutcome(base)).toEqual({
-      kind: "deployed-ok",
-      commit: "abc1234",
-      timestamp: 1_700_000_000_000,
+  it("maps a failed record to deploy-failed with the reason code as detail", () => {
+    expect(deployNotify.outcomeFromDeployRecord(record("failed", "drain-timeout"))).toEqual({
+      kind: "deploy-failed", commit: "abc1234def", timestamp: 1_700_000_100_000, detail: "drain-timeout",
     });
   });
 
-  // The entrypoint exports KG_SIDECAR_URL only after the sidecar answers, so an absent
-  // value means the image shipped without one — the failure this whole outcome exists for.
-  it("is deployed-not-serving when the sidecar URL is absent, and says why", () => {
-    const outcome = deployNotify.decideDeployOutcome({ ...base, kgSidecarUrl: null });
-    expect(outcome).toMatchObject({ kind: "deployed-not-serving", commit: "abc1234" });
-    expect(outcome?.detail).toContain("sidecar");
+  it("maps cancelled to deploy-cancelled", () => {
+    expect(deployNotify.outcomeFromDeployRecord(record("cancelled"))).toMatchObject({ kind: "deploy-cancelled" });
   });
 
-  // AII-648: the sidecar can come up (KG_SIDECAR_URL set) and still not serve — the
-  // liveness probe is what tells the difference the URL alone cannot.
-  it("is deployed-not-serving when the sidecar URL is present but the liveness probe failed", () => {
-    const outcome = deployNotify.decideDeployOutcome({
-      ...base,
-      sidecarProbeError: "tools/list is missing: kg_neighbors",
-    });
-    expect(outcome).toEqual({
-      kind: "deployed-not-serving",
-      commit: "abc1234",
-      timestamp: 1_700_000_000_000,
-      detail: "KG sidecar liveness probe failed: tools/list is missing: kg_neighbors",
-    });
+  it("stores the outcome and announces a failure", async () => {
+    await deployNotify.onSelfDeployOutcome(config, record("failed", "drain-timeout"));
+    expect(deployNotify.getDeployOutcome()).toMatchObject({ kind: "deploy-failed", detail: "drain-timeout" });
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kind: "deploy-failed", detail: "drain-timeout", commit: "abc1234def" });
   });
 
-  it("does not confuse a probe failure's detail with the sidecar-absent detail", () => {
-    const probeFailed = deployNotify.decideDeployOutcome({ ...base, sidecarProbeError: "connection refused" });
-    const absent = deployNotify.decideDeployOutcome({ ...base, kgSidecarUrl: null });
-    expect(probeFailed?.detail).not.toEqual(absent?.detail);
-    expect(absent?.detail).toBe("KG sidecar did not start");
+  it("stores a success without a notice, since the new process's boot notice announces it", async () => {
+    await deployNotify.onSelfDeployOutcome(config, record("succeeded"));
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
   });
 
-  it("carries a null commit through rather than inventing one", () => {
-    expect(deployNotify.decideDeployOutcome({ ...base, commit: null })?.commit).toBeNull();
+  it("never throws when the webhook fails, so the object does not retry and repeat the notice", async () => {
+    vi.mocked(notify.notifyDeploy).mockRejectedValueOnce(new Error("boom"));
+    await expect(deployNotify.onSelfDeployOutcome(config, record("cancelled"))).resolves.toBeUndefined();
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deploy-cancelled");
+  });
+
+  it("no longer exports the boot-time guess", () => {
+    expect("decideDeployOutcome" in deployNotify).toBe(false);
   });
 });
 
@@ -301,91 +282,23 @@ describe("postBootNotice", () => {
     expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ downtimeMs: null });
   });
 
-  // ---------- Hold-aware outcome recording ----------
-  // The branch table is decideDeployOutcome's; these cover the wiring around it —
-  // where each input comes from, and that the record lands independently of the webhook.
-
-  it("records deployed-ok, taking the commit from the build stamp", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_B);
-    vi.stubEnv("AI_IMPLEMENT_SOURCE_COMMIT", "abc1234");
-
-    await deployNotify.postBootNotice(config, { holdWasSet: true });
-
-    const outcome = deployNotify.getDeployOutcome();
-    expect(outcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234" });
-    expect(typeof outcome?.timestamp).toBe("number");
-  });
-
-  it("records deployed-not-serving when the config carries no sidecar URL", async () => {
+  // The outcome now comes from the SelfDeploy object, not from a guess at boot.
+  it("records no deploy outcome at boot, even when the image changed", async () => {
     writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
     onFly(IMAGE_B);
 
-    await deployNotify.postBootNotice({ ...config, kgSidecarUrl: null }, { holdWasSet: true });
-
-    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-not-serving");
-  });
-
-  // AII-648: the sidecar liveness probe result reaches decideDeployOutcome through opts,
-  // not through config — postBootNotice must thread it through rather than defaulting
-  // to "ok" whenever the caller doesn't pass it.
-  it("records deployed-not-serving when the sidecar URL is set but the probe failed", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_B);
-
-    await deployNotify.postBootNotice(config, { holdWasSet: true, sidecarProbeError: "tools/list rejected: 400" });
-
-    const outcome = deployNotify.getDeployOutcome();
-    expect(outcome?.kind).toBe("deployed-not-serving");
-    expect(outcome?.detail).toBe("KG sidecar liveness probe failed: tools/list rejected: 400");
-  });
-
-  it("records deployed-ok when the sidecar URL is set and no probe error is passed", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_B);
-
-    await deployNotify.postBootNotice(config, { holdWasSet: true });
-
-    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
-  });
-
-  it("records nothing when no hold was set", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_B);
-
-    await deployNotify.postBootNotice(config, { holdWasSet: false });
+    await deployNotify.postBootNotice(config);
 
     expect(deployNotify.getDeployOutcome()).toBeNull();
+    expect(readKey(LAST_IMAGE_REF_KEY)).toBe(IMAGE_B);
   });
 
-  it("records a null commit when the image carries no build stamp", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_B);
-    delete process.env.AI_IMPLEMENT_SOURCE_COMMIT;
-
-    await deployNotify.postBootNotice(config, { holdWasSet: true });
-
-    expect(deployNotify.getDeployOutcome()?.commit).toBeNull();
-  });
-
-  // The point of the record: a deployment with no webhook still learns how its deploy went.
-  it("records the outcome with no webhook configured, and posts nothing", async () => {
+  it("sends exactly one webhook notification", async () => {
     writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
     onFly(IMAGE_B);
 
-    await deployNotify.postBootNotice({ ...config, notifyWebhookUrl: null }, { holdWasSet: true });
+    await deployNotify.postBootNotice(config);
 
-    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
-    expect(notify.notifyDeploy).not.toHaveBeenCalled();
-  });
-
-  it("sends exactly one webhook notification alongside the record", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_B);
-
-    await deployNotify.postBootNotice(config, { holdWasSet: true });
-
-    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
     expect(notify.notifyDeploy).toHaveBeenCalledOnce();
     expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kind: "deployed" });
   });
@@ -609,5 +522,116 @@ describe("recordDeployOutcome / getDeployOutcome", () => {
       .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
       .run(DEPLOY_OUTCOME_KEY, "not-json{");
     expect(deployNotify.getDeployOutcome()).toBeNull();
+  });
+});
+
+
+describe("boot KG warm-up", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    kgProvider.sidecarHealth.lastError = "KG sidecar request timed out after 10000ms";
+    kgProvider.sidecarHealth.checkedAt = Date.now();
+  });
+  afterEach(() => vi.useRealTimers());
+  const health = (lastError: string | null) => ({ reachable: !lastError, toolsListed: !lastError, lastError, checkedAt: Date.now() });
+
+  it.each(["Error executing tool kg_neighbors: bad token", ""])("runs remote warm-up to its deadline without any store calls for %j", async (message) => {
+    vi.stubEnv("KG_BACKEND", "stardog_run");
+    const { probeKgSidecarAfterBoot } = await import("../restate/kg-sidecar-health.js");
+    const methods: string[] = [];
+    const request = vi.spyOn(http, "request").mockImplementation(((_options: unknown, cb: (res: unknown) => void) => {
+      const req = new PassThrough();
+      req.on("data", body => {
+        const method = JSON.parse(body.toString()).method;
+        methods.push(method);
+        const res = new PassThrough();
+        Object.assign(res, { statusCode: 200, headers: { "content-type": "application/json" } });
+        cb(res);
+        res.end(JSON.stringify(method === "tools/call"
+          ? { result: { isError: true, content: [{ type: "text", text: message }] } }
+          : { result: { tools: Object.keys(kgProvider.KG_TOOL_CAPABILITY).map(name => ({ name })) } }));
+      });
+      return req;
+    }) as never);
+    try {
+      const provider = new kgProvider.SidecarMemoryProvider(SIDECAR, async () => "https://kg.example.test/");
+      const boot = provider.probe();
+      await vi.advanceTimersByTimeAsync(0);
+      expect((await boot).lastError).toBe(message);
+      methods.length = 0;
+      const posted = deployNotify.postBootNotice(config, {
+        probe: remaining => probeKgSidecarAfterBoot(provider, remaining), retryMs: 5, deadlineMs: 16,
+      });
+      await vi.advanceTimersByTimeAsync(16);
+      await posted;
+      expect(methods).toEqual(["tools/list", "tools/list", "tools/list"]);
+      expect(methods.filter(method => method === "tools/call")).toHaveLength(0);
+      expect(kgProvider.sidecarHealth.lastError).toBe(message);
+      expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgUnavailable: true, sidecarError: message });
+    } finally { request.mockRestore(); }
+  });
+
+  it("uses a full post-boot probe for a local store", async () => {
+    vi.stubEnv("KG_BACKEND", "local");
+    const { probeKgSidecarAfterBoot } = await import("../restate/kg-sidecar-health.js");
+    const provider = new kgProvider.SidecarMemoryProvider(SIDECAR);
+    const probe = vi.spyOn(provider, "probe").mockResolvedValue(health(null));
+    await probeKgSidecarAfterBoot(provider, 100);
+    expect(probe).toHaveBeenCalledWith("full");
+  });
+
+  it("waits for a passing re-probe and omits the warning", async () => {
+    const probe = vi.fn(async () => health(null));
+    const posted = deployNotify.postBootNotice(config, { probe, retryMs: 5, deadlineMs: 20 });
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5);
+    await posted;
+    expect(probe).toHaveBeenCalledOnce();
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgUnavailable: false, sidecarError: null });
+    expect(deployNotify.hasKgRecoveryNotice()).toBe(false);
+  });
+
+  it("posts the last failure at the deadline, then recovers only once", async () => {
+    let calls = 0;
+    const probe = vi.fn(async () => health(`failure ${++calls}`));
+    const posted = deployNotify.postBootNotice(config, { probe, retryMs: 5, deadlineMs: 16 });
+    await vi.advanceTimersByTimeAsync(16);
+    await posted;
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgUnavailable: true, sidecarError: "failure 3" });
+    await deployNotify.postKgRecoveryNotice();
+    await deployNotify.postKgRecoveryNotice();
+    expect(notify.notifyKgRecovery).toHaveBeenCalledOnce();
+  });
+
+  it("uses recovery recorded by another probe during the final retry sleep", async () => {
+    const probe = vi.fn(async () => health("warm-up failed"));
+    const posted = deployNotify.postBootNotice(config, { probe, retryMs: 5, deadlineMs: 16 });
+    await vi.advanceTimersByTimeAsync(15);
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+
+    Object.assign(kgProvider.sidecarHealth, health(null));
+    await vi.advanceTimersByTimeAsync(1);
+    await posted;
+
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgUnavailable: false, sidecarError: null });
+    expect(deployNotify.hasKgRecoveryNotice()).toBe(false);
+    await deployNotify.postKgRecoveryNotice();
+    expect(notify.notifyKgRecovery).not.toHaveBeenCalled();
+  });
+
+  it("does not arm recovery after failed or suppressed delivery", async () => {
+    vi.mocked(notify.notifyDeploy).mockRejectedValueOnce(new Error("delivery failed"));
+    await deployNotify.postBootNotice(config, { probe: async () => health("failed"), deadlineMs: 0 });
+    expect(deployNotify.hasKgRecoveryNotice()).toBe(false);
+    await deployNotify.postBootNotice({ ...config, notifyWebhookUrl: null });
+    expect(deployNotify.hasKgRecoveryNotice()).toBe(false);
   });
 });

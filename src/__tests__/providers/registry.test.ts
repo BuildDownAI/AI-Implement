@@ -1,33 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ProviderRegistry } from "../../providers/registry.js";
 import { configureLinearAuth } from "../../linear-app-auth.js";
-import type { RepoMapping } from "../../config.js";
+import type { TicketingProvider } from "../../providers/types.js";
+import { makeIssue, makeMapping, makeProvider, makeRegistry } from "../helpers/builders.js";
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "test",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    awsRegion: null,
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    paused: false,
-    ...overrides,
-  };
-}
-
-const linearMapping = makeMapping({ ticketingProvider: "linear", ticketingConfig: { kind: "linear" } });
+const linearMapping = makeMapping();
 const jiraMapping = makeMapping({
   ticketingProvider: "jira",
   ticketingConfig: { kind: "jira", jql: "project = TEST", repoFieldValue: "acme/test" },
@@ -116,18 +93,22 @@ describe("ProviderRegistry", () => {
 });
 
 describe("ProviderRegistry.findByKeyInAnyTracker", () => {
-  const issue = { id: "i1", identifier: "KEY-1" } as never;
+  const issue = makeIssue({ id: "i1", identifier: "KEY-1" });
   function stub(id: string, behavior: "issue" | "null" | "throw") {
-    const findByKey = vi.fn(async () => {
-      if (behavior === "throw") throw new Error("boom");
-      return behavior === "issue" ? issue : null;
+    return makeProvider({
+      id,
+      findByKey: vi.fn(async () => {
+        if (behavior === "throw") throw new Error("boom");
+        return behavior === "issue" ? issue : null;
+      }),
     });
-    return { id, findByKey } as never as { id: string; findByKey: ReturnType<typeof vi.fn> };
   }
-  function setup(stubs: ReturnType<typeof stub>[]) {
-    const reg = new ProviderRegistry({}, () => ({ A: linearMapping }));
-    vi.spyOn(reg, "forAllMappings").mockResolvedValue(stubs as never);
-    return reg;
+  // One mapping per tracker, so the real forAllMappings picks each stub through its mapping.
+  function setup(stubs: TicketingProvider[]) {
+    return makeRegistry({
+      providers: Object.fromEntries(stubs.map((s) => [s.id, s])),
+      mappings: Object.fromEntries(stubs.map((s) => [s.id, makeMapping({ ticketingProvider: s.id })])),
+    });
   }
 
   it("found: exactly one issue, none throw", async () => {

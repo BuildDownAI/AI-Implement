@@ -39,3 +39,8 @@ export function withRequestErrorBoundary(
     }
   };
 }
+
+/** The port the orchestrator's HTTP server listens on: `PORT`, else 8080. */
+export function parseHealthPort(raw: string | undefined): number {
+  return parseInt(raw || "8080", 10);
+}

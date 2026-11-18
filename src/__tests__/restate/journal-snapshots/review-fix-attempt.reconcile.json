@@ -1,0 +1,50 @@
+[
+  {
+    "type": "Input",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "load-prepared-attempt"
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "check-prelaunch-authority"
+  },
+  {
+    "type": "Run",
+    "name": "launch-once"
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "PeekPromise",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "reconcile-0"
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "GetPromise",
+    "name": ""
+  },
+  {
+    "type": "Sleep",
+    "name": ""
+  }
+]

@@ -5,6 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { archiveLocalContainerLogsBestEffort } from "./local-job-logs.js";
+import { isEphemeralPolicyEnvName, MODEL_AUTH_ENV, type ModelAuthGrantBootstrapV1 } from "./model-auth-contract.js";
+import {
+  MODEL_CREDENTIAL_KEYS,
+  MODEL_SESSION_KEYS,
+  PROTECTED_BOOTSTRAP_KEYS,
+  PROTECTED_BOOTSTRAP_PREFIXES,
+} from "./pipeline/process-env.js";
+import { encodeTrustedRunConfig, type RunConfigV1 } from "./run-config.js";
 
 const execFile = promisify(nodeExecFile);
 const SECRET_ENV_KEYS = new Set([
@@ -13,6 +21,7 @@ const SECRET_ENV_KEYS = new Set([
   "GITHUB_TOKEN",
   "RUN_TOKEN",
   "RUN_PROGRESS_TOKEN",
+  "RUN_PUBLICATION_TOKEN",
   "SESSION_TOKEN",
 ]);
 
@@ -30,12 +39,29 @@ export interface LocalRunnerInput {
   githubToken: string;
   sessionToken: string;
   machineNonce: string;
+  /** @deprecated Ignored; session mode is no longer sent to runners. */
   sessionMode?: string;
   phase?: "implementation" | "planning" | "kg-refresh";
   orchestratorUrl?: string;
   runnerCallbackUrl?: string;
   runToken?: string;
+  runProgressToken?: string;
+  runPublicationToken?: string;
   extraEnv?: Record<string, string>;
+  /**
+   * Opt-in protected model auth. The run config and every model-auth value travel only in the
+   * private env file, never in `docker run` arguments; legacy credentials and reserved `extraEnv`
+   * names are rejected.
+   */
+  protectedModelAuth?: {
+    /** Backend "local"; from `decision.takeBootstrap()`. */
+    bootstrap: ModelAuthGrantBootstrapV1;
+    projectKey: string;
+    /** Without `credentials.modelAuthGrant`. */
+    runConfig: RunConfigV1;
+    /** Reachable from the container. */
+    modelAuthUrl: string;
+  };
 }
 
 export interface StartLocalContainerInput extends LocalRunnerInput {
@@ -50,7 +76,42 @@ export interface LocalContainerState {
   exitCode: number | null;
 }
 
+function isReservedModelEnvName(name: string): boolean {
+  const upper = name.toUpperCase();
+  return (
+    (PROTECTED_BOOTSTRAP_KEYS as readonly string[]).includes(upper) ||
+    (MODEL_CREDENTIAL_KEYS as readonly string[]).includes(upper) ||
+    (MODEL_SESSION_KEYS as readonly string[]).includes(upper) ||
+    PROTECTED_BOOTSTRAP_PREFIXES.some((p) => upper.startsWith(p))
+  );
+}
+
+/** Value-free: names only the category of the problem. */
+export function validateProtectedLocalInput(input: LocalRunnerInput, p: NonNullable<LocalRunnerInput["protectedModelAuth"]>): void {
+  if (input.anthropicApiKey || input.claudeOAuthToken) {
+    throw new Error("protected local model auth rejected: legacy credentials");
+  }
+  if (input.extraEnv && Object.keys(input.extraEnv).some(isReservedModelEnvName)) {
+    throw new Error("protected local model auth rejected: reserved env name in extraEnv");
+  }
+  if (
+    !p.bootstrap ||
+    typeof p.projectKey !== "string" || !p.projectKey.trim() ||
+    typeof p.modelAuthUrl !== "string" || !p.modelAuthUrl.trim() ||
+    !p.runConfig ||
+    p.runConfig.credentials?.modelAuthGrant !== undefined
+  ) {
+    throw new Error("protected local model auth rejected: invalid input");
+  }
+}
+
 export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, string> {
+  const protectedAuth = input.protectedModelAuth;
+  if (input.extraEnv && Object.keys(input.extraEnv).some(isEphemeralPolicyEnvName)) {
+    // The ephemeral full-access opt-in is GHA-only (AII-1437).
+    throw new Error("ephemeral full-access opt-in is not supported in local Docker");
+  }
+  if (protectedAuth) validateProtectedLocalInput(input, protectedAuth);
   const env: Record<string, string> = {
     AI_IMPLEMENT_MODE: "local",
     ISSUE_ID: input.issueId,
@@ -63,7 +124,6 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
     GITHUB_TOKEN: input.githubToken,
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
-    SESSION_MODE: input.sessionMode ?? "autonomous",
     RUNNER_PHASE: input.phase ?? "implementation",
   };
 
@@ -72,19 +132,47 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
   if (input.orchestratorUrl) env.ORCHESTRATOR_URL = input.orchestratorUrl;
   if (input.runnerCallbackUrl) env.RUNNER_CALLBACK_URL = input.runnerCallbackUrl;
   if (input.runToken) env.RUN_TOKEN = input.runToken;
+  if (input.runProgressToken) env.RUN_PROGRESS_TOKEN = input.runProgressToken;
+  if (input.runPublicationToken) env.RUN_PUBLICATION_TOKEN = input.runPublicationToken;
   if (input.extraEnv) Object.assign(env, input.extraEnv);
+
+  if (protectedAuth) {
+    // Authoritative values go after extraEnv so a mapping cannot replace the grant, URL or run config.
+    env[MODEL_AUTH_ENV.dispatchId] = protectedAuth.bootstrap.dispatchId;
+    env[MODEL_AUTH_ENV.projectKey] = protectedAuth.projectKey.trim();
+    env[MODEL_AUTH_ENV.backend] = "local";
+    env[MODEL_AUTH_ENV.baseUrl] = protectedAuth.modelAuthUrl;
+    env.AI_IMPLEMENT_RUN_CONFIG = encodeTrustedRunConfig({
+      ...protectedAuth.runConfig,
+      credentials: {
+        ...(protectedAuth.runConfig.credentials ?? { version: 1 }),
+        modelAuthGrant: protectedAuth.bootstrap,
+      },
+    });
+  }
 
   return env;
 }
 
-export function splitLocalRunnerEnv(env: Record<string, string>): {
+function isProtectedModelAuthName(key: string): boolean {
+  return (
+    (PROTECTED_BOOTSTRAP_KEYS as readonly string[]).includes(key) ||
+    PROTECTED_BOOTSTRAP_PREFIXES.some((p) => key.startsWith(p))
+  );
+}
+
+/** With `protectedModelAuth`, the run config and model-auth names go to the env file too. */
+export function splitLocalRunnerEnv(
+  env: Record<string, string>,
+  opts: { protectedModelAuth?: boolean } = {},
+): {
   publicEnv: Record<string, string>;
   secretEnv: Record<string, string>;
 } {
   const publicEnv: Record<string, string> = {};
   const secretEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
-    if (SECRET_ENV_KEYS.has(key)) {
+    if (SECRET_ENV_KEYS.has(key) || (opts.protectedModelAuth && isProtectedModelAuthName(key))) {
       secretEnv[key] = value;
     } else {
       publicEnv[key] = value;
@@ -105,7 +193,9 @@ function sanitizeContainerName(issueIdentifier: string): string {
 }
 
 export function buildDockerRunArgs(input: StartLocalContainerInput, envFilePath?: string): string[] {
-  const { publicEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv(input));
+  const { publicEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv(input), {
+    protectedModelAuth: input.protectedModelAuth !== undefined,
+  });
   const args = [
     "run",
     "-d",
@@ -131,7 +221,7 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
   containerId: string;
   containerName: string;
 }> {
-  const envFilePath = await writeSecretEnvFile(buildLocalRunnerEnv(input));
+  const envFilePath = await writeSecretEnvFile(buildLocalRunnerEnv(input), input.protectedModelAuth !== undefined);
   const args = buildDockerRunArgs(input, envFilePath);
   const nameIndex = args.indexOf("--name");
   const containerName = nameIndex >= 0 ? args[nameIndex + 1] : "";
@@ -139,7 +229,9 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
   try {
     input.onBeforeLaunch?.();
     const { stdout } = await execFile("docker", args);
-    return { containerId: stdout.trim(), containerName };
+    const containerId = stdout.trim();
+    if (!containerId) throw new Error("Docker run returned an empty container identity");
+    return { containerId, containerName };
   } catch (err) {
     throw new Error(`Failed to start local Docker runner: ${errorMessage(err)}`);
   } finally {
@@ -152,7 +244,9 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
 export async function findLocalContainerIdByName(name: string): Promise<string | null> {
   try {
     const { stdout } = await execFile("docker", ["inspect", "--type", "container", "--format", "{{.Id}}", name]);
-    return stdout.trim() || null;
+    const id = stdout.trim();
+    if (!id) throw new Error("Docker inspect returned an empty container identity");
+    return id;
   } catch (err) {
     if (/no such (container|object)/i.test(errorMessage(err))) return null;
     throw new Error(`Failed to look up local Docker runner ${name}: ${errorMessage(err)}`);
@@ -189,18 +283,29 @@ export async function fetchLocalContainerLogs(containerId: string, lastN = 100):
   }
 }
 
-export interface ExitedContainer {
+export interface LocalContainerSummary {
   id: string;
   name: string;
-  /** Human-readable docker status, e.g. "Exited (0) 5 minutes ago". */
+  /** Human-readable Docker status, e.g. "Up 5 minutes" or "Exited (0) 5 minutes ago". */
   status: string;
+}
+
+export type ExitedContainer = LocalContainerSummary;
+
+/** Lists ai-implement-* containers in every state with full IDs. */
+export async function listAiImplementContainers(): Promise<LocalContainerSummary[]> {
+  return listContainers(false);
 }
 
 /** Lists exited ai-implement-* containers with full (untruncated) IDs. */
 export async function listExitedAiImplementContainers(): Promise<ExitedContainer[]> {
+  return listContainers(true);
+}
+
+async function listContainers(exitedOnly: boolean): Promise<LocalContainerSummary[]> {
   const { stdout } = await execFile("docker", [
     "ps", "-a", "--no-trunc",
-    "--filter", "status=exited",
+    ...(exitedOnly ? ["--filter", "status=exited"] : []),
     "--filter", "name=ai-implement-",
     "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}",
   ]);
@@ -261,12 +366,27 @@ export async function sweepExitedLocalContainers(inFlightMachineIds: string[]): 
   return removed;
 }
 
+/** Accounting stamp for a container's stop; loaded lazily so this module stays free of the database. */
+async function stampComputeStopped(containerId: string, gone: boolean): Promise<void> {
+  try {
+    (await import("./log.js")).stampComputeStopped(containerId, gone);
+  } catch (err) {
+    console.error(`[local-docker] Failed to record compute stop for ${containerId}:`, err);
+  }
+}
+
 export async function removeLocalContainer(containerId: string): Promise<void> {
   try {
     await archiveLocalContainerLogsBestEffort(containerId);
     await execFile("docker", ["rm", "-f", containerId]);
+    await stampComputeStopped(containerId, false);
   } catch (err) {
-    throw new Error(`Failed to remove local Docker runner ${containerId}: ${errorMessage(err)}`);
+    const message = errorMessage(err);
+    // Removal may have succeeded before its acknowledgement was lost. Record
+    // the same completed_at fallback as stopLocalContainer before callers accept
+    // an already-gone response as successful cleanup.
+    if (/no such container/i.test(message)) await stampComputeStopped(containerId, true);
+    throw new Error(`Failed to remove local Docker runner ${containerId}: ${message}`);
   }
 }
 
@@ -274,9 +394,13 @@ export async function removeLocalContainer(containerId: string): Promise<void> {
 export async function stopLocalContainer(containerId: string): Promise<void> {
   try {
     await execFile("docker", ["rm", "-f", containerId]);
+    await stampComputeStopped(containerId, false);
   } catch (err) {
     const message = errorMessage(err);
-    if (/no such container/i.test(message)) return;
+    if (/no such container/i.test(message)) {
+      await stampComputeStopped(containerId, true);
+      return;
+    }
     throw new Error(`Failed to stop local Docker runner ${containerId}: ${message}`);
   }
 }
@@ -289,8 +413,8 @@ function errorMessage(err: unknown): string {
   return String(err);
 }
 
-async function writeSecretEnvFile(env: Record<string, string>): Promise<string> {
-  const { secretEnv } = splitLocalRunnerEnv(env);
+async function writeSecretEnvFile(env: Record<string, string>, protectedModelAuth: boolean): Promise<string> {
+  const { secretEnv } = splitLocalRunnerEnv(env, { protectedModelAuth });
   const dir = join(tmpdir(), "ai-implement-local-runner");
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const filePath = join(dir, `${randomUUID()}.env`);

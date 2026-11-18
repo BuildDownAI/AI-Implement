@@ -2,14 +2,17 @@ import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } 
 import os from "node:os";
 import path from "node:path";
 import { cloneStep } from "../pipeline/steps/clone.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { encodeRunConfig } from "../run-config.js";
+import { makeContext, makeReviewFixRunConfig } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
 }));
 
-vi.mock("node:fs", () => ({
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   default: {
     existsSync: vi.fn(),
     mkdirSync: vi.fn(),
@@ -41,18 +44,6 @@ function mockSpawn(calls: Array<{ status: number; stdout?: string; stderr?: stri
   });
 }
 
-function makeContext(): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test",
-    issueDescription: "Desc",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
-  });
-}
-
 const BASE_INPUTS = {
   repoOwner: "acme",
   repoRepo: "app",
@@ -63,7 +54,7 @@ const BASE_INPUTS = {
 
 const PR_INPUTS = {
   ...BASE_INPUTS,
-  branch: "ai-implement/ENG-1-test",
+  branch: "ai-implement/eng-1-test",
   prNumber: "42",
   baseBranch: "main",
 };
@@ -207,11 +198,7 @@ describe("cloneStep", () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.stubEnv("GITHUB_TOKEN", "secret-token");
     vi.stubEnv("GH_TOKEN", "secret-token");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ token: "fresh-token" }),
-    } as Response));
+    fakeFetch({ "POST /api/token": [{ json: { token: "fresh-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() } }] }).install();
     mockSpawn([
       { status: 0 },
       { status: 0 },
@@ -236,17 +223,13 @@ describe("cloneStep", () => {
         expect.objectContaining({ cwd: "/tmp/workspace" }),
       );
     } finally {
-      vi.unstubAllGlobals();
       vi.unstubAllEnvs();
     }
   });
 
   it("keeps the boot token when credential vending rejects the refresh", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: false,
-      status: 403,
-    } as Response));
+    fakeFetch({ "POST /api/token": [{ status: 403, json: { error: "Invalid or expired nonce" } }] }).install();
     mockSpawn([
       { status: 0 },
       { status: 0 },
@@ -255,23 +238,63 @@ describe("cloneStep", () => {
       { status: 0 },
     ]);
 
-    try {
-      const outputs = await cloneStep.run(makeContext(), {
-        ...PR_INPUTS,
-        orchestratorUrl: "https://orchestrator.example",
-        machineNonce: "machine-nonce",
-        baseBranch: undefined,
-      }, new NoopStepReporter());
+    const outputs = await cloneStep.run(makeContext(), {
+      ...PR_INPUTS,
+      orchestratorUrl: "https://orchestrator.example",
+      machineNonce: "machine-nonce",
+      baseBranch: undefined,
+    }, new NoopStepReporter());
 
-      expect(outputs.githubToken).toBe("secret-token");
-      expect(spawnSync).toHaveBeenLastCalledWith(
-        "git",
-        ["remote", "set-url", "origin", "https://x-access-token:secret-token@github.com/acme/app.git"],
-        expect.objectContaining({ cwd: "/tmp/workspace" }),
-      );
-    } finally {
-      vi.unstubAllGlobals();
+    expect(outputs.githubToken).toBe("secret-token");
+    expect(spawnSync).toHaveBeenLastCalledWith(
+      "git",
+      ["remote", "set-url", "origin", "https://x-access-token:secret-token@github.com/acme/app.git"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+  });
+
+  describe("pilot publication authority", () => {
+    // A pilot attempt on PR_INPUTS' PR, launched as a GitHub Actions run; returns the callback URL its envelope carries.
+    function stubPilot(): string {
+      const config = makeReviewFixRunConfig({ repository: "acme/app", prNumber: 42 });
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(config));
+      vi.stubEnv("RUN_TOKEN", "result-token");
+      vi.stubEnv("GITHUB_RUN_ID", "555");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      return config.runnerCallbackUrl!;
     }
+
+    it("checks publication authority with the callback URL on a pilot run", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      const callbackUrl = stubPilot();
+      const orchestrator = fakeFetch({ "POST /api/runner/publication-authority": { json: { authorized: true } } }).install();
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha1\n" }, { status: 0 }]);
+      try {
+        await cloneStep.run(makeContext(), {
+          ...PR_INPUTS, callbackUrl, baseBranch: undefined,
+        }, new NoopStepReporter());
+        expect(orchestrator.calls).toHaveLength(1);
+        expect(orchestrator.calls[0]!.url.href).toBe(`${callbackUrl}/api/runner/publication-authority`);
+        expect(Object.fromEntries(orchestrator.calls[0]!.headers)).toEqual({
+          authorization: "Bearer result-token", "x-run-repository": "acme/app",
+          "x-github-run-id": "555", "x-github-run-attempt": "1",
+        });
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("fails without the callback URL on a pilot run", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      stubPilot();
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha1\n" }, { status: 0 }]);
+      try {
+        await expect(cloneStep.run(makeContext(), { ...PR_INPUTS, baseBranch: undefined }, new NoopStepReporter()))
+          .rejects.toThrow("Pilot publication authority unavailable");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
   });
 
   describe("PR-targeted (gap-fill) runs: base branch fetch", () => {
@@ -1361,6 +1384,240 @@ describe("cloneStep", () => {
       expect(outputs.clonedCount).toBe(1);
       expect(runRealGit(["rev-parse", "HEAD"], effectiveDir)).toBe(mainTipSha);
       expect(runRealGit(["rev-parse", "--is-shallow-repository"], effectiveDir)).toBe("true");
+    });
+  });
+});
+
+describe("cloneStep git subprocess environment", () => {
+  const SENTINELS: Record<string, string> = {
+    ANTHROPIC_API_KEY: "sentinel-anthropic",
+    CLAUDE_CODE_OAUTH_TOKEN: "sentinel-oauth",
+    RUN_PROGRESS_TOKEN: "sentinel-progress",
+    RUN_PUBLICATION_TOKEN: "sentinel-publication",
+    RUN_TOKEN: "sentinel-run",
+    NPM_TOKEN: "sentinel-npm",
+    GH_TOKEN: "sentinel-gh",
+    GITHUB_TOKEN: "sentinel-github",
+    // AI_IMPLEMENT_RUN_CONFIG is read by the step itself (refreshRunnerGithubCredentials)
+    // and must decode; its stripping is covered by the gitProcessEnv helper tests.
+    AI_IMPLEMENT_FORWARDED_SECRETS: "SENTINEL_FORWARDED",
+    SENTINEL_FORWARDED: "sentinel-forwarded",
+  };
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const [k, v] of Object.entries(SENTINELS)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  // Secondary (bare-URL) network ops intentionally restore the progress bearer for the
+  // dependency credential helper; every other call must stay fully sanitized.
+  function expectAllCallsSanitized(opts: { dependencyOptIn?: boolean } = {}): void {
+    const calls = vi.mocked(spawnSync).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      const env = (call[2] as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+      expect(env, `git ${String(call[1]?.[0])} must pass an explicit env`).toBeDefined();
+      const optIn = opts.dependencyOptIn && ["clone", "fetch"].includes(String(call[1]?.[0]));
+      for (const key of Object.keys(SENTINELS)) {
+        if (optIn && key === "RUN_PROGRESS_TOKEN") {
+          expect(env![key]).toBe("sentinel-progress");
+        } else if (key === "AI_IMPLEMENT_FORWARDED_SECRETS" || key === "SENTINEL_FORWARDED") {
+          expect(env![key]).toBeUndefined();
+        } else if (key !== "GIT_PASSWORD") {
+          expect(env![key], key).toBeUndefined();
+        }
+      }
+    }
+  }
+
+  it("fresh clone, gap-fill base fetch, config and rev-parse", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockSpawn([]);
+    await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+    expectAllCallsSanitized();
+  });
+
+  it("incremental fetch with full depth (shallow check, unshallow, fetch, reset)", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    mockSpawn([{ status: 0, stdout: "true\n" }]);
+    await cloneStep.run(makeContext(), { ...BASE_INPUTS, depth: "full" }, new NoopStepReporter());
+    expectAllCallsSanitized();
+    const fetchCall = vi.mocked(spawnSync).mock.calls.find((c) => c[1]?.[0] === "fetch");
+    expect((fetchCall![2] as { env: NodeJS.ProcessEnv }).env.GIT_PASSWORD).toBe("secret-token");
+  });
+
+  it("secondary clone into a subdirectory, fresh and incremental", async () => {
+    for (const exists of [false, true]) {
+      vi.clearAllMocks();
+      vi.mocked(fs.existsSync).mockReturnValue(exists);
+      mockSpawn([]);
+      await cloneStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, targetDir: "code-repo", depth: "full" },
+        new NoopStepReporter(),
+      );
+      expectAllCallsSanitized({ dependencyOptIn: true });
+    }
+  });
+
+  it("multi-target secondary clones, fresh and incremental", async () => {
+    for (const exists of [false, true]) {
+      vi.clearAllMocks();
+      vi.mocked(fs.existsSync).mockReturnValue(exists);
+      mockSpawn([{ status: 0, stdout: "true\n" }]);
+      await cloneStep.run(
+        makeContext(),
+        {
+          ...BASE_INPUTS,
+          depth: "full",
+          targets: [{ repoOwner: "acme", repoRepo: "lib", targetDir: "lib", branch: "main" }],
+        },
+        new NoopStepReporter(),
+      );
+      expectAllCallsSanitized({ dependencyOptIn: true });
+    }
+  });
+
+  it("mounted mode rev-parse", async () => {
+    process.env.AI_IMPLEMENT_WORKSPACE_MODE = "mounted";
+    try {
+      mockSpawn([{ status: 0, stdout: "abc\n" }]);
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      expectAllCallsSanitized();
+    } finally {
+      delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+    }
+  });
+
+  describe("dependency credential fencing", () => {
+    const DEP_VARS: Record<string, string> = {
+      GIT_DEPENDENCY_TOKEN_FILE: "/sentinel/cache.json",
+      GIT_DEPENDENCY_CALLBACK_URL: "https://sentinel.invalid",
+      RUN_PROGRESS_TOKEN: "sentinel-progress",
+      COMPOSER_AUTH: '{"sentinel":"composer"}',
+      RUN_TOKEN: "sentinel-run",
+      GH_TOKEN: "sentinel-gh",
+    };
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const [k, v] of Object.entries(DEP_VARS)) {
+        saved[k] = process.env[k];
+        process.env[k] = v;
+      }
+    });
+    afterEach(() => {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+
+    function envOf(call: unknown[]): NodeJS.ProcessEnv {
+      return (call[2] as { env: NodeJS.ProcessEnv }).env;
+    }
+
+    function expectDependencyOptIn(env: NodeJS.ProcessEnv) {
+      expect(env.GIT_DEPENDENCY_TOKEN_FILE).toBe("/sentinel/cache.json");
+      expect(env.GIT_DEPENDENCY_CALLBACK_URL).toBe("https://sentinel.invalid");
+      expect(env.RUN_PROGRESS_TOKEN).toBe("sentinel-progress");
+      expect(env.COMPOSER_AUTH).toBeUndefined();
+      expect(env.RUN_TOKEN).toBeUndefined();
+      expect(env.GH_TOKEN).toBeUndefined();
+    }
+
+    function expectFenced(env: NodeJS.ProcessEnv) {
+      for (const k of Object.keys(DEP_VARS)) expect(env[k], k).toBeUndefined();
+    }
+
+    it("targetDir fresh clone opts in; rev-parse does not", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "abc\n" }]);
+      await cloneStep.run(
+        makeContext(),
+        { repoOwner: "acme", repoRepo: "code", branch: "", githubToken: "", workspaceDir: "/tmp/workspace", targetDir: "code" },
+        new NoopStepReporter(),
+      );
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toContain("clone");
+      expectDependencyOptIn(envOf(calls[0]));
+      expect(calls[1][1]).toContain("rev-parse");
+      expectFenced(envOf(calls[1]));
+    });
+
+    it("targetDir full-depth incremental: fetches opt in; local ops do not", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockSpawn([
+        { status: 0, stdout: "true\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "abc\n" },
+      ]);
+      await cloneStep.run(
+        makeContext(),
+        { repoOwner: "acme", repoRepo: "code", branch: "main", githubToken: "", workspaceDir: "/tmp/workspace", targetDir: "code", depth: "full" },
+        new NoopStepReporter(),
+      );
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls).toHaveLength(5);
+      const byKind = (c: unknown[]) => (c[1] as string[]).slice(0, 2).join(" ");
+      for (const c of calls) {
+        const kind = byKind(c);
+        if (kind.startsWith("fetch")) expectDependencyOptIn(envOf(c));
+        else expectFenced(envOf(c));
+      }
+      expect(calls.map(byKind)).toEqual([
+        "rev-parse --is-shallow-repository",
+        "fetch --unshallow",
+        "fetch origin",
+        "reset --hard",
+        "rev-parse HEAD",
+      ]);
+    });
+
+    it("targets: fresh clone and incremental fetch opt in; reset does not", async () => {
+      vi.mocked(fs.existsSync).mockReturnValueOnce(false).mockReturnValue(true);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }]);
+      await cloneStep.run(
+        makeContext(),
+        {
+          repoOwner: "", repoRepo: "", branch: "", githubToken: "", workspaceDir: "/tmp/workspace",
+          targets: [
+            { repoOwner: "acme", repoRepo: "a", targetDir: "repos/a" },
+            { repoOwner: "acme", repoRepo: "b", targetDir: "repos/b" },
+          ],
+        },
+        new NoopStepReporter(),
+      );
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls.map((c) => (c[1] as string[])[0])).toEqual(["clone", "fetch", "reset"]);
+      expectDependencyOptIn(envOf(calls[0]));
+      expectDependencyOptIn(envOf(calls[1]));
+      expectFenced(envOf(calls[2]));
+    });
+
+    it("primary workspace clone path never receives dependency credentials", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([]);
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const c of calls) {
+        const env = envOf(c);
+        expect(env, `git ${(c[1] as string[])[0]} must pass explicit env`).toBeDefined();
+        expectFenced(env);
+      }
     });
   });
 });

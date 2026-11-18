@@ -28,7 +28,7 @@ The case table, as it landed:
 | `ReviewFixAttempt` | one promise, `wake`, that carries a result, a cancel, or a conflict | total only | none |
 | `PlanningRun` | planned ([AII-1019](https://linear.app/eudoxus/issue/AII-1019/add-the-planningrun-workflow-and-its-scenarios)) | planned | planned |
 
-**2. One sender sends the started signal.** `RunSignalSender` in `src/pipeline/run-signal.ts` posts `{}` to `/runner/progress` with the reusable progress token. It retries, and it never throws, because a failed signal must not fail the run. `progressOnFirstStep` wraps it as a step reporter, and the kg-refresh runner entry (`src/pipeline/kg-refresh-run.ts`) uses it. The result keeps its own path: `postRunnerResult` in `src/runner-result.ts`.
+**2. One sender sends the started signal.** *(Amended by AII-1127.)* The kg-refresh runner entry (`src/pipeline/kg-refresh-run.ts`) reports each pipeline step with `TokenStepReporter` (`src/pipeline/reporter.ts`), which posts `{ step }` to `/runner/progress` with the reusable progress token. It retries, and it never throws, because a failed signal must not fail the run. The first accepted post is the started evidence; the callback validates and redacts the step, and the workflow keeps it as a durable `step:<id>:running` or `step:<id>:ended` promise (evidence, never a wait signal, ADR 034). `RunSignalSender`, `progressOnFirstStep` and `src/pipeline/run-signal.ts` were removed because the step reporter sends the same heartbeat. The result keeps its own path: `postRunnerResult` in `src/runner-result.ts`.
 
 **3. One test kit holds a race still.** `src/__tests__/restate/harness.ts` exports `gate` and `waitForStep`. `gate(label)` is a single-use gate: a fake calls `wait()` and parks until the test calls `release`; the test calls `reached()` to know the fake got there. A gate never re-arms, because a re-arming gate would park a retried `ctx.run` step a second time and deadlock the scenario. `waitForStep(read, step)` polls a workflow's status read until its `step` equals the named step, so a test sends a signal only after the workflow reached that step. The one permitted sleep is `settle`, and only before a negative assertion.
 
@@ -59,7 +59,7 @@ Harder: the helper reports and does not act, so each run kind writes its own han
 
 1. List the signals in a table: name, primitive, meaning, who resolves it. Use only the signals the run kind needs.
 2. Wait with `awaitOwnedRun`. Choose the deadlines (bootstrap, total, or total only) and say whether a status read exists.
-3. Name the production producer of each signal in a comment at the promise. Send the started signal with `RunSignalSender` and the result with `postRunnerResult`.
+3. Name the production producer of each signal in a comment at the promise. Send the started signal with `TokenStepReporter` and the result with `postRunnerResult`.
 4. Add a default-suite test titled `contract: <Workflow>.<promise>` for each promise, from the real producer to the real route handler. `src/__tests__/restate-producer-guard.test.ts` fails without it.
 5. Write the race scenarios with `gate` and `waitForStep` from `src/__tests__/restate/harness.ts`. Do not sleep to wait for a step.
 6. Name how a timeout and a cancel stop the run on each backend the run kind uses.

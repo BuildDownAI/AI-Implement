@@ -1,16 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import {
   fetchGate, stageGate, swapGate, verifyGate, revertRail,
   RailGateError, readServedStamp, readNamespace,
-  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postDryRunReport,
+  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postBaselineAcceptNote, postDryRunReport,
   type KgRailDeps, type RailContext,
 } from "../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
 import type { RefreshOutcome, KgDryRunReportTarget } from "../kg-refresh.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const NAMESPACE = "https://kg.test.example/";
 const OLD_STAMP = "2026-08-20T00:10:10+00:00";
@@ -19,7 +19,7 @@ const SNAPSHOT_SHA = "abc123def456abc123def456abc123def456abc1";
 
 /** extractSource strips one leading component, so wrap the fixture in a top-level dir. */
 function makeTarball(dir: string): Buffer {
-  const wrap = mkdtempSync(join(tmpdir(), "kgrailtar-"));
+  const wrap = testDir("kgrailtar");
   const top = join(wrap, "repo");
   mkdirSync(top, { recursive: true });
   execSync(`cp -R ${dir}/. ${top}/`);
@@ -69,6 +69,7 @@ describe("kg-refresh-rail", () => {
       loadSnapshotSha: vi.fn(() => null) as never,
       mergePullRequestFn: vi.fn(async () => "merged") as never,
       closePullRequestFn: vi.fn(async () => {}) as never,
+      getPullRequestStateFn: vi.fn(async () => null) as never,
       deleteBranchFn: vi.fn(async () => {}) as never,
       postPrCommentFn: vi.fn(async () => {}) as never,
       postOrUpdateStickyCommentFn: vi.fn(async () => {}) as never,
@@ -78,8 +79,8 @@ describe("kg-refresh-rail", () => {
   }
 
   beforeEach(() => {
-    dataRoot = mkdtempSync(join(tmpdir(), "kgroot-"));
-    fixtureRepo = mkdtempSync(join(tmpdir(), "kgrepo-"));
+    dataRoot = testDir("kgroot");
+    fixtureRepo = testDir("kgrepo");
     writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
     mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
     writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
@@ -103,8 +104,6 @@ describe("kg-refresh-rail", () => {
   });
 
   afterEach(() => {
-    rmSync(dataRoot, { recursive: true, force: true });
-    rmSync(fixtureRepo, { recursive: true, force: true });
     delete process.env.KG_SIDECAR_URL;
     vi.clearAllMocks();
   });
@@ -455,6 +454,47 @@ describe("kg-refresh-rail", () => {
       expect(postPrCommentFn).toHaveBeenCalledTimes(1);
       expect(closePullRequestFn).toHaveBeenCalledTimes(1);
       expect(deleteBranchFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("closeSnapshotPr treats an already merged or closed PR as done", async () => {
+      const postPrCommentFn = vi.fn(async () => {});
+      const closePullRequestFn = vi.fn(async () => { throw new Error("422 already merged"); });
+      const getPullRequestStateFn = vi.fn(async () => ({ merged: true, state: "closed", headRef: null, headSha: null }));
+      const deps = makeDeps({ postPrCommentFn: postPrCommentFn as never, closePullRequestFn: closePullRequestFn as never, getPullRequestStateFn: getPullRequestStateFn as never });
+      await expect(closeSnapshotPr(deps, "TestOrg", "test-kg", 9, "canary")).resolves.toBeUndefined();
+      expect(postPrCommentFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("closeSnapshotPr throws a real close failure while the PR is still open, without commenting", async () => {
+      const postPrCommentFn = vi.fn(async () => {});
+      const closePullRequestFn = vi.fn(async () => { throw new Error("502 bad gateway"); });
+      const getPullRequestStateFn = vi.fn(async () => ({ merged: false, state: "open", headRef: null, headSha: null }));
+      const deps = makeDeps({ postPrCommentFn: postPrCommentFn as never, closePullRequestFn: closePullRequestFn as never, getPullRequestStateFn: getPullRequestStateFn as never });
+      await expect(closeSnapshotPr(deps, "TestOrg", "test-kg", 9, "canary")).rejects.toThrow("502");
+      expect(postPrCommentFn).not.toHaveBeenCalled();
+    });
+
+    it("closeSnapshotPr does not throw when the closing comment fails, so a step retry cannot repost it", async () => {
+      const postPrCommentFn = vi.fn(async () => { throw new Error("comment API down"); });
+      const closePullRequestFn = vi.fn(async () => {});
+      const deleteBranchFn = vi.fn(async () => {});
+      const deps = makeDeps({ postPrCommentFn: postPrCommentFn as never, closePullRequestFn: closePullRequestFn as never, deleteBranchFn: deleteBranchFn as never });
+      await expect(closeSnapshotPr(deps, "TestOrg", "test-kg", 9, "canary", "kg-refresh/x")).resolves.toBeUndefined();
+      expect(closePullRequestFn).toHaveBeenCalledTimes(1);
+      expect(deleteBranchFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("postBaselineAcceptNote mints a scoped token and comments naming the actor", async () => {
+      const postPrCommentFn = vi.fn(async () => {});
+      const mintToken = vi.fn(async () => ({ token: "tok" }));
+      const deps = makeDeps({ postPrCommentFn: postPrCommentFn as never, mintToken: mintToken as never });
+      await postBaselineAcceptNote(deps, "TestOrg", "test-kg", 9, "alice@example.com");
+      expect(mintToken).toHaveBeenCalledWith(
+        expect.anything(), expect.anything(), "TestOrg",
+        { permissions: { contents: "write", pull_requests: "write" }, repositories: ["test-kg"] },
+      );
+      expect(postPrCommentFn).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", 9, expect.stringContaining("alice@example.com"));
+      expect((postPrCommentFn.mock.calls[0] as unknown[])[4]).toContain("### Baseline");
     });
 
     it("postDryRunReport posts the sticky comment and sets the commit status on success", async () => {

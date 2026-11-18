@@ -1,8 +1,8 @@
 # Unit-test gate for AI-Implement PRs (AII-449).
 #
 # Named unit-tests.yml deliberately: the claude-*.yml files here are TEMPLATES
-# synced to target repos, and sync-workflow.yml is the sync fallback — this file
-# is neither, and must never be distributed by sync.
+# synced to target repos by the orchestrator. This file is a repository-only
+# test gate and must never be distributed by sync.
 #
 # Operator step after first merge: mark the "unit-tests" check REQUIRED on the
 # testing branch (Settings → Branches). The branch is unprotected today, so the
@@ -14,8 +14,8 @@
 name: unit-tests
 
 on:
+  # Every PR, whatever its base.
   pull_request:
-    branches: [testing, main, "ai-implement/feature/**", "ai-implement/multi-issue/**"]
 
 jobs:
   unit-tests:
@@ -32,74 +32,31 @@ jobs:
       # (verified on AII-448: 28 unhandled rejections alone produced exit 1
       # while all tests passed — the exact signal this gate exists to catch).
       #
-      # Ambient Actions vars are scrubbed for the test step: orchestrator code
-      # branches on GITHUB_RUN_ID / GITHUB_ENV / etc., and the suite asserts
-      # the non-CI defaults (first run of this gate proved it: reporter tests
-      # picked up the job's own run id). The suite must see the same env shape
-      # locally and here.
-      - name: npm test (ambient CI vars scrubbed)
-        run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          npm test
+      # No unset step: the suite deletes ambient variables itself, the same way here as on any machine.
+      # Its allowlist, with the reason for each entry, is src/__tests__/setup/ambient-env.ts.
+      - run: npm test
       - run: npm run typecheck
-      - run: npx tsc --noEmit --project tsconfig.review-fix-ports-tests.json
-      - run: npx tsc --noEmit --project tsconfig.dispatch-admission-tests.json
-      - run: npx tsc --noEmit --project tsconfig.review-fix-attempt-store-tests.json
-      - run: npx tsc --noEmit --project tsconfig.review-fix-finalize-tests.json
-      - run: npx tsc --noEmit --project tsconfig.aii-806-tests.json
 
-  # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts, isolated from
-  # `unit-tests` above because it needs Docker for testcontainers. No `on:` block
-  # here on purpose — a job inherits the workflow's triggers only by staying in
-  # this file, which is what gets it onto ai-implement/feature/** PRs (AII-467
-  # pattern). No `needs:` either: it runs in parallel with `unit-tests` so this
-  # job's own time, not the sum, is what the ~2-minutes budget has to cover.
-  restate-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      # Pinned (not `latest`) so the image cache key below is stable and so a
-      # new Restate release can't silently change the harness's behavior.
-      # Keep in sync with the `RESTATE_IMAGE_VERSION` constant in
-      # src/__tests__/restate/harness.ts.
-      RESTATE_IMAGE_TAG: "1.7.10"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      # testcontainers pulls this image on every RestateTestEnvironment.start();
-      # caching the `docker save` tar keeps that pull off the network on a cache
-      # hit, which is what keeps this job's added time near ~2 minutes.
-      - name: Cache Restate container image
-        id: restate-image-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/restate-image-cache
-          key: restate-image-${{ env.RESTATE_IMAGE_TAG }}
-      - name: Load cached Restate image
-        if: steps.restate-image-cache.outputs.cache-hit == 'true'
-        run: docker load -i ~/restate-image-cache/restate.tar
-      - name: Pull and cache Restate image
-        if: steps.restate-image-cache.outputs.cache-hit != 'true'
-        run: |
-          docker pull "docker.io/restatedev/restate:${RESTATE_IMAGE_TAG}"
-          mkdir -p ~/restate-image-cache
-          docker save "docker.io/restatedev/restate:${RESTATE_IMAGE_TAG}" -o ~/restate-image-cache/restate.tar
-      - name: npm run test:restate (ambient CI vars scrubbed)
-        run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          npm run test:restate
-      - run: npx tsc --noEmit --project tsconfig.restate-tests.json
-
-  # Binary runtime (AII-915): the same suite on the runtime a dispatched runner
-  # uses — restate-server from node_modules, no Docker. Sibling of
-  # `restate-tests` so a PR proves both runtimes.
+  # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts on the
+  # `restate-server` binary from node_modules — the runtime the orchestrator sidecar
+  # and a dispatched runner use (AII-1195); no Docker. No `on:` block here on
+  # purpose — a job inherits the workflow's triggers only by staying in this file,
+  # which is what gets it onto ai-implement/feature/** PRs (AII-467 pattern). No
+  # `needs:` either: it runs in parallel with `unit-tests`. The suite runs three times
+  # (AII-993 flake detector: a scenario that fails one run in three must fail
+  # the PR that adds it), and each pass is split into two shards (vitest `--shard`,
+  # which divides the files by a hash of their paths), so six jobs run side by side
+  # and the wall time is that of the slower shard, not of the whole suite.
+  # fail-fast is off so the evidence of which passes failed survives.
+  # Checks: `restate-tests-binary (<pass>, <shard>)`, for example `restate-tests-binary (1, 2)`.
   restate-tests-binary:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pass: [1, 2, 3]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -107,9 +64,5 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: npm run test:restate on the binary runtime, three passes (ambient CI vars scrubbed)
-        env:
-          RESTATE_TEST_RUNTIME: binary
-        run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          for i in 1 2 3; do npm run test:restate || exit 1; done
+      - name: npm run test:restate pass ${{ matrix.pass }} of 3, shard ${{ matrix.shard }} of 2
+        run: npm run test:restate -- --shard=${{ matrix.shard }}/2

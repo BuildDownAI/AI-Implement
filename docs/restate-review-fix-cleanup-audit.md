@@ -4,7 +4,7 @@ At feature commit `d46a6fb`, the owner-based switch and the AII-813 fault matrix
 
 | Seam | Current role | Why it stays |
 | --- | --- | --- |
-| `processReviewFixQueue` in `src/index.ts` | For selected Restate/GHA work, records a feedback delivery in the durable inbox, then returns before Legacy admission or dispatch. | This is a delivery nudge for pending queue rows, including a missed webhook signal or a project toggle. It owns no runner, deadline, or outcome. The local execution path continues into Legacy dispatch. |
+| `processReviewFixQueue` in `src/index.ts` | For selected Restate/GHA work, calls the ingress client's `feedback` with no event (it records nothing in an inbox), then returns before Legacy admission or dispatch. | This is a delivery nudge for pending queue rows, including a missed webhook signal or a project toggle. It owns no runner, deadline, or outcome. The local execution path continues into Legacy dispatch. |
 | `handleRunnerResult` in `src/runner-callback.ts` | Authenticates the pilot attempt marker, durably records the result and cycle evidence, then returns before consuming a Legacy token or calling a provider. | Callback ingress must survive. Duplicate and stale callbacks remain classified against the immutable attempt. |
 | `src/review-fix-queue.ts` | Stores accepted finding versions and queue events and supports existing Legacy queue reads. | It has no Restate lifecycle owner branch to delete; accepted history must remain readable. |
 | `isRestateOwnedJob` guards in `src/index.ts` | Stop Legacy monitors, timeout remediation, and boot recovery from acting on a Restate admission. | Removing a guard would let a Legacy path finalize or release a Restate owner. |

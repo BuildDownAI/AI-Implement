@@ -1,8 +1,10 @@
+import { FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RepoMapping } from "../config.js";
 import type { PlanningRunDependencies, PlanningRunInput } from "../restate/planning-run-workflow.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/planning-run-workflow.js", async (importOriginal) => ({
@@ -20,9 +22,12 @@ vi.mock("../log.js", () => ({
   updateJobStatus: vi.fn(),
   findLogIdByDispatchId: vi.fn().mockReturnValue(7),
   updateJobRunId: vi.fn(),
-  getStuckAttemptStampedAt: vi.fn().mockReturnValue(null),
+  markJobFailureCommented: vi.fn(),
+  stampComputeStopped: vi.fn(),
+  recordGhaRunCompleted: vi.fn(),
 }));
-vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
+vi.mock("../dispatch-breaker.js", () => ({ parkIssue: vi.fn() }));
+vi.mock("../fly-machines.js", () => ({ machineNeverStarted: vi.fn().mockReturnValue(false), getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
 vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn(), removeLocalContainer: vi.fn() }));
 vi.mock("../stuck-watchdog.js", () => ({ remediateFailedJob: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../dispatch-admission.js", () => ({
@@ -34,10 +39,11 @@ vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 
 import { acquireDispatch } from "../dispatch-gate.js";
 import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
-import { getJobByDispatchId, getStuckAttemptStampedAt, updateJobRunId, updateJobStatus } from "../log.js";
+import { getJobByDispatchId, markJobFailureCommented, updateJobRunId, updateJobStatus } from "../log.js";
+import { parkIssue } from "../dispatch-breaker.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import { remediateFailedJob } from "../stuck-watchdog.js";
-import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
+import { destroyMachine, getMachine, listMachines, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer, stopLocalContainer } from "../local-docker.js";
 import { planningSessionName } from "../planning-launch.js";
 import {
@@ -47,7 +53,7 @@ import {
   type PlanningRunProductionInput,
 } from "../restate/planning-run-production.js";
 
-const MAPPING = { owner: "Org", repo: "repo", defaultBranch: "main", planningWorkflowFile: "claude-plan.yml" } as RepoMapping;
+const MAPPING = makeMapping({ owner: "Org", repo: "repo" });
 const INPUT: PlanningRunInput = {
   dispatchId: "d-1", teamKey: "ENG", issueId: "i-1", issueIdentifier: "ENG-1", planningContext: {}, backend: "github-actions",
 };
@@ -55,13 +61,12 @@ const DISPATCHED_AT = Date.parse("2026-10-03T12:00:10Z");
 const getMapping = (team: string) => (team === "ENG" ? MAPPING : undefined);
 const title = (id: string) => `${PLANNING_RUN_TITLE_PREFIX}${id}`;
 
-function stubRuns(runs: Array<Record<string, unknown>>, ok = true) {
-  const fetchMock = vi.fn().mockResolvedValue({ ok, status: ok ? 200 : 502, json: async () => ({ workflow_runs: runs }) });
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
+// GitHub's run list for the mapping's planning workflow, answering one read.
+function githubRuns(runs: Array<Record<string, unknown>>, status = 200): FakeFetch {
+  return fakeFetch({
+    "GET /repos/Org/repo/actions/workflows/claude-plan.yml/runs": [{ status, json: { workflow_runs: runs } }],
+  }).install();
 }
-
-afterEach(() => vi.unstubAllGlobals());
 
 describe("title prefix", () => {
   it("is contained in the run-name of workflows/claude-plan.yml", () => {
@@ -72,31 +77,31 @@ describe("title prefix", () => {
 });
 
 describe("findExistingRun", () => {
-  const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok", flySessionsToken: "fly-token", flySessionsApp: "fly-app" });
+  const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok", getFlySessions: () => ({ token: "fly-token", app: "fly-app" }) });
 
   it("returns the run titled for this issue created at or after the dispatch time", async () => {
-    const fetchMock = stubRuns([{ id: 5, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:12Z" }]);
+    const github = githubRuns([{ id: 5, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:12Z" }]);
     expect(await find(INPUT, DISPATCHED_AT)).toBe("5");
-    expect(String(fetchMock.mock.calls[0][0])).toContain("/repos/Org/repo/actions/workflows/claude-plan.yml/runs?event=workflow_dispatch");
+    expect(github.calls[0].url.href).toContain("/repos/Org/repo/actions/workflows/claude-plan.yml/runs?event=workflow_dispatch");
   });
 
   it("accepts a run stamped in the same second as the dispatch (GitHub truncates to seconds)", async () => {
-    stubRuns([{ id: 6, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:10Z" }]);
+    githubRuns([{ id: 6, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:10Z" }]);
     expect(await find(INPUT, DISPATCHED_AT + 400)).toBe("6");
   });
 
   it("returns null for a run titled for another issue", async () => {
-    stubRuns([{ id: 1, display_title: title("ENG-2"), created_at: "2026-10-03T12:01:00Z" }]);
+    githubRuns([{ id: 1, display_title: title("ENG-2"), created_at: "2026-10-03T12:01:00Z" }]);
     expect(await find(INPUT, DISPATCHED_AT)).toBeNull();
   });
 
   it("returns null for the same title created before the dispatch time", async () => {
-    stubRuns([{ id: 2, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:05Z" }]);
+    githubRuns([{ id: 2, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:05Z" }]);
     expect(await find(INPUT, DISPATCHED_AT)).toBeNull();
   });
 
   it("returns null for an untitled run and for the identifier-less fallback title", async () => {
-    stubRuns([
+    githubRuns([
       { id: 3, created_at: "2026-10-03T12:01:00Z" },
       { id: 4, display_title: "Claude AI Planning", created_at: "2026-10-03T12:01:00Z" },
       { id: 8, display_title: `${title("ENG-1")}0`, created_at: "2026-10-03T12:01:00Z" },
@@ -105,7 +110,7 @@ describe("findExistingRun", () => {
   });
 
   it("throws on an HTTP error rather than answering null", async () => {
-    stubRuns([], false);
+    githubRuns([], 502);
     await expect(find(INPUT, DISPATCHED_AT)).rejects.toThrow(/HTTP 502/);
   });
 
@@ -171,7 +176,7 @@ describe("production deps", () => {
   const launchResult = { outcome: "accepted" as const, runId: 4242 };
   const prepared = { ghToken: "secret-gh-token", runnerImage: undefined, planningSentBaseBranch: false, planningContract: "envelope", planningDispatchInputs: {} };
   const issue = { id: "i-1", identifier: "ENG-1", scopeKey: "ENG" };
-  const provider = { findByKey: vi.fn(), clearWorkingState: vi.fn().mockResolvedValue(true) };
+  const provider = { findByKey: vi.fn(), clearWorkingState: vi.fn().mockResolvedValue(true), markPlanningFailed: vi.fn().mockResolvedValue(true) };
 
   function deps(overrides: Partial<PlanningRunProductionInput> = {}) {
     const input: PlanningRunProductionInput = {
@@ -207,11 +212,11 @@ describe("production deps", () => {
 
     it("calls acquireDispatch with the dispatch id and the Restate owner", async () => {
       vi.mocked(acquireDispatch).mockReturnValue(grant as never);
-      const { d } = compose({ getMapping: (team) => (team === "ENG" ? ({ ...MAPPING, maxInProgressAiIssues: 3 } as RepoMapping) : undefined) });
+      const { d } = compose({ getMapping: (team) => (team === "ENG" ? { ...MAPPING, maxInProgressAiIssues: 5 } : undefined) });
       expect(await d.reserve({ ...INPUT, backend: "fly-machines" })).toBe(true);
       expect(acquireDispatch).toHaveBeenCalledWith({
         dispatchId: "d-1", issueId: "i-1", issueIdentifier: "ENG-1", kind: "planning", teamKey: "ENG",
-        maxInProgressAiIssues: 3, backend: "fly-machines", lifecycleOwner: { kind: "restate", attemptId: "d-1" },
+        maxInProgressAiIssues: 5, backend: "fly-machines", lifecycleOwner: { kind: "restate", attemptId: "d-1" },
       });
     });
 
@@ -265,6 +270,27 @@ describe("production deps", () => {
     const { d } = compose({ launchPlanningRun: vi.fn().mockResolvedValue({ outcome: "unknown" }) as never });
     expect(await d.launch(INPUT)).toEqual({ outcome: "unknown" });
     expect(updateJobRunId).not.toHaveBeenCalled();
+  });
+
+  it("launch overrides an empty scopeKey from findByKey (Jira) with the run's mapping key", async () => {
+    provider.findByKey.mockResolvedValue({ ...issue, scopeKey: "" });
+    const { input, d } = compose();
+    await d.launch(INPUT);
+    expect(vi.mocked(input.launchPlanningRun).mock.calls[0][0].issue.scopeKey).toBe(INPUT.teamKey);
+    expect(vi.mocked(input.preparePlanningLaunch).mock.calls[0][0].issue.scopeKey).toBe(INPUT.teamKey);
+  });
+
+  it("launchSession overrides an empty scopeKey from findByKey (Jira) with the run's mapping key", async () => {
+    provider.findByKey.mockResolvedValue({ ...issue, scopeKey: "" });
+    const { input, d } = compose();
+    await d.launch({ ...INPUT, backend: "fly-machines" });
+    expect(vi.mocked(input.launchPlanningSession).mock.calls[0][0].issue.scopeKey).toBe(INPUT.teamKey);
+  });
+
+  it.each([undefined, "fly-machines"] as const)("launch (backend %s) reads the issue with the run's mapping key so Jira returns its description and custom fields", async (backend) => {
+    const { d } = compose();
+    await d.launch(backend ? { ...INPUT, backend } : INPUT);
+    expect(provider.findByKey).toHaveBeenCalledWith(INPUT.issueIdentifier, INPUT.teamKey);
   });
 
   it.each(["fly-machines", "local-docker"] as const)("launch on %s calls launchPlanningSession with the held reservation and returns the machine id", async (backend) => {
@@ -427,6 +453,27 @@ describe("production deps", () => {
   describe("finishJob", () => {
     const row = { id: 7, issueId: "i-1", teamKey: "ENG", dispatchId: "d-1", status: "dispatched", conclusion: null };
 
+    it.each(["never-started", "started", "timeout", "read-error", "deadline"])("keeps planning semantics for %s", async scenario => {
+      vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, executionMode: "fly-machines", machineId: "m-1" } as never);
+      vi.mocked(machineNeverStarted).mockReturnValue(scenario === "never-started");
+      vi.mocked(getMachine).mockResolvedValue({ id: "m-1" } as never);
+      if (scenario === "timeout") vi.mocked(getMachine).mockRejectedValueOnce(new DOMException("Timed out", "AbortError"));
+      if (scenario === "read-error") vi.mocked(getMachine).mockRejectedValueOnce(new Error("unreadable"));
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: scenario === "deadline" ? "deadline" : "run_ended" });
+      const conclusion = scenario === "deadline" ? "deadline_exceeded" : "ended_without_callback";
+      expect(updateJobStatus).toHaveBeenCalledWith(7, scenario === "deadline" ? "timed_out" : "failed", conclusion);
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", conclusion);
+      if (scenario === "deadline") expect(getMachine).not.toHaveBeenCalled();
+      else expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1", 10_000);
+      const cause = scenario === "never-started" ? "Fly removed the machine before it started" :
+        scenario === "deadline" ? "the run deadline passed before a planning result arrived" : "the run ended with no planning result";
+      expect(provider.markPlanningFailed).toHaveBeenCalledWith("i-1", "ENG",
+        cause + ". The issue is parked and will not be retried by itself. " +
+        (scenario === "never-started" ? FLY_MACHINE_NEVER_STARTED_REMEDIATION + " " : "") +
+        "Next: press Unpark at /admin#runners, then set the status to `Ready` (Jira) or keep the AI-Implement label (Linear).");
+    });
+
     it("does nothing for a row the callback already closed", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, status: "completed" } as never);
       const { d } = compose();
@@ -442,15 +489,16 @@ describe("production deps", () => {
       expect(remediateFailedJob).not.toHaveBeenCalled();
     });
 
-    it("closes an in-flight row as failed and runs the failure handling with the owner option", async () => {
+    it("closes an in-flight row as failed, parks the issue, and writes the tracker failure once", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
-      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", expect.any(String));
-      expect(remediateFailedJob).toHaveBeenCalledTimes(1);
-      const call = vi.mocked(remediateFailedJob).mock.calls[0];
-      expect(call[1]).toBe(provider);
-      expect(call[4]).toEqual({ ownerCall: true });
+      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "ended_without_callback");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback");
+      expect(provider.markPlanningFailed).toHaveBeenCalledWith("i-1", "ENG", expect.stringContaining("Unpark"));
+      expect(markJobFailureCommented).toHaveBeenCalledWith(7);
+      expect(remediateFailedJob).not.toHaveBeenCalled();
+      expect(provider.clearWorkingState).not.toHaveBeenCalled();
     });
 
     it("closes an in-flight row as operator_cancelled after an invocation cancel, clears the working state, and runs no failure handling", async () => {
@@ -460,40 +508,52 @@ describe("production deps", () => {
       expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "operator_cancelled");
       expect(remediateFailedJob).not.toHaveBeenCalled();
       // The planning label is cleared, so the ticket does not stay blocked in `AI-Planning`.
-      expect(provider.clearWorkingState).toHaveBeenCalledTimes(1);
+
+      expect(provider.clearWorkingState).toHaveBeenCalledWith(expect.anything(), expect.anything(), "planning");      expect(provider.clearWorkingState).toHaveBeenCalledTimes(1);
     });
 
-    it("does not count a second stuck attempt when a retry finds one stamped since the dispatch began", async () => {
+    it("skips the tracker write on a retry when the failure comment is already recorded", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(
-        { ...row, status: "failed", conclusion: "ended_without_callback", dispatchedAt: 1_000 } as never,
+        { ...row, status: "failed", conclusion: "ended_without_callback", failureCommentedAt: 2_000 } as never,
       );
-      vi.mocked(getStuckAttemptStampedAt).mockReturnValueOnce(2_000);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
-      expect(remediateFailedJob).not.toHaveBeenCalled();
+      expect(parkIssue).toHaveBeenCalledTimes(1);
+      expect(provider.markPlanningFailed).not.toHaveBeenCalled();
     });
 
-    it("closes an in-flight row as timed_out at a deadline", async () => {
+    it("closes an in-flight row as timed_out at a deadline and parks it", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "deadline" });
-      expect(updateJobStatus).toHaveBeenCalledWith(7, "timed_out", expect.any(String));
-      expect(remediateFailedJob).toHaveBeenCalledTimes(1);
+      expect(updateJobStatus).toHaveBeenCalledWith(7, "timed_out", "deadline_exceeded");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "deadline_exceeded");
     });
 
-    it("re-runs the failure handling on retry when an earlier attempt closed the row then threw", async () => {
-      vi.mocked(remediateFailedJob).mockRejectedValueOnce(new Error("tracker down"));
-      vi.mocked(getJobByDispatchId).mockReturnValueOnce(row as never);
+    it("does not throw when the tracker write fails, and leaves the failure comment unrecorded", async () => {
+      provider.markPlanningFailed.mockRejectedValueOnce(new Error("tracker down"));
+      vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
       const { d } = compose();
-      await expect(d.finishJob("d-1", { kind: "run_ended" })).rejects.toThrow("tracker down");
-      expect(updateJobStatus).toHaveBeenCalledTimes(1);
-
-      vi.mocked(getJobByDispatchId).mockReturnValueOnce(
-        { ...row, status: "failed", conclusion: "ended_without_callback" } as never,
-      );
-      await d.finishJob("d-1", { kind: "run_ended" });
-      expect(updateJobStatus).toHaveBeenCalledTimes(1);
-      expect(remediateFailedJob).toHaveBeenCalledTimes(2);
+      await expect(d.finishJob("d-1", { kind: "run_ended" })).resolves.toBeUndefined();
+      expect(parkIssue).toHaveBeenCalledTimes(1);
+      expect(markJobFailureCommented).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("findExistingRun reads the Fly sessions app live (AII-1237)", () => {
+  it("uses the new app after a change, with no rebuild", async () => {
+    const listMachinesMock = vi.mocked(listMachines);
+    listMachinesMock.mockReset();
+    listMachinesMock.mockResolvedValue([] as never);
+    vi.mocked(getJobByDispatchId).mockReturnValue(null);
+    let app = "first-app";
+    const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok", getFlySessions: () => ({ token: "t", app }) });
+    const input: PlanningRunInput = { ...INPUT, backend: "fly-machines" };
+    await find(input, DISPATCHED_AT);
+    app = "second-app";
+    await find(input, DISPATCHED_AT);
+    expect(listMachinesMock.mock.calls.map((c) => c[1])).toEqual(["first-app", "second-app"]);
+    vi.mocked(getJobByDispatchId).mockReset();
   });
 });

@@ -16,7 +16,7 @@
 // the tick, confirm and deadline intervals. Each scenario holds the workflow with `gate` and `waitForStep`.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000, escapeWaitMs: 4_000, escapeTickMs: 100 };
@@ -26,7 +26,7 @@ const sim = vi.hoisted(() => ({
   remediateCalls: 0,
   /** Completion notices the simulated webhook received. */
   notices: [] as unknown[],
-  /** Effects (`finish`, `outcome`) that run, then throw once: a retry must not count twice. */
+  /** Effects (`outcome`) that run, then throw once: a retry must not count twice. */
   failAfterEffect: new Set<string>(),
   /** The intervals the next composed workflow uses. */
   timing: {} as Record<string, number>,
@@ -53,7 +53,21 @@ vi.mock("../../notify.js", async (importOriginal) => ({
   notifyText: async () => {},
 }));
 
-vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "sim-gh-token" }));
+vi.mock("../../workflow-probe.js", () => ({
+  resolveWorkflowContract: async () => "envelope",
+  // Planning preparation probes the full capabilities (private transport, AII-983); an envelope without the marker.
+  resolveWorkflowCapabilities: async () => ({
+    contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: false, supportsPrivateRunConfig: false,
+  }),
+}));
+vi.mock("../../planning-context.js", () => ({ buildPlanningContextInputs: async () => ({}) }));
+vi.mock("../../github-app-auth.js", async () => {
+  const { makeScopedInstallationToken } = await import("../helpers/builders.js");
+  return {
+    getInstallationToken: async () => "sim-gh-token",
+    getScopedInstallationToken: async () => makeScopedInstallationToken(),
+  };
+});
 vi.mock("../../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../github.js")>()),
   getWorkflowRunStatus: (...args: [string, string, string, number]) => gh.status(args[3]),
@@ -72,7 +86,6 @@ vi.mock("../../stuck-watchdog.js", async (importOriginal) => {
     remediateFailedJob: async (...args: Parameters<typeof actual.remediateFailedJob>) => {
       sim.remediateCalls++;
       await actual.remediateFailedJob(...args);
-      if (sim.failAfterEffect.delete("finish")) throw new Error("injected: the handling ran, then the step failed");
     },
   };
 });
@@ -91,17 +104,26 @@ vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
     createPlanningRunWorkflow: (deps: Parameters<typeof actual.createPlanningRunWorkflow>[0]) =>
       actual.createPlanningRunWorkflow({
         ...deps,
+        // The real finishJob, then one throw: Restate retries the finish-job / finish-job-deadline step.
+        finishJob: async (dispatchId, outcome) => {
+          await deps.finishJob(dispatchId, outcome);
+          if (outcome.kind !== "cancelled" && sim.failAfterEffect.delete("finish")) throw new Error("injected: the finish effect ran, then the step failed");
+        },
         ...sim.timing,
       }),
   };
 });
 
 import { getDb } from "../../dedup.js";
-import { acquireDispatch } from "../../dispatch-gate.js";
-import { dispatchPlanning, reportTerminalJob } from "../../index.js";
+import { acquireDispatch, canDispatch } from "../../dispatch-gate.js";
+import { selectIssuesToDispatch } from "../../poll-selection.js";
+import { dispatchPlanning, dispatchSession, reportTerminalJob } from "../../index.js";
+import { preparePlanningLaunch } from "../../planning-launch.js";
+import { resolveRunnerImageForDispatch } from "../../repo-image.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
-import { initMappingsTable } from "../../config.js";
-import { initDispatchBreakerTable, recordDispatchFailure } from "../../dispatch-breaker.js";
+import { getMappings, initMappingsTable } from "../../config.js";
+import { JiraApiError } from "../../providers/jira-client.js";
+import { initDispatchBreakerTable, isParked, recordDispatchFailure } from "../../dispatch-breaker.js";
 import { acquire, read as readAdmission, releaseHeldReservation, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
 import { appendLog, getJobByDispatchId, getStuckAttempts, initLogTable, updateJobStatus } from "../../log.js";
 import { planningSessionName } from "../../planning-launch.js";
@@ -111,8 +133,9 @@ import type { PlanningRunInput, PlanningRunStatusResult } from "../../restate/pl
 import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
-import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
-import { VARIANTS, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+import { mintPreparedReviewFixToken, mintRunToken } from "../../runner-tokens.js";
+import { handleRunnerResult } from "../../runner-callback.js";
+import { VARIANTS, journalEntries, journalEntryNames, journalText, journaledRunResult, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 const OWNER = "TestOrg";
 const REPO = "test-repo";
@@ -125,6 +148,8 @@ interface SimRun { id: number; title: string; createdAt: string; status: string 
 const gh = {
   runs: [] as SimRun[],
   cancelCalls: [] as number[],
+  /** When set, `.ai-implement/image.yml` names an image outside the allowlist. */
+  evilImage: false,
   statusReads: [] as number[],
   /** Holds the first run-status read of a scenario until the test releases it. */
   statusGate: undefined as Gate | undefined,
@@ -161,10 +186,11 @@ const backends = {
   inspectError: undefined as string | undefined,
   /** The launch writes its row and creates the machine, then throws once (the acknowledgement is lost). */
   crashNextLaunch: false,
+  neverStarted: false,
   async flyGet(id: string) {
     const state = this.machines.get(id);
     if (!state) throw new Error(`Failed to get machine ${id} (404): not found`);
-    return { id, state };
+    return { id, state, events: (this.neverStarted ? ["launch", "promote", "launch", "destroy"] : ["start"]).map(type => ({ type })) };
   },
   /** Parks the first machine destroy (the `cleanup` step on Fly) until the test releases it. */
   destroyGate: undefined as Gate | undefined,
@@ -191,6 +217,7 @@ const backends = {
   },
   reset() {
     this.machines.clear(); this.containers.clear(); this.created = 0; this.names.clear(); this.crashBeforeRow = false; this.destroyCalls = []; this.stopCalls = []; this.removeCalls = [];
+    this.neverStarted = false;
     this.inspectError = undefined; this.crashNextLaunch = false; this.destroyGate = undefined;
   },
 };
@@ -204,12 +231,20 @@ let launchGate: Gate | undefined;
 /** Parks the `reserve` step after it took the reservation. */
 let reserveGate: Gate | undefined;
 const clearedIssues: string[] = [];
+/** Tracker status by issue id, as a Jira-style tracker holds it; the poll decision buckets on it. */
+const trackerStatus = new Map<string, string>();
+const planningFailedCalls: Array<{ issueId: string; reason: string }> = [];
+const planCompleteCalls: Array<{ issueId: string; opts: { awaitApproval: boolean } }> = [];
+let failPlanningFailed = false;
 const comments: string[] = [];
+/** Run tokens the simulated launch minted, by dispatch id (the real launch mints them in `buildPlanningLaunch`). */
+const mintedTokens = new Map<string, string>();
+const JIRA_TOKEN_SECRET = "jira-planning-token-secret-with-entropy";
 const issues = new Map<string, { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }>();
 
 describe("Restate PlanningRun pilot: production-composition proof", () => {
-  let environments: Map<string, RestateTestEnvironment>;
-  let deadlineEnvironments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
+  let deadlineEnvironments: Map<string, RestateEnvironment>;
   let counter = 0;
 
   beforeAll(async () => {
@@ -226,6 +261,11 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     vi.stubGlobal("fetch", async (url: string | URL | Request, init?: RequestInit) => {
       const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
       if (!href.startsWith("https://api.github.com/")) return realFetch(url as never, init);
+      if (href.endsWith("/contents/.ai-implement/image.yml")) {
+        if (!gh.evilImage) return new Response("not found", { status: 404 });
+        const content = Buffer.from("image: evil.example/runner:1\n").toString("base64");
+        return new Response(JSON.stringify({ type: "file", encoding: "base64", content }), { status: 200 });
+      }
       if (!href.includes(`/repos/${OWNER}/${REPO}/actions/workflows/claude-plan.yml/runs`)) throw new Error(`unexpected GitHub call ${href}`);
       const listGate = gh.listGate;
       if (listGate && !listGate.isReached()) await listGate.wait();
@@ -240,8 +280,23 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
 
     const provider = {
       id: "linear",
-      findByKey: async (key: string) => issues.get(key) ?? null,
+      findByKey: async (key: string) => {
+        const found = issues.get(key);
+        // Jira answers an empty scopeKey from `findByKey` on purpose.
+        return found && key.startsWith("PLT-JIRA") ? { ...found, scopeKey: "" } : found ?? null;
+      },
       clearWorkingState: async (issueId: string) => { clearedIssues.push(issueId); return true; },
+      markPlanComplete: async (issueId: string, _scopeKey: string, opts: { awaitApproval: boolean }) => {
+        planCompleteCalls.push({ issueId, opts });
+        trackerStatus.set(issueId, opts.awaitApproval ? "Awaiting Approval" : "Plan Approved");
+      },
+      markPlanningFailed: async (issueId: string, _scopeKey: string, reason: string) => {
+        planningFailedCalls.push({ issueId, reason });
+        if (failPlanningFailed) throw new Error("injected: tracker down");
+        trackerStatus.set(issueId, "Planning Failed");
+        comments.push(`Planning failed: ${reason}`);
+        return true;
+      },
       issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
       postComment: async (_issueId: string, body: string) => { comments.push(body); },
     };
@@ -258,6 +313,11 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       launchPlanningRun: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }; dispatchId: string; admissionGeneration: number }) => {
         launches.push(args.issue.identifier);
         if (launchGate) await launchGate.wait();
+        // As `buildPlanningLaunch` does: the token carries the issue's scopeKey as its mapping key.
+        mintedTokens.set(args.dispatchId, mintRunToken({
+          issueId: args.issue.id, mappingTeamKey: args.issue.scopeKey, phase: "planning", dispatchId: args.dispatchId,
+          ttlSeconds: 600, secret: JIRA_TOKEN_SECRET,
+        }).token);
         // The real function writes the row after the dispatch call succeeds.
         appendLog({
           issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
@@ -319,6 +379,10 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     backends.reset();
     launches.length = 0;
     clearedIssues.length = 0;
+    trackerStatus.clear();
+    planningFailedCalls.length = 0;
+    planCompleteCalls.length = 0;
+    failPlanningFailed = false;
     comments.length = 0;
     sim.notices = [];
     sim.failAfterEffect = new Set();
@@ -331,7 +395,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
 
   const labels = VARIANTS.map(([label]) => label);
 
-  function baseUrl(label: string, envs: Map<string, RestateTestEnvironment> = environments): string {
+  function baseUrl(label: string, envs: Map<string, RestateEnvironment> = environments): string {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env.baseUrl();
@@ -340,11 +404,12 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   /** Submits the run; the workflow takes the reservation in its first step. */
   async function dispatch(
     label: string, identifier: string,
-    backend: PlanningRunInput["backend"] = "github-actions", envs: Map<string, RestateTestEnvironment> = environments,
+    backend: PlanningRunInput["backend"] = "github-actions", envs: Map<string, RestateEnvironment> = environments,
   ) {
     const dispatchId = `plan-${label}-${counter++}`;
     const issue = { id: `id-${dispatchId}`, identifier, title: `Issue ${identifier}`, scopeKey: TEAM, nativeStatus: "Todo" };
     issues.set(identifier, issue);
+    trackerStatus.set(issue.id, "Ready");
     const url = baseUrl(label, envs);
     const client = createPlanningRunIngressClient(url);
     const input: PlanningRunInput = {
@@ -356,7 +421,6 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     await eventually(() => read(), (st) => st.step !== null && st.step !== "reserve", { label: `${dispatchId} past reserve` });
     const hook = createPlanningAdmissionTerminationHook({
       ingress: client,
-      legacy: async () => { throw new Error("the Legacy fast release must not run for a Restate-owned reservation"); },
     });
     return { dispatchId, issue, read, hook };
   }
@@ -364,6 +428,31 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   const released = (dispatchId: string) => readAdmission(dispatchId)?.releasedAt != null;
   async function untilReleased(dispatchId: string): Promise<void> {
     await eventually(() => released(dispatchId), (ok) => ok, { label: `reservation ${dispatchId} released`, timeoutMs: 20_000 });
+  }
+
+  /** One poll decision as `poll()` makes it: bucket the issues by tracker status like `fetchAIImplementSnapshot`
+   *  (`Ready` plans, `Plan Approved` implements), then select with the real gate. */
+  function pollDispatches(issueId: string): { planning: number; implementation: number } {
+    const status = trackerStatus.get(issueId);
+    const issue = [...issues.values()].find((i) => i.id === issueId)!;
+    const needsPlanning = status === "Ready" ? [issue] : [];
+    const readyForImplementation = status === "Plan Approved" ? [issue] : [];
+    const planningIds = new Set(needsPlanning.map((i) => i.id));
+    const mappings = getMappings();
+    const selected = selectIssuesToDispatch(
+      [...readyForImplementation, ...needsPlanning] as never, mappings, {},
+      (id) => !canDispatch({
+        issueId: id, kind: planningIds.has(id) ? "planning" : "implementation", teamKey: TEAM,
+        maxInProgressAiIssues: mappings[TEAM].maxInProgressAiIssues,
+      }).ok,
+    );
+    return {
+      planning: selected.filter((i) => planningIds.has(i.id)).length,
+      implementation: selected.filter((i) => !planningIds.has(i.id)).length,
+    };
+  }
+  function expectNoDispatchRounds(issueId: string): void {
+    for (let i = 0; i < 5; i++) expect(pollDispatches(issueId)).toEqual({ planning: 0, implementation: 0 });
   }
 
   it.each(labels)("a callback-closed run releases the reservation and leaves the closed row alone (%s)", async (label) => {
@@ -388,6 +477,34 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(getJobByDispatchId(w.dispatchId)).toEqual({ ...closed, notifiedAt: expect.any(Number) });
     expect(sim.remediateCalls).toBe(0);
     expect(clearedIssues).toEqual([]);
+  }, 60_000);
+
+  it.each(labels)("a Jira-style provider (findByKey scopeKey empty) still completes: the callback lands and report resolves (%s)", async (label) => {
+    gh.statusGate = gate("first status read");
+    const w = await dispatch(label, "PLT-JIRA");
+    await gh.statusGate.reached();
+    await waitForStep(w.read, "wait");
+    const token = mintedTokens.get(w.dispatchId)!;
+    expect(token).toBeDefined();
+    expect(getDb().prepare("SELECT mapping_team_key AS k FROM runner_tokens WHERE dispatch_id = ?").get(w.dispatchId)).toEqual({ k: TEAM });
+
+    const res = await handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [{ body: "plan" }] },
+      secret: JIRA_TOKEN_SECRET,
+      resolveProvider: async () => ({ postComment: async () => {}, markPlanComplete: async () => {} }) as never,
+      checkPlanningAdmissionTermination: w.hook,
+    });
+    expect(res.status).toBe(200);
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "completed", conclusion: "planning_callback" });
+    gh.runs[0].status = "completed";
+    gh.statusGate.release();
+
+    await untilReleased(w.dispatchId);
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ conclusion: "planning_callback", teamKey: TEAM });
+    expect(sim.remediateCalls).toBe(0);
+    expect(launches).toEqual(["PLT-JIRA"]);
   }, 60_000);
 
   it.each(labels)("an operator release of the owned row leaves the workflow's later release answering not_owner, and the workflow ends (%s)", async (label) => {
@@ -443,38 +560,159 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "deadline_exceeded" });
     expect(breakerFailures(w.issue.id)).toBe(1);
     expect(comments).toHaveLength(1);
+    expect(planningFailedCalls).toHaveLength(1);
+    expect(planningFailedCalls[0].reason).toMatch(/deadline[\s\S]*Unpark[\s\S]*\/admin#runners/);
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(clearedIssues).toEqual([]);
+    expectNoDispatchRounds(w.issue.id);
     expect(sim.notices).toHaveLength(1);
     expect(sim.notices[0]).toMatchObject({ status: "timed_out", phase: "planning", issueIdentifier: "PLT-21" });
     expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "timed_out", notifiedAt: expect.any(Number) });
   }, 60_000);
 
-  it.each(labels)("a retried outcome step counts one breaker failure and one stuck attempt (%s)", async (label) => {
-    // The first attempt of `finish-job-deadline` and of `outcome` run the real effect and then throw.
-    sim.failAfterEffect = new Set(["finish", "outcome"]);
+  it.each(labels)("a retried outcome step counts one breaker failure and the failure handling adds no stuck attempt (%s)", async (label) => {
+    // The first attempt of `outcome` runs the real effect and then throw.
+    sim.failAfterEffect = new Set(["outcome"]);
     const w = await dispatch(label, "PLT-22", "github-actions", deadlineEnvironments);
     await untilReleased(w.dispatchId);
     expect(breakerFailures(w.issue.id)).toBe(1);
-    expect(getStuckAttempts(w.issue.id)).toBe(1);
+    expect(getStuckAttempts(w.issue.id)).toBe(0);
     expect(sim.notices).toHaveLength(1);
     expect(sim.failAfterEffect.size).toBe(0);
   }, 60_000);
 
-  it.each(labels)("a run that ends with no callback closes the row as failed and handles the failure one time (%s)", async (label) => {
+  async function endWithNoCallback(label: string, identifier: string) {
     gh.statusGate = gate("first status read");
-    const w = await dispatch(label, "PLT-2");
+    const w = await dispatch(label, identifier);
     await gh.statusGate.reached();
     await waitForStep(w.read, "wait");
     expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "running" }); // in flight, bound to its run
-
     gh.runs[0].status = "completed";
     gh.statusGate.release();
     await untilReleased(w.dispatchId);
+    return w;
+  }
 
-    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed" });
+  it.each(labels)("a run that ends with no callback is failed and parked, with one failure comment and no requeue (%s)", async (label) => {
+    const w = await endWithNoCallback(label, "PLT-2");
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback" });
     expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
-    expect(sim.remediateCalls).toBe(1);
-    expect(clearedIssues).toEqual([w.issue.id]);
+    expect(planningFailedCalls).toHaveLength(1);
+    expect(planningFailedCalls[0].reason).toMatch(/no planning result[\s\S]*Unpark[\s\S]*\/admin#runners[\s\S]*Ready/);
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(clearedIssues).toEqual([]);
+    expect(sim.remediateCalls).toBe(0);
+    expect(comments).toHaveLength(1);
+    expectNoDispatchRounds(w.issue.id);
   }, 60_000);
+
+  it.each(labels)("a retried finish-job step posts no second comment (%s)", async (label) => {
+    sim.failAfterEffect = new Set(["finish"]);
+    const w = await endWithNoCallback(label, "PLT-4");
+    expect(sim.failAfterEffect.size).toBe(0);
+    expect(planningFailedCalls).toHaveLength(1);
+    expect(comments).toHaveLength(1);
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback" });
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+  }, 60_000);
+
+  it.each(labels)("a no-callback run with the tracker down is still parked and released, and the outcome step posts one comment (%s)", async (label) => {
+    failPlanningFailed = true;
+    const w = await endWithNoCallback(label, "PLT-3");
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback", failureCommentedAt: null });
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(clearedIssues).toEqual([]);
+    expect(comments).toHaveLength(1);
+    // The status write failed, so the tracker still says Ready: only the park holds the loop.
+    expect(trackerStatus.get(w.issue.id)).toBe("Ready");
+    expectNoDispatchRounds(w.issue.id);
+  }, 60_000);
+
+  describe.each([false, true])("a successful plan (autoApprovePlans %s)", (autoApprove) => {
+    afterEach(() => {
+      getDb().prepare("UPDATE mappings SET auto_approve_plans = 1 WHERE team_key = ?").run(TEAM);
+    });
+
+    it.each(labels)(autoApprove ? "starts implementation at once (%s)" : "waits for a person before implementation (%s)", async (label) => {
+      getDb().prepare("UPDATE mappings SET auto_approve_plans = ? WHERE team_key = ?").run(autoApprove ? 1 : 0, TEAM);
+      gh.statusGate = gate("first status read");
+      const w = await dispatch(label, "PLT-JIRA-4");
+      await gh.statusGate.reached();
+      await waitForStep(w.read, "wait");
+      const res = await handleRunnerResult({
+        authorization: `Bearer ${mintedTokens.get(w.dispatchId)!}`,
+        body: { phase: "planning", outcome: "success", comments: [{ body: "plan" }] },
+        secret: JIRA_TOKEN_SECRET,
+        resolveProvider: async () => ({ postComment: async () => {}, markPlanComplete: async (id: string, _k: string, opts: { awaitApproval: boolean }) => {
+          planCompleteCalls.push({ issueId: id, opts });
+          trackerStatus.set(id, opts.awaitApproval ? "Awaiting Approval" : "Plan Approved");
+        } }) as never,
+        checkPlanningAdmissionTermination: w.hook,
+      });
+      expect(res.status).toBe(200);
+      gh.runs[0].status = "completed";
+      gh.statusGate.release();
+      await untilReleased(w.dispatchId);
+
+      expect(planCompleteCalls).toEqual([{ issueId: w.issue.id, opts: { awaitApproval: !autoApprove } }]);
+      expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "completed", conclusion: "planning_callback" });
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+      if (autoApprove) {
+        expect(pollDispatches(w.issue.id)).toEqual({ planning: 0, implementation: 1 });
+        return;
+      }
+      expect(trackerStatus.get(w.issue.id)).toBe("Awaiting Approval");
+      expectNoDispatchRounds(w.issue.id);
+      trackerStatus.set(w.issue.id, "Plan Approved");
+      expect(pollDispatches(w.issue.id)).toEqual({ planning: 0, implementation: 1 });
+    }, 60_000);
+  });
+
+  describe.each([false, true])("Jira refuses the plan-complete write (Jira also refuses the failure write: %s)", (alsoRefuseFailure) => {
+    const JIRA_TEXT = "Option value 'Awaiting Approval' is not valid";
+
+    it.each(labels)("fails the run, parks the issue and breaks the planning loop (%s)", async (label) => {
+      gh.statusGate = gate("first status read");
+      const w = await dispatch(label, "PLT-JIRA-5");
+      await gh.statusGate.reached();
+      await waitForStep(w.read, "wait");
+      const refusal = new JiraApiError(400, `{"errors":{"customfield_12308":"${JIRA_TEXT}"}}`, "Jira 400");
+      const failureWrites: string[] = [];
+      const res = await handleRunnerResult({
+        authorization: `Bearer ${mintedTokens.get(w.dispatchId)!}`,
+        body: { phase: "planning", outcome: "success", comments: [{ body: "plan" }] },
+        secret: JIRA_TOKEN_SECRET,
+        resolveProvider: async () => ({
+          postComment: async () => {},
+          markPlanComplete: async () => { throw refusal; },
+          markPlanningFailed: async (id: string, _k: string, reason: string) => {
+            failureWrites.push(reason);
+            if (alsoRefuseFailure) throw refusal;
+            trackerStatus.set(id, "Planning Failed");
+            return true;
+          },
+        }) as never,
+        checkPlanningAdmissionTermination: w.hook,
+      });
+      expect(res.status).toBe(200);
+      gh.runs[0].status = "completed";
+      gh.statusGate.release();
+      await untilReleased(w.dispatchId);
+
+      const row = getJobByDispatchId(w.dispatchId);
+      expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
+      expect(row?.failure?.message).toContain(JIRA_TEXT);
+      expect(isParked(w.issue.id, "planning")).toBe(true);
+      expect(failureWrites).toHaveLength(1);
+      expect(failureWrites[0]).toContain(JIRA_TEXT);
+      expect(trackerStatus.get(w.issue.id)).toBe(alsoRefuseFailure ? "Ready" : "Planning Failed");
+
+      trackerStatus.set(w.issue.id, "Ready");
+      expectNoDispatchRounds(w.issue.id);
+    }, 60_000);
+  });
 
   it.each(labels)("two dispatches seconds apart bind their own runs by title and release their own reservations (%s)", async (label) => {
     launchAckLost = true;
@@ -504,6 +742,23 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(gh.statusReads).not.toContain(1);
     expect(sim.remediateCalls).toBe(0);
   }, 60_000);
+
+  it.each([false, true])("Fly never-started planning parks and releases even when the diagnostic read fails (%s)", async failedRead => {
+    const w = await dispatch(labels[0], "PLT-NEVER", "fly-machines");
+    await waitForStep(w.read, "wait");
+    const { jobId } = await w.read();
+    backends.neverStarted = true;
+    backends.machines.set(jobId!, "destroyed");
+    // A missing machine is an ended status; the diagnostic read must also tolerate its 404.
+    if (failedRead) backends.machines.delete(jobId!);
+    await untilReleased(w.dispatchId);
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback" });
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    expect(planningFailedCalls).toHaveLength(1);
+    expect(planningFailedCalls[0].reason).toContain(failedRead ? "the run ended with no planning result" : "Fly removed the machine before it started");
+    expect(sim.notices).toHaveLength(1);
+  });
 
   describe.each(["fly-machines", "local-docker"] as const)("backend %s", (backend) => {
     const running = (id: string) => (backend === "fly-machines" ? backends.machines.get(id) === "started" : backends.containers.get(id) === true);
@@ -647,7 +902,6 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       const read = (id: string) => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", id, "status");
       const hook = createPlanningAdmissionTerminationHook({
         ingress: createPlanningRunIngressClient(url),
-        legacy: async () => { throw new Error("the Legacy fast release must not run for a Restate-owned reservation"); },
       });
       const runA = await eventually(() => read(resA.dispatchId), (s) => s.jobId !== null, { label: "first bound" });
       const runB = await eventually(() => read(resB.dispatchId), (s) => s.jobId !== null, { label: "second bound" });
@@ -854,6 +1108,62 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     }, 60_000);
   });
 
+  describe("the runner image check (AII-1323)", () => {
+    let imageEnvironments: Map<string, RestateEnvironment>;
+
+    beforeAll(async () => {
+      const provider = {
+        id: "linear",
+        findByKey: async (key: string) => issues.get(key) ?? null,
+        clearWorkingState: async () => true,
+        issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
+        postComment: async () => {},
+      };
+      const config = {
+        githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app",
+        runnerCallbackBaseUrl: "http://callback.test", runnerTokenSecret: "planning-image-secret-with-enough-entropy",
+        sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest", runnerImageExplicit: false,
+      } as never;
+      sim.timing = SLOW;
+      imageEnvironments = await startVariants(createProductionPlanningRunServices({
+        config,
+        resolveProvider: async () => provider as never,
+        // The real check, as production wires it (resolveDispatchRunnerImage in src/index.ts).
+        resolveRunnerImage: (cfg, mapping, ghToken) => resolveRunnerImageForDispatch({
+          owner: mapping.owner, repo: mapping.repo, token: ghToken,
+          defaultImage: cfg.sessionImage, runnerImageExplicit: cfg.runnerImageExplicit,
+        }),
+        fireBreakerTrip: async () => {},
+        preparePlanningLaunch,
+        launchPlanningRun: (async (args: { issue: { identifier: string } }) => {
+          launches.push(args.issue.identifier);
+          return { outcome: "accepted", runId: gh.nextRunId++ };
+        }) as never,
+        launchPlanningSession: (async () => { throw new Error("not used: the scenario runs on github-actions"); }) as never,
+        reportTerminalJob: async () => {},
+        sessionDeps: {} as never,
+      }).services);
+    }, 60_000);
+
+    afterAll(async () => { await stopAll(imageEnvironments); });
+    afterEach(() => { gh.evilImage = false; });
+
+    it.each(labels)("an image.yml naming a disallowed image ends launch_rejected, releases the reservation and starts no run (%s)", async (label) => {
+      gh.evilImage = true;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const w = await dispatch(label, "PLT-70", "github-actions", imageEnvironments);
+      await waitForStep(w.read, "released");
+      await untilReleased(w.dispatchId);
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "launch_rejected" });
+      expect(launches).toEqual([]);
+      expect(gh.runs).toEqual([]);
+      const env = imageEnvironments.get(label)!;
+      const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`);
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), rows[0].id as string);
+      expect(names.filter((n) => n === "dispatch")).toHaveLength(1);
+    }, 60_000);
+  });
+
   it("the stale-admission sweep and the terminal-callback reconcile leave a Restate-owned planning row", async () => {
     const dispatchId = "plan-sweep-1";
     const decision = acquire({
@@ -881,10 +1191,135 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     if (!decision.ok) throw new Error("admission deferred");
 
     expect(listActiveRestateReviewFixPrs()).toEqual([]);
-    expect(queueReviewFixCancellationForClosedPr(`${OWNER}/${REPO}`, 1)).toBe(false);
-    const facade = createReviewFixAdminFacade(new SqliteReviewFixAttemptStore(), { reconcile: async () => ({ status: "unknown" }) });
+    expect(await queueReviewFixCancellationForClosedPr(`${OWNER}/${REPO}`, 1, { cancel: async () => ({ status: "accepted" }) })).toBe(false);
+    const facade = createReviewFixAdminFacade(new SqliteReviewFixAttemptStore(), { reconcile: async () => ({ status: "unknown" }) }, { cancel: async () => ({ status: "accepted" }) });
     expect(await facade.getAttempt(dispatchId, { role: "admin", email: "operator@example.com" })).toEqual({ status: "not_found" });
     expect(() => mintPreparedReviewFixToken({ attemptId: dispatchId, audience: "result", secret: "s" })).toThrow(/no current authority/);
     expect(getDb().prepare("SELECT COUNT(*) AS n FROM runner_tokens WHERE dispatch_id = ?").get(dispatchId)).toEqual({ n: 0 });
   });
+
+  describe("the run tokens of a planning launch (AII-1320)", () => {
+    const TOKEN_SECRET = "planning-token-secret-with-enough-entropy";
+    /** What each launch received: the audiences present and the token strings. */
+    let received: Array<{ audiences: string[]; tokens: string[] }> = [];
+    let throwAfterMint = false;
+    let tokenEnvironments: Map<string, RestateEnvironment>;
+
+    const seen = (tokens: Record<string, string | undefined>) => {
+      const named: Record<string, string | undefined> = { result: tokens.result, progress: tokens.progress, publication: tokens.publication };
+      const present = Object.entries(named).filter(([, v]) => v);
+      received.push({ audiences: present.map(([k]) => k), tokens: present.map(([, v]) => v as string) });
+    };
+
+    beforeAll(async () => {
+      const provider = {
+        id: "linear",
+        findByKey: async (key: string) => issues.get(key) ?? null,
+        clearWorkingState: async () => true,
+        issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
+        postComment: async () => {},
+      };
+      const outcomeConfig = { notifyType: "slack", notifyWebhookUrl: "https://hooks.test/notify" } as never;
+      const outcomeRegistry = { forMapping: async () => provider } as never;
+      const config = {
+        githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app",
+        runnerCallbackBaseUrl: "http://callback.test", runnerTokenSecret: TOKEN_SECRET,
+      } as never;
+      sim.timing = SLOW;
+      tokenEnvironments = await startVariants(createProductionPlanningRunServices({
+        config,
+        resolveProvider: async () => provider as never,
+        resolveRunnerImage: async () => undefined,
+        fireBreakerTrip: async () => {},
+        // The real preparation mints the tokens, as production does.
+        preparePlanningLaunch,
+        launchPlanningRun: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string }; dispatchId: string; admissionGeneration: number; planningDispatchInputs: Record<string, string> }) => {
+          const inputs = args.planningDispatchInputs;
+          seen({ result: inputs.run_token, progress: inputs.run_progress_token, publication: inputs.run_publication_token });
+          if (throwAfterMint) {
+            throwAfterMint = false;
+            throw new Error("injected: the launch call failed after the mint");
+          }
+          appendLog({
+            issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
+            repo: `${OWNER}/${REPO}`, dispatchId: args.dispatchId, admissionGeneration: args.admissionGeneration,
+            executionMode: "github-actions", phase: "planning",
+          });
+          const run: SimRun = { id: gh.nextRunId++, title: `${PLANNING_RUN_TITLE_PREFIX}${args.issue.identifier}`, createdAt: new Date().toISOString(), status: "in_progress" };
+          gh.runs.push(run);
+          return { outcome: "accepted", runId: run.id };
+        }) as never,
+        // The real dispatchSession mints for the container backends; only the launch call is simulated.
+        launchPlanningSession: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }; execPath: "fly-machines" | "local-docker"; mapping: never; reservation: { dispatchId: string } }) => {
+          const session = await dispatchSession(config, provider as never, args.issue as never, args.mapping, { count: 0, lastDispatchedAt: null }, "default", {
+            phase: "planning", tokenTtlSeconds: 1800, doMarkDispatched: false, shadow: false, backendKind: args.execPath,
+            onPostDispatch: async () => {},
+            backend: async ({ runToken, runProgressToken, runPublicationToken, markLaunchAttempted }) => {
+              seen({ result: runToken, progress: runProgressToken, publication: runPublicationToken });
+              markLaunchAttempted();
+              const id = `${args.execPath === "fly-machines" ? "m" : "c"}-${++backends.created}`;
+              if (args.execPath === "fly-machines") backends.machines.set(id, "started"); else backends.containers.set(id, true);
+              backends.names.set(planningSessionName(args.reservation.dispatchId), id);
+              return { machineId: id, sessionImage: "img", ghToken: "sim-gh-token", executionMode: args.execPath, statusComment: null };
+            },
+          }, args.reservation as never);
+          return session.admitted
+            ? { outcome: "accepted", machineId: session.machineId, executionMode: args.execPath }
+            : { outcome: "rejected", executionMode: args.execPath };
+        }) as never,
+        reportTerminalJob: async (job) => { await reportTerminalJob(outcomeConfig, outcomeRegistry, job, { ownerCall: true }); },
+        sessionDeps: {} as never,
+      }).services);
+    }, 60_000);
+
+    afterAll(async () => { await stopAll(tokenEnvironments); });
+    beforeEach(() => { received = []; throwAfterMint = false; });
+
+    /** Ends the run the way the backend's own end does, then waits for the release. */
+    async function finish(w: Awaited<ReturnType<typeof dispatch>>, backend: PlanningRunInput["backend"]) {
+      const { jobId } = await eventually(() => w.read(), (st) => st.jobId !== null, { label: "bound" });
+      updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+      await w.hook(w.dispatchId);
+      if (backend === "github-actions") gh.runs.find((r) => String(r.id) === jobId)!.status = "completed";
+      else if (backend === "fly-machines") backends.machines.set(jobId!, "destroyed");
+      else backends.containers.set(jobId!, false);
+      await untilReleased(w.dispatchId);
+    }
+
+    async function journalOf(label: string, dispatchId: string): Promise<Array<Record<string, unknown>>> {
+      const env = tokenEnvironments.get(label)!;
+      const rows = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${dispatchId}'`),
+        (r) => r.length > 0, { label: "PlanningRun invocation" });
+      return journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+    }
+
+    describe.each(["github-actions", "fly-machines", "local-docker"] as const)("backend %s", (backend) => {
+      it.each(labels)("the launch receives exactly the result and progress tokens, and the journal holds neither (%s)", async (label) => {
+        const w = await dispatch(label, "PLT-60", backend, tokenEnvironments);
+        await waitForStep(w.read, "wait");
+        expect(received).toHaveLength(1);
+        expect(received[0].audiences.sort()).toEqual(["progress", "result"]);
+        // Read while the workflow waits: Restate trims the `dispatch` entry once the run finishes, so a read
+        // after `finish()` finds no token for any reason. The entry must be present before its absence counts.
+        const journal = await journalOf(label, w.dispatchId);
+        expect(() => journaledRunResult(journal, "dispatch")).not.toThrow();
+        const text = journalText(journal);
+        for (const token of received[0].tokens) expect(text).not.toContain(token);
+        await finish(w, backend);
+      }, 60_000);
+    });
+
+    // Depends on a retry (docs/restate-testing.md), so alwaysReplay only. disableRetries fails the invocation at once.
+    it("a launch that throws after the mint is retried, mints again, and the workflow does not end launch_rejected (alwaysReplay)", async () => {
+      throwAfterMint = true;
+      const w = await dispatch("alwaysReplay", "PLT-61", "github-actions", tokenEnvironments);
+      await waitForStep(w.read, "wait");
+      expect(received).toHaveLength(2);
+      expect(received[1].audiences.sort()).toEqual(["progress", "result"]);
+      await finish(w, "github-actions");
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    }, 60_000);
+  });
+
 });

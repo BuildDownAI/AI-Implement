@@ -1,13 +1,12 @@
-// Proves the binary-backed Restate environment (AII-914). Forces the binary runtime, so it
-// needs no Docker. Run with `npm run test:restate`.
-process.env.RESTATE_TEST_RUNTIME = "binary";
-
+// Proves the binary-backed Restate environment (AII-914). Needs no Docker. Run with
+// `npm run test:restate`.
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import * as restate from "@restatedev/restate-sdk";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { RestateBinaryNotFoundError, startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
-import { attachWorkflow, callService, callWorkflow, restateTestRuntime } from "./harness.js";
+import { attachWorkflow, callService, callWorkflow } from "./harness.js";
 
 const echo = restate.service({
   name: "binaryEcho",
@@ -60,8 +59,10 @@ describe("binary Restate environment (AII-914)", () => {
     await Promise.all(envs.map((env) => env.stop()));
   });
 
-  it("selects the binary runtime when forced", () => {
-    expect(restateTestRuntime()).toBe("binary");
+  it("serves the ingress and admin API on loopback addresses of the spawned server", async () => {
+    const env = await start({ services: [echo] });
+    expect(new URL(env.baseUrl()).hostname).toBe("127.0.0.1");
+    expect(new URL(env.adminAPIBaseUrl()).hostname).toBe("127.0.0.1");
   });
 
   it("answers a service handler through the ingress", async () => {
@@ -92,7 +93,7 @@ describe("binary Restate environment (AII-914)", () => {
       body: "{}",
     });
     expect(submit.ok).toBe(true);
-    await env.startedRestateContainer.restart();
+    await env.startedRestateServer.restart();
     await callWorkflow(base, "binaryWaiter", key, "release", "resumed");
     await vi.waitFor(async () => expect(await attachWorkflow(base, "binaryWaiter", key)).toBe("resumed"), { timeout: 30_000, interval: 250 });
   }, 180_000);
@@ -114,5 +115,13 @@ describe("binary Restate environment (AII-914)", () => {
     expect(alive(pid!)).toBe(false);
     expect(existsSync(dir)).toBe(false);
     await expect(env.stop()).resolves.toBeUndefined();
+  }, 120_000);
+
+  it("leaves no invoker spill directory in the system temp directory", async () => {
+    const invokerDirs = () => new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("invoker-")));
+    const before = invokerDirs();
+    const env = await startBinaryEnvironment({ services: [echo] });
+    await env.stop();
+    expect([...invokerDirs()].filter((name) => !before.has(name))).toEqual([]);
   }, 120_000);
 });

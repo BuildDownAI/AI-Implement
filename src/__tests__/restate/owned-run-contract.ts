@@ -2,7 +2,7 @@
 // workflow with an OwnedRunAdapter and calls registerOwnedRunContract inside a describe block of
 // its own `*.restate.test.ts` file. The file is not named `.test.ts`, so vitest does not collect
 // it. Scenarios hold the workflow with `waitForStep` and never sleep.
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { describe, expect, it } from "vitest";
 import { VARIANTS, waitForStep } from "./harness.js";
 
@@ -35,12 +35,17 @@ export interface OwnedRunHandle {
   read(): Promise<{ step: string | null }>;
   /** Makes the run end normally (the result signal). */
   finish(): Promise<void>;
+  /** Required when scenario 6 is active; pending consumers need no implementation yet. */
+  report?(value: unknown): Promise<{ status: "accepted" | "duplicate" }>;
+  acceptedCount?(): number;
 }
 
 export interface OwnedRunAdapter {
+  /** Admission contract keeps occupancy through unreadable termination (ImplementationRun). */
+  retainUnconfirmed?: boolean;
   /** Names the describe block. */
   name: string;
-  /** The scenario numbers that apply to this run kind; all five when absent. The adapter's test file states why each other one does not apply. */
+  /** The scenario numbers that apply to this run kind; all six when absent. The adapter's test file states why each other one does not apply. */
   scenarios?: number[];
   /** False when the run kind has no cleanup step (its marker release is the cleanup); scenario 1 then expects no `cleanup:<runId>` call. Default true. */
   hasCleanup?: boolean;
@@ -64,7 +69,7 @@ export interface OwnedRunContractOptions {
 
 export function registerOwnedRunContract(
   adapter: OwnedRunAdapter,
-  envFor: (label: string) => RestateTestEnvironment,
+  envFor: (label: string) => RestateEnvironment,
   options: OwnedRunContractOptions = {},
 ): void {
   const labels = VARIANTS.map(([label]) => label);
@@ -82,12 +87,15 @@ export function registerOwnedRunContract(
   const withoutStatus = (calls: string[]) => calls.filter((call) => call !== "status");
 
   describe(`owned-run contract: ${adapter.name}`, () => {
-    scenario(1)("1. a status read that fails on each attempt still reaches the deadline, stops the run, and releases (%s)", async (label) => {
+    scenario(1)("1. repeated read failures reach the deadline and apply the lifecycle admission policy (%s)", async (label) => {
       const run = begin(label, { faults: { failStatusRead: true }, totalMs: DEADLINE_MS });
       await run.done;
       const calls = adapter.calls(run.key);
       expect(calls.filter((call) => call === "status").length).toBeGreaterThanOrEqual(3);
-      expect(withoutStatus(calls)).toEqual(["reserve", "launch", "stop", ...cleanupCalls(run.runId), "outcome", "release"]);
+      expect(withoutStatus(calls)).toEqual(adapter.retainUnconfirmed
+        ? ["reserve", "launch", "stop"]
+        : ["reserve", "launch", "stop", ...cleanupCalls(run.runId), "outcome", "release"]);
+      if (adapter.retainUnconfirmed) expect((await run.read()).step).toBe("termination_unconfirmed");
     }, 30_000);
 
     scenario(2)("2. a crash after the launch step adopts the run and does not launch a second run (%s)", async (label) => {
@@ -116,16 +124,33 @@ export function registerOwnedRunContract(
       expect(calls.filter((call) => call === "launch" || call === "release" || call.startsWith("cleanup"))).toEqual([]);
     }, 30_000);
 
-    scenario(5)("5. a failed cleanup and a failed outcome still release (%s)", async (label) => {
+    scenario(5)("5. failed bookkeeping follows the owner release policy (%s)", async (label) => {
       const run = begin(label, { faults: { failCleanup: true, failOutcome: true }, totalMs: LONG_MS });
       await waitForStep(run.read, "waiting");
       await run.finish();
-      await run.done;
+      if (adapter.retainUnconfirmed) await run.done.catch(() => undefined);
+      else await run.done;
       const calls = withoutStatus(adapter.calls(run.key));
       expect(calls.some((call) => call === `cleanup:${run.runId}`)).toBe(true);
+      if (adapter.retainUnconfirmed) {
+        expect(calls).not.toContain("outcome");
+        expect(calls).not.toContain("release");
+        expect((await run.read()).step).toBe("termination_unconfirmed");
+        return;
+      }
       expect(calls).toContain("outcome");
       expect(calls[calls.length - 1]).toBe("release");
       expect(calls.filter((call) => call === "release")).toHaveLength(1);
+    }, 30_000);
+    scenario(6)("6. a report is accepted once, a repeat is a duplicate, a different report is a 409, and onAccept ran exactly once (%s)", async (label) => {
+      const run = begin(label, { faults: {}, totalMs: LONG_MS });
+      await waitForStep(run.read, "waiting");
+      if (!run.report || !run.acceptedCount) throw new Error("scenario 6 requires report and acceptedCount");
+      expect(await run.report({ usage: { tokens: 12, cost: 1 }, items: [1, 2] })).toMatchObject({ status: "accepted" });
+      await run.done;
+      expect(await run.report({ items: [1, 2], usage: { cost: 1, tokens: 12 } })).toMatchObject({ status: "duplicate" });
+      await expect(run.report({ usage: { tokens: 13, cost: 1 }, items: [1, 2] })).rejects.toThrow(/409/);
+      expect(run.acceptedCount()).toBe(1);
     }, 30_000);
   });
 }

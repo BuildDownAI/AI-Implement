@@ -1,19 +1,19 @@
-// Binary-backed Restate test environment (AII-914): the `restate-server` platform binary
-// that RestateSidecar spawns in production, started as a child process, so the scenario
-// tests run where Docker is absent (a dispatched runner, a machine without a daemon).
+// Restate test environment (AII-914, AII-1195): the `restate-server` platform binary
+// that RestateSidecar spawns in production, started as a child process. It is the only
+// runtime the scenario tests use; no Docker is needed.
 //
-// The returned object carries the five members the scenario files use. The container
-// runtime's name `startedRestateContainer` is kept on purpose: several scenarios call
-// `env.startedRestateContainer.restart()`, and they must run unchanged on both runtimes.
+// The returned object carries the members the scenario files use. The name
+// `startedRestateServer` is the member the scenarios call:
+// `env.startedRestateServer.restart()`, which restarts the server child process.
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import * as http2 from "node:http2";
 import * as net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
-import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } from "@restatedev/restate-sdk-testcontainers";
+import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } from "@restatedev/restate-sdk";
 import { stopChildWithBackstop } from "../../process-stop.js";
 import {
   RESTATE_DEFAULT_NUM_PARTITIONS,
@@ -29,10 +29,16 @@ type RestateServices = Array<
 export interface BinaryEnvironmentOptions {
   services: RestateServices;
   variant?: "alwaysReplay" | "disableRetries";
-  /** Accepted for parity with RestateTestEnvironment; the binary always keeps its state on disk. */
+  /** Accepted for call-site clarity; the binary always keeps its state on disk. */
   storage?: "disk";
   /** Sign the server's calls with a fresh request identity key and have the endpoint verify it (AII-976). */
   requestIdentity?: boolean;
+  /**
+   * Server-wide invoker timeouts (humantime, such as "2s"), in place of the server's defaults of one minute each.
+   * A scenario that proves a handler's own `inactivityTimeout` / `abortTimeout` outlast the server's sets these short,
+   * so it waits seconds, not minutes. With `variant: "alwaysReplay"` the variant's `0s` inactivity timeout stays.
+   */
+  invokerTimeouts?: { inactivity: string; abort: string };
   /** Seam for the missing-binary path; defaults to the resolver RestateSidecar uses. */
   resolveBinary?: () => string | null;
 }
@@ -42,14 +48,14 @@ export interface BinaryEnvironment {
   adminAPIBaseUrl(): string;
   stop(): Promise<void>;
   startedRestateHttpServer: http2.Http2Server;
-  startedRestateContainer: { restart(): Promise<void> };
+  startedRestateServer: { restart(): Promise<void> };
   /** Port the SDK endpoint listens on (loopback). */
   endpointPort(): number;
   /** Public request identity key the endpoint verifies, when `requestIdentity` was set. */
   identityKey(): string | undefined;
   /** Pid of the current child (test seam for the cleanup assertion). */
   childPid(): number | undefined;
-  /** Base directory holding the Restate store (test seam for the cleanup assertion). */
+  /** Temp directory holding the Restate store and the invoker's spill directory (test seam for the cleanup assertion). */
   baseDir(): string;
 }
 
@@ -57,7 +63,7 @@ export class RestateBinaryNotFoundError extends Error {
   constructor() {
     super(
       `RestateBinaryNotFoundError: no @restatedev/restate-server platform binary for ${os.platform()}-${os.arch()}; ` +
-        "run npm install, or use RESTATE_TEST_RUNTIME=container with Docker",
+        "run npm install",
     );
     this.name = "RestateBinaryNotFoundError";
   }
@@ -103,7 +109,12 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
   const bin = (options.resolveBinary ?? resolvePlatformBinary)();
   if (!bin) throw new RestateBinaryNotFoundError();
 
-  const baseDir = await mkdtemp(path.join(os.tmpdir(), "restate-binary-env-"));
+  // One temp root holds the store and the invoker's spill directory, side by side.
+  // With no node name set, the server reads the directory under RESTATE_BASE_DIR as its node's data
+  // and refuses to start beside a second one, which the spill directory becomes once an invocation is in flight.
+  const root = await mkdtemp(path.join(os.tmpdir(), "restate-binary-env-"));
+  const baseDir = path.join(root, "store");
+  await mkdir(baseDir);
   let adminUrl = "";
   let ingressUrl = "";
 
@@ -133,6 +144,8 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     RESTATE_LISTEN_MODE: "tcp",
     RESTATE_DEFAULT_NUM_PARTITIONS,
     RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
+    // Unset, the invoker creates one spill directory per partition under TMPDIR at start and never removes them.
+    RESTATE_WORKER__INVOKER__TMP_DIR: path.join(root, "invoker"),
   });
   let identityKey: string | undefined;
   if (options.requestIdentity) {
@@ -140,7 +153,11 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     identityKey = identity.publicKey;
     childEnv.RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE = identity.privateKeyPath;
   }
-  // Same values RestateContainer.alwaysReplay() / .disableRetries() set.
+  if (options.invokerTimeouts) {
+    childEnv.RESTATE_WORKER__INVOKER__INACTIVITY_TIMEOUT = options.invokerTimeouts.inactivity;
+    childEnv.RESTATE_WORKER__INVOKER__ABORT_TIMEOUT = options.invokerTimeouts.abort;
+  }
+  // Same values the variant hooks set on a server.
   if (options.variant === "alwaysReplay") {
     childEnv.RESTATE_WORKER__INVOKER__INACTIVITY_TIMEOUT = "0s";
   } else if (options.variant === "disableRetries") {
@@ -220,7 +237,7 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
       for (const session of sessions) session.destroy();
     });
     if (child) await stopChildWithBackstop(child, STOP_TIMEOUT_MS);
-    await rm(baseDir, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
   };
 
   try {
@@ -264,7 +281,7 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     adminAPIBaseUrl: () => adminUrl,
     stop,
     startedRestateHttpServer: endpoint,
-    startedRestateContainer: {
+    startedRestateServer: {
       restart: async () => {
         if (child) await stopChildWithBackstop(child, STOP_TIMEOUT_MS);
         await spawnChild();
@@ -274,6 +291,6 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     endpointPort: () => (endpoint.address() as net.AddressInfo).port,
     identityKey: () => identityKey,
     childPid: () => (child as ChildProcess | null)?.pid,
-    baseDir: () => baseDir,
+    baseDir: () => root,
   };
 }

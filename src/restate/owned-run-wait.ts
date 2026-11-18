@@ -68,6 +68,12 @@ export interface OwnedRunWaitOptions {
   readStatus?: () => Promise<OwnedRunStatus>;
   /** Starting value, so a caller that calls again (a second phase) keeps what it knew. */
   startedSeen?: boolean;
+  /**
+   * Optional extra arm, called once per race (never cached): a promise that rejects when the caller
+   * is cancelled. Used by a handler registered with `explicitCancellation`, where the SDK no longer
+   * throws at the pending await. Other callers omit it.
+   */
+  cancelArm?: () => restate.RestatePromise<never>;
 }
 
 export type OwnedRunEvent =
@@ -137,7 +143,7 @@ export async function awaitOwnedRun(ctx: WorkflowContext, opts: OwnedRunWaitOpti
 
     const tick = Math.max(1, Math.min(decision.nextDeadlineAt - now, opts.tickMs));
     const tickArm = ctx.sleep(tick).map((): Arm => ({ kind: "tick" }));
-    const winner = await restate.RestatePromise.race([...signalArms, tickArm]);
+    const winner = await restate.RestatePromise.race([...signalArms, tickArm, ...(opts.cancelArm ? [opts.cancelArm()] : [])]);
     if (winner.kind === "signal") return winner;
     // "tick": loop again, re-reading status and the deadline.
   }

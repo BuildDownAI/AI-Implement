@@ -1,37 +1,52 @@
+import { IMPLEMENT_CONTINUATION_NOTE } from "../feedback-loop-core.js";
+import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../review-publication-limits.js";
+import { buildInlineReviewComments, inlineCommentBody } from "../review-inline-comments.js";
+import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { ReviewerSelection } from "../../config.js";
+import os from "node:os";
+import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary, terminalResultFailureMessage } from "../step-utils.js";
+import { formatGitNameStatusSummary, formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
-import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, type ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
-import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
+import type { ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
+import { classifyLlmResult, isLlmResultFailure, type FailureRecord } from "../failure-classification.js";
 import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
 import { summaryLine } from "../claude-stream.js";
 import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
+  collectClosedReviewThreadCommentUrls,
   collectExternalReviewFindingsFromGh,
+  collectClaudeReviewCommentFromGh,
+  collectReviewFindingsBlocksFromGh,
   formatReviewLedgerForPrompt,
+  type ReviewFindingsVerdict,
   type ReviewLedgerFinding,
   type ReviewLedgerSource,
+  reviewContractFindingGates,
 } from "../review-ledger.js";
 import {
   buildDispositionInstructions,
+  buildClosedFindingsMarker,
+  readClosedFindingKeys,
   DISPOSITIONS_FILE,
   readFindingDispositions,
   replyToDispositionThreads,
   stableReviewFindingKey,
   type FindingDisposition,
 } from "../finding-dispositions.js";
-import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { READ_ONLY_TOOL_PARAMS } from "./read-only-tools.js";
+import { resolveReviewProcess, type ReviewProcessDefinition, type ReviewProcessId, type ReviewVerdictResult } from "../../review-process.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
 import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
 import { DEFAULT_MODEL } from "../default-model.js";
+import { ACCOUNT_FALLBACK_CODES, safeLimitLabel } from "../stage-executor.js";
+import { reasonCodeTag, terminationReasonSentence } from "../../run-autopsy.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -41,8 +56,12 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   reviewProviders?: string[];
   /** Check-run names that identify the external review provider. Defaults to the Claude Code Review check. */
   reviewCheckNames?: string[];
-  /** Project reviewer selections from trusted run_config. Absent keeps direct-call legacy behavior. */
+  /** Project reviewer selections from trusted run_config. Absent uses DEFAULT_REVIEWER_SELECTION. */
   reviewers?: ReviewerSelection[];
+  /** Project review process from trusted run_config: which check/app pairs, verdict reader, and authors gate the PR. */
+  reviewProcess?: ReviewProcessId;
+  /** Extra trusted review author logins from trusted run_config. */
+  trustedReviewAuthors?: string[];
   /** Selected image-baked reviewer code resolved before workspace reviewer config is consulted. */
   trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
   /** Prompt-only reviewer definitions parsed from the trusted default branch config. */
@@ -68,7 +87,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   pushedSha?: string;
 }
 
-type ExternalReviewState = "skipped" | "absent" | "running" | "completed" | "permission-denied";
+type ExternalReviewState = "skipped" | "absent" | "running" | "completed" | "permission-denied" | "no-real-verdict";
 type PostPushReviewTerminationReason =
   | "approved"
   | "pr_merged"
@@ -92,11 +111,16 @@ interface PostPushReviewOutputs extends Record<string, unknown> {
   /** Set only for terminationReason "reviewer_turns_exhausted" — the classified failure the
    *  runner callback reports through `postRunnerResult`/`formatFailureComment`. */
   failure?: FailureRecord;
+  /** Set only for terminationReason "external_review_pending" — the head SHA the internal review
+   *  approved while the external review check was still running. */
+  reviewedHeadSha?: string;
   /** Sum of every review invocation (including superseded retry attempts) and every fix-pass
    *  invocation this step ran. Mirrors report-card.ts's extraCostUsd for this same step id
    *  prefix, so run-autonomous.ts can add it to the ticket-facing "Total cost" and agree with
    *  the report card (BAC-27201). */
   costUsd: number | null;
+  /** Internal findings collected across every review iteration. */
+  internalFindings?: ReviewLedgerFinding[];
   /** Every finding disposition read from the fix agent's dispositions file across every
    *  fix-pass push in this run, deduplicated by findingKey with the last one read winning. */
   findingDispositions: FindingDisposition[];
@@ -116,7 +140,9 @@ const FIX_MAX_TURNS = 45;
 const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
 const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
-const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 300000;
+// November 3–10, 2026: comment p90 6m14s; retrieved check-job p90 6m53s.
+// Ten minutes leaves over three minutes of margin while keeping the wait bounded.
+const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 600_000;
 const CLAUDE_REVIEW_SUMMARY_ID = "claude-review-summary";
 // Check-run names produced by the review workflows in this repository.
 // "review" comes from claude-review.yml (pull_request_target, resolves from the default branch).
@@ -124,10 +150,12 @@ const CLAUDE_REVIEW_SUMMARY_ID = "claude-review-summary";
 // "claude-review", "claude code review", and "claude-code-review" cover repos running earlier
 // workflow versions. The heuristic fallback in isExternalReviewCheckName catches other variants.
 const DEFAULT_REVIEW_CHECK_NAMES = ["review", "code-review-plugin", "claude-review", "claude code review", "claude-code-review"];
-// Allowlist of check-run conclusions that represent a reviewer actually producing findings.
-// Anything outside this set — skipped, neutral, cancelled, timed_out, action_required, and any
-// future conclusion GitHub adds — routes to "no-real-verdict" and fails closed.
-const REAL_REVIEW_CONCLUSIONS = new Set(["success", "failure", "stale"]);
+// Allowlist of check-run conclusions that represent a reviewer actually producing a verdict.
+// "failure" is not one: the review-findings/v1 emitter fails its check only when it has no
+// verdict to post, and claude-code-action fails only when its run errors. Everything else —
+// failure, skipped, neutral, cancelled, timed_out, action_required, and any future conclusion
+// GitHub adds — routes to "no-real-verdict" and fails closed.
+const REAL_REVIEW_CONCLUSIONS = new Set(["success", "stale"]);
 
 async function refreshCredentialsBeforePush(
   context: PipelineContext,
@@ -169,6 +197,7 @@ interface ReviewIssue {
   problem: string;
   requiredFix: string;
   rawText?: string;
+  severity?: ReviewLedgerFinding["severity"];
 }
 
 interface PostPushReviewLedgerFinding extends ReviewLedgerFinding {
@@ -181,13 +210,13 @@ interface FixSummary {
   notes: string;
 }
 
-function makeDefaultGhSpawn(cwd: string) {
+function makeDefaultGhSpawn(cwd: string, maxBuffer?: number) {
   return (args: string[]) => {
-    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"], ...(maxBuffer === undefined ? {} : { maxBuffer }) });
     return {
       stdout: r.stdout?.toString() ?? "",
-      stderr: r.stderr?.toString() ?? "",
-      exitCode: r.status ?? 1,
+      stderr: r.error ? `${r.error.message}\n${r.stderr?.toString() ?? ""}` : r.stderr?.toString() ?? "",
+      exitCode: r.error ? 1 : r.status ?? 1,
     };
   };
 }
@@ -207,29 +236,13 @@ function resultMessage(result: SpawnResult): string {
   return (result.stderr || result.stdout || `exit ${result.exitCode}`).trim();
 }
 
-function llmResultMessage(result: { stdout?: string; stderr?: string; exitCode: number }): string {
-  const detail = (result.stderr || result.stdout || "").trim();
-  return detail ? `exit ${result.exitCode}: ${detail}` : `exit ${result.exitCode}`;
+function llmResultMessage(result: { stdout?: string; stderr?: string; errorMessage?: string; exitCode: number }): string {
+  return `exit ${result.exitCode}${formatLlmResultDetail(result)}`;
 }
 
 function compactErrorMessage(message: string): string {
   const compact = message.replace(/\s+/g, " ").trim();
   return compact.length > 1200 ? `${compact.slice(0, 1200)}...` : compact;
-}
-
-function compactLogValue(text: string | undefined, maxLength = 1200): string {
-  const compact = (text ?? "").replace(/\s+/g, " ").trim();
-  if (compact.length <= maxLength) return compact;
-  return `${compact.slice(0, maxLength - 3).trim()}...`;
-}
-
-function resultDiagnostics(result: SpawnResult): string {
-  const parts = [`exit=${result.exitCode}`];
-  const stderr = compactLogValue(result.stderr);
-  const stdout = compactLogValue(result.stdout);
-  if (stderr) parts.push(`stderr=${stderr}`);
-  if (stdout) parts.push(`stdout=${stdout}`);
-  return parts.join(" ");
 }
 
 function compactForComment(text: string, maxLength = 260): string {
@@ -327,6 +340,9 @@ function fixPassLabel(iteration: number, maxIterations: number): string {
   return `${iteration}/${Math.max(1, maxIterations - 1)}`;
 }
 
+const CI_CHECK_FAILING_TITLE = "CI check failing";
+const CI_CHECK_UNVERIFIED_TITLE = "CI check status could not be verified";
+
 function formatReviewHistory(history: ReviewFinding[]): string {
   if (history.length === 0) {
     return "No previous post-push review findings.";
@@ -352,7 +368,7 @@ function reviewFindingToIssue(finding: PostPushReviewLedgerFinding): ReviewIssue
   const location = finding.path
     ? `${finding.path}${typeof finding.line === "number" ? `:${finding.line}` : ""}: `
     : "";
-  return issueFromString(`${location}${finding.body}`);
+  return { ...issueFromString(`${location}${finding.body}`), severity: finding.severity };
 }
 
 function formatReviewFindingsAsIssueList(findings: PostPushReviewLedgerFinding[]): string {
@@ -423,10 +439,23 @@ function internalReviewerGates(
   return reviewers.find((reviewer) => reviewer.id === reviewerId)?.gates ?? false;
 }
 
+/** The step feedback for `external_review_pending`: only what the failure reason does not already say. */
+export const EXTERNAL_REVIEW_PENDING_NEXT_STEP = "Open the pull request's checks to see the external review's status.";
+
+/**
+ * `summaryBlockingGates` is set under AI-Implement and the Claude Code Review processes:
+ * a `blocking` finding from a trusted Claude summary gates approval. Minor findings stay
+ * advisory; medium findings gate only when enabled by the reviewer selection.
+ */
 export function isReviewLedgerFindingGating(
-  finding: Pick<ReviewLedgerFinding, "source" | "reviewerId" | "reviewerProvenance">,
+  finding: Pick<ReviewLedgerFinding, "source" | "severity" | "reviewerId" | "reviewerProvenance">,
   reviewers?: ReviewerSelection[],
+  summaryBlockingGates = false,
+  contractVerdict?: ReviewFindingsVerdict,
 ): boolean {
+  if (finding.severity === "minor") return false;
+  if (summaryBlockingGates && finding.source === "claude-review-summary" && finding.severity === "blocking") return true;
+  if (finding.source === "review-contract") return reviewContractFindingGates(finding, contractVerdict);
   return isReviewLedgerSourceGating(finding.source, reviewers, finding.reviewerId, finding.reviewerProvenance);
 }
 
@@ -444,7 +473,8 @@ function isReviewLedgerSourceGating(
 function reviewIssueToLedgerFinding(issue: ReviewIssue): PostPushReviewLedgerFinding {
   return {
     source: "ai-implement-internal",
-    severity: "blocking",
+    // Legacy issues and synthetic CI failures have no emitted severity and remain blocking.
+    severity: issue.severity ?? "blocking",
     body: postPushIssueText(issue),
     issue,
   };
@@ -479,6 +509,8 @@ function buildReviewLedger(
   internalIssues: ReviewIssue[],
   externalFindings: ReviewLedgerFinding[],
   reviewers?: ReviewerSelection[],
+  summaryBlockingGates = false,
+  contractVerdict?: ReviewFindingsVerdict,
 ): PostPushReviewLedgerFinding[] {
   const ledger: PostPushReviewLedgerFinding[] = [];
   const indexByKey = new Map<string, number>();
@@ -490,7 +522,7 @@ function buildReviewLedger(
     const existingIndex = keys.map((key) => indexByKey.get(key)).find((index) => index !== undefined);
     if (existingIndex !== undefined) {
       const existing = ledger[existingIndex];
-      if (!isReviewLedgerFindingGating(existing, reviewers) && isReviewLedgerFindingGating(finding, reviewers)) {
+      if (!isReviewLedgerFindingGating(existing, reviewers, summaryBlockingGates, contractVerdict) && isReviewLedgerFindingGating(finding, reviewers, summaryBlockingGates, contractVerdict)) {
         ledger[existingIndex] = finding;
       }
       continue;
@@ -520,13 +552,20 @@ function suppressDuplicateExternalFeedback(feedback: string, externalFindings: R
 }
 
 function findingsUnavailableBlock(unavailable: boolean): string {
-  return unavailable ? "\n\n⚠️ External review findings could not be parsed — verdict from reviewer summary only." : "";
+  return unavailable ? "\n\n⚠️ AI-Implement could not read the findings of the external review. The verdict comes from the summary of the second review only." : "";
+}
+
+/** Feedback for the "verdict unavailable" ending. No verdict comes first: the comment the reader found may predate the head. */
+function externalVerdictUnavailableFeedback(cause: { noVerdict: boolean; verdictBlocks: boolean }): string {
+  if (cause.noVerdict) return "The external review check finished. AI-Implement cannot read its verdict. See the checks on the pull request for the result.";
+  if (cause.verdictBlocks) return "The external review blocks the merge, but AI-Implement cannot read its findings.";
+  return "AI-Implement could not read the findings of the external review.";
 }
 
 function internalReviewSummaryBlock(feedback: string): string {
   const summary = feedback.trim();
   if (!summary) return "";
-  return `\n\nInternal review:\n${summary}`;
+  return `\n\nSummary from the second review:\n${summary}`;
 }
 
 interface CiChecksReadResult {
@@ -544,6 +583,7 @@ function findFailingCiChecks(
   headSha: string,
   configuredCheckNames: string[] | undefined,
   excludeExternalReviewChecks = true,
+  process: ReviewProcessDefinition = resolveReviewProcess(null),
 ): CiChecksReadResult {
   if (!headSha) return { failingChecks: [], unreadable: false, permissionDenied: false };
   const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
@@ -556,7 +596,7 @@ function findFailingCiChecks(
   }
   return {
     failingChecks: parseCheckRuns(res.stdout)
-      .filter((run) => run.conclusion === "failure" && (!excludeExternalReviewChecks || !isExternalReviewCheckName(run.name, configuredCheckNames)))
+      .filter((run) => run.conclusion === "failure" && (!excludeExternalReviewChecks || !matchesReviewCheck(run, process, configuredCheckNames)))
       .map((run) => run.name),
     unreadable: false,
     permissionDenied: false,
@@ -580,6 +620,36 @@ function isExternalReviewCheckName(name: string, configured: string[] | undefine
     || (normalized.includes("claude") && normalized.includes("review"));
 }
 
+/**
+ * Whether a check run is the review process's check. The `ai-implement` process keeps today's name-only match
+ * (including the claude+review heuristic). Any other process matches a pair: the name AND the posting app, so a
+ * same-named check from another app cannot approve a PR.
+ */
+function matchesReviewCheck(
+  run: { name: string; appSlug: string },
+  process: ReviewProcessDefinition,
+  configured: string[] | undefined,
+): boolean {
+  if (process.id === "ai-implement") return isExternalReviewCheckName(run.name, configured);
+  const name = run.name.trim().toLowerCase();
+  const appSlug = run.appSlug.trim().toLowerCase();
+  if (!name) return false;
+  const listed = (pair: ReviewProcessDefinition["checkPairs"][number]) =>
+    expectedPairNames(pair.names, configured).some((candidate) => candidate.trim().toLowerCase() === name);
+  return process.checkPairs.some((pair) => {
+    if (pair.appSlug.trim().toLowerCase() !== appSlug || !listed(pair)) return false;
+    // A name another pair spells out exactly belongs to that pair's app: the hosted service's "Claude Code Review"
+    // is also in the default list, but only the posting app `claude` may use it.
+    return !process.checkPairs.some((other) => other !== pair && Array.isArray(other.names) && listed(other)
+      && other.appSlug.trim().toLowerCase() !== appSlug);
+  });
+}
+
+function expectedPairNames(names: string[] | "project-review-check-names", configured: string[] | undefined): string[] {
+  if (names !== "project-review-check-names") return names;
+  return configured && configured.length > 0 ? configured : DEFAULT_REVIEW_CHECK_NAMES;
+}
+
 /** The PR's head SHA, or "" when the API answered but carried no head.sha, or null when the
  *  call itself failed. The distinction matters: "" is information, null is the ABSENCE of
  *  information and must never be read as "this PR has no reviewer". */
@@ -594,7 +664,17 @@ function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
   }
 }
 
-function parseCheckRuns(stdout: string): { name: string; status: string; conclusion: string }[] {
+interface ParsedCheckRun {
+  name: string;
+  status: string;
+  conclusion: string;
+  appSlug: string;
+  outputText: string | null;
+  startedAt: string;
+  completedAt: string;
+}
+
+function parseCheckRuns(stdout: string): ParsedCheckRun[] {
   let payload: unknown;
   try {
     payload = JSON.parse(stdout);
@@ -603,7 +683,7 @@ function parseCheckRuns(stdout: string): { name: string; status: string; conclus
   }
   // `gh api` returns { check_runs: [...] }; with --slurp/--paginate it can be an array of pages.
   const pages = Array.isArray(payload) ? payload : [payload];
-  const runs: { name: string; status: string; conclusion: string }[] = [];
+  const runs: ParsedCheckRun[] = [];
   for (const page of pages) {
     const record = asRecord(page);
     const checkRuns = record?.check_runs;
@@ -613,7 +693,18 @@ function parseCheckRuns(stdout: string): { name: string; status: string; conclus
       const name = stringProp(r, "name");
       const status = stringProp(r, "status");
       const conclusion = stringProp(r, "conclusion");
-      if (name) runs.push({ name, status, conclusion });
+      const outputText = recordProp(r, "output")?.text;
+      if (name) {
+        runs.push({
+          startedAt: stringProp(r, "started_at"),
+          completedAt: stringProp(r, "completed_at"),
+          name,
+          status,
+          conclusion,
+          appSlug: stringProp(recordProp(r, "app"), "slug"),
+          outputText: typeof outputText === "string" ? outputText : null,
+        });
+      }
     }
   }
   return runs;
@@ -625,9 +716,9 @@ type WarnOnce = (key: string, message: string) => void;
 /**
  * One wait's worth of warn-once state.
  *
- * The wait loop runs up to timeoutMs/pollMs times (60 at the defaults) per review iteration, and
+ * The wait loop runs about timeoutMs/pollMs times (120 at the defaults) per review iteration, and
  * up to maxIterations of those per run, so an unconditional warn describes one sustained outage
- * in sixty identical lines.
+ * in repeated identical lines.
  *
  * The key is the CONDITION, not the rendered message. Two of the three messages interpolate
  * something that moves during a wait — the gh stderr, and the joined names of every check run
@@ -654,12 +745,26 @@ function createWarnOnce(): WarnOnce {
   };
 }
 
+type ExternalReviewProbeState = "absent" | "running" | "completed" | "no-real-verdict" | "unreadable" | "permission-denied";
+
+interface ExternalReviewProbe {
+  reviewWindow?: { startedAt: string; completedAt: string };
+  state: ExternalReviewProbeState;
+  /** The review process's verdict, set only when its reader ran. */
+  verdict?: ReviewVerdictResult;
+  /** The issue-comments read behind `verdict`, so the findings read after the wait does not repeat it. */
+  issueComments?: SpawnResult;
+}
+
 function probeExternalReviewCheck(
   ghSpawn: (args: string[]) => SpawnResult,
+  prNumber: string,
   headSha: string,
-  configuredCheckNames: string[] | undefined,
+  opts: { configuredCheckNames: string[] | undefined; process: ReviewProcessDefinition; extraAuthors: readonly string[] },
   warnOnce: WarnOnce,
-): "absent" | "running" | "completed" | "no-real-verdict" | "unreadable" | "permission-denied" {
+): ExternalReviewProbe {
+  const { configuredCheckNames, process } = opts;
+  if (process.checkPairs.length === 0) return readProcessVerdict(ghSpawn, prNumber, headSha, [], opts);
   // --paginate --slurp, not a bare per_page=100: on a busy SHA the review check can fall
   // outside the first page, and a truncated page is indistinguishable from "no reviewer" —
   // which resolves to "absent" and fails OPEN. parseCheckRuns already accepts the array-of-
@@ -678,13 +783,13 @@ function probeExternalReviewCheck(
   if (res.exitCode !== 0) {
     if (isChecksPermissionError({ text: res.stderr || res.stdout })) {
       warnOnce(`permission-denied:${headSha}`, `[post-push-review] Cannot read check runs at ${headSha}: the GitHub App lacks Checks: read, or the installation hasn't accepted updated permissions: ${res.stderr || `exit ${res.exitCode}`}`);
-      return "permission-denied";
+      return { state: "permission-denied" };
     }
     warnOnce(`unreadable:${headSha}`, `[post-push-review] Could not read check runs at ${headSha}: ${res.stderr || `exit ${res.exitCode}`}`);
-    return "unreadable";
+    return { state: "unreadable" };
   }
   const allRuns = parseCheckRuns(res.stdout);
-  const matching = allRuns.filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
+  const matching = allRuns.filter((run) => matchesReviewCheck(run, process, configuredCheckNames));
   if (matching.length === 0) {
     // Both shapes are worth surfacing — "no runs at all" and "runs present but none matched" are
     // the two most common causes of a silent fail-open — but once each, not once per probe. This
@@ -695,21 +800,125 @@ function probeExternalReviewCheck(
     if (allRuns.length === 0) {
       warnOnce(`no-runs:${headSha}`, `[post-push-review] No check runs present at ${headSha}`);
     } else {
-      const presentNames = allRuns.map((r) => r.name).join(", ");
-      const expected = (configuredCheckNames && configuredCheckNames.length > 0) ? configuredCheckNames : DEFAULT_REVIEW_CHECK_NAMES;
+      const presentNames = allRuns.map((r) => (r.appSlug ? `${r.name} (app: ${r.appSlug})` : r.name)).join(", ");
+      const expected = process.id === "ai-implement"
+        ? ((configuredCheckNames && configuredCheckNames.length > 0) ? configuredCheckNames : DEFAULT_REVIEW_CHECK_NAMES)
+        : process.checkPairs.flatMap((pair) => expectedPairNames(pair.names, configuredCheckNames).map((name) => `${name} (app: ${pair.appSlug})`));
       warnOnce(`no-match:${headSha}`, `[post-push-review] No external review check matched; present: ${presentNames}; expected one of: ${expected.join(", ")}`);
     }
-    return "absent";
+    return { state: "absent" };
   }
-  if (matching.some((run) => run.status !== "completed")) return "running";
+  if (matching.some((run) => run.status !== "completed")) return { state: "running" };
+  if (process.id !== "ai-implement") return readProcessVerdict(ghSpawn, prNumber, headSha, matching, opts);
   // Only conclusions a reviewer actually produces count as a real review. Cancelled, skipped,
   // neutral, timed_out, action_required, and any future conclusion GitHub adds all fail closed —
   // an unknown conclusion should never silently approve.
   const hasRealReview = matching.some((run) => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
-  if (hasRealReview) return "completed";
+  if (hasRealReview) {
+    const realRuns = matching.filter(run => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
+    const validTiming = realRuns.every(run => run.startedAt && run.completedAt &&
+      Number.isFinite(Date.parse(run.startedAt)) && Number.isFinite(Date.parse(run.completedAt)) &&
+      Date.parse(run.startedAt) <= Date.parse(run.completedAt));
+    const reviewWindow = validTiming ? {
+      startedAt: new Date(Math.min(...realRuns.map(run => Date.parse(run.startedAt!)))).toISOString(),
+      completedAt: new Date(Math.max(...realRuns.map(run => Date.parse(run.completedAt!)))).toISOString(),
+    } : undefined;
+    let issueComments: SpawnResult;
+    try {
+      issueComments = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+    } catch {
+      return { state: "unreadable" };
+    }
+    if (issueComments.exitCode !== 0) return { state: "unreadable" };
+    const comment = collectClaudeReviewCommentFromGh(ghSpawn, prNumber, {
+      process, extraAuthors: opts.extraAuthors, requireCurrentReview: true, reviewWindow, issueComments,
+    });
+    const pending = comment.reviewPending || comment.findingsUnavailable || comment.verdict === "incomplete";
+    return { state: pending ? "running" : "completed", reviewWindow, issueComments };
+  }
   // Every matching run is completed but none produced a real verdict. Return "no-real-verdict" so
   // the caller can fail closed immediately rather than approving as if no check existed.
-  return "no-real-verdict";
+  return { state: "no-real-verdict" };
+}
+
+/**
+ * Reads a non-default review process's verdict once every matched check run has completed. The reader takes the
+ * check runs, the bot-authored inline comments, and the trusted `review-findings` blocks (a trusted block wins).
+ * A completed set the reader cannot read a verdict from is `no-real-verdict` (fail closed); only a block that
+ * carries no verdict keeps the wait going.
+ */
+function readProcessVerdict(
+  ghSpawn: (args: string[]) => SpawnResult,
+  prNumber: string,
+  headSha: string,
+  matchedRuns: ParsedCheckRun[],
+  opts: { process: ReviewProcessDefinition; extraAuthors: readonly string[] },
+): ExternalReviewProbe {
+  const commentsRes = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/pulls/${prNumber}/comments?per_page=100`]);
+  if (commentsRes.exitCode !== 0) return { state: "unreadable" };
+  let issueComments: SpawnResult;
+  try {
+    issueComments = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+  } catch {
+    return { state: "unreadable" };
+  }
+  if (issueComments.exitCode !== 0) return { state: "unreadable" };
+  const blocks = collectReviewFindingsBlocksFromGh(ghSpawn, prNumber, { process: opts.process, extraAuthors: opts.extraAuthors, issueComments });
+  if (blocks === null) return { state: "unreadable" };
+
+  let payload: unknown;
+  let issuePayload: unknown;
+  try {
+    issuePayload = JSON.parse(issueComments.stdout);
+    if (!Array.isArray(issuePayload)) return { state: "unreadable" };
+    payload = JSON.parse(commentsRes.stdout);
+  } catch {
+    return { state: "unreadable" };
+  }
+  const inlineComments: Parameters<ReviewProcessDefinition["readVerdict"]>[0]["inlineComments"] = [];
+  for (const page of Array.isArray(payload) ? payload : [payload]) {
+    for (const item of Array.isArray(page) ? page : [page]) {
+      const c = asRecord(item);
+      const user = recordProp(c, "user");
+      const body = stringProp(c, "body");
+      const authorLogin = stringProp(user, "login");
+      if (!c || !body || !authorLogin) continue;
+      const line = c.line;
+      inlineComments.push({
+        authorLogin,
+        authorType: stringProp(user, "type"),
+        body,
+        ...(stringProp(c, "path") ? { path: stringProp(c, "path") } : {}),
+        ...(typeof line === "number" ? { line } : {}),
+        ...(stringProp(c, "commit_id") ? { commitId: stringProp(c, "commit_id") } : {}),
+        ...(stringProp(c, "html_url") ? { url: stringProp(c, "html_url") } : {}),
+      });
+    }
+  }
+
+  const closedUrls = opts.process.id === "codex-code-review"
+    ? collectClosedReviewThreadCommentUrls(ghSpawn, prNumber) : undefined;
+  if (closedUrls !== undefined) {
+    for (const comment of inlineComments) {
+      if (comment.url) comment.threadOpen = !closedUrls.has(comment.url);
+    }
+  }
+
+  const verdict = opts.process.readVerdict({
+    headSha,
+    checkRuns: matchedRuns.map((run) => ({ ...run, conclusion: run.conclusion || null })),
+    inlineComments,
+    inlineCommentThreadsRead: closedUrls !== undefined,
+    issueComments: (issuePayload as unknown[]).flat().map((item) => {
+      const c = asRecord(item);
+      const user = recordProp(c, "user");
+      return { authorLogin: stringProp(user, "login"), authorType: stringProp(user, "type"), body: stringProp(c, "body"), updatedAt: stringProp(c, "updated_at") || stringProp(c, "created_at") };
+    }),
+    blocks,
+  });
+  if (verdict.verdict === "approve" || verdict.verdict === "changes_requested") return { state: "completed", verdict, issueComments };
+  if (verdict.verdict === "incomplete" && (verdict.source !== "none" || opts.process.checkPairs.length === 0)) return { state: "running", verdict, issueComments };
+  return { state: "no-real-verdict", verdict, issueComments };
 }
 
 /**
@@ -720,9 +929,10 @@ function probeExternalReviewCheck(
  * - "completed": the external check finished with a real verdict — read findings and gate normally.
  * - "absent": no external review check exists for this SHA — fail open (repo has none). Settled
  *   only after two consecutive probes agree, since it is the one state that fails open.
- * - "running": the check is still in flight, concluded without a real verdict (cancelled, skipped,
- *   etc.) on two consecutive probes, or could not be read before the wait budget ran out — all
- *   three fail closed.
+ * - "running": the check is still in flight, or could not be read, when the wait budget runs
+ *   out — fails closed as a pending review.
+ * - "no-real-verdict": every matching check finished without a verdict (failed, cancelled, skipped,
+ *   etc.) on two consecutive probes — fails closed as an unavailable verdict.
  *
  * `headSha` is "" when the wait ended before the PR's head SHA could be resolved.
  */
@@ -734,8 +944,15 @@ async function waitForExternalReviewCompletion(
     pollMs: number;
     timeoutMs: number;
     configuredCheckNames: string[] | undefined;
+    process?: ReviewProcessDefinition;
+    extraAuthors?: readonly string[];
   },
-): Promise<{ state: ExternalReviewState; headSha: string }> {
+): Promise<{ state: ExternalReviewState; headSha: string; reviewVerdict?: ReviewVerdictResult; issueComments?: SpawnResult; reviewWindow?: { startedAt: string; completedAt: string } }> {
+  const probeOpts = {
+    configuredCheckNames: opts.configuredCheckNames,
+    process: opts.process ?? resolveReviewProcess(null),
+    extraAuthors: opts.extraAuthors ?? [],
+  };
   // The head-SHA read is retried inside the loop, not resolved once above it. A failed read
   // used to short-circuit to "absent" — the fail-OPEN state — BEFORE the loop, so none of the
   // hardening below could act. That is the same defect the "unreadable" probe state fixes, one
@@ -773,9 +990,15 @@ async function waitForExternalReviewCompletion(
       }
     }
 
-    const state = headSha
-      ? probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames, warnOnce)
-      : "unreadable";
+    const probe: ExternalReviewProbe = headSha
+      ? probeExternalReviewCheck(ghSpawn, prNumber, headSha, probeOpts, warnOnce)
+      : { state: "unreadable" };
+    const state = probe.state;
+    const reviewVerdict = {
+      ...(probe.reviewWindow ? { reviewWindow: probe.reviewWindow } : {}),
+      ...(probe.verdict ? { reviewVerdict: probe.verdict } : {}),
+      ...(probe.issueComments ? { issueComments: probe.issueComments } : {}),
+    };
 
     // Immediate, unambiguous terminal return — deliberately ahead of the sawMatching/
     // pendingSettle machinery below. That machinery exists to avoid mistaking a single bad
@@ -804,13 +1027,13 @@ async function waitForExternalReviewCompletion(
     // local to this code, and nothing fails if it stops holding — a cached verdict, an early
     // exit, or a cheap review model would quietly narrow the real protection to these 5s.
     if (observed === "absent" || observed === "no-real-verdict") {
-      if (pendingSettle === observed) return { state: observed === "absent" ? "absent" : "running", headSha };
+      if (pendingSettle === observed) return { state: observed, headSha, ...reviewVerdict };
       pendingSettle = observed;
     } else {
       pendingSettle = null;
-      if (observed !== "running" && observed !== "unreadable") return { state: observed, headSha };
+      if (observed !== "running" && observed !== "unreadable") return { state: observed, headSha, ...reviewVerdict };
     }
-    if (elapsed >= opts.timeoutMs) return { state: "running", headSha };
+    if (elapsed >= opts.timeoutMs) return { state: "running", headSha, ...reviewVerdict };
     await opts.sleep(opts.pollMs);
     elapsed += opts.pollMs;
   }
@@ -827,56 +1050,6 @@ function recordProp(record: Record<string, unknown> | null, key: string): Record
 function stringProp(record: Record<string, unknown> | null, key: string): string {
   const value = record?.[key];
   return typeof value === "string" ? value : "";
-}
-
-function shortSha(sha: string): string {
-  return sha ? sha.slice(0, 7) : "";
-}
-
-function formatRefSha(ref: string, sha: string): string {
-  const short = shortSha(sha);
-  if (ref && short) return `${ref}@${short}`;
-  return ref || short;
-}
-
-function summarizePrDiagnostics(stdout: string): string {
-  try {
-    const pr = asRecord(JSON.parse(stdout));
-    if (!pr) return compactLogValue(stdout);
-
-    const user = recordProp(pr, "user");
-    const head = recordProp(pr, "head");
-    const headUser = recordProp(head, "user");
-    const headRepo = recordProp(head, "repo");
-    const base = recordProp(pr, "base");
-    const baseRepo = recordProp(base, "repo");
-    const mergeable = pr.mergeable;
-    const draft = pr.draft;
-    const parts = [
-      stringProp(pr, "html_url") ? `url=${stringProp(pr, "html_url")}` : "",
-      stringProp(pr, "state") ? `state=${stringProp(pr, "state")}` : "",
-      typeof draft === "boolean" ? `draft=${draft}` : "",
-      stringProp(user, "login") ? `author=${stringProp(user, "login")}` : "",
-      formatRefSha(stringProp(head, "ref"), stringProp(head, "sha")) ? `head=${formatRefSha(stringProp(head, "ref"), stringProp(head, "sha"))}` : "",
-      stringProp(headRepo, "full_name") ? `headRepo=${stringProp(headRepo, "full_name")}` : "",
-      stringProp(headUser, "login") ? `headOwner=${stringProp(headUser, "login")}` : "",
-      formatRefSha(stringProp(base, "ref"), stringProp(base, "sha")) ? `base=${formatRefSha(stringProp(base, "ref"), stringProp(base, "sha"))}` : "",
-      stringProp(baseRepo, "full_name") ? `baseRepo=${stringProp(baseRepo, "full_name")}` : "",
-      typeof mergeable === "boolean" || mergeable === null ? `mergeable=${String(mergeable)}` : "",
-    ].filter(Boolean);
-    return parts.length > 0 ? parts.join(" ") : compactLogValue(stdout);
-  } catch {
-    return compactLogValue(stdout);
-  }
-}
-
-function logReviewFailureDiagnostics(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
-  const prDetails = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
-  if (prDetails.exitCode === 0) {
-    console.warn(`[post-push-review] Native review PR context: ${summarizePrDiagnostics(prDetails.stdout)}`);
-  } else {
-    console.warn(`[post-push-review] Failed to fetch native review PR context: ${resultDiagnostics(prDetails)}`);
-  }
 }
 
 function parseFixSummary(stdout: string): FixSummary | null {
@@ -961,8 +1134,33 @@ function assertPrWritable(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
   }
 }
 
-function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
+function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string): string | undefined {
   assertPrWritable(ghSpawn, prNumber);
+  // Bound both GitHub character counts and command argument bytes (including body=).
+  // Reserve space for continuation markers below Linux’s per-argument limit.
+  const chunkSize = 63_000;
+  if (body.length > 65_536 || Buffer.byteLength(body, "utf8") > 64_000) {
+    let offset = 0;
+    let part = 0;
+    while (offset < body.length) {
+      let end = offset;
+      let bytes = 0;
+      while (end < body.length) {
+        const codePoint = body.codePointAt(end)!;
+        const width = codePoint > 0xFFFF ? 2 : 1;
+        const byteWidth = Buffer.byteLength(body.slice(end, end + width), "utf8");
+        if (bytes + byteWidth > chunkSize || end + width - offset > chunkSize) break;
+        bytes += byteWidth;
+        end += width;
+      }
+      const partMarker = marker && part > 0 ? marker.replace("-->", `continuation:${part} -->`) : marker;
+      const prefix = part > 0 && partMarker ? `${partMarker}\n` : "";
+      postPrComment(ghSpawn, prNumber, prefix + body.slice(offset, end), partMarker);
+      offset = end;
+      part++;
+    }
+    return;
+  }
   if (marker) {
     const list = ghSpawn([
       "api",
@@ -1000,47 +1198,73 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
     }
     throw new Error(`gh pr comment failed: ${resultMessage(created)}`);
   }
+  return created.stdout.trim();
 }
 
-function submitPrReview(
+async function submitPrReview(
   ghSpawn: (args: string[]) => SpawnResult,
   prNumber: string,
   body: string,
-): string | undefined {
+  publication: { callbackUrl?: string; progressToken?: string; owner: string; repo: string; headSha: string | null; iteration: number; inline: ReturnType<typeof buildInlineReviewComments> },
+): Promise<{ url: string; truncated: boolean } | undefined> {
   assertPrWritable(ghSpawn, prNumber);
-  // The reviewing identity is the same GitHub App installation that authored
-  // the PR, and GitHub rejects APPROVE/REQUEST_CHANGES on your own PR (422).
-  // COMMENT is the only review event allowed on a self-authored PR; the
-  // verdict itself is carried by the review body and the sticky PR comment.
-  const event = "COMMENT";
-  const endpoint = `repos/:owner/:repo/pulls/${prNumber}/reviews`;
-  const result = ghSpawn([
-    "api",
-    endpoint,
-    "-X",
-    "POST",
-    "-f",
-    `event=${event}`,
-    "-f",
-    `body=${body}`,
-  ]);
-  if (result.exitCode !== 0) {
-    console.warn(`[post-push-review] Failed to submit ${event} review for PR #${prNumber}: ${resultDiagnostics(result)}`);
-    console.warn(`[post-push-review] Native review request: endpoint=${endpoint} event=${event} bodyChars=${body.length} bodyPreview=${compactLogValue(body, 260)}`);
-    logReviewFailureDiagnostics(ghSpawn, prNumber);
+  const fallback = (reason: string): undefined => {
+    console.warn(`[post-push-review] Review publication fallback: ${reason}`);
     return undefined;
+  };
+  if (!publication.headSha) return fallback("head unreadable");
+  if (!publication.callbackUrl || !publication.progressToken) return fallback("missing callback URL or progress token");
+  const overflow = publication.inline.comments.slice(MAX_PUBLICATION_COMMENTS);
+  const outside = [
+    ...publication.inline.unmapped.map(inlineCommentBody),
+    ...overflow.map((comment) => `### ${comment.path}:${comment.line} (${comment.side}; inline comment limit exceeded)\n\n${comment.body}`),
+  ];
+  const request = {
+    owner: publication.owner, repo: publication.repo, prNumber: Number(prNumber),
+    headSha: publication.headSha, iteration: publication.iteration,
+    body: body + (outside.length ? `\n\n### Findings outside the diff\n\n${outside.join("\n\n")}` : ""),
+    comments: publication.inline.comments.slice(0, MAX_PUBLICATION_COMMENTS),
+  };
+  const truncated = Buffer.byteLength(JSON.stringify(request), "utf8") > MAX_PUBLICATION_BYTES;
+  if (truncated) {
+    request.comments = [];
+    const fullBody = request.body;
+    const note = "\n\nReport shortened to fit publication limits. The full report is in the status comment.";
+    // Budget the complete serialized request, including JSON escapes and UTF-8 bytes.
+    let low = 0;
+    let high = fullBody.length;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      request.body = fullBody.slice(0, middle) + note;
+      if (Buffer.byteLength(JSON.stringify(request), "utf8") <= MAX_PUBLICATION_BYTES) low = middle;
+      else high = middle - 1;
+    }
+    // Keep the cut between code points rather than splitting a UTF-16 surrogate pair.
+    if (low > 0 && fullBody.charCodeAt(low - 1) >= 0xd800 && fullBody.charCodeAt(low - 1) <= 0xdbff
+      && fullBody.charCodeAt(low) >= 0xdc00 && fullBody.charCodeAt(low) <= 0xdfff) low -= 1;
+    request.body = fullBody.slice(0, low) + note;
   }
   try {
-    const url = new URL(stringProp(asRecord(JSON.parse(result.stdout)), "html_url"));
-    if (url.protocol === "https:" || url.protocol === "http:") {
-      return url.href.replace(/[<>\s()]/g, encodeURIComponent);
-    }
-  } catch { /* Keep the full status report when the review response has no usable link. */ }
-  return undefined;
+    const response = await fetch(`${publication.callbackUrl.replace(/\/$/, "")}/runner/review-publication`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${publication.progressToken}`, "content-type": "application/json" },
+      signal: AbortSignal.timeout(15_000),
+      body: JSON.stringify(request),
+    });
+    if (response.status !== 200) return fallback(`HTTP ${response.status}`);
+    const result = asRecord(await response.json());
+    if (result?.status !== "posted") return fallback(result?.status === "stale-head" ? "stale-head" : "unexpected publication status");
+    const url = new URL(stringProp(result, "reviewUrl"));
+    if (url.protocol !== "https:" && url.protocol !== "http:") return fallback("invalid review URL");
+    return { url: url.href.replace(/[<>\s()]/g, encodeURIComponent), truncated };
+  } catch {
+    return fallback("network error or invalid publication response");
+  }
 }
 
-function reviewReportForComment(reviewUrl: string | undefined, feedback: string): string {
-  return reviewUrl ? `[Full reviewer report](${reviewUrl})` : feedback;
+function reviewReportForComment(review: { url: string; truncated: boolean } | undefined, feedback: string): string {
+  if (!review) return feedback;
+  return review.truncated ? `[Shortened reviewer report](${review.url})\n\n${feedback}` : `[Full reviewer report](${review.url})`;
 }
 
 function failedReviewOutputs(feedback: string) {
@@ -1075,7 +1299,6 @@ function addExtraCost(a: number | null, b: number | null | undefined): number | 
 interface SelectedReviewer {
   selection: ReviewerSelection;
   definition: ReviewerDefinition;
-  legacy?: boolean;
   optional?: boolean;
   provenance?: InternalReviewerProvenance;
 }
@@ -1090,7 +1313,6 @@ interface SelectedReviewerPassResult {
   feedback: string;
   findings: PostPushReviewLedgerFinding[];
   incompleteReviews: IncompleteReviewerResult[];
-  telemetry?: RunTelemetry;
   costUsd: number | null;
   failure?: FailureRecord;
   terminationReason?: PostPushReviewTerminationReason;
@@ -1249,13 +1471,27 @@ function configAdvisoryReviewers(
   });
 }
 
+/** A report field the reviewer must fill: required and not nullable (strict mode requires every field; null marks it optional). */
+function isMandatoryReportField(schema: ReviewerDefinition["outputSchema"], field: string): boolean {
+  if (!Array.isArray(schema.required) || !schema.required.includes(field)) return false;
+  const properties = schema.properties as Record<string, { type?: unknown } | undefined> | undefined;
+  const type = properties?.[field]?.type;
+  return !(Array.isArray(type) && type.includes("null"));
+}
+
 function parseReviewerDefinitionVerdict(value: unknown, schema: ReviewerDefinition["outputSchema"]): ReviewerVerdict {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("expected structured reviewer output to be an object");
   }
-  const raw = value as { approved?: unknown; findings?: unknown; summary?: unknown; checks?: unknown };
+  const reported = value as { approved?: unknown; findings?: unknown; summary?: unknown; checks?: unknown };
+  // Null is the strict-mode encoding of an absent optional field.
+  const raw = {
+    ...reported,
+    summary: reported.summary === null ? undefined : reported.summary,
+    checks: reported.checks === null ? undefined : reported.checks,
+  };
   for (const field of ["summary", "checks"] as const) {
-    if (Array.isArray(schema.required) && schema.required.includes(field) && raw[field] === undefined) {
+    if (isMandatoryReportField(schema, field) && raw[field] === undefined) {
       throw new Error(`expected required report field ${field}`);
     }
   }
@@ -1272,10 +1508,10 @@ function parseReviewerDefinitionVerdict(value: unknown, schema: ReviewerDefiniti
     if (typeof item.body !== "string" || !item.body.trim()) {
       throw new Error(`expected findings[${index}].body to be a non-empty string`);
     }
-    if (item.path !== undefined && typeof item.path !== "string") {
+    if (item.path !== undefined && item.path !== null && typeof item.path !== "string") {
       throw new Error(`expected findings[${index}].path to be a string when present`);
     }
-    if (item.line !== undefined && typeof item.line !== "number") {
+    if (item.line !== undefined && item.line !== null && typeof item.line !== "number") {
       throw new Error(`expected findings[${index}].line to be a number when present`);
     }
     return {
@@ -1355,16 +1591,17 @@ function reviewerFindingToLedgerFinding(
 }
 
 function selectionFailureMessage(kind: "empty-selection" | "empty-internal" | "unresolved", ids?: string[]): string {
-  if (kind === "empty-selection") return "Project reviewer selection is empty; automated review is incomplete.";
-  if (kind === "empty-internal") return "Project reviewer selection contains no internal reviewers; automated review is incomplete.";
-  return `Selected reviewer(s) did not resolve from trusted code or default-branch config definitions: ${(ids ?? []).join(", ")}. Automated review is incomplete.`;
+  if (kind === "empty-selection") return "The reviewer selection for this project is empty. The second review is not complete.";
+  if (kind === "empty-internal") return "The reviewer selection for this project has no AI-Implement reviewers. The second review is not complete.";
+  return `These selected reviewers have no trusted definition in the code or in the config on the default branch: ${(ids ?? []).join(", ")}. The second review is not complete.`;
 }
 
-async function reportReviewerSelectionFailure(
+export async function reportReviewerSelectionFailure(
   reporter: StepReporter,
   ghSpawn: (args: string[]) => SpawnResult,
   prNumber: string,
   feedback: string,
+  rejectedBlock: string,
 ): Promise<PostPushReviewOutputs> {
   await reporter.report({
     id: "post-push-review.selection",
@@ -1382,24 +1619,22 @@ async function reportReviewerSelectionFailure(
     ghSpawn,
     prNumber,
     `${marker}
-⚠️ Post-push review could not start.
+⚠️ The second review could not start.
 
-${feedback}
+${feedback}${rejectedBlock}
 
-**Merge readiness:** Manual review required; automated review did not complete.`,
+**Merge readiness:** Manual review required; the review did not finish.`,
     marker,
   );
   return { approved: false, iterations: 0, finalFeedback: feedback, forcePushedRevisions: 0, terminationReason: "invalid_review", costUsd: null, findingDispositions: [] };
 }
 
 function reviewerReportId(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
-  if (reviewer.legacy) return `post-push-review.${iteration}`;
   const id = reviewer.selection.id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80) || "reviewer";
   return `post-push-review.${iteration}.reviewer.${reviewerIndex}.${reviewer.provenance ?? "trusted"}.${id}`;
 }
 
 function reviewerStage(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
-  if (reviewer.legacy) return `post-push-review/review-${iteration}`;
   const id = reviewer.selection.id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80) || "reviewer";
   if (reviewer.provenance === "branch") {
     return `post-push-review/branch-advisory-${reviewerIndex}-${id}-review-${iteration}`;
@@ -1430,23 +1665,11 @@ function reviewerGates(selection: ReviewerSelection, provenance?: InternalReview
 }
 
 function parsePartialReviewerVerdict(
-  legacy: boolean | undefined,
   value: unknown,
   schema: ReviewerDefinition["outputSchema"],
 ): ReviewerVerdict | null {
   if (value === undefined) return null;
   try {
-    if (legacy) {
-      const legacyVerdict = parseReviewVerdict(value);
-      return {
-        approved: false,
-        findings: legacyVerdict.blockingIssues.map((issue) => {
-          const reviewIssue = issueFromVerdictIssue(issue);
-          return { severity: "blocking", body: postPushIssueText(reviewIssue) };
-        }),
-        summary: legacyVerdict.feedback || "Partial legacy reviewer output was returned before the review completed.",
-      };
-    }
     return { ...parseReviewerDefinitionVerdict(value, schema), approved: false };
   } catch {
     return null;
@@ -1468,23 +1691,25 @@ async function runSelectedInternalReviewers(params: {
   const findings: PostPushReviewLedgerFinding[] = [];
   const feedbackParts: string[] = [];
   let approved = true;
-  let aggregateTelemetry: RunTelemetry | undefined;
   let costUsd: number | null = null;
   const incompleteReviews: IncompleteReviewerResult[] = [];
   let firstGatingFailure: FailureRecord | undefined;
   let firstTerminationReason: PostPushReviewTerminationReason | undefined;
   let priorLlmFailure = false;
 
+  const reviewSelection = params.context.data.agentConfig?.stages.review;
+  const isTimeBudget = reviewSelection?.agent === "codex";
   for (const [reviewerIndex, reviewer] of params.reviewers.entries()) {
-    const { selection, definition, legacy, provenance } = reviewer;
+    const { selection, definition, provenance } = reviewer;
     const reviewerId = selection.id;
     const label = reviewerFeedbackLabel(reviewerId, provenance);
     const reportId = reviewerReportId(params.iteration, reviewerIndex, reviewer);
     const stage = reviewerStage(params.iteration, reviewerIndex, reviewer);
     const maxTurns = selectionMaxTurns(selection) ?? definition.maxTurns ?? params.retryPolicy.reviewMaxTurns;
-    const reportInputs = legacy
-      ? { iteration: params.iteration, prNumber: params.prNumber, maxTurns }
-      : { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted", gates: reviewerGates(selection, provenance), maxTurns };
+    const reviewBudgetLabel = reviewSelection?.agent === "codex"
+      ? safeLimitLabel({ kind: "timeout_ms", value: reviewSelection.invocationTimeoutMs })
+      : `${maxTurns} turns`;
+    const reportInputs = { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted", gates: reviewerGates(selection, provenance), maxTurns };
     const reportIncompleteFailure = async (
       feedback: string,
       telemetry?: RunTelemetry,
@@ -1514,7 +1739,7 @@ async function runSelectedInternalReviewers(params: {
         status: "failed",
         started_at: startedAt,
         ended_at: endedAt,
-        parent_step_id: "post-push-review",
+        parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
         inputs: reportInputs,
         outputs: { approved: false, complete: false, feedback, issues: [], blockingIssues: [], maxTurns, ...extraOutputs, ...(telemetry ? { telemetry } : {}) },
         logs_url: null,
@@ -1522,15 +1747,18 @@ async function runSelectedInternalReviewers(params: {
     };
     let prompt: string;
     try {
-      prompt = definition.buildPrompt({
+      prompt = `The pipeline reads the CI checks on the current commit; do not report CI status as an issue.\n\n` + definition.buildPrompt({
         issueIdentifier: params.context.data.issueIdentifier,
         issueTitle: params.context.data.issueTitle,
         issueDescription: params.context.data.issueDescription,
+        groupingParent: params.context.data.groupingParent,
         prNumber: params.prNumber,
         diff: params.diff,
         previousFindings: params.previousFindings,
       });
-      prompt += `\n\nYou have a maximum of ${maxTurns} turns for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
+      prompt += isTimeBudget
+        ? `\n\nYou have a time budget of ${reviewBudgetLabel.replace(/^timeout /, "")} for this review. Finish within the time budget and reserve time for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`
+        : `\n\nYou have a maximum of ${reviewBudgetLabel} for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
     } catch (err) {
       if (err instanceof OperatorCancelledError || err instanceof PrMergedError) throw err;
       const feedback = compactErrorMessage(`Reviewer ${label} could not build its prompt: ${err instanceof Error ? err.message : String(err)}`);
@@ -1544,9 +1772,10 @@ async function runSelectedInternalReviewers(params: {
       prompt,
       model: definition.model ?? params.model,
       maxTurns,
-      tools: READ_ONLY_ALLOWED_TOOLS,
+      ...READ_ONLY_TOOL_PARAMS,
       jsonSchema: definition.outputSchema,
       stage,
+      agentStage: "review",
       expectsStructuredOutput: true,
     });
     let reviewResult: LLMResult;
@@ -1562,29 +1791,34 @@ async function runSelectedInternalReviewers(params: {
     }
     let reviewEndedAt = new Date().toISOString();
     let reviewStageAttempt = 1;
+    let transientRetries = 0;
     let reviewStageClassified: FailureRecord | undefined;
     let invocationThrew = false;
-    while (reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
-      reviewStageClassified = classifyLlmResult(reviewResult, {
+    while (!params.context.data.reviewOnly && reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
+      reviewStageClassified = reviewResult.failure ?? classifyLlmResult(reviewResult, {
         stage,
         attempt: reviewResult.attempts ?? 1,
         expectsStructuredOutput: true,
         elapsedMs: reviewResult.telemetry?.durationMs ?? undefined,
       });
-      if (reviewStageClassified.category !== "transient" || reviewStageAttempt > params.retryPolicy.stageRetries) break;
+      const accountSwitched = reviewStageClassified.accountFallback?.stage === "review";
+      if (!accountSwitched && (reviewStageClassified.category !== "transient" || transientRetries >= params.retryPolicy.stageRetries)) break;
       await params.reporter.report({
         id: `${reportId}.retry${reviewStageAttempt}`,
         type: "custom",
         status: "failed",
         started_at: reviewStartedAt,
         ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
+        parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
         inputs: reportInputs,
         outputs: { failure: reviewStageClassified, maxTurns, telemetry: reviewResult.telemetry },
         logs_url: null,
       });
       costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
-      await params.sleep(computeBackoffMs(reviewStageAttempt, params.retryPolicy));
+      if (!accountSwitched) {
+        transientRetries++;
+        await params.sleep(computeBackoffMs(transientRetries, params.retryPolicy));
+      }
       reviewStageAttempt++;
       reviewStartedAt = new Date().toISOString();
       try {
@@ -1604,12 +1838,12 @@ async function runSelectedInternalReviewers(params: {
     }
     if (invocationThrew) continue;
     costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
-    if (legacy) aggregateTelemetry = reviewResult.telemetry;
 
     if (reviewStageClassified && reviewStageClassified.category === "transient") {
       const failure = { ...reviewStageClassified, stage: "post-push-review", code: "PROVIDER_UNAVAILABLE" as const, retryable: false };
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
-      const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).`);
+      const modelErrorDetail = reviewResult.errorMessage?.trim() ? ` ${reviewFailureMessage(reviewResult)}` : "";
+      const feedback = compactErrorMessage(`The reviewer ${label} could not run because the AI service was not available after ${reviewStageAttempt} attempt(s) (${telemetryPart}).${modelErrorDetail}`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "provider_unavailable";
       priorLlmFailure ||= reviewerGates(selection, provenance);
       await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
@@ -1624,11 +1858,11 @@ async function runSelectedInternalReviewers(params: {
         retryable: false,
         reviewMaxTurns: maxTurns,
       };
-      const partialVerdict = parsePartialReviewerVerdict(legacy, reviewResult.structuredOutput, definition.outputSchema);
+      const partialVerdict = parsePartialReviewerVerdict(reviewResult.structuredOutput, definition.outputSchema);
       const partialReport = partialVerdict
         ? `\n\n${reviewerEvidenceReport(label, partialVerdict, true)}`
         : "\n\nNo usable partial structured review evidence was returned before the cap.";
-      const feedback = `${label} ran out of turns at the configured cap (${maxTurns}). ${summaryLine(reviewResult.telemetry)}${partialReport}`;
+      const feedback = `${label} used all of its permitted steps (${maxTurns}). ${summaryLine(reviewResult.telemetry)}${partialReport}`;
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "reviewer_turns_exhausted";
       await reportIncompleteFailure(
         feedback,
@@ -1642,9 +1876,12 @@ async function runSelectedInternalReviewers(params: {
 
     const reviewFailure = reviewFailureMessage(reviewResult);
     if (reviewFailure) {
-      const failure = classifyLlmResult(reviewResult, { stage, attempt: reviewResult.attempts ?? 1, expectsStructuredOutput: true, elapsedMs: reviewResult.telemetry?.durationMs ?? undefined });
+      const failure = reviewResult.failure ?? classifyLlmResult(reviewResult, { stage, attempt: reviewResult.attempts ?? 1, expectsStructuredOutput: true, elapsedMs: reviewResult.telemetry?.durationMs ?? undefined });
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
-      const feedback = compactErrorMessage(`Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
+      const timedOut = isTimeBudget && reviewResult.failure?.code === "INVOCATION_TIMEOUT";
+      const feedback = compactErrorMessage(timedOut
+        ? `Reviewer ${label} ran out of its time budget (${reviewBudgetLabel}): ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`
+        : `Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "review_failed";
       priorLlmFailure ||= reviewerGates(selection, provenance);
       await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
@@ -1652,75 +1889,49 @@ async function runSelectedInternalReviewers(params: {
     }
 
     if (reviewResult.structuredOutput === undefined) {
-      const feedback = compactErrorMessage(legacy
-        ? `Reviewer returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`
-        : `Reviewer ${label} returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`);
+      const feedback = compactErrorMessage(`The reviewer ${label} returned no result that AI-Implement can read. Reviewer output: ${reviewResult.stdout || "(empty stdout)"}`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
       await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
       continue;
     }
 
     let verdict: ReviewerVerdict;
-    let reviewerFeedback = "";
     try {
-      if (legacy) {
-        const legacyVerdict = parseReviewVerdict(reviewResult.structuredOutput);
-        reviewerFeedback = legacyVerdict.feedback;
-        const legacyFindings = legacyVerdict.blockingIssues.map((issue) => {
-          const reviewIssue = issueFromVerdictIssue(issue);
-          return {
-            source: "ai-implement-internal" as const,
-            reviewerId,
-            ...(provenance ? { reviewerProvenance: provenance } : {}),
-            severity: "blocking" as const,
-            body: postPushIssueText(reviewIssue),
-            issue: reviewIssue,
-          };
-        });
-        verdict = {
-          approved: legacyVerdict.approved,
-          findings: legacyFindings.map((finding) => ({ severity: finding.severity, body: finding.body })),
-        };
-        findings.push(...legacyFindings);
-      } else {
-        verdict = parseReviewerDefinitionVerdict(reviewResult.structuredOutput, definition.outputSchema);
-      }
+      verdict = parseReviewerDefinitionVerdict(reviewResult.structuredOutput, definition.outputSchema);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      const feedback = compactErrorMessage(legacy
-        ? `Reviewer returned invalid structured review output: ${reason}.`
-        : `Reviewer ${label} returned invalid structured review output: ${reason}.`);
+      const feedback = compactErrorMessage(`Reviewer ${label} returned invalid structured review output: ${reason}.`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
       await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
       continue;
     }
 
-    if (!legacy && verdict.findings.length === 0 && verdict.approved === false) {
+    if (verdict.findings.length === 0 && verdict.approved === false) {
       const feedback = `Reviewer ${label} returned approved=false without findings[].`;
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
       await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
       continue;
     }
 
-    const reviewerFindings = legacy ? [] : verdict.findings.map((finding) => reviewerFindingToLedgerFinding(reviewerId, finding, provenance));
+    const reviewerFindings = verdict.findings.map((finding) => reviewerFindingToLedgerFinding(reviewerId, finding, provenance));
     findings.push(...reviewerFindings);
     if (selection.gates && provenance !== "branch") {
-      approved = approved && verdict.approved && (legacy ? verdict.findings.length === 0 : reviewerFindings.length === 0);
+      // A minor-only negative verdict is advisory; an empty negative verdict still fails closed.
+      approved = approved && (verdict.approved || verdict.findings.length > 0)
+        && !verdict.findings.some((finding) => finding.severity !== "minor");
     }
-    feedbackParts.push(legacy && reviewerFeedback ? reviewerFeedback : reviewerEvidenceReport(label, verdict));
-    if (!legacy) {
-      await params.reporter.report({
-        id: reportId,
-        type: "custom",
-        status: "passed",
-        started_at: reviewStartedAt,
-        ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
-        inputs: reportInputs,
-        outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, maxTurns, telemetry: reviewResult.telemetry },
-        logs_url: null,
-      });
-    }
+    feedbackParts.push(reviewerEvidenceReport(label, verdict));
+    await params.reporter.report({
+      id: reportId,
+      type: "custom",
+      status: "passed",
+      started_at: reviewStartedAt,
+      ended_at: reviewEndedAt,
+      parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
+      inputs: reportInputs,
+      outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, maxTurns, telemetry: reviewResult.telemetry },
+      logs_url: null,
+    });
   }
 
   return {
@@ -1728,7 +1939,6 @@ async function runSelectedInternalReviewers(params: {
     feedback: feedbackParts.join("\n\n"),
     findings,
     incompleteReviews,
-    telemetry: aggregateTelemetry,
     costUsd,
     ...(firstGatingFailure ? { failure: firstGatingFailure } : {}),
     ...(firstTerminationReason ? { terminationReason: firstTerminationReason } : {}),
@@ -1742,7 +1952,8 @@ async function reportInvalidStructuredReview(
   prNumber: string,
   iteration: number,
   feedback: string,
-  telemetry?: RunTelemetry,
+  telemetry: RunTelemetry | undefined,
+  rejectedBlock: string,
 ) {
   await reporter.report({
     id: `post-push-review.${iteration}`,
@@ -1759,7 +1970,7 @@ async function reportInvalidStructuredReview(
   postPrComment(
     ghSpawn,
     prNumber,
-    `${marker}\n⚠️ Post-push review returned invalid output.\n\n${feedback}\n\nThe implementation PR is still available, but this automated review pass did not finish. No actionable code feedback was produced by this review attempt.\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
+    `${marker}\n⚠️ The second review returned a result that AI-Implement cannot read.\n\n${feedback}\n\nThe pull request is still open. This review pass did not finish, and it gave no feedback on the code. A person must review the pull request.${rejectedBlock}\n\n**Merge readiness:** Manual review required; the review did not finish.`,
     marker,
   );
 }
@@ -1778,6 +1989,7 @@ async function reportChecksPermissionDenied(
   ghSpawn: (args: string[]) => SpawnResult,
   prNumber: string,
   iteration: number,
+  rejectedBlock: string,
 ): Promise<FailureRecord> {
   const failure: FailureRecord = {
     category: "auth",
@@ -1803,7 +2015,7 @@ async function reportChecksPermissionDenied(
   postPrComment(
     ghSpawn,
     prNumber,
-    `${marker}\n🔒 Post-push review could not verify check runs.\n\n${CHECKS_PERMISSION_DENIED_MESSAGE}\n\n**Merge readiness:** Manual review required; check runs could not be read.`,
+    `${marker}\n🔒 The second review could not read the checks on the pull request.\n\n${CHECKS_PERMISSION_DENIED_MESSAGE}${rejectedBlock}\n\n**Merge readiness:** Manual review required; check runs could not be read.`,
     marker,
   );
   return failure;
@@ -1839,6 +2051,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let loggedLeaseFallback = false;
     let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     let reviewerFailure: FailureRecord | undefined;
+    let reviewedHeadSha: string | undefined;
     const reviewHistory: ReviewFinding[] = [];
     // Every review invocation (including superseded retry attempts) and every fix-pass
     // invocation this step runs, summed — mirrors report-card.ts's extraCostUsd so the
@@ -1848,14 +2061,42 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     // (PrMergedError or OperatorCancelledError) thrown afterward while posting the failure
     // comment is suppressed so the genuine failure conclusion surfaces rather than being masked.
     let priorLlmFailure = false;
-    // findingKeys the fix agent disposed as "follow-up": dropped from gatingExternalFindings
+    // findingKeys the fix agent disposed as "follow-up" or "invalid": dropped from gatingExternalFindings
     // on every later iteration so an external reviewer's out-of-scope ask stops gating merge
-    // readiness or reappearing in the next fix prompt. Per-run only (AII-751); a gap-fill run
-    // starts with an empty set.
-    const deferredKeys = new Set<string>();
+    // readiness or reappearing in the next fix prompt. Seeded from trusted PR markers.
+    const closedKeys = new Set<string>();
+    const internalFindingsByKey = new Map<string, ReviewLedgerFinding>();
+    let finalInternalKeys: Set<string> | undefined;
+    const finalDispositions = (): FindingDisposition[] => {
+      const dispositions = new Map(findingDispositionsByKey);
+      for (const key of internalFindingsByKey.keys()) {
+        // Only a complete final review can establish absence. A re-report wins over
+        // any earlier fix-agent disposition for an internal finding.
+        dispositions.delete(key);
+        if (finalInternalKeys && !finalInternalKeys.has(key)) {
+          dispositions.set(key, { findingKey: key, disposition: "fixed", reason: "Not reported by the final internal review." });
+        }
+      }
+      return [...dispositions.values()];
+    };
     // Every disposition read from the fix agent's dispositions file across every push this
     // run, keyed by findingKey so a later push's entry for the same key overwrites an earlier one.
     const findingDispositionsByKey = new Map<string, FindingDisposition>();
+    // Keep rejection reasons even if a later fix pass writes another disposition for the key.
+    const findingsByKey = new Map<string, PostPushReviewLedgerFinding>();
+    const rejectedFindingsByKey = new Map<string, { disposition: FindingDisposition; finding?: PostPushReviewLedgerFinding }>();
+    const rejectedCommentBlock = (): string => {
+      if (rejectedFindingsByKey.size === 0) return "";
+      const lines = [...rejectedFindingsByKey.values()].map(({ disposition, finding }) => {
+        if (!finding) return `- ${disposition.reason}`;
+        const location = finding.path ? (typeof finding.line === "number" ? `${finding.path}:${finding.line}` : finding.path) : undefined;
+        const origin = [finding.source, location].filter(Boolean).join(" · ");
+        const body = finding.body.replace(/\s+/g, " ").trim();
+        const excerpt = body.length > 160 ? `${body.slice(0, 157)}...` : body;
+        return `- ${origin} — ${excerpt} — ${disposition.reason}`;
+      });
+      return `\n\n### Rejected by the fix pass\n\n${lines.join("\n")}`;
+    };
     // Reads and applies the fix agent's dispositions file (reply to threads, defer follow-ups,
     // record for outputs), then deletes it so a later iteration never re-reads a stale file.
     // Called both after a successful push and when the fix pass made no pushable change —
@@ -1866,131 +2107,94 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       fs.rmSync(path.join(inputs.workspaceDir, DISPOSITIONS_FILE), { force: true });
       for (const disposition of dispositions) {
         findingDispositionsByKey.set(disposition.findingKey, disposition);
+        if (disposition.disposition === "invalid") rejectedFindingsByKey.set(disposition.findingKey, { disposition, finding: findingsByKey.get(disposition.findingKey) });
       }
       replyToDispositionThreads(ghSpawn, prNumber, dispositions);
       for (const disposition of dispositions) {
-        if (disposition.disposition === "follow-up") deferredKeys.add(disposition.findingKey);
+        if (disposition.disposition === "follow-up" || disposition.disposition === "invalid") closedKeys.add(disposition.findingKey);
+        else closedKeys.delete(disposition.findingKey);
       }
       return dispositions;
     }
 
     try {
     assertPrWritable(ghSpawn, prNumber);
-    postPrComment(
+    // Always create this comment: a marker-matched historical comment cannot establish identity.
+    const startCommentUrl = postPrComment(
       ghSpawn,
       prNumber,
       `${startMarker}\n🔍 Running post-implementation review...`,
-      startMarker,
     );
+    let ownLogin: string | undefined;
+    const startCommentId = startCommentUrl?.match(/#issuecomment-(\d+)$/)?.[1];
+    if (startCommentId) {
+      try {
+        const result = ghSpawn(["api", `repos/:owner/:repo/issues/comments/${startCommentId}`]);
+        const comment = result.exitCode === 0 ? JSON.parse(result.stdout) : undefined;
+        if (typeof comment?.user?.login === "string" && comment.user.login.trim()) ownLogin = comment.user.login;
+      } catch { /* Unreadable identity seeds nothing. */ }
+    }
+    for (const key of readClosedFindingKeys(ghSpawn, prNumber, ownLogin)) closedKeys.add(key);
+    console.log(`[post-push-review] seeded ${closedKeys.size} closed finding(s) from PR markers`);
 
     const configReviewerResolution = await resolveConfigReviewerDefinitions(
       inputs.reviewerDefinitions,
       inputs.trustedReviewerDefinitions,
       inputs.trustedConfigReviewerDefinitions,
     );
-    const configuredReviewerSelection = inputs.reviewers;
-    const selectedReviewerResolution = configuredReviewerSelection !== undefined
-      ? await resolveSelectedInternalReviewers(
-          configuredReviewerSelection,
-          inputs.trustedReviewerDefinitions,
-          configReviewerResolution.trustedDefinitions,
-          configReviewerResolution.branchDefinitions,
-        )
-      : null;
-    if (configuredReviewerSelection?.length === 0) {
+    const configuredReviewerSelection = inputs.reviewers ?? DEFAULT_REVIEWER_SELECTION;
+    const selectedReviewerResolution = await resolveSelectedInternalReviewers(
+      configuredReviewerSelection,
+      inputs.trustedReviewerDefinitions,
+      configReviewerResolution.trustedDefinitions,
+      configReviewerResolution.branchDefinitions,
+    );
+    // A non-default review process gates on its external verdict, so it may run with no internal reviewer.
+    const reviewProcess = resolveReviewProcess(inputs.reviewProcess);
+    const trustedReviewAuthors = inputs.trustedReviewAuthors ?? [];
+    const externalOnlyReview = reviewProcess.id !== "ai-implement" && configuredReviewerSelection.length === 0;
+    if (configuredReviewerSelection.length === 0 && !externalOnlyReview) {
       return reportReviewerSelectionFailure(
         reporter,
         ghSpawn,
         prNumber,
         selectionFailureMessage("empty-selection"),
+        rejectedCommentBlock(),
       );
     }
-    if (selectedReviewerResolution && selectedReviewerResolution.unresolvedIds.length > 0) {
+    if (selectedReviewerResolution.unresolvedIds.length > 0) {
       const message = selectionFailureMessage("unresolved", selectedReviewerResolution.unresolvedIds);
       console.warn(`[post-push-review] ${message}`);
-      return reportReviewerSelectionFailure(reporter, ghSpawn, prNumber, message);
+      return reportReviewerSelectionFailure(reporter, ghSpawn, prNumber, message, rejectedCommentBlock());
     }
-    if (selectedReviewerResolution && selectedReviewerResolution.reviewers.length === 0) {
+    if (selectedReviewerResolution.reviewers.length === 0 && !externalOnlyReview) {
       const message = selectionFailureMessage("empty-internal");
       console.warn(`[post-push-review] ${message}`);
-      return reportReviewerSelectionFailure(reporter, ghSpawn, prNumber, message);
+      return reportReviewerSelectionFailure(reporter, ghSpawn, prNumber, message, rejectedCommentBlock());
     }
-    const selectedInternalReviewers = selectedReviewerResolution?.reviewers ?? null;
+    const selectedInternalReviewers = selectedReviewerResolution.reviewers;
 
     while (iteration < maxIterations && !approved) {
       iteration++;
       // Probe before the LLM call: a merge/close between iterations exits immediately rather than burning a full reviewer turn.
       assertPrWritable(ghSpawn, prNumber);
 
+      const publicationHeadSha = resolvePrHeadSha(ghSpawn, prNumber);
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
 
-      const previousFindings = formatReviewHistory(reviewHistory);
-      const legacyReviewPrompt = `You are reviewing the diff for PR #${prNumber} against issue ${context.data.issueIdentifier}: ${context.data.issueTitle}.
-
-Set approved=true only when no code changes are needed. If you find any bug,
-missing requirement, unsafe behavior, test gap, or follow-up that should be
-fixed in this PR, set approved=false and put every actionable item in
-blocking_issues[].
-The orchestrator treats blocking_issues[] as the only internal blocking finding
-list; it will not infer blockers from feedback prose. If something must be
-fixed before merge, it must be present in blocking_issues[].
-Do not set approved=false for future/later-task concerns that are not required
-by this issue; mention those in feedback only.
-
-This is a complete merge-readiness review, not an incremental comment pass.
-Inspect the whole diff before deciding. Do not stop after the first issue.
-Before producing JSON, check requirements coverage, changed API/data contracts,
-error handling, security, regressions, edge cases, and test coverage.
-
-Every blocking_issues[] entry must be self-contained and immediately
-actionable. Use structured objects with title, location, problem, and
-required_fix fields. Include the affected file/function when possible, the
-failing behavior, and the required fix. Do not abbreviate or truncate issue
-details; do not use ellipses. Do not put praise, overall status, or
-optional/future cleanup in blocking_issues[]. Do not write feedback that
-refers to issues "above" unless those issues are explicitly listed in
-blocking_issues[].
-
-Use feedback for a short overall review summary that adds context not already
-present in blocking_issues[]. Do not repeat the blocking_issues[] text
-verbatim in feedback.
-
-On follow-up reviews, first verify every previous issue is fixed, then review
-the entire updated diff again for newly introduced or newly visible blockers.
-If a previous issue remains unresolved, keep it in blocking_issues[] with the
-current reason it is still blocking.
-
-Issue description:
-${context.data.issueDescription}
-
-Previous post-push review findings:
-${previousFindings}
-
-${DIFF_INJECTION_PREAMBLE}
-
-<pr_diff>
-${diffRes.stdout}
-</pr_diff>
-
-Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string", "location": "file/function; omit when unknown", "problem": "full failing behavior", "required_fix": "full required fix"}], "score": int, "progress_delta": int, "feedback": "string"}.`;
-
-      const primaryInternalReviewers = selectedInternalReviewers ?? [{
-        selection: { id: "legacy-post-push-review", gates: true },
-        definition: {
-          id: "legacy-post-push-review",
-          buildPrompt: () => legacyReviewPrompt,
-          outputSchema: REVIEW_VERDICT_JSON_SCHEMA,
-        },
-        legacy: true,
-      }];
+      const previousFindings = formatReviewHistory(reviewHistory.map(finding => ({
+        ...finding,
+        issues: finding.issues.filter(issue =>
+          issue.title !== CI_CHECK_FAILING_TITLE && issue.title !== CI_CHECK_UNVERIFIED_TITLE),
+      })));
       const advisoryConfigReviewers = configAdvisoryReviewers(configReviewerResolution.branchDefinitions, selectedInternalReviewers);
       const activeInternalReviewers: SelectedReviewer[] = [
-        ...primaryInternalReviewers,
+        ...selectedInternalReviewers,
         ...advisoryConfigReviewers,
       ];
       const effectiveReviewerPolicy: ReviewerSelection[] = [
-        ...(configuredReviewerSelection ?? primaryInternalReviewers.map((reviewer) => reviewer.selection)),
+        ...configuredReviewerSelection,
         ...advisoryConfigReviewers.map((reviewer) => reviewer.selection),
       ];
       const selectedReviewerResult = await runSelectedInternalReviewers({
@@ -2010,6 +2214,18 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (selectedReviewerResult.priorLlmFailure) priorLlmFailure = true;
       const gatingIncompleteReviews = selectedReviewerResult.incompleteReviews.filter(review => review.gates);
       const selectedInternalFindings = selectedReviewerResult.findings;
+      // Internal review completeness is independent of external approval gates, which
+      // can terminate this iteration before the combined ledger is built.
+      const gatingInternalFindings = selectedInternalFindings.filter(finding =>
+        internalReviewerGates(finding.reviewerId, effectiveReviewerPolicy, finding.reviewerProvenance));
+      finalInternalKeys = gatingIncompleteReviews.length === 0
+        ? new Set(gatingInternalFindings.map(stableReviewFindingKey))
+        : undefined;
+      // Report gating reviewers only, including minor findings, even when prompt
+      // deduplication prefers a finding from another reviewer or source.
+      for (const finding of gatingInternalFindings) {
+        internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
+      }
       const verdict = {
         approved: selectedReviewerResult.approved,
         blockingIssues: [] as VerdictReviewIssue[],
@@ -2019,7 +2235,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         stdout: "",
         exitCode: 0,
         tokensUsed: 0,
-        telemetry: selectedInternalReviewers ? undefined : selectedReviewerResult.telemetry,
+        telemetry: undefined,
       } as LLMResult;
 
       // The external review (e.g. Claude Code Review) runs concurrently and finishes
@@ -2032,13 +2248,15 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const filesystemWithoutExternalReviewer = context.data.issueId?.startsWith("filesystem:")
         && inputs.reviewProviders === undefined
         && !inputs.reviewCheckNames?.length
-        && !configuredReviewerSelection?.some((reviewer) => reviewer.id === CLAUDE_REVIEW_SUMMARY_ID);
+        && !configuredReviewerSelection.some((reviewer) => reviewer.id === CLAUDE_REVIEW_SUMMARY_ID);
       const externalReviewResult = gatingIncompleteReviews.length === 0 && !filesystemWithoutExternalReviewer && shouldCollectExternalReviewFindings(inputs.reviewProviders)
         ? await waitForExternalReviewCompletion(ghSpawn, prNumber, {
             sleep,
             pollMs: reviewWaitPollMs,
             timeoutMs: reviewWaitTimeoutMs,
             configuredCheckNames: inputs.reviewCheckNames,
+            process: reviewProcess,
+            extraAuthors: trustedReviewAuthors,
           })
         : {
             state: "skipped" as ExternalReviewState,
@@ -2052,27 +2270,61 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (externalReviewState === "permission-denied") {
         terminationReason = "checks_permission_denied";
         feedback = CHECKS_PERMISSION_DENIED_MESSAGE;
-        reviewerFailure = await reportChecksPermissionDenied(reporter, ghSpawn, prNumber, iteration);
+        reviewerFailure = await reportChecksPermissionDenied(reporter, ghSpawn, prNumber, iteration, rejectedCommentBlock());
         break;
       }
       const externalReviewPending = externalReviewState === "running";
+      // Findings read below may belong to an older head, so a check without a verdict never approves.
+      // With no internal reviewer the external verdict is the only review, so a skipped or absent
+      // external check leaves nothing that reviewed the PR and fails closed.
+      const externalReviewNoVerdict = externalReviewState === "no-real-verdict"
+        || (externalOnlyReview && (externalReviewState === "skipped" || externalReviewState === "absent"));
+      let processVerdict = externalReviewResult.reviewVerdict;
+      if (externalReviewState !== "skipped") {
+        console.log(`[post-push-review] review process ${reviewProcess.id}: verdict ${processVerdict?.verdict ?? externalReviewState} from ${processVerdict?.source ?? "check-conclusion"}`);
+      }
       const externalFindingsResult = externalReviewState === "skipped"
         ? { findings: [] as ReviewLedgerFinding[], findingsUnavailable: false }
-        : collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
-      const externalFindings = externalFindingsResult.findings;
+        : collectExternalReviewFindingsFromGh(ghSpawn, prNumber, {
+            process: reviewProcess,
+            extraAuthors: trustedReviewAuthors,
+            ...(reviewProcess.id === "ai-implement" && externalReviewState === "completed"
+              ? { requireCurrentReview: true, reviewWindow: "reviewWindow" in externalReviewResult ? externalReviewResult.reviewWindow : undefined } : {}),
+            ...(externalReviewResult.headSha && reviewProcess.id !== "ai-implement" ? { headSha: externalReviewResult.headSha } : {}),
+            ...("issueComments" in externalReviewResult && externalReviewResult.issueComments ? { issueComments: externalReviewResult.issueComments } : {}),
+          });
+      if ("selectedComment" in externalFindingsResult && externalFindingsResult.selectedComment) {
+        const selected = externalFindingsResult.selectedComment;
+        console.log(`[post-push-review] Claude review comment ${selected.id}: ${selected.kind}`);
+      }
+      let externalFindings = externalFindingsResult.findings;
+      if (processVerdict?.verdict === "changes_requested" && externalFindings.length === 0) {
+        externalFindings = processVerdict.findings;
+        if (processVerdict.source === "check-and-comments") {
+          // The REST inline comments behind this fallback carry no thread state, so drop the ones on
+          // resolved or outdated threads. A failed thread read keeps them all: unknown is open.
+          const closedUrls = collectClosedReviewThreadCommentUrls(ghSpawn, prNumber);
+          if (closedUrls) {
+            externalFindings = externalFindings.filter((finding) => !(finding.url && closedUrls.has(finding.url)));
+            if (!externalFindings.some((finding) => finding.severity === "blocking")) {
+              processVerdict = { ...processVerdict, verdict: "approve", findings: externalFindings };
+            }
+          }
+        }
+      }
       const findingsUnavailable = externalFindingsResult.findingsUnavailable;
 
       // CI gate: collect failing non-review checks so a red build can never produce
       // "Ready to merge". Filesystem projects still check CI when external review is
       // unconfigured, including CI jobs whose names happen to resemble review checks.
       const ciChecksResult = ((externalReviewState !== "skipped" || filesystemWithoutExternalReviewer) && externalReviewResult.headSha)
-        ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames, !filesystemWithoutExternalReviewer)
+        ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames, !filesystemWithoutExternalReviewer, reviewProcess)
         : { failingChecks: [] as string[], unreadable: false, permissionDenied: false };
 
       if (ciChecksResult.permissionDenied) {
         terminationReason = "checks_permission_denied";
         feedback = CHECKS_PERMISSION_DENIED_MESSAGE;
-        reviewerFailure = await reportChecksPermissionDenied(reporter, ghSpawn, prNumber, iteration);
+        reviewerFailure = await reportChecksPermissionDenied(reporter, ghSpawn, prNumber, iteration, rejectedCommentBlock());
         break;
       }
 
@@ -2083,42 +2335,80 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         // issue so it flows through the same ledger/gating path "CI check failing" already uses,
         // rather than silently approving on missing evidence.
         internalIssues.push({
-          title: "CI check status could not be verified",
+          title: CI_CHECK_UNVERIFIED_TITLE,
           problem: `Could not read check runs at ${externalReviewResult.headSha} to determine whether CI checks passed.`,
           requiredFix: "Investigate the check-runs read failure (transient API error or credential issue), then re-run review once check runs can be read.",
         });
       }
       for (const checkName of ciChecksResult.failingChecks) {
         internalIssues.push({
-          title: "CI check failing",
+          title: CI_CHECK_FAILING_TITLE,
           problem: `CI check '${checkName}' is failing on the current head`,
           requiredFix: `Fix the underlying defect causing '${checkName}' to fail`,
         });
       }
 
-      const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy);
-      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy));
-      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy));
+      const summaryBlockingGates = reviewProcess.summaryBlockingGates;
+      const contractVerdict = externalFindingsResult.verdictSource === "review-contract" ? externalFindingsResult.verdict : undefined;
+      const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
+      for (const finding of reviewLedger) {
+        findingsByKey.set(stableReviewFindingKey(finding), finding);
+      }
+      for (const issue of internalIssues) {
+        const finding = reviewIssueToLedgerFinding(issue);
+        internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
+      }
+      // Preserve current CI findings in the same internal ledger snapshot.
+      for (const issue of internalIssues) {
+        finalInternalKeys?.add(stableReviewFindingKey(reviewIssueToLedgerFinding(issue)));
+      }
+      const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
+        return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
+      };
+      // Terminal branches exit this pass; the fix branch reuses its publication on no changes.
+      const inline = buildInlineReviewComments(reviewLedger.filter((finding) => finding.source === "ai-implement-internal"), diffRes.stdout);
+      const publishReview = (spawn: typeof ghSpawn, number: string, body: string) => submitPrReview(spawn, number, body, {
+        callbackUrl: context.data.callbackUrl, progressToken: context.data.progressToken,
+        owner: context.data.githubOwner ?? "", repo: context.data.githubRepo ?? "",
+        headSha: publicationHeadSha, iteration, inline,
+      });
+      const gatingReviewFindings = reviewLedger.filter(findingGates);
+      const advisoryReviewFindings = reviewLedger.filter((finding) => !findingGates(finding));
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
       // before the merge-readiness decision and before it can reappear in the next fix prompt.
-      // An "invalid" disposition is not filtered — it stays gating so the next review decides.
-      const gatingExternalFindings = gatingReviewFindings
+      // Rejected findings also stay closed when the reviewer repeats their key.
+      const reportedGatingExternalFindings = gatingReviewFindings
         .filter((finding) => finding.source !== "ai-implement-internal")
-        .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
+        .filter((finding) => !closedKeys.has(stableReviewFindingKey(finding)));
+      let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
+      // While the external check on the current head is still running, the findings read above may
+      // belong to an older head (a fix pass may already have fixed them). They do not gate; the
+      // LateExternalReview workflow ignores findings the current head's review has not reported again.
+      // An unapproved internal verdict keeps them visible so a fix pass never runs with no feedback.
+      const gatingExternalFindings =
+        externalReviewPending && verdict.approved === true && issues.length === 0 ? [] : reportedGatingExternalFindings;
       const hasGatingExternalFindings = gatingExternalFindings.length > 0;
       const advisoryExternalFindings = advisoryReviewFindings;
-      let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
-      const externalReviewVerdictBlocks = externalFindingsResult.verdictSource === "review-contract"
-        && (externalFindingsResult.verdict === "changes_requested" || externalFindingsResult.verdict === "incomplete");
+      const contractFindings = externalFindingsResult.findings.filter((finding) => finding.source === "review-contract");
+      const allFindingsNonBlockingOrClosed = (findings: ReviewLedgerFinding[]): boolean =>
+        findings.length > 0 && findings.every((finding) =>
+          finding.severity === "minor" || closedKeys.has(stableReviewFindingKey(finding)));
+      // Missing/incomplete verdicts remain independent safeguards. Each finding in a
+      // completed negative verdict must be advisory or closed by an earlier fix pass.
+      // Aggregate severity counts and empty negative verdicts remain blocking.
+      const externalReviewVerdictBlocks = (externalFindingsResult.verdictSource === "review-contract"
+        && (externalFindingsResult.verdict === "incomplete"
+          || (externalFindingsResult.verdict === "changes_requested" && !allFindingsNonBlockingOrClosed(contractFindings))))
+        || (processVerdict?.verdict === "changes_requested" && !allFindingsNonBlockingOrClosed(processVerdict.findings));
       console.log(
         `[post-push-review] Review ledger findings: gating=${gatingReviewFindings.length} advisory=${advisoryReviewFindings.length}`,
       );
 
       feedback = suppressDuplicateExternalFeedback(verdict.feedback, externalFindings);
-      if (gatingIncompleteReviews.length === 0 && issues.length === 0 && verdict.approved === false && gatingExternalFindings.length === 0 && !findingsUnavailable && !externalReviewVerdictBlocks) {
+      if (gatingIncompleteReviews.length === 0 && issues.length === 0 && verdict.approved === false && reportedGatingExternalFindings.length === 0 && !findingsUnavailable && !externalReviewVerdictBlocks) {
         terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
-        await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback, reviewResult.telemetry);
+        await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback, reviewResult.telemetry, rejectedCommentBlock());
         break;
       }
 
@@ -2130,7 +2420,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // external review check did not finish within the wait budget. Do not auto-approve
       // against a reviewer that is still in flight — defer to a human.
       const cleanInternalNoGatingFindings = verdict.approved === true && issues.length === 0 && gatingExternalFindings.length === 0;
-      const internalApprovable = cleanInternalNoGatingFindings && !findingsUnavailable && !externalReviewVerdictBlocks;
+      const internalApprovable = cleanInternalNoGatingFindings && !findingsUnavailable && !externalReviewVerdictBlocks && !externalReviewNoVerdict;
       if (gatingIncompleteReviews.length > 0) {
         terminationReason = selectedReviewerResult.terminationReason ?? "invalid_review";
         const lastFinding = reviewHistory.at(-1);
@@ -2165,22 +2455,78 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           : terminationReason === "provider_unavailable" ? "provider-unavailable"
           : terminationReason === "invalid_review" ? "review-invalid" : "review-failed";
         const marker = `<!-- ai-implement post-push iter=${iteration} ${markerReason} -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review did not complete for every required reviewer. Manual review required.${blockingIssuesBlock(issues)}${internalReviewSummaryBlock(feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review: at least one required reviewer did not finish. Manual review required.${blockingIssuesBlock(issues)}${internalReviewSummaryBlock(feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n🟠 Required automated review is incomplete; at least one reviewer did not finish.\n\n${reviewReportForComment(reviewUrl, feedback)}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
+          `${marker}\n🟠 The second review is not complete. At least one required reviewer did not finish.\n\n${reviewReportForComment(reviewUrl, feedback)}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${rejectedCommentBlock()}\n\n**Merge readiness:** Manual review required; the review did not finish.`,
           marker,
         );
         break;
       }
+      // Repository-fix processes: the repository's auto-fix is the only fixer for Claude's findings, so
+      // once Claude's review of this commit has completed with a blocking finding, no fix pass runs.
+      const claudeBlocking = reviewProcess.fixer === "repository"
+        && externalReviewState === "completed"
+        && (gatingExternalFindings.length > 0 || processVerdict?.verdict === "changes_requested");
+      if (claudeBlocking) {
+        const internalBlocking = verdict.approved === false
+          || gatingReviewFindings.some((finding) => finding.source === "ai-implement-internal");
+        if (!internalBlocking) {
+          // The LateExternalReview workflow follows the auto-fix to its new commit and approves from there.
+          terminationReason = "external_review_pending";
+          reviewedHeadSha = externalReviewResult.headSha || undefined;
+          feedback = "Claude's review found blocking issues; the repository's auto-fix owns the fix. Not auto-approving.";
+          await reporter.report({
+            id: `post-push-review.${iteration}`,
+            type: "custom",
+            status: "passed",
+            started_at: new Date().toISOString(),
+            ended_at: new Date().toISOString(),
+            parent_step_id: "post-push-review",
+            inputs: { iteration, prNumber },
+            outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry, ...(reviewedHeadSha ? { reviewedHeadSha } : {}) },
+            logs_url: null,
+          });
+          const marker = `<!-- ai-implement post-push iter=${iteration} repository-fix -->`;
+          const reviewUrl = await publishReview(
+            ghSpawn,
+            prNumber,
+            `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed. Claude's review found blocking issues, which the repository's auto-fix handles. Not approving until the auto-fix commit has a clean review.${internalReviewSummaryBlock(verdict.feedback)}`,
+          );
+          postPrComment(
+            ghSpawn,
+            prNumber,
+            `${marker}\n⏳ Internal review passed. Claude's review found blocking issues; waiting for the repository's auto-fix. No AI-Implement fix pass will run.${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge; waiting for the repository's auto-fix.`,
+            marker,
+          );
+          break;
+        }
+        // Both reviews block: two fixers must never run at once, so a person decides.
+        terminationReason = "iterations_exhausted";
+        const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
+        const reviewUrl = await publishReview(
+          ghSpawn,
+          prNumber,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement's review and Claude's review both found blocking issues. Manual review required.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${internalReviewSummaryBlock(verdict.feedback)}`,
+        );
+        postPrComment(
+          ghSpawn,
+          prNumber,
+          `${marker}\n⚠️ Both AI-Implement's review and Claude's review found blocking issues. No fix pass runs, so the repository's auto-fix and AI-Implement never push at once.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Manual review required.`,
+          marker,
+        );
+        break;
+      }
+
       if (cleanInternalNoGatingFindings && externalReviewPending) {
         terminationReason = "external_review_pending";
-        feedback = "External review did not complete within the wait budget; not auto-approving.";
+        reviewedHeadSha = externalReviewResult.headSha || undefined;
+        feedback = EXTERNAL_REVIEW_PENDING_NEXT_STEP;
         await reporter.report({
           id: `post-push-review.${iteration}`,
           type: "custom",
@@ -2189,29 +2535,65 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           ended_at: new Date().toISOString(),
           parent_step_id: "post-push-review",
           inputs: { iteration, prNumber },
-          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry },
+          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry, ...(reviewedHeadSha ? { reviewedHeadSha } : {}) },
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} external-pending -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review did not complete within the wait budget. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review: the AI-Implement reviewers found no problems, but the external review check did not finish in the time limit. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review did not complete within the wait budget. Not auto-approving.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}\n\n**Merge readiness:** Manual review required; external review did not complete.`,
+          `${marker}\n⚠️ The AI-Implement reviewers found no problems. But the external review check did not finish in the time limit. AI-Implement did not approve the change.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${rejectedCommentBlock()}\n\n**Merge readiness:** Manual review required; the external review check did not finish.`,
           marker,
         );
         break;
       }
 
-      if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks)) {
+      // Only a real, readable, blocking verdict goes to the late gate: LateExternalReview re-reads it from
+      // Claude's review comment (ai-implement process), and does not require an initial run's own review
+      // check to have succeeded, so a no-verdict or unreadable ending would otherwise earn the mark (AII-1589).
+      const handOffToLateReview = cleanInternalNoGatingFindings
+        && externalReviewVerdictBlocks
+        && !findingsUnavailable
+        && !externalReviewNoVerdict
+        && reviewProcess.id === "ai-implement";
+      if (handOffToLateReview) {
+        terminationReason = "external_review_pending";
+        reviewedHeadSha = externalReviewResult.headSha || undefined;
+        feedback = externalVerdictUnavailableFeedback({ noVerdict: false, verdictBlocks: true });
+        await reporter.report({
+          id: `post-push-review.${iteration}`,
+          type: "custom",
+          status: "passed",
+          started_at: new Date().toISOString(),
+          ended_at: new Date().toISOString(),
+          parent_step_id: "post-push-review",
+          inputs: { iteration, prNumber },
+          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry, ...(reviewedHeadSha ? { reviewedHeadSha } : {}) },
+          logs_url: null,
+        });
+        const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
+        const reviewUrl = await publishReview(
+          ghSpawn,
+          prNumber,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. The late external review now decides.${internalReviewSummaryBlock(verdict.feedback)}`,
+        );
+        postPrComment(
+          ghSpawn,
+          prNumber,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not approving here; the late external review now decides (a verdict whose findings are all deferred follow-ups does not hold the PR).${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${rejectedCommentBlock()}\n\n**Merge readiness:** Waiting for the late external review to decide.`,
+          marker,
+        );
+        break;
+      }
+
+      if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks || externalReviewNoVerdict)) {
         terminationReason = "invalid_review";
-        feedback = externalReviewVerdictBlocks
-          ? "External review returned a structured verdict that blocks merge without machine-readable findings; not auto-approving."
-          : "External review findings could not be parsed; not auto-approving.";
+        feedback = externalVerdictUnavailableFeedback({ noVerdict: externalReviewNoVerdict, verdictBlocks: externalReviewVerdictBlocks });
         await reporter.report({
           id: `post-push-review.${iteration}`,
           type: "custom",
@@ -2224,15 +2606,15 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review: the AI-Implement reviewers found no problems, but AI-Implement cannot read the verdict of the external review. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
+          `${marker}\n⚠️ The AI-Implement reviewers found no problems. But AI-Implement cannot read the verdict of the external review. AI-Implement did not approve the change.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${rejectedCommentBlock()}\n\n**Merge readiness:** Manual review required; the external review verdict is not available.`,
           marker,
         );
         break;
@@ -2263,11 +2645,11 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (approved) {
         terminationReason = "approved";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        const reviewUrl = submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.${internalReviewSummaryBlock(verdict.feedback)}`);
+        const reviewUrl = await publishReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review approved this pull request.${internalReviewSummaryBlock(verdict.feedback)}`);
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${reviewReportForComment(reviewUrl, feedback)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Ready to merge.`,
+          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${reviewReportForComment(reviewUrl, feedback)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${rejectedCommentBlock()}\n\n**Merge readiness:** Ready to merge.`,
           marker,
         );
         break;
@@ -2276,25 +2658,31 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (iteration >= maxIterations) {
         terminationReason = "iterations_exhausted";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review: the pull request still has blocking problems.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ AI-Implement did not approve the change. ${terminationReasonSentence("iterations_exhausted", iteration)} ${reasonCodeTag("iterations_exhausted")}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
       }
 
+      // Publish against the reviewed head before the fix can push a new one.
+      const reviewUrl = await publishReview(
+        ghSpawn,
+        prNumber,
+        `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found issues; starting a fix pass.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}`,
+      );
       const feedbackMarker = `<!-- ai-implement post-push iter=${iteration} -->`;
       postPrComment(
         ghSpawn,
         prNumber,
-        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
         feedbackMarker,
       );
 
@@ -2361,15 +2749,39 @@ ${externalFindingsFixBlock}
       // commit the fix pass started from, reported as the cycle summary's `inputCommit`.
       const inputHead = leaseSha ? null : gitSpawn(["rev-parse", "HEAD"]);
       const fixCycleInputCommit = leaseSha ?? (inputHead?.exitCode === 0 && inputHead.stdout.trim() ? inputHead.stdout.trim() : null);
-      const fixResult = await context.llmExecutor.invoke({
-        prompt: fixPrompt,
+      const invokeFix = (continuation = false) => context.llmExecutor.invoke({
+        prompt: continuation ? `${fixPrompt}\n\n${IMPLEMENT_CONTINUATION_NOTE}` : fixPrompt,
         model,
         maxTurns: FIX_MAX_TURNS,
         stage: `post-push-review/fix-${iteration}`,
+        agentStage: "implementation",
         expectsStructuredOutput: false,
       });
+      let fixResult = await invokeFix();
+      let fixAttempt = 1;
+      while (isLlmResultFailure(fixResult, false)
+        && fixResult.failure?.accountFallback?.stage === "implementation") {
+        await reporter.report({
+          id: `post-push-review.fix-${iteration}.retry${fixAttempt++}`,
+          type: "custom",
+          status: "failed",
+          started_at: new Date().toISOString(),
+          ended_at: new Date().toISOString(),
+          parent_step_id: "post-push-review",
+          inputs: { iteration, prNumber },
+          outputs: { failure: fixResult.failure, telemetry: fixResult.telemetry },
+          logs_url: null,
+        });
+        costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);
+        fixResult = await invokeFix(true);
+      }
       costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);
-      if (fixResult.exitCode !== 0) {
+      const fixFailure = fixResult.failure ?? (isLlmResultFailure(fixResult, false) ? classifyLlmResult(fixResult, {
+        stage: `post-push-review/fix-${iteration}`, attempt: fixResult.attempts ?? 1, expectsStructuredOutput: false,
+      }) : null);
+      // Preserve partial work from capped passes and exit-0 errors, except when account fallbacks are exhausted.
+      if ((fixResult.exitCode !== 0 && fixResult.telemetry?.outcome !== "max_turns") || (fixFailure && ACCOUNT_FALLBACK_CODES.has(fixFailure.code))) {
+        if (fixFailure && ACCOUNT_FALLBACK_CODES.has(fixFailure.code)) reviewerFailure = fixFailure;
         priorLlmFailure = true;
         terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);
@@ -2396,14 +2808,14 @@ ${externalFindingsFixBlock}
           ended_at: new Date().toISOString(),
           parent_step_id: "post-push-review",
           inputs: { iteration, prNumber },
-          outputs: { error: failure, telemetry: fixResult.telemetry },
+          outputs: { error: failure, failure: fixFailure, telemetry: fixResult.telemetry },
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} fix-failed -->`;
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} could not complete.\n\n${failure}\n\nNo automated fix was pushed in this pass.\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} could not complete.\n\n${failure}\n\nNo automated fix was pushed in this pass.${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         feedback = failure;
@@ -2425,12 +2837,14 @@ ${externalFindingsFixBlock}
       const add = gitSpawn(["add", "-A"]);
       if (add.exitCode !== 0) throw new Error(`git add failed: ${resultMessage(add)}`);
 
+      removeScratchFromIndex(inputs.workspaceDir, gitSpawn);
+
       const status = gitSpawn(["status", "--porcelain"]);
       if (status.exitCode !== 0) throw new Error(`git status failed: ${resultMessage(status)}`);
       if (!status.stdout.trim()) {
         const noChangesDispositions = hasGatingExternalFindings ? applyFixPassDispositions() : [];
         const remainingGatingExternalFindings = gatingExternalFindings
-          .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
+          .filter((finding) => !closedKeys.has(stableReviewFindingKey(finding)));
         if (hasGatingExternalFindings && issues.length === 0 && remainingGatingExternalFindings.length === 0) {
           // Every gating item was an external finding, and the fix agent dispositioned all
           // of them instead of touching code — a complete outcome with nothing to push. Let
@@ -2439,8 +2853,7 @@ ${externalFindingsFixBlock}
           postPrComment(
             ghSpawn,
             prNumber,
-            `${marker}\nℹ️ Fix pass ${fixPassLabel(iteration, maxIterations)} made no code changes; disposed of ${gatingExternalFindings.length} external finding(s) instead.\n\n**Merge readiness:** Not ready to merge; re-reviewing.`,
-            marker,
+            `${marker}\n${buildClosedFindingsMarker(noChangesDispositions)}\nℹ️ Fix pass ${fixPassLabel(iteration, maxIterations)} made no code changes; disposed of ${gatingExternalFindings.length} external finding(s) instead.${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge; re-reviewing.`,
           );
           writeCycleSummary(inputs.workspaceDir, {
             id: `post-push-review.fix-${iteration}`,
@@ -2458,16 +2871,11 @@ ${externalFindingsFixBlock}
         }
         terminationReason = "no_changes";
         const marker = `<!-- ai-implement post-push iter=${iteration} no-changes -->`;
-        const reviewUrl = submitPrReview(
-          ghSpawn,
-          prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
-        );
+        // Reuse the pre-fix attempt, including publication failures.
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
-          marker,
+          `${marker}\n${buildClosedFindingsMarker(noChangesDispositions)}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the second review.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
         );
         writeCycleSummary(inputs.workspaceDir, {
           id: `post-push-review.fix-${iteration}`,
@@ -2572,8 +2980,7 @@ ${externalFindingsFixBlock}
       postPrComment(
         ghSpawn,
         prNumber,
-        `${marker}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}\n\n**Merge readiness:** Awaiting follow-up review.`,
-        marker,
+        `${marker}\n${buildClosedFindingsMarker(pushedDispositions)}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}${rejectedCommentBlock()}\n\n**Merge readiness:** Awaiting follow-up review.`,
       );
       writeCycleSummary(inputs.workspaceDir, {
         id: `post-push-review.fix-${iteration}`,
@@ -2597,7 +3004,7 @@ ${externalFindingsFixBlock}
             `[post-push-review] PR #${prNumber} was closed by operator while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: finalDispositions(), ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         // No prior genuine failure — the operator cancel is the sole anomaly.
         terminationReason = "operator_cancelled";
@@ -2612,11 +3019,11 @@ ${externalFindingsFixBlock}
             `[post-push-review] PR #${prNumber} was merged while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: finalDispositions(), ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         terminationReason = "pr_merged";
         console.warn(`[post-push-review] PR #${prNumber} was merged under the run — exiting as pr_merged`);
-        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, findingDispositions: [...findingDispositionsByKey.values()] };
+        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: finalDispositions() };
       }
       throw err;
     }
@@ -2628,10 +3035,121 @@ ${externalFindingsFixBlock}
       forcePushedRevisions: forcePushed,
       terminationReason,
       costUsd,
-      findingDispositions: [...findingDispositionsByKey.values()],
+      internalFindings: [...internalFindingsByKey.values()],
+      findingDispositions: finalDispositions(),
       ...(reviewerFailure ? { failure: reviewerFailure } : {}),
+      ...(terminationReason === "external_review_pending" && reviewedHeadSha ? { reviewedHeadSha } : {}),
     };
   },
 };
 
 export default postPushReviewStep;
+
+// Keep one comment below GitHub's 65,536-character limit. Allocate finding
+// space before summaries, and make any omitted detail explicit.
+function rollupReviewBody(verdict: string, feedback: string, findings: ReviewLedgerFinding[], reviewedHead: string): string {
+  const limit = 65_000;
+  const clip = (value: string, size: number) => {
+    if (value.length <= size) return value;
+    let end = Math.max(0, size - 15);
+    // Avoid cutting a Unicode surrogate pair when shortening reviewer text.
+    if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1])) end--;
+    return `${value.slice(0, end)}… [truncated]`;
+  };
+  const header = `<!-- ai-implement rollup-review -->\n\n## Roll-up review: ${verdict}\n\nThis verdict does not block the merge; blocking findings are filed as one [roll-up-review] child until the automatic follow-up limit is reached.\n\nReviewed head: \`${reviewedHead ? reviewedHead.slice(0, 7) : "unavailable"}\``;
+  const severityRank = { minor: 0, medium: 1, blocking: 2 };
+  const grouped = new Map<string, { finding: ReviewLedgerFinding; reviewers: Set<string> }>();
+  for (const finding of findings) {
+    const key = stableReviewFindingKey(finding);
+    const entry = grouped.get(key);
+    if (entry) {
+      if (finding.reviewerId) entry.reviewers.add(finding.reviewerId);
+      if (severityRank[finding.severity] > severityRank[entry.finding.severity]) entry.finding = finding;
+    } else grouped.set(key, { finding, reviewers: new Set(finding.reviewerId ? [finding.reviewerId] : []) });
+  }
+  const unique = [...grouped.values()];
+  const shown = unique.slice(0, 100);
+  const findingBudget = 50_000;
+  const perFinding = Math.floor(findingBudget / Math.max(1, shown.length));
+  const details = shown.map(({ finding: f, reviewers }) => {
+    const location = `${clip(f.path ?? "(general)", Math.floor(perFinding / 3))}:${f.line ?? "?"}`;
+    const prefix = `- **${f.severity}** ${location} — `;
+    const attribution = ` (Reviewers: ${clip([...reviewers].join(", "), Math.floor(perFinding / 3))})`;
+    return prefix + clip(f.body, Math.max(30, perFinding - prefix.length - attribution.length - 2)) + attribution;
+  }).join("\n\n");
+  const omitted = unique.length > shown.length ? `\n\n${unique.length - shown.length} additional findings omitted from this comment.` : "";
+  const body = [header, details + omitted].filter(Boolean).join("\n\n");
+  return `${body}\n\n${clip(feedback, limit - body.length - 2)}`;
+}
+
+/** Single advisory pass. No native review, external polling, fix, commit or push. */
+export async function runReviewOnly(context: PipelineContext, workspaceDir: string, reporter: StepReporter, ghSpawn?: (args: string[]) => SpawnResult) {
+  // Bound memory explicitly; overflow is an incomplete review, never a partial diff review.
+  const gh = ghSpawn ?? makeDefaultGhSpawn(workspaceDir, 64 * 1024 * 1024);
+  const prNumber = context.data.prNumber!;
+  let reviewedHead = "";
+  let findings: ReviewLedgerFinding[] = [];
+  let feedback = "";
+  let failed = false;
+  let failedReviewers: string[] = [];
+  let incompleteReviews: import("../../runner-result.js").RollupReviewResult["incompleteReviews"] = [];
+  let approved = false;
+  let costUsd: number | null = null;
+  try {
+    const headArgs = ["pr", "view", prNumber, "--json", "headRefOid", "--jq", ".headRefOid"];
+    const head = gh(headArgs);
+    if (head.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("Cannot read reviewed roll-up head");
+    reviewedHead = head.stdout.trim();
+    const expectedHead = context.data.reviewOnly?.expectedHeadSha;
+    if (expectedHead && expectedHead.toLowerCase() !== reviewedHead.toLowerCase()) {
+      const skipReason = `Roll-up review skipped: PR head moved from queued head ${expectedHead} to ${reviewedHead}.`;
+      console.log(`[roll-up-review] ${skipReason}`);
+      return { approved: false, iterations: 0, finalFeedback: skipReason, terminationReason: "approved" as const,
+        passes: [], extraCostUsd: null, internalFindings: [],
+        rollupReview: { headSha: expectedHead, verdictUrl: "", skipReason } };
+    }
+    // gh returns the entire base-to-head PR diff, including earlier commits and lockfiles.
+    const diff = gh(["pr", "diff", prNumber]);
+    if (diff.exitCode !== 0) throw new Error(`Cannot read PR diff: ${resultMessage(diff)}`);
+    const afterDiff = gh(headArgs);
+    if (afterDiff.exitCode !== 0 || afterDiff.stdout.trim() !== reviewedHead) throw new Error("Roll-up head changed while reading the diff; review incomplete");
+    const { fetchTrustedConfigReviewers } = await import("./install.js");
+    const trustedConfig = await fetchTrustedConfigReviewers({
+      owner: context.data.githubOwner, repo: context.data.githubRepo, token: context.data.githubToken,
+      reviewers: context.data.reviewOnly!.reviewers, trustedReviewerDefinitions: context.data.trustedReviewerDefinitions,
+    });
+    const definitions = await resolveConfigReviewerDefinitions([], context.data.trustedReviewerDefinitions, trustedConfig);
+    const resolved = await resolveSelectedInternalReviewers(context.data.reviewOnly!.reviewers, context.data.trustedReviewerDefinitions,
+      definitions.trustedDefinitions, definitions.branchDefinitions);
+    if (resolved.unresolvedIds.length) throw new Error(selectionFailureMessage("unresolved", resolved.unresolvedIds));
+    const result = await runSelectedInternalReviewers({ context, reporter, reviewers: resolved.reviewers,
+      retryPolicy: normalizeRetryPolicy(context.data.retryPolicy), prNumber, iteration: 1, diff: diff.stdout,
+      previousFindings: "", model: context.data.model ?? DEFAULT_MODEL, sleep: async () => {} });
+    findings = result.findings;
+    feedback = result.feedback;
+    incompleteReviews = result.incompleteReviews.map(({ reviewerId, failure }) => ({ reviewerId,
+      ...(failure ? { failure: { category: failure.category, code: failure.code } } : {}) }));
+    failedReviewers = result.incompleteReviews.map(review => review.reviewerId);
+    failed = failedReviewers.length > 0;
+    approved = result.approved;
+    costUsd = result.costUsd;
+  } catch (error) {
+    failed = true;
+    feedback = error instanceof Error ? error.message : String(error);
+  }
+  const verdict = failed ? "Review incomplete" : approved ? "Approved" : "Changes recommended";
+  const body = rollupReviewBody(verdict, feedback, findings, reviewedHead);
+  let verdictUrl = "";
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rollup-review-"));
+  try {
+    const bodyFile = path.join(tempDir, "verdict.md");
+    fs.writeFileSync(bodyFile, body, { mode: 0o600 });
+    const posted = gh(["pr", "comment", prNumber, "--body-file", bodyFile]);
+    if (posted.exitCode !== 0) throw new Error(`Cannot post roll-up review: ${resultMessage(posted)}`);
+    verdictUrl = posted.stdout.trim();
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  return { approved, iterations: 1, finalFeedback: feedback, terminationReason: failed ? "review_error" as const : "approved" as const,
+    passes: [], extraCostUsd: costUsd, internalFindings: findings, rollupReview: { headSha: reviewedHead, verdictUrl, failedReviewers, incompleteReviews } };
+}

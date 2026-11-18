@@ -35,7 +35,15 @@ describe("dependency direction: the main pipeline never reaches into Restate (AI
 describe("import allowlist: only the door adapters may import Restate from outside src/restate/ (AII-717)", () => {
   // deploy.ts is the self-deployment door: it probes the old Restate endpoint
   // before replacing the process (AII-810), without importing the SDK itself.
-  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts"]);
+  // webhook.ts is the review-event door: it forwards a validated GitHub review event to ReviewFixPR.feedback
+  // through an injected ingress client and takes the body cap and event type from src/restate/review-fix-pr.ts (AII-1184).
+  // reaper.ts imports the durable-runner machine-metadata constants from
+  // src/restate/fly-machine-profile.ts so the stamp and the reaper's reading of it share one definition (AII-1132).
+  // orchestrator-settings.ts is the RunnerBackend cache's reader and boot seed: it reaches the object through the ingress client (AII-1243).
+  // model-account-cli.ts is the operator command; it reaches ChatGptPlanAccount through the ingress client (AII-1204).
+  // health-body.ts reads only the local status contract to report HTTP availability (AII-1750).
+  // comment-gapfill-drain.ts is the gap-fill submission door (AII-1554): ingress and readiness only.
+  const ALLOWLIST = new Set(["src/comment-gapfill-drain.ts", "src/health-body.ts", "src/model-account-cli.ts", "src/orchestrator-settings.ts", "src/mcp.ts", "src/mcp-oauth.ts", "src/oauth/routes.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/webhook.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -84,6 +92,20 @@ describe("import allowlist: only the door adapters may import Restate from outsi
     expect(violations).toEqual([]);
   });
 
+  it("the comment gap-fill door imports only ImplementationRun ingress and local readiness", () => {
+    const imports = extractImportSpecifiers(readFileSync("src/comment-gapfill-drain.ts", "utf8"))
+      .filter((entry) => isRestateSpecifier(entry.source))
+      .map((entry) => entry.source).sort();
+    expect(imports).toEqual(["./restate/implementation-run-client.js", "./restate/status.js"]);
+  });
+
+  it("src/health-body.ts imports only local Restate status, never the SDK or ingress", () => {
+    const imports = extractImportSpecifiers(readFileSync("src/health-body.ts", "utf8"))
+      .filter((entry) => isRestateSpecifier(entry.source))
+      .map((entry) => entry.source);
+    expect(imports).toEqual(["./restate/status.js"]);
+  });
+
   it("src/admin.ts's Restate import(s) are type-only — it carries no runtime Restate dependency", () => {
     const content = readFileSync("src/admin.ts", "utf8");
     const restateImports = extractImportSpecifiers(content).filter((i) => isRestateSpecifier(i.source));
@@ -106,7 +128,7 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
   it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/runner-callback.ts"]);
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/comment-gapfill-drain.ts", "src/deploy.ts", "src/health-body.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/model-account-cli.ts", "src/oauth/routes.ts", "src/orchestrator-settings.ts", "src/reaper.ts", "src/runner-callback.ts", "src/webhook.ts"]);
   });
 });
 
@@ -202,23 +224,23 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     return /role:\s*"admin"/.test(block) && /operation:\s*"read"/.test(block);
   });
 
-  it("found the seven documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
+  it("found the eighteen documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
     expect(writeEntries.map((e) => e.toolName).sort()).toEqual(
-      ["add_project", "clear_dispatch_dedup", "pause_project", "release_dispatch_reservation", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
+      ["add_model_account", "add_project", "clear_dispatch_dedup", "decide_kg_refresh", "import_environment_credential", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_pipeline_schedule", "set_project_agent_mode", "set_project_stage", "set_run_profile", "set_runner_backend", "set_runner_mode", "start_deploy", "trigger_kg_refresh", "trigger_workflow_sync", "unpark_issue"],
     );
   });
 
   it.each(writeEntries.map(({ toolName, identifier }) => [toolName, identifier] as const))(
-    "%s (%s) contains both ctx.run( and retryPolicy in its definition",
+    "%s (%s) contains a journaled side effect (ctx.run( or an object client call) and retryPolicy in its definition",
     (_toolName, identifier) => {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
-      expect(block).toContain("ctx.run(");
+      expect(block).toMatch(/ctx\.run\(|ctx\.objectClient\(/);
       expect(block).toMatch(/retryPolicy\s*:/);
     },
   );
 
-  it("the two review-fix admin reads are explicitly marked read-only and declare no retryPolicy", () => {
-    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_review_fix_activity", "get_review_fix_attempt"]);
+  it("the admin reads are explicitly marked read-only and declare no retryPolicy", () => {
+    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_fly_setup", "get_review_fix_activity", "get_review_fix_attempt"]);
     for (const { identifier } of adminReadEntries) {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
       expect(block).toContain('operation: "read"');

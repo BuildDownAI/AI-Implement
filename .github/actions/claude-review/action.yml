@@ -63,26 +63,52 @@ runs:
           REPO: ${{ github.repository }}
           PR NUMBER: ${{ inputs.pr_number }}
 
-          Review the diff for this PR. Focus on:
+          You are reviewing this pull request. You can read it but not change it. You
+          cannot run tests, builds or the type check: CI runs those on this PR
+          separately, so do not try to run them.
+
+          Read the change and its description (`gh pr diff`, `gh pr view`), then every
+          changed file in full, not only its hunks, and follow each change to the code it
+          affects: its callers, its consumers, and the tests that cover it. Focus on:
           - Correctness, edge cases, and likely bugs
           - Security issues (especially around the GitHub Actions / secrets surface,
             SQLite usage, GraphQL inputs, and shell escaping)
           - Style consistency with the rest of the codebase (see CLAUDE.md)
           - Test coverage gaps
 
-          Do not post any comment yourself — a later workflow step renders and posts the
-          review from your structured output. Respond only with the JSON object the
-          supplied schema requires: `summary` (your free-text review, carried into the
-          posted comment verbatim), `verdict` (`approve`, `changes_requested`, or
-          `incomplete`), and
-          `findings[]` (empty when the diff looks fine). Set verdict to changes_requested
-          whenever any finding should block merge. Set verdict to incomplete when you
-          cannot reach a trustworthy review verdict for this diff.
+          Review the PR's current head against its base branch. Earlier review comments on
+          this PR may describe older commits: derive every finding from the current diff,
+          and never carry one forward from a comment without confirming it still applies.
 
-          Never write a line consisting of three backticks alone inside a finding's
-          `body` or inside `summary` — the posted comment wraps them in fenced sections,
-          and a bare ``` line inside would close one of those sections early and corrupt
-          the rest of the comment, including the machine-readable block that follows it.
+          Do not post any comment yourself — a later workflow step renders and posts the
+          review from your structured output. Return the review as that structured
+          output, passing its fields in this order:
+          1. `verdict`: `approve`, `changes_requested` whenever any finding should block
+             merge, or `incomplete` when you cannot reach a trustworthy review verdict
+             for this diff.
+          2. `findings[]`: every issue that could cause incorrect behavior, a test
+             failure, a security weakness or a misleading result, or that breaks the
+             codebase's conventions; `[]` when there are none. Each finding has exactly
+             these fields and no others: `severity` (`blocking` when it should stop the
+             merge, `minor` otherwise), `body` (self-contained: what is wrong, where, and
+             why it matters), and optionally `path` (the file) and `line` (a line number
+             in it).
+          3. `summary`: your free-text review, carried into the posted comment verbatim.
+             Name the files you read.
+
+          Before you respond, check:
+          - Every changed file was read, and the summary names them. If any was not,
+            the summary says which and why.
+          - If any finding is `blocking`, `verdict` is `changes_requested`.
+          - `findings` is present, even when it is empty.
+          - Never write a line consisting of three backticks alone inside a finding's
+            `body` or inside `summary` — the posted comment wraps them in fenced sections,
+            and a bare ``` line inside would close one of those sections early and corrupt
+            the rest of the comment, including the machine-readable block that follows it.
+
+          If you cannot read part of the change, say so in the summary and set `verdict`
+          to `incomplete`. An explicit incomplete review is better than an approval that
+          did not look.
 
           ${{ inputs.prompt_extra }}
         claude_args: |

@@ -1,16 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type http from "node:http";
 import { SESSION_COOKIE_NAME } from "../cookies.js";
+import { testDb } from "./helpers/test-db.js";
 
-// dedup.ts freezes its DB path at import time, so each test sets a unique DEDUP_DB_PATH and
-// re-imports the modules fresh (the same isolation pattern admin.test.ts uses).
 let session: typeof import("../admin-session.js");
 let access: typeof import("../access-entries.js");
 let dedup: typeof import("../dedup.js");
-let dbPath: string;
 
 /** Seed the list in force the way a pre-handover deployment does — from the env. */
 function allow(domains: string, emails = ""): void {
@@ -31,22 +26,15 @@ function sessionRow(token: string) {
 }
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `admin-session-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  session = await import("../admin-session.js");
-  access = await import("../access-entries.js");
-  dedup = await import("../dedup.js");
-  access.initAccessEntriesTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
+  ({ session, access, dedup } = (
+    await testDb({
+      modules: {
+        session: () => import("../admin-session.js"),
+        access: () => import("../access-entries.js"),
+        dedup: () => import("../dedup.js"),
+      },
+    })
+  ).modules);
 });
 
 describe("createSession", () => {
@@ -182,6 +170,22 @@ describe("authenticateAdminRequest", () => {
       // The entry is what carries the role once roles land.
       expect(gate.entry).toMatchObject({ kind: "domain", value: "eudoxus.ai" });
     }
+  });
+
+  it("keeps a claim-admitted builddown session valid, with the claim's role, and ends it once the claim is cleared", () => {
+    allow("unrelated.example");
+    const bd = { email: "cam@eudoxus.ai", sub: "bd|1", provider: "builddown" };
+    const token = session.createSession({ ...bd, name: "Cam" });
+    expect(session.authenticateAdminRequest(withToken(token))).toMatchObject({ ok: false, status: 401 });
+
+    const again = session.createSession({ ...bd, name: "Cam" });
+    access.recordOrgClaimRole(bd, "user", Date.now() + 1e6);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: true, role: "user" });
+    access.recordOrgClaimRole(bd, "admin", Date.now() + 1e6);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: true, role: "admin" });
+
+    access.clearOrgClaimRole(bd);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: false, status: 401 });
   });
 
   it("revokes the session when the identity is no longer admitted, so a removal takes effect at once", () => {

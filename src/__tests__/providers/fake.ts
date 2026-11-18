@@ -99,7 +99,7 @@ export class FakeProvider implements TicketingProvider {
     await this.tick("markPlanningStarted", [issueId, scopeKey]);
     this.transition(issueId, "planning");
   }
-  async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
+  async markPlanComplete(issueId: string, scopeKey: string, _opts: { awaitApproval: boolean }): Promise<void> {
     await this.tick("markPlanComplete", [issueId, scopeKey]);
     this.transition(issueId, "plan_complete");
   }
@@ -125,9 +125,23 @@ export class FakeProvider implements TicketingProvider {
     this.appendComment(issueId, `Implementation failed: ${reason}`);
     return true;
   }
-  async clearWorkingState(issueId: string, scopeKey: string): Promise<boolean> {
-    await this.tick("clearWorkingState", [issueId, scopeKey]);
+  async clearWorkingState(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    await this.tick("clearWorkingState", [issueId, scopeKey, phase]);
     this.transition(issueId, "cleared");
+    return true;
+  }
+  async parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    await this.tick("parkForHuman", [issueId, scopeKey, phase]);
+    if (this.issues.get(issueId)?.lifecycle !== "active") return false;
+    this.transition(issueId, "cleared");
+    return true;
+  }
+  async markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    await this.tick("markPrClosedUnmerged", [issueId, scopeKey, prUrl]);
+    if (this.issues.get(issueId)?.lifecycle !== "active") return false;
+    this.transition(issueId, "cleared");
+    this.setLifecycle(issueId, "cancelled");
+    this.appendComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the task status to its pickup value.`);
     return true;
   }
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
@@ -147,6 +161,21 @@ export class FakeProvider implements TicketingProvider {
 
   issueUrl(issue: TicketIssue): string {
     return `https://fake/issue/${issue.identifier}`;
+  }
+
+  async createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    await this.tick("createChildIssue", [parentId, scopeKey, content]);
+    const parent = this.issues.get(parentId)?.issue;
+    if (!parent || parent.scopeKey !== scopeKey) throw new Error("Parent not found in scope");
+    let n = this.issues.size + 1;
+    while (this.issues.has(`fake-child-${n}`)) n++;
+    const id = `fake-child-${n}`;
+    const identifier = `CHILD-${n}`;
+    this.issues.set(id, { issue: { id, identifier, title: content.title, description: content.body,
+      scopeKey, nativeStatus: "Ready", parentRef: { identifier: parent.identifier } },
+      phase: "needs_planning", lifecycle: "active" });
+    this.comments.set(id, []);
+    return { id, identifier };
   }
 
   async findByKey(key: string): Promise<TicketIssue | null> {

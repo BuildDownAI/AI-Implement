@@ -4,10 +4,15 @@
  * `review-fix-production.ts` and `review-fix-client.ts`. `src/index.ts` composes and registers
  * the services; this file is the allowed SDK boundary where the orchestrator's existing
  * kg-refresh closures become Restate services. */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
+import { createHmac } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
-import { getDb } from "../dedup.js";
 import type { AppConfig } from "../index.js";
+import { createPipelineSchedule } from "./pipeline-schedule.js";
+import { createKgSidecarHealth, probeKgSidecarIfUnavailable } from "./kg-sidecar-health.js";
+import { createKgRefreshSchedulePipeline } from "./kg-refresh-schedule.js";
+import { getFlySessionsConfig } from "../orchestrator-settings.js";
 import {
   CANARY_DEADLINE_MS,
   CANARY_RETRY_MS,
@@ -22,25 +27,32 @@ import {
 import { readServedStamp, type KgRailDeps } from "../kg-refresh-rail.js";
 import { KG_DIR, getServedNamespace } from "../kg-sidecar.js";
 import { parseKgSourceRepo } from "../deploy.js";
-import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, defaultFetchSignal, postWorkflowDispatch } from "../github.js";
+import { RUN_TITLE_PREFIX, defaultFetchSignal } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
-import { resolveRunnerImageForDispatch } from "../repo-image.js";
-import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
-import { stopBackendRun } from "../backend-run.js";
-import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
-import { mintRunToken } from "../runner-tokens.js";
+import { buildKgRefreshRunConfig } from "../run-config.js";
+import { readBackendRun, stopBackendRun } from "../backend-run.js";
+import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendResolution } from "../runner-mode.js";
+import { mintLaunchTokens } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
-import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { appendLogIfAbsent, findLogIdByDispatchId, markJobAwaitingDecision, reopenHeldJob as reopenHeldJobRow, setJobCompute, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig, type SettleOptions } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
   type KgDispatchInput,
+  type KgDispatchRecord,
   type KgDispatchResult,
+  type KgDispatchRowDetails,
   type KgRefreshReportBody,
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
-import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
+import { createKgRefreshSenders, type KgRefreshSender, type KgRefreshSenderDeps } from "./kg-refresh-senders.js";
+import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "../durable-runner.js";
+import { createGhaRunProfile } from "./gha-run-profile.js";
+import { DURABLE_RUNNER_DISPATCH_ID_KEY, createFlyMachineProfile, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
+import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult } from "./kg-repo.js";
+import type { Step } from "../pipeline/types.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
@@ -53,7 +65,6 @@ export function createKgFindRunByTitle(opts: {
   owner: string;
   repo: string;
   getToken: () => Promise<string>;
-  recordDetails: (dispatchId: string, details: { workflowRunId: number; logsUrl?: string }) => void;
 }): KgRefreshWorkflowDependencies["findRunByTitle"] {
   return async (title) => {
     const res = await fetch(
@@ -64,48 +75,182 @@ export function createKgFindRunByTitle(opts: {
     const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string; html_url?: string }> };
     const match = data.workflow_runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
     if (!match) return null;
-    // The title is `KG-REFRESH · <dispatchId>`; a bare identifier carries no dispatch id to record against.
-    const dispatchIdPrefix = "KG-REFRESH · ";
-    if (title.startsWith(dispatchIdPrefix)) {
-      opts.recordDetails(title.slice(dispatchIdPrefix.length), { workflowRunId: match.id, logsUrl: match.html_url });
-    }
-    return { runId: match.id };
+    // A read only: the workflow projects the found run onto the row in its own `record-reconcile` step.
+    return { runId: match.id, ...(match.html_url ? { logsUrl: match.html_url } : {}) };
   };
 }
-const GHA_EXECUTION_MODE = "github-actions";
 
-type LegacyDispatch = (opts: {
-  runToken: string;
-  runProgressToken: string;
-  dispatchId: string;
-  runConfig: string;
-  executionPath?: string;
-}) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
+/** The Fly calls the kept-machine launch makes; a fake in tests. */
+export interface KeptMachineFly {
+  getMachine(id: string): Promise<Machine>;
+  /** Every machine in the sessions app; the create path looks a dispatch's machine up here before it creates one. */
+  listMachines(): Promise<Machine[]>;
+  createMachine(config: CreateMachineOpts): Promise<Machine>;
+  updateMachine(id: string, config: MachineConfig): Promise<unknown>;
+  startMachine(id: string): Promise<void>;
+  /** Polls until the machine is `stopped`, `started` or gone; null when gone. Throws past `timeoutMs`. */
+  waitSettled(id: string, timeoutMs: number): Promise<Machine | null>;
+  /** Fly's `/wait` for the given instance (the one an `update` answered with) to reach `stopped`. */
+  waitForStopped(id: string, instanceId: string, timeoutSeconds: number): Promise<void>;
+}
 
-export interface KgDispatchDetails {
-  machineId?: string;
-  machineNonce?: string;
-  logsUrl?: string;
-  workflowRunId?: number;
+/** Bound on each wait for a settled machine or a finished replace. */
+export const KEPT_MACHINE_SETTLE_MS = 60_000;
+const UNSETTLED_STATES = new Set(["replacing", "starting", "stopping", "created"]);
+
+export function bindKeptMachineFly(token: string, app: string): KeptMachineFly {
+  return {
+    getMachine: (id) => getMachine(token, app, id),
+    listMachines: () => listMachines(token, app),
+    createMachine: (config) => createMachine(token, app, config),
+    updateMachine: (id, config) => updateMachine(token, app, id, config),
+    startMachine: (id) => startMachine(token, app, id),
+    waitSettled: (id, timeoutMs) => waitForMachineSettled(token, app, id, { timeoutMs, until: ["stopped", "started", "suspended", "destroyed"] }),
+    waitForStopped: (id, instanceId, timeoutSeconds) => waitForMachine(token, app, id, "stopped", timeoutSeconds, instanceId),
+  };
+}
+
+const isReplaceWindow = (err: unknown, status: number, text: RegExp): boolean =>
+  err instanceof Error && err.message.includes(`(${status})`) && text.test(err.message);
+
+const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\)/.test(err.message);
+
+/**
+ * The dispatch step's Fly write for a kept machine (AII-1136). Every create first lists the app's machines and adopts
+ * the live `durable-runner` one stamped with this dispatch id (an earlier try of the step created it and lost the ack), else creates one.
+ * With one it reconciles first: `started` for this dispatch means an earlier try of the step already ran
+ * (return it, no second `update`, which would reboot it); `started` for another dispatch means the hold is
+ * wrong (throw); `destroyed` or 404 falls back to that adopt-or-create; anything else is `update` then `start`. A machine
+ * still replacing, starting, stopping or created is waited out first (bounded). `update` makes Fly replace the instance, so
+ * the launch waits for the replacement to reach `stopped` before `start`, and repeats a call Fly refused inside the
+ * replace window once (409 on `update`, 412 on `start`). A lookup error, or a window that outlasts the bound,
+ * throws so the step retries. `machineNonce` is the one the new config carries, or, for an
+ * already-dispatched machine, the one read back from its env.
+ */
+export async function launchKeptMachine(
+  fly: KeptMachineFly,
+  opts: { keptMachineId: string | null; dispatchId: string; machineConfig: CreateMachineOpts; machineNonce: string; settleMs?: number },
+): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean; adopted?: boolean; replaced?: string; waitedSeconds?: number }> {
+  const { keptMachineId, dispatchId, machineConfig, machineNonce, settleMs = KEPT_MACHINE_SETTLE_MS } = opts;
+  const create = async (replaced?: string) => {
+    // A lookup error throws before any create, so the step retries rather than making a second machine.
+    const machines = await fly.listMachines();
+    const found = machines.find((m) =>
+      m.id !== keptMachineId
+      && m.state !== "destroyed"
+      && m.config?.metadata?.[DURABLE_RUNNER_DISPATCH_ID_KEY] === dispatchId
+      && m.config?.metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE);
+    if (found) {
+      return {
+        machineId: found.id, machineNonce: found.config?.env?.MACHINE_NONCE ?? machineNonce, created: true, reused: false, adopted: true,
+        ...(replaced !== undefined && { replaced }),
+      };
+    }
+    const machine = await fly.createMachine(machineConfig);
+    return { machineId: machine.id, machineNonce, created: true, reused: false, ...(replaced !== undefined && { replaced }) };
+  };
+  if (keptMachineId === null) return create();
+
+  let existing: Machine;
+  try {
+    existing = await fly.getMachine(keptMachineId);
+  } catch (err) {
+    if (!isFlyNotFound(err)) throw err;
+    console.log(`[kg-refresh] kept machine ${keptMachineId} is gone (404); creating a new one`);
+    return create(keptMachineId);
+  }
+  let waitedMs = 0;
+  const timed = async <T>(work: Promise<T>): Promise<T> => {
+    const t0 = Date.now();
+    try { return await work; } finally { waitedMs += Date.now() - t0; }
+  };
+  const gone = () => {
+    console.log(`[kg-refresh] kept machine ${keptMachineId} is gone; creating a new one`);
+    return create(keptMachineId);
+  };
+  if (UNSETTLED_STATES.has(existing.state)) {
+    const settled = await timed(fly.waitSettled(keptMachineId, settleMs));
+    if (settled === null) return gone();
+    existing = settled;
+  }
+  if (existing.state === "destroyed") return gone();
+  if (existing.state === "started") {
+    if (existing.config?.metadata?.[DURABLE_RUNNER_DISPATCH_ID_KEY] === dispatchId) {
+      return { machineId: keptMachineId, machineNonce: existing.config.env?.MACHINE_NONCE ?? machineNonce, created: false, reused: true };
+    }
+    throw new Error(`kept machine ${keptMachineId} is started for another dispatch; the hold is wrong`);
+  }
+  let updated: unknown;
+  try {
+    updated = await fly.updateMachine(keptMachineId, machineConfig.config);
+  } catch (err) {
+    if (!isReplaceWindow(err, 409, /concurrent update in progress|machine is replacing/i)) throw err;
+    // An earlier update is still applying: wait it out, then update once more.
+    const settled = await timed(fly.waitSettled(keptMachineId, settleMs));
+    if (settled === null || settled.state === "destroyed") return gone();
+    updated = await fly.updateMachine(keptMachineId, machineConfig.config);
+  }
+  const instanceId = (updated as { instance_id?: unknown } | null | undefined)?.instance_id;
+  if (typeof instanceId === "string" && instanceId !== "") {
+    await timed(fly.waitForStopped(keptMachineId, instanceId, Math.ceil(settleMs / 1000)));
+  }
+  try {
+    await fly.startMachine(keptMachineId);
+  } catch (err) {
+    if (!isReplaceWindow(err, 412, /replac/i)) throw err;
+    const settled = await timed(fly.waitSettled(keptMachineId, settleMs));
+    if (settled === null || settled.state === "destroyed") return gone();
+    await fly.startMachine(keptMachineId);
+  }
+  const waitedSeconds = Math.round(waitedMs / 1000);
+  return { machineId: keptMachineId, machineNonce, created: false, reused: true, ...(waitedSeconds > 0 && { waitedSeconds }) };
+}
+
+/** The machine nonce for one attempt: HMAC-SHA256 of `${dispatchId}:${attempt}` under the token secret, 32 hex characters
+ *  (the length `generateMachineNonce` produces). A credential: derived inside a step, never returned from one. */
+export function deriveMachineNonce(secret: string, dispatchId: string, attempt: number): string {
+  if (!secret) throw new Error("RUNNER_TOKEN_SECRET is not configured");
+  return createHmac("sha256", secret).update(`${dispatchId}:${attempt}`).digest("hex").slice(0, 32);
+}
+
+/** Re-arms the row to the nonce a reused kept machine actually carries. A no-op when it equals the derived one or the row is
+ *  missing. Written inside the dispatch step and never returned, so the credential stays out of the journal. */
+export function syncRowToMachineNonce(dispatchId: string, derivedNonce: string, machineNonce: string): void {
+  if (machineNonce === derivedNonce) return;
+  const jobId = findLogIdByDispatchId(dispatchId);
+  if (jobId !== undefined) setJobMachineNonce(jobId, machineNonce);
 }
 
 /**
- * Writes a kg-refresh dispatch's machine and run details onto its job row (legacy `updateJobMachine`):
- * the machine nonce wins, else the logs URL, plus the run id. A dispatch id with no row is a no-op.
+ * Projects a kg-refresh dispatch's journaled machine and run details onto its job row. The machine id
+ * is a plain write: the row stays `dispatched` until the machine read moves it. A dispatch id with no row is a no-op.
  */
-export function recordKgDispatchDetails(dispatchId: string, d: KgDispatchDetails): void {
+export function recordKgDispatchDetails(dispatchId: string, d: KgDispatchRowDetails): void {
   const jobId = findLogIdByDispatchId(dispatchId);
   if (jobId === undefined) return;
-  if (d.machineNonce) updateJobMachineDetails(jobId, { machineNonce: d.machineNonce, machineId: d.machineId, logsUrl: d.logsUrl });
-  else if (d.logsUrl) updateJobPrUrl(jobId, d.logsUrl);
+  if (d.machineId) {
+    setJobMachineId(jobId, d.machineId);
+    // The start is this run's dispatch, not the kept machine's creation.
+    setJobCompute(jobId, d.machineSize ?? null, Date.now());
+  }
+  if (d.logsUrl) updateJobPrUrl(jobId, d.logsUrl);
   if (d.workflowRunId !== undefined) updateJobRunId(jobId, d.workflowRunId);
+}
+
+/** Writes the `dispatch_log` row from the journaled record. Idempotent on the dispatch id. */
+export function recordKgDispatchRow(record: KgDispatchRecord): void {
+  appendLogIfAbsent({
+    issueId: record.issueId, phase: record.phase, dispatchId: record.dispatchId,
+    executionMode: record.executionMode, repo: record.repo, trigger: record.trigger,
+  });
 }
 
 export interface KgRefreshProductionInput {
   kgSourceRepo: string;
   config: Pick<AppConfig,
     "githubAppId" | "githubAppPrivateKey" | "sessionImage" | "runnerImageExplicit"
-    | "runnerCallbackBaseUrl" | "runnerTokenSecret" | "flySessionsToken" | "flySessionsApp">;
+    | "runnerCallbackBaseUrl" | "runnerTokenSecret" | "flySessionsToken" | "flySessionsApp"
+    | "flySessionsRegion" | "localRunnerImage" | "localRunnerOrchestratorUrl" | "healthPort">;
   mintToken: KgRailDeps["mintToken"];
   fetchTarball: KgRailDeps["fetchTarball"];
   fetchDefaultBranch: KgRailDeps["fetchDefaultBranch"];
@@ -118,17 +263,22 @@ export interface KgRefreshProductionInput {
   setCommitStatusFn: KgRailDeps["setCommitStatusFn"];
   mergePullRequestFn: KgRailDeps["mergePullRequestFn"];
   closePullRequestFn: KgRailDeps["closePullRequestFn"];
+  getPullRequestStateFn: KgRailDeps["getPullRequestStateFn"];
   deleteBranchFn: KgRailDeps["deleteBranchFn"];
-  /** The legacy dispatcher (`dispatchKgRefreshRun` in `src/index.ts`). Used only when the
-   *  resolved execution path is not GitHub Actions; the GHA path is dispatched by this
-   *  module so it can request `return_run_details`. */
-  dispatchKgRefreshRun: LegacyDispatch;
+  /** The sender deps the backends need and `config` cannot supply (AII-1148). */
+  getInstallationToken: KgRefreshSenderDeps["getInstallationToken"];
+  getScopedInstallationToken: KgRefreshSenderDeps["getScopedInstallationToken"];
+  resolveRunnerImage: KgRefreshSenderDeps["resolveRunnerImage"];
+  postWorkflowDispatch: KgRefreshSenderDeps["postWorkflowDispatch"];
+  keptMachineFly: KgRefreshSenderDeps["keptMachineFly"];
+  startLocalRunnerContainer: KgRefreshSenderDeps["startLocalRunnerContainer"];
+  /** Overrides `resolveKgExecutionMode` for the dispatch. A test seam: the workflow's `resolveDispatchRecord` dependency calls it. */
+  resolveExecutionMode?: () => string;
   /** Probes the KG source repo's dispatch workflow for `run_publication_token` support. Defaults to `resolveWorkflowCapabilities`. */
   resolveWorkflowCapabilities?: typeof resolveWorkflowCapabilities;
   updateJobStatus: (jobId: number, status: JobStatus, conclusion?: string | null) => void;
-  /** Writes the backend's machine and run details onto the job row for `dispatchId` (a missing row is a no-op).
-   *  Called inside the dispatch closure so `machineNonce` reaches SQLite and never the journal. */
-  recordDispatch: (dispatchId: string, details: KgDispatchDetails) => void;
+  /** Projects journaled machine and run details onto the job row for `dispatchId` (a missing row is a no-op). */
+  recordDispatchDetails?: (dispatchId: string, details: KgDispatchRowDetails) => void;
   /** Recovers the dispatch_log id after a restart (journaled `reserve` does not re-run).
    *  Defaults to a `dispatch_log.dispatch_id` lookup. */
   findJobId?: (dispatchId: string) => number | undefined;
@@ -165,84 +315,39 @@ export interface KgRefreshToolDeps {
   readServedStamp: () => Promise<string | null>;
 }
 
-function findKgMapping(kgSourceRepo: string) {
+export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
 }
 
-/** The execution mode a kg-refresh dispatch resolves to under the current runner mode.
- *  `createKgRefreshDispatch` acts on it and `appendJobLog` records it, so both read one answer. */
-export function resolveKgExecutionMode(): string {
-  const { mode } = getRunnerMode();
-  const resolved = resolveExecutionPath(mode, GHA_EXECUTION_MODE);
-  return resolved === "both" ? GHA_EXECUTION_MODE : resolved;
+/** The backend a kg-refresh run uses, resolved one time by the workflow's `reserve` step (the journaled result is the record).
+ *  Rule: runner mode (`local`, `gha`, `fly`) wins, else the KG page's Backend setting (default: Fly when configured, else
+ *  GitHub Actions). `shadow` stays on the setting's one backend: two concurrent ingests race to push the same snapshot commit.
+ *  Fly without configuration falls back to GitHub Actions (retrying cannot configure Fly). */
+export function resolveKgExecutionMode(fly: Pick<AppConfig, "flySessionsToken" | "flySessionsApp">): KgBackendResolution {
+  const flyConfigured = !!(fly.flySessionsToken && fly.flySessionsApp);
+  return resolveKgBackend(getRunnerMode().mode, getKgExecutionMode(flyConfigured), flyConfigured);
 }
 
-/** Builds the GHA-first dispatch the workflow calls inside `ctx.run`. */
+/** Builds the dispatch the workflow calls inside `ctx.run`: a lookup in the sender table keyed by the journaled
+ *  `executionMode`. An unknown mode is a definitive `rejected`, since a throw would retry a value that cannot change. */
 export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispatch: KgDispatchInput) => Promise<KgDispatchResult> {
-  const { config } = input;
-  const repo = parseKgSourceRepo(input.kgSourceRepo);
-  return async ({ runConfig, tokens, issueIdentifier, dispatchId }) => {
-    const executionMode = resolveKgExecutionMode();
-    const mapping = findKgMapping(input.kgSourceRepo)?.[1];
-    const envelope: RunConfigV1 = {
-      v: 1,
-      issue: { id: "kg-refresh", identifier: issueIdentifier, title: "KG ingest", description: "" },
-      runnerPhase: "kg-refresh",
-      kgSourceRepo: input.kgSourceRepo,
-      ...(config.runnerCallbackBaseUrl ? { runnerCallbackUrl: config.runnerCallbackBaseUrl } : {}),
-      ...(mapping?.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-      ...(runConfig.dryRun ? { kgDryRun: true as const } : {}),
-      ...(runConfig.kgSourceRef ? { kgSourceRef: runConfig.kgSourceRef } : {}),
-      ...(runConfig.acceptNewBaseline ? { kgAcceptNewBaseline: true as const } : {}),
-      ...(runConfig.actorEmail ? { kgBaselineActor: runConfig.actorEmail } : {}),
-    };
-    const encoded = encodeRunConfig(envelope);
-
-    if (executionMode !== GHA_EXECUTION_MODE) {
-      const legacy = await input.dispatchKgRefreshRun({
-        runToken: tokens.runToken, runProgressToken: tokens.progressToken,
-        dispatchId, runConfig: encoded, executionPath: executionMode,
-      });
-      input.recordDispatch(dispatchId, {
-        machineId: legacy.machineId, machineNonce: legacy.machineNonce,
-        logsUrl: legacy.logsUrl, workflowRunId: legacy.workflowRunId,
-      });
-      // The nonce authenticates the machine to /api/token: it goes to the row above, never into the journaled result.
-      return { outcome: "accepted", runId: legacy.workflowRunId, runUrl: legacy.logsUrl,
-        jobId: legacy.machineId ?? null, executionMode };
-    }
-
-    const { token } = await input.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
-    const defaultBranch = await input.fetchDefaultBranch(token, repo.owner, repo.repo).catch(() => "main");
-    const runnerImage = await resolveRunnerImageForDispatch({
-      owner: repo.owner, repo: repo.repo, token,
-      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
-    });
-    const ref = runConfig.kgSourceRef ?? defaultBranch;
-    const { supportsRunPublicationToken } = await (input.resolveWorkflowCapabilities ?? resolveWorkflowCapabilities)({
-      owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, token, ref,
-    });
-    const inputs = buildKgRefreshGhaDispatchBody({
-      runConfig: encoded, runToken: tokens.runToken, runProgressToken: tokens.progressToken,
-      ...(supportsRunPublicationToken ? { runPublicationToken: tokens.publicationToken } : {}),
-      runnerImage, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier,
-    });
-    const result = await postWorkflowDispatch({
-      token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
-      ref, inputs, returnRunDetails: true,
-    });
-    if (result.runId !== undefined) {
-      input.recordDispatch(dispatchId, { workflowRunId: result.runId, logsUrl: result.runUrl });
-    }
-    return {
-      outcome: result.outcome ?? (result.success ? "accepted" : "unknown"),
-      runId: result.runId,
-      runUrl: result.runUrl,
-      // The GitHub run id once known; the workflow keys its own job row by dispatch id.
-      jobId: result.runId !== undefined ? String(result.runId) : null,
-      executionMode,
-    };
+  const senders = createKgRefreshSenders({
+    // Inherit from the live config: a spread would read every getter once and freeze the Fly values at boot.
+    config: Object.create(input.config, { kgSourceRepo: { value: input.kgSourceRepo, enumerable: true } }) as AppConfig,
+    getInstallationToken: input.getInstallationToken,
+    getScopedInstallationToken: input.getScopedInstallationToken,
+    mintToken: input.mintToken,
+    fetchDefaultBranch: input.fetchDefaultBranch,
+    resolveRunnerImage: input.resolveRunnerImage,
+    resolveWorkflowCapabilities: input.resolveWorkflowCapabilities ?? resolveWorkflowCapabilities,
+    postWorkflowDispatch: input.postWorkflowDispatch,
+    keptMachineFly: input.keptMachineFly,
+    startLocalRunnerContainer: input.startLocalRunnerContainer,
+  });
+  return async (dispatch) => {
+    const send = (senders as Record<string, KgRefreshSender | undefined>)[dispatch.executionMode];
+    if (!send) return { outcome: "rejected", jobId: null, executionMode: dispatch.executionMode, reason: `unknown execution mode ${dispatch.executionMode}` };
+    return send(dispatch);
   };
 }
 
@@ -272,6 +377,7 @@ export function createProductionKgRefreshServices(
     loadSnapshotSha: defaultLoadSnapshotSha,
     mergePullRequestFn: input.mergePullRequestFn,
     closePullRequestFn: input.closePullRequestFn,
+    getPullRequestStateFn: input.getPullRequestStateFn,
     deleteBranchFn: input.deleteBranchFn,
     postPrCommentFn: input.postPrCommentFn,
     postOrUpdateStickyCommentFn: input.postOrUpdateStickyCommentFn,
@@ -288,33 +394,61 @@ export function createProductionKgRefreshServices(
       if (!config.runnerTokenSecret) throw new Error("RUNNER_TOKEN_SECRET is not configured");
       const mappingTeamKey = findKgMapping(input.kgSourceRepo)?.[0];
       if (mappingTeamKey === undefined) throw new Error(`no project mapping found for kgSourceRepo=${input.kgSourceRepo}`);
-      // Idempotent across processes: a replay after a crash before the dispatch step journaled re-mints for the same
-      // dispatch id, so clear any unconsumed rows first (the primary key is (dispatch_id, audience)).
-      getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ? AND consumed_at IS NULL").run(dispatchId);
-      const base = { issueId: "kg-refresh", mappingTeamKey, phase: "kg-refresh" as const, dispatchId, ttlSeconds, secret: config.runnerTokenSecret };
+      // mintLaunchTokens clears the dispatch's unconsumed rows first, so a replay re-mints for the same dispatch id.
+      const minted = mintLaunchTokens({
+        issueId: "kg-refresh", mappingTeamKey, phase: "kg-refresh", dispatchId, ttlSeconds,
+        secret: config.runnerTokenSecret, repository: input.kgSourceRepo,
+      });
       return {
-        runToken: mintRunToken({ ...base, audience: "result" }).token,
-        progressToken: mintRunToken({ ...base, audience: "progress" }).token,
-        publicationToken: mintRunToken({ ...base, audience: "publication", repository: input.kgSourceRepo }).token,
+        runToken: minted.runToken,
+        progressToken: minted.runProgressToken,
+        publicationToken: minted.runPublicationToken!,
       };
     },
     dispatch: createKgRefreshDispatch(input),
+    buildEnvelope: (run, issueIdentifier) => buildKgRefreshRunConfig({
+      kgSourceRepo: input.kgSourceRepo,
+      issueIdentifier,
+      runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
+      dependencyTokenScope: findKgMapping(input.kgSourceRepo)?.[1]?.dependencyTokenScope ?? undefined,
+      dryRun: run.dryRun,
+      kgSourceRef: run.kgSourceRef,
+    }),
     // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
-    appendJobLog: ({ dispatchId }) => {
-      return appendLogIfAbsent({
-        issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode: resolveKgExecutionMode(),
-        repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
-      });
+    resolveDispatchRecord: (dispatchId) => ({
+      dispatchId, issueId: "kg-refresh", phase: "kg-refresh",
+      repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
+      executionMode: (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config).mode))(),
+    }),
+    resolveFlyApp: () => config.flySessionsApp,
+    recordDispatchRow: recordKgDispatchRow,
+    deriveMachineNonce: (dispatchId, attempt) => deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt),
+    armMachineNonce: (dispatchId, attempt) => {
+      const jobId = findJobId(dispatchId);
+      if (jobId === undefined) throw new Error(`no dispatch_log row for ${dispatchId}; reserve must run first`);
+      setJobMachineNonce(jobId, deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt));
     },
+    recordDispatchDetails: input.recordDispatchDetails ?? recordKgDispatchDetails,
     closeJobLog: (jobId, status, conclusion) => {
       const id = findJobId(jobId);
       if (id === undefined) return;
       input.updateJobStatus(id, status, conclusion);
     },
+    markJobHeld: (jobId) => {
+      const id = findJobId(jobId);
+      if (id === undefined) return;
+      markJobAwaitingDecision(id);
+    },
+    reopenHeldJob: (jobId) => {
+      const id = findJobId(jobId);
+      if (id === undefined) return;
+      reopenHeldJobRow(id);
+    },
     getWorkflowRunStatus: input.getWorkflowRunStatus,
     findRunByTitle: input.findRunByTitle,
     cancelWorkflowRun: input.cancelWorkflowRun,
-    stopMachineRun: (executionMode, jobId) => stopBackendRun(config, executionMode, jobId),
+    readMachineRun: (executionMode, jobId) => readBackendRun(config, executionMode, jobId),
+    stopMachineRun: (executionMode, jobId, keep) => stopBackendRun(config, executionMode, jobId, { keep }),
     persistLastRefresh: input.persistLastRefresh,
     onOutcome: (kind, outcome, meta) => {
       // Returned so the workflow's `outcome` step awaits (and retries) the notification.
@@ -352,8 +486,32 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps), createPipelineSchedule({ pipelines: { "kg-refresh": createKgRefreshSchedulePipeline(input.kgSourceRepo) } }), createKgSidecarHealth({ probe: probeKgSidecarIfUnavailable })],
     toolDeps,
+  };
+}
+
+/**
+ * Binds the profile object's Fly calls to `getFlySessionsConfig()`, read at call time. When either is unset
+ * the object still registers (boot stays non-fatal) and a handler that needs Fly fails when it runs.
+ */
+export function buildFlyMachineProfileDeps(): FlyMachineProfileDeps {
+  // `appOf` picks the per-call app override out of the arguments; the accessor's app is the fallback.
+  const bound = <A extends unknown[], R>(fn: (token: string, app: string, ...args: A) => Promise<R>, appOf: (args: A) => string | undefined) => async (...args: A): Promise<R> => {
+    const { token, app } = getFlySessionsConfig();
+    const useApp = appOf(args) ?? app;
+    if (!token || !useApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+    return fn(token, useApp, ...args);
+  };
+  return {
+    fly: {
+      getMachine: bound((t, a, id: string) => getMachine(t, a, id), () => undefined),
+      clearMachineEnv: bound(
+        (t, a, id: string, metadata?: Record<string, string>, settle?: SettleOptions, _app?: string) => clearMachineEnv(t, a, id, metadata, settle),
+        (args) => args[3],
+      ),
+      destroyMachine: bound((t, a, id: string, _app?: string) => destroyMachine(t, a, id), (args) => args[1]),
+    },
   };
 }
 
@@ -364,13 +522,13 @@ export function createProductionKgRefreshServices(
 /** `accepted` carries the handler's JSON result when it returned one (an empty 2xx body has none). */
 export type KgIngressResult<T = undefined> =
   | { readonly status: "accepted"; readonly value?: T }
-  | { readonly status: "conflict" }
+  | { readonly status: "conflict"; readonly error?: string }
   | { readonly status: "not-found" }
   | { readonly status: "unavailable" };
 
 export interface KgRefreshIngressClient {
   report(triggerId: string, body: KgRefreshReportBody, opts?: { idempotencyKey?: string }): Promise<KgIngressResult<{ status: "accepted" | "duplicate" }>>;
-  progress(triggerId: string): Promise<KgIngressResult>;
+  progress(triggerId: string, step?: Step): Promise<KgIngressResult>;
   cancel(triggerId: string, reason: string): Promise<KgIngressResult>;
   status(triggerId: string): Promise<KgIngressResult<KgRefreshStatusResult>>;
   repoStatus(slug: string): Promise<KgIngressResult<{ triggerId: string; startedAt: number } | null>>;
@@ -380,9 +538,7 @@ export interface KgRefreshIngressClient {
     entry: KgRepoEnqueueInput,
     opts?: { idempotencyKey?: string },
   ): Promise<Exclude<KgIngressResult<KgRepoEnqueueResult>, { readonly status: "not-found" }>>;
-  /** The stored dry-run verdict for a PR; `accepted` with `value: null` when none is held. */
-  dryRunOutcome(slug: string, pr: KgRepoPrInput): Promise<KgIngressResult<StoredDryRunOutcome | null>>;
-  /** Drops a closed PR's verdict and held dry-run head. */
+  /** Drops a closed PR's held dry-run head. */
   forgetPr(slug: string, pr: KgRepoPrInput): Promise<KgIngressResult>;
 }
 
@@ -392,6 +548,17 @@ export interface KgRefreshIngressClientDeps {
 }
 
 const INGRESS_TIMEOUT_MS = 10_000;
+
+/** The handler's `TerminalError` text: the ingress answers `{ code, message }`, which `HttpCallError.message` wraps. */
+function handlerErrorText(err: InstanceType<typeof restateClients.HttpCallError>): string {
+  try {
+    const parsed = JSON.parse(err.responseText) as { message?: unknown };
+    if (typeof parsed.message === "string" && parsed.message) return parsed.message;
+  } catch {
+    // Not JSON: fall back to the raw text.
+  }
+  return err.responseText || err.message;
+}
 
 /** Real client for the Restate ingress, on the SDK's typed client. Never throws: a connection error or timeout resolves `unavailable`. */
 export function createKgRefreshIngressClient(
@@ -408,7 +575,7 @@ export function createKgRefreshIngressClient(
   /** 404 is `not-found` for the workflow only; 409 is `conflict` where the caller asked for it. */
   async function invoke<T = undefined>(
     call: () => PromiseLike<unknown>,
-    statuses: { notFound?: boolean; conflict?: boolean } = {},
+    statuses: { notFound?: boolean; conflict?: boolean; conflictText?: boolean } = {},
   ): Promise<KgIngressResult<T>> {
     try {
       const value = await call();
@@ -417,22 +584,26 @@ export function createKgRefreshIngressClient(
     } catch (err) {
       if (err instanceof restateClients.HttpCallError) {
         if (statuses.notFound && err.status === 404) return { status: "not-found" };
-        if (statuses.conflict && err.status === 409) return { status: "conflict" };
+        if (statuses.conflict && err.status === 409) return statuses.conflictText ? { status: "conflict", error: handlerErrorText(err) } : { status: "conflict" };
       }
       return { status: "unavailable" };
     }
   }
 
   return {
-    report: (triggerId, body, opts) =>
-      invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
-    progress: (triggerId) => invoke(() => refresh(triggerId).progress(callOpts()), { notFound: true }),
-    cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true }),
+    report: async (triggerId, body, opts): Promise<KgIngressResult<{ status: "accepted" | "duplicate" }>> => {
+      const result = await invoke<{ status: "accepted" | "duplicate"; fingerprint?: string }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true });
+      if (result.status === "accepted" && body.usage && !result.value?.fingerprint) return { status: "unavailable" };
+      if (result.status === "accepted" && result.value?.fingerprint &&
+          result.value.fingerprint !== ownedRunReportFingerprint(body)) return { status: "conflict" };
+      return result;
+    },
+    progress: (triggerId, step) => invoke(() => refresh(triggerId).progress(step ? { step } : {}, callOpts()), { notFound: true }),
+    cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true, conflict: true, conflictText: true }),
     status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),
     repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),
     enqueueDryRun: (slug, entry, opts) =>
       invoke<KgRepoEnqueueResult>(() => repo(slug).enqueueDryRun(entry, callOpts(opts?.idempotencyKey))) as ReturnType<KgRefreshIngressClient["enqueueDryRun"]>,
-    dryRunOutcome: (slug, pr) => invoke<StoredDryRunOutcome | null>(() => repo(slug).dryRunOutcome(pr, callOpts())),
     forgetPr: (slug, pr) => invoke(() => repo(slug).forgetPr(pr, callOpts())),
   };
 }

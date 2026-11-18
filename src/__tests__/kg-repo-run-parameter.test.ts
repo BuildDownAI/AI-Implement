@@ -10,7 +10,7 @@ describe("KgRepo run send parameter", () => {
         kgSourceRef: "pr-head",
         acceptNewBaseline: true,
         actorEmail: "a@example.com",
-        report: { repo: "o/r", prNumber: 7, sha: "abc", acceptBaseline: true },
+        report: { repo: "o/r", prNumber: 7, sha: "abc", acceptBaseline: true } as { repo: string; prNumber: number; sha: string },
       },
       "trig-1",
     );

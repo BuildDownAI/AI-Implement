@@ -2,9 +2,13 @@
 // No Docker and no Restate runtime: the services are only constructed, the GHA dispatch
 // is exercised against a mocked postWorkflowDispatch, and the client against a faked fetch.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { __clearWorkflowProbeCacheForTests } from "../workflow-probe.js";
+import { makeAppConfig, makeScopedInstallationToken } from "./helpers/builders.js";
+import { fakeFetch, hangUntilAborted, type Reply, type Routes } from "./helpers/fake-fetch.js";
+import { githubFile } from "./helpers/replies/github.js";
+import { testDb } from "./helpers/test-db.js";
 
 const postWorkflowDispatch = vi.fn();
 vi.mock("../github.js", async (importOriginal) => ({
@@ -12,14 +16,20 @@ vi.mock("../github.js", async (importOriginal) => ({
   postWorkflowDispatch: (...args: unknown[]) => postWorkflowDispatch(...args),
 }));
 const destroyMachine = vi.fn(async (..._args: unknown[]) => {});
+const stopMachine = vi.fn(async (..._args: unknown[]) => {});
+const getMachine = vi.fn(async (..._args: unknown[]): Promise<unknown> => ({ state: "started" }));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   destroyMachine: (...args: unknown[]) => destroyMachine(...args),
+  stopMachine: (...args: unknown[]) => stopMachine(...args),
+  getMachine: (...args: unknown[]) => getMachine(...args),
 }));
+const inspectLocalContainer = vi.fn(async (_id: string): Promise<{ running: boolean }> => ({ running: true }));
 const stopLocalContainer = vi.fn(async (_id: string) => {});
 vi.mock("../local-docker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../local-docker.js")>()),
   stopLocalContainer: (id: string) => stopLocalContainer(id),
+  inspectLocalContainer: (id: string) => inspectLocalContainer(id),
 }));
 const capturedWorkflowDeps: { current?: import("../restate/kg-refresh-workflow.js").KgRefreshWorkflowDependencies } = {};
 vi.mock("../restate/kg-refresh-workflow.js", async (importOriginal) => {
@@ -39,14 +49,18 @@ vi.mock("../log.js", async (importOriginal) => ({
 }));
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
 const resolvedPath = { current: "github-actions" };
-vi.mock("../runner-mode.js", () => ({
-  getRunnerMode: () => ({ mode: "default" }),
-  resolveExecutionPath: () => resolvedPath.current,
-  getKgMaterializeDirect: () => ({ enabled: false }),
+vi.mock("../runner-mode.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runner-mode.js")>()),
+  getKgExecutionMode: (flyConfigured = false) =>
+    kgSetting.current ?? { mode: flyConfigured ? "fly-machines" : "github-actions", source: "default" },
+  getRunnerMode: () => ({ mode: runnerMode.current, source: runnerMode.current === "default" ? "default" : "db" }),
 }));
+const runnerMode = { current: "default" };
+const kgSetting: { current: { mode: "github-actions" | "fly-machines"; source: "db" | "env" | "default" } | null } = { current: null };
+const kgMappingSize: { current: { machineCpus?: number; machineMemoryMb?: number } } = { current: {} };
 vi.mock("../config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config.js")>()),
-  getMappings: () => ({ AII: { owner: "acme", repo: "kg", dependencyTokenScope: "installation" } }),
+  getMappings: () => ({ AII: { owner: "acme", repo: "kg", dependencyTokenScope: "installation", ...kgMappingSize.current } }),
 }));
 
 import {
@@ -54,21 +68,34 @@ import {
   createKgRefreshDispatch,
   createKgRefreshIngressClient,
   createProductionKgRefreshServices,
+  deriveMachineNonce,
+  launchKeptMachine,
+  type KeptMachineFly,
+  resolveKgExecutionMode,
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
-import { decodeRunConfig } from "../run-config.js";
+import { buildKgRefreshRunConfig, decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
 import { verifyRunToken } from "../runner-tokens.js";
+
+function makeKeptFly(): KeptMachineFly {
+  return {
+    createMachine: vi.fn(async () => ({ id: "m-1" })),
+    getMachine: vi.fn(async () => ({ state: "stopped" })),
+    listMachines: vi.fn(async () => []),
+    updateMachine: vi.fn(async () => ({})),
+    startMachine: vi.fn(async () => ({})),
+  } as unknown as KeptMachineFly;
+}
 
 function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefreshProductionInput {
   const noop = vi.fn();
   return {
     kgSourceRepo: "acme/kg",
-    config: {
-      githubAppId: "1", githubAppPrivateKey: "key", sessionImage: "img", runnerImageExplicit: false,
+    config: makeAppConfig({
       runnerCallbackBaseUrl: "https://orch.example", runnerTokenSecret: "secret",
       flySessionsToken: "fly-token", flySessionsApp: "fly-app",
-    },
-    mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "" })),
+    }),
+    mintToken: vi.fn(async () => makeScopedInstallationToken()),
     fetchTarball: noop as never,
     fetchDefaultBranch: vi.fn(async () => "main"),
     fetchSnapshotCommitSha: vi.fn(async () => null),
@@ -80,10 +107,16 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     setCommitStatusFn: noop as never,
     mergePullRequestFn: noop as never,
     closePullRequestFn: noop as never,
+    getPullRequestStateFn: noop as never,
     deleteBranchFn: noop as never,
-    dispatchKgRefreshRun: vi.fn(async () => ({})),
+    getInstallationToken: vi.fn(async () => "gh-token"),
+    getScopedInstallationToken: vi.fn(async () => makeScopedInstallationToken({ token: "scoped-gh-token" })),
+    resolveRunnerImage: vi.fn(async () => "runner:test"),
+    postWorkflowDispatch: ((...args: unknown[]) => postWorkflowDispatch(...args)) as never,
+    keptMachineFly: () => makeKeptFly(),
+    startLocalRunnerContainer: vi.fn(async () => ({ containerId: "c-1" })) as never,
+    resolveExecutionMode: () => resolvedPath.current,
     updateJobStatus: noop,
-    recordDispatch: vi.fn(),
     getWorkflowRunStatus: vi.fn(async () => ({ status: "completed", conclusion: "success" })),
     findRunByTitle: vi.fn(async () => null),
     cancelWorkflowRun: vi.fn(async () => true),
@@ -96,22 +129,41 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
   };
 }
 
+/** The envelope the workflow's `envelope` step journals, built the way the production composition builds it. */
+function envelopeFor(run: { dryRun?: boolean; kgSourceRef?: string }) {
+  return buildKgRefreshRunConfig({
+    kgSourceRepo: "acme/kg", issueIdentifier: "KG-REFRESH · t-1", runnerCallbackUrl: "https://orch.example",
+    dependencyTokenScope: "installation", ...run,
+  });
+}
+
 const dispatchInput = {
-  runConfig: { triggerId: "t-1", kgSourceRef: "feature/x" },
+  envelope: envelopeFor({ kgSourceRef: "feature/x" }),
   tokens: { runToken: "rt", progressToken: "pt", publicationToken: "pub" },
-  issueIdentifier: "KG-REFRESH · t-1",
   dispatchId: "d-workflow",
+  machineId: null,
+  jobTimeoutMinutes: 240 as number | null,
+  machineNonce: null as string | null,
+  /** What the workflow's `reserve` step resolved; the tests steer it through `resolvedPath`. */
+  get executionMode() { return resolvedPath.current; },
+  machine: { cpuKind: "performance" as const, cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 },
 };
+
+/** The KG repo's dispatch workflow as sync writes it, which a GitHub Actions dispatch probes for its inputs. */
+const WORKFLOW_FILE = "GET /repos/acme/kg/contents/.github/workflows/claude-implement.yml" as const;
+const syncedWorkflow = githubFile(fs.readFileSync(path.join(__dirname, "../../workflows/claude-implement.yml"), "utf8"));
 
 beforeEach(() => {
   postWorkflowDispatch.mockReset();
   resolvedPath.current = "github-actions";
+  __clearWorkflowProbeCacheForTests();
+  fakeFetch({ [WORKFLOW_FILE]: syncedWorkflow }).install();
 });
 
 describe("createProductionKgRefreshServices", () => {
   it("returns the KgRepo and KgRefresh services and the nine tool deps", () => {
     const { services, toolDeps } = createProductionKgRefreshServices(makeInput());
-    expect(services.map((s) => s.name)).toEqual(["KgRepo", "KgRefresh"]);
+    expect(services.map((s) => s.name)).toEqual(["KgRepo", "FlyMachineProfile", "GhaRunProfile", "KgRefresh", "PipelineSchedule", "KgSidecarHealth"]);
     expect(Object.keys(toolDeps).sort()).toEqual([
       "callbackConfigured", "freeBytes", "isDeployHeld", "kgSourceRepo", "mappingExists",
       "persistPreflightFailure", "readServedStamp", "readStatusRecord", "runPreflight",
@@ -213,20 +265,21 @@ describe("onOutcome", () => {
   });
 });
 
-describe("appendJobLog idempotency", () => {
-  it("goes through appendLogIfAbsent and returns the same id for a repeated dispatch id", () => {
+describe("recordDispatchRow idempotency", () => {
+  it("goes through appendLogIfAbsent and writes each column from the journaled record", () => {
     appendLogIfAbsent.mockReset().mockReturnValue(9);
     createProductionKgRefreshServices(makeInput());
     const deps = capturedWorkflowDeps.current!;
-    expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem" })).toBe(9);
-    expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem" })).toBe(9);
+    const record = { dispatchId: "d-idem", issueId: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", executionMode: "fly-machines" } as const;
+    deps.recordDispatchRow(record);
+    deps.recordDispatchRow(record);
     expect(appendLogIfAbsent).toHaveBeenCalledTimes(2);
-    expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-idem", issueId: "kg-refresh" }));
+    expect(appendLogIfAbsent).toHaveBeenCalledWith({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-idem", executionMode: "fly-machines", repo: "acme/kg" });
   });
 });
 
 describe("dispatch_log job row lifecycle", () => {
-  it("closes the row on a fresh composer that never saw appendJobLog (restart replay)", () => {
+  it("closes the row on a fresh composer that never saw recordDispatchRow (restart replay)", () => {
     const updateJobStatus = vi.fn();
     const findJobId = vi.fn((id: string) => (id === "d-1" ? 42 : undefined));
     createProductionKgRefreshServices(makeInput({ updateJobStatus, findJobId }));
@@ -237,23 +290,60 @@ describe("dispatch_log job row lifecycle", () => {
   });
 });
 
-describe("appendJobLog execution mode", () => {
-  it("records the resolved execution mode rather than github-actions", () => {
+describe("resolveDispatchRecord", () => {
+  it.each(["github-actions", "fly-machines", "local-docker"])("builds the row record with the resolved execution mode %s and does no store I/O", (mode) => {
+    resolvedPath.current = mode;
+    appendLogIfAbsent.mockClear();
+    createProductionKgRefreshServices(makeInput());
+    expect(capturedWorkflowDeps.current!.resolveDispatchRecord("d-3")).toEqual({
+      dispatchId: "d-3", issueId: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", executionMode: mode,
+    });
+    expect(appendLogIfAbsent).not.toHaveBeenCalled();
+  });
+});
+
+describe("fly dispatch without a Fly sessions app (AII-1130)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    ["no app", { flySessionsToken: "fly-token", flySessionsApp: null }],
+    ["no token", { flySessionsToken: null, flySessionsApp: "fly-app" }],
+    ["neither", { flySessionsToken: null, flySessionsApp: null }],
+  ])("rejects without launching a machine (%s)", async (_label, fly) => {
     resolvedPath.current = "fly-machines";
-    appendLogIfAbsent.mockReset().mockReturnValue(1);
-    createProductionKgRefreshServices(makeInput({ findJobId: () => undefined }));
-    capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-3", jobId: "d-3" });
-    expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-3", executionMode: "fly-machines" }));
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const createMachine = vi.fn(async () => ({ id: "m-1" }));
+    const input = makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) });
+    const result = await createKgRefreshDispatch({ ...input, config: { ...input.config, ...fly } })({ ...dispatchInput, machineNonce: "n" });
+    expect(result).toMatchObject({ outcome: "rejected", jobId: null, executionMode: "fly-machines" });
+    expect(createMachine).not.toHaveBeenCalled();
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured"));
+  });
+
+  it("dispatches when both are set", async () => {
+    resolvedPath.current = "fly-machines";
+    const createMachine = vi.fn(async () => ({ id: "m-1" }));
+    const result = await createKgRefreshDispatch(makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) }))({ ...dispatchInput, machineNonce: "n" });
+    expect(result.outcome).toBe("accepted");
+    expect(createMachine).toHaveBeenCalledTimes(1);
   });
 });
 
 describe("non-GHA dispatch", () => {
-  it("passes the workflow's dispatch id through and reports an unknown job id when the backend gave none", async () => {
+  it("passes the workflow's dispatch id through to the Fly machine config", async () => {
     resolvedPath.current = "fly-machines";
-    const dispatchKgRefreshRun = vi.fn(async () => ({}));
-    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
-    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-workflow", executionPath: "fly-machines" }));
-    expect(result).toMatchObject({ outcome: "accepted", jobId: null, executionMode: "fly-machines" });
+    const createMachine = vi.fn(async (_config: unknown) => ({ id: "m-1" }));
+    const result = await createKgRefreshDispatch(makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) }))({ ...dispatchInput, machineNonce: "n" });
+    expect(JSON.stringify(createMachine.mock.calls[0][0])).toContain("d-workflow");
+    expect(result).toMatchObject({ outcome: "accepted", jobId: "m-1", executionMode: "fly-machines" });
+  });
+
+  it("rejects an unknown execution mode without throwing and without calling a backend", async () => {
+    const input = makeInput();
+    const result = await createKgRefreshDispatch(input)({ ...dispatchInput, executionMode: "carrier-pigeon" });
+    expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: "carrier-pigeon", reason: "unknown execution mode carrier-pigeon" });
+    expect(postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(input.startLocalRunnerContainer).not.toHaveBeenCalled();
   });
 });
 
@@ -265,6 +355,14 @@ describe("stopMachineRun wiring", () => {
     await expect(capturedWorkflowDeps.current!.stopMachineRun("fly-machines", "m-1")).resolves.toBe(true);
     expect(destroyMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
     expect(stopLocalContainer).not.toHaveBeenCalled();
+  });
+
+  it("stops, not destroys, a kept Fly machine", async () => {
+    stopMachine.mockClear();
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.stopMachineRun("fly-machines", "m-1", true)).resolves.toBe(true);
+    expect(stopMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+    expect(destroyMachine).not.toHaveBeenCalled();
   });
 
   it("stops the local container", async () => {
@@ -285,77 +383,169 @@ describe("stopMachineRun wiring", () => {
 
   it("surfaces a local container id from the dispatch as the job id", async () => {
     resolvedPath.current = "local-docker";
-    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun: vi.fn(async () => ({ machineId: "c-1", machineNonce: "n" })) }))(dispatchInput);
+    const result = await createKgRefreshDispatch(makeInput())({ ...dispatchInput, machineNonce: "n" });
     expect(result.jobId).toBe("c-1");
   });
 });
 
-describe("recordDispatch", () => {
-  it("records machine id, nonce and logs URL on a non-GHA dispatch and keeps the nonce out of the result", async () => {
+describe("the dispatch closure writes nothing", () => {
+  it("passes the derived nonce to the Fly sender and returns the machine id and URL without it", async () => {
     resolvedPath.current = "fly-machines";
-    const recordDispatch = vi.fn();
-    const dispatchKgRefreshRun = vi.fn(async () => ({ machineId: "m-1", machineNonce: "nonce-secret", logsUrl: "https://fly/m-1" }));
-    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, recordDispatch }))(dispatchInput);
-    expect(recordDispatch).toHaveBeenCalledWith("d-workflow", expect.objectContaining({ machineId: "m-1", machineNonce: "nonce-secret", logsUrl: "https://fly/m-1" }));
+    const createMachine = vi.fn(async (_config: unknown) => ({ id: "m-1" }));
+    const result = await createKgRefreshDispatch(makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) }))({ ...dispatchInput, machineNonce: "nonce-secret" });
+    expect(JSON.stringify(createMachine.mock.calls[0][0])).toContain("nonce-secret");
     expect(JSON.stringify(result)).not.toContain("nonce-secret");
     expect(result.jobId).toBe("m-1");
+    expect(result.runUrl).toBe("https://fly.io/apps/fly-app/machines/m-1");
   });
 
-  it("does not leak the nonce through jobId when no machine id came back", async () => {
-    resolvedPath.current = "fly-machines";
-    const dispatchKgRefreshRun = vi.fn(async () => ({ machineNonce: "nonce-secret" }));
-    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
-    expect(JSON.stringify(result)).not.toContain("nonce-secret");
-  });
-
-  it("records the run id and URL on a GHA dispatch that returned them, and nothing otherwise", async () => {
-    const recordDispatch = vi.fn();
+  it("returns the GHA run id and URL for the workflow to project", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 99, runUrl: "https://gh/run/99" });
-    await createKgRefreshDispatch(makeInput({ recordDispatch }))(dispatchInput);
-    expect(recordDispatch).toHaveBeenCalledWith("d-workflow", { workflowRunId: 99, logsUrl: "https://gh/run/99" });
-    recordDispatch.mockClear();
-    postWorkflowDispatch.mockResolvedValue({ success: false, status: 422, outcome: "rejected" });
-    await createKgRefreshDispatch(makeInput({ recordDispatch }))(dispatchInput);
-    expect(recordDispatch).not.toHaveBeenCalled();
+    const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
+    expect(result).toMatchObject({ runId: 99, runUrl: "https://gh/run/99", jobId: "99", executionMode: "github-actions" });
   });
 });
 
-describe("job row after a non-GHA dispatch (real log.ts, scratch database)", () => {
-  it("lets getJobByMachineId and getJobByNonce resolve the kg-refresh row", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-record-"));
-    const previous = process.env.DEDUP_DB_PATH;
-    process.env.DEDUP_DB_PATH = path.join(dir, "dedup.sqlite");
-    vi.resetModules();
-    const dedup = await vi.importActual<typeof import("../dedup.js")>("../dedup.js");
-    const log = await vi.importActual<typeof import("../log.js")>("../log.js");
-    try {
-      log.initLogTable();
-      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-workflow", executionMode: "fly-machines", repo: "acme/kg" });
-      vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
-      const { recordKgDispatchDetails } = await import("../restate/kg-refresh-production.js");
-      const recordDispatch = recordKgDispatchDetails;
-      resolvedPath.current = "fly-machines";
-      const dispatchKgRefreshRun = vi.fn(async () => ({ machineId: "m-7", machineNonce: "nonce-7", logsUrl: "https://fly/m-7" }));
-      await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, recordDispatch }))(dispatchInput);
-      expect(log.getJobByMachineId("m-7")?.id).toBe(id);
-      expect(log.getJobByNonce("nonce-7")?.id).toBe(id);
+describe("buildEnvelope", () => {
+  it("builds the envelope from the run input, the mapping's token scope and the callback URL", () => {
+    createProductionKgRefreshServices(makeInput());
+    const envelope = capturedWorkflowDeps.current!.buildEnvelope(
+      { triggerId: "t-1", dryRun: true, kgSourceRef: "pr-head", acceptNewBaseline: true, actorEmail: "a@b" },
+      "KG-REFRESH · t-1",
+    );
+    expect(envelope).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · t-1", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "acme/kg",
+      runnerCallbackUrl: "https://orch.example",
+      dependencyTokenScope: "installation",
+      kgDryRun: true,
+      kgSourceRef: "pr-head",
+    });
+    expect(envelope).not.toHaveProperty("kgAccept" + "NewBaseline");
+    expect(envelope).not.toHaveProperty("kgBaseline" + "Actor");
+  });
+});
 
-      // A GHA dispatch (no nonce) stores the run id and the URL on the row.
-      const ghaId = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-gha", executionMode: "github-actions", repo: "acme/kg" });
-      recordKgDispatchDetails("d-gha", { workflowRunId: 321, logsUrl: "https://gh/run/321" });
-      const ghaRow = log.getJobById(ghaId);
-      expect(ghaRow?.runId).toBe(321);
-      expect(ghaRow?.prUrl).toBe("https://gh/run/321");
+describe("deriveMachineNonce", () => {
+  it("is deterministic for one (secret, dispatchId, attempt), differs across attempts, and is 32 hex characters", () => {
+    const a = deriveMachineNonce("secret", "d-1", 1);
+    expect(deriveMachineNonce("secret", "d-1", 1)).toBe(a);
+    expect(a).toMatch(/^[0-9a-f]{32}$/);
+    expect(deriveMachineNonce("secret", "d-1", 2)).not.toBe(a);
+    expect(deriveMachineNonce("secret", "d-2", 1)).not.toBe(a);
+    expect(deriveMachineNonce("other", "d-1", 1)).not.toBe(a);
+  });
 
+  it("refuses an empty secret rather than deriving a guessable nonce", () => {
+    expect(() => deriveMachineNonce("", "d-1", 1)).toThrow(/RUNNER_TOKEN_SECRET/);
+  });
+
+  it("the workflow dependency and the arm step derive the same value from the configured secret", () => {
+    createProductionKgRefreshServices(makeInput());
+    expect(capturedWorkflowDeps.current!.deriveMachineNonce("d-1", 1)).toBe(deriveMachineNonce("secret", "d-1", 1));
+  });
+});
+
+describe("row projections (real log.ts, scratch database)", () => {
+  async function withScratchDb<T>(fn: (log: typeof import("../log.js"), prod: typeof import("../restate/kg-refresh-production.js"), db: ReturnType<typeof import("../dedup.js")["getDb"]>) => T | Promise<T>): Promise<T> {
+    vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
+    const { log, prod, dedup } = (await testDb({
+      modules: {
+        log: () => import("../log.js"),
+        prod: () => import("../restate/kg-refresh-production.js"),
+        dedup: () => import("../dedup.js"),
+      },
+    })).modules;
+    return await fn(log, prod, dedup.getDb());
+  }
+
+  it("recordKgDispatchRow writes issue_id, phase, repo and execution_mode from the record, once", async () => {
+    await withScratchDb((log, prod, db) => {
+      const record = { dispatchId: "d-row", issueId: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", executionMode: "fly-machines" } as const;
+      prod.recordKgDispatchRow(record);
+      prod.recordKgDispatchRow(record);
+      const rows = db.prepare("SELECT issue_id, phase, repo, execution_mode, status, machine_nonce FROM dispatch_log WHERE dispatch_id = 'd-row'").all();
+      expect(log.listLog()[0].trigger).toBeNull();
+      expect(rows).toEqual([{ issue_id: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", execution_mode: "fly-machines", status: "dispatched", machine_nonce: null }]);
+    });
+  });
+
+  it.each([
+    { options: {}, expected: "schedule" },
+    { options: { actorEmail: "operator@example.com" }, expected: "manual" },
+    { options: { trigger: "manual" as const }, expected: "manual" },
+    { options: { trigger: "schedule" as const }, expected: "schedule" },
+  ])("persists the derived trigger without the actor email ($expected, $options)", async ({ options, expected }) => {
+    const { kgRefreshTrigger } = await import("../restate/kg-refresh-workflow.js");
+    await withScratchDb((log, prod, db) => {
+      const trigger = kgRefreshTrigger(options);
+      const record = { dispatchId: "d-trigger", issueId: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", executionMode: "github-actions", trigger } as const;
+      prod.recordKgDispatchRow(record);
+      prod.recordKgDispatchRow(record);
+      expect(db.prepare("SELECT trigger FROM dispatch_log").all()).toEqual([{ trigger: expected }]);
+      expect(log.listLog()[0].trigger).toBe(expected);
+    });
+  });
+
+  it("setJobMachineNonce re-arms the nonce without clearing machine_id", async () => {
+    await withScratchDb((log, _prod, db) => {
+      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-rearm", executionMode: "fly-machines", repo: "acme/kg" });
+      log.setJobMachineNonce(id, "n1");
+      log.setJobMachineId(id, "m-1");
+      log.setJobMachineNonce(id, "n2");
+      expect(db.prepare("SELECT machine_nonce, machine_id FROM dispatch_log WHERE id = ?").get(id)).toEqual({ machine_nonce: "n2", machine_id: "m-1" });
+    });
+  });
+
+  it("syncRowToMachineNonce re-arms the row to a reused machine's nonce and keeps machine_id", async () => {
+    await withScratchDb((log, prod, db) => {
+      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-reuse", executionMode: "fly-machines", repo: "acme/kg" });
+      log.setJobMachineNonce(id, "attempt2");
+      log.setJobMachineId(id, "m-1");
+      prod.syncRowToMachineNonce("d-reuse", "attempt2", "attempt1");
+      expect(log.getJobByNonce("attempt1")?.id).toBe(id);
+      expect(log.getJobByNonce("attempt2")).toBeFalsy();
+      expect(db.prepare("SELECT machine_id FROM dispatch_log WHERE id = ?").get(id)).toEqual({ machine_id: "m-1" });
+      // Equal nonces and unknown dispatch ids change nothing.
+      prod.syncRowToMachineNonce("d-reuse", "attempt1", "attempt1");
+      expect(() => prod.syncRowToMachineNonce("d-none", "a", "b")).not.toThrow();
+      expect(log.getJobByNonce("attempt1")?.id).toBe(id);
+    });
+  });
+
+  it("recordKgDispatchDetails writes machine_id and pr_url and leaves the status unchanged", async () => {
+    await withScratchDb((log, prod, db) => {
+      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-fly", executionMode: "fly-machines", repo: "acme/kg" });
+      prod.recordKgDispatchDetails("d-fly", { machineId: "m-7", logsUrl: "https://fly/m-7" });
+      expect(db.prepare("SELECT machine_id, pr_url, run_id, status FROM dispatch_log WHERE id = ?").get(id))
+        .toEqual({ machine_id: "m-7", pr_url: "https://fly/m-7", run_id: null, status: "dispatched" });
       // A dispatch id with no row does nothing and does not throw.
-      expect(() => recordKgDispatchDetails("d-missing", { machineNonce: "n", workflowRunId: 1, logsUrl: "u" })).not.toThrow();
-      expect(log.getJobByNonce("n")).toBeNull();
-    } finally {
-      dedup.closeDb();
-      if (previous === undefined) delete process.env.DEDUP_DB_PATH;
-      else process.env.DEDUP_DB_PATH = previous;
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+      expect(() => prod.recordKgDispatchDetails("d-missing", { machineId: "m", workflowRunId: 1, logsUrl: "u" })).not.toThrow();
+    });
+  });
+
+  it("recordKgDispatchDetails writes run_id through updateJobRunId, which marks the row running as it did before", async () => {
+    await withScratchDb((log, prod, db) => {
+      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-gha", executionMode: "github-actions", repo: "acme/kg" });
+      prod.recordKgDispatchDetails("d-gha", { workflowRunId: 322, logsUrl: "https://gh/run/322" });
+      expect(db.prepare("SELECT machine_id, pr_url, run_id, status FROM dispatch_log WHERE id = ?").get(id))
+        .toEqual({ machine_id: null, pr_url: "https://gh/run/322", run_id: 322, status: "running" });
+    });
+  });
+
+  it("the armed nonce lets getJobByNonce resolve the row before any machine exists, and getJobByMachineId after the projection", async () => {
+    await withScratchDb((log, prod) => {
+      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-arm", executionMode: "fly-machines", repo: "acme/kg" });
+      const nonce = prod.deriveMachineNonce("secret", "d-arm", 1);
+      log.setJobMachineNonce(id, nonce);
+      expect(log.getJobByNonce(nonce)?.id).toBe(id);
+      expect(log.getJobById(id)?.machineId ?? null).toBeNull();
+      prod.recordKgDispatchDetails("d-arm", { machineId: "m-arm" });
+      expect(log.getJobByMachineId("m-arm")?.id).toBe(id);
+      expect(log.getJobByNonce(nonce)?.id).toBe(id);
+    });
   });
 });
 
@@ -377,25 +567,25 @@ describe("GHA dispatch wrapper", () => {
     expect(result).toEqual({ outcome: "accepted", runId: 99, runUrl: "https://gh/run/99", jobId: "99", executionMode: "github-actions" });
   });
 
-  it("carries kgSourceRef, accept-baseline and the actor into the envelope, and the ref into the GHA dispatch", async () => {
+  it("carries kgSourceRef into the envelope, and the ref into the GHA dispatch", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 5 });
     await createKgRefreshDispatch(makeInput())({
       ...dispatchInput,
-      runConfig: { triggerId: "t-1", kgSourceRef: "pr-head", acceptNewBaseline: true, actorEmail: "a@b" },
+      envelope: envelopeFor({ kgSourceRef: "pr-head" }),
     });
     const call = postWorkflowDispatch.mock.calls[0][0];
     expect(call.ref).toBe("pr-head");
     expect(decodeRunConfig(call.inputs.run_config)).toMatchObject({
-      kgSourceRef: "pr-head", kgAcceptNewBaseline: true, kgBaselineActor: "a@b",
+      kgSourceRef: "pr-head",
     });
   });
 
-  it("omits the accept-baseline keys when the options are unset", async () => {
+  it("never carries the removed accept keys", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 5 });
-    await createKgRefreshDispatch(makeInput())({ ...dispatchInput, runConfig: { triggerId: "t-1" } });
+    await createKgRefreshDispatch(makeInput())({ ...dispatchInput, envelope: envelopeFor({}) });
     const decoded = decodeRunConfig(postWorkflowDispatch.mock.calls[0][0].inputs.run_config);
-    expect(decoded).not.toHaveProperty("kgAcceptNewBaseline");
-    expect(decoded).not.toHaveProperty("kgBaselineActor");
+    expect(decoded).not.toHaveProperty("kgAccept" + "NewBaseline");
+    expect(decoded).not.toHaveProperty("kgBaseline" + "Actor");
   });
 
   it("sends run_publication_token when the probe reports support", async () => {
@@ -413,11 +603,34 @@ describe("GHA dispatch wrapper", () => {
     expect(postWorkflowDispatch.mock.calls[0][0].inputs).not.toHaveProperty("run_publication_token");
   });
 
+  it("moves minted KG bearers into the private envelope on a capable reader", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 1 });
+    const probe = vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsAttemptCorrelation: false }));
+    await createKgRefreshDispatch(makeInput({ resolveWorkflowCapabilities: probe as never }))(dispatchInput);
+    const inputs = postWorkflowDispatch.mock.calls[0][0].inputs;
+    expect(inputs.run_token).toBe("");
+    expect(inputs).not.toHaveProperty("run_progress_token");
+    expect(inputs).not.toHaveProperty("run_publication_token");
+    expect(decodeTrustedRunConfig(inputs.run_config).credentials).toEqual({
+      version: 1, resultToken: "rt", progressToken: "pt", publicationToken: "pub",
+    });
+  });
+
   it("maps a definite rejection to rejected", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: false, status: 422, error: "no", outcome: "rejected" });
     const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
     expect(result.outcome).toBe("rejected");
     expect(result.runId).toBeUndefined();
+  });
+
+  it("carries GitHub's 4xx text as the reason, bounded to 200 characters", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: false, status: 422, error: "No ref found for: x", outcome: "rejected" });
+    const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
+    expect(result.reason).toContain("No ref found for: x");
+
+    postWorkflowDispatch.mockResolvedValue({ success: false, status: 422, error: "e".repeat(500), outcome: "rejected" });
+    const long = await createKgRefreshDispatch(makeInput())(dispatchInput);
+    expect(long.reason).toHaveLength(200);
   });
 
   it("surfaces a transport failure as unknown rather than throwing", async () => {
@@ -433,7 +646,16 @@ describe("createKgRefreshIngressClient", () => {
   function clientWith(fetchImpl: typeof fetch) {
     return createKgRefreshIngressClient(BASE, { fetchImpl });
   }
-  const respond = (status: number, body = "") => vi.fn(async () => new Response(body, { status })) as unknown as typeof fetch;
+  // The sidecar answering every handler these tests call, for trigger t-1 and repo acme/kg, with one reply.
+  function sidecar(reply: Reply, extraPaths: string[] = []) {
+    const paths = ["/KgRefresh/t-1/report", "/KgRefresh/t-1/progress", "/KgRefresh/t-1/cancel", "/KgRefresh/t-1/decide", "/KgRefresh/t-1/status",
+      "/KgRepo/acme%2Fkg/status", "/KgRepo/acme%2Fkg/enqueueDryRun", ...extraPaths];
+    const routes: Routes = {};
+    for (const p of paths) routes[`POST ${p}` as keyof Routes] = reply;
+    return fakeFetch(routes);
+  }
+  const respond = (status: number, body = "") => sidecar({ status, text: body }).fetch;
+  const throwing = (error: () => Error) => sidecar(() => { throw error(); }).fetch;
 
   it("treats an empty 2xx body as success", async () => {
     expect(await clientWith(respond(200)).progress("t-1")).toEqual({ status: "accepted" });
@@ -445,10 +667,10 @@ describe("createKgRefreshIngressClient", () => {
     expect(result).toEqual({ status: "accepted", value: { status: "duplicate" } });
   });
 
-  it("maps a 409 from report to conflict, and only from report", async () => {
+  it("maps a 409 from report to conflict, and cancel's 409 to conflict with the handler's text", async () => {
     const body = JSON.stringify({ code: 409, message: "report rejected" });
     expect(await clientWith(respond(409, body)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
-    expect(await clientWith(respond(409, body)).cancel("t-1", "stop")).toEqual({ status: "unavailable" });
+    expect(await clientWith(respond(409, body)).cancel("t-1", "stop")).toEqual({ status: "conflict", error: "report rejected" });
     // A 500 carrying the same body is not a conflict.
     expect(await clientWith(respond(500, body)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
   });
@@ -460,8 +682,8 @@ describe("createKgRefreshIngressClient", () => {
   });
 
   it("answers unavailable from every handler on a connection error and on a timeout", async () => {
-    const refused = vi.fn(async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
-    const timedOut = vi.fn(async () => { throw new DOMException("timed out", "TimeoutError"); }) as unknown as typeof fetch;
+    const refused = throwing(() => new TypeError("fetch failed"));
+    const timedOut = throwing(() => new DOMException("timed out", "TimeoutError"));
     const entry = { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } };
     for (const f of [refused, timedOut]) {
       const c = clientWith(f);
@@ -484,22 +706,21 @@ describe("createKgRefreshIngressClient", () => {
   });
 
   it("maps a rejected fetch, a timeout, and a bad body to unavailable without throwing", async () => {
-    const refused = vi.fn(async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
-    const timedOut = vi.fn(async () => { throw new DOMException("timed out", "TimeoutError"); }) as unknown as typeof fetch;
+    const refused = throwing(() => new TypeError("fetch failed"));
+    const timedOut = throwing(() => new DOMException("timed out", "TimeoutError"));
     expect(await clientWith(refused).progress("t-1")).toEqual({ status: "unavailable" });
     expect(await clientWith(timedOut).progress("t-1")).toEqual({ status: "unavailable" });
     expect(await clientWith(respond(200, "not json")).status("t-1")).toEqual({ status: "unavailable" });
   });
 
   it("answers unavailable within the timeout when the sidecar hangs or is down", async () => {
-    const hung = vi.fn((_url: unknown, init?: RequestInit) => new Promise<Response>((_, reject) => {
-      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
-    })) as unknown as typeof fetch;
+    const hung = sidecar(hangUntilAborted).fetch;
     const started = Date.now();
     expect(await createKgRefreshIngressClient(BASE, { fetchImpl: hung, timeoutMs: 50 }).progress("t-1")).toEqual({ status: "unavailable" });
     expect(Date.now() - started).toBeLessThan(2000);
-    // Nothing listening: a real connection refusal.
-    expect(await createKgRefreshIngressClient("http://127.0.0.1:1", { timeoutMs: 500 }).progress("t-1")).toEqual({ status: "unavailable" });
+    // Nothing listening: fetch rejects at once, as it does on a refused connection.
+    const down = throwing(() => new TypeError("fetch failed"));
+    expect(await createKgRefreshIngressClient(BASE, { fetchImpl: down, timeoutMs: 500 }).progress("t-1")).toEqual({ status: "unavailable" });
   });
 
   it("maps a 404 from report to not-found", async () => {
@@ -507,61 +728,357 @@ describe("createKgRefreshIngressClient", () => {
   });
 
   it("encodes every dynamic segment", async () => {
-    const fetchImpl = respond(200);
-    const client = clientWith(fetchImpl);
+    const ingress = sidecar({}, ["/KgRepo/owner%2Fname/status", "/KgRefresh/a%2Fb%3Fc/progress"]);
+    const client = clientWith(ingress.fetch);
     await client.repoStatus("owner/name");
     await client.progress("a/b?c");
-    const urls = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
-    expect(urls).toEqual([`${BASE}/KgRepo/owner%2Fname/status`, `${BASE}/KgRefresh/a%2Fb%3Fc/progress`]);
+    expect(ingress.calls.map((call) => call.url.href)).toEqual([`${BASE}/KgRepo/owner%2Fname/status`, `${BASE}/KgRefresh/a%2Fb%3Fc/progress`]);
   });
 
   it("sends idempotency-key only when given, and always an abort signal", async () => {
-    const fetchImpl = respond(200);
-    const client = clientWith(fetchImpl);
+    const ingress = sidecar({});
+    const client = clientWith(ingress.fetch);
     await client.report("t-1", { ok: true }, { idempotencyKey: "k1" });
     await client.report("t-1", { ok: true });
-    const calls = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<[string, RequestInit]>;
-    expect((calls[0][1].headers as Record<string, string>)["idempotency-key"]).toBe("k1");
-    expect(calls[1][1].headers as Record<string, string>).not.toHaveProperty("idempotency-key");
-    expect(calls[0][1].signal).toBeInstanceOf(AbortSignal);
-    expect(calls[0][1].method).toBe("POST");
+    expect(ingress.calls[0]!.headers.get("idempotency-key")).toBe("k1");
+    expect(ingress.calls[1]!.headers.has("idempotency-key")).toBe(false);
+    expect(ingress.calls[0]!.signal).toBeInstanceOf(AbortSignal);
+    expect(ingress.calls[0]!.method).toBe("POST");
   });
 
   it("forwards the delivery id to KgRepo.enqueueDryRun as the idempotency-key header (AII-730)", async () => {
-    const fetchImpl = respond(200, JSON.stringify({ queued: true }));
-    const client = clientWith(fetchImpl);
+    const ingress = sidecar({ json: { queued: true } });
+    const client = clientWith(ingress.fetch);
     const entry = { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } };
     expect(await client.enqueueDryRun("acme/kg", entry, { idempotencyKey: "delivery-1" })).toEqual({ status: "accepted", value: { queued: true } });
-    const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
-    expect((init.headers as Record<string, string>)["idempotency-key"]).toBe("delivery-1");
-    expect(JSON.parse(new TextDecoder().decode(init.body as Uint8Array))).toEqual(entry);
+    expect(ingress.calls[0]!.url.href).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
+    expect(ingress.calls[0]!.headers.get("idempotency-key")).toBe("delivery-1");
+    expect(JSON.parse(ingress.calls[0]!.body)).toEqual(entry);
   });
 });
 
 describe("createKgFindRunByTitle", () => {
-  const lookup = (recordDetails = vi.fn()) =>
-    ({ find: createKgFindRunByTitle({ owner: "acme", repo: "kg", getToken: async () => "tok", recordDetails }), recordDetails });
+  const lookup = () => ({ find: createKgFindRunByTitle({ owner: "acme", repo: "kg", getToken: async () => "tok" }) });
+
+  const RUNS = "GET /repos/acme/kg/actions/workflows/claude-implement.yml/runs" as const;
 
   it("throws on an HTTP error instead of answering no run", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("boom", { status: 500 })));
-    try {
-      await expect(lookup().find("KG-REFRESH · d-1")).rejects.toThrow(/HTTP 500/);
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    fakeFetch({ [RUNS]: { status: 500, text: "boom" } }).install();
+    await expect(lookup().find("KG-REFRESH · d-1")).rejects.toThrow(/HTTP 500/);
   });
 
   it("answers null for a 200 with no matching title, and the run id for a match", async () => {
     const body = { workflow_runs: [{ id: 7, display_title: "Claude AI Implementation — KG-REFRESH · d-1", html_url: "u" }] };
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })));
-    try {
-      const { find, recordDetails } = lookup();
-      expect(await find("KG-REFRESH · other")).toBeNull();
-      expect(await find("KG-REFRESH · d-1")).toEqual({ runId: 7 });
-      expect(recordDetails).toHaveBeenCalledWith("d-1", { workflowRunId: 7, logsUrl: "u" });
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    fakeFetch({ [RUNS]: { json: body } }).install();
+    const { find } = lookup();
+    expect(await find("KG-REFRESH · other")).toBeNull();
+    expect(await find("KG-REFRESH · d-1")).toEqual({ runId: 7, logsUrl: "u" });
+  });
+});
+
+describe("resolveKgExecutionMode (AII-1130, AII-1218)", () => {
+  afterEach(() => { runnerMode.current = "default"; kgSetting.current = null; });
+  const configured = { flySessionsToken: "t", flySessionsApp: "a" };
+  const unconfigured = { flySessionsToken: null, flySessionsApp: null };
+  const gha = { mode: "github-actions" as const, source: "db" as const };
+  const fly = { mode: "fly-machines" as const, source: "db" as const };
+
+  it.each([
+    ["default", gha, configured, "github-actions", "kg-setting"],
+    ["default", fly, configured, "fly-machines", "kg-setting"],
+    ["default", fly, unconfigured, "github-actions", "fly-unconfigured"],
+    ["gha", fly, configured, "github-actions", "runner-mode"],
+    ["gha", gha, unconfigured, "github-actions", "runner-mode"],
+    ["fly", gha, configured, "fly-machines", "runner-mode"],
+    ["fly", gha, unconfigured, "github-actions", "fly-unconfigured"],
+    ["local", fly, configured, "local-docker", "runner-mode"],
+    ["local", gha, unconfigured, "local-docker", "runner-mode"],
+    ["shadow", gha, configured, "github-actions", "kg-setting"],
+    ["shadow", fly, configured, "fly-machines", "kg-setting"],
+    ["shadow", fly, unconfigured, "github-actions", "fly-unconfigured"],
+  ] as const)("runner mode %s, setting %j, Fly %j answers %s (%s)", (mode, setting, flyCfg, expected, source) => {
+    runnerMode.current = mode;
+    kgSetting.current = setting;
+    expect(resolveKgExecutionMode(flyCfg)).toEqual({ mode: expected, source });
+  });
+
+  it("with nothing set, keeps today's result", () => {
+    expect(resolveKgExecutionMode(configured)).toEqual({ mode: "fly-machines", source: "default" });
+    expect(resolveKgExecutionMode(unconfigured)).toEqual({ mode: "github-actions", source: "default" });
+  });
+
+  it("counts a half-set Fly configuration as not configured", () => {
+    expect(resolveKgExecutionMode({ flySessionsToken: "t", flySessionsApp: null }).mode).toBe("github-actions");
+    expect(resolveKgExecutionMode({ flySessionsToken: null, flySessionsApp: "a" }).mode).toBe("github-actions");
+  });
+});
+
+describe("the dispatch closure does not resolve the backend (AII-1146)", () => {
+  it("acts on input.executionMode and leaves the rule to the workflow dependency", async () => {
+    runnerMode.current = "local";
+    const seam = vi.fn(() => "fly-machines");
+    const input = makeInput({ resolveExecutionMode: seam });
+    await createKgRefreshDispatch(input)({ ...dispatchInput, executionMode: "local-docker", machineNonce: "n" });
+    expect(seam).not.toHaveBeenCalled();
+    expect(input.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
+    runnerMode.current = "default";
+  });
+
+  it("calls the seam one time per resolveExecutionMode dependency call", () => {
+    const seam = vi.fn(() => "github-actions");
+    createProductionKgRefreshServices(makeInput({ resolveExecutionMode: seam }));
+    expect(seam).not.toHaveBeenCalled();
+    expect(capturedWorkflowDeps.current!.resolveDispatchRecord("d-1").executionMode).toBe("github-actions");
+    expect(seam).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("KG dispatch sizes the machine from the profile (AII-1130)", () => {
+  it("passes machine through to the Fly sender and ignores the mapping size", async () => {
+    resolvedPath.current = "fly-machines";
+    kgMappingSize.current = { machineCpus: 8, machineMemoryMb: 32768 };
+    const createMachine = vi.fn(async (_config: unknown) => ({ id: "m-1" }));
+    await createKgRefreshDispatch(makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) }))({ ...dispatchInput, machineNonce: "n" });
+    const guest = (createMachine.mock.calls[0][0] as { config: { guest: Record<string, unknown> } }).config.guest;
+    expect(guest).toMatchObject({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
+    kgMappingSize.current = {};
+  });
+});
+
+describe("readMachineRun wiring", () => {
+  const exitEvent = { type: "exit", timestamp: 7, request: { exit_event: { exit_code: 137, guest_signal: 9, oom_killed: true } } };
+  beforeEach(() => { getMachine.mockReset(); inspectLocalContainer.mockReset(); });
+
+  it.each(["stopped", "destroyed"])("reads a %s machine as ended with its exit", async (state) => {
+    getMachine.mockResolvedValue({ state, events: [exitEvent] });
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({
+      state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 7 },
+    });
+    expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+  });
+
+  it("reads a 404 as ended with an empty exit", async () => {
+    getMachine.mockRejectedValue(new Error("Fly API 404: not found"));
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({
+      state: "ended", exit: { exitCode: null, signal: null, oomKilled: null, timestamp: null },
+    });
+  });
+
+  it("reads started as started, and created or a thrown lookup as unknown", async () => {
+    createProductionKgRefreshServices(makeInput());
+    getMachine.mockResolvedValue({ state: "started" });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "started", exit: null });
+    getMachine.mockResolvedValue({ state: "created" });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "unknown", exit: null });
+    getMachine.mockRejectedValue(new Error("Fly API 500"));
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "unknown", exit: null });
+  });
+
+  it("reads a local container with no exit, and any other mode as unknown without a call", async () => {
+    createProductionKgRefreshServices(makeInput());
+    inspectLocalContainer.mockResolvedValue({ running: false });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("local-docker", "c-1")).resolves.toEqual({ state: "ended", exit: null });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("other", "x")).resolves.toEqual({ state: "unknown", exit: null });
+    expect(getMachine).not.toHaveBeenCalled();
+  });
+});
+
+describe("launchKeptMachine: the dispatch step's Fly write", () => {
+  const machineConfig = { config: { image: "img", env: { MACHINE_NONCE: "fresh-nonce" }, metadata: { dispatch_id: "d1" } } } as never;
+  const notFound = () => new Error("Failed to get machine m-1 (404): not found");
+
+  function makeFly(get: () => Promise<unknown>, list: () => Promise<unknown[]> = async () => []) {
+    const calls: string[] = [];
+    const fly: KeptMachineFly = {
+      listMachines: vi.fn(async () => { calls.push("list"); return list() as never; }),
+      getMachine: vi.fn(async () => { calls.push("get"); return get() as never; }),
+      createMachine: vi.fn(async () => { calls.push("create"); return { id: "m-new" } as never; }),
+      updateMachine: vi.fn(async () => { calls.push("update"); }),
+      startMachine: vi.fn(async () => { calls.push("start"); }),
+      waitSettled: vi.fn(async () => { calls.push("settle"); return { state: "stopped" } as never; }),
+      waitForStopped: vi.fn(async () => { calls.push("wait"); }),
+    };
+    return { fly, calls };
+  }
+  const launch = (fly: KeptMachineFly, keptMachineId: string | null) =>
+    launchKeptMachine(fly, { keptMachineId, dispatchId: "d1", machineConfig, machineNonce: "fresh-nonce" });
+
+  it("lists by dispatch id and creates a machine when none is kept and none is tagged", async () => {
+    const tagged = (id: string, dispatch: string, purpose = "durable-runner", state = "started") =>
+      ({ id, state, config: { metadata: { dispatch_id: dispatch, purpose }, env: { MACHINE_NONCE: "x" } } });
+    const { fly, calls } = makeFly(async () => ({}), async () => [tagged("o1", "other"), tagged("o2", "d1", "session"), tagged("o3", "d1", "durable-runner", "destroyed"), { id: "o4", state: "started" }]);
+    const result = await launch(fly, null);
+    expect(result).toMatchObject({ machineId: "m-new", created: true });
+    expect(result).not.toHaveProperty("replaced");
+    expect(result).not.toHaveProperty("adopted");
+    expect(calls).toEqual(["list", "create"]);
+  });
+
+  it("adopts the machine tagged with the dispatch id instead of creating one", async () => {
+    const { fly, calls } = makeFly(async () => ({}), async () => [
+      { id: "m-orphan", state: "started", config: { metadata: { dispatch_id: "d1", purpose: "durable-runner" }, env: { MACHINE_NONCE: "adopted-nonce" } } },
+    ]);
+    const result = await launch(fly, null);
+    expect(result).toEqual({ machineId: "m-orphan", machineNonce: "adopted-nonce", created: true, reused: false, adopted: true });
+    expect(calls).toEqual(["list"]);
+  });
+
+  it("throws and does not create when the list fails", async () => {
+    const { fly, calls } = makeFly(async () => ({}), async () => { throw new Error("Failed to list machines (500): boom"); });
+    await expect(launch(fly, null)).rejects.toThrow(/Failed to list machines/);
+    expect(calls).toEqual(["list"]);
+  });
+
+  it("does not list when a kept machine is updated and started", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    await launch(fly, "m-1");
+    expect(calls).not.toContain("list");
+  });
+
+  it("updates then starts a stopped kept machine", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    await expect(launch(fly, "m-1")).resolves.toEqual({ machineId: "m-1", machineNonce: "fresh-nonce", created: false, reused: true });
+    expect(calls).toEqual(["get", "update", "start"]);
+  });
+
+  it("waits out a replace-window 409 on update and updates once more", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    let n = 0;
+    vi.mocked(fly.updateMachine).mockImplementation(async () => {
+      calls.push("update");
+      if (n++ === 0) throw new Error('Failed to update machine m-1 (409): {"error":"aborted: machine is replacing: concurrent update in progress"}');
+      return {};
+    });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-1", reused: true, created: false });
+    expect(calls).toEqual(["get", "update", "settle", "update", "start"]);
+  });
+
+  it("throws when the 409 outlasts the wait, so the step retries", async () => {
+    const { fly } = makeFly(async () => ({ state: "stopped" }));
+    vi.mocked(fly.updateMachine).mockRejectedValue(new Error("Failed to update machine m-1 (409): concurrent update in progress"));
+    await expect(launch(fly, "m-1")).rejects.toThrow(/\(409\)/);
+    expect(fly.startMachine).not.toHaveBeenCalled();
+  });
+
+  it("does not swallow a 409 that is not a replace window, or a 5xx", async () => {
+    const { fly } = makeFly(async () => ({ state: "stopped" }));
+    vi.mocked(fly.updateMachine).mockRejectedValue(new Error("Failed to update machine m-1 (409): something else"));
+    await expect(launch(fly, "m-1")).rejects.toThrow(/something else/);
+    vi.mocked(fly.updateMachine).mockRejectedValue(new Error("Failed to update machine m-1 (500): boom"));
+    await expect(launch(fly, "m-1")).rejects.toThrow(/500/);
+    expect(fly.waitSettled).not.toHaveBeenCalled();
+  });
+
+  it("waits for the replaced instance to be stopped before start", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    let replaced = false;
+    vi.mocked(fly.updateMachine).mockImplementation(async () => { calls.push("update"); return { instance_id: "inst-2" }; });
+    vi.mocked(fly.waitForStopped).mockImplementation(async () => { calls.push("wait"); replaced = true; });
+    vi.mocked(fly.startMachine).mockImplementation(async () => {
+      calls.push("start");
+      if (!replaced) throw new Error('Failed to start machine m-1 (412): {"error":"failed_precondition: machine getting replaced, refusing to start"}');
+    });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-1", reused: true });
+    expect(calls).toEqual(["get", "update", "wait", "start"]);
+    expect(fly.waitForStopped).toHaveBeenCalledWith("m-1", "inst-2", 60);
+  });
+
+  it("waits and starts once more on a 412 start refusal", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    let n = 0;
+    vi.mocked(fly.startMachine).mockImplementation(async () => {
+      calls.push("start");
+      if (n++ === 0) throw new Error("Failed to start machine m-1 (412): machine getting replaced, refusing to start");
+    });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-1", reused: true });
+    expect(calls).toEqual(["get", "update", "start", "settle", "start"]);
+  });
+
+  it("creates a replacement when the machine is destroyed during the 409 or 412 wait", async () => {
+    const a = makeFly(async () => ({ state: "stopped" }));
+    vi.mocked(a.fly.updateMachine).mockRejectedValue(new Error("Failed to update machine m-1 (409): machine is replacing"));
+    vi.mocked(a.fly.waitSettled).mockResolvedValue({ state: "destroyed" } as never);
+    await expect(launch(a.fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
+    expect(a.fly.updateMachine).toHaveBeenCalledTimes(1);
+
+    const b = makeFly(async () => ({ state: "stopped" }));
+    vi.mocked(b.fly.startMachine).mockRejectedValue(new Error("Failed to start machine m-1 (412): machine getting replaced"));
+    vi.mocked(b.fly.waitSettled).mockResolvedValue(null);
+    await expect(launch(b.fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
+    expect(b.fly.startMachine).toHaveBeenCalledTimes(1);
+  });
+
+  it("settles a machine that is still replacing before it updates", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "replacing" }));
+    await launch(fly, "m-1");
+    expect(calls).toEqual(["get", "settle", "update", "start"]);
+  });
+
+  it("returns a machine already started for this dispatch, with no update or start", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "started", config: { env: { MACHINE_NONCE: "earlier-nonce" }, metadata: { dispatch_id: "d1" } } }));
+    await expect(launch(fly, "m-1")).resolves.toEqual({ machineId: "m-1", machineNonce: "earlier-nonce", created: false, reused: true });
+    expect(calls).toEqual(["get"]);
+  });
+
+  it("throws for a machine started for another dispatch", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "started", config: { metadata: { dispatch_id: "other" } } }));
+    await expect(launch(fly, "m-1")).rejects.toThrow(/another dispatch/);
+    expect(calls).toEqual(["get"]);
+  });
+
+  it("creates a replacement when the kept machine is destroyed", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "destroyed" }));
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
+    expect(calls).toEqual(["get", "list", "create"]);
+  });
+
+  it("creates a replacement when the lookup answers 404", async () => {
+    const { fly, calls } = makeFly(async () => { throw notFound(); });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
+    expect(calls).toEqual(["get", "list", "create"]);
+  });
+
+  const orphan = { id: "m-orphan", state: "started", config: { metadata: { dispatch_id: "d1", purpose: "durable-runner" }, env: { MACHINE_NONCE: "adopted-nonce" } } };
+  const adoptedResult = { machineId: "m-orphan", machineNonce: "adopted-nonce", created: true, reused: false, adopted: true, replaced: "m-1" };
+
+  it("adopts the dispatch's machine on every gone path instead of creating", async () => {
+    const a = makeFly(async () => { throw notFound(); }, async () => [orphan]);
+    await expect(launch(a.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(a.fly.createMachine).not.toHaveBeenCalled();
+
+    const b = makeFly(async () => ({ state: "replacing" }), async () => [orphan]);
+    vi.mocked(b.fly.waitSettled).mockResolvedValue(null);
+    await expect(launch(b.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(b.fly.createMachine).not.toHaveBeenCalled();
+
+    const c = makeFly(async () => ({ state: "destroyed" }), async () => [orphan]);
+    await expect(launch(c.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(c.fly.createMachine).not.toHaveBeenCalled();
+
+    const d = makeFly(async () => ({ state: "stopped" }), async () => [orphan]);
+    vi.mocked(d.fly.updateMachine).mockRejectedValue(new Error("Failed to update machine m-1 (409): machine is replacing"));
+    vi.mocked(d.fly.waitSettled).mockResolvedValue({ state: "destroyed" } as never);
+    await expect(launch(d.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(d.fly.createMachine).not.toHaveBeenCalled();
+  });
+
+  it("ignores the kept id itself when adopting on a gone path", async () => {
+    const { fly } = makeFly(async () => { throw notFound(); }, async () => [{ ...orphan, id: "m-1" }]);
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", replaced: "m-1" });
+    expect(fly.createMachine).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws without creating when the list fails on a gone path", async () => {
+    const { fly } = makeFly(async () => { throw notFound(); }, async () => { throw new Error("Failed to list machines (500): boom"); });
+    await expect(launch(fly, "m-1")).rejects.toThrow(/Failed to list machines/);
+    expect(fly.createMachine).not.toHaveBeenCalled();
+  });
+
+  it("throws on any other lookup error so the step retries", async () => {
+    const { fly, calls } = makeFly(async () => { throw new Error("Failed to get machine m-1 (500): boom"); });
+    await expect(launch(fly, "m-1")).rejects.toThrow(/500/);
+    expect(calls).toEqual(["get"]);
   });
 });

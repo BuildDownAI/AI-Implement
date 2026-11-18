@@ -1,20 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { extractReviewFindingsBlock } from "../pipeline/review-ledger.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const action = parse(readFileSync(".github/actions/claude-review/action.yml", "utf8"));
 const steps = action.runs.steps as Array<{ name: string; id?: string; run?: string; with?: { claude_args?: string } }>;
-const tempRoots: string[] = [];
-
-afterEach(() => {
-  for (const root of tempRoots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 function getStep(name: string) {
   const step = steps.find((candidate) => candidate.name === name);
@@ -23,8 +16,7 @@ function getStep(name: string) {
 }
 
 function runRenderStep(structuredOutput: string) {
-  const tempRoot = mkdtempSync(join(tmpdir(), "claude-review-action-"));
-  tempRoots.push(tempRoot);
+  const tempRoot = testDir("claude-review-action");
   const binDir = join(tempRoot, "bin");
   const runnerTemp = join(tempRoot, "runner");
   const scriptPath = join(tempRoot, "render.sh");
@@ -93,6 +85,20 @@ describe("Claude review action", () => {
     expect(prepareSchema.run).toContain('jq -c \'del(.. | .description?)\' "${{ github.action_path }}/review-findings-schema.json"');
     expect(runReview.with?.claude_args).toContain("--json-schema '${{ steps.prepare-schema.outputs.json }}'");
     expect(runReview.with?.claude_args).not.toContain("--json-schema \"${{ github.action_path }}");
+  });
+
+  // The model writes its structured-output arguments in schema order, and the argument after a long
+  // free-text string is the one a malformed call loses (AII-1102), so `summary` must stay last.
+  it("hands Claude a schema whose last property is summary", () => {
+    const prepared = spawnSync("jq", ["-c", "del(.. | .description?)", ".github/actions/claude-review/review-findings-schema.json"], {
+      encoding: "utf8",
+    });
+    expect(prepared.status).toBe(0);
+    const schema = JSON.parse(prepared.stdout) as { properties: Record<string, unknown>; required: string[] };
+
+    expect(Object.keys(schema.properties).at(-1)).toBe("summary");
+    expect(schema.required.at(-1)).toBe("summary");
+    expect(schema.required).toEqual(expect.arrayContaining(["verdict", "findings", "summary"]));
   });
 
   it("renders an approving verdict into the human text and the machine block", () => {

@@ -230,7 +230,7 @@ export const stepperHtml = `
           </div>
         </div>
         <div id="np-fly-fields" hidden style="margin-bottom:18px">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
             <div class="field">
               <label class="field-label">CPUs</label>
               <input class="input" id="np-cpus" type="number" min="1" value="2">
@@ -238,6 +238,14 @@ export const stepperHtml = `
             <div class="field">
               <label class="field-label">Memory (MB)</label>
               <input class="input" id="np-mem" type="number" min="256" step="256" value="4096">
+            </div>
+            <div class="field">
+              <label class="field-label" for="np-cpu-kind">CPU kind</label>
+              <select class="select" id="np-cpu-kind">
+                <option value="shared">shared</option>
+                <option value="performance">performance</option>
+              </select>
+              <div class="field-hint">Fly limits a shared CPU. Use performance for a project whose tests use the CPU for more than some minutes. Performance needs 2048 MB or more for each CPU.</div>
             </div>
           </div>
         </div>
@@ -327,9 +335,24 @@ export const stepperHtml = `
             <div class="field-hint">Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.</div>
           </div>
           <div class="field">
+            <label class="field-label">Review process</label>
+            <select class="select" id="np-review-process">
+              <option value="ai-implement">AI-Implement</option>
+              <option value="claude-code-review">Claude Code Review</option>
+              <option value="codex-code-review">Codex Code Review</option>
+              <option value="claude-code-review-repository-fix">Claude Code Review, repository auto-fix</option>
+            </select>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Codex Code Review reads the hosted Codex verdict for the PR head. Restate coordinates AI-Implement fix attempts on every backend.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Trusted Review Authors <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <textarea class="textarea" id="np-trusted-review-authors" rows="3" placeholder="topia-ai-implement-bot[bot]"></textarea>
+            <div class="field-hint">Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.</div>
+          </div>
+          <div class="field">
             <label class="field-label">Job Timeout (min) <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input" type="number" id="np-maxJobMinutes" min="1" step="1" placeholder="90">
-            <div class="field-hint">GitHub Actions only. Blank = 90.</div>
+            <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
           </div>
         </div>
       </div>
@@ -432,6 +455,15 @@ export const stepperHtml = `
             <div data-review="caps"></div>
           </div>
 
+          <div class="np-review-row">
+            <div class="np-review-label">Review process</div>
+            <div data-review="reviewProcess"></div>
+          </div>
+          <div class="np-review-row">
+            <div class="np-review-label">Trusted authors</div>
+            <div data-review="trustedReviewAuthors"></div>
+          </div>
+
           <div class="np-review-h">Secrets</div>
           <div class="np-review-row">
             <div class="np-review-label">Seeded</div>
@@ -487,10 +519,11 @@ export const stepperScript = `
     jiraBaseBranchFieldOverride: '',
     teamKey: '', owner: '', repo: '', defaultBranch: '', branchPrefix: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
     skillsRepo: '', referenceRepos: [], dependencyTokenScope: null,
-    executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
+    executionMode: 'github-actions', machineCpuKind: 'shared', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
     maxInProgressAiIssues: 3, maxTurns: null, maxIterations: null, prDispatchBudget: null, maxJobMinutes: null,
+    reviewProcess: 'ai-implement', trustedReviewAuthors: null,
     secrets: [],
   };
   let jiraFieldsLoaded = false;
@@ -517,6 +550,7 @@ export const stepperScript = `
     data.sensitiveAllowPatterns = '';
     data.dependencyTokenScope = null;
     data.executionMode = 'github-actions';
+    data.machineCpuKind = 'shared';
     data.machineCpus = 2;
     data.machineMemoryMb = 4096;
     data.sessionMode = 'autonomous';
@@ -529,19 +563,24 @@ export const stepperScript = `
     data.maxTurns = null;
     data.maxIterations = null;
     data.prDispatchBudget = null;
+    data.reviewProcess = 'ai-implement';
+    data.trustedReviewAuthors = null;
     data.maxJobMinutes = null;
     data.secrets = [];
 
     // Clear inputs. Not derived from the initializer above — a new field needs both.
-    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-prDispatchBudget', 'np-maxJobMinutes'];
+    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-prDispatchBudget', 'np-maxJobMinutes', 'np-trusted-review-authors'];
     const depScopeEl = document.getElementById('np-dep-token-scope');
     if (depScopeEl) depScopeEl.value = '';
+    const reviewProcessEl = document.getElementById('np-review-process');
+    if (reviewProcessEl) reviewProcessEl.value = 'ai-implement';
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
     }
     refRepoPending = null;
     npRenderRefRepos();
+    document.getElementById('np-cpu-kind').value = 'shared';
     const cpusEl = document.getElementById('np-cpus');
     if (cpusEl) cpusEl.value = '2';
     const memEl = document.getElementById('np-mem');
@@ -910,6 +949,7 @@ export const stepperScript = `
       const cpEl = document.getElementById('np-cpus');
       const memEl = document.getElementById('np-mem');
       if (smEl) data.sessionMode = smEl.value;
+      data.machineCpuKind = document.getElementById('np-cpu-kind').value;
       if (cpEl) data.machineCpus = parseInt(cpEl.value, 10) || 2;
       if (memEl) data.machineMemoryMb = parseInt(memEl.value, 10) || 4096;
     } else if (n === 5) {
@@ -927,6 +967,11 @@ export const stepperScript = `
       data.maxTurns = optionalCap('np-maxTurns');
       data.maxIterations = optionalCap('np-maxIterations');
       data.prDispatchBudget = optionalCap('np-prDispatchBudget');
+      const rpEl = document.getElementById('np-review-process');
+      if (rpEl) data.reviewProcess = rpEl.value;
+      const taEl = document.getElementById('np-trusted-review-authors');
+      const authors = taEl ? taEl.value.split('\\n').map(function (x) { return x.trim(); }).filter(Boolean) : [];
+      data.trustedReviewAuthors = authors.length ? authors : null;
       data.maxJobMinutes = optionalCap('np-maxJobMinutes');
     } else if (n === 7) {
       const secrets = [];
@@ -1059,7 +1104,7 @@ export const stepperScript = `
       ? 'local Docker via RUNNER_MODE=local'
       : window.esc(data.executionMode);
     if (data.ticketingProvider !== 'filesystem' && data.executionMode === 'fly-machines') {
-      runnerText += ' &middot; ' + data.machineCpus + 'cpu / ' + data.machineMemoryMb + ' MB';
+      runnerText += ' &middot; ' + data.machineCpus + 'cpu ' + window.esc(data.machineCpuKind) + ' / ' + data.machineMemoryMb + ' MB';
     }
     set('runner', runnerText);
 
@@ -1084,6 +1129,11 @@ export const stepperScript = `
       + ' &middot; iterations ' + capText(data.maxIterations)
       + ' &middot; PR budget ' + capText(data.prDispatchBudget)
       + ' &middot; timeout ' + capText(data.maxJobMinutes, ' min'));
+
+    set('reviewProcess', window.esc(data.reviewProcess));
+    set('trustedReviewAuthors', data.trustedReviewAuthors
+      ? data.trustedReviewAuthors.map(function (l) { return window.esc(l); }).join(', ')
+      : '&mdash;');
 
     const validSecrets = data.secrets.filter(function (s) { return s.name && s.value; });
     set('secrets', String(validSecrets.length));
@@ -1409,6 +1459,7 @@ export const stepperScript = `
       maxInProgressAiIssues: data.maxInProgressAiIssues,
       executionMode: data.executionMode,
       sessionMode: data.sessionMode,
+      machineCpuKind: data.machineCpuKind,
       machineCpus: data.machineCpus,
       machineMemoryMb: data.machineMemoryMb,
       planningEnabled: data.planningEnabled,
@@ -1422,6 +1473,8 @@ export const stepperScript = `
       maxTurns: data.maxTurns,
       maxIterations: data.maxIterations,
       prDispatchBudget: data.prDispatchBudget,
+      reviewProcess: data.reviewProcess,
+      trustedReviewAuthors: data.trustedReviewAuthors,
       maxJobMinutes: data.maxJobMinutes,
       skillsRepo: data.skillsRepo || null,
       referenceRepos: data.referenceRepos.length ? data.referenceRepos : null,

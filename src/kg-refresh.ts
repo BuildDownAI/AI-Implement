@@ -1,3 +1,4 @@
+import type { SourceResult } from "./kg-source-results.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { existsSync, statfsSync } from "node:fs";
 import { join } from "node:path";
@@ -7,7 +8,7 @@ import { promisify } from "node:util";
 import http from "node:http";
 import { parse as parseYaml } from "yaml";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { fetchRepoTarball, postOrUpdateStickyComment, setCommitStatus } from "./github.js";
+import { fetchRepoTarball } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { parseSidecarRpcResponse } from "./kg-provider.js";
 import type { SidecarHealth } from "./kg-provider.js";
@@ -19,7 +20,7 @@ import {
   readBaseRepoFromSourcesYml,
   DEFAULT_BASE_REPO,
 } from "./pipeline/steps/kg-tracker-data.js";
-import { postDryRunReport } from "./kg-refresh-rail.js";
+import type { StepStatus } from "./pipeline/types.js";
 
 const execFile = promisify(execFileCb);
 
@@ -72,21 +73,42 @@ export interface RefreshOutcome {
   stampAfter: string | null;
   /** True for a dry-run outcome (AII-632): the local rail never ran and `stage` was restored, not advanced. */
   dryRun?: boolean;
+  /** The `KgRefresh` workflow key (dispatch id) that wrote this record; absent on records from before AII-1129. */
+  dispatchId?: string;
   /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  cause?: "shrink" | "tracker-missing" | "source-failed";
+  failedTeams?: string[];
+  /** Skipped or failed teams that had served issues, when the run was held with Accept blocked. */
+  lostTeams?: Array<{ team: string; servedIssues: number }>;
+  /** Warnings on a run that completed or was held (skipped or failed tracker teams). */
+  warnings?: string[];
+  /** Per-source results (tracker teams, repos, docs sites); absent on older records. */
+  sources?: SourceResult[];
+  /** Every runner step the workflow saw, in pipeline order (AII-1134); absent when the runner reported none. */
+  steps?: KgRefreshStepRecord[];
+  /** Why the run ended (`operator_cancelled`, `decision_timeout`, `merge_failed`, …); absent on success and on older records. */
+  conclusion?: string;
+  /** True when the run reached the decision gate (a held snapshot PR), whatever its end; absent on older records. */
+  held?: boolean;
+}
+
+export interface KgRefreshStepRecord {
+  id: string;
+  status: StepStatus;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
 }
 
 /**
- * PR to report a dry-run's verdict against (AII-633). `acceptBaseline` is set by the
- * webhook when the PR carries the `accept-baseline` label at trigger time — it only
- * changes the report's wording, never the underlying guard outcome (a real refresh
- * still refuses the shrink unless an admin accepts the new baseline at refresh time).
+ * PR to report a dry-run's verdict against (AII-633). A refused shrink is accepted at the
+ * decision gate of the refresh that runs after the PR merges, never on the PR.
  */
 export interface KgDryRunReportTarget {
   repo: string;
   prNumber: number;
   sha: string;
-  acceptBaseline?: boolean;
 }
 
 /** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633).
@@ -149,6 +171,7 @@ export interface KgPreflightInput {
  * checking         → runRefresh() is in progress
  * ingest-running   → kg-refresh runner dispatched, waiting for callback
  * snapshot-landed  → runner callback received, snapshot commit verified
+ * awaiting-decision → a held run waits for accept or cancel at the decision gate
  * staging          → local rail is running (fetch→stage→swap→verify)
  * serving          → rail succeeded; sidecar is serving the new graph
  * reverted         → rail failed and reverted to the previous overlay
@@ -160,6 +183,7 @@ export type KgRefreshStage =
   | "checking"
   | "ingest-running"
   | "snapshot-landed"
+  | "awaiting-decision"
   | "staging"
   | "serving"
   | "reverted"
@@ -174,39 +198,42 @@ export interface KgRefreshStatus {
   sidecar: SidecarHealth;
   servedStamp: string | null;
   lastRefresh: RefreshOutcome | null;
-  /** The last dry-run with no PR report target (admin page or tool); never written to `lastRefresh`. */
-  lastDryRun: { ok: boolean; at: number; detail: string; partTable?: Array<{ part: string; prev: string; new: string }> } | null;
   stage: KgRefreshStage;
+  /** The in-flight run's step and open decisions; `null` with no run in flight. */
+  currentRun: {
+    triggerId: string;
+    step: string | null;
+    decisions: Array<"accept" | "cancel">;
+    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing" | "source-failed"; failedTeams: string[]; acceptBlocked: boolean; lostTeams: Array<{ team: string; servedIssues: number }>; sources: SourceResult[]; decideBy: number } | null;
+  } | null;
+  /** The runner step in flight, when the workflow has one (AII-1134). */
+  runnerStep?: { id: string; status: StepStatus };
   /** Which materialize path the next refresh will stage (AII-602). */
   materialize: "rdflib" | "direct";
+  /** The backend the next refresh uses, the rule's source, and the KG page's own setting. */
+  executionMode: {
+    effective: "github-actions" | "fly-machines" | "local-docker";
+    source: "runner-mode" | "kg-setting" | "default" | "fly-unconfigured";
+    setting: "github-actions" | "fly-machines";
+  };
+  /** The `kg-refresh` Fly machine profile the next refresh will use (`set_fly_machine_profile`). */
+  flyMachine?: { cpuKind: "shared" | "performance"; cpus: number; memoryMb: number; idleTimeoutMs: number; source: "profile" | "default" };
+  /** The effective backend's run profile (AII-1244); absent for local-docker. */
+  runProfile?: { backend: "fly-machines" | "github-actions"; config: unknown; source: "profile" | "default" };
+  /** The `KgRefresh` workflow to look up in the journal: the in-flight run, else the last refresh's; null when neither is known. */
+  restate: { service: "KgRefresh"; key: string } | null;
 }
 
 export interface KgRefreshHandle {
   /**
-   * Re-posts a dry-run outcome's comment/status to `report` without triggering a new
-   * run (AII-633). Reads the outcome `KgRepo` holds for `report.repo`#`report.prNumber`
-   * (AII-636, AII-977) and posts only that PR's own outcome — never another PR's — and only
-   * when it ran against `report.sha`; otherwise a no-op (with a debug log line).
-   * Called on a `labeled` PR event (e.g. `accept-baseline` applied after the fact) so
-   * the report's wording updates without spending another dispatch. Returns whether
-   * it actually posted, so a caller can distinguish a real re-report from a silent
-   * no-op (AII-636) instead of always answering as if something was posted.
-   */
-  reportDryRun(report: KgDryRunReportTarget): Promise<"reported" | "no-outcome" | "unavailable">;
-  /**
-   * Evicts any stored dry-run outcome (and held head) for `repo`#`prNumber` (AII-636), called when the
-   * webhook observes that PR close — a closed PR's outcome can never be legitimately
-   * re-reported, so there is no reason to hold it until the cap evicts it naturally.
+   * Clears the held head for `repo`#`prNumber` (AII-636), called when the webhook observes that PR
+   * close, and any outcome an older release stored for it.
    */
   forgetPr(repo: string, prNumber: number): Promise<void>;
 }
 
-/** The two `KgRepo` calls the report surface needs; structural, so this module imports nothing from `src/restate/`. */
+/** The `KgRepo` call the report surface needs; structural, so this module imports nothing from `src/restate/`. */
 export interface KgDryRunOutcomeStore {
-  dryRunOutcome(
-    slug: string,
-    pr: { repo: string; prNumber: number },
-  ): Promise<{ status: string; value?: { sha: string; outcome: RefreshOutcome } | null }>;
   forgetPr(slug: string, pr: { repo: string; prNumber: number }): Promise<{ status: string }>;
 }
 
@@ -215,13 +242,7 @@ interface KgRefreshInput {
   githubAppPrivateKey: string;
   /** owner/repo of the KG source (config.kgSourceRepo — never hard-code the slug). */
   kgSourceRepo: string | null;
-  /** Overrides for tests. */
-  mintToken?: typeof getScopedInstallationToken;
-  /** Post or update the sticky dry-run PR comment (AII-633). Injectable for tests; defaults to postOrUpdateStickyComment from github.ts. */
-  postOrUpdateStickyCommentFn?: typeof postOrUpdateStickyComment;
-  /** Set the dry-run commit status (AII-633). Injectable for tests; defaults to setCommitStatus from github.ts. */
-  setCommitStatusFn?: typeof setCommitStatus;
-  /** The `KgRepo` ingress calls the dry-run report surface reads and evicts through (AII-977). */
+  /** The `KgRepo` ingress calls the dry-run report surface evicts through (AII-977). */
   dryRunOutcomes: KgDryRunOutcomeStore;
 }
 
@@ -377,11 +398,9 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  // Probe whether the KG repo's claude-implement.yml is on the envelope contract (AII-594,
-  // AII-654): the rail's phase and callback URL only ride the top-level runner_phase/
-  // runner_callback_url inputs on the legacy contract, and any envelope template — which
-  // declares run_config and reads the phase from it (AII-653) — works regardless of whether
-  // it still declares those two optional inputs (the poster strips them on a 422).
+  // Probe whether the KG repo's claude-implement.yml declares run_config (AII-594,
+  // AII-654). KG dispatches carry phase and callback URL only in the envelope,
+  // which the entrypoint reads under the envelope contract (AII-653).
   // Reuses the read token/branch minted above when available.
   try {
     const token = sourcesReadToken ?? (await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
@@ -461,7 +480,8 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     results.push({ repo: kgRepoSlug, grant: "contents:write", ok: false, status: 0 });
   }
 
-  // Advisory `statuses:write` rows for the PR-triggered dry-run check (AII-633): the
+  // Advisory `statuses:write` rows for the PR-triggered dry-run check (AII-633). The webhook
+  // skips PRs on the base template repo (AII-1529), so the base row is advisory only. The
   // commit status is additive to the always-posted sticky PR comment, so a repo that
   // hasn't granted the App `statuses: write` yet must never fail the whole preflight —
   // `ok` is always true here, same convention as the `base:drift` row above, with the
@@ -521,39 +541,15 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
 }
 
 /**
- * The dry-run PR-check surface of the KG refresh: `reportDryRun`/`forgetPr`, which read and
- * evict the per-PR outcome `KgRepo` holds. The refresh lifecycle itself (dispatch, waits,
+ * The dry-run PR-check surface of the KG refresh: `forgetPr`, which evicts the
+ * per-PR outcome `KgRepo` holds. The refresh lifecycle itself (dispatch, waits,
  * deadlines, the local rail) runs in the `KgRefresh` workflow.
  */
 export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
-  /** What `postDryRunReport` reads, built once from this handle's resolved config. */
-  const reportDeps = {
-    githubAppId: input.githubAppId,
-    githubAppPrivateKey: input.githubAppPrivateKey,
-    mintToken: input.mintToken ?? getScopedInstallationToken,
-    postOrUpdateStickyCommentFn: input.postOrUpdateStickyCommentFn ?? postOrUpdateStickyComment,
-    setCommitStatusFn: input.setCommitStatusFn ?? setCommitStatus,
-  };
-
   /** The `KgRepo` object key — the bound KG source repo, the same one `enqueueDryRun` uses. */
   const reportSlug = (): string | null => (input.kgSourceRepo ? parseKgSourceRepo(input.kgSourceRepo).fullName : null);
 
   return {
-    async reportDryRun(report: KgDryRunReportTarget): Promise<"reported" | "no-outcome" | "unavailable"> {
-      const slug = reportSlug();
-      const result = slug
-        ? await input.dryRunOutcomes.dryRunOutcome(slug, { repo: report.repo, prNumber: report.prNumber })
-        : null;
-      if (result?.status === "unavailable") return "unavailable";
-      const stored = result?.status === "accepted" ? result.value : null;
-      if (!stored || stored.sha !== report.sha) {
-        console.debug(`[kg-refresh] dry-run report skipped: no outcome for ${report.repo}#${report.prNumber}`);
-        return "no-outcome";
-      }
-      await postDryRunReport(reportDeps, report, stored.outcome);
-      return "reported";
-    },
-
     async forgetPr(repo: string, prNumber: number): Promise<void> {
       const slug = reportSlug();
       if (!slug) return;
@@ -701,8 +697,8 @@ export const MATERIALIZE_ARGS = ["-m", "kg_ingest.materialize"] as const;
 
 /**
  * True when the low-memory `--direct` materialize path is enabled (AII-599, AII-602).
- * Resolved via the same db | env | default precedence as runner mode — KG_MATERIALIZE_DIRECT
- * seeds the setting, but an admin can flip it from the Deployments page without a redeploy.
+ * Resolved from the DB setting (default false) — KG_MATERIALIZE_DIRECT seeds it once on first
+ * boot, and an admin can flip it from the Knowledge Graph Pipelines page without a redeploy.
  * Off by default until the configured KG_SOURCE_REPO derivative carries base PR #34's
  * `--direct` / `nt_parts` support.
  */
@@ -710,7 +706,7 @@ function materializeDirectEnabled(): boolean {
   return getKgMaterializeDirect().enabled;
 }
 
-/** MATERIALIZE_ARGS, with `--direct` appended when KG_MATERIALIZE_DIRECT=true (AII-599). */
+/** MATERIALIZE_ARGS, with `--direct` appended when the materialize-direct setting is on (AII-599). */
 export function materializeArgs(): string[] {
   return materializeDirectEnabled() ? [...MATERIALIZE_ARGS, "--direct"] : [...MATERIALIZE_ARGS];
 }

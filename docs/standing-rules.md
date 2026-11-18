@@ -39,3 +39,12 @@ Many ADRs record a decision for the context of their date: the first run kind on
 * A rejected alternative is rejected for its stated reason only. Example: awakeables were removed from kg-refresh because the resolver was the `workflow_run` webhook, which needs a new GitHub App event subscription. The permission behind that event (Actions, read) was already held; the event subscription was the only missing right. An awakeable that needs no new right is allowed (ADR 033 and ADR 034, amendments of 2026-10-02).
 
 The Restate-related ADRs today: 017, 018, 023, 025, 030, 031, 032, 033, 034.
+
+## 4. Wrap a proven mechanism; do not rebuild it
+
+When working behavior moves into Restate, into a new object, or behind a new caller (for example the control plane), keep the mechanism exactly as it was: the same command, the same arguments, the same order. Only the wrapper is new. A change to the mechanism itself is a separate decision by the operator, in its own issue, with the reason stated.
+
+* **Why (2026-11-03):** AII-1609/1610 moved self-deploy into the `SelfDeploy` Restate object (correct) and in the same change replaced the proven single `flyctl deploy --remote-only` of the old `runDeploy` with `flyctl --build-only --push` plus a Machines API `updateMachine` call (not asked for). The Machines API could not resolve the new tag yet, so most testing-orchestrator deploys failed from 2026-11-01 to 2026-11-03. AII-1653 and AII-1660 were workarounds; AII-1681 restores the original command.
+* **In a plan:** for each mechanism that moves, write "same command and arguments as before" and cite the old code (`git show <commit>^:<file>`). List any change to it as its own decision.
+* **When a regression follows a move:** compare against the old code path first, before you add retries or waits.
+* **Redeploys:** every merge into `testing` redeploys the testing orchestrator once. Put a multi-issue change to the orchestrator in a feature branch (`ai-implement/feature/<key>`), so that only the roll-up reaches `testing`.

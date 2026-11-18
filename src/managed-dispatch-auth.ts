@@ -1,0 +1,248 @@
+/**
+ * Managed dispatch decision adapter (AII-1386).
+ *
+ * Turns one `prepareAgentRun` result into one dispatch decision (legacy, launch, leave-queued, refuse, hold),
+ * settles a launch, and revokes a grant that did not start a run. Every dispatch path calls it so each path
+ * makes the same choice for the same state. A GitHub Actions launch is decided by the verified default-branch
+ * workflow capability (`prepareAgentRun`), never by backend alone (AII-1420).
+ *
+ * The raw bearer stays inside the function-valued `takeBootstrap` on a `launch` decision, which
+ * `JSON.stringify` and structured logging never see. Refusal text is fixed and built from `kind`, `category`
+ * and `code` only.
+ */
+import type { StageName } from "./agent-config.js";
+import { isProjectConfigured, resolveProjectStageConfig } from "./agent-config-store.js";
+import {
+  loadStoredSnapshot,
+  prepareAgentRun,
+  releaseRejectedLaunch,
+} from "./agent-run-preparation.js";
+import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
+import { parseExecutionPolicy, parseModelAuthContext, type ModelAuthGrantBootstrapV1, type SafeGrantMetadata } from "./model-auth-contract.js";
+import type { ModelAuthRuntime } from "./model-auth-runtime.js";
+import { copyAccountFallbacks, type AccountFallbacks, copyModelFallbacks, type ResolvedAgentSnapshotV1, type RunCredentialsV1 } from "./run-config.js";
+
+export interface ManagedDispatchRequest {
+  dispatchId: string;
+  /** Mapping key (`issue.scopeKey`). */
+  projectKey: string;
+  backend: DispatchAdmissionBackend;
+  /** Repository used for the workflow-capability probe and credential scoping. */
+  owner: string;
+  repo: string;
+  workflowFile: string;
+}
+
+export type ManagedDispatchDecision =
+  | { readonly kind: "legacy" }
+  | {
+      readonly kind: "launch";
+      readonly dispatchId: string;
+      readonly projectKey: string;
+      readonly backend: DispatchAdmissionBackend;
+      readonly snapshot: ResolvedAgentSnapshotV1;
+      readonly accountFallbacks?: AccountFallbacks;
+      readonly fallbackModels: Partial<Record<StageName, string>>;
+      readonly grant: SafeGrantMetadata;
+      readonly takeBootstrap: () => ModelAuthGrantBootstrapV1 | undefined;
+    }
+  | { readonly kind: "leave-queued"; readonly code: "profile_busy" }
+  | {
+      readonly kind: "refuse";
+      readonly category: "configuration-error" | "authentication-required";
+      readonly code: string;
+    }
+  | { readonly kind: "hold"; readonly code: string };
+
+/** True when the dispatch has a stored snapshot or the project is opted in. Reads SQLite only. */
+export function isManagedProject(projectKey: string, dispatchId?: string): boolean {
+  if (typeof projectKey !== "string" || projectKey.length === 0) return false;
+  if (dispatchId && loadStoredSnapshot(dispatchId) !== null) return true;
+  return isProjectConfigured(projectKey);
+}
+
+/** Frozen selection wins for an existing dispatch; used by read-only GHA capability admission. */
+export function selectsCodexImplementation(projectKey: string, dispatchId?: string): boolean {
+  const stored = dispatchId ? loadStoredSnapshot(dispatchId) : null;
+  if (stored) return stored.stages.implementation.agent === "codex";
+  try {
+    const { resolution } = resolveProjectStageConfig(projectKey);
+    return resolution.mode === "configured" && resolution.stages.implementation.agent === "codex";
+  } catch {
+    // Normal preparation reports invalid configuration; this helper grants no authority.
+    return false;
+  }
+}
+
+const RESERVATION_REFUSAL = {
+  kind: "refuse",
+  category: "configuration-error",
+  code: "reserved_account_unsupported",
+} as const;
+
+export async function prepareManagedDispatch(
+  req: ManagedDispatchRequest,
+  runtime: ModelAuthRuntime,
+): Promise<ManagedDispatchDecision> {
+  if (!isManagedProject(req.projectKey, req.dispatchId)) return { kind: "legacy" };
+
+  const repository = `${req.owner}/${req.repo}`;
+  let result;
+  try {
+    result = await prepareAgentRun(
+      {
+        dispatchId: req.dispatchId,
+        projectKey: req.projectKey,
+        backend: req.backend,
+        workflowRepository: repository,
+        workflowFile: req.workflowFile,
+      },
+      runtime.preparationDeps({ owner: req.owner, repo: req.repo, projectKey: req.projectKey }),
+    );
+  } catch {
+    return { kind: "hold", code: "preparation_failed" };
+  }
+
+  switch (result.status) {
+    case "legacy":
+      return { kind: "legacy" };
+    case "ready":
+      if (result.reused) return { kind: "hold", code: "bootstrap_consumed" };
+      if (result.reservations.length > 0) {
+        // Refuse even if the release is incomplete: nothing launches, and the grant stays unusable without a bootstrap.
+        releaseRejectedLaunch(req.dispatchId, result.reservations, { ownership: runtime.ownership });
+        return RESERVATION_REFUSAL;
+      }
+      return {
+        kind: "launch",
+        dispatchId: result.dispatchId,
+        projectKey: req.projectKey,
+        backend: req.backend,
+        snapshot: result.snapshot,
+        fallbackModels: result.fallbackModels,
+        ...(result.accountFallbacks ? { accountFallbacks: result.accountFallbacks } : {}),
+        grant: result.grant,
+        takeBootstrap: result.takeBootstrap,
+      };
+    case "queued":
+      return { kind: "leave-queued", code: "profile_busy" };
+    case "configuration-error":
+      // An operational fault reading the selection (a locked database) is not a verdict on it: hold, never refuse,
+      // so callers that fail the queue row on a refusal keep the feedback pending.
+      if (result.code === "resolution_unavailable") return { kind: "hold", code: result.code };
+      return { kind: "refuse", category: "configuration-error", code: result.code };
+    case "authentication-required":
+      return { kind: "refuse", category: "authentication-required", code: result.code };
+    case "recovery-required":
+      return { kind: "hold", code: result.code };
+  }
+}
+
+/** `accepted` keeps the grant; `rejected` and `unknown` revoke it, because a grant lives only when the launch is accepted. */
+export function settleLaunch(
+  decision: ManagedDispatchDecision,
+  outcome: "accepted" | "rejected" | "unknown",
+  runtime: ModelAuthRuntime,
+): { revoked: boolean } {
+  if (decision.kind !== "launch" || outcome === "accepted") return { revoked: false };
+  const released = releaseRejectedLaunch(decision.dispatchId, [], { ownership: runtime.ownership });
+  return { revoked: released.complete };
+}
+
+/** Mirrors `isDefinitiveFlyRejectionError` and `isDefinitiveLocalDockerLaunchFailure` in `src/index.ts`. */
+export function classifyLaunchError(
+  backend: DispatchAdmissionBackend,
+  launchAttempted: boolean,
+  err: unknown,
+): "rejected" | "unknown" {
+  if (!launchAttempted) return "rejected";
+  if (backend !== "fly-machines") return "unknown";
+  if (!(err instanceof Error)) return "unknown";
+  const match = /\((\d{3})\)/.exec(err.message);
+  if (!match) return "unknown";
+  const status = Number(match[1]);
+  return status >= 400 && status < 500 ? "rejected" : "unknown";
+}
+
+export function refusalText(
+  decision: Extract<ManagedDispatchDecision, { kind: "refuse" | "hold" | "leave-queued" }>,
+): string {
+  switch (decision.kind) {
+    case "refuse":
+      return `Managed dispatch refused (${decision.category}): ${decision.code}. No run was started.`;
+    case "hold":
+      return `Managed dispatch held: ${decision.code}. No run was started.`;
+    case "leave-queued":
+      return `Managed dispatch left queued: ${decision.code}. No run was started.`;
+  }
+}
+
+/**
+ * Private credentials for a GitHub Actions `launch` decision, or undefined for a legacy one. The bearer is taken
+ * once; a missing bootstrap (already consumed) throws a fixed message so nothing launches without it.
+ */
+export function ghaManagedCredentials(
+  decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>,
+  callbackBaseUrl: string | null | undefined,
+  /** Presence marks an implementation-phase writer. extraEnv is retained for caller compatibility only;
+   *  the frozen Codex selection now determines the default. Planning omits this argument. */
+  implementation?: { extraEnv?: Readonly<Record<string, string>> | null },
+): RunCredentialsV1 | undefined {
+  if (decision.kind !== "launch") return undefined;
+  if (decision.backend !== "github-actions") throw new Error("managed credentials require GitHub Actions");
+  // Context comes from the trusted request and configured callback base, never from the grant.
+  const context = parseModelAuthContext({
+    version: 1,
+    dispatchId: decision.dispatchId,
+    projectKey: decision.projectKey,
+    backend: "gha",
+    modelAuthUrl: callbackBaseUrl,
+  });
+  if (!context.ok) throw new Error("managed dispatch refused: model auth context unavailable");
+  const bootstrap = decision.takeBootstrap();
+  if (!bootstrap) throw new Error("managed dispatch bootstrap unavailable");
+  // The policy follows the frozen Codex implementation on a trusted GHA launch. The capable workflow
+  // verifies the actual runner is GitHub-hosted before projecting it; executor admission remains mandatory.
+  let executionPolicy: RunCredentialsV1["executionPolicy"];
+  if (implementation && decision.snapshot.stages.implementation.agent === "codex") {
+    const policy = parseExecutionPolicy({
+      version: 1,
+      implementationSandbox: "ephemeral-full-access",
+      dispatchId: decision.dispatchId,
+      projectKey: decision.projectKey,
+      backend: "gha",
+      ephemeralRunnerAsserted: true,
+    });
+    if (!policy.ok) throw new Error("managed dispatch refused: execution policy unavailable");
+    executionPolicy = policy.value;
+  }
+  return {
+    version: 1,
+    modelAuthGrant: bootstrap,
+    modelAuthContext: context.value,
+    ...(executionPolicy ? { executionPolicy } : {}),
+  };
+}
+
+/** Maps a `postWorkflowDispatch` result to a settle outcome: only an API-level rejection is definitive. */
+export function ghaLaunchOutcome(result: { success: boolean; outcome?: string }): "accepted" | "rejected" | "unknown" {
+  if (result.success) return "accepted";
+  return result.outcome === "rejected" ? "rejected" : "unknown";
+}
+
+/** Keep the snapshot and its companion model ids together on every managed transport. */
+export function managedRunConfigFields(
+  decision:
+    | { kind: "launch"; snapshot: ResolvedAgentSnapshotV1; accountFallbacks?: AccountFallbacks; fallbackModels?: Partial<Record<StageName, string>> }
+    | { kind: Exclude<ManagedDispatchDecision["kind"], "launch"> }
+    | null | undefined,
+): {
+  agentConfig?: ResolvedAgentSnapshotV1;
+  modelFallbacks?: Partial<Record<StageName, string>>;
+  accountFallbacks?: AccountFallbacks;
+} {
+  if (decision?.kind !== "launch") return {};
+  const modelFallbacks = copyModelFallbacks(decision.fallbackModels);
+  const accountFallbacks = copyAccountFallbacks(decision.accountFallbacks);
+  return { ...(accountFallbacks ? { accountFallbacks } : {}), agentConfig: decision.snapshot, ...(modelFallbacks ? { modelFallbacks } : {}) };
+}

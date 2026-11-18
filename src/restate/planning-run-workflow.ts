@@ -9,17 +9,18 @@
  * `finally` release. Contract: ADR 034 / ADR 035, `docs/restate.md` § "The owned-run wait".
  * No production path calls it yet; a later change supplies the real deps and registers it.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { PLANNING_TTL_SECONDS } from "../runner-tokens.js";
-import { cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun } from "./owned-run-lifecycle.js";
+import { recordUsage, type RecordedUsage } from "../agent-usage.js";
+import { acceptOwnedRunReport, cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun, type OwnedRunReportResult } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
+import { restateRetentionMs } from "./retention.js";
 
-/** One shared retention constant, the same pattern as `KG_REFRESH_RETENTION_MS`. */
-export const PLANNING_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** How often the wait reads the run's status. */
 export const PLANNING_RUN_TICK_MS = 30 * 1000;
 /** How often the confirm phase reads the status after a `report`. */
@@ -73,6 +74,8 @@ export interface PlanningRunResult {
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
 export interface PlanningRunDependencies {
+  /** Test seam; production leaves it unset and reads `restate_retention_days` at build time. */
+  retentionMs?: number;
   /** Takes the reservation for this dispatch id: `true` when held, `false` when refused. Idempotent per dispatch id. */
   reserve(input: PlanningRunInput): boolean | Promise<boolean>;
   /** The run or machine id of a launch that already happened for this dispatch, or `null`.
@@ -102,6 +105,7 @@ export interface PlanningRunDependencies {
 }
 
 export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
+  const retentionMs = deps.retentionMs ?? restateRetentionMs();
   const tickMs = deps.tickMs ?? PLANNING_RUN_TICK_MS;
   const confirmTickMs = deps.confirmTickMs ?? PLANNING_RUN_CONFIRM_TICK_MS;
   const confirmWindowMs = deps.confirmWindowMs ?? PLANNING_RUN_CONFIRM_WINDOW_MS;
@@ -403,12 +407,13 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     }
   }
 
-  async function report(ctx: WorkflowSharedContext): Promise<void> {
+  async function report(ctx: WorkflowSharedContext, body?: { usage?: RecordedUsage }): Promise<OwnedRunReportResult> {
     await requireStarted(ctx);
     // Producer: handleRunnerResult in src/runner-callback.ts, through createPlanningAdmissionTerminationHook.
     // The promise resolves with a body: awaitOwnedRun reads `undefined` as "not resolved".
-    const promise = ctx.promise<{ ok: true }>("report");
-    if ((await promise.peek()) === undefined) await promise.resolve({ ok: true });
+    const result = await acceptOwnedRunReport(ctx, "report", { ok: true, ...(body?.usage ? { usage: body.usage } : {}) },
+      (value) => value.usage && recordUsage(ctx.key, value.usage));
+    return { ...result, fingerprint: ownedRunReportFingerprint(body ?? {}) };
   }
 
   async function status(ctx: WorkflowSharedContext): Promise<PlanningRunStatusResult> {
@@ -425,17 +430,17 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     handlers: {
       run: restate.handlers.workflow.workflow({
         input: serde.zod(planningRunInputSchema),
-        journalRetention: PLANNING_RUN_RETENTION_MS,
+        journalRetention: retentionMs,
       }, run),
-      report: restate.handlers.workflow.shared({
-        journalRetention: PLANNING_RUN_RETENTION_MS,
-        idempotencyRetention: PLANNING_RUN_RETENTION_MS,
+      report: restate.handlers.workflow.shared<OwnedRunReportResult, { usage?: RecordedUsage }>({
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
       }, report),
       status: restate.handlers.workflow.shared(status),
     },
     options: {
-      workflowRetention: PLANNING_RUN_RETENTION_MS,
-      journalRetention: PLANNING_RUN_RETENTION_MS,
+      workflowRetention: retentionMs,
+      journalRetention: retentionMs,
       inactivityTimeout: 15 * 60 * 1000,
       abortTimeout: 20 * 60 * 1000,
     },

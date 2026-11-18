@@ -19,8 +19,16 @@ A Linear issue tree maps onto a tree of git branches:
   (mode defaults to `feature` — see §5).
 - Its **labelled children** are worked on and open PRs **into that feature branch**, not
   into the repo's base branch.
-- Unlabelled children are ignored until they too get the pickup label — so you can
-  roll a tree out incrementally.
+- An **unlabelled child** gets no run. While it is open (neither Done nor Cancelled),
+  the parent's closing-work run waits, and consequently so does the roll-up PR. The
+  [AII-349](https://linear.app/eudoxus/issue/AII-349/grouping-cascade-parent-with-pre-done-children-finalized-during-parent)
+  guard applies to both Linear and Jira, allowing for operators still labelling children.
+  Linear's guard in `src/providers/linear.ts` logs
+  `Skipping <key>: <mode> grouping parent has undesignated non-terminal children`.
+  Jira applies the same guard via `classifyByChildren` in `src/providers/jira-hierarchy.ts`;
+  `src/providers/jira.ts` logs `[jira] Skipping <key>: grouping parent not ready (waiting-parent)`.
+  File operator-only or later tasks outside the feature node (for example under the
+  parent's own parent), or close them, before the last labelled child lands.
 - The tree is **recursive**: a child that is itself a feature node gets its own branch cut
   from its parent's branch, and so on.
 - When a feature node's children are all done, the node's **own work** runs (a parent
@@ -53,6 +61,7 @@ testing                                  (repo base branch)
 | `Plan-Complete` | Planning finished and approved → the issue is ready for implementation. | Orchestrator via the **runner callback** (`runner-callback.ts` → `markPlanComplete`) |
 | `AI-Working` | Implementation in flight. Counts against capacity; the issue is skipped while present. | Orchestrator on implementation dispatch |
 | `Ready for Review` | An implementation PR is open. The issue is skipped (waiting on the human to merge). | Orchestrator when the PR is detected |
+| `AI-Needs-Human` | The stuck watchdog gave up on the issue (`parkForHuman`). The issue is skipped until a human removes this label. It keeps `AI-Implement`, so it stays in the grouping tree and, while not terminal, holds its parent's roll-up. | Orchestrator on give-up |
 
 When a PR merges, the orchestrator moves the issue to **Done** via `markMerged` — driven by
 a poll detector (guaranteed, runs every tick) and optionally accelerated by a webhook delivery
@@ -69,6 +78,7 @@ classifies each one (`src/providers/linear.ts`, `fetchAIImplementSnapshot`):
 
 | Condition | Class | Action |
 |-----------|-------|--------|
+| `AI-Needs-Human` present (checked before the capacity count) | parked | skipped, not counted for capacity |
 | `AI-Working` or `AI-Planning` present | in-progress | counted for capacity, skipped |
 | `Ready for Review` present | in review | skipped |
 | blocked by an open "blocks" relation | blocked | skipped |
@@ -76,6 +86,11 @@ classifies each one (`src/providers/linear.ts`, `fetchAIImplementSnapshot`):
 | **≥1 `AI-Implement` child, not all terminal** | **feature node (waiting)** | skipped — its branch is cut lazily when the first child dispatches |
 | **≥1 `AI-Implement` child, all terminal** | **feature node (ready)** | dispatched; its own closing work lands on its own feature branch |
 | **has children but none `AI-Implement` yet** | **waiting parent** | skipped — race guard (see below) |
+
+A parked Linear child holds its parent's roll-up until it is finished, cancelled or
+restarted (marker removed). The roll-up sweep only looks at nodes updated in the last 14
+days (`ROLLUP_LOOKBACK_MS`), and Linear does not update a parent when a child changes, so a
+longer hold can drop the parent out of the sweep; touching the parent brings it back.
 
 This classification and the label lifecycle above apply identically to both `feature` and
 `multi-issue` mode — the grouping mode affects only the shared branch name (§4).
@@ -93,8 +108,20 @@ without the parent being worked prematurely. Log line:
 A feature node is **not** implemented while any of its `AI-Implement` children are still
 in flight (`Skipping <key>: feature-node parent waiting on in-flight AI-Implement
 children`). Only once **all** its labelled children reach a terminal state does its own
-work dispatch — onto its own feature branch. "Terminal" means completed *or* cancelled, so
-a cancelled child doesn't block the parent forever.
+work dispatch — onto its own feature branch. "Terminal" means completed or cancelled, and for Linear also Duplicate
+(state type `duplicate`), so these closed children do not block the parent forever.
+
+A child whose implementation PR closes without a merge is cancelled by the orchestrator once it has no other open PR and no run in flight (subject to the [grouping-parent exemptions](pull-request-links.md#cancellation-after-an-unmerged-close)). The cancelled child is terminal, so the parent's closing run can then start without that child's work.
+
+On both Linear and Jira, unlabelled children must also be terminal (Done or Cancelled, and also Duplicate for Linear) before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
+
+The internal gap-analysis and in-loop review grade a grouping parent's closing-work PR
+only against the requirements the parent keeps for itself. Child-owned requirements are
+treated as delivered by the children into the base branch, even when the parent issue or
+planning acceptance bar lists them. Their absence from the closing-work diff is not a
+finding, and does not imply independent verification of the children's implementation or
+test execution. Missing parent-owned work still blocks approval. Reviews for other runs
+are unchanged.
 
 "Terminal" is read live from each labelled child's own tracker workflow state on every
 roll-up check for both providers, and on Linear's poll dispatch check, via
@@ -125,6 +152,13 @@ value ([AII-609](https://linear.app/eudoxus/issue/AII-609)).
   idempotent and **fails closed for grouped work**: a GitHub error leaves the issue
   queued for the next poll instead of silently dispatching it against the repository
   base branch.
+
+Linear refuses to dispatch a designated child when its repository mapping differs
+from any contiguous labelled ancestor's mapping, or any of these mappings is
+missing. Each refusal logs both issue identifiers and team-to-repository mappings.
+Different teams may share the same owner/repository. This fence applies to planning
+and implementation; it does not repair branches already orphaned by a cross-repository
+tree. Those require a manual merge.
 
 This resolution is the same in all execution modes — the resolved branch is passed to the
 runner as the `base_branch` workflow input (GitHub Actions) or as the runner's default
@@ -235,7 +269,66 @@ The step is **idempotent** and **fails soft** per roll-up — one failure never 
 
 Idempotency is handled differently per path:
 - **Internal level:** `compareBranches` returning 0 (branch already merged into parent) or `null` (branch missing) causes an early return.
-- **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker, but **only when nothing on the branch is missing from the base**: it fetches the branch's current tip (`getBranchSha`) and deletes when that tip equals the merged PR's recorded head SHA, or — as a secondary fallback, for a real merge-commit strategy or a branch already gone — when `compareBranches` confirms 0 commits ahead. SHA equality is checked first because it is strategy-agnostic (unlike ancestry, it doesn't get confused by a squash/rebase merge); the ahead-count fallback exists for a fully-absorbed merge-commit branch or a since-deleted one, not as the primary defense against a squash/rebase false-ahead reading. A merged PR does not by itself mean the branch is safe to delete: a long-lived feature node's roll-up can merge early (an interim roll-up), after which more children merge into the same branch by hand or via the cascade — the branch's tip then moves past the PR's recorded head and it also shows genuinely ahead of the base. In that case the branch is kept, the already-merged roll-up is still finalized, and a further roll-up PR is opened for the new commits instead of deleting the branch ([AII-642](https://linear.app/eudoxus/issue/AII-642)). If the PR is still open, the step returns and awaits the human. Only when no PR exists (or the last one merged but the branch has since moved on) is a new one opened (guarded by the same ahead-check so a missing branch exits early). The ahead-count fallback is a narrower version of the old git-ancestry-only heuristic that once gated the top-of-tree path, which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)) — the SHA check now covers that case directly instead of relying on ancestry alone.
+- **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker, but **only when nothing on the branch is missing from the base**: it fetches the branch's current tip (`getBranchSha`) and deletes when that tip equals the merged PR's recorded head SHA, or — as a secondary fallback, for a real merge-commit strategy or a branch already gone — when `compareBranches` confirms 0 commits ahead. SHA equality is checked first because it is strategy-agnostic (unlike ancestry, it doesn't get confused by a squash/rebase merge); the ahead-count fallback exists for a fully-absorbed merge-commit branch or a since-deleted one, not as the primary defense against a squash/rebase false-ahead reading. A merged PR does not by itself mean the branch is safe to delete: a long-lived feature node's roll-up can merge early (an interim roll-up), after which more children merge into the same branch by hand or via the cascade — the branch's tip then moves past the PR's recorded head and it also shows genuinely ahead of the base. In that case the branch is kept, the already-merged roll-up is still finalized, and a further roll-up PR is opened for the new commits instead of deleting the branch ([AII-642](https://linear.app/eudoxus/issue/AII-642)). If the PR is still open, the step requests a review for its current head and returns to await the human. Only when no PR exists (or the last one merged but the branch has since moved on) is a new one opened (guarded by the same ahead-check so a missing branch exits early). The ahead-count fallback is a narrower version of the old git-ancestry-only heuristic that once gated the top-of-tree path, which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)) — the SHA check now covers that case directly instead of relying on ancestry alone.
+
+An automatic review-only run is queued when the top-of-tree roll-up PR opens and
+whenever polling observes a new head SHA on that open PR. Each head gets one initial queue entry, even after its review finishes;
+an incomplete transient failure can receive the single retry described below. The review is advisory: it does not merge or
+modify the branch. Its verdict appears as a comment in the roll-up PR conversation,
+showing the short reviewed head SHA and explaining that it does not block the merge; blockers
+are filed as one `[roll-up-review]` child until the limit is reached. Findings
+with the same `stableReviewFindingKey` appear once with all reporting reviewer
+IDs and the strongest reported severity (`blocking` > `medium` > `minor`); findings are never merged by meaning.
+
+Blocking findings from a complete review on an open roll-up also produce
+**one pickup-ready child** under that tree's parent, containing all blockers and
+the reviewed head, PR, and verdict
+links in the Problem / Task / Files / Acceptance Criteria template. Minor findings
+stay in the verdict comment. Incomplete reviews retain any partial findings in the
+verdict but create no child and consume none of the two-child budget. Titles start
+with `[roll-up-review]` and identify the repository, PR, and head. Each head gets at most one child; each PR gets at most
+two, including completed or cancelled children. Each terminal result is given a
+follow-up notice naming the filed child or stating that no child was filed. Incomplete notices name the failed reviewers (or explain
+that no failed reviewer was identified for a failure before review). Once the
+two-child limit is reached, every notice, including an incomplete review, says a
+person must decide further fixes. Callbacks sharing a notice identity serialize
+preparation through delivery, including child creation, so overlapping deliveries
+preserve the child identifier and edit the verdict only once. Before reading or
+updating the verdict comment, the callback saves the exact notice
+text, reviewed head, and verdict comment ID in SQLite settings. A failed comment
+read, missing verdict, or failed edit leaves that notice pending and returns 503
+without consuming the callback credential or completing the job. The runner's
+existing bounded result-delivery retries replay the saved notice without filing
+another child or regenerating its wording. A delivery receipt prevents later
+callbacks for the same complete head/verdict from posting it again; a comment
+read also detects an edit that succeeded remotely before its response was lost.
+Pending records survive restarts, but there is no independent scheduled drain:
+after the sender exhausts its retry budget, recovery needs another authenticated
+callback delivery while its credential is valid. Existing settings rows
+reserve creation attempts atomically, including ambiguous tracker failures (which
+require a person to check the tracker); no new table is used. Tracker enumeration
+must finish successfully before filing, so an unreadable page cannot reset the cap.
+
+An incomplete roll-up review with a nonempty list of failed reviewers, all classified
+`transient` (for example `PROVIDER_OVERLOADED`), queues one retry for the same head.
+`ROLLUP_REVIEW_RETRY_LIMIT = 1` caps retries per repository/PR/head across every queue
+state. Non-transient or unclassified failures and a second incomplete result get no
+retry. The initial queue key is unchanged; attempt 1 has a distinct hashed negative
+ID and retains `ROLLUP_REVIEW_COMMENTER`. The retry uses the normal drain and budget
+checks with `humanRequested=false`. The verdict follow-up says “one retry is queued”
+or “no retry is left; a person decides”. Partial findings remain advisory.
+
+A separate poll sweep finds marked children even when an active child excludes its
+parent from roll-up discovery, or the tree already has a handled marker. If its
+roll-up has merged or closed, a nonterminal child is parked for a person and gets
+a comment explaining that the tree merged first or closed and the fix should be
+re-filed against the base branch. The sweep runs before fetching planning and
+implementation pickup snapshots, so a child parked in this poll cannot be dispatched
+from a stale snapshot. Closure is also checked immediately after creation.
+Roll-up child reconciliation filters tracker queries by the review-child title marker. If a child’s lifecycle or roll-up PR state cannot be verified, or required parking fails, the poll skips planning and implementation pickup for that mapping until reconciliation succeeds; other mappings continue. Filesystem mappings discover marked children in active and archived tasks, retaining terminal children for the filing cap.
+The verdict remains advisory to merge gates: review-only results never write
+`review_findings`, dispositions, approval marks, or `LateExternalReview` submissions.
+Filing and parking emit `[roll-up-review]` log lines.
 
 **`/ai-implement` on the roll-up PR.** Merge-up opens the top-of-tree PR directly, never
 through a dispatch, so it has no `dispatch_log` row of its own and the comment-gapfill drain's
@@ -247,6 +340,7 @@ identity. The gap-fill then runs against the roll-up branch with `prNumber` = th
 and reports against the parent issue. The fallback is best-effort — a failed PR lookup or a
 parent with no dispatch in the log degrades to the existing refusal — and hand-created PRs
 are still refused, since nothing on them names a tracker issue to report against.
+For an automated roll-up review (commenter `ai-implement-rollup-review`, `ROLLUP_REVIEW_COMMENTER`), a parent with no dispatch in the log is instead skipped quietly: the drain logs one line, marks the queue item `skipped`, posts nothing on the PR, and does not retry it (`src/comment-gapfill-drain.ts`, the branch after `resolveInFlightDispatch`).
 
 > ⚠️ **Auto-roll-up needs the runner callback.** A feature node only completes when its
 > closing-work PR merges and Linear marks it Done; the roll-up keys off that completed
@@ -254,6 +348,29 @@ are still refused, since nothing on them names a tracker issue to report against
 > (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`, which must be **publicly reachable**).
 > With the callback disabled, planning stalls at `AI-Planning` and the cascade can't advance
 > on its own.
+
+The merge poll checks stored open pull request links, so dispatch-log pruning does not
+prevent reconciliation. Merged implementation links queue completion; unmerged closes
+record a tombstone. Both persist the terminal outcome on the link. Roll-up links only
+record the outcome here because `merge-up` owns their reconciliation. Unreadable PRs and
+repositories without a mapping remain open for retry.
+
+### A parent's own PR closed without merging (AII-1294)
+
+A feature-node parent never blocks its own roll-up. When the PR from the parent's own run
+(identified for finalization by `isCurrentGroupingParent`: durable
+`pull_request_link.grouping_parent` ownership and the current PR of the issue's newest job,
+using `job_dispatched_at`/`job_id` ordering with `job_current` selecting a job's replacement PR) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
+parent, then writes the tombstone. Ownership survives dispatch-history pruning and
+a later gap-fill report does not clear it (`recordLinkJob` never clears the flag).
+Cancellation exempts every link with `groupingParent` set, current or superseded;
+only finalization requires current-PR identity. The poll skips finalization while a run for the issue is in flight
+(nothing is written; the next poll re-checks) and when the closed PR is not the issue's latest
+PR (tombstone only). If `markMerged` throws or no mapping resolves, no tombstone is written
+and the link stays open for the next poll to retry. Existing queue rows only repair the
+link outcome without repeating finalization. The poll does not check children; the roll-up gates above do that
+live, so a Done parent with a non-terminal designated child still gets no roll-up. A closed
+parent PR does not veto the tree; to stop a tree, cancel the parent issue.
 
 ---
 
@@ -275,19 +392,42 @@ are still refused, since nothing on them names a tracker issue to report against
 
 ## 8. Child-PR merge ordering guarantee
 
-A child PR is auto-merged only after its runner's result callback has written an **approval mark** on the run record — the auto-merge gate reads `getRunRecordMergeVerdict` keyed on **both the issue identifier and the PR URL**, so only the specific run record that produced that PR can grant approval. A stale approval from a prior run on the same issue (e.g. a superseded PR) does not carry over to a newly opened PR with the same title key.
+A child PR is auto-merged only when the project's **Auto-merge child PRs into their grouping branch** setting is on (default off) **and** its runner's result callback has written an **approval mark** on the run record — the auto-merge gate (`runAutoMerges`, which also skips mappings with the setting off and logs why) reads `getRunRecordMergeVerdict` keyed on **both the issue identifier and the PR URL**, so only the specific run record that produced that PR can grant approval. A stale approval from a prior run on the same issue (e.g. a superseded PR) does not carry over to a newly opened PR with the same title key.
+
+With the setting off, approved children are left for a person to merge: the cascade does not self-advance for that project (including a reopened parent's children), and dirty children are not re-queued for conflict resolution, since that happens only inside the auto-merge path.
 
 The approval mark has two components in `dispatch_log`: the `approved` column (an integer flag set to `1` by `stampJobApproved`) and the `conclusion` column (set to `runner_approved`). `getRunRecordMergeVerdict` treats a row as approved when either `approved = 1` OR `conclusion = 'runner_approved'`, so existing rows written before the `approved` column was added are still valid. The `approved` column is the authoritative gate field for new runs: it is written atomically by `stampJobApproved` in the runner callback and is never cleared by subsequent `updateJobStatus` calls from the GHA monitor, the reaper, or the stuck watchdog, making the approval durable regardless of write order between the callback and the monitor.
 
 The in-flight check remains issue-scoped: if any implementation or gap-analysis run for the issue is still dispatched or running, the gate defers the merge and retries on the next poll tick. The approval check is PR-URL-scoped: the latest row matching both the issue identifier and the PR URL must be completed and carry the approval mark.
 
-A PR whose run completed without the approval mark — including runs terminated by the stuck watchdog, the reaper, or a machine sweep, and runs that ended with `REVIEW_UNAPPROVED`, `MAX_TURNS_EXHAUSTED`, or `INSTALL_FAILED` — is **held**: it is never auto-merged, and a human must either close it or trigger a re-run. `INSTALL_FAILED` covers an approved change whose dependency install never succeeded — the review passed, but the change was never built or tested, so the run reports `outcome: "failure"` instead of stamping the approval mark. A PR with no run record at all — including any PR opened by a human directly into a grouping branch — is also held; human-opened PRs into grouping branches no longer auto-merge.
+A PR whose run completed without the approval mark — including runs terminated by the stuck watchdog, the reaper, or a machine sweep, and runs that ended with `REVIEW_UNAPPROVED`, `MAX_TURNS_EXHAUSTED`, `VERIFY_FAILED`, or `INSTALL_FAILED` — is **held**: it is never auto-merged, and a human must either close it or trigger a re-run. `INSTALL_FAILED` covers an approved change whose dependency install never succeeded — the review passed, but the change was never built or tested, so the run reports `outcome: "failure"` instead of stamping the approval mark. A PR with no run record at all — including any PR opened by a human directly into a grouping branch — is also held; human-opened PRs into grouping branches no longer auto-merge.
 
-**Gap-fill interactions with the approval mark:** Every gap-fill success re-stamps the approval mark via `stampJobApproved`, because a successful gap-fill means the gap-fill's own post-push review approved the updated code. A gap-fill that ends `REVIEW_UNAPPROVED` leaves the latest row unapproved and the PR held until a subsequent run completes with approval.
+**Readiness gate.** After the issue-key, approval-mark and per-head checks above, auto-merge asks `getPrReadiness` (`src/github.ts`) whether GitHub reports the PR ready **at the exact head SHA the poll listed**: open, not a draft, head unchanged, `mergeable === true`, `mergeable_state === "clean"`, and no reviewer's latest review `CHANGES_REQUESTED` (grouping branches usually lack branch protection, so `clean` alone does not cover reviews). It replaces the former `getCombinedChecksState` + `hasChangesRequestedReview` pair, which let a child with green checks but a `behind`, `blocked` or `dirty` state reach the merge call. `mergeable` is computed lazily, so an unknown state is re-read up to 3 times about 2 s apart; still unknown, the PR waits for the next tick. A child that is not ready logs `Skipping PR #N -> base: not ready (<reason>, mergeable_state=<state>)`, where the reason is `closed`, `draft`, `head_moved`, `behind`, `blocked`, `unstable` (a failing or pending check), `unknown`, `changes_requested`, `unrecognized` (a `mergeable_state` outside the known set, never treated as `dirty` or `blocked`) or `error` (a failed read; the helper never throws). A `dirty` child is not merged and goes to the conflict re-queue rail below without a merge attempt. A `blocked` child (for example, a ruleset that requires an approving review on the grouping branch) only logs the skip each tick and is not sent to the conflict rail. The rule itself, `classifyPullReadiness`, is shared with the review-fix merge policy (`evaluateMergePolicy`, `src/review-fix-github-adapter.ts`).
+
+**Gap-fill interactions with the approval mark:** a gap-fill success does not write the mark itself, because the head it pushed has not been judged by the external review (AII-1291). The callback resolves the ledger findings, sets conclusion `external_review_pending` (not an approval), and submits `LateExternalReview` with `gapFill: true` and the target parsed from the job row's `pr_url` (a gap-fill reports `prUrl: null`). `LateExternalReview` writes the mark. When Restate is not ready at callback time, the row stays `external_review_pending` with `approved = 0` and the PR is held only until a later poll tick (unlike an initial-run success, which stamps the mark in the callback with no Restate dependency): while `restateReady()` is true, `resubmitPendingGapFillReviews` (called from `poll()`) submits `LateExternalReview` for each `gap-analysis` row that is `completed`, `external_review_pending`, unapproved, has a `pr_url`, and completed within the last 24 h (`getGapFillRowsAwaitingLateReview`). The workflow key is the dispatch id, so a repeat submit is a no-op. Since AII-1524 the sweep settles a row instead of re-submitting it every tick. For each candidate row it reads the PR first: a merged or closed PR sets `late_review_pr_closed`. It then reads the workflow's state through the Restate client (`getState`, built on `workflowOutput()`): a finished workflow's ending is written to the row, a running one is left alone, and only a key with no workflow (`absent`) is submitted. An unreadable PR or state changes nothing. Each settle logs one `[late-review-sweep] row <id> settled: <ending>` line. The submit carries `rowId` (the `dispatch_log` id the callback or sweep selected), and the workflow writes every ending to that row in one `record ending` step: `conclusion = late_review_<ending>`, and `approved = 1` only for `approved`. The write applies only to a row still `external_review_pending` and unapproved, so it never replaces a later mark (a stamp by the workflow itself leaves `runner_approved`). The approval stamp also targets that row rather than the newest row for the dispatch id, which matters when a later row shares the dispatch id. A workflow started before `rowId` existed records nothing; the sweep settles its row from the workflow output. The `updateJobStatus` guard and the TTL sweep both preserve `external_review_pending`. Rows older than 24 h are not re-submitted and stay held for a person. A gap-fill that ends `REVIEW_UNAPPROVED` leaves the latest row unapproved and the PR held until a subsequent run completes with approval. This covers the legacy gap-fill path (comment gap-fill and legacy review-fix); Restate-owned review-fix attempts finalize through `applyApproval`.
+
+**Late approval path (AII-1227):** a run that ends `external_review_pending` (the internal review approved, but the external review such as `claude-review` was still running when the in-run wait ran out) reports `externalReviewPending: { headSha }`. The in-run loop also ends this way while the current head's external check is running, ignoring external findings that may belong to an older head (AII-1233). When the failed `implementation` callback carries it and a `prUrl`, and the Restate sidecar is `ready` and the endpoint `registered`, `handleRunnerResult` submits the `LateExternalReview` workflow (`src/restate/late-external-review.ts`), keyed by the dispatch id. Only an `implementation` result submits here (gap-fill runs skip post-push-review). Before the submit the callback records a `late_review_pending` outbox row (workflow key, dispatch id, PR URL, head SHA); a settled submit clears it at once, and when the hook returns `false` (Restate not ready, or ingress `unavailable`) or throws, the poll sweep re-submits the row with the stored head SHA while Restate is ready, for up to 24 h. Review-fix attempts share the same outbox (`docs/review-fix-rail.md`); gap-fill rows are retried from `dispatch_log` instead. It reads the PR every 60 s for up to 30 min. If the checks on the same head turn `success` and the ledger holds no open `blocking` finding last seen at or after that head's commit time (`commit.committer.date`; an older one was not reported by a review of this head, since `review_findings` has no head SHA and a finding fixed in-run stays `open`), it calls `stampJobApproved` and posts one PR comment marked `<!-- ai-implement late-external-approval -->`; auto-merge then reads the mark as for any approved run. A review ingested after the check turns `success` is not seen by the workflow's tick; that is accepted. It ends without a mark when the PR closed or the head moved (`superseded`), the checks failed (`external-failed`), a blocking finding is open (`findings`, owned by the review-fix rail), or the deadline passed (`timed-out`, a human reviews as before). The two held outcomes (`findings`, `timed-out`) post one more PR comment from a final `held` step, marked `<!-- ai-implement late-external-held key=<workflow key> -->` (once per workflow key, read strictly so an unreadable comment list retries rather than duplicates; a terminal failure is logged and never changes the outcome). It names the head SHA, why the PR is held (`heldBy` on the tick: `incomplete`, `unreadable`, `changes_requested`, `changes_requested-empty`, `review-failed`, else `ledger`; `timed-out` uses the 30-minute text unless the last tick was blocked) and the action to take. `external-failed`, `superseded`, `no-job` and `approved` post none. A tick journaled before `heldBy` existed reads as generic text. For a project on `claude-code-review-repository-fix`, the run ends this way when Claude's review of the current commit has blocking findings and the internal review is clean (the repository's auto-fix owns the fix), and the workflow follows the head: the submit sets `followHead`, a head change no longer ends it, and it approves only when the newest commit passes `headReviewedClean`: its review check completed with `success` (a `completed` + `skipped` run, as from a workflow that skips bot-authored pushes, is not a review), passing checks, and no blocking finding seen at or after its commit time. The mark records no head SHA, so for these projects auto-merge applies the same test to the PR's head at merge time and holds (`Holding PR #N -> base: current head not reviewed clean`) when it fails, which covers an auto-fix push after the approval; other processes are unchanged. It ends `superseded` only when the PR closes (ADR 038 decision 8). It does not un-draft a PR, so a draft stays skipped by auto-merge. In this repository, `claude-review.yml` reviews a draft PR only on a push by the orchestrator bot (a gap-fill push), so a gap-fill on a PR that an operator holds in Draft still gets its review and its mark; the workflow skips any other event on a draft PR, and where the review job skips the head, this workflow ends `timed-out` after the 30 minutes.
+
+**Gap-fill late path (AII-1291):** Codex approval comes from its current-head state comment as described below; the check-run and grace rules in this paragraph apply to processes with check pairs. A gap-fill on any project names the head it pushed (AII-1484, AII-1734): the runner reports it as `externalReviewPending.headSha`, and the comment-rail callback and the review-fix attempt's `submitLateReviewForAttempt` pass it as `headSha`. The workflow then skips `read-head`, journals `reviewerExpected` for that head in one `reviewer-expected` step, and treats a tick whose head is not yet `headSha` as "not visible yet", polling for up to `LATE_EXTERNAL_REVIEW_HEAD_GRACE_MS` (2 min, measured from `startedAt` with `ctx.date.now()`); once a tick has shown `headSha`, a different head ends `superseded`, and so does a grace that passes without ever showing it. The poll sweep re-submits the stored head (AII-1596): the callback writes `dispatch_log.late_review_head_sha` before the first submit for every project, and the attempt outbox row carries the attempt's head, so a retry also ends `superseded` when a newer commit landed first. An older runner or a row with no stored head carries no head, so the rule below applies: with `gapFill` and no `headSha` the workflow's first journaled step (`read-head`) reads the PR head and every tick uses it (a replay keeps the same head). A tick reads `pending` until that head's review check completed `success`. The workflow decides "no reviewer" once, from the PR's own history (AII-1302): the `read-head` journal entry also carries `reviewerExpected` (no extra `ctx.run`, so the call sequence of an in-flight workflow is unchanged; an entry journaled before AII-1302 is a bare SHA and reads as `true`, no grace), `true` when any earlier commit of the PR (newest 20, head excluded) has a review check run. The grace applies only when it is `false`: if the head has no review check run at all and its commit is older than `LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS` (5 min), the repo has no reviewer and the check counts as passed. When it is `true`, the tick stays `pending` until the head's review check completes `success`; a queued or skipped review ends `timed-out` at the deadline with no mark and the PR holds; a review check that is present but not `success` stays `pending`. The ledger rule is unchanged (an open `blocking` finding seen at or after the head's commit time ends `findings`, no mark; a moved head ends `superseded`). Auto-merge also calls `headHasBlockingFinding` (`src/review-head-clean.ts`) for every review process and holds (`Holding PR #N -> base: blocking finding on current head`) when the ledger has such a finding, since the mark records no head SHA. Unlike `headReviewedClean` it requires no review check, so a repo without a reviewer is not held.
+
+**Codex late approval:** For a `codex-code-review` project, initial and gap-fill late-review ticks use the process's shared `readVerdict` reader on strictly fetched PR issue and inline review comments (all pages). Approval requires the trusted Codex state comment for the current head to be `completed` with no unresolved findings or with only trusted P2 open badge threads (unresolved and not outdated, across commits), or no open badge threads after a successful thread read, plus green CI and no current-head blocking ledger finding. Missing, running, or older-head state stays pending until the existing timeout; the five-minute no-reviewer grace never applies. Only P0/P1 findings block; P2-only is approved with the findings returned as advice. Any open P0/P1 badge holds as `changes_requested`; resolving or outdating that thread removes the hold when no other blocker remains. Unknown thread state retains the legacy head-badge rule. An inline-comment or thread read failure retries the tick; failed review state holds as `review-failed`, with instructions to post `@codex review` and then `/ai-implement verify only, make no code change` after approval. Processes with check pairs keep their check-run gate, using the shared `claude-code-review-repository-fix` check pairs. All Codex reads happen inside the existing tick step, preserving Restate replay order.
+
+**Verdict rule for processes with check pairs (AII-1303):** the ledger stores no verdict, so a Claude review with verdict `changes_requested` and only `minor` findings leaves no blocking row. On a gap-fill, `post-push-review` is skipped, so nothing in the run records the verdict; on an initial run that reaches `external_review_pending`, the in-run review ended before Claude's review landed, so the external reviewer's comment was never captured by the ledger. Each late-review tick except follow mode (initial run and gap-fill alike, AII-1309) therefore also reads the PR's top-level comments, classifies them with `classifyReviewIssueComment` under the project's review process and trusted authors, and takes the newest recognised review. If that comment's `updated_at`/`created_at` is at or after the head's commit time (a comment has no SHA; a review of an older head does not count) and its verdict is not `approve` (or its findings could not be read), the tick reports a blocking state and the workflow ends `findings` with no mark. The one exception (AII-1583): a `changes_requested` verdict that lists findings does not block when every listed finding (keyed by `stableReviewFindingKey`, `owner/repo`) has a row in the review ledger and every row is `deferred` (ADR 028 decision 4); a missing row, or a row that is `open` or `resolved`, keeps the hold. A run whose internal review is clean but whose external verdict still blocks ends `external_review_pending` and hands off to this workflow rather than ending `invalid_review`. An `approve` with only minor findings does not block, as in the in-run gate (AII-1290, AII-1277). A recognised review with no verdict (the old heading format) does not block by itself. An unreadable comment list (any non-OK page, read strictly via `listPrComments`'s `strict` option) throws and the step retries; it never reads as "no review". The same tick matches review check runs (success test, no-reviewer grace, `readReviewerExpected`) by the project's `reviewCheckNames`, read from `.ai-implement/config.yml` on the default branch, falling back to the default names.
 
 Recovery for a capped or unapproved child is tracked in [AII-263](https://linear.app/eudoxus/issue/AII-263/max-turns-capped-child-run-leaves-a-stalled-draft-pr-that-silently).
 
 ---
+
+### Default-branch sync after each auto-merged child (AII-934)
+
+A feature branch is cut from the default branch once, then collects child PRs while the default branch moves. For every project, regardless of its review-fix lifecycle, `autoMergeRepo` merges the default branch into the grouping branch right after each child merge returns `merged` — after, not before, because moving the base first can make the child PR look blocked and send it to the conflict rail for nothing. It applies to every grouping base (`feature/*` and `multi-issue/*`), since the same drift applies.
+
+- It is a direct `mergeBranch` call (no PR, no new branch) with the message `Merge default branch into feature branch`, which carries no issue key and no branch name.
+- `merged` logs `[auto-merge] Synced <default> into <base>`; `noop` does nothing.
+- `conflict` is logged, notified once per feature branch per process (`deps.notify`), and the branch is left as it is. It never blocks or retries the child merge; the conflict surfaces at the roll-up as before.
+- A thrown error is logged and the loop over the other PRs continues.
+
+**No issue key in any sync merge (AII-1412).** Linear's GitHub integration marks an issue Done when a merged PR or commit carries its key. A hand-made `testing` → feature sync PR (BuildDownAI/AI-Implement#1077) carried the parent key in its title and branch and closed AII-939 on merge. So: prefer a direct merge with no key; a sync PR's title and head branch must not contain the parent key; and if a parent is closed by mistake, recover by moving it back to In Progress.
 
 ## 9. Where each part lives
 
@@ -302,6 +442,7 @@ Recovery for a capped or unapproved child is tracked in [AII-263](https://linear
 | Planning-base resolution (read-only, no branch creation) | `src/feature-branch.ts` (`resolvePlanningBranch`), wired in `src/index.ts` (`preparePlanningDispatch`) |
 | Roll-up (direct merge / human PR) | `src/merge-up.ts` (`runMergeUps`) |
 | GitHub helpers (branch/compare/merge/PR/merged-state) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `getBranchSha`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`, `findPullRequestByBranches`, `deleteBranch`) — `findPullRequestByBranches` detects the top-of-tree PR's merged state (robust to any merge method) and returns its head SHA; `getBranchSha` fetches the branch's current tip for the SHA-equality safety check; `deleteBranch` removes the feature branch after merge |
+| Child auto-merge and default-branch sync | `src/auto-merge.ts` (`runAutoMerges`, `syncDefaultIntoFeature`) |
 | Plan-Complete transition | `src/runner-callback.ts` → `markPlanComplete` |
 | Poll-loop wiring (roll-up before dispatch; base resolved per issue) | `src/index.ts` |
 
@@ -345,7 +486,7 @@ Feature-branch grouping is supported on **both providers**:
   to self-drive. On a local (`localhost`) orchestrator the callback can't be reached, so
   `Plan-Complete` must be set by hand to test the implementation/grouping path.
 - **Pair the runner image with the orchestrator.** A testing orchestrator should set
-  `SESSION_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`; otherwise a GitHub Actions
+  `AI_IMPLEMENT_RUNNER_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`; otherwise a GitHub Actions
   run falls back to the `:latest` runner, which may be incompatible with the current
   workflow/entrypoint.
 - **Top-of-tree PR merge method:** any method (merge-commit, squash, rebase) works correctly — the orchestrator detects completion via the PR's merged state, not git ancestry. On orchestrator versions before AII-188 shipped, squash/rebase merges left the feature branch appearing "ahead" of base, causing the PR to be re-opened each poll tick. If running a pre-fix orchestrator, use merge-commit with **Delete branch** checked as a temporary workaround.

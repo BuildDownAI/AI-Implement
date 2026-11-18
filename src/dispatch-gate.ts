@@ -1,6 +1,6 @@
 import { isAlreadyDispatched } from "./dedup.js";
 import { countGapfillDispatchesForPr, getInFlightIssueIds, getInFlightJobs } from "./log.js";
-import { isParked } from "./dispatch-breaker.js";
+import { isParked, breakerPhaseFor } from "./dispatch-breaker.js";
 import {
   acquire as acquireAdmission,
   release as releaseAdmission,
@@ -20,12 +20,6 @@ export type DispatchBlockReason =
   | "team_capacity"; // the team has no free slot (gap-fill only)
 
 export type DispatchDecision = { ok: true } | { ok: false; reason: DispatchBlockReason };
-
-const BREAKER_PHASE: Record<DispatchKind, string> = {
-  planning: "planning",
-  implementation: "implementation",
-  "gap-fill": "gap-analysis",
-};
 
 const PR_BUDGET_WINDOW_MS = 24 * 60 * 60 * 1000;
 
@@ -55,7 +49,7 @@ export function canDispatch(input: {
     }
   }
 
-  if (!(kind === "gap-fill" && humanRequested) && isParked(issueId, BREAKER_PHASE[kind])) {
+  if (!(kind === "gap-fill" && humanRequested) && isParked(issueId, breakerPhaseFor(kind === "gap-fill" ? "gap-analysis" : kind))) {
     return { ok: false, reason: "parked" };
   }
 
@@ -103,11 +97,6 @@ export type AcquireDispatchOutcome =
   | { ok: true; admissionGeneration: number; release: (reason: DispatchAdmissionReleaseReason) => void }
   | { ok: false; reason: DispatchAdmissionDeferReason; count: number; cap: number };
 
-const ADMISSION_BREAKER_PHASE: Record<AcquireDispatchKind, string> = {
-  planning: "planning",
-  implementation: "implementation",
-};
-
 /**
  * Final-authority admission check for planning/implementation dispatch. Call this as
  * the first statement in a dispatch function — before minting credentials or making
@@ -122,7 +111,7 @@ const ADMISSION_BREAKER_PHASE: Record<AcquireDispatchKind, string> = {
  * (reaper / stuck-watchdog) to resolve later.
  */
 export function acquireDispatch(input: AcquireDispatchInput): AcquireDispatchOutcome {
-  const parked = isParked(input.issueId, ADMISSION_BREAKER_PHASE[input.kind]);
+  const parked = isParked(input.issueId, breakerPhaseFor(input.kind));
 
   const decision = acquireAdmission({
     dispatchId: input.dispatchId,

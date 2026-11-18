@@ -1,22 +1,53 @@
-// Docker-backed round-trip coverage for the orchestratorTools service (src/restate/tools.ts,
-// AII-710) — a real Restate server (via testcontainers) journals the ingress body and
+import { getReviewerScorecard } from "../../report-card.js";
+import { createModelProtectedSecrets } from "../../model-protected-secrets.js";
+import { makeStageAgentDefaults, makeStageAgentProfile } from "../helpers/builders.js";
+import { getOrchestratorDefaults, saveAccountProfileRevision, setOrchestratorDefaults, setProjectConfigured } from "../../agent-config-store.js";
+import { createSession } from "../../admin-session.js";
+import { handleAdminRequest } from "../../admin.js";
+import { initReconciliationTable } from "../../reconciliation.js";
+import { readFileSync } from "node:fs";
+import { createModelPrices, type ModelPrice } from "../../restate/model-prices.js";
+import { setObjectState } from "./harness.js";
+// Binary-backed round-trip coverage for the orchestratorTools service (src/restate/tools.ts,
+// AII-710) — a real Restate server (the binary) journals the ingress body and
 // delivers it to our in-process endpoint, proving the role assertion and the discovery
 // metadata work through the real wire, not just against the unit-level fakes in
 // tools.test.ts. Shape mirrors src/__tests__/restate/harness.restate.test.ts exactly.
 //
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import * as restate from "@restatedev/restate-sdk";
-import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { orchestratorTools, tool, setReviewFixAttemptsFacade, type ToolResponse } from "../../restate/tools.js";
 import type { ReviewFixAttemptsFacade, ReviewFixAttemptDetail } from "../../admin.js";
+import type { SelfDeployRecord, SelfDeployStartResult, SelfDeployStatus } from "../../restate/self-deploy.js";
+import { serviceCaller, systemCaller, type Caller } from "../../mcp-identity.js";
 import * as dedup from "../../dedup.js";
 import { initLogTable } from "../../log.js";
 import { initMappingsTable, getMappings } from "../../config.js";
 import { initSettingsTable } from "../../runner-mode.js";
-import { setKgMemoryProvider } from "../../kg-provider.js";
-import { VARIANTS, callService, startVariants, stopAll } from "./harness.js";
+import { setKgMemoryProvider, type KgToolResult, type MemoryProvider } from "../../kg-provider.js";
+import { createSetupChecks } from "../../restate/setup-checks.js";
+import type { SetupCheckRun } from "../../setup-checks/index.js";
+import { VARIANTS, journalEntries, journalText, callObject, callService, gate, queryInvocations, startVariants, stopAll } from "./harness.js";
+
+// Supply valid inputs so registry-wide grant checks reach authorization even for
+// strict schemas, which reject unrelated shared fixture fields at ingress.
+function adminToolArgs(name: string, fallback: Record<string, unknown>): Record<string, unknown> {
+  switch (name) {
+    case "get_fly_setup": return {};
+    case "unpark_issue": return { identifier: "CON-146" };
+    case "set_project_agent_mode": return { teamKey: "BDS", mode: "legacy" };
+    case "start_deploy": return { branch: "testing", requestedBy: "test" };
+    case "add_model_account": return {
+      profileId: "grant-test", identity: "operator", agent: "claude",
+      provider: "openrouter", authMode: "openrouter-api-key",
+    };
+    case "set_project_stage": return { teamKey: "BDS", stage: "implementation" };
+    default: return fallback;
+  }
+}
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
 // try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
@@ -105,6 +136,48 @@ const replayCounterTools = restate.service({
   handlers: { increment: replayCounterTool },
 });
 
+// Echoing the caller proves grants survive serde; execution counts prove denials
+// return before the handler body, including on the replay runtime.
+let authorizationExecutions = 0;
+const authorizationHandler = async (_ctx: restate.Context, input: { caller: Caller }): Promise<ToolResponse> => {
+  authorizationExecutions += 1;
+  return { content: [{ type: "text", text: JSON.stringify(input.caller) }] };
+};
+const authorizationTools = restate.service({
+  name: "authorizationTools",
+  handlers: {
+    read: tool({ description: "test read", input: z.object({}), role: "user" }, authorizationHandler),
+    admin: tool({ description: "test admin", input: z.object({}), role: "admin" }, authorizationHandler),
+    projects: tool({ description: "test projects", input: z.object({}), role: "admin", grant: "projects" }, authorizationHandler),
+    secrets: tool({ description: "test secrets", input: z.object({}), role: "admin", grant: "secrets" }, authorizationHandler),
+    deploy: tool({ description: "test deploy", input: z.object({}), role: "admin", grant: "deploy" }, authorizationHandler),
+  },
+});
+
+// A counting stand-in for the SelfDeploy object that start_deploy and get_deploy_posture address.
+let selfDeployStarts = 0;
+let selfDeployStatusThrows = false;
+let selfDeployRecord: SelfDeployRecord | null = null;
+let applyGate = gate("apply");
+const stubDeployRecord: SelfDeployRecord = {
+  deployId: "deploy-1", phase: "draining", target: { repo: "owner/repo", branch: "testing", commit: "a".repeat(40), image: "registry.fly.io/img:testing-aaaaaaa", source: "published" },
+  requestedBy: "cp", startedAt: 1, finishedAt: null, reason: null,
+};
+const selfDeployStub = restate.object({
+  name: "SelfDeploy",
+  handlers: {
+    apply: async (ctx: restate.ObjectContext) => { await ctx.run("blocked apply", () => applyGate.wait()); },
+    start: async (_ctx: restate.ObjectContext, _input: unknown): Promise<SelfDeployStartResult> => {
+      selfDeployStarts++;
+      return { deployId: stubDeployRecord.deployId, commit: stubDeployRecord.target.commit, image: stubDeployRecord.target.image, alreadyActive: false };
+    },
+    status: restate.handlers.object.shared(async (_ctx: restate.ObjectSharedContext): Promise<SelfDeployStatus> => {
+      if (selfDeployStatusThrows) throw new restate.TerminalError("unavailable");
+      return { deploy: selfDeployRecord, options: { applyFlyToml: false } };
+    }),
+  },
+});
+
 interface ToolCallResult {
   content?: Array<{ type: string; text: string }>;
   isError?: boolean;
@@ -112,8 +185,15 @@ interface ToolCallResult {
 
 const SYSTEM = { kind: "system", email: null, role: "admin" } as const;
 
+/** get_tenant_health reads SetupChecks, so it is registered beside the tools, running these canned checks. */
+const SETUP_RUN: SetupCheckRun = {
+  checkedAt: 4242,
+  results: [{ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines" }],
+};
+const setupChecks = createSetupChecks({ runChecks: async () => SETUP_RUN });
+
 describe("orchestratorTools (Restate)", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
 
   beforeAll(async () => {
     // get_tenant_health reads comment_gapfill_queue via dedup.getDb(); DEDUP_DB_PATH is
@@ -121,6 +201,7 @@ describe("orchestratorTools (Restate)", () => {
     dedup.getDb();
     // getInFlightJobs (src/log.ts) reads dispatch_log, which getDb() does not create.
     initLogTable();
+    initReconciliationTable();
     // get_tenant_health also reads `mappings` (getMappings) and `settings` (getRunnerMode).
     initMappingsTable();
     initSettingsTable();
@@ -130,11 +211,215 @@ describe("orchestratorTools (Restate)", () => {
     ).run("BDS", "BuildDownAI", "skills", "claude.yml", "testing", JSON.stringify({ SUPER_SECRET: "leak-me" }));
     setKgMemoryProvider(null);
 
-    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools]);
+    environments = await startVariants([createModelPrices({ issuer: () => "https://prices.example", fetch: (...args) => fetch(...args) }), orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools, authorizationTools, selfDeployStub, setupChecks]);
   }, 60_000);
 
   afterAll(async () => {
     await stopAll(environments);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("returns reviewer scores to a user with nested args (%s)", async (label) => {
+      const env = environments.get(label)!;
+      const args = { days: 7, repo: "scorecard/repo" };
+      dedup.getDb().prepare(`INSERT OR IGNORE INTO review_findings
+        (repo, pr_number, finding_key, source, severity, body, status, disposition, first_seen_at, last_seen_at)
+        VALUES ('scorecard/repo', 1, 'scorecard-key', 'ai-implement-internal', 'blocking', 'fix', 'resolved', 'fixed', ?, ?)`).run(Date.now(), Date.now());
+      const expected = getReviewerScorecard(args);
+      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_reviewer_scorecard", {
+        caller: { kind: "human", email: "user@example.com", role: "user", grants: [] }, args,
+      });
+      expect(result).toEqual({ content: [{ type: "text", text: JSON.stringify(expected, null, 2) }] });
+    });
+
+  it.each(VARIANTS.map(([label]) => label))("estimates report-card costs from ModelPrices state (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const identifier = `AII-EST-${label}`;
+    const dispatchId = `estimate-${label}`;
+    dedup.getDb().prepare(`INSERT INTO dispatch_log (issue_id, issue_identifier, dispatched_at, phase, status, dispatch_id)
+      VALUES (?, ?, 1, 'implementation', 'completed', ?)`).run(identifier, identifier, dispatchId);
+    dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', 'a-dated', 'test', 'succeeded', 1, ?)`)
+      .run(dispatchId, dispatchId, JSON.stringify({ tokensIn: 100, tokensOut: 10, costStatus: "unavailable" }));
+    const prices: ModelPrice[] = JSON.parse(readFileSync(new URL("../fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+    for (const available of [true, false]) {
+      await setObjectState(env.adminAPIBaseUrl(), "ModelPrices", "builddown", "state", {
+        prices: available ? prices : [], fetchedAt: 1, lastError: null, nextAt: 9999999999999,
+      });
+      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_issue_report_card", {
+        caller: systemCaller(), args: { issue: identifier },
+      });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect(JSON.parse(result.content[0]!.text).totals).toEqual({
+        dispatches: 1, passes: 0, costUsd: null,
+        estimatedCostUsd: available ? 0.00031234567890123456789 : null,
+        unpricedCalls: available ? 0 : 1,
+      });
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("enforces every authorization state-table cell (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const rows: Array<[string, Caller, boolean[]]> = [
+      ["projects token", serviceCaller({ grants: ["projects"] }), [true, false, false, true, false]],
+      ["projects + deploy token", serviceCaller({ grants: ["deploy", "projects"] }), [true, false, true, true, false]],
+      ["read token", serviceCaller(), [true, false, false, false, false]],
+      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false, false]],
+      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false, false]],
+      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false, false, false]],
+      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true, true, true]],
+      ["system", systemCaller(), [true, true, true, true, true]],
+      ["secrets token", serviceCaller({ grants: ["secrets"] }), [true, false, false, false, true]],
+      ["all grants token", serviceCaller({ grants: ["deploy", "projects", "secrets"] }), [true, false, true, true, true]],
+    ];
+    for (const [row, caller, allowed] of rows) {
+      for (const [index, name] of ["read", "admin", "deploy", "projects", "secrets"].entries()) {
+        const before = authorizationExecutions;
+        const result = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", name, { caller, args: {} });
+        if (allowed[index]) {
+          expect(result.isError, `${row}: ${name}`).not.toBe(true);
+          expect(JSON.parse(result.content![0]!.text)).toEqual(caller);
+          expect(authorizationExecutions).toBeGreaterThan(before);
+        } else {
+          expect(result.isError, `${row}: ${name}`).toBe(true);
+          expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
+          expect(authorizationExecutions).toBe(before);
+        }
+      }
+    }
+    // Journaled calls from before grants existed retain empty grants and no authority.
+    const legacy = { kind: "service", email: null, role: "user" };
+    const read = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", "read", { caller: legacy, args: {} });
+    expect(JSON.parse(read.content![0]!.text).grants).toEqual([]);
+    const denied = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", "deploy", { caller: legacy, args: {} });
+    expect(denied.isError).toBe(true);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("start_deploy: deploy token and human admin start a deploy; read token and human user are forbidden (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const args = { branch: "testing", requestedBy: "cp" };
+    const call = (caller: Caller) => callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "start_deploy", { caller, args });
+    const before = selfDeployStarts;
+    for (const caller of [serviceCaller({ grants: ["deploy"] }), { kind: "human", email: "a@example.com", role: "admin", grants: [] } as Caller]) {
+      const result = await call(caller);
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.content![0]!.text)).toEqual({ deployId: "deploy-1", commit: "a".repeat(40), image: stubDeployRecord.target.image, alreadyActive: false });
+    }
+    expect(selfDeployStarts).toBe(before + 2);
+    for (const caller of [serviceCaller(), { kind: "human", email: "u@example.com", role: "user", grants: [] } as Caller]) {
+      const result = await call(caller);
+      expect(result.isError).toBe(true);
+      expect(result.content?.[0]?.text).toBe("forbidden: start_deploy requires the admin role");
+    }
+    expect(selfDeployStarts).toBe(before + 2);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("start_deploy: two calls with one idempotency key run SelfDeploy.start once (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const key = `start-deploy-dedup-${label}`;
+    const before = selfDeployStarts;
+    const body = { caller: serviceCaller({ grants: ["deploy"] }), args: { branch: "main", requestedBy: "cp" } };
+    const first = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "start_deploy", body, { "idempotency-key": key });
+    const second = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "start_deploy", body, { "idempotency-key": key });
+    expect(second).toEqual(first);
+    expect(selfDeployStarts).toBe(before + 1);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("start_deploy answers while exclusive apply is blocked without queueing start (%s)", async (label) => {
+    const env = environments.get(label)!;
+    selfDeployRecord = { ...stubDeployRecord, phase: "applying" };
+    applyGate = gate("exclusive apply");
+    const before = selfDeployStarts;
+    const starts = () => queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'SelfDeploy' AND target_handler_name = 'start'");
+    const previous = (await starts()).map(row => row.id);
+    const applying = callObject(env.baseUrl(), "SelfDeploy", process.env.FLY_APP_NAME ?? "orchestrator", "apply", {});
+    let pending: Promise<ToolCallResult> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await applyGate.reached();
+      pending = callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "start_deploy", {
+        caller: serviceCaller({ grants: ["deploy"] }), args: { branch: "main", requestedBy: "cp" },
+      });
+      const result = await Promise.race([pending, new Promise<never>((_, reject) => {
+        // restate-test-allow: enforce the one-second response deadline while apply stays blocked, not a sleep.
+        timer = setTimeout(() => reject(new Error("start_deploy did not return within one second")), 1_000);
+      })]);
+      expect(JSON.parse(result.content![0]!.text)).toEqual({
+        deployId: stubDeployRecord.deployId, commit: stubDeployRecord.target.commit,
+        image: stubDeployRecord.target.image, alreadyActive: true,
+      });
+      expect((await starts()).map(row => row.id)).toEqual(previous);
+      expect(selfDeployStarts).toBe(before);
+    } finally {
+      clearTimeout(timer);
+      applyGate.release();
+      await applying;
+      await pending;
+      selfDeployRecord = null;
+    }
+    expect((await starts()).map(row => row.id)).toEqual(previous);
+    expect(selfDeployStarts).toBe(before);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("get_deploy_posture carries the SelfDeploy record, and null when the object is unreadable (%s)", async (label) => {
+    const env = environments.get(label)!;
+    selfDeployRecord = stubDeployRecord;
+    const read = async () => JSON.parse((await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_deploy_posture", { caller: serviceCaller(), args: {} })).content![0]!.text);
+    expect((await read()).selfDeploy).toEqual(stubDeployRecord);
+    selfDeployStatusThrows = true;
+    try {
+      const posture = await read();
+      expect(posture.selfDeploy).toBeNull();
+      expect(posture).toHaveProperty("deploy");
+    } finally { selfDeployStatusThrows = false; selfDeployRecord = null; }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("deploy grants cannot reach any registered admin tool (%s)", async (label) => {
+    const env = environments.get(label)!;
+    // Bootstrap discovery with a harmless read, then select from the actual registry.
+    await callService(env.baseUrl(), "orchestratorTools", "get_runner_mode", { caller: SYSTEM, args: {} });
+    const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
+    expect(response.ok).toBe(true);
+    const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
+    const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
+    expect(admins.length).toBeGreaterThan(0);
+    // Shared fields cover permissive admin schemas; strict schemas get their own
+    // arguments below so ingress validation reaches the authorization check.
+    const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
+      backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
+      paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
+    // start_deploy is the one admin tool the deploy grant reaches (its own cases are below).
+    for (const { name } of admins.filter((handler) => handler.name !== "start_deploy")) {
+      const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
+        caller: serviceCaller({ grants: ["deploy"] }), args: adminToolArgs(name, args),
+      });
+      expect(result.isError, name).toBe(true);
+      expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("projects grants cannot reach any other registered admin tool (%s)", async (label) => {
+    const env = environments.get(label)!;
+    // Bootstrap discovery with a harmless read, then select from the actual registry.
+    await callService(env.baseUrl(), "orchestratorTools", "get_runner_mode", { caller: SYSTEM, args: {} });
+    const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
+    expect(response.ok).toBe(true);
+    const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
+    const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
+    expect(admins.length).toBeGreaterThan(0);
+    // Shared fields cover permissive admin schemas; strict schemas get their own
+    // arguments below so ingress validation reaches the authorization check.
+    const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
+      backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
+      paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
+    // Only the project mode tool is reachable with the projects grant.
+    for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode")) {
+      const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
+        caller: serviceCaller({ grants: ["projects"] }), args: adminToolArgs(name, args),
+      });
+      expect(result.isError, name).toBe(true);
+      expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
+    }
   });
 
   it.each(VARIANTS.map(([label]) => label))(
@@ -157,6 +442,57 @@ describe("orchestratorTools (Restate)", () => {
       expect(health).toHaveProperty("projectCount");
       expect(health).toHaveProperty("kgDegraded");
       expect(health).toHaveProperty("kgRefreshPreflight");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))("changes project agent modes through ingress (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const change = (mode: string, caller: Caller = systemCaller()) => callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_agent_mode", { caller, args: { teamKey: "BDS", mode } });
+    try {
+      setProjectConfigured("BDS", false);
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
+        saveAccountProfileRevision(makeStageAgentProfile());
+      }
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      for (const mode of ["configured", "legacy"]) {
+        const result = await change(mode, serviceCaller({ grants: ["projects"] }));
+        expect(result.isError).toBeFalsy();
+        expect(JSON.parse(result.content[0].text)).toEqual({ teamKey: "BDS", agentMode: mode });
+        const health = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", { caller: SYSTEM, args: {} });
+        expect(JSON.parse(health.content[0].text).stageAgents.projects).toContainEqual({ teamKey: "BDS", agentMode: mode });
+      }
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+      expect(await change("configured")).toEqual({ isError: true, content: [{ type: "text", text: "resolution-failed" }] });
+      const refused = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_agent_mode", {
+        caller: { kind: "human", email: "user@example.com", role: "user" }, args: { teamKey: "BDS", mode: "legacy" },
+      });
+      expect(refused).toEqual({ isError: true, content: [{ type: "text", text: "forbidden: set_project_agent_mode requires the admin role" }] });
+    } finally {
+      setProjectConfigured("BDS", false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    }
+  });
+
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "get_tenant_health reads the stored setup-check run from the SetupChecks object, without its detail or fix (%s)",
+    async (label) => {
+      const env = environments.get(label)!;
+      const health = async () => {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
+          caller: { kind: "human", email: "user@example.com", role: "user" },
+          args: {},
+        });
+        return JSON.parse(body?.content?.[0]?.text as string) as { setupChecks: unknown };
+      };
+
+      expect((await health()).setupChecks).toBeNull();
+      await callObject(env.baseUrl(), "SetupChecks", "orchestrator", "run", undefined);
+      expect((await health()).setupChecks).toStrictEqual({
+        checkedAt: 4242,
+        failingCore: 1,
+        rows: [{ id: "restate", title: "Restate engine", state: "fail" }],
+      });
     },
   );
 
@@ -240,9 +576,15 @@ describe("orchestratorTools (Restate)", () => {
       let reads = 0;
       const detail: ReviewFixAttemptDetail = {
         attemptId: "exact-attempt", owner: { kind: "restate", attemptId: "exact-attempt" },
-        execution: { githubRunId: "123", githubRunAttempt: 2 }, deadlineAt: 42,
+        execution: { backend: "github-actions", githubRunId: "123", githubRunAttempt: 2 }, deadlineAt: 42,
         pendingFeedback: true, snapshot: null, state: "running", evidenceComplete: false,
         terminationConfirmed: false, cycles: [],
+        attribution: {
+          version: 1, invocationId: "implementation-managed", stage: "implementation", snapshotId: "snapshot-managed",
+          agent: "codex", provider: "openai", model: "gpt-managed", profileId: "selected-plan", authMode: "codex-subscription",
+          limit: null, outcome: "success",
+          usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable" },
+        },
       };
       const calls: unknown[] = [];
       const facade: Pick<ReviewFixAttemptsFacade, "getAttempt" | "getActivity"> = {
@@ -259,10 +601,10 @@ describe("orchestratorTools (Restate)", () => {
       };
       setReviewFixAttemptsFacade(facade);
       try {
-        for (const name of ["get_review_fix_attempt", "get_review_fix_activity"]) {
+        for (const name of ["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]) {
           const denied = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
             caller: { kind: "human", email: "reader@example.com", role: "user" },
-            args: { attemptId: "exact-attempt" },
+            args: name === "get_fly_setup" ? {} : { attemptId: "exact-attempt" },
           });
           expect(denied.isError).toBe(true);
           expect(denied.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -304,7 +646,7 @@ describe("orchestratorTools (Restate)", () => {
         const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
         expect(response.ok).toBe(true);
         const catalog = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
-        for (const name of ["get_review_fix_attempt", "get_review_fix_activity"]) {
+        for (const name of ["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]) {
           expect(catalog.handlers.find((h) => h.name === name)?.metadata).toMatchObject({
             "mcp.type": "tool", "mcp.role": "admin",
           });
@@ -415,6 +757,110 @@ describe("orchestratorTools (Restate)", () => {
     },
   );
 
+  // ---- AII-1223: the other three answers kgTool gives, against a fake MemoryProvider. The
+  // endpoint runs in this process, so the fake's recorded calls are visible to assertions.
+  function fakeKgProvider(
+    answer: KgToolResult,
+    capabilities: Partial<MemoryProvider["capabilities"]> = {},
+  ): { provider: MemoryProvider; calls: Array<{ name: string; args: Record<string, unknown> }> } {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const provider: MemoryProvider = {
+      id: "fake",
+      capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: true, ...capabilities },
+      listTools: async () => [],
+      callKgTool: async (name, args) => {
+        calls.push({ name, args });
+        return answer;
+      },
+    };
+    return { provider, calls };
+  }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search passes the provider's answer through, degraded flag included (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const result = { results: [{ id: "n1", score: 0.9 }], degraded: true };
+      const { provider, calls } = fakeKgProvider({ ok: true, result });
+      setKgMemoryProvider(provider);
+      try {
+        const args = { query: "x", limit: 3 };
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args,
+        });
+        expect(body?.isError).toBeFalsy();
+        expect(JSON.parse(body?.content?.[0]?.text ?? "null")).toEqual(result);
+        expect(calls).toEqual([{ name: "kg_hybrid_search", args }]);
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_semantic_search answers isError without calling a provider that lacks the capability (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      // kg_semantic_search is gated by the hybridSearch capability (KG_TOOL_CAPABILITY).
+      const { provider, calls } = fakeKgProvider({ ok: true, result: { results: [] } }, { hybridSearch: false });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_semantic_search", {
+          caller: SYSTEM,
+          args: { query: "x" },
+        });
+        expect(body?.isError).toBe(true);
+        expect(body?.content?.[0]?.text).toBe("Tool not supported by this memory provider: kg_semantic_search");
+        expect(calls).toHaveLength(0);
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search answers isError with the provider's error text on failure (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { provider } = fakeKgProvider({ ok: false, error: "KG sidecar unavailable: connection refused" });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args: { query: "x" },
+        });
+        expect(body?.isError).toBe(true);
+        expect(body?.content?.[0]?.text).toBe("KG sidecar unavailable: connection refused");
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search with an empty result is not an error (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { provider } = fakeKgProvider({ ok: true, result: { results: [] } });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args: { query: "nothing matches" },
+        });
+        expect(body?.isError).toBeFalsy();
+        expect(JSON.parse(body?.content?.[0]?.text ?? "null")).toEqual({ results: [] });
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
   // ---- AII-713: the six writes, migrated off WRITE_TOOLS in src/mcp.ts onto this same
   // service. Business-logic parity (each action's own status codes and validation) is unit
   // tested in tools.test.ts against a mocked src/admin.ts; what's real-ingress-only here is
@@ -471,7 +917,7 @@ describe("orchestratorTools (Restate)", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "trigger_kg_refresh's discovered schema declares dryRun/acceptNewBaseline booleans, and add_project's reviewers array matches the pre-migration shape (%s)",
+    "trigger_kg_refresh's discovered schema still declares the removed dryRun/acceptNewBaseline booleans (so zod does not strip them), and add_project's reviewers array matches the pre-migration shape (%s)",
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
@@ -490,6 +936,8 @@ describe("orchestratorTools (Restate)", () => {
       expect(kgRefreshArgs?.acceptNewBaseline?.type).toBe("boolean");
 
       const addProjectArgs = metadata.handlers.find((h) => h.name === "add_project")?.input_json_schema?.properties?.args?.properties;
+      expect(addProjectArgs).toBeDefined();
+      expect(addProjectArgs).not.toHaveProperty("reviewFixLifecycle");
       // AII-720: reviewers is now `.nullable()`, so zod's JSON schema wraps the array
       // variant in `anyOf` alongside `{ type: "null" }` instead of exposing `items` directly.
       const reviewers = addProjectArgs?.reviewers as
@@ -499,6 +947,25 @@ describe("orchestratorTools (Restate)", () => {
       const reviewersArrayVariant = reviewers?.anyOf?.find((v) => v.items !== undefined);
       expect(reviewersArrayVariant?.items?.required).toEqual(["id", "gates"]);
       expect(reviewersArrayVariant?.items?.properties?.maxTurns).toMatchObject({ type: "integer", minimum: 1, maximum: 200 });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "trigger_kg_refresh refuses dryRun: true and acceptNewBaseline: true with 400 option-removed before any dispatch (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "trigger_kg_refresh", {
+          caller: SYSTEM,
+          args: { [option]: true },
+        });
+        // The refusal runs before the deploy-held check, preflight and KgRepo.trigger, so it is
+        // the 400 answer and not the 501/409 a later gate would give.
+        const result = JSON.parse(body?.content?.[0]?.text as string) as { status: number; body: Record<string, unknown> };
+        expect(result.status).toBe(400);
+        expect(result.body).toEqual({ error: "option-removed", option });
+      }
     },
   );
 
@@ -526,6 +993,66 @@ describe("orchestratorTools (Restate)", () => {
       expect(result.body.maxTurns).toBeNull();
     },
   );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "add_project creates a Codex project and ignores a retired lifecycle through real ingress (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "add_project", {
+        caller: SYSTEM,
+        args: { teamKey: `CODEX-${label}`, owner: "BuildDownAI", repo: "codex-fixture", defaultBranch: "main",
+          reviewProcess: "codex-code-review", reviewFixLifecycle: "legacy" },
+      });
+      const result = JSON.parse(body?.content?.[0]?.text as string) as { status: number; body: Record<string, unknown> };
+      expect(result.status).toBe(202);
+      expect(result.body).toMatchObject({ reviewProcess: "codex-code-review", reviewFixLifecycle: null });
+      expect(result.body.syncJobId).toBeDefined();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))("add_project starts configured with defaults on (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const teamKey = `CONFIGURED-${label}`;
+    try {
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) saveAccountProfileRevision(makeStageAgentProfile());
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "add_project", {
+        caller: SYSTEM, args: { teamKey, owner: "BuildDownAI", repo: "configured-fixture", defaultBranch: "main" },
+      });
+      expect(JSON.parse(result.content![0].text).status).toBe(202);
+      const health = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", { caller: SYSTEM, args: {} });
+      expect(JSON.parse(health.content[0].text).stageAgents.projects).toContainEqual({ teamKey, agentMode: "configured" });
+    } finally {
+      setProjectConfigured(teamKey, false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("reports configured and legacy stage agents through ingress (%s)", async (label) => {
+    const env = environments.get(label)!;
+    try {
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
+        saveAccountProfileRevision(makeStageAgentProfile());
+      }
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      dedup.getDb().prepare("INSERT OR IGNORE INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES ('AII', 'acme', 'widgets', 'claude.yml', 'main')").run();
+      setProjectConfigured("AII", true);
+      setProjectConfigured("BDS", false);
+      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
+        caller: { kind: "human", email: "user@example.com", role: "user", grants: [] }, args: {},
+      });
+      expect(result.isError).toBeFalsy();
+      const stageAgents = JSON.parse(result.content[0].text).stageAgents;
+      expect(stageAgents.defaultsMode).toBe("configured");
+      expect(stageAgents.projects.filter((project: { teamKey: string }) => ["AII", "BDS"].includes(project.teamKey))).toEqual([{ teamKey: "AII", agentMode: "configured" }, { teamKey: "BDS", agentMode: "legacy" }]);
+    } finally {
+      setProjectConfigured("AII", false);
+      setProjectConfigured("BDS", false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+      dedup.getDb().prepare("DELETE FROM mappings WHERE team_key = 'AII'").run();
+    }
+  });
 
   it.each(VARIANTS.map(([label]) => label))(
     "a user caller is refused a write tool over the real ingress and never runs the action (%s)",
@@ -557,6 +1084,70 @@ describe("orchestratorTools (Restate)", () => {
     // had just written).
     expect(replayInsideCounter).toBe(1);
     expect(replayOutsideCounter).toBeGreaterThan(1);
+  });
+
+  it("imports an environment account through one secret-free journal step", async () => {
+    const env = environments.get("alwaysReplay")!;
+    const names = ["RUNNER_TOKEN_SECRET", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] as const;
+    const previous = names.map(name => process.env[name]);
+    const token = "SENTINEL-RESTATE-ENV-IMPORT";
+    const ref = "model-account:adopted-env-claude-subscription";
+    const defaults = getOrchestratorDefaults();
+    const mappings = getMappings();
+    const projects = dedup.getDb().prepare("SELECT * FROM stage_agent_config_revisions WHERE scope_kind = 'project'").all();
+    try {
+      process.env.RUNNER_TOKEN_SECRET = "test-environment-import-secret";
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = token;
+      delete process.env.ANTHROPIC_API_KEY;
+      const invoke = (caller = SYSTEM as Caller) => callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "import_environment_credential", { caller, args: {} });
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      expect(JSON.parse((await invoke()).content![0]!.text)).toEqual({ status: 404, body: { error: "no model credential in the environment" } });
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = token;
+      delete process.env.RUNNER_TOKEN_SECRET;
+      expect(JSON.parse((await invoke()).content![0]!.text)).toEqual({ status: 503, body: { error: "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it" } });
+      process.env.RUNNER_TOKEN_SECRET = "test-environment-import-secret";
+      const first = await invoke();
+      expect(JSON.parse(first.content![0]!.text)).toMatchObject({ status: 201, body: { result: "created", profileId: "adopted-env-claude-subscription" } });
+      const store = createModelProtectedSecrets({ env: process.env });
+      expect(store.delete(ref).ok).toBe(true);
+      expect(store.open(ref).ok).toBe(false);
+      const repaired = await invoke();
+      expect(JSON.parse(repaired.content![0]!.text)).toMatchObject({ status: 201, body: { result: "created" } });
+      expect(store.resolve(ref)).toBe(token);
+      const second = await invoke();
+      expect(JSON.parse(second.content![0]!.text)).toMatchObject({ status: 200, body: { result: "already-imported" } });
+      expect((await invoke({ kind: "human", email: "user@example.com", role: "user", grants: [] })).isError).toBe(true);
+      expect(getOrchestratorDefaults()).toEqual(defaults);
+      expect(getMappings()).toEqual(mappings);
+      expect(dedup.getDb().prepare("SELECT * FROM stage_agent_config_revisions WHERE scope_kind = 'project'").all()).toEqual(projects);
+      let status = 0;
+      let body = "";
+      handleAdminRequest({ url: "/api/model-accounts", method: "GET", headers: { authorization: `Bearer ${createSession()}` } } as never,
+        { writeHead: (code: number) => { status = code; }, end: (data: string) => { body = data; } } as never,
+        { adminAccessCode: "test" } as never, {} as never);
+      expect(status).toBe(200);
+      expect(body).toContain('"credentialSet":true');
+      expect(body).toContain("adopted-env-claude-subscription");
+      const invocations = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'import_environment_credential'");
+      expect(invocations.length).toBeGreaterThanOrEqual(3);
+      const journals: string[] = [];
+      for (const invocation of invocations) {
+        const entries = await journalEntries(env.adminAPIBaseUrl(), String(invocation.id));
+        const text = journalText(entries);
+        journals.push(text);
+        expect(text).not.toContain(token);
+        expect(text).not.toContain(ref);
+      }
+      // Prove the absence checks searched the decoded import result, not an empty journal.
+      expect(journals.join("\n")).toContain("adopted-env-claude-subscription");
+      expect(journals.join("\n")).toContain("import-environment-credential");
+      expect(JSON.stringify([first, repaired, second, body])).not.toContain(token);
+      expect(JSON.stringify([first, repaired, second, body])).not.toContain(ref);
+      const metadata = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools/handlers/import_environment_credential`).then(r => r.json());
+      expect(metadata).toMatchObject({ retry_policy: { max_attempts: 1, on_max_attempts: "Kill" } });
+    } finally {
+      names.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; });
+    }
   });
 
   it("pause_project: a second ingress call with the same idempotency key attaches to the first result instead of running pauseProjectAction again", async () => {

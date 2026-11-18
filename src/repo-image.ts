@@ -1,3 +1,5 @@
+import { getRunnerImageAllowedPrefixes } from "./orchestrator-settings.js";
+
 declare global {
   namespace NodeJS {
     interface ProcessEnv {
@@ -40,6 +42,41 @@ export interface ResolveSessionImageResult {
   source: "override" | "default";
 }
 
+const BUILTIN_IMAGE_PREFIX = "ghcr.io/builddownai/";
+
+/** Thrown when the resolved runner image is outside the allowlist. */
+export class RunnerImageNotAllowedError extends Error {
+  constructor(
+    readonly image: string,
+    readonly owner: string,
+    readonly allowedPrefixes: string[],
+    repo?: string,
+  ) {
+    super(
+      `runner image ${image} for ${owner}${repo ? `/${repo}` : ""} is not allowed; `
+      + `allowed prefixes: ${allowedPrefixes.join(", ")}; add a prefix at /admin#settings`,
+    );
+    this.name = "RunnerImageNotAllowedError";
+  }
+}
+
+function allowedPrefixList(owner: string, extraPrefixes: string[]): string[] {
+  return [...new Set([BUILTIN_IMAGE_PREFIX, `ghcr.io/${owner.toLowerCase()}/`, ...extraPrefixes])];
+}
+
+/** Literal prefix match only: a stored prefix is never compiled into a RegExp or glob. */
+export function isRunnerImageAllowed(image: string, owner: string, extraPrefixes: string[]): boolean {
+  return allowedPrefixList(owner, extraPrefixes).some((prefix) => prefix !== "" && image.startsWith(prefix));
+}
+
+function assertRunnerImageAllowed(result: ResolveSessionImageResult, owner: string, repo: string): void {
+  const extra = getRunnerImageAllowedPrefixes();
+  if (isRunnerImageAllowed(result.image, owner, extra)) return;
+  const err = new RunnerImageNotAllowedError(result.image, owner, allowedPrefixList(owner, extra), repo);
+  console.warn(`[repo-image] ${err.message}`);
+  throw err;
+}
+
 export async function resolveSessionImage(
   input: ResolveSessionImageInput,
 ): Promise<ResolveSessionImageResult> {
@@ -50,11 +87,14 @@ export async function resolveSessionImage(
   const cacheKey = `${owner}/${repo}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
-    return { image: cached.image, source: cached.source };
+    const hit = { image: cached.image, source: cached.source };
+    assertRunnerImageAllowed(hit, owner, repo);
+    return hit;
   }
 
   const result = await fetchImage(owner, repo, token, defaultImage, fetchImpl);
   cache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, ...result });
+  assertRunnerImageAllowed(result, owner, repo);
   return result;
 }
 

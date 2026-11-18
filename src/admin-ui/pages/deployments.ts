@@ -45,6 +45,23 @@ export const deploymentsHtml = `
 
     <div class="alert" id="deployments-outcome-alert" hidden></div>
 
+    <div class="card" id="deployments-active" hidden>
+      <div class="card-header"><h2 class="card-title">Deploy in progress <span class="badge neutral" id="deployments-active-badge">—</span></h2></div>
+      <div class="card-body">
+        <div id="deployments-active-details" class="kpi-trend" style="font-family: var(--font-mono)"></div>
+        <div style="margin-top: 8px">
+          <button class="btn btn-sm" id="deployments-cancel-btn" onclick="window.cancelDeploy()" hidden>Cancel deploy</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="deployments-last-result" hidden>
+      <div class="card-header"><h2 class="card-title">Last deploy result <span class="badge neutral" id="deployments-last-result-badge">—</span></h2></div>
+      <div class="card-body">
+        <div id="deployments-last-result-details" class="kpi-trend" style="font-family: var(--font-mono)"></div>
+      </div>
+    </div>
+
     <div class="card" id="deployments-policy" hidden>
       <div class="card-header"><h2 class="card-title">When a deployment becomes available...</h2></div>
       <div class="card-body">
@@ -74,6 +91,12 @@ export const deploymentsHtml = `
         </label>
         <div class="kpi-trend text-secondary" id="deployments-auto-hint" style="margin-left: 24px"></div>
 
+        <label class="checkbox-row" id="deployments-fly-toml-row">
+          <input type="checkbox" id="deployments-fly-toml" onchange="window.refreshPolicyDirty()">
+          <span>Apply fly.toml on deploy</span>
+        </label>
+        <div class="kpi-trend text-secondary" id="deployments-fly-toml-hint" style="margin-left: 24px"></div>
+
         <label class="checkbox-row" id="deployments-notify-row">
           <input type="checkbox" id="deployments-notify" onchange="window.refreshPolicyDirty()">
           <span>Announce it to the notification webhook</span>
@@ -86,35 +109,34 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div class="card" id="deployments-retention">
+      <div class="card-header"><h2 class="card-title">Retention</h2></div>
+      <div class="card-body">
+        <div style="display: flex; gap: 16px; flex-wrap: wrap">
+          <div>
+            <div class="kpi-label" style="margin-bottom: 6px">Restate retention (days)</div>
+            <input type="number" class="input" id="deployments-retention-restate" step="1"
+              oninput="window.refreshRetentionDirty()">
+          </div>
+          <div>
+            <div class="kpi-label" style="margin-bottom: 6px">Volume snapshot retention (days)</div>
+            <input type="number" class="input" id="deployments-retention-volume" step="1"
+              oninput="window.refreshRetentionDirty()">
+          </div>
+        </div>
+        <div class="kpi-trend text-secondary" id="deployments-retention-applies" style="margin-top: 8px"></div>
+        <div class="kpi-trend text-secondary" id="deployments-retention-applied" style="margin-top: 4px"></div>
+        <div class="kpi-trend" id="deployments-retention-error" style="color: var(--color-warn); margin-top: 4px" hidden></div>
+        <div style="margin-top: 12px">
+          <button class="btn btn-primary btn-sm" id="deployments-retention-save" onclick="window.saveRetention()" disabled>Save</button>
+        </div>
+      </div>
+    </div>
+
     <div id="deployments-cta" hidden style="text-align: center">
       <div style="display: inline-flex; flex-direction: column; align-items: center; gap: 8px">
         <button class="btn btn-accent btn-lg" id="deployments-deploy-btn" onclick="window.triggerDeploy()">Deploy now</button>
         <div class="kpi-trend text-secondary" style="justify-content: center; max-width: 46ch">New dispatches pause immediately, and in-flight work drains before the build starts.</div>
-      </div>
-    </div>
-
-    <div class="card" id="kg-refresh-card" hidden>
-      <div class="card-header"><h2 class="card-title">Knowledge graph <span class="badge neutral" id="kg-refresh-badge">—</span></h2></div>
-      <div class="card-body">
-        <div class="kpi-trend" id="kg-refresh-stamp">Served graph stamp: —</div>
-        <div class="kpi-trend text-secondary" id="kg-refresh-last"></div>
-        <div class="kpi-trend text-secondary" id="kg-sidecar-status" hidden></div>
-        <div style="margin-top: 12px">
-          <button class="btn btn-sm" id="kg-refresh-btn" onclick="window.triggerKgRefresh()">Refresh graph now</button>
-          <button class="btn btn-sm" id="kg-dry-run-btn" onclick="window.triggerKgRefresh(true)">Dry-run refresh</button>
-          <button class="btn btn-sm" id="kg-accept-baseline-btn" onclick="window.triggerKgAcceptBaseline()">Accept new baseline &amp; refresh</button>
-          <span class="kpi-trend text-secondary" style="margin-left: 8px">Refresh fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause. Dry-run runs the same job with the push skipped and reports the guard table below; the served graph never changes. Accept new baseline pushes even if the guard table above shows a shrink — review it first.</span>
-        </div>
-        <div class="kpi-trend text-secondary" id="kg-dry-run-last" style="margin-top: 8px" hidden></div>
-        <div id="kg-materialize-env-warning" class="warning hidden">&#x26A0; KG_MATERIALIZE_DIRECT env var is set &#x2014; UI toggle has no effect until it is unset.</div>
-        <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap">
-          <span class="kpi-trend text-secondary">Materialize:</span>
-          <span class="seg" id="kg-materialize-controls">
-            <button class="btn btn-sm" id="btn-kg-materialize-rdflib" data-materialize="rdflib" onclick="window.setKgMaterializeDirect(false)">rdflib</button>
-            <button class="btn btn-sm" id="btn-kg-materialize-direct" data-materialize="direct" onclick="window.setKgMaterializeDirect(true)">direct</button>
-          </span>
-          <span class="kpi-trend text-secondary" id="kg-materialize-source"></span>
-        </div>
       </div>
     </div>
 
@@ -227,6 +249,49 @@ export const deploymentsScript = `
   // does not silently revert a checkbox someone has ticked but not yet saved.
   let savedPolicy = null;
   let stampedBranch = null;
+  // Whether a SelfDeploy is draining, applying or verifying; the Deploy button must stay
+  // disabled for exactly that long, including after triggerDeploy's finally block.
+  let deployActive = false;
+
+  function isActivePhase(phase) {
+    return phase === 'draining' || phase === 'applying' || phase === 'verifying';
+  }
+
+  function deployDetails(deploy) {
+    const t = deploy.target || {};
+    const parts = [];
+    if (t.branch) parts.push('branch ' + t.branch);
+    if (t.commit) parts.push('commit ' + short(t.commit));
+    if (t.image) parts.push('image ' + t.image);
+    return parts;
+  }
+
+  function renderSelfDeploy(deploy) {
+    const activeCard = document.getElementById('deployments-active');
+    const lastCard = document.getElementById('deployments-last-result');
+    const cancelBtn = document.getElementById('deployments-cancel-btn');
+    const phase = deploy ? deploy.phase : null;
+    deployActive = isActivePhase(phase);
+    activeCard.hidden = !deployActive;
+    cancelBtn.hidden = phase !== 'draining';
+    const isResult = phase === 'succeeded' || phase === 'failed' || phase === 'cancelled';
+    lastCard.hidden = !isResult;
+    document.getElementById('deployments-deploy-btn').disabled = deployActive;
+    if (deployActive) {
+      setBadge(document.getElementById('deployments-active-badge'), phase === 'draining' ? 'warn' : 'running', phase);
+      const parts = deployDetails(deploy);
+      if (deploy.requestedBy) parts.push('started by ' + deploy.requestedBy);
+      if (deploy.startedAt) parts.push('started ' + new Date(deploy.startedAt).toLocaleString());
+      document.getElementById('deployments-active-details').textContent = parts.join(' · ');
+    }
+    if (isResult) {
+      setBadge(document.getElementById('deployments-last-result-badge'), phase === 'succeeded' ? 'success' : phase === 'failed' ? 'fail' : 'neutral', phase);
+      const parts = deployDetails(deploy);
+      if (deploy.reason) parts.push('reason ' + deploy.reason);
+      if (deploy.finishedAt) parts.push('finished ' + new Date(deploy.finishedAt).toLocaleString());
+      document.getElementById('deployments-last-result-details').textContent = parts.join(' · ');
+    }
+  }
 
   function policyDirty() {
     if (!savedPolicy) return false;
@@ -237,7 +302,10 @@ export const deploymentsScript = `
     const notifyChanged = !notifyEl.disabled && notifyEl.checked !== savedPolicy.notifyAvailable;
     const watchedRepoChanged = document.getElementById('deployments-watched-repo').value !== (savedPolicy.watchedRepo || '');
     const watchedRefChanged = document.getElementById('deployments-watched-ref').value !== (savedPolicy.watchedRef || '');
-    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged || watchedRepoChanged || watchedRefChanged;
+    // Same rule as the announcement switch: a disabled control is not part of the form.
+    const flyEl = document.getElementById('deployments-fly-toml');
+    const flyChanged = !flyEl.disabled && flyEl.checked !== savedPolicy.applyFlyToml;
+    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged || flyChanged || watchedRepoChanged || watchedRefChanged;
   }
 
   function refreshPolicyDirty() {
@@ -392,8 +460,8 @@ export const deploymentsScript = `
     loadDeployments();
   }
 
-  async function loadDeployments() {
-    clearMessage();
+  async function loadDeployments(opts) {
+    if (!(opts && opts.keepMessage)) clearMessage();
     loadReservations();
 
     let data;
@@ -449,12 +517,20 @@ export const deploymentsScript = `
     const notifyEl = document.getElementById('deployments-notify');
     const watchedRepoEl = document.getElementById('deployments-watched-repo');
     const watchedRefEl = document.getElementById('deployments-watched-ref');
+    const flyEl = document.getElementById('deployments-fly-toml');
+
+    // Before the dirty check below, which ignores a disabled control. A Restate fault
+    // leaves selfDeploy null; the stored option is then unknown and reads as off.
+    const selfDeploy = data.selfDeploy || null;
+    const flyAllowed = data.applyFlyTomlAllowed !== false;
+    flyEl.disabled = !flyAllowed;
 
     // Computed against the *previous* server state, before it is replaced below — the
     // poll must not overwrite a checkbox that is ticked and not yet saved.
     if (!policyDirty()) {
       autoEl.checked = !!data.autoDeploy;
       notifyEl.checked = !!data.notifyAvailable;
+      flyEl.checked = flyAllowed && !!(selfDeploy && selfDeploy.options && selfDeploy.options.applyFlyToml);
       watchedRepoEl.value = data.watchedRepo || '';
       // Seed the ref selector with the saved value; the options are loaded on blur.
       const savedRef = data.watchedRef || '';
@@ -477,6 +553,7 @@ export const deploymentsScript = `
       notifyAvailable: !!data.notifyAvailable,
       watchedRepo: data.watchedRepo || '',
       watchedRef: data.watchedRef || '',
+      applyFlyToml: flyAllowed && !!(selfDeploy && selfDeploy.options && selfDeploy.options.applyFlyToml),
     };
     refreshPolicyDirty();
 
@@ -490,6 +567,15 @@ export const deploymentsScript = `
     const notifyRow = document.getElementById('deployments-notify-row');
     notifyRow.style.opacity = data.notifyConfigured ? '' : '0.5';
     notifyRow.style.cursor = data.notifyConfigured ? '' : 'not-allowed';
+
+    const flyRow = document.getElementById('deployments-fly-toml-row');
+    flyRow.style.opacity = flyAllowed ? '' : '0.5';
+    flyRow.style.cursor = flyAllowed ? '' : 'not-allowed';
+    document.getElementById('deployments-fly-toml-hint').textContent = flyAllowed
+      ? 'Off by default. On: a deploy also applies this repo\u2019s fly.toml to the machine.'
+      : 'The control plane created this machine and owns its config.';
+
+    renderSelfDeploy(selfDeploy && selfDeploy.deploy ? selfDeploy.deploy : null);
 
     document.getElementById('deployments-auto-hint').textContent = autoHint(data, available, held);
     document.getElementById('deployments-notify-hint').textContent = notifyHint(data);
@@ -544,6 +630,9 @@ export const deploymentsScript = `
         setBadge(outcomeBadge, 'success', 'Completed');
       } else if (outcome.kind === 'deployed-not-serving') {
         setBadge(outcomeBadge, 'warn', 'Degraded');
+      } else if (outcome.kind === 'deploy-cancelled') {
+        // Deliberate, so neither the red failure treatment nor a success.
+        setBadge(outcomeBadge, 'neutral', 'Cancelled');
       } else {
         setBadge(outcomeBadge, 'fail', 'Failed');
       }
@@ -563,19 +652,23 @@ export const deploymentsScript = `
     outcomeAlert.hidden = !troubled;
     if (troubled) {
       const degraded = outcome.kind === 'deployed-not-serving';
+      const cancelled = outcome.kind === 'deploy-cancelled';
       outcomeAlert.className = 'alert ' + (degraded ? 'warn' : 'fail');
+      // Cancelling is deliberate: the warn treatment, not the failure one.
+      if (cancelled) outcomeAlert.className = 'alert warn';
       const title = degraded
         ? 'Released, but the knowledge graph is not serving'
-        : 'Deploy did not release';
+        : cancelled ? 'Deploy cancelled' : 'Deploy did not release';
       const explain = degraded
         ? '/mcp answers 503 while every other route is healthy. Deploy now, below, rebuilds and releases the same commit.'
+        : cancelled ? 'The deploy was cancelled while draining. The running version is unchanged.'
         : 'The running version is unchanged, and the commit is still available to deploy.';
       // The record carries a one-line reason on purpose. flyctl's real output is a 64 KB
       // tail that is logged and never stored, because the KG token rides in its argv and a
       // stored copy would outlive a rotating log and be served on every status poll.
       // Naming where the output is beats reproducing it somewhere it should not be.
       outcomeAlert.innerHTML =
-        '<div class="alert-icon">' + (degraded ? '!' : '\\u00d7') + '</div>'
+        '<div class="alert-icon">' + (degraded || cancelled ? '!' : '\\u00d7') + '</div>'
         + '<div style="flex:1">'
         + '<div class="alert-title">' + window.esc(title) + '</div>'
         + '<div class="alert-desc">' + window.esc(explain) + '</div>'
@@ -644,9 +737,34 @@ export const deploymentsScript = `
     } finally {
       // finally, not the success path: returning early there left the button dead
       // whenever a fast failure cleared the hold before the next poll could hide it.
-      btn.disabled = false;
+      btn.disabled = deployActive;
       loadDeployments();
     }
+  }
+
+  async function cancelDeploy() {
+    clearMessage();
+    const btn = document.getElementById('deployments-cancel-btn');
+    btn.disabled = true;
+    try {
+      const res = await window.api('/api/deploy-cancel', { method: 'POST' });
+      if (!res.ok) {
+        let message = 'Unknown error';
+        try { const body = await res.json(); message = body.error || message; } catch (e) { /* ignore */ }
+        showMessage('error', 'Could not cancel the deploy — ' + message);
+      } else {
+        const body = await res.json().catch(function () { return {}; });
+        if (body && body.cancelled === false && body.reason === 'too-late') {
+          showMessage('warning', 'The deploy is past the drain and cannot be cancelled.');
+        }
+      }
+    } catch (err) {
+      showMessage('error', 'Could not cancel the deploy — ' + String(err));
+    } finally {
+      btn.disabled = false;
+    }
+    // keepMessage: a plain reload would erase the too-late notice just shown.
+    await loadDeployments({ keepMessage: true });
   }
 
   async function saveDeployPolicy() {
@@ -662,17 +780,87 @@ export const deploymentsScript = `
     const patch = { autoDeploy: document.getElementById('deployments-auto').checked };
     if (!notifyEl.disabled) patch.notifyAvailable = notifyEl.checked;
     // Send null to clear the override when the field is blank.
+    const flyEl = document.getElementById('deployments-fly-toml');
+    if (!flyEl.disabled) patch.applyFlyToml = flyEl.checked;
     patch.watchedRepo = watchedRepoEl.value.trim() || null;
     patch.watchedRef = watchedRefEl.value || null;
     try {
       const res = await window.api('/api/deploy-policy', { method: 'POST', body: JSON.stringify(patch) });
-      if (!res.ok && res.status !== 401) {
+      if (res.status === 409) {
+        showMessage('error', 'Could not save the deployment policy — the control plane owns this machine\u2019s config, so fly.toml cannot be applied.');
+      } else if (!res.ok && res.status !== 401) {
         showMessage('error', 'Could not save the deployment policy — the settings may not reflect what is stored.');
       }
     } catch (err) {
       showMessage('error', 'Could not save the deployment policy — ' + String(err));
     }
     loadDeployments();
+  }
+
+  let savedRetention = null;
+
+  function retentionDirty() {
+    if (!savedRetention) return false;
+    return document.getElementById('deployments-retention-restate').value !== String(savedRetention.restate.days)
+      || document.getElementById('deployments-retention-volume').value !== String(savedRetention.volume.days);
+  }
+
+  function refreshRetentionDirty() {
+    document.getElementById('deployments-retention-save').disabled = !retentionDirty();
+  }
+
+  function renderRetention(data) {
+    savedRetention = data;
+    document.getElementById('deployments-retention-restate').value = String(data.restate.days);
+    document.getElementById('deployments-retention-volume').value = String(data.volume.days);
+    for (const id of ['deployments-retention-restate', 'deployments-retention-volume']) {
+      const el = document.getElementById(id);
+      el.min = String(data.min);
+      el.max = String(data.max);
+    }
+    document.getElementById('deployments-retention-applies').innerHTML =
+      'Restate retention applies at the ' + window.esc(data.restate.appliesAt);
+    const last = data.volume.lastApplied;
+    let text = 'Volume retention: not applied since boot';
+    if (last) {
+      text = 'Volume retention last applied ' + fmtAgo(last.at) + ': ' + last.applied.length + ' volume(s) changed'
+        + (last.skipped ? ', not applied — ' + last.skipped : '');
+    }
+    document.getElementById('deployments-retention-applied').textContent = text;
+    refreshRetentionDirty();
+  }
+
+  async function loadRetention() {
+    try {
+      const res = await window.api('/api/retention');
+      if (res.ok) renderRetention(await res.json());
+    } catch (err) {
+      // The card keeps its last values; the rest of the page does not depend on it.
+    }
+  }
+
+  async function saveRetention() {
+    const errEl = document.getElementById('deployments-retention-error');
+    errEl.hidden = true;
+    // Only the changed field is sent, so saving one value cannot re-apply the other.
+    const patch = {};
+    const restateVal = document.getElementById('deployments-retention-restate').value;
+    const volumeVal = document.getElementById('deployments-retention-volume').value;
+    if (restateVal !== String(savedRetention.restate.days)) patch.restate = Number(restateVal);
+    if (volumeVal !== String(savedRetention.volume.days)) patch.volume = Number(volumeVal);
+    try {
+      const res = await window.api('/api/retention', { method: 'POST', body: JSON.stringify(patch) });
+      if (res.ok) {
+        renderRetention(await res.json());
+      } else if (res.status !== 401) {
+        const body = await res.json().catch(function () { return {}; });
+        errEl.textContent = body.error || 'Could not save the retention settings';
+        errEl.hidden = false;
+      }
+    } catch (err) {
+      errEl.textContent = 'Could not save the retention settings — ' + String(err);
+      errEl.hidden = false;
+    }
   }
 
   async function checkNow() {
@@ -696,215 +884,19 @@ export const deploymentsScript = `
   window.loadDeployments = loadDeployments;
   window.releaseReservation = releaseReservation;
   window.triggerDeploy = triggerDeploy;
+  window.cancelDeploy = cancelDeploy;
   window.saveDeployPolicy = saveDeployPolicy;
   window.refreshPolicyDirty = refreshPolicyDirty;
   window.loadDeployRefs = loadDeployRefs;
   window.checkNow = checkNow;
-
-  async function loadKgStatus() {
-    const card = document.getElementById('kg-refresh-card');
-    try {
-      const res = await window.api('/api/kg/status');
-      if (res.status === 409) {
-        const held = await res.json().catch(() => ({}));
-        if (held.error === 'deploy-in-progress') {
-          card.hidden = false;
-          document.getElementById('kg-refresh-btn').disabled = true;
-          document.getElementById('kg-dry-run-btn').disabled = true;
-          document.getElementById('kg-accept-baseline-btn').disabled = true;
-          document.getElementById('kg-refresh-last').textContent =
-            'A deploy is in progress \u2014 the refresh status returns after it completes.';
-          return;
-        }
-      }
-      if (!res.ok) { card.hidden = true; return; }
-      const data = await res.json();
-      card.hidden = false;
-      const badge = document.getElementById('kg-refresh-badge');
-      // Use the stage field for fine-grained badge states; fall back to running for
-      // older orchestrator responses that lack it.
-      const stage = data.stage || (data.running ? 'checking' : 'idle');
-      if (stage === 'checking') {
-        setBadge(badge, 'running', 'checking');
-      } else if (stage === 'ingest-running') {
-        setBadge(badge, 'running', 'running');
-      } else if (stage === 'snapshot-landed') {
-        setBadge(badge, 'running', 'landing');
-      } else if (stage === 'staging') {
-        setBadge(badge, 'running', 'staging');
-      } else if (stage === 'serving') {
-        setBadge(badge, 'ok', 'serving');
-      } else if (stage === 'reverted') {
-        setBadge(badge, 'warn', 'reverted');
-      } else if (stage === 'failed') {
-        setBadge(badge, 'fail', 'failed');
-      } else if (data.kgDegraded) {
-        setBadge(badge, 'warn', 'degraded');
-      } else if (data.lastRefresh?.gate === 'ingest-needed') {
-        setBadge(badge, 'neutral', 'stale');
-      } else {
-        setBadge(badge, 'ok', 'serving');
-      }
-      document.getElementById('kg-refresh-stamp').textContent =
-        'Served graph stamp: ' + (data.servedStamp || 'baked image graph');
-      // Stage-specific in-progress text, otherwise show last-refresh summary.
-      let progressText = '';
-      if (stage === 'checking') progressText = 'Checking KG source repo for a newer snapshot\u2026';
-      else if (stage === 'ingest-running') progressText = 'Runner job dispatched \u2014 waiting for snapshot commit\u2026';
-      else if (stage === 'snapshot-landed') progressText = 'Snapshot commit confirmed \u2014 starting local staging\u2026';
-      else if (stage === 'staging') progressText = 'Staging new graph overlay\u2026';
-      const last = data.lastRefresh;
-      const lastText = !last
-        ? 'No refresh has run since boot.'
-        : last.gate === 'ingest-needed'
-        ? 'Last refresh: ' + last.detail
-        : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' \u2014 ' + last.detail;
-      document.getElementById('kg-refresh-last').textContent = progressText || lastText;
-      // AII-650: surface the sidecar liveness probe (AII-648) next to the stage-based badge —
-      // a sidecar can be "serving" per the stage above while the probe shows it rejecting calls.
-      const sidecarEl = document.getElementById('kg-sidecar-status');
-      if (data.kgUnavailable) {
-        sidecarEl.textContent = '⚠️ KG sidecar not serving — ' + ((data.sidecar && data.sidecar.lastError) || 'unknown error');
-        sidecarEl.hidden = false;
-      } else if (data.sidecar && data.sidecar.checkedAt) {
-        sidecarEl.textContent = 'KG sidecar: reachable';
-        sidecarEl.hidden = false;
-      } else {
-        sidecarEl.hidden = true;
-      }
-      renderKgDryRun(document.getElementById('kg-dry-run-last'), data.lastDryRun);
-      const busy = !!data.running || !!data.deployHeld;
-      document.getElementById('kg-refresh-btn').disabled = busy;
-      document.getElementById('kg-dry-run-btn').disabled = busy;
-      document.getElementById('kg-accept-baseline-btn').disabled = busy;
-    } catch (e) { card.hidden = true; }
-  }
-
-  // AII-635: the last dry-run's verdict and per-part table, shown only when the last
-  // admin dry-run (get_kg_status lastDryRun, never lastRefresh). Cells are set with
-  // textContent, never innerHTML.
-  function renderKgDryRun(el, last) {
-    el.textContent = '';
-    if (!last) { el.hidden = true; return; }
-    el.hidden = false;
-    const head = document.createElement('div');
-    head.textContent = 'Last dry-run (' + new Date(last.at).toLocaleString() + '): ' + last.detail;
-    el.appendChild(head);
-    const rows = Array.isArray(last.partTable) ? last.partTable : [];
-    if (!rows.length) return;
-    const table = document.createElement('table');
-    table.className = 'table';
-    table.style.marginTop = '6px';
-    const thead = document.createElement('thead');
-    const hr = document.createElement('tr');
-    ['part', 'previous', 'new', 'delta'].forEach(function (h) {
-      const th = document.createElement('th'); th.textContent = h; hr.appendChild(th);
-    });
-    thead.appendChild(hr);
-    table.appendChild(thead);
-    const tbody = document.createElement('tbody');
-    rows.forEach(function (r) {
-      const tr = document.createElement('tr');
-      const prev = parseInt(r.prev, 10);
-      const next = parseInt(r.new, 10);
-      const delta = (isNaN(prev) || isNaN(next)) ? '' : ((next - prev >= 0 ? '+' : '') + String(next - prev));
-      [r.part, r.prev, r.new, delta].forEach(function (v) {
-        const td = document.createElement('td'); td.textContent = v == null ? '' : String(v); tr.appendChild(td);
-      });
-      tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-    el.appendChild(table);
-  }
-
-  // AII-635: dryRun=true posts { dryRun: true } so the rail runs with the push skipped
-  // and reports the guard table on the card instead of changing the served graph.
-  window.triggerKgRefresh = async function (dryRun) {
-    const btn = document.getElementById('kg-refresh-btn');
-    const dryBtn = document.getElementById('kg-dry-run-btn');
-    btn.disabled = true;
-    dryBtn.disabled = true;
-    document.getElementById('kg-accept-baseline-btn').disabled = true;
-    try {
-      const res = dryRun
-        ? await window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ dryRun: true }) })
-        : await window.api('/api/kg/refresh', { method: 'POST' });
-      if (!res.ok) showKgRefreshRefusal(res, await res.json().catch(function () { return {}; }));
-    } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
-    setTimeout(loadKgStatus, 1000);
-  };
-
-  // One refusal-to-message mapping for all three refresh buttons (real, dry-run, accept-baseline):
-  // the same preconditions (callback-unconfigured, deploy-in-progress, already-running) apply to each.
-  function showKgRefreshRefusal(res, body) {
-    if (res.status === 422 && body.precondition === 'callback-unconfigured') {
-      showMessage('warning', 'Refresh requires a configured runner callback \u2014 set RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET on the orchestrator.');
-    } else if (res.status === 409 && body.error === 'deploy-in-progress') {
-      showMessage('warning', 'A deploy is in progress \u2014 try again after it completes.');
-    } else if (res.status === 409) {
-      showMessage('warning', 'A refresh is already in progress.');
-    } else {
-      showMessage('warning', 'Refresh refused \u2014 ' + (body.error || String(res.status)));
-    }
-  }
-
-  // AII-628: a one-shot override of the zero-shrink/50% push guards, gated by the same
-  // native confirm() this page uses for every other consequential action (see "Deploy now").
-  // A separate button/function from triggerKgRefresh rather than a third argument there,
-  // so an operator reads the shrink table first and opts in deliberately.
-  window.triggerKgAcceptBaseline = async function () {
-    if (!confirm('Accept the new baseline? This pushes the snapshot even though a tracked part (issue.nt/comment.nt) shrank, overriding the zero-shrink/50% guard for this one refresh. Review the guard table above first.')) return;
-    document.getElementById('kg-refresh-btn').disabled = true;
-    document.getElementById('kg-dry-run-btn').disabled = true;
-    document.getElementById('kg-accept-baseline-btn').disabled = true;
-    try {
-      const res = await window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ acceptNewBaseline: true }) });
-      if (!res.ok) showKgRefreshRefusal(res, await res.json().catch(function () { return {}; }));
-    } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
-    setTimeout(loadKgStatus, 1000);
-  };
-
-  async function loadKgMaterializeMode() {
-    try {
-      const res = await window.api('/api/kg/materialize-mode');
-      if (!res.ok) return;
-      const data = await res.json();
-      const direct = !!data.direct;
-      const envPinned = data.source === 'env';
-      document.getElementById('btn-kg-materialize-rdflib').classList.toggle('btn-primary', !direct);
-      document.getElementById('btn-kg-materialize-direct').classList.toggle('btn-primary', direct);
-      document.getElementById('btn-kg-materialize-rdflib').disabled = envPinned;
-      document.getElementById('btn-kg-materialize-direct').disabled = envPinned;
-      document.getElementById('kg-materialize-source').textContent = '(' + data.source + ')';
-      const warning = document.getElementById('kg-materialize-env-warning');
-      if (envPinned) {
-        warning.classList.remove('hidden');
-      } else {
-        warning.classList.add('hidden');
-      }
-    } catch (e) { /* transient \u2014 next poll retries */ }
-  }
-
-  window.setKgMaterializeDirect = async function (direct) {
-    try {
-      const res = await window.api('/api/kg/materialize-mode', { method: 'POST', body: JSON.stringify({ direct: direct }) });
-      if (!res.ok && res.status !== 401) {
-        const body = await res.json().catch(function () { return {}; });
-        showMessage('warning', 'Could not change materialize mode \u2014 ' + (body.error || res.status));
-      }
-    } catch (err) {
-      showMessage('warning', 'Could not change materialize mode \u2014 ' + String(err));
-    }
-    loadKgMaterializeMode();
-  };
+  window.saveRetention = saveRetention;
+  window.refreshRetentionDirty = refreshRetentionDirty;
+  window.loadRetention = loadRetention;
 
   window.registerPage('deployments', function () {
     loadDeployments();
-    loadKgStatus();
-    loadKgMaterializeMode();
+    loadRetention();
     setInterval(loadDeployments, 30000);
-    setInterval(loadKgStatus, 15000);
-    setInterval(loadKgMaterializeMode, 15000);
   });
 })();
 `;

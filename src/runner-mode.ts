@@ -1,4 +1,5 @@
 import { getDb } from "./dedup.js";
+import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 
 declare global {
   namespace NodeJS {
@@ -8,6 +9,7 @@ declare global {
       PORT?: string;
       FLY_PROCESS_LEVEL_SECRETS?: string;
       KG_MATERIALIZE_DIRECT?: string;
+      KG_EXECUTION_MODE?: string;
     }
   }
 }
@@ -15,7 +17,7 @@ declare global {
 export const VALID_RUNNER_MODES = ["default", "gha", "fly", "local", "shadow"] as const;
 export type RunnerMode = typeof VALID_RUNNER_MODES[number];
 export const DEFAULT_RUNNER_MODE: RunnerMode = "default";
-const RUNNER_MODE_SETTING_KEY = "runner_mode";
+export const RUNNER_MODE_SETTING_KEY = "runner_mode";
 const FLY_SECRETS_MIN_VERSION_SETTING_KEY = "fly_secrets_min_version";
 
 /** Type guard for narrowing an arbitrary string to RunnerMode. */
@@ -37,30 +39,32 @@ export function initSettingsTable(): void {
   `);
 }
 
+/** A settings row, or null when it is absent or the database is unavailable. */
+function readSettingRowOrNull(key: string): string | null {
+  try {
+    const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  } catch {
+    return null; // DB unavailable — fall through to the default
+  }
+}
+
 /**
- * Returns the effective runner mode.
+ * The effective runner mode from the variable and the stored row.
  * Priority: RUNNER_MODE env var > DB setting > default ("default").
  * The env var acts as a break-glass override when the DB is unavailable.
  */
+export function resolveRunnerMode(envValue: string | undefined, rowValue: string | null): RunnerModeStatus {
+  if (isRunnerMode(envValue)) return { mode: envValue, source: "env" };
+  if (isRunnerMode(rowValue)) return { mode: rowValue, source: "db" };
+  return { mode: DEFAULT_RUNNER_MODE, source: "default" };
+}
+
+/** The effective runner mode in this process. The row is read only when the variable does not decide it. */
 export function getRunnerMode(): RunnerModeStatus {
   const envMode = process.env.RUNNER_MODE;
-  if (isRunnerMode(envMode)) {
-    return { mode: envMode, source: "env" };
-  }
-
-  try {
-    const row = getDb()
-      .prepare("SELECT value FROM settings WHERE key = ?")
-      .get(RUNNER_MODE_SETTING_KEY) as { value: string } | undefined;
-
-    if (row && isRunnerMode(row.value)) {
-      return { mode: row.value, source: "db" };
-    }
-  } catch {
-    // DB unavailable — fall through to default
-  }
-
-  return { mode: DEFAULT_RUNNER_MODE, source: "default" };
+  if (isRunnerMode(envMode)) return resolveRunnerMode(envMode, null);
+  return resolveRunnerMode(envMode, readSettingRowOrNull(RUNNER_MODE_SETTING_KEY));
 }
 
 /**
@@ -96,9 +100,13 @@ export interface ForcedPathEligibility {
  */
 export function checkForcedPathEligibility(
   runnerMode: RunnerMode,
-  mapping: { executionMode: "github-actions" | "fly-machines"; provider?: string },
+  mapping: { executionMode: "github-actions" | "fly-machines"; provider?: string; extraEnv?: Readonly<Record<string, string>> | null },
   hasFlySessionsApp: boolean,
 ): ForcedPathEligibility {
+  // AII-1437: the ephemeral full-access opt-in is GHA-only; any other resolved path would throw at launch.
+  if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && resolveExecutionPath(runnerMode, mapping.executionMode) !== "github-actions") {
+    return { eligible: false, reason: "ephemeral full-access opt-in requires GitHub Actions execution" };
+  }
   if (runnerMode !== "fly") return { eligible: true, reason: null };
   if (mapping.provider === "bedrock") {
     return { eligible: false, reason: "provider=bedrock is GHA-only (no role-assumption on Fly)" };
@@ -182,7 +190,7 @@ export interface FlyProcessLevelSecretsStatus {
   source: "env" | "db" | "default";
 }
 
-const FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY = "fly_process_level_secrets";
+export const FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY = "fly_process_level_secrets";
 
 /**
  * Returns true/false for recognised values (true/1/yes or false/0/no, case-insensitive),
@@ -196,29 +204,22 @@ export function parseFlyProcessLevelSecretsEnv(val: string | undefined): boolean
 }
 
 /**
- * Returns the effective Fly process-level secrets setting.
+ * The effective Fly process-level secrets setting from the variable and the stored row.
  * Priority: FLY_PROCESS_LEVEL_SECRETS env var > DB setting > default (true).
  * An explicit false/0/no env value is treated as a set override, not a fall-through.
  */
-export function getFlyProcessLevelSecrets(): FlyProcessLevelSecretsStatus {
-  const envVal = parseFlyProcessLevelSecretsEnv(process.env.FLY_PROCESS_LEVEL_SECRETS);
-  if (envVal !== undefined) {
-    return { enabled: envVal, source: "env" };
-  }
-
-  try {
-    const row = getDb()
-      .prepare("SELECT value FROM settings WHERE key = ?")
-      .get(FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY) as { value: string } | undefined;
-
-    if (row) {
-      return { enabled: row.value === "true", source: "db" };
-    }
-  } catch {
-    // DB unavailable — fall through to default
-  }
-
+export function resolveFlyProcessLevelSecrets(envValue: string | undefined, rowValue: string | null): FlyProcessLevelSecretsStatus {
+  const envVal = parseFlyProcessLevelSecretsEnv(envValue);
+  if (envVal !== undefined) return { enabled: envVal, source: "env" };
+  if (rowValue !== null) return { enabled: rowValue === "true", source: "db" };
   return { enabled: true, source: "default" };
+}
+
+/** The effective setting in this process. The row is read only when the variable does not decide it. */
+export function getFlyProcessLevelSecrets(): FlyProcessLevelSecretsStatus {
+  const envValue = process.env.FLY_PROCESS_LEVEL_SECRETS;
+  if (parseFlyProcessLevelSecretsEnv(envValue) !== undefined) return resolveFlyProcessLevelSecrets(envValue, null);
+  return resolveFlyProcessLevelSecrets(envValue, readSettingRowOrNull(FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY));
 }
 
 /** Persists the Fly process-level secrets setting to the DB. Env var override is unaffected. */
@@ -230,16 +231,16 @@ export function setFlyProcessLevelSecrets(enabled: boolean): void {
 
 export interface KgMaterializeDirectStatus {
   enabled: boolean;
-  source: "env" | "db" | "default";
+  source: "db" | "default";
 }
 
-const KG_MATERIALIZE_DIRECT_SETTING_KEY = "kg_materialize_direct";
+export const KG_MATERIALIZE_DIRECT_SETTING_KEY = "kg_materialize_direct";
 
 /**
  * Returns true/false for an explicit non-blank value ("true" → true, anything else → false,
  * matching the flag's pre-AII-602 exact-match behaviour), or undefined when the var is
  * absent, empty, or whitespace-only (treat as unset) — an empty `KG_MATERIALIZE_DIRECT=` in
- * a copied `.env.example` must fall through to the DB/default, not pin the setting to "env".
+ * a copied `.env.example` must not seed a row.
  */
 export function parseKgMaterializeDirectEnv(val: string | undefined): boolean | undefined {
   if (!val || !val.trim()) return undefined;
@@ -248,16 +249,10 @@ export function parseKgMaterializeDirectEnv(val: string | undefined): boolean | 
 
 /**
  * Returns the effective KG materialize-direct setting (AII-602).
- * Priority: KG_MATERIALIZE_DIRECT env var > DB setting > default (false / rdflib).
- * The env var remains the seed for a fresh deployment and a break-glass override
- * when the DB is unavailable.
+ * Priority: DB setting > default (false / rdflib). KG_MATERIALIZE_DIRECT is only a
+ * first-boot seed (see SEED_ONCE_SETTINGS in seed-once-settings.ts) and is never read here.
  */
 export function getKgMaterializeDirect(): KgMaterializeDirectStatus {
-  const envVal = parseKgMaterializeDirectEnv(process.env.KG_MATERIALIZE_DIRECT);
-  if (envVal !== undefined) {
-    return { enabled: envVal, source: "env" };
-  }
-
   try {
     const row = getDb()
       .prepare("SELECT value FROM settings WHERE key = ?")
@@ -273,9 +268,71 @@ export function getKgMaterializeDirect(): KgMaterializeDirectStatus {
   return { enabled: false, source: "default" };
 }
 
-/** Persists the KG materialize-direct setting to the DB. Env var override is unaffected. */
+/** Persists the KG materialize-direct setting to the DB. */
 export function setKgMaterializeDirect(enabled: boolean): void {
   getDb()
     .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
     .run(KG_MATERIALIZE_DIRECT_SETTING_KEY, String(enabled));
+}
+
+export type KgExecutionBackend = "github-actions" | "fly-machines";
+
+export interface KgExecutionModeStatus {
+  mode: KgExecutionBackend;
+  source: "db" | "default";
+}
+
+export const KG_EXECUTION_MODE_SETTING_KEY = "kg_execution_mode";
+
+/** Accepts only the two backends; blank or unknown is undefined so an empty `KG_EXECUTION_MODE=` seeds nothing. */
+export function parseKgExecutionModeEnv(val: string | undefined): KgExecutionBackend | undefined {
+  const v = val?.trim();
+  return v === "github-actions" || v === "fly-machines" ? v : undefined;
+}
+
+/**
+ * The KG refresh backend chosen on the KG page. Priority: DB row > default. The default is
+ * today's behaviour: Fly when it is configured (`flyConfigured`), else GitHub Actions.
+ * KG_EXECUTION_MODE only seeds the row (see SEED_ONCE_SETTINGS in seed-once-settings.ts).
+ */
+export function getKgExecutionMode(flyConfigured = false): KgExecutionModeStatus {
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(KG_EXECUTION_MODE_SETTING_KEY) as { value: string } | undefined;
+    const parsed = parseKgExecutionModeEnv(row?.value);
+    if (parsed) return { mode: parsed, source: "db" };
+  } catch {
+    // DB unavailable — fall through to default
+  }
+  return { mode: flyConfigured ? "fly-machines" : "github-actions", source: "default" };
+}
+
+export function setKgExecutionMode(mode: KgExecutionBackend): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    .run(KG_EXECUTION_MODE_SETTING_KEY, mode);
+}
+
+export interface KgBackendResolution {
+  mode: KgExecutionBackend | "local-docker";
+  source: "runner-mode" | "kg-setting" | "default" | "fly-unconfigured";
+}
+
+/**
+ * Pure KG refresh backend rule: runner mode, then the KG setting, then whether Fly is configured.
+ * `shadow` ("both") collapses to the setting's own mode: two concurrent ingests race on the snapshot commit.
+ * An unconfigured Fly falls back to GitHub Actions (retrying cannot configure Fly).
+ */
+export function resolveKgBackend(
+  runnerMode: RunnerMode,
+  setting: KgExecutionModeStatus,
+  flyConfigured: boolean,
+): KgBackendResolution {
+  const path = resolveExecutionPath(runnerMode, setting.mode);
+  const mode = path === "both" ? setting.mode : path;
+  if (mode === "fly-machines" && !flyConfigured) return { mode: "github-actions", source: "fly-unconfigured" };
+  if (runnerMode !== "default" && runnerMode !== "shadow") return { mode, source: "runner-mode" };
+  const source = setting.source === "db" ? "kg-setting" : setting.source;
+  return { mode, source };
 }

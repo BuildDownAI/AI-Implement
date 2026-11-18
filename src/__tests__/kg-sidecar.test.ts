@@ -1,17 +1,21 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   closeSync,
   mkdirSync,
-  mkdtempSync,
   openSync,
-  rmSync,
   writeFileSync,
   chmodSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { spawn as realSpawn } from "node:child_process";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { checkDegraded, COMPLETION_MARKER, getServedNamespace, KgSidecar } from "../kg-sidecar.js";
+import { checkDegraded, COMPLETION_MARKER, getServedNamespace, isRemoteKgStore, KgSidecar } from "../kg-sidecar.js";
+import { testDir } from "./helpers/test-dir.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => ({
+  ...await importOriginal<typeof import("node:fs/promises")>(),
+  readFile: vi.fn((await importOriginal<typeof import("node:fs/promises")>()).readFile),
+}));
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -21,16 +25,8 @@ function touch(filePath: string): void {
   closeSync(openSync(filePath, "w"));
 }
 
-const tempDirs: string[] = [];
-
-function makeTmpDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "kg-sidecar-test-"));
-  tempDirs.push(dir);
-  return dir;
-}
-
 function makeKgDir(): string {
-  const dir = makeTmpDir();
+  const dir = testDir("kg-sidecar");
   mkdirSync(join(dir, "out"));
   return dir;
 }
@@ -47,9 +43,9 @@ function testSpawn(cmd: string, args: string[], opts: object) {
 }
 
 afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   delete process.env.KG_SIDECAR_URL;
   delete process.env.KG_EMBEDDINGS_DEGRADED;
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -93,7 +89,7 @@ describe("getServedNamespace", () => {
   it("prefers the runtime overlay's namespace when a runtime sources.yml exists", async () => {
     const kgDir = makeKgDir();
     writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/\n");
-    const runtimeDir = makeTmpDir();
+    const runtimeDir = testDir("kg-sidecar");
     writeFileSync(join(runtimeDir, "sources.yml"), "namespace: http://overlay.example/kg/\n");
 
     const ns = await getServedNamespace(kgDir, runtimeDir);
@@ -103,7 +99,7 @@ describe("getServedNamespace", () => {
   it("falls back to the baked kgDir sources.yml when no runtime overlay is present", async () => {
     const kgDir = makeKgDir();
     writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/\n");
-    const runtimeDir = makeTmpDir(); // exists, but has no sources.yml of its own
+    const runtimeDir = testDir("kg-sidecar"); // exists, but has no sources.yml of its own
 
     const ns = await getServedNamespace(kgDir, runtimeDir);
     expect(ns).toBe("http://baked.example/kg/");
@@ -112,7 +108,7 @@ describe("getServedNamespace", () => {
   it("parses the namespace: line even with trailing whitespace", async () => {
     const kgDir = makeKgDir();
     writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/   \n");
-    const runtimeDir = makeTmpDir();
+    const runtimeDir = testDir("kg-sidecar");
 
     const ns = await getServedNamespace(kgDir, runtimeDir);
     expect(ns).toBe("http://baked.example/kg/");
@@ -120,7 +116,7 @@ describe("getServedNamespace", () => {
 
   it("returns null when sources.yml is missing from both locations", async () => {
     const kgDir = makeKgDir();
-    const runtimeDir = makeTmpDir();
+    const runtimeDir = testDir("kg-sidecar");
 
     expect(await getServedNamespace(kgDir, runtimeDir)).toBeNull();
   });
@@ -128,7 +124,7 @@ describe("getServedNamespace", () => {
   it("returns null for a malformed sources.yml with no namespace: line, rather than throwing", async () => {
     const kgDir = makeKgDir();
     writeFileSync(join(kgDir, "sources.yml"), "other: value\nunrelated content\n");
-    const runtimeDir = makeTmpDir();
+    const runtimeDir = testDir("kg-sidecar");
 
     expect(await getServedNamespace(kgDir, runtimeDir)).toBeNull();
   });
@@ -154,7 +150,7 @@ describe("entry-point resolution", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -175,7 +171,7 @@ describe("entry-point resolution", () => {
     writeScript(join(kgDir, ".venv", "bin", "python"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -193,7 +189,7 @@ describe("entry-point resolution", () => {
     // No .venv/bin/python
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 500, pollIntervalMs: 50 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 500, pollIntervalMs: 50 },
       { httpGet: async () => true },
     );
     await sidecar.start();
@@ -206,7 +202,7 @@ describe("entry-point resolution", () => {
     // Neither start.sh nor server.py
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 500, pollIntervalMs: 50 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 500, pollIntervalMs: 50 },
       { httpGet: async () => true },
     );
     await sidecar.start();
@@ -226,7 +222,7 @@ describe("readiness polling", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -246,7 +242,7 @@ describe("readiness polling", () => {
 
     let calls = 0;
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
       { httpGet: async () => ++calls >= 5, spawn: testSpawn },
     );
     await sidecar.start();
@@ -267,7 +263,7 @@ describe("readiness polling", () => {
     // The httpGet injection returns a boolean — true = any response received.
     // The real defaultHttpGet resolves true on any HTTP status (inc. 4xx).
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
       { httpGet: async () => true, spawn: testSpawn }, // simulates a 4xx response (still "ready")
     );
     await sidecar.start();
@@ -286,7 +282,7 @@ describe("readiness polling", () => {
 
     // httpGet always fails (not reachable)
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 3_000, pollIntervalMs: 50 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 3_000, pollIntervalMs: 50 },
       { httpGet: async () => false, spawn: testSpawn },
     );
     await sidecar.start();
@@ -299,7 +295,7 @@ describe("readiness polling", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 200, pollIntervalMs: 50 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 200, pollIntervalMs: 50 },
       { httpGet: async () => false, spawn: testSpawn }, // never ready
     );
     await sidecar.start();
@@ -318,7 +314,7 @@ describe("readiness polling", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -341,11 +337,11 @@ describe("runtime data directory overlay", () => {
     const kgDir = makeKgDir();
     touch(join(kgDir, "out", "embeddings.npz"));
 
-    const runtimeDir = makeTmpDir();
+    const runtimeDir = testDir("kg-sidecar");
     touch(join(runtimeDir, COMPLETION_MARKER));
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -368,10 +364,10 @@ describe("runtime data directory overlay", () => {
   it("current dir absent → child receives no KG_DATA_DIR", async () => {
     const kgDir = makeKgDir();
     touch(join(kgDir, "out", "embeddings.npz"));
-    const runtimeDir = join(makeTmpDir(), "nonexistent-subdir");
+    const runtimeDir = join(testDir("kg-sidecar"), "nonexistent-subdir");
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -394,10 +390,10 @@ describe("runtime data directory overlay", () => {
   it("current dir present WITHOUT completion marker → non-fatal: no KG_DATA_DIR, baked copy used", async () => {
     const kgDir = makeKgDir();
     touch(join(kgDir, "out", "embeddings.npz"));
-    const runtimeDir = makeTmpDir(); // exists but no COMPLETION_MARKER
+    const runtimeDir = testDir("kg-sidecar"); // exists but no COMPLETION_MARKER
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -435,13 +431,13 @@ describe("nt_parts backend selection", () => {
     const kgDir = makeKgDir();
     touch(join(kgDir, "out", "embeddings.npz"));
 
-    const runtimeDir = makeTmpDir();
+    const runtimeDir = testDir("kg-sidecar");
     touch(join(runtimeDir, COMPLETION_MARKER));
     mkdirSync(join(runtimeDir, "parts"));
     touch(join(runtimeDir, "parts", "issue.nt"));
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -467,12 +463,12 @@ describe("nt_parts backend selection", () => {
     const kgDir = makeKgDir();
     touch(join(kgDir, "out", "embeddings.npz"));
 
-    const runtimeDir = makeTmpDir();
+    const runtimeDir = testDir("kg-sidecar");
     touch(join(runtimeDir, COMPLETION_MARKER));
     touch(join(runtimeDir, "graph.trig"));
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -498,12 +494,12 @@ describe("nt_parts backend selection", () => {
     const kgDir = makeKgDir();
     touch(join(kgDir, "out", "embeddings.npz"));
 
-    const runtimeDir = makeTmpDir();
+    const runtimeDir = testDir("kg-sidecar");
     touch(join(runtimeDir, COMPLETION_MARKER));
     mkdirSync(join(runtimeDir, "parts"));
 
     const capturedEnvs: Array<NodeJS.ProcessEnv | undefined> = [];
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnvs.push((opts as { env?: NodeJS.ProcessEnv }).env);
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -538,7 +534,7 @@ describe("stop / shutdown", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -558,7 +554,7 @@ describe("stop / shutdown", () => {
     writeScript(join(kgDir, "start.sh"), "exit 0");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 3_000, pollIntervalMs: 50 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 3_000, pollIntervalMs: 50 },
       { httpGet: async () => false, spawn: testSpawn },
     );
     await sidecar.start(); // child dies during poll; KG_SIDECAR_URL not set
@@ -583,7 +579,7 @@ describe("stop / shutdown", () => {
     const sidecar = new KgSidecar(
       {
         kgDir,
-        runtimeDataDir: makeTmpDir(),
+        runtimeDataDir: testDir("kg-sidecar"),
         pollTimeoutMs: 5_000,
         pollIntervalMs: 10,
         stopTimeoutMs: 200, // short timeout so SIGKILL fires quickly
@@ -607,7 +603,7 @@ describe("stop / shutdown", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -637,7 +633,7 @@ describe("restart()", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -672,7 +668,7 @@ describe("shutdown re-entrancy", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -697,7 +693,7 @@ describe("shutdown re-entrancy", () => {
     writeScript(join(kgDir, "start.sh"), "sleep 60");
 
     const sidecar = new KgSidecar(
-      { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
       { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
@@ -719,11 +715,93 @@ describe("env var cleanup", () => {
     process.env.KG_EMBEDDINGS_DEGRADED = "1";
 
     const kgDir = makeKgDir(); // no start.sh or server.py
-    const sidecar = new KgSidecar({ kgDir, runtimeDataDir: makeTmpDir() });
+    const sidecar = new KgSidecar({ kgDir, runtimeDataDir: testDir("kg-sidecar") });
     await sidecar.start(); // no entry point → returns early
 
     // Both must be cleared, even though start returned without setting them
     expect(process.env.KG_SIDECAR_URL).toBeUndefined();
     expect(process.env.KG_EMBEDDINGS_DEGRADED).toBeUndefined();
   });
+});
+
+
+describe("remote store selection", () => {
+  it.each([undefined, "", "stardog", "STARDOG_RUN", "stardog_run ", "nt_parts", "stardog_run"])(
+    "recognizes only the exact remote backend: %s", (backend) => {
+      expect(isRemoteKgStore({ KG_BACKEND: backend })).toBe(backend === "stardog_run");
+      vi.stubEnv("KG_BACKEND", backend);
+      expect(isRemoteKgStore()).toBe(backend === "stardog_run");
+    },
+  );
+
+  it.each([
+    [undefined, false], [undefined, true],
+    ["stardog_run", false], ["stardog_run", true],
+    ["other", false], ["other", true],
+  ] as const)("backend %s, staged parts %s", async (backend, parts) => {
+    vi.stubEnv("KG_BACKEND", backend);
+    vi.stubEnv("KG_DATA_DIR", undefined);
+    vi.stubEnv("KG_PARTS_DIR", undefined);
+    vi.stubEnv("KG_EMBEDDINGS_DEGRADED", "1");
+    const remote = backend === "stardog_run";
+    if (remote) {
+      vi.stubEnv("KG_DATA_DIR", "/stale/data");
+      vi.stubEnv("KG_PARTS_DIR", "/stale/parts");
+    }
+    const values = {
+      KG_STARDOG_RUN_TOKEN: "sentinel-token",
+      KG_STARDOG_DB: "sentinel-db",
+      KG_STARDOG_RUN_ENDPOINT: "sentinel-endpoint",
+      KG_STARDOG_DATASET: "sentinel-dataset",
+      KG_STARDOG_RUN_CONSOLE: "sentinel-console",
+      KG_NAMESPACE: "https://sentinel.example/",
+    };
+    for (const [key, value] of Object.entries(values)) vi.stubEnv(key, value);
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    const kgDir = makeKgDir(); // No embeddings; remote searches run in the database.
+    if (parts) touch(join(kgDir, ".embeddings-failed"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+    const runtimeDir = join(testDir("kg-sidecar"), "current");
+    if (parts) {
+      mkdirSync(join(runtimeDir, "parts"), { recursive: true });
+      touch(join(runtimeDir, COMPLETION_MARKER));
+    }
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    const sidecar = new KgSidecar({ kgDir, runtimeDataDir: runtimeDir }, {
+      httpGet: async () => true,
+      spawn: (cmd, args, opts) => {
+        childEnv = (opts as { env: NodeJS.ProcessEnv }).env;
+        return testSpawn(cmd, args, opts);
+      },
+    });
+    try {
+      await sidecar.start();
+      expect(childEnv?.KG_BACKEND).toBe(remote ? backend : parts ? "nt_parts" : backend);
+      expect(childEnv?.KG_DATA_DIR).toBe(!remote && parts ? runtimeDir : undefined);
+      expect(childEnv?.KG_PARTS_DIR).toBe(!remote && parts ? join(runtimeDir, "parts") : undefined);
+      expect(childEnv?.KG_EMBEDDINGS_DEGRADED).toBeUndefined();
+      expect(process.env.KG_EMBEDDINGS_DEGRADED).toBe(remote ? undefined : "1");
+      expect(childEnv).toMatchObject(values);
+      const lines = logs.mock.calls.map((args) => args.join(" "));
+      expect(lines.filter((line) => line === "[kg] serving remote store stardog_run")).toHaveLength(remote ? 1 : 0);
+      for (const value of Object.values(values)) expect(lines.join("\n")).not.toContain(value);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+it("uses KG_NAMESPACE before reading sources.yml", async () => {
+  vi.stubEnv("KG_NAMESPACE", "https://kg.builddown.dev/");
+  const read = vi.mocked(fsPromises.readFile);
+  read.mockClear();
+  expect(await getServedNamespace("/unused/baked", "/unused/runtime")).toBe("https://kg.builddown.dev/");
+  expect(read).not.toHaveBeenCalled();
+});
+
+it("falls back to sources.yml for an empty KG_NAMESPACE", async () => {
+  vi.stubEnv("KG_NAMESPACE", "");
+  const kgDir = makeKgDir();
+  writeFileSync(join(kgDir, "sources.yml"), "namespace: https://baked.example/\n");
+  expect(await getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://baked.example/");
 });

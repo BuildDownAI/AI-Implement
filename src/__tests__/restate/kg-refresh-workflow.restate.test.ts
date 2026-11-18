@@ -10,32 +10,77 @@
 // (each dispatches through `KgRepo.trigger` for that reason); every other scenario still
 // dispatches `KgRefresh.run` directly with a test-chosen triggerId, and the real KgRepo's
 // `release` send for that unrelated key is a harmless no-op.
+import { buildKgRefreshRunConfig } from "../../run-config.js";
+import { getDb } from "../../dedup.js";
+import { appendLog, initLogTable } from "../../log.js";
+import { toRecordedUsage } from "../../agent-usage.js";
+import { JobAccountingPageSchema } from "../../job-accounting.js";
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as restate from "@restatedev/restate-sdk";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import { createEndpointHandler } from "@restatedev/restate-sdk/node";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CreateMachineOpts, Machine, MachineExit } from "../../fly-machines.js";
 import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
-import { createKgRefreshIngressClient } from "../../restate/kg-refresh-production.js";
+import { parseSourceResults } from "../../kg-source-results.js";
+import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js";
+import type { KgRefreshToolDeps } from "../../restate/kg-refresh-production.js";
+import { callToolAsSystem } from "../../restate/tools-client.js";
+import { createKgRefreshIngressClient, launchKeptMachine, type KeptMachineFly } from "../../restate/kg-refresh-production.js";
+import { GHA_RUN_PROFILE_DEFAULTS } from "../../restate/gha-run-profile.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, mergeProfile, type FlyMachineProfileConfig, type KeptMachineState } from "../../restate/fly-machine-profile.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   createKgRefreshWorkflow,
-  KG_REFRESH_RETENTION_MS,
+  DISPATCH_RETRY_INITIAL_INTERVAL,
   type KgDispatchInput,
+  type KgRefreshWorkflowDependencies,
+  type KgDispatchRecord,
+  type KgDispatchRowDetails,
   type KgDispatchResult,
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
+import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
+import { testDir } from "../helpers/test-dir.js";
 import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, eventually, gate, queryInvocations, replaceEndpoint, settle,
+  VARIANTS, attachInvocation, attachWorkflow, awaitSentInvocations, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, killInvocation, queryInvocations, replaceEndpoint, setObjectStates, settle,
   startRetryEnabled, startVariants, stopAll, type Gate,
+  journalEntries,
+  waitForStep,
+  journalEntryNames,
+  journalText,
 } from "./harness.js";
+
+function reportedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
+  const snapshotId = `snapshot-${dispatchId}`;
+  const selection = { agent: "claude", provider: "anthropic", model: "claude-model", accountProfileId: "kg-profile", invocationTimeoutMs: 60_000 };
+  const profile = { id: "kg-profile", identity: "account", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
+  return toRecordedUsage({ invocations: items.map((item) => ({ attribution: {
+    version: 1, invocationId: `${dispatchId}-inv-${item}`, snapshotId, stage: "planning",
+    agent: selection.agent, provider: selection.provider, model: selection.model,
+    profileId: profile.id, authMode: profile.authMode, limit: null, outcome: "success",
+    usage: { availability: "complete", tokensIn: tokens, tokensOut: 2, costUsd: cost, costStatus: "reported" },
+  } })) });
+}
+
+const storedRows = (dispatchId: string) => getDb().prepare(
+  "SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id",
+).all(dispatchId);
+
+function reverseObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reverseObjectKeys);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).reverse().map(([key, entry]) => [key, reverseObjectKeys(entry)]));
+  }
+  return value;
+}
 
 const NAMESPACE = "https://kg.test.example/";
 const OLD_STAMP = "2026-08-20T00:10:10+00:00";
@@ -43,13 +88,17 @@ const NEW_STAMP = "2026-08-24T12:00:00+00:00";
 const SNAPSHOT_SHA = "abc123def456abc123def456abc123def456abc1";
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 
+// The bootstrap deadline stays at 1 s: AII-1125's scenario needs the started read to arrive inside it, AII-1111 raised a
+// 400 ms bootstrap to avoid exactly that race, and AII-1028 measured invocation start delays up to 1.08 s on a loaded runner.
+// The total deadline keeps an 800 ms margin after the bootstrap deadline (eight 100 ms ticks); every scenario that reaches it
+// has already passed bootstrap with a progress call.
 const BOOTSTRAP_DEADLINE_MS = 1_000;
-const TOTAL_DEADLINE_MS = 2_600;
-const WATCH_INTERVAL_MS = 300;
+const TOTAL_DEADLINE_MS = 1_800;
+const WATCH_INTERVAL_MS = 100;
 
 /** extractSource strips one leading path component, so wrap the fixture in a top-level dir — copied from src/__tests__/kg-refresh-rail.test.ts. */
 function makeTarball(dir: string): Buffer {
-  const wrap = mkdtempSync(join(tmpdir(), "kgwftar-"));
+  const wrap = testDir("kgwftar");
   const top = join(wrap, "repo");
   mkdirSync(top, { recursive: true });
   execSync(`cp -R ${dir}/. ${top}/`);
@@ -71,15 +120,19 @@ const GENERIC_FAILURE_REPORT: KgRefreshReportBody = {
 interface RunScenario {
   triggerId: string;
   dispatchOutcome: "accepted" | "rejected" | "unknown";
+  dispatchReason?: string;
   runId?: number;
   executionMode: string;
   dispatchCalls: number;
   findByTitleCalls: number;
   runStatusCalls: number;
   runStatusCallTimes: number[];
+  findByTitleCallTimes: number[];
   cancelCalls: number;
   /** Dispatch result carries no job id, as when the backend returned no machine or container id. */
   jobIdUnknown?: boolean;
+  /** AII-1246: a Fly create, as the sender reports it; `app` is the app the machine was created in. */
+  flyCreate?: { machineId: string; app?: string; reused?: boolean };
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
   /** Title lookups that throw, by 1-based call number. */
@@ -139,9 +192,12 @@ describe("KgRefresh durable workflow", () => {
   let mintTokenImpl: () => Promise<{ token: string; expiresAt: string }>;
   let loadSnapshotShaImpl: () => string | null;
   let mergeDelayMs: number;
-  // Set per-test (W13) to hold the next sidecar call open, inside verify's own ctx.run, for a
-  // concurrent status() poll; null keeps every other scenario running with no added latency.
+  // W13 sets it to hold the next kg_hybrid_search call (verify's canary) open inside verify's
+  // ctx.run; null keeps every other scenario running with no added latency.
   let holdNextMcpCall: Promise<void> | null = null;
+  // Fired by mcpToolCall as the held call parks, so the test body learns the workflow is inside
+  // verify from the fake itself rather than by polling. Null outside W13.
+  let onMcpCallHeld: (() => void) | null = null;
   // Reassigned per-test for the release-leak regression: forces `reserve` (and, once
   // failurePath is reached, `persist`) to fail terminally, so the outer catch's KgRepo
   // release is the only thing standing between a forced double-failure and a leaked lock.
@@ -150,6 +206,8 @@ describe("KgRefresh durable workflow", () => {
   // Fail the next N `reserve` steps (a one-shot version of forceReserveFailure), and hold the
   // next `persist` open until the promise settles, to stage the failure-path overlap scenario.
   let reserveFailuresRemaining = 0;
+  // Parks `reserve` until the promise settles, so a run stays before its dispatch.
+  let reserveHold: Promise<void> | null = null;
   let persistHold: Promise<void> | null = null;
 
   /** A latch that releases itself after `maxMs`, so a missed observation fails fast at the
@@ -164,11 +222,14 @@ describe("KgRefresh durable workflow", () => {
     return { promise, release };
   }
   const STATUS_LATCH_MAX_MS = 5_000;
+  // W13's safety bound only: the scenario releases the latch itself once it has read `status`.
+  const W13_LATCH_MAX_MS = 1_000;
 
   const mcpToolCall = async (_url: string, tool: string): Promise<unknown> => {
-    if (holdNextMcpCall) {
+    if (holdNextMcpCall && tool === "kg_hybrid_search") {
       const held = holdNextMcpCall;
       holdNextMcpCall = null;
+      onMcpCallHeld?.();
       await held;
       sidecarUp = false; // the held call and every canary retry after it find a dead sidecar
     }
@@ -186,6 +247,8 @@ describe("KgRefresh durable workflow", () => {
     return "merged";
   });
   const closePullRequestFn = vi.fn(async (): Promise<void> => {});
+  // What a failed close finds when it re-reads the PR: merged by default, open for the keeps-failing scenarios.
+  let pullRequestState: { merged: boolean; state: string } = { merged: true, state: "closed" };
   const deleteBranchFn = vi.fn(async (): Promise<void> => {});
   const postPrCommentFn = vi.fn(async (): Promise<void> => {});
   const postOrUpdateStickyCommentFn = vi.fn(async (): Promise<void> => {});
@@ -222,6 +285,7 @@ describe("KgRefresh durable workflow", () => {
     loadSnapshotSha: () => loadSnapshotShaImpl(),
     mergePullRequestFn: mergePullRequestFn as unknown as KgRailDeps["mergePullRequestFn"],
     closePullRequestFn: closePullRequestFn as unknown as KgRailDeps["closePullRequestFn"],
+    getPullRequestStateFn: (async () => ({ ...pullRequestState, headRef: null, headSha: null })) as unknown as KgRailDeps["getPullRequestStateFn"],
     deleteBranchFn: deleteBranchFn as unknown as KgRailDeps["deleteBranchFn"],
     postPrCommentFn: postPrCommentFn as unknown as KgRailDeps["postPrCommentFn"],
     postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as unknown as KgRailDeps["postOrUpdateStickyCommentFn"],
@@ -229,8 +293,8 @@ describe("KgRefresh durable workflow", () => {
   };
 
   beforeEach(() => {
-    dataRoot = mkdtempSync(join(tmpdir(), "kgwfroot-"));
-    fixtureRepo = mkdtempSync(join(tmpdir(), "kgwfrepo-"));
+    dataRoot = testDir("kgwfroot");
+    fixtureRepo = testDir("kgwfrepo");
     writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
     mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
     writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
@@ -260,13 +324,17 @@ describe("KgRefresh durable workflow", () => {
     fetchSnapshotShaFailure = false;
     gateOrder = [];
     holdNextMcpCall = null;
+    onMcpCallHeld = null;
     reserveFailuresRemaining = 0;
+    reserveHold = null;
     persistHold = null;
     forceReserveFailure = false;
     forcePersistFailure = false;
 
     mergePullRequestFn.mockClear();
-    closePullRequestFn.mockClear();
+    closePullRequestFn.mockReset();
+    closePullRequestFn.mockImplementation(async () => {});
+    pullRequestState = { merged: true, state: "closed" };
     deleteBranchFn.mockClear();
     postPrCommentFn.mockClear();
     postOrUpdateStickyCommentFn.mockClear();
@@ -275,24 +343,69 @@ describe("KgRefresh durable workflow", () => {
   });
 
   afterEach(() => {
-    rmSync(dataRoot, { recursive: true, force: true });
-    rmSync(fixtureRepo, { recursive: true, force: true });
     delete process.env.KG_SIDECAR_URL;
   });
 
   // ---- non-rail deps: recorded in-process, per-run scenarios keyed by triggerId ----
   const scenarios = new Map<string, RunScenario>();
   const runIdIndex = new Map<number, string>();
-  const appendJobLogCalls: Array<{ dispatchId: string; jobId: string }> = [];
+  const appendJobLogCalls: KgDispatchRecord[] = [];
+  const resolveExecutionModeCalls: string[] = [];
+  const recordedDetails: Array<{ dispatchId: string; details: KgDispatchRowDetails }> = [];
+  const armedNonces: Array<{ dispatchId: string; attempt: number; nonce: string }> = [];
+  const dispatchedNonces: Array<string | null> = [];
+  const dispatchTimes = new Map<string, number[]>();
+  const dispatchResults: KgDispatchResult[] = [];
+  /** A recognizable stand-in for the HMAC derivation; the test proves it never reaches the journal. */
+  const fakeNonce = (dispatchId: string, attempt: number) => `derived-nonce-${dispatchId}-${attempt}`;
   const dispatchedIds: string[] = [];
   /** triggerId -> the run the backend "committed" before the ack was lost. */
   const dispatchThrowAfterCommit = new Map<string, number>();
+  /** Triggers whose first dispatch call fails before anything commits, so the retry dispatches again. */
+  const dispatchThrowOnce = new Set<string>();
   const dispatchedTokens: KgDispatchInput["tokens"][] = [];
+  const dispatchedEnvelopes: Array<{ dispatchId: string; envelope: KgDispatchInput["envelope"] }> = [];
   const mintedDispatchIds: string[] = [];
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
   const persistCalls: RefreshOutcome[] = [];
   const onOutcomeCalls: Array<{ kind: "success" | "no-new-data" | "failure"; outcome: RefreshOutcome; meta: { failureCode?: string; timedOut?: boolean; dispatchId?: string } }> = [];
   let runIdCounter = 9_000;
+  let heldRowPark: { jobId: string; gate: ReturnType<typeof gate>; /** The invocation was killed while parked: its stale write must not land. */ dropped?: boolean } | null = null;
+  /**
+   * The row the workflow closes, emulated as `src/log.ts` writes it (AII-1493): absent is a fresh `running` row, the
+   * gate's write lands only on a fresh `running` row, and a resumed run's reopen stamps it so a late gate write cannot land.
+   */
+  const rowState = new Map<string, { status: string; conclusion?: string }>();
+  const reopenCalls: string[] = [];
+  const closeRowFake = (jobId: string, status: string, conclusion?: string): void => {
+    closeRowCalls.push({ jobId, status, conclusion });
+    rowState.set(jobId, { status, conclusion });
+  };
+  /** The guarded gate write; a test parks it with `heldRowPark`, and the guard reads the row after the park, as the SQL does. */
+  const markJobHeldFake = async (jobId: string): Promise<void> => {
+    const park = heldRowPark?.jobId === jobId ? heldRowPark : null;
+    if (park) {
+      await park.gate.wait();
+      if (park.dropped) return;
+    }
+    const row = rowState.get(jobId);
+    if (row !== undefined && !(row.status === "running" && row.conclusion === undefined)) return;
+    closeRowFake(jobId, "completed", "awaiting_decision");
+  };
+  const reopenHeldJobFake = (jobId: string): void => {
+    reopenCalls.push(jobId);
+    const row = rowState.get(jobId);
+    if (row === undefined || (row.status === "completed" && row.conclusion === "awaiting_decision") || (row.status === "running" && row.conclusion === undefined)) {
+      rowState.set(jobId, { status: "running", conclusion: "resumed" });
+    }
+  };
+  /** This scenario's own close rows: the workflow closes its job log under the trigger id. */
+  const closeRowsFor = (triggerId: string) => closeRowCalls.filter((c) => c.jobId === triggerId);
+  /** Waits for this scenario's close row and returns the latest one, so another scenario's late close cannot be read. */
+  const closeRowFor = (triggerId: string) =>
+    eventually(() => closeRowsFor(triggerId).at(-1), (row) => row !== undefined, { label: `close row for ${triggerId}` }) as Promise<{ jobId: string; status: string; conclusion?: string }>;
+  /** Outcome calls for this scenario's dispatch only (the workflow stamps meta.dispatchId with the trigger id). */
+  const outcomesFor = (triggerId: string) => onOutcomeCalls.filter((c) => c.meta.dispatchId === triggerId);
 
   function newTriggerId(): string {
     return randomUUID();
@@ -320,6 +433,7 @@ describe("KgRefresh durable workflow", () => {
       findByTitleCalls: 0,
       runStatusCalls: 0,
       runStatusCallTimes: [],
+      findByTitleCallTimes: [],
       cancelCalls: 0,
       runStatusSequence: [{ status: "in_progress", conclusion: null }],
       findByTitleResult: null,
@@ -330,25 +444,104 @@ describe("KgRefresh durable workflow", () => {
     return scenario;
   }
 
+  // A counting stand-in for FlyMachineProfile that runs the real merge/validation, so a test can tell a
+  // journaled replay from a second read.
+  let profileGets = 0;
+  const claimCalls: string[] = [];
+  const attachCalls: string[] = [];
+  const attachRequests: Array<Record<string, unknown>> = [];
+  const dispatchedMachines: FlyMachineProfileConfig[] = [];
+  const flyMachineProfile = restate.object({
+    name: "FlyMachineProfile",
+    handlers: {
+      get: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) => {
+        profileGets++;
+        const stored = await ctx.get<FlyMachineProfileConfig>("profile");
+        return stored ? { config: stored, source: "profile" } : { config: { ...FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"] }, source: "default" };
+      }),
+      set: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, patch: Partial<FlyMachineProfileConfig>) => {
+        const stored = await ctx.get<FlyMachineProfileConfig>("profile");
+        ctx.set("profile", mergeProfile(stored ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch));
+      }),
+      // AII-1136: the workflow claims, attaches and releases the kept machine; this stand-in keeps none (the real object is exercised below).
+      claim: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<{ machineId: string | null }> => {
+        claimCalls.push(req.dispatchId);
+        return { machineId: null };
+      }),
+      attach: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<void> => { attachCalls.push(req.dispatchId); attachRequests.push(req); }),
+      release: restate.handlers.object.exclusive(async (): Promise<void> => {}),
+    },
+  });
+
+  // AII-1244: a counting stand-in for GhaRunProfile; the workflow reads it only on a GitHub Actions run.
+  let ghaProfileGets = 0;
+  const dispatchedTimeouts: Array<number | null> = [];
+  const ghaRunProfile = restate.object({
+    name: "GhaRunProfile",
+    handlers: {
+      get: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) => {
+        ghaProfileGets++;
+        const stored = await ctx.get<{ jobTimeoutMinutes: number }>("profile");
+        return stored ? { config: stored, source: "profile" } : { config: { ...GHA_RUN_PROFILE_DEFAULTS["kg-refresh"] }, source: "default" };
+      }),
+      set: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, patch: { jobTimeoutMinutes: number }) => {
+        ctx.set("profile", patch);
+      }),
+    },
+  });
+
+  /** The workflow dependency: the pending scenario's backend, keyed by dispatch id (which is the trigger id). */
+  function resolveDispatchRecordFn(dispatchId: string): KgDispatchRecord {
+    resolveExecutionModeCalls.push(dispatchId);
+    adoptPendingScenario(dispatchId);
+    return {
+      dispatchId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO,
+      executionMode: scenarios.get(dispatchId)?.executionMode ?? "fly-machines",
+    };
+  }
+  /** A test parks `recordDispatchDetails` here so signals can land before the workflow starts waiting. */
+  let detailsHold: Promise<void> | null = null;
+  const projectionFakes = {
+    deriveMachineNonce: fakeNonce,
+    armMachineNonce: (dispatchId: string, attempt: number) => { armedNonces.push({ dispatchId, attempt, nonce: fakeNonce(dispatchId, attempt) }); },
+    recordDispatchDetails: async (dispatchId: string, details: KgDispatchRowDetails) => {
+      recordedDetails.push({ dispatchId, details });
+      await detailsHold;
+    },
+  };
+
   async function dispatchFn(input: KgDispatchInput): Promise<KgDispatchResult> {
-    const triggerId = input.runConfig.triggerId;
+    const triggerId = input.dispatchId; // the workflow key equals the trigger id
     adoptPendingScenario(triggerId);
     const scenario = scenarios.get(triggerId);
     if (!scenario) throw new Error(`no scenario registered for trigger ${triggerId}`);
+    expect(input.envelope.issue.identifier).toBe(`KG-REFRESH · ${triggerId}`);
+    expect(input.envelope.runnerPhase).toBe("kg-refresh");
+    dispatchedEnvelopes.push({ dispatchId: input.dispatchId, envelope: input.envelope });
     contractCalls?.push("launch");
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
+    dispatchedMachines.push(input.machine);
+    dispatchedTimeouts.push(input.jobTimeoutMinutes);
     dispatchedTokens.push(input.tokens);
+    dispatchedNonces.push(input.machineNonce);
+    dispatchTimes.set(triggerId, [...(dispatchTimes.get(triggerId) ?? []), Date.now()]);
+    if (dispatchThrowOnce.delete(triggerId)) throw new Error("dispatch failed before commit");
     const committedRunId = dispatchThrowAfterCommit.get(triggerId);
     if (committedRunId !== undefined) {
       dispatchThrowAfterCommit.delete(triggerId);
       scenario.findByTitleResult = { runId: committedRunId }; // visible to the retry's title lookup
       throw new Error("dispatch ack lost after commit");
     }
-    return {
+    const result: KgDispatchResult = {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
+      ...(scenario.dispatchReason !== undefined ? { reason: scenario.dispatchReason } : {}),
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
+      ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
+      ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: scenario.flyCreate.reused !== true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
     };
+    dispatchResults.push(result);
+    return result;
   }
 
   async function getWorkflowRunStatusFn(runId: number): Promise<{ status: string; conclusion: string | null }> {
@@ -364,13 +557,14 @@ describe("KgRefresh durable workflow", () => {
     return scenario.runStatusSequence[idx];
   }
 
-  async function findRunByTitleFn(title: string): Promise<{ runId: number } | null> {
+  async function findRunByTitleFn(title: string): Promise<{ runId: number; logsUrl?: string } | null> {
     const match = /KG-REFRESH · (.+)$/.exec(title);
     const triggerId = match?.[1];
     adoptPendingScenario(triggerId);
     const scenario = triggerId ? scenarios.get(triggerId) : undefined;
     if (!scenario) throw new Error(`no scenario registered for title "${title}"`);
     scenario.findByTitleCalls++;
+    scenario.findByTitleCallTimes.push(Date.now());
     if (scenario.findByTitleThrowOn?.has(scenario.findByTitleCalls)) throw new Error("workflow runs lookup answered HTTP 500");
     if (scenario.findAlwaysThrows && scenario.dispatchCalls > 0) throw new Error("workflow runs lookup answered HTTP 500");
     // The dispatch step's own reconcile-first lookup runs before the deadlines are set; only a later lookup is a tick.
@@ -397,6 +591,21 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
+  /** Per-trigger `readMachineRun` answers, consumed in order; the last one repeats. */
+  const machineReads = new Map<string, Array<{ state: "ended" | "started" | "unknown"; exit: MachineExit | null }>>();
+  const machineReadCalls: Array<{ executionMode: string; jobId: string }> = [];
+  /** A read for this trigger parks until the promise settles, so a test orders the report before the answer. */
+  const machineReadGates = new Map<string, Promise<void>>();
+
+  async function readMachineRunFn(executionMode: string, jobId: string) {
+    machineReadCalls.push({ executionMode, jobId });
+    const key = jobId.replace(/^job-/, "");
+    await machineReadGates.get(key);
+    const answers = machineReads.get(key) ?? [];
+    const next = answers.length > 1 ? answers.shift()! : answers[0];
+    return next ?? { state: "unknown" as const, exit: null };
+  }
+
   async function cancelWorkflowRunFn(runId: number): Promise<boolean> {
     contractCalls?.push("stop");
     if (cancelTerminalFailure) throw new restate.TerminalError("forced cancel failure");
@@ -406,7 +615,13 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
+  const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => buildKgRefreshRunConfig({
+    kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
+  });
+
+  const TEST_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
   const workflowDeps: Omit<Parameters<typeof createKgRefreshWorkflow>[0], "bootstrapDeadlineMs" | "totalDeadlineMs"> = {
+    retentionMs: TEST_RETENTION_MS,
     rail,
     kgSourceRepo: KG_SOURCE_REPO,
     mintRunTokens: (input) => {
@@ -414,7 +629,10 @@ describe("KgRefresh durable workflow", () => {
       return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
     dispatch: dispatchFn,
-    appendJobLog: (input) => {
+    buildEnvelope: buildEnvelopeFn,
+    resolveDispatchRecord: resolveDispatchRecordFn,
+    ...projectionFakes,
+    recordDispatchRow: (input) => {
       appendJobLogCalls.push(input);
       contractCalls?.push("reserve");
       if (reserveFailuresRemaining > 0) {
@@ -422,11 +640,16 @@ describe("KgRefresh durable workflow", () => {
         throw new restate.TerminalError("forced one-shot reserve failure for the release-order test");
       }
       if (forceReserveFailure) throw new restate.TerminalError("forced reserve failure for the outer-catch release test");
+      // The step awaits what its closure returns, so a parked reserve is a returned promise.
+      if (reserveHold) return reserveHold as unknown as void;
     },
-    closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
+    closeJobLog: (jobId, status, conclusion) => closeRowFake(jobId, status, conclusion),
+    markJobHeld: (jobId) => markJobHeldFake(jobId),
+    reopenHeldJob: (jobId) => reopenHeldJobFake(jobId),
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
+    readMachineRun: readMachineRunFn,
     stopMachineRun: stopMachineRunFn,
     persistLastRefresh: async (outcome) => {
       if (persistHold) {
@@ -451,6 +674,15 @@ describe("KgRefresh durable workflow", () => {
     totalDeadlineMs: TOTAL_DEADLINE_MS,
   });
 
+  // The bootstrap deadline is short and the total deadline is long against the work, for a scenario that must act
+  // after the bootstrap deadline and cannot be ordered against a later short deadline: a gate holds only a lower bound.
+  const BOOTSTRAP_ONLY_TOTAL_DEADLINE_MS = 30_000;
+  const bootstrapOnlyWorkflow = createKgRefreshWorkflow({
+    ...workflowDeps,
+    bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
+    totalDeadlineMs: BOOTSTRAP_ONLY_TOTAL_DEADLINE_MS,
+  });
+
   const kgRepo = createKgRepo({ workflowName: "KgRefresh" });
   const starter = restate.service({
     name: "KgRefreshStarter",
@@ -471,7 +703,7 @@ describe("KgRefresh durable workflow", () => {
     return callObject<KgRepoTriggerResult>(baseUrl, "KgRepo", KG_SOURCE_REPO, "trigger", opts);
   }
 
-  async function kgRepoStatus(baseUrl: string): Promise<{ triggerId: string; startedAt: number } | null> {
+  async function kgRepoStatus(baseUrl: string): Promise<{ triggerId: string; startedAt: number; invocationId?: string; held?: { snapshotPr: number; acceptBlocked: boolean; [k: string]: unknown } | null } | null> {
     return callObject(baseUrl, "KgRepo", KG_SOURCE_REPO, "status", {});
   }
 
@@ -480,34 +712,45 @@ describe("KgRefresh durable workflow", () => {
     await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "workflow started" });
   }
 
-  let envs: Map<string, RestateTestEnvironment>;
-  let deadlineEnvs: Map<string, RestateTestEnvironment>;
+  let envs: Map<string, RestateEnvironment>;
+  let deadlineEnvs: Map<string, RestateEnvironment>;
+  let bootstrapEnvs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([workflow, kgRepo, starter]);
-    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter]);
+    initLogTable();
+    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools]);
+    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
+    bootstrapEnvs = await startVariants([bootstrapOnlyWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
   }, 120_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
     if (deadlineEnvs) await stopAll(deadlineEnvs);
+    if (bootstrapEnvs) await stopAll(bootstrapEnvs);
   });
 
   // A scenario that does not test a deadline runs in envFor, whose deadlines are long against its own work.
   // A scenario that tests a deadline runs in deadlineEnvFor, which serves the short deadlines.
-  function envFor(label: string): RestateTestEnvironment {
+  // A scenario that tests the bootstrap deadline only runs in bootstrapEnvFor, whose total deadline is long.
+  function envFor(label: string): RestateEnvironment {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   }
 
-  function deadlineEnvFor(label: string): RestateTestEnvironment {
+  function deadlineEnvFor(label: string): RestateEnvironment {
     const env = deadlineEnvs.get(label);
     if (!env) throw new Error(`missing Restate deadline variant ${label}`);
     return env;
   }
 
+  function bootstrapEnvFor(label: string): RestateEnvironment {
+    const env = bootstrapEnvs.get(label);
+    if (!env) throw new Error(`missing Restate bootstrap variant ${label}`);
+    return env;
+  }
+
   // KgRefresh.run is ingressPrivate (AII-976): production starts it by a send from KgRepo. This
   // forwarder stands in for that caller so a scenario can start a run with its own trigger id.
-  async function runWorkflow(baseUrl: string, triggerId: string, extra: Record<string, unknown> = {}): Promise<Promise<RefreshOutcome>> {
+  async function runWorkflow(baseUrl: string, triggerId: string, extra: Record<string, unknown> = {}): Promise<RefreshOutcome> {
     return callService<RefreshOutcome>(baseUrl, "KgRefreshStarter", "start", { triggerId, input: { triggerId, ...extra } });
   }
 
@@ -534,13 +777,8 @@ describe("KgRefresh durable workflow", () => {
     "W1/W11: a success report runs the full merge+gates+persist path exactly once (%s)",
     async (label) => {
       const env = envFor(label);
-      const triggered = await triggerViaKgRepo(env.baseUrl());
-      expect(triggered).not.toHaveProperty("status");
-      const triggerId = (triggered as { triggerId: string }).triggerId;
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-
+      // Every "before" count is read before the trigger: the run starts by one-way send and can record its row at once.
       const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
       const beforeDeleteBranch = deleteBranchFn.mock.calls.length;
       const beforeFetchTarball = fetchTarballCallCount;
@@ -548,7 +786,11 @@ describe("KgRefresh durable workflow", () => {
       const beforeRestart = restartCallCount;
       const beforeDispatched = dispatchedIds.length;
       const beforeMinted = mintedDispatchIds.length;
-      const beforeJobLog = appendJobLogCalls.length;
+
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      expect(triggered).not.toHaveProperty("status");
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
 
       await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
@@ -566,7 +808,7 @@ describe("KgRefresh durable workflow", () => {
       expect(dispatchedTokens.slice(beforeDispatched)).toEqual([
         { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" },
       ]);
-      expect(appendJobLogCalls.slice(beforeJobLog).map((c) => c.dispatchId)).toEqual([dispatchedId]);
+      expect(appendJobLogCalls.filter((c) => c.dispatchId === dispatchedId).map((c) => c.dispatchId)).toEqual([dispatchedId]);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(deleteBranchFn.mock.calls.length - beforeDeleteBranch).toBe(1);
       // one run of each rail gate's own side effect: fetchGate calls fetchTarball once,
@@ -576,8 +818,8 @@ describe("KgRefresh durable workflow", () => {
       expect(materializeCallCount - beforeMaterialize).toBe(1);
       expect(restartCallCount - beforeRestart).toBe(1);
       expect(persistCalls.length - beforePersist).toBe(1);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("success");
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!.kind).toBe("success");
 
       // W11: the release actually cleared KgRepo's marker for this repo, proven through the
       // real object's own state, and a follow-up trigger mints a fresh workflow rather than
@@ -612,7 +854,6 @@ describe("KgRefresh durable workflow", () => {
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       loadSnapshotShaImpl = () => SNAPSHOT_SHA; // collides with the fixture's fixed fetchSnapshotCommitSha() value
 
-      const beforeOutcome = onOutcomeCalls.length;
       const beforeRestart = restartCallCount;
       const beforePersistSnapshot = persistSnapshotShaFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
@@ -626,9 +867,9 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.detail).toContain("Graph is current");
       // the snapshot PR still merges — only the local rail short-circuits after fetch.
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "completed" });
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "no-new-data", meta: { failureCode: "ingest-needed" } });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed", conclusion: "passed" });
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "no-new-data", meta: { failureCode: "ingest-needed" } });
       // no stage/swap/verify/revert: the sidecar never restarts, nothing is persisted again,
       // and no staging directory is ever created.
       expect(restartCallCount - beforeRestart).toBe(0);
@@ -660,6 +901,24 @@ describe("KgRefresh durable workflow", () => {
     },
     15_000,
   );
+
+  it.each([
+    ["a clean report", {}, "passed"],
+    ["a report carrying warnings", { warnings: ["source skipped"] }, "warnings"],
+    ["a warnings guard verdict", { guardVerdict: "warnings" }, "warnings"],
+  ] as const)("AII-1472: a live success with %s closes completed/%s (alwaysReplay)", async (_name, extra, conclusion) => {
+    const env = envFor("alwaysReplay");
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+
+    const done = runWorkflow(env.baseUrl(), triggerId);
+    await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+    await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ...SUCCESS_REPORT, ...extra });
+    const outcome = await done;
+
+    expect(outcome.ok).toBe(true);
+    expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed", conclusion });
+  }, 15_000);
 
   it.each(VARIANTS.map(([label]) => label))(
     "a snapshot with no committed embeddings ends as a graceful no-op without materialize, swap, or revert (%s)",
@@ -702,7 +961,7 @@ describe("KgRefresh durable workflow", () => {
       expect(materializeCallCount).toBe(0);
       expect(restartCallCount).toBe(0);
       expect(existsSync(join(dataRoot, "staging"))).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("staging");
     },
     15_000,
   );
@@ -772,7 +1031,6 @@ describe("KgRefresh durable workflow", () => {
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       mergePullRequestFn.mockImplementationOnce(async () => "conflict");
 
-      const beforeOutcome = onOutcomeCalls.length;
       const beforeDeleteBranch = deleteBranchFn.mock.calls.length;
       const beforeFetchTarball = fetchTarballCallCount;
       const beforeMaterialize = materializeCallCount;
@@ -786,15 +1044,15 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await done;
       expect(outcome.ok).toBe(false);
       expect(outcome.detail).toContain("conflict");
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "failed", conclusion: "merge_failed" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "merge_failed" });
       // no delete-branch and no rail gate ran after a failed merge.
       expect(deleteBranchFn.mock.calls.length - beforeDeleteBranch).toBe(0);
       expect(fetchTarballCallCount - beforeFetchTarball).toBe(0);
       expect(materializeCallCount - beforeMaterialize).toBe(0);
       expect(restartCallCount - beforeRestart).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "merge_failed" } });
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].meta.timedOut).toBeUndefined();
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "failure", meta: { failureCode: "merge_failed" } });
+      expect(outcomesFor(triggerId).at(-1)!.meta.timedOut).toBeUndefined();
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -882,6 +1140,31 @@ describe("KgRefresh durable workflow", () => {
     30_000,
   );
 
+  it.each(VARIANTS.map(([label]) => label))("stores KG usage once and serves job accounting (%s)", async (label) => {
+    const url = envFor(label).baseUrl();
+    const key = newTriggerId();
+    makeScenario(key, { runId: runIdCounter++, executionMode: "fly-machines" });
+    const done = runWorkflow(url, key);
+    await eventually(() => scenarios.get(key)!.dispatchCalls === 1, Boolean, { label: "dispatch" });
+    const id = appendLog({ dispatchId: key, issueId: "kg-refresh", phase: "kg-refresh" });
+    const body = { ...STALE_REPORT, usage: reportedUsage(key) };
+    expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toMatchObject({ status: "accepted" });
+    const rows = storedRows(key);
+    expect(rows).toHaveLength(2);
+    expect(rows).toMatchObject([{ snapshot_id: null, config_revision_id: null }, { snapshot_id: null, config_revision_id: null }]);
+    expect(getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(key)).toBeUndefined();
+    await done;
+    expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toMatchObject({ status: "duplicate" });
+    await expect(callWorkflow(url, "KgRefresh", key, "report", { ...body, usage: reportedUsage(key, 99) })).rejects.toThrow(/409/);
+    expect(storedRows(key)).toEqual(rows);
+    // Job-log effects are faked in this fixture; mirror production closing its dispatch row.
+    getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(Date.now(), id);
+    const result = await callService<{ content: Array<{ text: string }> }>(url, "orchestratorTools", "list_job_accounting",
+      { caller: { kind: "service", email: null, role: "user" }, args: { includeUnsettled: true } });
+    const page = JobAccountingPageSchema.parse(JSON.parse(result.content[0].text));
+    expect(page.records.find((row) => row.dispatchId === key)?.invocations).toHaveLength(2);
+  });
+
   // ---- W2: idempotency-key semantics on `report` ----
   it.each(VARIANTS.map(([label]) => label))(
     "W2: a duplicate report under the same key is absorbed by Restate; a differing report under a new key is refused (%s)",
@@ -904,11 +1187,11 @@ describe("KgRefresh durable workflow", () => {
 
       const first = await post(SUCCESS_REPORT, "w2-key-1");
       expect(first.ok).toBe(true);
-      expect(await first.json()).toEqual({ status: "accepted" });
+      expect(await first.json()).toMatchObject({ status: "accepted" });
 
       const duplicate = await post(SUCCESS_REPORT, "w2-key-1");
       expect(duplicate.ok).toBe(true);
-      expect(await duplicate.json()).toEqual({ status: "accepted" });
+      expect(await duplicate.json()).toMatchObject({ status: "accepted" });
 
       const conflicting = await post(GENERIC_FAILURE_REPORT, "w2-key-2");
       expect(conflicting.status).toBe(409);
@@ -917,7 +1200,7 @@ describe("KgRefresh durable workflow", () => {
       expect(conflictBody).toContain("runner_crashed");
 
       // The `report` handler itself is registered with journalRetention/idempotencyRetention
-      // set to KG_REFRESH_RETENTION_MS (kg-refresh-workflow.ts's handlers.report) — a
+      // set to TEST_RETENTION_MS (kg-refresh-workflow.ts's handlers.report) — a
       // handler-level introspection, distinct from W18's service-level check, that the
       // idempotency-key behavior just exercised above actually rides that retention.
       const handlerResponse = await fetch(`${env.adminAPIBaseUrl()}/services/KgRefresh/handlers/report`);
@@ -925,12 +1208,12 @@ describe("KgRefresh durable workflow", () => {
       const handlerMeta = (await handlerResponse.json()) as Record<string, unknown>;
       expectDurationMs(
         handlerMeta.journal_retention ?? handlerMeta.journalRetention,
-        KG_REFRESH_RETENTION_MS,
+        TEST_RETENTION_MS,
         "report journal_retention",
       );
       expectDurationMs(
         handlerMeta.idempotency_retention ?? handlerMeta.idempotencyRetention,
-        KG_REFRESH_RETENTION_MS,
+        TEST_RETENTION_MS,
         "report idempotency_retention",
       );
 
@@ -953,8 +1236,8 @@ describe("KgRefresh durable workflow", () => {
       }
       for (const handler of ["report", "cancel"]) {
         const m = await meta(handler);
-        expectDurationMs(m.journal_retention ?? m.journalRetention, KG_REFRESH_RETENTION_MS, `${handler} journal_retention`);
-        expectDurationMs(m.idempotency_retention ?? m.idempotencyRetention, KG_REFRESH_RETENTION_MS, `${handler} idempotency_retention`);
+        expectDurationMs(m.journal_retention ?? m.journalRetention, TEST_RETENTION_MS, `${handler} journal_retention`);
+        expectDurationMs(m.idempotency_retention ?? m.idempotencyRetention, TEST_RETENTION_MS, `${handler} idempotency_retention`);
       }
     },
   );
@@ -963,12 +1246,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "W3: no progress within the bootstrap deadline fails with a timed_out row and one outcome call (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
-      // Captured before the trigger (not after): the trigger's genericSend dispatches the
-      // run immediately, and with a 1s bootstrap deadline a call recorded even a moment
-      // late risks folding an already-fired outcome into the "before" snapshot instead of
-      // the "after" delta.
-      const beforeOutcome = onOutcomeCalls.length;
+      const env = bootstrapEnvFor(label);
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
@@ -977,9 +1255,9 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
 
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "bootstrap_timeout", timedOut: true } });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "failure", meta: { failureCode: "bootstrap_timeout", timedOut: true } });
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -998,7 +1276,7 @@ describe("KgRefresh durable workflow", () => {
 
       const outcome = await done;
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
     },
     15_000,
   );
@@ -1006,29 +1284,22 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a dry-run with a report target that ends by bootstrap_timeout gets a failure verdict and no persist or notify (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const report = { repo: KG_SOURCE_REPO, prNumber: 11, sha: "b".repeat(40) };
       const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
       const beforeStatus = setCommitStatusFn.mock.calls.length;
 
       const outcome = await (await runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report }));
 
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(setCommitStatusFn.mock.calls.length - beforeStatus).toBe(1);
       expect((setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4]).toMatchObject({ state: "failure" });
-      const stored = await eventually(
-        () => callObject<{ sha: string; outcome: RefreshOutcome } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
-        (v) => v !== null,
-        { label: "durable effect" },
-      );
-      expect(stored!.sha).toBe(report.sha);
-      expect(stored!.outcome.ok).toBe(false);
       expect(persistCalls.length - beforePersist).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+      await closeRowFor(triggerId);
+      expect(outcomesFor(triggerId).length).toBe(0);
     },
     15_000,
   );
@@ -1039,13 +1310,13 @@ describe("KgRefresh durable workflow", () => {
 
   describe.each(STOP_BACKENDS)("AII-1046: stop on %s", (backend) => {
     it.each(VARIANTS.map(([label]) => label))("a bootstrap timeout stops the run one time and keeps the timeout outcome (%s)", async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
       stopCalls.length = 0;
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
     }, 15_000);
 
@@ -1059,7 +1330,7 @@ describe("KgRefresh durable workflow", () => {
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
       const outcome = await done;
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
       expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
     }, 15_000);
 
@@ -1072,18 +1343,18 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
     }, 15_000);
 
     it.each(VARIANTS.map(([label]) => label))("an unknown job id makes no stop call on a timeout (%s)", async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend, jobIdUnknown: true });
       stopCalls.length = 0;
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(stopCalls).toEqual([]);
     }, 15_000);
 
@@ -1096,19 +1367,19 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(stopCalls).toEqual([]);
     }, 15_000);
 
     it.each(VARIANTS.map(([label]) => label))("a failed stop does not change a timeout or a cancel outcome (%s)", async (label) => {
       stopFailure = true;
       try {
-        const timeoutEnv = deadlineEnvFor(label);
+        const timeoutEnv = bootstrapEnvFor(label);
         const timedOutId = newTriggerId();
         makeScenario(timedOutId, { dispatchOutcome: "accepted", executionMode: backend });
         const timedOut = await runWorkflow(timeoutEnv.baseUrl(), timedOutId);
         expect(timedOut.ok).toBe(false);
-        expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+        expect(await closeRowFor(timedOutId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
 
         const env = envFor(label);
         const cancelledId = newTriggerId();
@@ -1117,7 +1388,7 @@ describe("KgRefresh durable workflow", () => {
         await eventually(() => scenarios.get(cancelledId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
         await callWorkflow(env.baseUrl(), "KgRefresh", cancelledId, "cancel", { reason: "operator requested" });
         await done;
-        expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+        expect((await closeRowFor(cancelledId)).conclusion).toBe("operator_cancelled");
       } finally {
         stopFailure = false;
       }
@@ -1136,28 +1407,252 @@ describe("KgRefresh durable workflow", () => {
     }, 15_000);
   });
 
+  // ---- AII-1146: the backend resolves one time, in `reserve`; only a Fly run claims the kept machine ----
+  describe("AII-1146: one backend resolution per run", () => {
+    it.each(VARIANTS.map(([label]) => label))("a github-actions run records no claim and no attach, and the row carries the mode (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      expect(claimCalls).not.toContain(triggerId);
+      expect(attachCalls).not.toContain(triggerId);
+      expect(appendJobLogCalls.filter((c) => c.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "github-actions", trigger: "schedule" }]);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("AII-1246: attach receives the dispatch result's app, and no app key when there is none (%s)", async (label) => {
+      const env = envFor(label);
+      for (const app of ["app-a", undefined]) {
+        const triggerId = newTriggerId();
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-app", ...(app !== undefined && { app }) } });
+        const done = runWorkflow(env.baseUrl(), triggerId);
+        await eventually(() => attachRequests.find((r) => r.dispatchId === triggerId), (r) => r !== undefined, { label: "attach" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+        await done;
+        const req = attachRequests.find((r) => r.dispatchId === triggerId)!;
+        expect(req.machineId).toBe("m-app");
+        if (app === undefined) expect("app" in req).toBe(false);
+        else expect(req.app).toBe(app);
+      }
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("AII-1276: a reuse sends attach with the current app; a reuse without an app sends none (%s)", async (label) => {
+      const env = envFor(label);
+      const withApp = newTriggerId();
+      const noApp = newTriggerId();
+      makeScenario(withApp, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-kept", app: "app-a", reused: true } });
+      makeScenario(noApp, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-kept", reused: true } });
+      for (const id of [withApp, noApp]) {
+        const done = runWorkflow(env.baseUrl(), id);
+        await eventually(() => scenarios.get(id)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", id, "report", SUCCESS_REPORT);
+        await done;
+      }
+      const req = (await eventually(() => attachRequests.find((r) => r.dispatchId === withApp), (r) => r !== undefined, { label: "attach" }))!;
+      expect(req).toMatchObject({ machineId: "m-kept", app: "app-a" });
+      expect("replaces" in req).toBe(false);
+      expect(attachCalls).not.toContain(noApp);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a fly-machines run records one claim and resolves the backend once across dispatch retries (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      dispatchThrowAfterCommit.set(triggerId, scenario.runId!);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      expect(claimCalls.filter((id) => id === triggerId)).toHaveLength(1);
+      expect(resolveExecutionModeCalls.filter((id) => id === triggerId)).toHaveLength(1);
+      expect(appendJobLogCalls.find((c) => c.dispatchId === triggerId)?.executionMode).toBe("fly-machines");
+    }, 30_000);
+  });
+
+  // ---- AII-1150: the journal is the record; every row write is a projection of journaled values ----
+  describe("AII-1150: journal projections", () => {
+    /** The run invocation's journal id, once the workflow has started. */
+    async function runInvocationId(env: ReturnType<typeof envFor>, triggerId: string): Promise<string> {
+      const rows = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
+        (r) => r.length === 1,
+        { label: "the KgRefresh run invocation" },
+      );
+      return rows[0].id as string;
+    }
+
+    it.each(VARIANTS.map(([label]) => label))("a fly-machines run journals resolve, reserve, nonce-1, dispatch-1, record-dispatch-1 in order (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => ["resolve", "reserve", "nonce-1", "dispatch-1", "record-dispatch-1"].includes(n)))
+        .toEqual(["resolve", "reserve", "nonce-1", "dispatch-1", "record-dispatch-1"]);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("the envelope is journaled after reserve and before dispatch-1 (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => n === "envelope")).toHaveLength(1);
+      expect(names.indexOf("envelope")).toBeGreaterThan(names.indexOf("reserve"));
+      expect(names.indexOf("envelope")).toBeLessThan(names.indexOf("dispatch-1"));
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("AII-1264: a run input still carrying acceptNewBaseline is accepted and the envelope has no accept field (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId, { acceptNewBaseline: true, actorEmail: "a@b" });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const sent = dispatchedEnvelopes.find((e) => e.dispatchId.includes(triggerId))?.envelope;
+      expect(sent).toBeDefined();
+      expect(sent).not.toHaveProperty("kgAccept" + "NewBaseline");
+      expect(sent).not.toHaveProperty("kgBaseline" + "Actor");
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a dispatch retry receives the same envelope as the first attempt (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      dispatchThrowOnce.add(triggerId);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 2, (ok) => ok, { label: "dispatch retry" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const seen = dispatchedEnvelopes.filter((e) => e.dispatchId === triggerId);
+      expect(seen).toHaveLength(2);
+      expect(seen[1].envelope).toEqual(seen[0].envelope);
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => n === "envelope")).toHaveLength(1);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a failed dispatch attempt is retried no sooner than the initial delay (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      dispatchThrowOnce.add(triggerId);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 2, (ok) => ok, { label: "dispatch retry", timeoutMs: 20_000 });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const [first, second] = dispatchTimes.get(triggerId)!;
+      expect(DISPATCH_RETRY_INITIAL_INTERVAL.seconds).toBeGreaterThan(0);
+      // Small allowance for timer granularity between the failure and the recorded start.
+      expect(second - first).toBeGreaterThanOrEqual(DISPATCH_RETRY_INITIAL_INTERVAL.seconds * 1000 - 200);
+    }, 40_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a local-docker run arms a nonce too (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "local-docker" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names).toContain("nonce-1");
+      expect(armedNonces.filter((a) => a.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, attempt: 1, nonce: fakeNonce(triggerId, 1) }]);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a github-actions run journals no nonce step and dispatches a null nonce (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => ["resolve", "reserve", "nonce-1", "dispatch-1", "record-dispatch-1"].includes(n)))
+        .toEqual(["resolve", "reserve", "dispatch-1", "record-dispatch-1"]);
+      expect(armedNonces.filter((a) => a.dispatchId === triggerId)).toEqual([]);
+      expect(dispatchedNonces.at(-1)).toBeNull();
+    }, 30_000);
+
+    it.each(VARIANTS.flatMap(([label]) => (["schedule", "manual"] as const).map((trigger) => [label, trigger] as const)))("the projections receive exactly the journaled values, and the nonce is in no journal entry (%s, %s)", async (label, trigger) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "fly-machines" });
+      const rowsBefore = appendJobLogCalls.length;
+      const resultsBefore = dispatchResults.length;
+      const done = runWorkflow(env.baseUrl(), triggerId, { trigger });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+
+      // `recordDispatchRow` receives the journaled `resolve` record.
+      const record = appendJobLogCalls.slice(rowsBefore).find((r) => r.dispatchId === triggerId);
+      expect(record).toEqual({ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "fly-machines", trigger });
+
+      // `recordDispatchDetails` receives the journaled dispatch result's machine id, URL and run id, and nothing else.
+      const result = dispatchResults.slice(resultsBefore).at(-1)!;
+      expect(recordedDetails.filter((d) => d.dispatchId === triggerId)).toEqual([
+        { dispatchId: triggerId, details: { machineId: result.jobId, logsUrl: result.runUrl, workflowRunId: result.runId } },
+      ]);
+
+      // The dispatcher got the nonce the arm step wrote, and the journal holds it nowhere.
+      const nonce = fakeNonce(triggerId, 1);
+      expect(dispatchedNonces.at(-1)).toBe(nonce);
+      expect(armedNonces.filter((a) => a.dispatchId === triggerId).map((a) => a.nonce)).toEqual([nonce]);
+      const entries = await journalEntries(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      const journal = journalText(entries);
+      expect(journal).toContain(triggerId); // the decoder reads the payloads, so the absence below means something
+      expect(journal).not.toContain(nonce);
+      expect(journal).not.toContain(Buffer.from(nonce).toString("base64"));
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a github-actions run projects the run id and URL but no machine id (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      expect(recordedDetails.filter((d) => d.dispatchId === triggerId)).toEqual([
+        { dispatchId: triggerId, details: { logsUrl: `https://example.test/runs/${runId}`, workflowRunId: runId } },
+      ]);
+    }, 30_000);
+  });
+
   // ---- AII-1066: bounded reads (watch-N, reconcile-N, watch-cancel-N, reconcile-cancel-N) ----
   // A read that fails on each attempt is "no new evidence" and never holds the workflow past its
-  // deadline. The deadline workflow serves a 1 s bootstrap deadline and a 2.6 s total deadline.
+  // deadline. The deadline workflow serves a 1 s bootstrap deadline and a 1.8 s total deadline.
   describe("AII-1066: a failing read does not hold the workflow", () => {
     it.each(VARIANTS.map(([label]) => label))("a status read that fails on each attempt ends at bootstrap_timeout, cancels the run (%s)", async (label) => {
       const triggerId = newTriggerId();
       const scenario = makeScenario(triggerId, { runId: runIdCounter++, executionMode: "github-actions", statusAlwaysThrows: true });
-      const outcome = await runWorkflow(deadlineEnvFor(label).baseUrl(), triggerId);
+      const outcome = await runWorkflow(bootstrapEnvFor(label).baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(scenario.cancelCalls).toBe(1);
-      expect(scenario.runStatusCalls).toBeGreaterThanOrEqual(3);
+      expect(scenario.runStatusCalls).toBeGreaterThanOrEqual(2);
     }, 30_000);
 
     it.each(VARIANTS.map(([label]) => label))("a title lookup that fails on each attempt counts as not found yet and ends at bootstrap_timeout (%s)", async (label) => {
       const triggerId = newTriggerId();
       const scenario = makeScenario(triggerId, { dispatchOutcome: "unknown", executionMode: "github-actions", findAlwaysThrows: true });
-      const outcome = await runWorkflow(deadlineEnvFor(label).baseUrl(), triggerId);
+      const outcome = await runWorkflow(bootstrapEnvFor(label).baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(scenario.cancelCalls).toBe(0);
-      expect(scenario.findByTitleCalls).toBeGreaterThanOrEqual(4);
+      expect(scenario.findByTitleCalls).toBeGreaterThanOrEqual(2);
     }, 30_000);
 
     it.each(VARIANTS.map(([label]) => label))("a status read that fails in the cancel phase ends at the total deadline as operator_cancelled (%s)", async (label) => {
@@ -1170,8 +1665,8 @@ describe("KgRefresh durable workflow", () => {
       const callsAtCancel = scenario.runStatusCalls;
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
-      expect(scenario.runStatusCalls - callsAtCancel).toBeGreaterThanOrEqual(3);
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
+      expect(scenario.runStatusCalls - callsAtCancel).toBeGreaterThanOrEqual(2);
     }, 30_000);
 
     it.each(VARIANTS.map(([label]) => label))("a title lookup that fails in the cancel phase ends at the no-run deadline as operator_cancelled (%s)", async (label) => {
@@ -1182,22 +1677,28 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenario.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(scenario.cancelCalls).toBe(0);
     }, 30_000);
+
+    it("the dispatch step is journaled under a name that carries the attempt", () => {
+      const source = readFileSync(fileURLToPath(new URL("../../restate/kg-refresh-workflow.ts", import.meta.url)), "utf8");
+      expect(source).not.toContain('ctx.run("dispatch"');
+      expect(source).toMatch(/ctx\.run\(\s*`dispatch-\$\{attempt\}`/);
+    });
 
     it("every watch-* and reconcile-* step in the workflow source carries a retry bound", () => {
       const source = readFileSync(fileURLToPath(new URL("../../restate/kg-refresh-workflow.ts", import.meta.url)), "utf8");
       const steps = [...source.matchAll(/(ctx\.run|readBoundedOwnedRun)\(\s*(ctx,\s*)?`(watch|reconcile)-/g)];
-      expect(steps.length).toBe(4);
+      expect(steps.length).toBe(5);
       for (const step of steps) expect(step[1]).toBe("readBoundedOwnedRun");
     });
   });
 
   // ---- AII-1066: the owned-run contract suite (src/__tests__/restate/owned-run-contract.ts) ----
   // Applies: scenario 1 (a failing status read still reaches the deadline, stops the run, and
-  // releases the KgRepo marker). The adapter drives the real KgRepo, so `release` is observed as
-  // the marker clearing. Does not apply:
+  // releases the KgRepo marker), and scenario 6 (report intake persists usage once). Scenario 1
+  // drives the real KgRepo, so `release` is observed as the marker clearing. Does not apply:
   //  - 2 (a crash after the launch adopts the run): KgRefresh's `dispatch` step already looks the
   //    run up by title before it dispatches, and W8 covers the adoption with its own fixture.
   //  - 3 and 5 (a normal end, a failed cleanup): a normal end runs the rail gates, which the W-
@@ -1209,9 +1710,41 @@ describe("KgRefresh durable workflow", () => {
   registerOwnedRunContract(
     {
       name: "KgRefresh",
-      scenarios: [1],
+      scenarios: [1, 6],
       hasCleanup: false,
-      start(baseUrl, _key, { faults }) {
+      start(baseUrl, key, { faults }) {
+        if (!faults.failStatusRead) {
+          const label = VARIANTS.map(([label]) => label).find((label) => key.startsWith(`contract-${label}-`))!;
+          const url = envFor(label).baseUrl();
+          makeScenario(key, { runId: runIdCounter++, executionMode: "fly-machines" });
+          appendLog({ dispatchId: key, issueId: "kg-refresh", phase: "kg-refresh" });
+          const done = runWorkflow(url, key);
+          return {
+            runId: key, done,
+            read: async () => ({ step: scenarios.get(key)!.dispatchCalls > 0 ? "waiting" : null }),
+            finish: async () => { await callWorkflow(url, "KgRefresh", key, "report", STALE_REPORT); },
+            report: async (value: unknown) => {
+              const { usage, items } = value as { usage: { tokens: number; cost: number }; items: number[] };
+              const body = { ...STALE_REPORT, usage: reportedUsage(key, usage.tokens, usage.cost, [items.reduce((sum, item) => sum + item, 0)]) };
+              // Preserve the contract's reordered delivery through the KG-specific mapping,
+              // including nested usage objects, without changing array order.
+              const reordered = Object.keys(value as object)[0] === "items";
+              const result = await callWorkflow<{ status: "accepted" | "duplicate" }>(url, "KgRefresh", key, "report",
+                reordered ? reverseObjectKeys(body) : body);
+              if (result.status === "duplicate") {
+                // Row uniqueness alone could hide a second usage write. Inspect the real
+                // shared-handler journals to prove intake journaled the effect only once.
+                const reports = await queryInvocations(envFor(label).adminAPIBaseUrl(),
+                  `target_service_name = 'KgRefresh' AND target_service_key = '${key}' AND target_handler_name = 'report'`);
+                const steps = (await Promise.all(reports.map((row) =>
+                  journalEntryNames(envFor(label).adminAPIBaseUrl(), String(row.id))))).flat();
+                expect(steps.filter((step) => step === "record-usage")).toHaveLength(1);
+              }
+              return result;
+            },
+            acceptedCount: () => storedRows(key).length,
+          };
+        }
         const recorded: string[] = [];
         contractCalls = recorded;
         lastContractCalls = recorded;
@@ -1248,6 +1781,88 @@ describe("KgRefresh durable workflow", () => {
     expect(stopCalls).toEqual([]);
   }, 15_000);
 
+  // ---- AII-1125: a Fly machine's status read ends a dead run ----
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a machine that stops with no report ends dispatch_lost naming the exit (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    machineReads.set(triggerId, [
+      { state: "started", exit: null },
+      { state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 1 } },
+    ]);
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toBe("machine stopped with no report (exit 137, signal 9, oomKilled)");
+    expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_lost");
+    await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a clean exit with no report ends dispatch_lost naming exit 0 (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    machineReads.set(triggerId, [{ state: "ended", exit: { exitCode: 0, signal: null, oomKilled: false, timestamp: 1 } }]);
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("machine stopped with no report (exit 0)");
+    expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_lost");
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a started read holds off the bootstrap timeout until the machine ends dispatch_lost (%s)", async (label) => {
+    const env = bootstrapEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    // Twelve started reads always span more than the 1 s bootstrap deadline (a sleep never fires early); the long total deadline is no limit.
+    const started = { state: "started" as const, exit: null };
+    machineReads.set(triggerId, [
+      ...Array.from({ length: 12 }, () => started),
+      { state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 1 } },
+    ]);
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toBe("machine stopped with no report (exit 137, signal 9, oomKilled)");
+    expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_lost");
+    expect(closeRowsFor(triggerId).some((c) => c.conclusion === "bootstrap_timeout")).toBe(false);
+    await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a null job id makes no readMachineRun call (%s)", async (label) => {
+    const env = deadlineEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines", jobIdUnknown: true });
+    machineReadCalls.length = 0;
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(machineReadCalls).toEqual([]);
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a report delivered before the machine read says ended wins (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    machineReads.set(triggerId, [{ state: "ended", exit: { exitCode: null, signal: null, oomKilled: null, timestamp: 1 } }]);
+    let release!: () => void;
+    machineReadGates.set(triggerId, new Promise<void>((resolve) => { release = resolve; }));
+    const done = runWorkflow(env.baseUrl(), triggerId);
+    await eventually(() => machineReadCalls.some((c) => c.jobId === `job-${triggerId}`), (ok) => ok, { label: "durable effect" });
+    await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+    release();
+    const outcome = await done;
+    expect(outcome.ok).toBe(true);
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a GitHub Actions dispatch never calls readMachineRun (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, {
+      dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
+      runStatusSequence: [{ status: "completed", conclusion: "failure" }],
+    });
+    machineReadCalls.length = 0;
+    await runWorkflow(env.baseUrl(), triggerId);
+    expect(machineReadCalls).toEqual([]);
+  }, 15_000);
+
   // ---- W5/W6/W7: GHA vs Fly watch behavior ----
   it.each(VARIANTS.map(([label]) => label))(
     "W5: GHA backend — the run concludes with no report: failure with dispatch_lost, no further watch calls (%s)",
@@ -1266,7 +1881,7 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
       expect(outcome.detail).toContain("failure");
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_lost");
 
       const callsAtFinish = scenarios.get(triggerId)!.runStatusCalls;
       await settle(WATCH_INTERVAL_MS * 2);
@@ -1281,14 +1896,18 @@ describe("KgRefresh durable workflow", () => {
       const env = envFor(label);
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
+      const held = gate("W6 first status read");
       makeScenario(triggerId, {
         dispatchOutcome: "accepted", runId, executionMode: "github-actions",
-        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+        runStatusSequence: [{ status: "in_progress", conclusion: null }], tickGate: held,
       });
 
       const done = runWorkflow(env.baseUrl(), triggerId);
-      await eventually(() => scenarios.get(triggerId)!.runStatusCalls >= 1, (ok) => ok, { label: "durable effect" });
+      // The first status read is held, so no tick can fire while the report is sent: the report is resolved
+      // before the workflow races its signal arms, in both variants. The order is fixed by the fake, not a tick.
+      await held.reached();
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      held.release();
 
       const outcome = await done;
       expect(outcome.ok).toBe(true);
@@ -1302,23 +1921,30 @@ describe("KgRefresh durable workflow", () => {
   it("the watch reads the run status at most one time for each watch interval", async () => {
     const scaledTick = 100;
     const scaledWorkflow = createKgRefreshWorkflow({
+      retentionMs: TEST_RETENTION_MS,
       rail,
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
       dispatch: dispatchFn,
-      appendJobLog: (input) => { appendJobLogCalls.push(input); },
-      closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
+      buildEnvelope: buildEnvelopeFn,
+      resolveDispatchRecord: resolveDispatchRecordFn,
+      ...projectionFakes,
+      recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
+      closeJobLog: (jobId, status, conclusion) => closeRowFake(jobId, status, conclusion),
+      markJobHeld: (jobId) => markJobHeldFake(jobId),
+      reopenHeldJob: (jobId) => reopenHeldJobFake(jobId),
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
-    stopMachineRun: stopMachineRunFn,
+      readMachineRun: readMachineRunFn,
+      stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: scaledTick * 4,
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
     });
-    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter]);
+    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     try {
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
@@ -1428,23 +2054,30 @@ describe("KgRefresh durable workflow", () => {
 
   it("W8c: with the run id unknown the reconcile read runs at the watch interval", async () => {
     const cadenceWorkflow = createKgRefreshWorkflow({
+      retentionMs: TEST_RETENTION_MS,
       rail,
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
       dispatch: dispatchFn,
-      appendJobLog: (input) => { appendJobLogCalls.push(input); },
-      closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
+      buildEnvelope: buildEnvelopeFn,
+      resolveDispatchRecord: resolveDispatchRecordFn,
+      ...projectionFakes,
+      recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
+      closeJobLog: (jobId, status, conclusion) => closeRowFake(jobId, status, conclusion),
+      markJobHeld: (jobId) => markJobHeldFake(jobId),
+      reopenHeldJob: (jobId) => reopenHeldJobFake(jobId),
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
-    stopMachineRun: stopMachineRunFn,
+      readMachineRun: readMachineRunFn,
+      stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: 1_000,
       totalDeadlineMs: 5_000,
       watchIntervalMs: 100,
     });
-    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter]);
+    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, {
@@ -1452,9 +2085,15 @@ describe("KgRefresh durable workflow", () => {
       });
       const outcome = await runWorkflow(cadenceEnv.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("bootstrap_timeout");
-      // One lookup inside dispatch plus about ten reconcile attempts across the deadline.
-      expect(scenarios.get(triggerId)!.findByTitleCalls).toBeGreaterThanOrEqual(6);
+      expect((await closeRowFor(triggerId)).conclusion).toBe("bootstrap_timeout");
+      // Machine speed changes how many ticks fit before the deadline, so assert the cadence and repetition, not a count.
+      const times = scenarios.get(triggerId)!.findByTitleCallTimes;
+      expect(times.length).toBeGreaterThanOrEqual(3);
+      // The first gap is skipped: call 1 is the dispatch-step lookup and the first reconcile follows at once.
+      // The last gap is skipped: awaitOwnedRun cuts the final sleep at the deadline.
+      for (let i = 2; i < times.length - 1; i++) {
+        expect(times[i] - times[i - 1]).toBeGreaterThanOrEqual(100 - 15);
+      }
     } finally {
       await cadenceEnv.stop();
     }
@@ -1469,8 +2108,30 @@ describe("KgRefresh durable workflow", () => {
 
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_rejected");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_rejected");
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.conclusion).toBe("dispatch_rejected");
+      expect(persisted?.held).toBeUndefined();
       expect(scenarios.get(triggerId)!.findByTitleCalls).toBe(1);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "W9b: a rejected dry-run dispatch carries its reason into the outcome and the report (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "rejected", dispatchReason: "No ref found for: x", executionMode: "github-actions" });
+      const report = { repo: KG_SOURCE_REPO, prNumber: 9, sha: "c".repeat(40) };
+      const beforeSticky = postOrUpdateStickyCommentFn.mock.calls.length;
+
+      const outcome = await runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report });
+
+      expect(outcome.ok).toBe(false);
+      expect(outcome.detail).toBe("dispatch was rejected: No ref found for: x");
+      expect(postOrUpdateStickyCommentFn.mock.calls.length - beforeSticky).toBe(1);
+      expect(JSON.stringify(postOrUpdateStickyCommentFn.mock.calls.at(-1))).toContain("dispatch was rejected: No ref found for: x");
     },
     15_000,
   );
@@ -1485,14 +2146,8 @@ describe("KgRefresh durable workflow", () => {
       const runId = runIdCounter++;
       makeScenario(triggerId, {
         dispatchOutcome: "accepted", runId, executionMode: "github-actions",
-        runStatusSequence: [
-          { status: "in_progress", conclusion: null },
-          { status: "in_progress", conclusion: null },
-          { status: "completed", conclusion: "cancelled" },
-        ],
+        runStatusSequence: [{ status: "in_progress", conclusion: null }],
       });
-
-      const beforeOutcome = onOutcomeCalls.length;
 
       await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
@@ -1502,12 +2157,14 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenarios.get(triggerId)!.cancelCalls === 1, (ok) => ok, { label: "durable effect" });
       // The marker must not release before the run reader reports "completed".
       expect(await kgRepoStatus(env.baseUrl())).not.toBeNull();
+      // Only now may the run conclude; the next cancel-phase read gets "completed".
+      scenarios.get(triggerId)!.runStatusSequence = [{ status: "completed", conclusion: "cancelled" }];
 
       const outcome = await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
       // The operator-cancelled path must not call onOutcome — only persistLastRefresh/closeJobLog fire.
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+      expect(outcomesFor(triggerId).length).toBe(0);
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
       void outcome;
     },
@@ -1518,7 +2175,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1029: GHA backend — in_progress status reads with no progress call outlive the bootstrap deadline (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       const held = gate("AII-1029 first status read");
       const scenario = makeScenario(triggerId, {
@@ -1526,7 +2183,7 @@ describe("KgRefresh durable workflow", () => {
         runStatusSequence: [{ status: "in_progress", conclusion: null }], tickGate: held,
       });
       const done = runWorkflow(env.baseUrl(), triggerId);
-      // Past the 1s bootstrap deadline and still before the total deadline.
+      // Past the 1s bootstrap deadline; the total deadline is long, so no limit is raced.
       await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
       held.release();
       // A second status read means the wait went on past the bootstrap deadline.
@@ -1536,7 +2193,7 @@ describe("KgRefresh durable workflow", () => {
 
       const outcome = await done;
       expect(outcome.ok).toBe(true);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+      expect((await closeRowFor(triggerId)).conclusion).not.toBe("bootstrap_timeout");
     },
     15_000,
   );
@@ -1544,7 +2201,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1029: GHA backend — a run that stays queued with no progress ends bootstrap_timeout and is cancelled once (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       const held = gate("AII-1029 queued first status read");
       const scenario = makeScenario(triggerId, {
@@ -1556,7 +2213,7 @@ describe("KgRefresh durable workflow", () => {
       held.release();
       const outcome = await done;
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
     },
     15_000,
@@ -1573,7 +2230,6 @@ describe("KgRefresh durable workflow", () => {
       const held = gate("total timeout first status read");
       const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "github-actions", tickGate: held });
       const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
 
       await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
@@ -1585,10 +2241,10 @@ describe("KgRefresh durable workflow", () => {
 
       expect(outcome.ok).toBe(false);
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
       // A real (non-dry-run) timeout still persists and notifies.
       expect(persistCalls.length - beforePersist).toBe(1);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
+      expect(outcomesFor(triggerId).length).toBe(1);
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -1601,7 +2257,6 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = newTriggerId();
       const held = gate("cancel failure first status read");
       const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions", tickGate: held });
-      const beforeOutcome = onOutcomeCalls.length;
       cancelTerminalFailure = true;
       try {
         const done = runWorkflow(env.baseUrl(), triggerId);
@@ -1611,8 +2266,8 @@ describe("KgRefresh durable workflow", () => {
         held.release();
         const outcome = await done;
         expect(outcome.ok).toBe(false);
-        expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
-        expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+        expect(outcomesFor(triggerId).length).toBe(1);
       } finally {
         cancelTerminalFailure = false;
       }
@@ -1638,10 +2293,44 @@ describe("KgRefresh durable workflow", () => {
       held.release();
       const outcome = await done;
       expect(outcome.ok).toBe(true);
-      expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
+      expect((await closeRowFor(triggerId)).status).toBe("completed");
     },
     15_000,
   );
+
+  describe("AII-1472: the row conclusion is the real outcome", () => {
+    const runWith = async (label: string, dryRun: boolean, body: Record<string, unknown>) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      const held = gate("report for row conclusion");
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "queued", conclusion: null }], tickGate: held,
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId, dryRun ? { dryRun: true } : {});
+      await held.reached();
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", body);
+      held.release();
+      await done;
+      return closeRowFor(triggerId);
+    };
+    it("a refused dry run closes failed with the failure code (disableRetries)", async () => {
+      const row = await runWith("disableRetries", true, { ok: false, failureCode: "KG_SNAPSHOT_REFUSED" });
+      expect(row).toMatchObject({ status: "failed", conclusion: "KG_SNAPSHOT_REFUSED" });
+    }, 15_000);
+    it("a refused dry run without a code still carries a conclusion (disableRetries)", async () => {
+      const row = await runWith("disableRetries", true, { ok: false });
+      expect(row).toMatchObject({ status: "failed", conclusion: "dry_run_refused" });
+    }, 15_000);
+    it("a dry run with warnings closes completed/warnings (alwaysReplay)", async () => {
+      const row = await runWith("alwaysReplay", true, { ok: true, guardVerdict: "warnings" });
+      expect(row).toMatchObject({ status: "completed", conclusion: "warnings" });
+    }, 15_000);
+    it("a clean dry run closes completed/passed (alwaysReplay)", async () => {
+      const row = await runWith("alwaysReplay", true, { ok: true, guardVerdict: "clean" });
+      expect(row).toMatchObject({ status: "completed", conclusion: "passed" });
+    }, 15_000);
+  });
 
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a report resolved while the bootstrap deadline passes wins over bootstrap_timeout (%s)",
@@ -1660,8 +2349,8 @@ describe("KgRefresh durable workflow", () => {
       held.release();
       const outcome = await done;
       expect(outcome.ok).toBe(true);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "completed" });
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+      expect((await closeRowFor(triggerId)).conclusion).not.toBe("bootstrap_timeout");
     },
     15_000,
   );
@@ -1685,7 +2374,7 @@ describe("KgRefresh durable workflow", () => {
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
       const outcome = await done;
       expect(outcome.ok).toBe(true);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+      expect((await closeRowFor(triggerId)).conclusion).not.toBe("bootstrap_timeout");
     },
     15_000,
   );
@@ -1712,7 +2401,7 @@ describe("KgRefresh durable workflow", () => {
       scenarios.get(triggerId)!.findByTitleResult = { runId };
       await done;
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
     },
     15_000,
   );
@@ -1720,7 +2409,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: cancel with no run ever found completes within the bootstrap window, not the total deadline (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       const held = gate("cancel first title lookup");
       const heldCancelWait = gate("cancel phase title lookup");
@@ -1738,17 +2427,17 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => Date.now(), (now) => now > started + BOOTSTRAP_DEADLINE_MS, { label: "wall clock past bootstrap window" });
       heldCancelWait.release();
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
-      // Bounded by cancel time + BOOTSTRAP_DEADLINE_MS (1s); the total deadline is 2.6s after dispatch.
-      expect(Date.now() - started).toBeLessThan(TOTAL_DEADLINE_MS);
+      // No elapsed-time assertion: the total deadline here is 30 s and the test timeout 15 s, so a cancel that
+      // ended at the total deadline could not pass. The cancel phase ended at the bootstrap window.
     },
     15_000,
   );
 
   // ---- AII-973: reconcile-first dispatch, workflow-owned expiry, tokens out of the journal ----
   it.each(VARIANTS.map(([label]) => label))(
-    "the workflow sends no KgRepo.expire (KgRepo owns the lease expiry), and no journal entry holds a token (%s)",
+    "the workflow sends no KgRepo.expire (nothing schedules a lease expiry), and no journal entry holds a token (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -1772,20 +2461,16 @@ describe("KgRefresh durable workflow", () => {
         { label: "the KgRefresh run invocation" },
       );
       const invocation = invocationRows[0];
-      const journalResponse = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({ query: `SELECT * FROM sys_journal WHERE id = '${invocation.id}'` }),
-      });
-      const journal = JSON.stringify(((await journalResponse.json()) as { rows: unknown[] }).rows);
-      expect(journal).toContain("dispatch");
+      const journal = JSON.stringify(await journalEntries(env.adminAPIBaseUrl(), invocation.id as string));
+      expect(await journalEntryNames(env.adminAPIBaseUrl(), invocation.id as string)).toEqual(expect.arrayContaining(["dispatch-1"]));
+      expect(await journalEntryNames(env.adminAPIBaseUrl(), invocation.id as string)).not.toContain("dispatch");
       expect(journal).not.toContain("mint-tokens");
       for (const token of ["run-token", "progress-token", "publication-token"]) {
         expect(journal).not.toContain(token);
         expect(journal).not.toContain(Buffer.from(token).toString("base64"));
       }
 
-      // the workflow never schedules the lease expiry; `KgRepo.submit` does
+      // nothing schedules the lease expiry: since AII-1297 `KgRepo.watch` releases the lock
       const expires = await queryInvocations(
         env.adminAPIBaseUrl(),
         `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'expire' AND invoked_by_target LIKE 'KgRefresh/${triggerId}/%'`,
@@ -1814,9 +2499,89 @@ describe("KgRefresh durable workflow", () => {
     30_000,
   );
 
+  // ---- AII-1130: the dispatch reads the FlyMachineProfile once, before the step ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1130: dispatch receives the profile's machine, a later run sees a changed profile, and a retried dispatch reuses the one read (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const setProfile = (patch: Partial<FlyMachineProfileConfig>) =>
+        callObject(env.baseUrl(), "FlyMachineProfile", "kg-refresh", "set", patch);
+      const defaults = FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"];
+
+      await setProfile({ memoryMb: 4096 });
+      const first = newTriggerId();
+      makeScenario(first, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const firstDone = runWorkflow(env.baseUrl(), first);
+      await eventually(() => scenarios.get(first)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      expect(dispatchedMachines.at(-1)).toEqual({ ...defaults, memoryMb: 4096 });
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "report", SUCCESS_REPORT);
+      expect((await firstDone).ok).toBe(true);
+
+      await setProfile({ memoryMb: 8192 });
+      await setProfile({ cpus: 4 });
+      const second = newTriggerId();
+      const retried = makeScenario(second, { dispatchOutcome: "accepted", executionMode: "github-actions", runId: undefined });
+      const secondRunId = runIdCounter++;
+      dispatchThrowAfterCommit.set(second, secondRunId);
+      const beforeGets = profileGets;
+      const beforeMachines = dispatchedMachines.length;
+      const secondDone = runWorkflow(env.baseUrl(), second);
+      await eventually(() => retried.dispatchCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await eventually(() => retried.runId === secondRunId, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", second, "report", SUCCESS_REPORT);
+      await secondDone; // the rail's stamp gate may revert a second run on the shared fixture; only the dispatch matters here
+      // the retry (if the dispatch step ran again) reuses the journaled read: one get, same machine every attempt
+      expect(profileGets - beforeGets).toBe(1);
+      const seen = dispatchedMachines.slice(beforeMachines);
+      expect(seen.length).toBeGreaterThanOrEqual(1);
+      for (const m of seen) expect(m).toEqual({ ...defaults, cpus: 4, memoryMb: 8192 });
+
+      await setProfile({ cpus: defaults.cpus, memoryMb: defaults.memoryMb });
+    },
+    60_000,
+  );
+
+  // ---- AII-1244: the GitHub Actions dispatch reads GhaRunProfile once, before the step ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1244: a GitHub Actions dispatch gets the stored jobTimeoutMinutes, a retried dispatch keeps the journaled one, and a Fly run reads no GHA profile (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const setGha = (patch: { jobTimeoutMinutes: number }) => callObject(env.baseUrl(), "GhaRunProfile", "kg-refresh", "set", patch);
+
+      const fly = newTriggerId();
+      makeScenario(fly, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const flyDone = runWorkflow(env.baseUrl(), fly);
+      await eventually(() => scenarios.get(fly)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      expect(dispatchedTimeouts.at(-1)).toBeNull();
+      await callWorkflow(env.baseUrl(), "KgRefresh", fly, "report", SUCCESS_REPORT);
+      await flyDone;
+
+      await setGha({ jobTimeoutMinutes: 120 });
+      const gha = newTriggerId();
+      const retried = makeScenario(gha, { dispatchOutcome: "accepted", executionMode: "github-actions", runId: undefined });
+      const runId = runIdCounter++;
+      dispatchThrowAfterCommit.set(gha, runId);
+      const beforeGets = ghaProfileGets;
+      const beforeTimeouts = dispatchedTimeouts.length;
+      const done = runWorkflow(env.baseUrl(), gha);
+      await eventually(() => retried.dispatchCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await setGha({ jobTimeoutMinutes: 300 }); // after the journaled read: a retry must not see it
+      await eventually(() => retried.runId === runId, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", gha, "report", SUCCESS_REPORT);
+      await done;
+      expect(ghaProfileGets - beforeGets).toBe(1);
+      const seen = dispatchedTimeouts.slice(beforeTimeouts);
+      expect(seen.length).toBeGreaterThanOrEqual(1);
+      for (const t of seen) expect(t).toBe(120);
+
+      await setGha({ jobTimeoutMinutes: GHA_RUN_PROFILE_DEFAULTS["kg-refresh"].jobTimeoutMinutes });
+    },
+    60_000,
+  );
+
   // ---- W13/W14: RailGateError conversion and revert ----
   it.each(VARIANTS.map(([label]) => label))(
-    "W13: a RailGateError at verify reverts once and fails, status named verify beforehand (%s)",
+    "W13: a RailGateError at verify reverts once and fails, the run journaled verify beforehand (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -1825,47 +2590,44 @@ describe("KgRefresh durable workflow", () => {
       const done = runWorkflow(env.baseUrl(), triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
 
-      // verifyGate's first check (the "answers" gate) is a synchronous env-var read with no
-      // suspension point of its own, so the step is set and the gate fails within the same
-      // tick — well under a 10ms poll's granularity. Verify's canary is its first call into
-      // the rail fakes, so hold that sidecar call open until the poll has actually observed
-      // "verify", then let the sidecar die so the gate fails, at the canary, as a real one would.
-      const verifyLatch = boundedLatch(STATUS_LATCH_MAX_MS);
-      const releaseVerifyGate = verifyLatch.release;
+      // Hold verify's canary, the `kg_hybrid_search` call. The mcpToolCall fake lets fetch's
+      // `kg_neighbors` served-stamp read through and parks only the canary, signalling `canaryHeld`
+      // as it parks, so the body knows the run is inside verify without polling. While it is held
+      // the body reads `status` once and asserts it answers `verify` (form a); then it releases the
+      // latch and the sidecar dies so the gate fails at the canary, as a real one would. The bound
+      // is a safety net, not the wait.
+      const canaryHeld = gate("verify canary (kg_hybrid_search) held");
+      const verifyLatch = boundedLatch(W13_LATCH_MAX_MS);
       holdNextMcpCall = verifyLatch.promise;
-
-      // Poll `status` concurrently with the run so it observes the "verify" step while the
-      // workflow is still executing it — a single point-in-time check would race the failure
-      // path, which reverts and completes soon after. Collecting every observed step over
-      // the run's lifetime proves `ctx.set("step", "verify")` was visible before the failure,
-      // the same timing-sensitive polling pattern `eventually()` uses elsewhere in this suite.
-      const observedSteps = new Set<string | null>();
-      let polling = true;
-      const statusPoll = (async () => {
-        while (polling) {
-          try {
-            const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-            observedSteps.add(status.step);
-            if (status.step === "verify") releaseVerifyGate();
-          } catch {
-            // the workflow may be mid-transition between invocations; retry on the next tick.
-          }
-          await new Promise((resolve) => setTimeout(resolve, 10)); // restate-test-allow: samples the step over the run's lifetime
-        }
-      })();
+      // canaryHeld is only a signal (no release()); verifyLatch does the park and release.
+      onMcpCallHeld = () => void canaryHeld.wait();
 
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await canaryHeld.reached();
+      const heldStatus = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+      expect(heldStatus.step).toBe("verify");
+      // The journal assertion below still pins the order: swap, verify, revert, failed.
+      verifyLatch.release();
+
       const outcome = await done;
-      polling = false;
-      releaseVerifyGate(); // no-op if already released; unblocks the poll loop regardless
-      await statusPoll;
+      const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+      const runs = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
+        (r) => r.length === 1,
+        { label: "the KgRefresh run invocation" },
+      );
+      const journaledSteps = (await journalEntries(env.adminAPIBaseUrl(), runs[0].id as string)).flatMap((entry) => {
+        const set = JSON.parse(String(entry.entry_json ?? "null"))?.Command?.SetState as { key: string; value: number[] } | undefined;
+        return set?.key === "step" ? [JSON.parse(Buffer.from(set.value).toString("utf8")) as string] : [];
+      });
 
       expect(outcome.ok).toBe(false);
       expect(outcome.gate).toBe("canary");
-      expect(observedSteps.has("verify"), `step "verify" was not observed within the ${STATUS_LATCH_MAX_MS}ms latch bound`).toBe(true);
+      expect(status.step).toBe("failed");
+      expect(journaledSteps.slice(journaledSteps.indexOf("swap"))).toEqual(["swap", "verify", "revert", "failed"]);
       // swap's own restart (1) plus revertRail's restart while reverting (1).
       expect(restartCallCount).toBe(2);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("canary");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("canary");
     },
     15_000,
   );
@@ -1876,52 +2638,38 @@ describe("KgRefresh durable workflow", () => {
       const env = envFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-      // swapGate's restart call fails with no suspension point of its own, so hold it open
-      // until a concurrent status poll has actually observed "swap", then fail it exactly as
-      // before. The latch is bounded: if the poll never sees "swap" the restart proceeds after
-      // STATUS_LATCH_MAX_MS and the assertion below fails with a named message.
-      // Only the first restart fails (inside swapGate itself); revertRail's own restart call
-      // afterward must still succeed so the workflow can report a reverted outcome.
-      const swapLatch = boundedLatch(STATUS_LATCH_MAX_MS);
-      const releaseSwapGate = swapLatch.release;
+      // Hold swapGate's restart call open on a gate: the `step` write runs just before the gate,
+      // so while the restart is parked the run is inside swap and one `status` read answers
+      // "swap". Then release it and fail it with the same RailGateError.
+      // Only the first restart is held and fails (inside swapGate itself); revertRail's own
+      // restart call afterward must still succeed so the workflow can report a reverted outcome.
+      const swapHeld = gate("swap restart held");
       let swapAttempts = 0;
       restartImpl = async () => {
         swapAttempts++;
         if (swapAttempts !== 1) return;
-        await swapLatch.promise;
+        await swapHeld.wait();
         throw new RailGateError("staging", "forced swap failure for W14");
       };
 
       const done = runWorkflow(env.baseUrl(), triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
 
-      // Poll `status` concurrently with the run so it observes the "swap" step while the
-      // workflow is still executing it, mirroring W13's polling pattern.
-      const observedSteps = new Set<string | null>();
-      let polling = true;
-      const statusPoll = (async () => {
-        while (polling) {
-          try {
-            const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-            observedSteps.add(status.step);
-            if (status.step === "swap") releaseSwapGate();
-          } catch {
-            // the workflow may be mid-transition between invocations; retry on the next tick.
-          }
-          await new Promise((resolve) => setTimeout(resolve, 10)); // restate-test-allow: samples the step over the run's lifetime
-        }
-      })();
-
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
-      const outcome = await done;
-      polling = false;
-      releaseSwapGate(); // no-op if already released; unblocks the poll loop regardless
-      await statusPoll;
+      let outcome;
+      try {
+        await swapHeld.reached();
+        const heldStatus = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(heldStatus.step).toBe("swap");
+      } finally {
+        // Release even when the assertion fails, so the run is not left held in the shared environment.
+        swapHeld.release();
+        outcome = await done;
+      }
 
       expect(outcome.ok).toBe(false);
-      expect(observedSteps.has("swap"), `step "swap" was not observed within the ${STATUS_LATCH_MAX_MS}ms latch bound`).toBe(true);
       expect(restartCallCount).toBe(2);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("staging");
     },
     15_000,
   );
@@ -1951,7 +2699,7 @@ describe("KgRefresh durable workflow", () => {
       expect(existsSync(join(dataRoot, "rejected"))).toBe(false);
       expect(existsSync(join(dataRoot, "staging"))).toBe(false);
       expect(restartCallCount).toBe(0);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("staging");
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -1977,7 +2725,7 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.ok).toBe(false);
       // swap's own failing restart (1) plus revertRail's restart while reverting (1).
       expect(restartCallCount).toBe(2);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "failed" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed" });
     },
     15_000,
   );
@@ -2006,75 +2754,11 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.dryRun).toBe(true);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
       expect(postOrUpdateStickyCommentFn.mock.calls.length - beforeSticky).toBe(1);
-      // Q7: the outcome goes to KgRepo for the PR's label path — one send, holding the outcome the report carried.
-      const stored = await eventually(
-        () => callObject<{ sha: string; outcome: unknown } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
-        (v) => v !== null,
-        { label: "durable effect" },
-      );
-      expect(stored).toEqual({ sha: report.sha, outcome });
+      // The journaled send to the no-op `recordDryRunOutcome` stays for one release; nothing is stored or read back.
       await eventually(async () => (await recordSends()).length - beforeRecorded, (n) => n >= 1, { label: "durable effect" });
       await settle(300);
       expect((await recordSends()).length - beforeRecorded).toBe(1);
-      expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
-    },
-    15_000,
-  );
-
-  const readAdminDryRun = (baseUrl: string) =>
-    callObject<RefreshOutcome | null>(baseUrl, "KgRepo", KG_SOURCE_REPO, "lastAdminDryRun", undefined);
-
-  it.each(VARIANTS.map(([label]) => label))(
-    "AII-1036: an admin dry run (no report target) that passes stores its outcome under lastAdminDryRun, without the last-refresh record or a notification (%s)",
-    async (label) => {
-      const env = envFor(label);
-      const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-      const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
-      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
-      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
-      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
-      const outcome = await done;
-      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
-      expect(stored).toEqual(outcome);
-      expect(persistCalls.length - beforePersist).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
-    },
-    15_000,
-  );
-
-  it.each(VARIANTS.map(([label]) => label))(
-    "AII-1036: an admin dry run the guard refuses stores ok:false with its part table (%s)",
-    async (label) => {
-      const env = envFor(label);
-      const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-      const partTable = [{ part: "issues", prev: "10", new: "4" }];
-      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
-      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
-      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: false, failureReason: "shrink refused", partTable });
-      const outcome = await done;
-      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
-      expect(stored).toMatchObject({ ok: false, detail: "shrink refused", dryRun: true, partTable });
-    },
-    15_000,
-  );
-
-  it.each(VARIANTS.map(([label]) => label))(
-    "AII-1036: an admin dry run that fails before a report stores the failure and writes no last-refresh record (%s)",
-    async (label) => {
-      const env = envFor(label);
-      const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
-      const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
-      const outcome = await runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
-      expect(outcome.ok).toBe(false);
-      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
-      expect(stored).toMatchObject({ ok: false, dryRun: true, detail: outcome.detail });
-      expect(persistCalls.length - beforePersist).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+      expect((await closeRowFor(triggerId)).status).toBe("completed");
     },
     15_000,
   );
@@ -2086,7 +2770,6 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const beforeOutcome = onOutcomeCalls.length;
 
       const done = runWorkflow(env.baseUrl(), triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
@@ -2095,9 +2778,9 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await done;
       expect(outcome.ok).toBe(true);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
-      expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "no-new-data", meta: { failureCode: "KG_SNAPSHOT_STALE" } });
+      expect((await closeRowFor(triggerId)).status).toBe("completed");
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "no-new-data", meta: { failureCode: "KG_SNAPSHOT_STALE" } });
     },
     15_000,
   );
@@ -2123,6 +2806,228 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  // ---- AII-1127: the runner's steps are durable promises; status names the one in flight ----
+  describe("runner step reports", () => {
+    const stepBody = (id: string, status: string, extra: Record<string, unknown> = {}) => ({
+      step: {
+        id, type: "custom", status, started_at: "2026-10-07T00:00:00.000Z", ended_at: null,
+        parent_step_id: null, inputs: {}, outputs: {}, logs_url: null, ...extra,
+      },
+    });
+    const runnerStep = (baseUrl: string, triggerId: string) =>
+      callWorkflow<{ runnerStep: { id: string; status: string } | null }>(baseUrl, "KgRefresh", triggerId, "status").then((st) => st.runnerStep);
+
+    // `runWorkflow` returns the run's own promise; wrapping it in an object keeps `await` from waiting for the whole run.
+    async function parkedRun(
+      baseUrl: string, triggerId: string, executionMode: "fly-machines" | "github-actions" = "fly-machines",
+    ): Promise<{ done: Promise<RefreshOutcome> }> {
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode });
+      const done = runWorkflow(baseUrl, triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      return { done };
+    }
+
+    // AII-1134: the table the run keeps after `report`.
+    async function deliverSteps(baseUrl: string, triggerId: string) {
+      for (const id of ["clone", "kg-ingest", "kg-snapshot-push"]) {
+        await callWorkflow(baseUrl, "KgRefresh", triggerId, "progress", stepBody(id, "running"));
+        await callWorkflow(baseUrl, "KgRefresh", triggerId, "progress", stepBody(id, "passed", { ended_at: "2026-10-07T00:00:05.000Z" }));
+      }
+    }
+    const expectedTable = ["clone", "kg-ingest", "kg-snapshot-push"].map((id) => ({
+      id, status: "passed", startedAt: "2026-10-07T00:00:00.000Z", endedAt: "2026-10-07T00:00:05.000Z", durationMs: 5000,
+    }));
+
+    it.each(VARIANTS.map(([label]) => label))("the persisted outcome lists the reported steps in pipeline order (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await deliverSteps(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.steps).toEqual(expectedTable);
+      expect(persisted?.steps?.some((st) => st.id === "kg-tracker-data")).toBe(false);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a gate failure after report still persists the step table (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await deliverSteps(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", GENERIC_FAILURE_REPORT);
+      const outcome = await done;
+      expect(outcome.ok).toBe(false);
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.ok).toBe(false);
+      expect(persisted?.steps).toEqual(expectedTable);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step with only a running body has null endedAt and durationMs (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.steps).toEqual([
+        { id: "clone", status: "running", startedAt: "2026-10-07T00:00:00.000Z", endedAt: null, durationMs: null },
+      ]);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a run with no step bodies persists no step table (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted).toBeDefined();
+      expect(persisted?.steps ?? []).toEqual([]);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("status names the last reported runner step; a repeat changes nothing (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toBeNull();
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "passed"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("kg-ingest", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      // A repeated delivery is left alone, and an older step does not move the report backwards.
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+    }, 20_000);
+
+    // AII-1149: the step report is one contract for every backend; the GitHub Actions backend resolves the same promises.
+    it.each(VARIANTS.map(([label]) => label))("a GitHub Actions run names the runner step in flight (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId, "github-actions");
+      expect(await runnerStep(env.baseUrl(), triggerId)).toBeNull();
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "passed"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("kg-ingest", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step report resolves the progress heartbeat; a body-less progress does too (%s)", async (label) => {
+      const env = envFor(label);
+      const first = newTriggerId();
+      const { done: doneFirst } = await parkedRun(env.baseUrl(), first);
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "progress", stepBody("clone", "running"));
+      const response = await fetch(`${env.baseUrl()}/KgRefresh/${first}/progress`, { method: "POST" });
+      expect(response.ok).toBe(true);
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "report", SUCCESS_REPORT);
+      await doneFirst;
+
+      // An old runner image sends no step and no body at all.
+      const second = newTriggerId();
+      const { done: doneSecond } = await parkedRun(env.baseUrl(), second);
+      const bare = await fetch(`${env.baseUrl()}/KgRefresh/${second}/progress`, { method: "POST" });
+      expect(bare.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), second)).toBeNull();
+      await callWorkflow(env.baseUrl(), "KgRefresh", second, "report", SUCCESS_REPORT);
+      await doneSecond;
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step report after completion answers 2xx and changes nothing (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+
+      const late = await fetch(`${env.baseUrl()}/KgRefresh/${triggerId}/progress`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(stepBody("kg-ingest", "running")),
+      });
+      expect(late.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an unknown step id is accepted but creates no promise and leaves runnerStep unchanged (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      const res = await fetch(`${env.baseUrl()}/KgRefresh/${triggerId}/progress`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(stepBody("not-a-step", "running")),
+      });
+      expect(res.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      const promises = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: the one sanctioned admin read
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT * FROM sys_promise WHERE service_name = 'KgRefresh' AND service_key = '${triggerId}'` }),
+      });
+      const rows = ((await promises.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      expect(JSON.stringify(rows)).not.toContain("not-a-step");
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("the callback redacts credentials before the ingress journals the step (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      const SENTINEL = "ghs_SENTINEL_credential_value";
+      const secret = "restate-test-secret";
+      // Token verification reads SQLite; this scenario is about the ingress, so verification is stubbed.
+      vi.resetModules();
+      vi.doMock("../../runner-tokens.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof import("../../runner-tokens.js")>()),
+        verifyRunToken: () => ({ ok: true, claims: { phase: "kg-refresh", audience: "progress", dispatchId: triggerId, issueId: "kg" } }),
+      }));
+      const { handleRunnerProgress } = await import("../../runner-callback.js");
+      const token = "stubbed";
+      const res = await handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        secret,
+        kgRefreshClient: createKgRefreshIngressClient(env.baseUrl()),
+        body: stepBody("clone", "passed", {
+          inputs: { githubToken: SENTINEL, machineNonce: SENTINEL, repoOwner: "org" },
+          outputs: { githubToken: SENTINEL, workspaceDir: "/w" },
+        }) as never,
+      });
+      vi.doUnmock("../../runner-tokens.js");
+      expect(res.status).toBe(200);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+
+      const status = await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "status");
+      expect(JSON.stringify(status)).not.toContain(SENTINEL);
+      const promises = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: the one sanctioned admin read
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT * FROM sys_promise WHERE service_name = 'KgRefresh' AND service_key = '${triggerId}'` }),
+      });
+      expect(promises.ok).toBe(true);
+      const rows = ((await promises.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      expect(rows.some((row) => JSON.stringify(row).includes("step:clone:ended"))).toBe(true);
+      expect(JSON.stringify(rows)).not.toContain(SENTINEL);
+      // The value is stored as bytes, so check the encoded sentinel too.
+      expect(JSON.stringify(rows)).not.toContain(JSON.stringify(Array.from(Buffer.from(SENTINEL))).slice(1, -1));
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+    }, 20_000);
+  });
+
   // ---- W18: registered deployment options ----
   it.each(VARIANTS.map(([label]) => label))("a run call with a non-object input is rejected by the schema (%s)", async (label) => {
     const env = envFor(label);
@@ -2142,7 +3047,7 @@ describe("KgRefresh durable workflow", () => {
     }
   });
 
-  it("W18: the registered workflow advertises seven-day retention and the two timeouts", async () => {
+  it("W18: the registered workflow advertises the built retention and the two timeouts", async () => {
     const env = envFor("alwaysReplay");
     // Deploy metadata is only populated once the service has been invoked at least once.
     const triggerId = newTriggerId();
@@ -2152,11 +3057,27 @@ describe("KgRefresh durable workflow", () => {
     const response = await fetch(`${env.adminAPIBaseUrl()}/services/KgRefresh`);
     expect(response.ok).toBe(true);
     const metadata = (await response.json()) as Record<string, unknown>;
-    expectDurationMs(metadata.workflow_completion_retention, KG_REFRESH_RETENTION_MS, "workflow_completion_retention");
-    expectDurationMs(metadata.journal_retention, KG_REFRESH_RETENTION_MS, "journal_retention");
+    expectDurationMs(metadata.workflow_completion_retention, TEST_RETENTION_MS, "workflow_completion_retention");
+    expectDurationMs(metadata.journal_retention, TEST_RETENTION_MS, "journal_retention");
     expectDurationMs(metadata.inactivity_timeout, 15 * 60 * 1000, "inactivity_timeout");
     expectDurationMs(metadata.abort_timeout, 20 * 60 * 1000, "abort_timeout");
   }, 15_000);
+
+  it("W18b: a workflow built with a ten-day retentionMs registers ten days", async () => {
+    const tenDays = 10 * 24 * 60 * 60 * 1000;
+    const tenDayWorkflow = createKgRefreshWorkflow({ ...workflowDeps, retentionMs: tenDays, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000 });
+    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
+    try {
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
+      await runWorkflow(tenDayEnv.baseUrl(), triggerId);
+      const metadata = (await (await fetch(`${tenDayEnv.adminAPIBaseUrl()}/services/KgRefresh`)).json()) as Record<string, unknown>;
+      expectDurationMs(metadata.workflow_completion_retention, tenDays, "workflow_completion_retention");
+      expectDurationMs(metadata.journal_retention, tenDays, "journal_retention");
+    } finally {
+      await tenDayEnv.stop();
+    }
+  }, 30_000);
 
   // ---- W12: a crash after `stage`, then replay — fetch/stage do not re-run; swap/verify do ----
   it("W12: a crash injected after stage replays without re-running fetch or stage", async () => {
@@ -2198,6 +3119,7 @@ describe("KgRefresh durable workflow", () => {
     let releaseLatch: () => void = () => {};
     const latch = new Promise<void>((resolve) => { releaseLatch = resolve; });
     const buildCrashWorkflow = (endpointId: string) => createKgRefreshWorkflow({
+      retentionMs: TEST_RETENTION_MS,
       rail: railWithCounter,
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: (input) => {
@@ -2205,12 +3127,18 @@ describe("KgRefresh durable workflow", () => {
       return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
       dispatch: dispatchFn,
-      appendJobLog: (input) => { appendJobLogCalls.push(input); },
-      closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
+      buildEnvelope: buildEnvelopeFn,
+      resolveDispatchRecord: resolveDispatchRecordFn,
+      ...projectionFakes,
+      recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
+      closeJobLog: (jobId, status, conclusion) => closeRowFake(jobId, status, conclusion),
+      markJobHeld: (jobId) => markJobHeldFake(jobId),
+      reopenHeldJob: (jobId) => reopenHeldJobFake(jobId),
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
-    stopMachineRun: stopMachineRunFn,
+      readMachineRun: readMachineRunFn,
+      stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       afterStageCommitted: async () => {
@@ -2224,7 +3152,7 @@ describe("KgRefresh durable workflow", () => {
     const crashWorkflow = buildCrashWorkflow("original");
     const replacementWorkflow = buildCrashWorkflow("replacement");
 
-    const env = await startRetryEnabled([crashWorkflow, kgRepo]);
+    const env = await startRetryEnabled([crashWorkflow, kgRepo, flyMachineProfile, ghaRunProfile]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
       // Dispatches through the real KgRepo.trigger (not a direct KgRefresh.run call) so the
@@ -2242,8 +3170,8 @@ describe("KgRefresh durable workflow", () => {
       const stagingMarker = join(dataRoot, "staging", COMPLETION_MARKER);
       await eventually(() => existsSync(stagingMarker) && stageCommittedAttempts.length >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 12_000 });
 
-      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo]);
-      await env.startedRestateContainer.restart();
+      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo, flyMachineProfile, ghaRunProfile]);
+      await env.startedRestateServer.restart();
 
       // The restart severs the blocked first attempt's connection; Restate retries the
       // step on the replacement endpoint, which is the not-yet-blocked second call.
@@ -2265,6 +3193,1500 @@ describe("KgRefresh durable workflow", () => {
       await env.stop();
     }
   }, 60_000);
+
+  // ---- AII-1136: the kept machine. The real FlyMachineProfile object, a fake Fly, and the real
+  // `launchKeptMachine` as the dispatch, so the workflow's claim / attach / release / keep wiring runs end to end. ----
+  describe("AII-1136: the workflow keeps one Fly machine between refreshes", () => {
+    class FakeFly implements KeptMachineFly {
+      machines = new Map<string, { state: string; config: Machine["config"] }>();
+      calls: string[] = [];
+      private nextId = 1;
+      async getMachine(id: string): Promise<Machine> {
+        const m = this.machines.get(id);
+        if (!m) throw new Error(`Failed to get machine ${id} (404): not found`);
+        return { id, state: m.state, config: m.config } as unknown as Machine;
+      }
+      async listMachines(): Promise<Machine[]> {
+        return [...this.machines].map(([id, m]) => ({ id, state: m.state, config: m.config }) as unknown as Machine);
+      }
+      async createMachine(opts: CreateMachineOpts): Promise<Machine> {
+        const id = `m-${this.nextId++}`;
+        this.machines.set(id, { state: "started", config: opts.config });
+        this.calls.push(`create:${id}`);
+        return { id } as unknown as Machine;
+      }
+      async updateMachine(id: string, config: Machine["config"]): Promise<void> {
+        this.machines.get(id)!.config = config;
+        this.calls.push(`update:${id}`);
+      }
+      async waitSettled(id: string): Promise<Machine | null> {
+        return this.machines.has(id) ? this.getMachine(id) : null;
+      }
+      async waitForStopped(): Promise<void> {}
+      async startMachine(id: string): Promise<void> {
+        this.machines.get(id)!.state = "started";
+        this.calls.push(`start:${id}`);
+      }
+      async stopMachine(id: string): Promise<void> {
+        this.machines.get(id)!.state = "stopped";
+        this.calls.push(`stop:${id}`);
+      }
+      async destroyMachine(id: string): Promise<void> {
+        this.machines.delete(id);
+        this.calls.push(`destroy:${id}`);
+      }
+      /** The runner exiting on its own after its report. */
+      runnerExits(id: string): void {
+        this.machines.get(id)!.state = "stopped";
+      }
+    }
+
+    let fly: FakeFly;
+    let profileFlyCalls: string[];
+    let readGate: Gate | null;
+
+    const profileObject = createFlyMachineProfile({
+      fly: {
+        getMachine: (id) => fly.getMachine(id),
+        clearMachineEnv: async (id, metadata) => { profileFlyCalls.push(`clear-env:${id}:${Object.keys(metadata ?? {}).join(",")}`); },
+        destroyMachine: async (id, app) => { profileFlyCalls.push(`destroy:${id}${app ? `@${app}` : ""}`); },
+      },
+    });
+    // The sessions app the dispatch creates in and `resolveFlyApp` reports; unset leaves the app check off.
+    let currentFlyApp: string | undefined;
+
+    async function keptDispatch(input: KgDispatchInput): Promise<KgDispatchResult> {
+      const scenario = scenarios.get(input.dispatchId)!;
+      scenario.dispatchCalls++;
+      const machineConfig = {
+        config: { image: "img", env: { MACHINE_NONCE: `nonce-${input.dispatchId}` }, metadata: { dispatch_id: input.dispatchId } },
+      } as unknown as CreateMachineOpts;
+      const launched = await launchKeptMachine(fly, {
+        keptMachineId: input.machineId, dispatchId: input.dispatchId, machineConfig, machineNonce: `nonce-${input.dispatchId}`,
+      });
+      return { outcome: "accepted", jobId: launched.machineId, executionMode: "fly-machines", machineId: launched.machineId, created: launched.created, replaced: launched.replaced, ...(currentFlyApp && { app: currentFlyApp }) };
+    }
+
+    const keptStopCalls: Array<{ jobId: string; keep: boolean }> = [];
+    function buildKeptWorkflow() {
+      return createKgRefreshWorkflow({
+        ...workflowDeps,
+        dispatch: keptDispatch,
+        resolveFlyApp: () => currentFlyApp ?? null,
+        stopMachineRun: async (_mode, jobId, keep) => {
+          keptStopCalls.push({ jobId, keep: keep === true });
+          if (keep) await fly.stopMachine(jobId);
+          else await fly.destroyMachine(jobId);
+          return true;
+        },
+        readMachineRun: async () => {
+          if (readGate) await readGate.wait();
+          return { state: "started", exit: null };
+        },
+        bootstrapDeadlineMs: 30_000,
+        totalDeadlineMs: 60_000,
+      });
+    }
+
+    const profileStatus = (baseUrl: string) =>
+      callObject<{ machine: KeptMachineState | null }>(baseUrl, "FlyMachineProfile", "kg-refresh", "status", undefined);
+    const expireSends = (env: RestateEnvironment) => queryInvocations(
+      env.adminAPIBaseUrl(),
+      "target_service_name = 'FlyMachineProfile' AND target_service_key = 'kg-refresh' AND target_handler_name = 'expire'",
+    );
+
+    beforeEach(() => {
+      fly = new FakeFly();
+      profileFlyCalls = [];
+      readGate = null;
+      keptStopCalls.length = 0;
+    });
+
+    async function startRun(env: RestateEnvironment): Promise<{ triggerId: string; done: Promise<RefreshOutcome> }> {
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 1, (ok) => ok, { label: "dispatched" });
+      return { triggerId, done };
+    }
+
+    it("two refreshes in a row: the first creates and attaches, the second reuses with update then start", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        expect(fly.calls).toEqual(["create:m-1"]);
+        expect(profileFlyCalls).toEqual(["clear-env:m-1:durable_until"]);
+        fly.runnerExits("m-1");
+        await eventually(() => expireSends(env), (rows) => rows.length === 1, { label: "first expire scheduled" });
+
+        fly.calls.length = 0;
+        const second = await startRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(fly.calls).toEqual(["update:m-1", "start:m-1"]);
+        expect(status.machine?.machineId).toBe("m-1");
+        // one expire per release
+        await eventually(() => expireSends(env), (rows) => rows.length === 2, { label: "second expire scheduled" });
+      } finally {
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("a destroyed kept machine is replaced: attach replaces it and release scrubs the new machine", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        fly.machines.get("m-1")!.state = "destroyed";
+
+        fly.calls.length = 0;
+        profileFlyCalls.length = 0;
+        const second = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-2", { label: "replacement recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(fly.calls).toEqual(["create:m-2"]);
+        expect(profileFlyCalls).toContain("clear-env:m-2:durable_until");
+        expect(profileFlyCalls.filter((c) => c.endsWith(":m-1"))).toEqual([]);
+      } finally {
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("a refresh after a sessions-app change destroys the old kept machine in its app and creates one in the current app", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = "app-a";
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        expect((await profileStatus(env.baseUrl())).machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+
+        fly.calls.length = 0;
+        profileFlyCalls.length = 0;
+        currentFlyApp = "app-b";
+        const second = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-2", { label: "new machine recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-2", app: "app-b" });
+        expect(fly.calls).toEqual(["create:m-2"]);
+        expect(profileFlyCalls).toContain("destroy:m-1@app-a");
+      } finally {
+        currentFlyApp = undefined;
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("AII-1276: a reuse of a kept machine with no recorded app backfills the app, and the hold is released", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = undefined;
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        expect((await profileStatus(env.baseUrl())).machine?.app).toBeUndefined();
+        fly.runnerExits("m-1");
+
+        fly.calls.length = 0;
+        currentFlyApp = "app-a";
+        const second = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.app === "app-a", { label: "app backfilled" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+        expect(fly.calls).toEqual(["update:m-1", "start:m-1"]);
+      } finally {
+        currentFlyApp = undefined;
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("AII-1276: a reuse where the app is already recorded leaves the machine and app unchanged", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = "app-a";
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        fly.runnerExits("m-1");
+
+        fly.calls.length = 0;
+        profileFlyCalls.length = 0;
+        const second = await startRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+        expect(fly.calls).toEqual(["update:m-1", "start:m-1"]);
+        expect(profileFlyCalls.filter((c) => c.startsWith("destroy:"))).toEqual([]);
+      } finally {
+        currentFlyApp = undefined;
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("a cancel during the wait stops the kept machine, releases it, and keeps its id", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        const run = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", run.triggerId, "cancel", { reason: "operator requested" });
+        await run.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "release" });
+        expect(fly.calls).toEqual(["create:m-1", "stop:m-1"]);
+        expect(keptStopCalls).toEqual([{ jobId: "m-1", keep: true }]);
+        expect(status.machine?.machineId).toBe("m-1");
+        expect(fly.machines.has("m-1")).toBe(true);
+      } finally {
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("a crash after the dispatch step does not send attach again", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+      try {
+        const held = gate("first machine read");
+        readGate = held;
+        // Started through KgRepo's one-way send: no ingress request may stay open across the restart.
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (triggered as { triggerId: string }).triggerId;
+        const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+        await eventually(() => scenario.dispatchCalls >= 1, (ok) => ok, { label: "dispatched" });
+        await held.reached();
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+
+        replacement = await replaceEndpoint(env, [buildKeptWorkflow(), kgRepo, starter, profileObject]);
+        await env.startedRestateServer.restart();
+        readGate.release();
+
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", GENERIC_FAILURE_REPORT);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "release" });
+        expect(status.machine?.machineId).toBe("m-1");
+        expect(fly.calls).toEqual(["create:m-1"]);
+        const attaches = await queryInvocations(
+          env.adminAPIBaseUrl(),
+          "target_service_name = 'FlyMachineProfile' AND target_service_key = 'kg-refresh' AND target_handler_name = 'attach'",
+        );
+        expect(attaches).toHaveLength(1);
+      } finally {
+        readGate?.release();
+        replacement?.close();
+        await env.stop();
+      }
+    }, 90_000);
+  });
+  describe("AII-1489: a held snapshot is a KgRepo record, not a suspended run", () => {
+    const DECISION_TIMEOUT_MS = 8 * 3_600_000;
+    const HELD_REPORT: KgRefreshReportBody = {
+      ok: false, failureCode: "KG_SNAPSHOT_HELD", failureReason: "snapshot shrank",
+      snapshotPr: 77, snapshotCommit: "cafe1234", snapshotBranch: "kg-refresh/snapshot-77",
+      partTable: [{ part: "graph", prev: "100", new: "40" }],
+    };
+    const ACCEPT = { action: "accept", actor: "ada@example.com" } as const;
+    const heldWorkflow = createKgRefreshWorkflow({
+      ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: DECISION_TIMEOUT_MS,
+    });
+    let heldEnvs: Map<string, RestateEnvironment>;
+    beforeAll(async () => {
+      heldEnvs = await startVariants([heldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools]);
+      setKgRefreshToolDeps({ kgSourceRepo: KG_SOURCE_REPO } as unknown as KgRefreshToolDeps);
+    }, 120_000);
+    afterAll(async () => {
+      setKgRefreshToolDeps(null);
+      await stopAll(heldEnvs);
+    });
+    const LABELS = VARIANTS.map(([label]) => label);
+
+    const readStatus = (baseUrl: string, triggerId: string) =>
+      callWorkflow<{ step: string | null }>(baseUrl, "KgRefresh", triggerId, "status", {});
+    /** Completed invocations of a handler: a send that was only enqueued does not count. */
+    const countSends = async (env: RestateEnvironment, service: string, key: string, handler: string) =>
+      (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}' AND status = 'completed'`,
+      )).length;
+    /** Invocations of one target that have not completed. */
+    const openInvocations = (env: RestateEnvironment, where: string) =>
+      queryInvocations(env.adminAPIBaseUrl(), `${where} AND status <> 'completed'`);
+    /** The decision timers `KgRepo.hold` armed: scheduled `KgRepo/decide` invocations. */
+    const scheduledDecides = async (env: RestateEnvironment) =>
+      (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'decide' AND status = 'scheduled'`,
+      )).length;
+
+    /** Sent invocations of a handler, completed or not: a send the run journaled exists as soon as the run ends. */
+    const sentInvocations = async (env: RestateEnvironment, service: string, key: string, handler: string) =>
+      (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`,
+      )).length;
+    /** `KgRepo.decide`, the one decision door. */
+    const decideRepo = (env: RestateEnvironment, body: Record<string, unknown>) =>
+      callObject<{ triggerId: string } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "decide", body);
+    /** A `sys_invocation` condition for the sends one `KgRefresh` run made (its `finally` release, a forwarded `decide`). */
+    const sentByRun = (key: string) => `invoked_by_target LIKE 'KgRefresh/${key}/%'`;
+    /** A `sys_invocation` condition for the sends one invocation made (a `watch`'s release). */
+    const sentBy = (invocationId: string) => `invoked_by_id = '${invocationId}'`;
+    /**
+     * Waits until the `KgRepo.release` sent by each sender has run, then makes a barrier call on `KgRepo`'s exclusive queue.
+     * A call to the object does not order a send another invocation made, so each sender the test depends on is named
+     * and waited on (docs/restate-testing.md, timing rule 1). Reading state after it needs no polling.
+     */
+    const afterReleases = async (env: RestateEnvironment, ...senders: string[]) => {
+      for (const sender of senders) {
+        await awaitSentInvocations(env.adminAPIBaseUrl(), env.baseUrl(), { service: "KgRepo", key: KG_SOURCE_REPO, handler: "release" }, sender);
+      }
+      await decideRepo(env, { action: "timeout", triggerId: "barrier" });
+    };
+    /** The workflow keys of every `KgRefresh/run` invocation, completed or not. */
+    const runKeys = async (env: RestateEnvironment) =>
+      new Set((await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_handler_name = 'run'`)).map((r) => String(r.target_service_key)));
+    /**
+     * The one run started since `known`, found in Restate: the lock marker is released when the resumed run ends, so it can already be null.
+     * A finished run still counts, so the lookup never filters on status.
+     */
+    const resumedRunKey = async (env: RestateEnvironment, known: Set<string>) =>
+      (await eventually(
+        async () => [...(await runKeys(env))].filter((key) => !known.has(key)),
+        (fresh) => fresh.length === 1,
+        { label: "resumed run started" },
+      ))[0]!;
+    /** Every `KgRepo/watch` invocation for the test repo, completed or not. */
+    const watchInvocations = (env: RestateEnvironment) =>
+      queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'watch'`,
+      );
+    /** Decides the hold `gateId` and waits for the resumed run to end; returns its trigger id and outcome. */
+    async function decideAndAttach(env: RestateEnvironment, gateId: string, body: Record<string, unknown>) {
+      const resumed = (await decideRepo(env, { triggerId: gateId, ...body }))!.triggerId;
+      const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+      return { resumed, outcome };
+    }
+
+    /** Triggers through the real KgRepo, delivers the held report, and returns once the gate run has ended and `KgRepo` holds the snapshot. */
+    async function holdRun(env: RestateEnvironment, opts: { report?: KgRefreshReportBody } = {}): Promise<string> {
+      const watchesBefore = new Set((await watchInvocations(env)).map((w) => String(w.id)));
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      // `submit` sends the run's `watch`: the one invocation that was not there before this trigger.
+      const watchId = String((await eventually(
+        async () => (await watchInvocations(env)).filter((w) => !watchesBefore.has(String(w.id))),
+        (fresh) => fresh.length === 1,
+        { label: "watch sent" },
+      ))[0]!.id);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", opts.report ?? HELD_REPORT);
+      const gateOutcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      expect(gateOutcome).toMatchObject({ ok: false, conclusion: "awaiting_decision", held: true });
+      // The gate run's own release and the release its `watch` sends once it resumes: wait on both.
+      await attachInvocation(env.baseUrl(), watchId);
+      await afterReleases(env, sentByRun(triggerId), sentBy(watchId));
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
+      return triggerId;
+    }
+
+    it.each(LABELS)(
+      "a held report ends the run at the gate: KgRepo holds the lock and the hold, no run or watch stays open, one timer is armed (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const beforePersist = persistCalls.length;
+        const timersBefore = await scheduledDecides(env);
+        const repoReleasesBefore = await countSends(env, "KgRepo", KG_SOURCE_REPO, "release");
+        const triggerId = await holdRun(env);
+
+        expect(await openInvocations(env, `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}'`)).toEqual([]);
+        expect((await scheduledDecides(env)) - timersBefore).toBe(1);
+        // The gate run's `finally` release and the `watch` release both completed, and both left the held lock alone.
+        expect((await countSends(env, "KgRepo", KG_SOURCE_REPO, "release")) - repoReleasesBefore).toBe(2);
+        expect(await sentInvocations(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
+        // The watch's release is its last act, so once both releases completed no watch is left open.
+        expect(await openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`)).toEqual([]);
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
+        expect(await triggerViaKgRepo(env.baseUrl())).toMatchObject({ status: "refresh-in-progress", triggerId });
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+        expect(persistCalls.length - beforePersist).toBe(0);
+        expect(outcomesFor(triggerId)).toHaveLength(0);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed", conclusion: "awaiting_decision" });
+
+        await decideAndAttach(env, triggerId, { action: "cancel" });
+      },
+      60_000,
+    );
+
+    const decideTool = async (env: RestateEnvironment, action: string, extra: Record<string, unknown> = {}) => {
+      const result = await callToolAsSystem("decide_kg_refresh", { action, ...extra }, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
+      if (result.status !== "ok") throw new Error("decide_kg_refresh unavailable");
+      return { isError: result.isError === true, text: result.content[0].text };
+    };
+
+    it.each(LABELS)(
+      "accept: the baseline note names the actor, the resumed run merges and serves, and the original row is closed completed after awaiting_decision, never before (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeComments = postPrCommentFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, ACCEPT);
+
+        expect(resumed).not.toBe(triggerId);
+        expect(outcome.ok).toBe(true);
+        const comments = postPrCommentFn.mock.calls.slice(beforeComments).map((c) => String((c as unknown[])[4]));
+        expect(comments).toHaveLength(1);
+        expect(comments[0]).toContain("### Baseline");
+        expect(comments[0]).toContain("ada@example.com");
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        expect(outcomesFor(triggerId).map((c) => c.kind)).toEqual(["success"]);
+        expect(persistCalls.at(-1)).toMatchObject({ ok: true, held: true, dispatchId: triggerId });
+        expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+        // The gate close came first and the final close last: a late awaiting_decision can never overwrite the result.
+        expect(closeRowsFor(triggerId).map((r) => [r.status, r.conclusion])).toEqual([["completed", "awaiting_decision"], ["completed", "passed"]]);
+        await afterReleases(env, sentByRun(resumed));
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "contract: the real decide_kg_refresh tool accepts a hold through KgRepo.decide, and a second accept answers no-decision-open (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const known = await runKeys(env);
+        // Park the resumed run in its merge so it is still running, and the hold still decided, when the second accept lands.
+        let releaseMerge!: () => void;
+        const mergeParked = new Promise<void>((resolve) => {
+          releaseMerge = resolve;
+        });
+        mergePullRequestFn.mockImplementationOnce(async () => {
+          await mergeParked;
+          return "merged";
+        });
+        let resumed: string;
+        try {
+          const first = await decideTool(env, "accept", { triggerId });
+          expect(first.isError).toBe(false);
+          expect(JSON.parse(first.text)).toEqual({ decided: "accept" });
+          resumed = await resumedRunKey(env, known);
+          expect(resumed).not.toBe(triggerId);
+          expect(await decideTool(env, "accept", { triggerId })).toEqual({ isError: true, text: "no-decision-open" });
+        } finally {
+          releaseMerge();
+        }
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+        expect(closeRowsFor(triggerId).at(-1)?.conclusion).toBe("passed");
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        await afterReleases(env, sentByRun(resumed));
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "no-refresh-in-flight" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "cancel closes the held PR as operator_cancelled in a new run, closes the row once, records it once and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
+
+        expect(resumed).not.toBe(triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain("operator_cancelled");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false, conclusion: "operator_cancelled", held: true });
+        expect(outcomesFor(triggerId)).toHaveLength(0);
+        await afterReleases(env, sentByRun(resumed));
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+        expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "the timeout the hold armed, sent as KgRepo.decide, closes the PR as decision_timeout, closes the row once and releases the lock (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain("decision_timeout");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
+        expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
+        await afterReleases(env, sentByRun(resumed));
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      60_000,
+    );
+
+    /** Names of the services registered at this variant's endpoint URI. */
+    const deployedServices = async (env: RestateEnvironment, uri: string): Promise<string[]> => {
+      const response = await fetch(`${env.adminAPIBaseUrl()}/deployments`);
+      const body = (await response.json()) as { deployments: Array<{ uri?: string; http?: { uri?: string }; services: Array<{ name: string }> }> };
+      return body.deployments
+        .filter((d) => (d.uri ?? d.http?.uri)?.replace(/\/+$/, "") === uri)
+        .flatMap((d) => d.services.map((svc) => svc.name));
+    };
+
+    let probeCounter = 0;
+    /**
+     * Ships a new build at the same address: the live server keeps its sessions, so only its request handler changes, to one
+     * with an extra service. Restate does not rediscover a duplicate URI on its own, which is why a deploy forces.
+     */
+    function swapEndpoint(env: RestateEnvironment): void {
+      const probe = restate.service({ name: `DeployProbe${probeCounter++}`, handlers: { ping: async () => "ok" } });
+      const handler = createEndpointHandler({ services: [heldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools, probe] });
+      env.startedRestateHttpServer.removeAllListeners("request");
+      env.startedRestateHttpServer.on("request", handler as (...args: unknown[]) => void);
+    }
+
+    /** A deploy over a hold: proves nothing drains on the hold, then forces a re-registration at the same URI. */
+    async function deployOverHold(env: RestateEnvironment, gateId: string): Promise<void> {
+      const uri = `http://127.0.0.1:${env.endpointPort()}`;
+      // The hold is state plus a scheduled timer: no run, no watch, and nothing the drain counts.
+      expect(await openInvocations(env, `target_service_name = 'KgRefresh' AND target_service_key = '${gateId}'`)).toEqual([]);
+      expect(await openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`)).toEqual([]);
+      expect(await scheduledDecides(env)).toBeGreaterThanOrEqual(1);
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(0);
+      // The row-side drain signal (getInFlightWork) is covered against the real log in deploy.test.ts.
+
+      const before = await deployedServices(env, uri);
+      swapEndpoint(env);
+      const forced = await fetch(`${env.adminAPIBaseUrl()}/deployments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ uri, force: true }),
+      });
+      expect(forced.ok).toBe(true);
+      // The deployment was replaced (the new build's service set is registered), not answered as an unchanged duplicate.
+      const after = await deployedServices(env, uri);
+      const probe = `DeployProbe${probeCounter - 1}`;
+      expect(before).not.toContain(probe);
+      expect(after).toContain(probe);
+      // The hold and its timer came through untouched.
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: gateId, held: { snapshotPr: 77 } });
+      expect(await scheduledDecides(env)).toBeGreaterThanOrEqual(1);
+    }
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: accept then merges and serves in a new run and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, ACCEPT);
+
+        expect(resumed).not.toBe(triggerId);
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+        expect(closeRowsFor(triggerId).map((r) => [r.status, r.conclusion])).toEqual([["completed", "awaiting_decision"], ["completed", "passed"]]);
+        await afterReleases(env, sentByRun(resumed));
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: cancel then closes the PR once as operator_cancelled and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!).toContain("operator_cancelled");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
+        await afterReleases(env, sentByRun(resumed));
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: the timeout, sent as KgRepo.decide, closes the PR as decision_timeout and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!).toContain("decision_timeout");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
+        await afterReleases(env, sentByRun(resumed));
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "refusals: a stale triggerId, a second decision, a timeout after a decision and a timeout from an old hold all leave the hold or the result alone (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const first = await holdRun(env);
+        // A stale page names a hold that is not the current one.
+        await expect(decideRepo(env, { action: "cancel", triggerId: "not-the-hold" })).rejects.toThrow(/409.*no-decision-open/);
+        expect(await decideRepo(env, { action: "timeout", triggerId: "not-the-hold" })).toBeNull();
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: first, held: { snapshotPr: 77 } });
+
+        const firstRun = await decideAndAttach(env, first, { action: "cancel" });
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        // The hold is gone: a second decision and the old timer do nothing.
+        await expect(decideRepo(env, { action: "accept", actor: "bob@example.com" })).rejects.toThrow(/409.*no-decision-open/);
+        await expect(decideRepo(env, { action: "cancel", triggerId: first })).rejects.toThrow(/409.*no-decision-open/);
+        expect(await decideRepo(env, { action: "timeout", triggerId: first })).toBeNull();
+
+        // A newer hold is untouched by the first hold's timer.
+        await afterReleases(env, sentByRun(firstRun.resumed));
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        const second = await holdRun(env);
+        expect(await decideRepo(env, { action: "timeout", triggerId: first })).toBeNull();
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: second, held: { snapshotPr: 77 } });
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        await decideAndAttach(env, second, { action: "cancel" });
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "decide answers no-decision-open before the gate (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (triggered as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*no-decision-open/);
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: null });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await decideAndAttach(env, triggerId, { action: "cancel" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "a tracker-missing hold shows the cause, failed teams and sources from KgRepo, and accept merges (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const sources = [
+          { source: "tracker:X", kind: "tracker", status: "failed", reason: "503", counts: {} },
+          { source: "tracker:Z", kind: "tracker", status: "success", reason: "", counts: { issues: 12 } },
+        ];
+        const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "tracker-missing", failedTeams: ["X", "Y"], sources } as KgRefreshReportBody });
+        const open = await kgRepoStatus(env.baseUrl());
+        expect(open?.held).toMatchObject({ snapshotPr: 77, cause: "tracker-missing", failedTeams: ["X", "Y"], acceptBlocked: false, sources });
+
+        const { outcome } = await decideAndAttach(env, triggerId, ACCEPT);
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+      },
+      60_000,
+    );
+
+    const BLOCKED_REPORT = {
+      ...HELD_REPORT, cause: "tracker-missing", failedTeams: ["X"], acceptBlocked: true,
+      lostTeams: [{ team: "X", servedIssues: 40 }],
+    } as KgRefreshReportBody;
+
+    it.each(LABELS)(
+      "an acceptBlocked hold answers accept-blocked and stays open; cancel then closes the held PR (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env, { report: BLOCKED_REPORT });
+        expect((await kgRepoStatus(env.baseUrl()))?.held).toMatchObject({ acceptBlocked: true, lostTeams: [{ team: "X", servedIssues: 40 }] });
+
+        await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*accept-blocked/);
+        expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "accept-blocked" });
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { acceptBlocked: true, decideBy: expect.any(Number) } });
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+
+        const { outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "a source-failed hold is blocked, and cancel closes the held PR (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const sources = parseSourceResults(JSON.parse(readFileSync(fileURLToPath(new URL("../fixtures/kgb-source-results/failed.json", import.meta.url)), "utf8")));
+        const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "source-failed", acceptBlocked: true, lostTeams: [], sources } as KgRefreshReportBody });
+        expect((await kgRepoStatus(env.baseUrl()))?.held).toMatchObject({ cause: "source-failed", acceptBlocked: true, sources });
+        await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*accept-blocked/);
+        const { outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "status shows a shrink hold with both decisions' hold view, and none once decided (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const triggerId = await holdRun(env);
+        expect((await kgRepoStatus(env.baseUrl()))?.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], cause: "shrink", failedTeams: [], acceptBlocked: false, lostTeams: [], sources: [], decideBy: expect.any(Number) });
+
+        const { resumed } = await decideAndAttach(env, triggerId, { action: "cancel" });
+        const after = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", resumed, "status", {});
+        expect(after).toMatchObject({ decisions: [], held: null });
+      },
+      60_000,
+    );
+
+    it.each(LABELS.flatMap((label) => [[label, "superseded_by_schedule", "superseded_by_schedule"], [label, "cancelled", "operator_cancelled"]] as const))(
+      "%s: a decided cancel with reason %s closes the PR with gate %s and the run stays operator_cancelled (AII-1432)",
+      async (label, reason, gate) => {
+        const env = heldEnvs.get(label)!;
+        const triggerId = await holdRun(env);
+        await decideAndAttach(env, triggerId, { action: "cancel", reason });
+
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain(gate);
+        if (gate === "superseded_by_schedule") expect(comment).not.toContain("operator_cancelled");
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false, conclusion: "operator_cancelled", held: true });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "a gate run that has ended answers a cancel signal no-refresh-in-flight (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const triggerId = await holdRun(env);
+        await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" })).rejects.toThrow(/409.*no-refresh-in-flight/);
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
+        await decideAndAttach(env, triggerId, { action: "cancel" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "a Stop sent before the held report is not lost: the hold is cancelled through the decision door (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        let release!: () => void;
+        detailsHold = new Promise<void>((resolve) => { release = resolve; });
+        let triggerId: string;
+        try {
+          const triggered = await triggerViaKgRepo(env.baseUrl());
+          triggerId = (triggered as { triggerId: string }).triggerId;
+          makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+          await workflowDispatched(triggerId);
+          // The workflow is parked before its first wait, so the report and the Stop are both durable when it starts waiting.
+          await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+          await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
+        } finally {
+          release();
+          detailsHold = null;
+        }
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await eventually(() => closeRowsFor(triggerId).at(-1)?.conclusion, (c) => c === "operator_cancelled", { label: "the stop's resumed run closes the row" });
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain("operator_cancelled");
+        expect(outcomesFor(triggerId)).toHaveLength(0);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "AII-1284: a timeout whose close GitHub refuses still ends decision_timeout with one comment (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeComments = postPrCommentFn.mock.calls.length;
+        closePullRequestFn.mockRejectedValueOnce(new Error("Pull request is already merged"));
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
+
+        expect(outcome.ok).toBe(false);
+        expect(postPrCommentFn.mock.calls.length - beforeComments).toBe(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+        await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "AII-1284: a timeout whose close keeps failing on an open PR still ends decision_timeout and releases (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        pullRequestState = { merged: false, state: "open" };
+        closePullRequestFn.mockRejectedValue(new Error("GitHub 502"));
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+        expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
+        await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "AII-1284: a cancel whose close keeps failing on an open PR still ends operator_cancelled and releases (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        pullRequestState = { merged: false, state: "open" };
+        closePullRequestFn.mockRejectedValue(new Error("GitHub 502"));
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "cancel" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "AII-1284: a decide while the timed-out run is still closing answers 409 no-decision-open (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        let unblock!: () => void;
+        const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+        closePullRequestFn.mockImplementationOnce(async () => { await blocked; });
+        const triggerId = await holdRun(env);
+        const resumed = (await decideRepo(env, { action: "timeout", triggerId }))!.triggerId;
+        try {
+          await waitForStep(() => readStatus(env.baseUrl(), resumed), "closing");
+          await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*no-decision-open/);
+        } finally {
+          unblock();
+        }
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+        expect(outcome.ok).toBe(false);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "AII-1284: an accept whose note fails three times still merges the PR (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        for (let i = 0; i < 3; i++) postPrCommentFn.mockRejectedValueOnce(new Error("comment API down"));
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, ACCEPT);
+
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+        await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "release" });
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "AII-1284: a held report with no snapshotPr deletes the pushed branch (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeDelete = deleteBranchFn.mock.calls.length;
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (triggered as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        const { snapshotPr: _pr, ...noPr } = HELD_REPORT;
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", noPr);
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(deleteBranchFn.mock.calls.length - beforeDelete).toBe(1);
+        expect(deleteBranchFn.mock.calls.at(-1)).toContain("kg-refresh/snapshot-77");
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    // ---- AII-1259: a Restate cancel of `run` does the same cleanup as the `cancel` signal, at every step ----
+    const runInvocation = async (env: RestateEnvironment, triggerId: string) =>
+      (await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
+        (found) => found.length === 1,
+        { label: "the run invocation" },
+      ))[0];
+    const restateCancel = async (env: RestateEnvironment, triggerId: string) =>
+      cancelInvocation(env.adminAPIBaseUrl(), String((await runInvocation(env, triggerId)).id));
+    const runReleases = async (env: RestateEnvironment, triggerId: string) =>
+      (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'release' AND invoked_by_target LIKE 'KgRefresh/${triggerId}/%'`,
+      )).length;
+    /** `runId` is the run that ended; `dispatchId` is the row it closed (the held run's, for a resumed run). */
+    const expectClosedAndReleasedOnce = async (env: RestateEnvironment, runId: string, dispatchId = runId) => {
+      // A held run's row is closed awaiting_decision at the gate; the resumed run's close is the final one.
+      const finalRow = await eventually(() => closeRowsFor(dispatchId).at(-1), (row) => row !== undefined && row.conclusion !== "awaiting_decision", { label: `final close row for ${dispatchId}` });
+      expect(finalRow).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+      await eventually(() => runReleases(env, runId), (n) => n >= 1, { label: "the release" });
+      await settle(500);
+      expect(await runReleases(env, runId)).toBe(1);
+      expect(outcomesFor(dispatchId)).toHaveLength(0);
+    };
+
+    it.each(LABELS)("a Restate cancel before the dispatch closes the row and releases, with no stop call (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const hold = boundedLatch(STATUS_LATCH_MAX_MS * 4);
+      reserveHold = hold.promise;
+      stopCalls.length = 0;
+      let triggerId: string;
+      try {
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        triggerId = (triggered as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await eventually(() => appendJobLogCalls.some((c) => c.dispatchId === triggerId), (ok) => ok, { label: "the reserve attempt" });
+        await restateCancel(env, triggerId);
+      } finally {
+        hold.release();
+        reserveHold = null;
+      }
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(stopCalls).toEqual([]);
+      expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
+      expect(scenarios.get(triggerId)!.dispatchCalls).toBe(0);
+    }, 60_000);
+
+    it.each(LABELS)("a Restate cancel during await-progress on GitHub Actions cancels the run, closes the row and releases (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      stopCalls.length = 0;
+      await workflowDispatched(triggerId);
+      await waitForStep(() => readStatus(env.baseUrl(), triggerId), "await-progress");
+      await restateCancel(env, triggerId);
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(scenario.cancelCalls).toBe(1);
+      expect(stopCalls).toEqual([]);
+    }, 60_000);
+
+    it.each(LABELS)("a Restate cancel during await-progress on Fly stops the machine, closes the row and releases (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      stopCalls.length = 0;
+      await workflowDispatched(triggerId);
+      await waitForStep(() => readStatus(env.baseUrl(), triggerId), "await-progress");
+      await restateCancel(env, triggerId);
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(stopCalls).toEqual([{ executionMode: "fly-machines", jobId: `job-${triggerId}` }]);
+      expect(scenario.cancelCalls).toBe(1);
+    }, 60_000);
+
+    // ---- AII-1296: the start of the merge is the point of no return (the resumed run is a normal KgRefresh run) ----
+    const expectRunSucceeded = async (env: RestateEnvironment, triggerId: string) => {
+      const row = await eventually(
+        async () => runInvocation(env, triggerId),
+        (inv) => inv.status === "completed" || inv.status === "succeeded",
+        { label: "the run invocation ends" },
+      );
+      expect(row.completion_result).toBe("success");
+    };
+    const expectStoppedBeforeMerge = async (env: RestateEnvironment, resumed: string, dispatchId: string, beforeMerge: number, beforeClose: number) => {
+      await expectClosedAndReleasedOnce(env, resumed, dispatchId);
+      expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+    };
+    /** Parks the next `postPrCommentFn` call (the baseline-accept-note step) until released. */
+    const holdAcceptNote = () => {
+      const held = gate("baseline-accept-note held");
+      postPrCommentFn.mockImplementationOnce(async () => { await held.wait(); });
+      return held;
+    };
+    /** Accepts the hold with the note parked, runs `during` on the resumed run while it waits, then lets it go. */
+    async function acceptThenDuring(env: RestateEnvironment, during: (resumed: string, dispatchId: string) => Promise<void>) {
+      const dispatchId = await holdRun(env);
+      const held = holdAcceptNote();
+      let resumed!: string;
+      try {
+        resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
+        await held.reached();
+        await during(resumed, dispatchId);
+      } finally {
+        held.release();
+      }
+      return { dispatchId, resumed };
+    }
+
+    it.each(LABELS)("a Restate cancel during the merge does not interrupt: the gates run, the row completes and the run succeeds (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      mergeDelayMs = 1_500; // parks `run` inside the merge step
+      const dispatchId = await holdRun(env);
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
+      await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
+      // Mid-merge, past the gate: the resumed run's invocation holds the lock.
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: resumed, invocationId: expect.any(String), held: null });
+      await restateCancel(env, resumed);
+      await expectRunSucceeded(env, resumed);
+      expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+      expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+      expect(persistCalls.at(-1)).toMatchObject({ ok: true });
+      expect(servedStamp).toBe(NEW_STAMP);
+      expect(await closeRowFor(dispatchId)).toMatchObject({ status: "completed", conclusion: "passed" });
+      await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "the release" });
+      await settle(500);
+      expect(await runReleases(env, resumed)).toBe(1);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+    }, 60_000);
+
+    it.each(LABELS)("a Restate cancel during a held swap restart does not orphan it: one restart, verify runs, the run succeeds (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const swapHeld = gate("AII-1296 swap restart held");
+      let swapAttempts = 0;
+      restartImpl = async () => {
+        swapAttempts++;
+        if (swapAttempts === 1) await swapHeld.wait();
+        servedStamp = NEW_STAMP;
+      };
+      const dispatchId = await holdRun(env);
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
+      try {
+        await swapHeld.reached();
+        await restateCancel(env, resumed);
+      } finally {
+        swapHeld.release();
+      }
+      await expectRunSucceeded(env, resumed);
+      expect(restartCallCount).toBe(1);
+      expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+      expect(persistCalls.at(-1)).toMatchObject({ ok: true });
+      expect(await closeRowFor(dispatchId)).toMatchObject({ status: "completed" });
+    }, 60_000);
+
+    it.each(LABELS)("a cancel signal between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const { dispatchId, resumed } = await acceptThenDuring(env, (r) => callWorkflow(env.baseUrl(), "KgRefresh", r, "cancel", { reason: "stop" }));
+      await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
+    }, 60_000);
+
+    it.each(LABELS)("a schedule's replace after an accept finds no hold: it answers no-decision-open and the merge runs (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const { dispatchId, resumed } = await acceptThenDuring(env, async (_r, gateId) => {
+        await expect(decideRepo(env, { action: "cancel", triggerId: gateId, reason: "superseded_by_schedule" })).rejects.toThrow(/409.*no-decision-open/);
+      });
+      await expectRunSucceeded(env, resumed);
+      expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+      expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+      expect(await closeRowFor(dispatchId)).toMatchObject({ status: "completed" });
+    }, 60_000);
+
+    it.each(LABELS)("after a schedule's replace finds no hold, a later cancel and decide_kg_refresh cancel answer past-merge and the run succeeds (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      mergeDelayMs = 1_500;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const { resumed } = await acceptThenDuring(env, async (_r, gateId) => {
+        await expect(decideRepo(env, { action: "cancel", triggerId: gateId, reason: "superseded_by_schedule" })).rejects.toThrow(/409.*no-decision-open/);
+      });
+      await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", resumed, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
+      expect(await decideTool(env, "cancel")).toEqual({ isError: true, text: "past-merge" });
+      await expectRunSucceeded(env, resumed);
+    }, 60_000);
+
+    it.each(LABELS)("an operator cancel with another reason after an accept still wins at the commit point (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const { dispatchId, resumed } = await acceptThenDuring(env, (r) => callWorkflow(env.baseUrl(), "KgRefresh", r, "cancel", { reason: "operator requested" }));
+      await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
+    }, 60_000);
+
+    it.each(LABELS)("a Restate cancel between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const { dispatchId, resumed } = await acceptThenDuring(env, (r) => restateCancel(env, r));
+      await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
+    }, 60_000);
+
+    it.each(LABELS)("decide_kg_refresh cancel between the accept and the commit goes to the resumed run and stops it (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const { dispatchId, resumed } = await acceptThenDuring(env, async () => {
+        // KgRepo.decide has no hold to cancel now; the tool falls back to the run in flight, which is the resumed one.
+        await expect(decideRepo(env, { action: "cancel" })).rejects.toThrow(/409.*no-decision-open/);
+        expect(JSON.parse((await decideTool(env, "cancel")).text)).toEqual({ cancelled: true });
+      });
+      await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
+    }, 60_000);
+
+    it.each(LABELS)("after the merge starts, cancel and decide_kg_refresh cancel answer past-merge, a second accept answers no-decision-open, and the run succeeds (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      mergeDelayMs = 1_500;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const dispatchId = await holdRun(env);
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
+      await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", resumed, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
+      expect(await decideTool(env, "cancel")).toEqual({ isError: true, text: "past-merge" });
+      expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "no-decision-open" });
+      const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+      expect(outcome.ok).toBe(true);
+      await expectRunSucceeded(env, resumed);
+      // A finished run answers no-refresh-in-flight, not past-merge, so the Stop route can stamp a stuck row.
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", resumed, "cancel", { reason: "stop" })).rejects.toThrow(/409.*no-refresh-in-flight/);
+    }, 60_000);
+
+    it.each(LABELS)("a gate run whose lock was taken ends failed/workflow_error with its PR closed, never as an operator cancel (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeComments = postPrCommentFn.mock.calls.length;
+      const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      // Another trigger owns the marker, so `hold` answers lock-lost.
+      await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", KG_SOURCE_REPO, { inFlight: { triggerId: "someone-else", startedAt: Date.now() } });
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(outcome.conclusion).not.toBe("operator_cancelled");
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.slice(beforeComments).map((c) => String((c as unknown[])[4])).join("\n")).toContain("workflow_error");
+        // The hold is stored first (AII-1493), so a refused hold never writes the awaiting_decision row.
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["workflow_error"]);
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false });
+        expect(persistCalls.at(-1)?.conclusion).not.toBe("operator_cancelled");
+      } finally {
+        await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", KG_SOURCE_REPO, {});
+      }
+    }, 60_000);
+
+    /** Reaches the window after `step` is held and before the hold is stored, runs `stop`, then lets the gate run finish. */
+    async function stopInsideGate(env: RestateEnvironment, stop: (triggerId: string) => Promise<void>): Promise<string> {
+      const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      const park = gate("held row close");
+      heldRowPark = { jobId: triggerId, gate: park };
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await park.reached();
+        expect(await readStatus(env.baseUrl(), triggerId)).toMatchObject({ step: "held" });
+        await stop(triggerId);
+      } finally {
+        park.release();
+        heldRowPark = null;
+      }
+      await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      return triggerId;
+    }
+
+    /** A Stop that reached the gate run is read after `hold` and sent through the decision door: the resumed run closes the hold. */
+    async function expectStoppedHold(env: RestateEnvironment, gateId: string, beforeClose: number, stopSentByRun = true): Promise<void> {
+      // A Stop that went through the run reaches `KgRepo.decide` as a one-way send (the cancel handler or the post-hold
+      // read): wait on that send itself. A tool Cancel calls `KgRepo.decide` and waits for its answer, so nothing is sent.
+      if (stopSentByRun) {
+        await awaitSentInvocations(env.adminAPIBaseUrl(), env.baseUrl(), { service: "KgRepo", key: KG_SOURCE_REPO, handler: "decide" }, sentByRun(gateId));
+      }
+      await afterReleases(env);
+      // A Stop made while the gate run is parked at its row write is decided earlier, and the resumed run may have ended and cleared the hold.
+      const marker = await kgRepoStatus(env.baseUrl());
+      if (marker !== null) {
+        expect(marker.triggerId).not.toBe(gateId);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", marker.triggerId);
+      }
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+      // A Stop decides the hold while the gate run may still be parked at its row write: that write lands before the
+      // resumed run takes the row back, or not at all, but never after the final close.
+      const conclusions = closeRowsFor(gateId).map((r) => r.conclusion);
+      expect(conclusions.at(-1)).toBe("operator_cancelled");
+      expect(conclusions.filter((c) => c === "operator_cancelled")).toHaveLength(1);
+      expect(rowState.get(gateId)).toEqual({ status: "failed", conclusion: "operator_cancelled" });
+    }
+
+    it.each(LABELS)("a Stop sent to the workflow once step is held cancels the hold through KgRepo.decide: PR closed, row closed once (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async (id) => {
+        await callWorkflow(env.baseUrl(), "KgRefresh", id, "cancel", { reason: "stop" });
+      });
+      await expectStoppedHold(env, gateId, beforeClose);
+    }, 60_000);
+
+    it.each(LABELS)("a Restate cancel of the gate run while the held row closes cancels the hold through KgRepo.decide: PR closed, row closed once (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async (id) => {
+        const [run] = await queryInvocations(
+          env.adminAPIBaseUrl(),
+          `target_service_name = 'KgRefresh' AND target_service_key = '${id}' AND target_handler_name = 'run'`,
+        );
+        await cancelInvocation(env.adminAPIBaseUrl(), String(run!.id));
+      });
+      await expectStoppedHold(env, gateId, beforeClose);
+      expect(await runReleases(env, gateId)).toBe(1);
+    }, 60_000);
+
+    it.each(LABELS)("a tool Cancel with no triggerId that races the gate stops the hold and answers success (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async () => {
+        // The hold is stored before the row write (AII-1493), so the decision door is already open at the park.
+        expect(JSON.parse((await decideTool(env, "cancel")).text)).toEqual({ decided: "cancel" });
+      });
+      await expectStoppedHold(env, gateId, beforeClose, false);
+    }, 60_000);
+
+    // ---- AII-1493: the hold outlives the run that acts on it, so a killed run leaves a decidable hold ----
+    /** Kills the `run` invocation of one workflow key through the admin API. */
+    const killRun = async (env: RestateEnvironment, key: string) => {
+      const [run] = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${key}' AND target_handler_name = 'run'`);
+      await killInvocation(env.adminAPIBaseUrl(), String(run!.id));
+    };
+    const knownWatches = async (env: RestateEnvironment) => new Set((await watchInvocations(env)).map((w) => String(w.id)));
+    /** The one `KgRepo.watch` sent since `known`: it ends when its run does, so attaching to it waits for the release. */
+    const freshWatchId = async (env: RestateEnvironment, known: Set<string>) =>
+      String((await eventually(
+        async () => (await watchInvocations(env)).filter((w) => !known.has(String(w.id))),
+        (fresh) => fresh.length === 1,
+        { label: "watch sent" },
+      ))[0]!.id);
+
+    it.each(LABELS)("a gate run killed at its row write leaves a hold with the row still running; a cancel closes the PR and the row once and frees the lock once (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const known = await knownWatches(env);
+      const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      const watchId = await freshWatchId(env, known);
+      const park = gate("guarded held row write");
+      const parked = { jobId: triggerId, gate: park, dropped: false };
+      heldRowPark = parked;
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await park.reached();
+        await killRun(env, triggerId);
+        parked.dropped = true;
+      } finally {
+        park.release();
+        heldRowPark = null;
+      }
+      await attachInvocation(env.baseUrl(), watchId);
+      await afterReleases(env, sentBy(watchId));
+      // The hold exists and is open; the row never reached awaiting_decision.
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
+      expect(rowState.get(triggerId)).toBeUndefined();
+      expect(closeRowsFor(triggerId)).toEqual([]);
+
+      const knownBeforeDecide = await knownWatches(env);
+      const { resumed } = await decideAndAttach(env, triggerId, { action: "cancel" });
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+      expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["operator_cancelled"]);
+      // Wait on the releases themselves (the run's own and its watch's): a barrier does not order another invocation's send.
+      const resumedWatch = await freshWatchId(env, knownBeforeDecide);
+      await attachInvocation(env.baseUrl(), resumedWatch);
+      await afterReleases(env, sentByRun(resumed), sentBy(resumedWatch));
+      expect(await runReleases(env, resumed)).toBe(1);
+      expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+    }, 60_000);
+
+    it.each(LABELS)("a resumed cancel run killed while parked in the close-PR stub has consumed the hold: it stays cleared, the PR is closed once and the row never reopens (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      expect(rowState.get(triggerId)).toEqual({ status: "completed", conclusion: "awaiting_decision" });
+      const park = gate("resumed close of the held PR");
+      closePullRequestFn.mockImplementationOnce(async () => { await park.wait(); });
+      const known = await knownWatches(env);
+      const resumed = (await decideRepo(env, { action: "cancel", triggerId }))!.triggerId;
+      const watchId = await freshWatchId(env, known);
+      await park.reached();
+      // The hold is decided while the resumed run acts: no open decisions, a second decision is refused, the row is taken back.
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: resumed, held: null });
+      await expect(decideRepo(env, { action: "cancel", triggerId })).rejects.toThrow(/409.*no-decision-open/);
+      expect(rowState.get(triggerId)).toEqual({ status: "running", conclusion: "resumed" });
+      expect((await callWorkflow(env.baseUrl(), "KgRefresh", resumed, "status", {}) as { holdConsumed: boolean }).holdConsumed).toBe(true);
+
+      await killRun(env, resumed);
+      park.release();
+      await attachInvocation(env.baseUrl(), watchId);
+      await afterReleases(env, sentBy(watchId));
+      // Cleared, not reopened: Accept is never offered on the closed PR.
+      expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+      expect(rowState.get(triggerId)).toEqual({ status: "running", conclusion: "resumed" });
+    }, 60_000);
+
+    it.each(LABELS)("a resumed accept run killed after its commit point clears the hold and reopens nothing: one merge call, the row stays running (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const timersBefore = await scheduledDecides(env);
+      const triggerId = await holdRun(env);
+      const park = gate("resumed merge");
+      mergePullRequestFn.mockImplementationOnce(async () => { await park.wait(); return "merged"; });
+      const known = await knownWatches(env);
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId }))!.triggerId;
+      const watchId = await freshWatchId(env, known);
+      await park.reached();
+      await killRun(env, resumed);
+      park.release();
+      await attachInvocation(env.baseUrl(), watchId);
+      await afterReleases(env, sentBy(watchId));
+      expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+      expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+      expect(rowState.get(triggerId)).toEqual({ status: "running", conclusion: "resumed" });
+      // The hold's own timer is all there is: nothing was re-armed.
+      expect((await scheduledDecides(env)) - timersBefore).toBe(1);
+    }, 60_000);
+
+    it.each(LABELS)("status of a resumed accept run parked at its merge reports committed from the cancel promise (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const triggerId = await holdRun(env);
+      const park = gate("resumed merge for status");
+      mergePullRequestFn.mockImplementationOnce(async () => { await park.wait(); return "merged"; });
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId }))!.triggerId;
+      await park.reached();
+      expect((await callWorkflow(env.baseUrl(), "KgRefresh", resumed, "status", {}) as { committed: boolean }).committed).toBe(true);
+      park.release();
+      await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+    }, 60_000);
+
+    it.each(LABELS)("a decision made while the gate run is parked at its row write closes the row; the released write leaves the final row unchanged (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      const park = gate("guarded held row write");
+      heldRowPark = { jobId: triggerId, gate: park };
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await park.reached();
+        // The hold is stored before the row write, so the decision door is open while the gate run is parked.
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
+        await decideAndAttach(env, triggerId, { action: "cancel" });
+        expect(rowState.get(triggerId)).toEqual({ status: "failed", conclusion: "operator_cancelled" });
+      } finally {
+        park.release();
+        heldRowPark = null;
+      }
+      await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      expect(rowState.get(triggerId)).toEqual({ status: "failed", conclusion: "operator_cancelled" });
+      expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["operator_cancelled"]);
+    }, 60_000);
+
+    it("the timer a real KgRefresh armed fires by itself: a zero timeout decides the hold as decision_timeout in a new run", async () => {
+      const zero = createKgRefreshWorkflow({ ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: 0 });
+      const env = await startRetryEnabled([zero, kgRepo, starter, flyMachineProfile]);
+      try {
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        // The timer is a scheduled send due at once: it fires with no caller, and the barrier returns after it ran.
+        await decideRepo(env, { action: "timeout", triggerId: "barrier" });
+        const resumed = await resumedRunKey(env, new Set([triggerId]));
+        expect(resumed).not.toBe(triggerId);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        // The timer is due at once, so it can decide before the gate's row write: that write then lands first or not at all (AII-1493).
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion).at(-1)).toBe("decision_timeout");
+        expect(rowState.get(triggerId)).toEqual({ status: "failed", conclusion: "decision_timeout" });
+      } finally {
+        await env.stop();
+      }
+    }, 90_000);
+
+    it("a restart of the endpoint after the gate keeps the hold: no run to replay, the lock and the hold stay, and a decision still resumes it", async () => {
+      const env = await startRetryEnabled([heldWorkflow, kgRepo, starter, flyMachineProfile]);
+      let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+      try {
+        const triggerId = await holdRun(env);
+        const releasesBefore = await countSends(env, "FlyMachineProfile", "kg-refresh", "release");
+
+        replacement = await replaceEndpoint(env, [createKgRefreshWorkflow({
+          ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: DECISION_TIMEOUT_MS,
+        }), kgRepo, starter, flyMachineProfile]);
+        await env.startedRestateServer.restart();
+
+        expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBe(releasesBefore);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker?.triggerId === triggerId && marker.held != null, { label: "the hold survives the restart" });
+        await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
+      } finally {
+        replacement?.close();
+        await env.stop();
+      }
+    }, 90_000);
+  });
 });
 
 // ---- shared admin-API duration parsing (mirrors src/__tests__/restate/harness.restate.test.ts) ----
