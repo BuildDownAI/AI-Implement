@@ -334,15 +334,22 @@ For an automated roll-up review (commenter `ai-implement-rollup-review`, `ROLLUP
 > With the callback disabled, planning stalls at `AI-Planning` and the cascade can't advance
 > on its own.
 
+The merge poll checks stored open pull request links, so dispatch-log pruning does not
+prevent reconciliation. Merged implementation links queue completion; unmerged closes
+record a tombstone. Both persist the terminal outcome on the link. Roll-up links only
+record the outcome here because `merge-up` owns their reconciliation. Unreadable PRs and
+repositories without a mapping remain open for retry.
+
 ### A parent's own PR closed without merging (AII-1294)
 
 A feature-node parent never blocks its own roll-up. When the PR from the parent's own run
-(any dispatch row for that PR with `grouping_parent` set, even if a newer gap-fill row says
+(any surviving dispatch row for that PR with `grouping_parent` set, even if a newer gap-fill row says
 otherwise) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
 parent, then writes the tombstone. It skips this while a run for the issue is in flight
 (nothing is written; the next poll re-checks) and when the closed PR is not the issue's latest
 PR (tombstone only). If `markMerged` throws or no mapping resolves, no tombstone is written
-and the next poll retries. The poll does not check children; the roll-up gates above do that
+and the link stays open for the next poll to retry. Existing queue rows only repair the
+link outcome without repeating finalization. The poll does not check children; the roll-up gates above do that
 live, so a Done parent with a non-terminal designated child still gets no roll-up. A closed
 parent PR does not veto the tree; to stop a tree, cancel the parent issue.
 

@@ -4,18 +4,31 @@ import { makeMapping } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 let log: typeof import("../log.js");
 let recon: typeof import("../reconciliation.js");
+let links: typeof import("../pr-links.js");
+let db: ReturnType<typeof import("../dedup.js")["getDb"]>;
 let mod: typeof import("../poll-merged-prs.js");
 beforeEach(async () => {
-  ({ log, recon, mod } = (
+  const fixture = (
     await testDb({
       modules: {
+        dedup: () => import("../dedup.js"),
+        links: () => import("../pr-links.js"),
         log: () => import("../log.js"),
         recon: () => import("../reconciliation.js"),
         mod: () => import("../poll-merged-prs.js"),
       },
     })
-  ).modules);
+  );
+  ({ log, recon, mod, links } = fixture.modules);
+  db = fixture.modules.dedup.getDb();
 });
+
+function seedLink(prNumber: number, issueId = "i1", identifier: string | null = "ENG-1", role: "implementation" | "roll-up" = "implementation") {
+  return links.linkPullRequest({ repository: "o/r", number: prNumber,
+    url: `https://github.com/o/r/pull/${prNumber}`, role, source: "backfill",
+    issue: { trackerKind: "linear", mappingKey: "m", trackerIssueId: issueId,
+      identifier, title: null, url: null } });
+}
 
 /**
  * Seed a dispatch_log row with status='completed' and pr_url ending /pull/<n>.
@@ -23,6 +36,7 @@ beforeEach(async () => {
  * to set it to 'completed' with a prUrl.
  */
 function seedCompletedJob(prNumber: number) {
+  seedLink(prNumber);
   const jobId = log.appendLog({
     issueId: "i1",
     issueIdentifier: "ENG-1",
@@ -42,6 +56,7 @@ describe("prNumberFromUrl", () => {
 
 describe("detectMergedPrs", () => {
   it("reconciles a job-row misread: 'failed' row with a recorded PR that actually merged (AII-264 r6)", async () => {
+    seedLink(3610, "i-r6", "OOL-183");
     const jobId = log.appendLog({ issueId: "i-r6", issueIdentifier: "OOL-183", repo: "o/r" });
     log.updateJobStatus(jobId, "failed", "pr_not_found", "https://github.com/o/r/pull/3610");
     await mod.detectMergedPrs({
@@ -68,7 +83,7 @@ describe("detectMergedPrs", () => {
   });
 
   it("enqueues a reconciliation for a merged PR", async () => {
-    seedCompletedJob(5);
+    seedLink(5);
     const getPullRequestState = vi.fn(async () => ({ merged: true, state: "closed" as const }));
     await mod.detectMergedPrs({
       getPullRequestState,
@@ -77,9 +92,11 @@ describe("detectMergedPrs", () => {
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
+    expect(recon.getPendingReconciliations()[0]).toMatchObject({ issueId: "i1", issueIdentifier: "ENG-1" });
+    expect(links.findLinkByPr("o/r", 5)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
   });
   it("tombstones a closed-unmerged PR and does not re-check next tick", async () => {
-    seedCompletedJob(5);
+    seedLink(5);
     const getPullRequestState = vi.fn(async () => ({ merged: false, state: "closed" as const }));
     const deps = {
       getPullRequestState,
@@ -88,13 +105,15 @@ describe("detectMergedPrs", () => {
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     };
     await mod.detectMergedPrs(deps);
+    expect(links.findLinkByPr("o/r", 5)).toMatchObject({ outcome: "closed-unmerged", closedAt: expect.any(Number) });
+    expect(db.prepare("SELECT status FROM reconciliation_queue").all()).toEqual([{ status: "skipped" }]);
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(true);
     expect(recon.getPendingReconciliations()).toHaveLength(0);
     await mod.detectMergedPrs(deps);
     expect(getPullRequestState).toHaveBeenCalledTimes(1);
   });
   it("leaves an open PR alone", async () => {
-    seedCompletedJob(5);
+    seedLink(5);
     const getPullRequestState = vi.fn(async () => ({ merged: false, state: "open" as const }));
     await mod.detectMergedPrs({
       getPullRequestState,
@@ -121,22 +140,56 @@ describe("detectMergedPrs", () => {
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
-  it("skips rows whose PR already has a queue row", async () => {
+  it("repairs an open link whose PR already has a queue row", async () => {
     seedCompletedJob(5);
     recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "" });
-    const getPullRequestState = vi.fn();
+    const getPullRequestState = vi.fn(async () => ({ merged: true, state: "closed" as const }));
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
       finalizeGroupingParent: async () => true,
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
+    expect(getPullRequestState).toHaveBeenCalledTimes(1);
+    expect(links.findLinkByPr("o/r", 5)?.outcome).toBe("merged");
+    expect(recon.getPendingReconciliations()).toHaveLength(1);
+  });
+
+  it.each(["merged", "closed-unmerged"] as const)("does not read a %s link", async (outcome) => {
+    seedLink(5);
+    links.setLinkOutcome("o/r", 5, outcome, 123);
+    const getPullRequestState = vi.fn();
+    await mod.detectMergedPrs({ getPullRequestState, tokenForOwner: async () => "tok",
+      mappingForRepo: () => makeMapping(), finalizeGroupingParent: async () => true });
     expect(getPullRequestState).not.toHaveBeenCalled();
+    expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
+  });
+
+  it.each([true, false])("records a terminal roll-up outcome (merged=%s) without reconciliation", async (merged) => {
+    seedLink(5, "i1", null, "roll-up");
+    const finalizeGroupingParent = vi.fn(async () => true);
+    await mod.detectMergedPrs({ getPullRequestState: async () => ({ merged, state: "closed" }),
+      tokenForOwner: async () => "tok", mappingForRepo: () => makeMapping(), finalizeGroupingParent });
+    expect(links.findLinkByPr("o/r", 5)?.outcome).toBe(merged ? "merged" : "closed-unmerged");
+    expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
+    expect(finalizeGroupingParent).not.toHaveBeenCalled();
+  });
+
+  it.each(["unreadable", "unmapped"])("leaves an %s link retryable", async (kind) => {
+    seedLink(5);
+    const getPullRequestState = vi.fn(async () => null);
+    await mod.detectMergedPrs({ getPullRequestState, tokenForOwner: async () => "tok",
+      mappingForRepo: () => kind === "unmapped" ? undefined : makeMapping(),
+      finalizeGroupingParent: async () => true });
+    expect(links.findLinkByPr("o/r", 5)).toMatchObject({ outcome: "open", closedAt: null });
+    expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
+    expect(getPullRequestState).toHaveBeenCalledTimes(kind === "unmapped" ? 0 : 1);
   });
 
   describe("grouping parent whose own PR closed unmerged (AII-1294)", () => {
     const url = (n: number) => `https://github.com/o/r/pull/${n}`;
     function seedParent(prNumber: number, opts: { issueId?: string; groupingParent?: boolean } = {}) {
+      seedLink(prNumber, opts.issueId ?? "p1", "ENG-40");
       const jobId = log.appendLog({
         issueId: opts.issueId ?? "p1", issueIdentifier: "ENG-40", repo: "o/r",
         groupingParent: opts.groupingParent ?? true,
@@ -173,6 +226,36 @@ describe("detectMergedPrs", () => {
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(true);
     });
 
+    it("finds grouping ownership beyond the newest 500 rows", async () => {
+      seedParent(7);
+      for (let i = 0; i < 501; i++) seedCompletedJob(100 + i);
+      const deps = makeDeps(async () => true);
+      deps.getPullRequestState.mockImplementation(async (_t, _o, _r, n) => n === 7 ? closed : null);
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).toHaveBeenCalledWith(expect.objectContaining({
+        repository: "o/r", number: 7, issue: expect.objectContaining({ trackerIssueId: "p1" }),
+      }));
+    });
+
+    it("does not finalize when no grouping row survives", async () => {
+      seedParent(7);
+      db.prepare("DELETE FROM dispatch_log").run();
+      const deps = makeDeps(async () => true);
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 7)?.outcome).toBe("closed-unmerged");
+    });
+
+    it("repairs a tombstoned parent's outcome without finalizing again", async () => {
+      seedParent(7);
+      recon.recordReconciliationTombstone({ repo: "o/r", prNumber: 7, issueId: "p1", issueIdentifier: "ENG-40" });
+      const deps = makeDeps(async () => true);
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 7)?.outcome).toBe("closed-unmerged");
+      expect(db.prepare("SELECT count(*) AS count FROM reconciliation_queue").get()).toEqual({ count: 1 });
+    });
+
     it("leaves a non-grouping issue at tombstone only", async () => {
       seedParent(7, { groupingParent: false });
       const deps = makeDeps(async () => true);
@@ -188,6 +271,7 @@ describe("detectMergedPrs", () => {
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(false);
+      expect(links.findLinkByPr("o/r", 7)?.outcome).toBe("open");
     });
 
     it("tombstones without finalizing when the closed PR is not the issue's latest", async () => {
@@ -210,6 +294,7 @@ describe("detectMergedPrs", () => {
       const deps = makeDeps(async () => { if (fail) throw new Error("boom"); return true; });
       await mod.detectMergedPrs(deps);
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(false);
+      expect(links.findLinkByPr("o/r", 7)?.outcome).toBe("open");
       fail = false;
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).toHaveBeenCalledTimes(2);
@@ -220,6 +305,7 @@ describe("detectMergedPrs", () => {
       seedParent(7);
       await mod.detectMergedPrs(makeDeps(async () => false));
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(false);
+      expect(links.findLinkByPr("o/r", 7)?.outcome).toBe("open");
     });
   });
 });
