@@ -3,14 +3,16 @@ import type {
   FeatureBranchChainEntry,
   FeatureNodeRollUp,
   IssueLifecycleState,
+  IssueStatusRecord,
   LinearSetupFacts,
+  LifecycleLabelsResult,
   TicketIssue,
   TicketingProvider,
   ProviderConfig,
   TrackerIssuePage,
 } from "./types.js";
 import { getMappings, type RepoMapping } from "../config.js";
-import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
 import { getLinearToken, isLinearAuthConfigured, LinearApiError, withLinearToken } from "../linear-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
@@ -20,7 +22,32 @@ import { DEFAULT_LINEAR_PICKUP_LABEL, getLinearPickupLabel } from "../orchestrat
 
 interface GraphQLResponse<T> {
   data?: T;
-  errors?: Array<{ message: string }>;
+  errors?: Array<{ message: string; extensions?: unknown }>;
+}
+
+/** A GraphQL refusal, retaining only the first error's message and structured type. */
+export class LinearGraphQLError extends Error {
+  constructor(
+    readonly operation: string | undefined,
+    readonly linearMessage: string,
+    readonly extensionsType?: string,
+    readonly permanent: boolean = false,
+  ) {
+    super(`Linear GraphQL error${operation ? ` (${operation})` : ""}: ${linearMessage}`);
+    this.name = "LinearGraphQLError";
+    // permanent is true when Linear reports a permission refusal (extensions.type forbidden, extensions.code FORBIDDEN, or extensions.statusCode 403), so a retry cannot help.
+  }
+}
+
+/** A refused label creation, with the issue's actual team and requested label. */
+export class LinearLabelWriteError extends LinearGraphQLError {
+  readonly action = "create" as const;
+
+  constructor(readonly label: string, readonly teamKey: string, error: LinearGraphQLError) {
+    super(error.operation, error.linearMessage, error.extensionsType, error.permanent);
+    this.name = "LinearLabelWriteError";
+    this.message = `Linear refused to create label "${label}" on team ${teamKey}: ${error.linearMessage}`;
+  }
 }
 
 /** How far back to scan completed feature nodes for roll-up (bounds the query). */
@@ -60,6 +87,10 @@ type AncestorNode = {
   parent?: AncestorNode | null;
 } | null;
 
+function isTerminalStateType(type: string | null | undefined): boolean {
+  return type === "completed" || type === "canceled" || type === "duplicate";
+}
+
 /**
  * Walks up the ancestor chain from `parent` while each ancestor carries the AI-Implement
  * label, returning the contiguous run of labeled ancestors base-most first, each paired with
@@ -73,14 +104,14 @@ type AncestorNode = {
  */
 /** Maps a Linear children-query node list to the provider-agnostic child-readiness shape
  *  (see src/feature-branch.ts). Designated = carries the pickup label; terminal =
- *  tracker state is completed or cancelled — never inferred from a job row. */
+ *  tracker state is completed, cancelled or duplicate — never inferred from a job row. */
 function childFeatureStates(
   children: Array<{ identifier: string; state?: { type: string } | null; labels?: { nodes: Array<{ name: string }> } }>,
 ): FeatureChildState[] {
   return children.map((c) => ({
     identifier: c.identifier,
     designated: (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
-    terminal: c.state?.type === "completed" || c.state?.type === "canceled",
+    terminal: isTerminalStateType(c.state?.type),
   }));
 }
 
@@ -220,6 +251,72 @@ export class LinearProvider implements TicketingProvider {
     };
   }
 
+  async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {
+    refreshPickupLabel();
+    if (!isLinearAuthConfigured()) throw new TrackerUnavailableError("Linear credential not configured");
+    if (!mapping.teamKey) throw new TrackerUnavailableError("mapping carries no team key");
+    const label = AI_IMPLEMENT_LABEL;
+    const since = new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString();
+    type StatusNode = {
+      id: string; identifier: string; title: string; url: string; updatedAt: string;
+      state: { name: string; type: string };
+      labels: { nodes: Array<{ name: string }> };
+    };
+    type StatusPage = { issues: {
+      nodes: StatusNode[];
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    } };
+    const nodes = new Map<string, StatusNode>();
+    for (const recent of [false, true]) {
+      const query = `query($teamKey: String!, $label: String!, $first: Int!, $after: String${recent ? ", $since: DateTimeOrDuration!" : ""}) {
+        issues(first: $first, after: $after, filter: {
+          team: { key: { eq: $teamKey } }
+          labels: { name: { eq: $label } }
+          ${recent ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }'}
+        }) {
+          nodes { id identifier title url updatedAt state { name type } labels { nodes { name } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`;
+      let after: string | null = null;
+      for (let page = 1; ; page++) {
+        const data: StatusPage = await this.linearMutation<StatusPage>(query, {
+          teamKey: mapping.teamKey, label, first: 100, after, ...(recent ? { since } : {}),
+        });
+        for (const node of data.issues.nodes) nodes.set(node.id, node);
+        const { hasNextPage, endCursor } = data.issues.pageInfo;
+        if (!hasNextPage) break;
+        if (page >= 20) throw new Error("Linear listIssueStatuses exceeded 20 pages");
+        if (!endCursor || endCursor === after) throw new Error("Linear listIssueStatuses missing advancing cursor");
+        after = endCursor;
+      }
+    }
+
+    const precedence: Array<[string, IssueStatusRecord["state"]]> = [
+      [LINEAR_LABELS.needsHuman.name, "failed"],
+      [LINEAR_LABELS.readyForReview.name, "pr-ready"],
+      [LINEAR_LABELS.working.name, "implementing"],
+      [LINEAR_LABELS.planComplete.name, "plan-approved"],
+      [LINEAR_LABELS.planning.name, "planning"],
+      [label, "ready"],
+    ];
+    const records: IssueStatusRecord[] = [];
+    for (const node of nodes.values()) {
+      if (node.state.type === "canceled" || node.state.type === "duplicate") continue;
+      const labels = node.labels.nodes.map((l) => l.name);
+      const deciding = precedence.find(([name]) => labels.includes(name)) ?? [label, "ready"];
+      const completed = node.state.type === "completed";
+      records.push({
+        id: node.id, identifier: node.identifier, title: node.title,
+        url: this.issueUrl({ id: node.id, identifier: node.identifier, title: node.title, description: null, scopeKey: mapping.teamKey, nativeStatus: node.state.name }),
+        state: completed ? "merged" : deciding[1], phase: null,
+        labels: completed ? [] : [deciding[0], ...labels.filter((name) => name !== deciding[0])],
+        workflowState: node.state.name, updatedAt: Date.parse(node.updatedAt),
+      });
+    }
+    return records;
+  }
+
   async fetchSetupFacts(teamKeys: string[]): Promise<LinearSetupFacts> {
     const refused = await tokenRefusal();
     if (refused) return refused;
@@ -284,6 +381,7 @@ export class LinearProvider implements TicketingProvider {
   private async linearMutation<T>(
     query: string,
     variables: Record<string, unknown>,
+    operation?: string,
   ): Promise<T> {
     const res = await withLinearToken((token) =>
       fetch("https://api.linear.app/graphql", {
@@ -304,7 +402,18 @@ export class LinearProvider implements TicketingProvider {
 
     const json = (await res.json()) as GraphQLResponse<T>;
     if (json.errors?.length) {
-      throw new Error(`Linear GraphQL error: ${json.errors[0].message}`);
+      const error = json.errors[0];
+      const extensions = error.extensions;
+      let extensionsType: string | undefined;
+      let permanent = false;
+      if (extensions && typeof extensions === "object") {
+        permanent = ("type" in extensions && extensions.type === "forbidden")
+          || ("code" in extensions && extensions.code === "FORBIDDEN")
+          || ("statusCode" in extensions && extensions.statusCode === 403);
+        if ("type" in extensions && typeof extensions.type === "string") extensionsType = extensions.type;
+        else if ("code" in extensions && typeof extensions.code === "string") extensionsType = extensions.code;
+      }
+      throw new LinearGraphQLError(operation, error.message, extensionsType, permanent);
     }
     if (!json.data) {
       throw new Error("Linear API returned no data");
@@ -323,7 +432,7 @@ export class LinearProvider implements TicketingProvider {
           filter: {
             labels: { name: { eq: $label } }
             state: {
-              type: { nin: ["completed", "canceled"] }
+              type: { nin: ["completed", "canceled", "duplicate"] }
             }
           }
         ) {
@@ -475,8 +584,7 @@ export class LinearProvider implements TicketingProvider {
         issue.inverseRelations?.nodes?.some(
           (r) =>
             r.type === "blocks" &&
-            r.issue?.state?.type !== "completed" &&
-            r.issue?.state?.type !== "canceled",
+            !isTerminalStateType(r.issue?.state?.type),
         ) ?? false;
       if (isBlocked) {
         console.log(`[linear] Skipping ${issue.identifier}: blocked by an incomplete issue`);
@@ -523,8 +631,7 @@ export class LinearProvider implements TicketingProvider {
         const anyUndesignatedActive = children.some(
           (c) =>
             !(c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL) &&
-            c.state?.type !== "completed" &&
-            c.state?.type !== "canceled",
+            !isTerminalStateType(c.state?.type),
         );
         if (anyUndesignatedActive) {
           console.log(`[linear] Skipping ${issue.identifier}: ${mode} grouping parent has undesignated non-terminal children`);
@@ -676,7 +783,7 @@ export class LinearProvider implements TicketingProvider {
     for (const node of data.issues.nodes) {
       let lifecycle: IssueLifecycleState;
       if (node.state.type === "completed") lifecycle = "completed";
-      else if (node.state.type === "canceled") lifecycle = "cancelled";
+      else if (isTerminalStateType(node.state.type)) lifecycle = "cancelled";
       else lifecycle = "active";
       result.set(node.id, lifecycle);
     }
@@ -727,20 +834,28 @@ export class LinearProvider implements TicketingProvider {
       return reusableMatch.id;
     }
 
-    const createData = await this.linearMutation<{
-      issueLabelCreate: { issueLabel: { id: string } };
-    }>(
-      `mutation($teamId: String!, $name: String!, $color: String!) {
-        issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
-          issueLabel { id }
-        }
-      }`,
-      { teamId, name: label.name, color: label.color },
-    );
-    console.log(`[linear] Created '${label.name}' label for team ${teamId}`);
-    const id = createData.issueLabelCreate.issueLabel.id;
-    cache.set(teamKey, id);
-    return id;
+    try {
+      const createData = await this.linearMutation<{
+        issueLabelCreate: { issueLabel: { id: string } };
+      }>(
+        `mutation($teamId: String!, $name: String!, $color: String!) {
+          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
+            issueLabel { id }
+          }
+        }`,
+        { teamId, name: label.name, color: label.color },
+        "issueLabelCreate",
+      );
+      console.log(`[linear] Created '${label.name}' label for team ${teamId}`);
+      const id = createData.issueLabelCreate.issueLabel.id;
+      cache.set(teamKey, id);
+      return id;
+    } catch (error) {
+      if (error instanceof LinearGraphQLError) {
+        throw new LinearLabelWriteError(label.name, teamKey, error);
+      }
+      throw error;
+    }
   }
 
   private async getInProgressStateId(teamKey: string): Promise<string> {
@@ -801,6 +916,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, stateId },
+      "issueUpdate",
     );
   }
 
@@ -825,6 +941,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, labelIds: [...currentIds, labelId] },
+      "issueUpdate",
     );
   }
 
@@ -849,6 +966,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, labelIds: remaining.map((l) => l.id) },
+      "issueUpdate",
     );
   }
 
@@ -876,6 +994,31 @@ export class LinearProvider implements TicketingProvider {
   }
 
   // ---------- lifecycle verbs ----------
+
+  async ensureLifecycleLabels(scopeKey: string): Promise<LifecycleLabelsResult> {
+    const caches: Record<keyof typeof LINEAR_LABELS, Map<string, string>> = {
+      planning: this.aiPlanningLabelCache,
+      planComplete: this.planCompleteLabelCache,
+      working: this.aiWorkingLabelCache,
+      readyForReview: this.readyForReviewLabelCache,
+      needsHuman: this.needsHumanLabelCache,
+    };
+    for (const key of Object.keys(LINEAR_LABELS) as Array<keyof typeof LINEAR_LABELS>) {
+      const label = LINEAR_LABELS[key];
+      try {
+        await this.ensureTeamLabel(scopeKey, label, caches[key]);
+      } catch (err) {
+        if (err instanceof LinearLabelWriteError) {
+          return { ok: false, permanent: err.permanent, label: err.label, message: err.message };
+        }
+        return {
+          ok: false, permanent: false, label: label.name,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+    return { ok: true };
+  }
 
   async markPlanningStarted(issueId: string, _scopeKey: string): Promise<void> {
     const teamKey = await this.getTeamKeyForIssue(issueId);
@@ -935,6 +1078,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, labelIds: newLabelIds },
+      "issueUpdate",
     );
 
     await this.postComment(issueId, `AI implementation PR: ${prUrl}`);
@@ -962,7 +1106,7 @@ export class LinearProvider implements TicketingProvider {
     );
     const issue = data.issue;
     if (!issue) return;
-    if (issue.state.type === "completed" || issue.state.type === "canceled") return;
+    if (isTerminalStateType(issue.state.type)) return;
     const stateId = await this.getCompletedStateId(issue.team.key);
     const labelIds = issue.labels.nodes
       .filter((l) => l.name !== LINEAR_LABELS.readyForReview.name)
@@ -974,6 +1118,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, stateId, labelIds },
+      "issueUpdate",
     );
   }
 
@@ -989,13 +1134,13 @@ export class LinearProvider implements TicketingProvider {
     return true;
   }
   async parkForHuman(issueId: string, _scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
-    // Refuse a completed/canceled issue: the caller must keep dedup (same as Jira's Merged guard).
+    // Refuse a terminal issue: the caller must keep dedup (same as Jira's Merged guard).
     const data = await this.linearMutation<{ issue: { state: { type: string }; team: { key: string } } | null }>(
       `query($id: String!) { issue(id: $id) { state { type } team { key } } }`,
       { id: issueId },
     );
     const type = data.issue?.state?.type;
-    if (!data.issue || type === "completed" || type === "canceled") return false;
+    if (!data.issue || isTerminalStateType(type)) return false;
     // Marker first: once it is on, pickup skips the issue even if a removal below fails. The
     // pickup label stays, so the issue keeps its place in the feature-branch grouping tree and,
     // being non-terminal, keeps holding its parent's roll-up.
@@ -1016,6 +1161,6 @@ export class LinearProvider implements TicketingProvider {
     await this.linearMutation<{ commentCreate: { success: boolean } }>(query, {
       issueId,
       body,
-    });
+    }, "commentCreate");
   }
 }

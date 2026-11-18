@@ -462,12 +462,30 @@ describe("row projections (real log.ts, scratch database)", () => {
   }
 
   it("recordKgDispatchRow writes issue_id, phase, repo and execution_mode from the record, once", async () => {
-    await withScratchDb((_log, prod, db) => {
+    await withScratchDb((log, prod, db) => {
       const record = { dispatchId: "d-row", issueId: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", executionMode: "fly-machines" } as const;
       prod.recordKgDispatchRow(record);
       prod.recordKgDispatchRow(record);
       const rows = db.prepare("SELECT issue_id, phase, repo, execution_mode, status, machine_nonce FROM dispatch_log WHERE dispatch_id = 'd-row'").all();
+      expect(log.listLog()[0].trigger).toBeNull();
       expect(rows).toEqual([{ issue_id: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", execution_mode: "fly-machines", status: "dispatched", machine_nonce: null }]);
+    });
+  });
+
+  it.each([
+    { options: {}, expected: "schedule" },
+    { options: { actorEmail: "operator@example.com" }, expected: "manual" },
+    { options: { trigger: "manual" as const }, expected: "manual" },
+    { options: { trigger: "schedule" as const }, expected: "schedule" },
+  ])("persists the derived trigger without the actor email ($expected, $options)", async ({ options, expected }) => {
+    const { kgRefreshTrigger } = await import("../restate/kg-refresh-workflow.js");
+    await withScratchDb((log, prod, db) => {
+      const trigger = kgRefreshTrigger(options);
+      const record = { dispatchId: "d-trigger", issueId: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", executionMode: "github-actions", trigger } as const;
+      prod.recordKgDispatchRow(record);
+      prod.recordKgDispatchRow(record);
+      expect(db.prepare("SELECT trigger FROM dispatch_log").all()).toEqual([{ trigger: expected }]);
+      expect(log.listLog()[0].trigger).toBe(expected);
     });
   });
 

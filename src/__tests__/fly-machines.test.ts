@@ -17,12 +17,14 @@ import {
   generateMachineNonce,
   buildSessionMachineConfig,
   listAppSecrets,
+  classifyFlySecretNames,
   setAppSecrets,
   putAppSecretsVersioned,
   unsetAppSecret,
   fetchMachineLogs,
   updateMachineMetadata,
   readMachineExit,
+  machineNeverStarted,
   ProtectedBootstrapError,
 } from "../fly-machines.js";
 import type { Machine, MachineEvent, SessionMachineInput, SettleOptions, CreateMachineOpts, ProtectedBootstrapSecretMetadata } from "../fly-machines.js";
@@ -33,7 +35,7 @@ import { DURABLE_UNTIL_KEY, SCRUB_SETTLE_MS } from "../restate/fly-machine-profi
 import { sealModelAuthBootstrap } from "../model-auth-seal.js";
 import { MODEL_AUTH_ENV } from "../model-auth-contract.js";
 import { makeMapping } from "./helpers/builders.js";
-import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
+import { fakeFetch, hangUntilAborted, type ReplyInit } from "./helpers/fake-fetch.js";
 import { flySecretsUpdated } from "./helpers/replies/fly.js";
 
 const TOKEN = "fly-test-token";
@@ -41,8 +43,7 @@ const APP = "ai-implement-sessions-test";
 // The orchestrator's runner callback base URL, which production also passes as the orchestrator URL.
 const ORCH = "https://orchestrator.example";
 
-// Route keys match the path alone; the Machines API (api.machines.dev) and the GraphQL API
-// (api.fly.io) are told apart by each test's url.href assertion.
+// Route keys match paths; assert the Machines hostname separately.
 const MACHINES = `/v1/apps/${APP}/machines`;
 const MACHINE = `${MACHINES}/machine-123`;
 const MACHINES_URL = `https://api.machines.dev${MACHINES}`;
@@ -143,6 +144,39 @@ describe("createMachine", () => {
 });
 
 describe("getMachine", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it.each(["headers", "json", "error text"])("bounds stalled %s with the abort signal", async stage => {
+    vi.useFakeTimers();
+    let bodyStarted = false;
+    const fly = fakeFetch({ [`GET ${MACHINE}`]: stage === "headers" ? hangUntilAborted : ({ signal }) =>
+      new Response(new ReadableStream({
+        start(controller) {
+          bodyStarted = true;
+          signal!.addEventListener("abort", () => controller.error(signal!.reason), { once: true });
+        },
+      }), { status: stage === "json" ? 200 : 503 }),
+    }).install();
+    const result = getMachine(TOKEN, APP, "machine-123", 10_000);
+    const rejected = expect(result).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(fly.calls[0].signal?.aborted).toBe(false);
+    expect(bodyStarted).toBe(stage !== "headers");
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([200, 404])("clears the timeout after a completed %s response", async status => {
+    vi.useFakeTimers();
+    fakeFetch({ [`GET ${MACHINE}`]: { status, json: mockMachine } }).install();
+    const result = getMachine(TOKEN, APP, "machine-123", 10_000);
+    if (status === 200) await expect(result).resolves.toEqual(mockMachine);
+    else await expect(result).rejects.toThrow("(404)");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("fetches machine by ID", async () => {
     const fly = fakeFetch({ [`GET ${MACHINE}`]: { json: mockMachine } }).install();
 
@@ -150,6 +184,7 @@ describe("getMachine", () => {
     expect(result.id).toBe("machine-123");
     expect(result.state).toBe("started");
     expect(fly.calls[0].url.href).toBe(MACHINE_URL);
+    expect(fly.calls[0].signal).toBeUndefined();
   });
 
   it("throws on 404", async () => {
@@ -274,102 +309,47 @@ describe("generateMachineNonce", () => {
   });
 });
 
-describe("listAppSecrets", () => {
-  it("returns array of secrets with name/digest/created_at via GraphQL", async () => {
-    const secrets = [
-      { name: "ENG_DATABASE_URL", digest: "abc123", createdAt: "2026-01-01T00:00:00Z" },
-      { name: "ENG_STRIPE_KEY", digest: "def456", createdAt: "2026-01-02T00:00:00Z" },
-    ];
-    const fly = fakeFetch({ "POST /graphql": { json: { data: { app: { secrets } } } } }).install();
-
-    const result = await listAppSecrets(TOKEN, APP);
-    expect(result).toHaveLength(2);
-    expect(result[0].name).toBe("ENG_DATABASE_URL");
-    expect(result[0].created_at).toBe("2026-01-01T00:00:00Z");
-
-    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
-    const body = JSON.parse(fly.calls[0].body);
-    expect(body.variables.appName).toBe(APP);
+describe("app secrets through Machines REST", () => {
+  const path = `/v1/apps/${APP}/secrets`;
+  it("lists start-store metadata and empty lists", async () => {
+    // The reply shape Fly returned on 2026-11-14: an object that holds the list, not a bare list.
+    const secrets = [{ name: "ENG_DB", digest: "abc", created_at: "2026-01-01", updated_at: "2026-01-02" }];
+    const fake = fakeFetch({ [`GET ${path}`]: [{ json: { secrets } }, { json: { secrets: [] } }] }).install();
+    expect(await listAppSecrets(TOKEN, APP)).toEqual(secrets);
+    expect(await listAppSecrets(TOKEN, APP)).toEqual([]);
+    expect(fake.calls[0].url.href).toBe(`https://api.machines.dev${path}`);
+    expect(fake.calls[0].headers.get("Authorization")).toBe(`Bearer ${TOKEN}`);
   });
-
-  it("returns empty array when app has no secrets", async () => {
-    fakeFetch({ "POST /graphql": { json: { data: { app: { secrets: [] } } } } }).install();
-
-    const result = await listAppSecrets(TOKEN, APP);
-    expect(result).toEqual([]);
+  it("writes values, ignores the version, and deletes missing names successfully", async () => {
+    const fake = fakeFetch({
+      [`POST ${path}`]: { json: { version: 42, secrets: [{ value: "marker" }] } },
+      [`DELETE ${path}/MISSING`]: { json: { version: 43 } },
+    }).install();
+    expect(await setAppSecrets(TOKEN, APP, { KEY: "marker" })).toBeNull();
+    expect(await unsetAppSecret(TOKEN, APP, "MISSING")).toBeNull();
+    expect(JSON.parse(fake.calls[0].body)).toEqual({ values: { KEY: "marker" } });
+    for (const call of fake.calls) {
+      expect(call.url.origin).toBe("https://api.machines.dev");
+      expect(call.headers.get("Authorization")).toBe(`Bearer ${TOKEN}`);
+    }
   });
-
-  it("returns empty array when app is null", async () => {
-    fakeFetch({ "POST /graphql": { json: { data: { app: null } } } }).install();
-
-    const result = await listAppSecrets(TOKEN, APP);
-    expect(result).toEqual([]);
+  it("keeps HTTP and malformed reply errors value-free", async () => {
+    const marker = "SECRET_MARKER_NEVER_ECHO";
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    fakeFetch({ [`POST ${path}`]: [{ status: 422, text: marker }, { text: marker }] }).install();
+    await expect(setAppSecrets(TOKEN, APP, { KEY: marker })).rejects.toThrow(/^Fly app secrets write failed \(422\)$/);
+    await expect(setAppSecrets(TOKEN, APP, { KEY: marker })).rejects.toThrow(/^Fly app secrets write returned no integer version$/);
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(marker);
   });
-
-  it("throws on HTTP error response", async () => {
-    fakeFetch({ "POST /graphql": { status: 403, text: "forbidden" } }).install();
-
-    await expect(listAppSecrets(TOKEN, APP))
-      .rejects.toThrow("Fly API request failed (403): forbidden");
+  it("rejects a list reply that holds no secrets list", async () => {
+    fakeFetch({ [`GET ${path}`]: [{ json: [] }, { json: {} }] }).install();
+    await expect(listAppSecrets(TOKEN, APP)).rejects.toThrow(/^Fly app secrets list returned no secrets list$/);
+    await expect(listAppSecrets(TOKEN, APP)).rejects.toThrow(/^Fly app secrets list returned no secrets list$/);
   });
-});
-
-describe("setAppSecrets", () => {
-  it("sends GraphQL mutation with secrets and returns null version", async () => {
-    const fly = fakeFetch({ "POST /graphql": { json: { data: { setSecrets: { release: { version: 42 } } } } } }).install();
-
-    const version = await setAppSecrets(TOKEN, APP, { ENG_DATABASE_URL: "postgres://localhost/db" });
-
-    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
-    expect(version).toBeNull();
-
-    const body = JSON.parse(fly.calls[0].body);
-    expect(body.variables.input.appId).toBe(APP);
-    expect(body.variables.input.secrets[0].key).toBe("ENG_DATABASE_URL");
-    expect(body.variables.input.secrets[0].value).toBe("postgres://localhost/db");
-  });
-
-  it("throws on HTTP error response", async () => {
-    fakeFetch({ "POST /graphql": { status: 422, text: "invalid secret name" } }).install();
-
-    await expect(setAppSecrets(TOKEN, APP, { BAD: "val" }))
-      .rejects.toThrow("Fly API request failed (422): invalid secret name");
-  });
-});
-
-describe("unsetAppSecret", () => {
-  it("sends GraphQL mutation to unset secret and returns null version", async () => {
-    const fly = fakeFetch({ "POST /graphql": { json: { data: { unsetSecrets: { release: { version: 43 } } } } } }).install();
-
-    const version = await unsetAppSecret(TOKEN, APP, "ENG_DATABASE_URL");
-
-    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
-    expect(version).toBeNull();
-
-    const body = JSON.parse(fly.calls[0].body);
-    expect(body.variables.input.appId).toBe(APP);
-    expect(body.variables.input.keys[0]).toBe("ENG_DATABASE_URL");
-  });
-
-  it("throws on HTTP error response", async () => {
-    fakeFetch({ "POST /graphql": { status: 500, text: "internal server error" } }).install();
-
-    await expect(unsetAppSecret(TOKEN, APP, "MISSING_SECRET"))
-      .rejects.toThrow("Fly API request failed (500): internal server error");
-  });
-
-  it("throws when GraphQL reports the secret was not found", async () => {
-    fakeFetch({ "POST /graphql": { json: { errors: [{ message: "Could not find secret MISSING_SECRET" }] } } }).install();
-
-    await expect(unsetAppSecret(TOKEN, APP, "MISSING_SECRET"))
-      .rejects.toThrow("Could not find secret MISSING_SECRET");
-  });
-
-  it("throws on any GraphQL error", async () => {
-    fakeFetch({ "POST /graphql": { json: { errors: [{ message: "Unauthorized" }] } } }).install();
-
-    await expect(unsetAppSecret(TOKEN, APP, "ENG_DATABASE_URL"))
-      .rejects.toThrow("Unauthorized");
+  it("reports list and delete HTTP status", async () => {
+    fakeFetch({ [`GET ${path}`]: { status: 403 }, [`DELETE ${path}/KEY`]: { status: 404 } }).install();
+    await expect(listAppSecrets(TOKEN, APP)).rejects.toThrow("403");
+    await expect(unsetAppSecret(TOKEN, APP, "KEY")).rejects.toThrow("404");
   });
 });
 
@@ -1564,5 +1544,61 @@ describe("putAppSecretsVersioned", () => {
     const err = await putAppSecretsVersioned("tok", "app", { A: "SECRETVALUE" }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).not.toContain("SECRETVALUE");
+  });
+});
+
+describe("machineNeverStarted", () => {
+  it.each([
+    [["launch", "promote", "launch", "destroy"], true],
+    [["launch", "start", "destroy"], false],
+    [[], false],
+    [undefined, false],
+  ] as const)("reads start evidence from %j", (types, expected) => {
+    expect(machineNeverStarted({ ...mockMachine, events: types?.map(type => ({ type })) })).toBe(expected);
+  });
+});
+
+
+describe("Fly secret name classification", () => {
+  it("preserves protection precedence, all matching projects and unknown-prefix globals", () => {
+    const names = ["MQ_KEY", "GLOBAL", MODEL_AUTH_ENV.protectionKey, "OLD_KEY", "MQ_ADM_TOKEN"];
+    const rows = classifyFlySecretNames(names, ["mq", "MQ_ADM"]);
+    expect(rows).toEqual([
+      { name: "MQ_KEY", group: "project", projects: ["mq"] },
+      { name: "GLOBAL", group: "global", projects: [] },
+      { name: MODEL_AUTH_ENV.protectionKey, group: "protection-key", projects: [] },
+      { name: "OLD_KEY", group: "global", projects: [] },
+      { name: "MQ_ADM_TOKEN", group: "project", projects: ["mq", "MQ_ADM"] },
+    ]);
+    for (const teamKey of ["mq", "MQ_ADM"]) {
+      const config = buildSessionMachineConfig({ ...baseInput, teamKey, allTeamKeys: ["mq", "MQ_ADM"], teamSecretNames: names, flyProcessLevelSecrets: true });
+      const globals = config.config.processes![0].secrets!.filter((s) => !("name" in s)).map((s) => s.env_var).sort();
+      expect(globals).toEqual(rows.filter((r) => r.group === "global").map((r) => r.name).sort());
+    }
+  });
+});
+
+describe("listAppSecrets time limit", () => {
+  it("bounds the response body and clears the timer", async () => {
+    vi.useFakeTimers();
+    try {
+      fakeFetch({ [`GET /v1/apps/${APP}/secrets`]: ({ signal }) => new Response(new ReadableStream({
+        start(controller) { signal!.addEventListener("abort", () => controller.error(signal!.reason), { once: true }); },
+      })) }).install();
+      const pending = expect(listAppSecrets(TOKEN, APP, 100)).rejects.toMatchObject({ name: "AbortError" });
+      await vi.advanceTimersByTimeAsync(100);
+      await pending;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it("clears the timer on success and HTTP failure", async () => {
+    vi.useFakeTimers();
+    try {
+      fakeFetch({ [`GET /v1/apps/${APP}/secrets`]: [{ json: { secrets: [] } }, { status: 401 }] }).install();
+      expect(await listAppSecrets(TOKEN, APP, 100)).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(listAppSecrets(TOKEN, APP, 100)).rejects.toMatchObject({ status: 401, message: "Fly app secrets list failed (401)" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
   });
 });

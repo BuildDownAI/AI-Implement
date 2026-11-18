@@ -22,7 +22,7 @@ Every project mapping carries `ticketingProvider` and a matching `ticketingConfi
 
 ## How each provider finds work
 
-- **Linear** fetches every issue in the workspace that carries the pickup label and is not completed or cancelled. Each issue's `scopeKey` is its **Linear team key**.
+- **Linear** fetches every issue in the workspace that carries the pickup label and is not terminal: completed, cancelled, or Duplicate (state types `completed`, `canceled`, and `duplicate`). Each issue's `scopeKey` is its **Linear team key**.
 - **Jira** runs each Jira mapping's `jql` wrapped with the `AI-Implement Status` filter. Each issue's `scopeKey` is the **mapping key** it was found under.
 
 ## Knowledge-graph export (`listIssuesPage`)
@@ -100,6 +100,10 @@ A Linear mapping's key is its team's key ("Mapping keys", above). The poll is on
 The poll matches the pickup label by its exact name (`labels: { name: { eq } }`), as a workspace label or one of the team's own. The orchestrator never creates it, and reads its name from the `linear_pickup_label` setting at the start of each poll ([ADR 022](adr/022-pickup-label-is-a-settings-row-seeded-once-from-the-environment.md)). A label that differs only in case is never matched.
 
 ### Lifecycle labels
+
+The optional `ensureLifecycleLabels(scopeKey)` provider verb prepares every lifecycle label for a scope and may create missing labels. Before planning or implementation dispatch, the poll calls this verb with the issue’s scope key. It is safe to call on every dispatch. Linear checks labels in `LINEAR_LABELS` order using the lifecycle verbs’ existing caches, stops at the first failure, and returns its label, message and permanence (other errors are transient). Once cached, preparation sends no requests. Providers with nothing to prepare, including Jira and filesystem, omit the verb.
+
+A transient refusal or thrown error skips dispatch, logs the failure, and retries on the next poll without parking. A permanent refusal skips dispatch and parks the issue for its dispatch phase with conclusion `tracker_setup_refused`. Only a new park posts an issue comment naming the refused label, team, error, and remedy; comment failures are logged without undoing the park. Create the label manually or allow the app to create labels, then Unpark the issue at `/admin#runners` so the next poll can dispatch. Providers omitting the verb dispatch without a preparation request. Setup checks remain read-only.
 
 The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working`, once a PR opens `Ready for Review`, and, when the stuck watchdog gives up, `AI-Needs-Human`. The poll skips an issue carrying `AI-Needs-Human` before it counts capacity, so a park that added the marker but failed to remove `AI-Working` does not hold a slot. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
 
@@ -225,3 +229,11 @@ remain invisible to polling, and failed writes remove temporary files and state.
 Parent metadata is stored in provider-owned state
 and survives restart; pickup follows the mapping's planning setting. The fake
 provider records the parent association and puts children in planning pickup.
+
+## Aggregated issue statuses
+
+`src/issue-statuses.ts` exposes `listIssueStatuses`, called by `listIssueStatusesTool` in `src/restate/tools.ts` and registered as the user-role `list_issue_statuses` read tool. See [Spotter status tools](spotter-status-tools.md) for the tool contract. It reads every mapping, including paused mappings, and caches only successful provider status reads for 60 seconds per mapping key. Missing provider support or any provider failure rejects the whole call.
+
+Each call refreshes dispatch-breaker and job-log overlays. Merged issues retain their state and phase; otherwise a park makes an issue failed with the park's phase (gap-analysis maps to implementation). A failed issue with no tracker phase uses the newest job's phase. The newest job is ordered by `dispatched_at`, then row ID; its `completed_at`, falling back to `dispatched_at`, can advance the tracker change time. If multiple phases are parked, the newest park wins.
+
+Output contains only named public fields. Identifier collisions retain the first mapping in key order and warn with both team keys. Entries sort by team key and descending change time, with null times last.

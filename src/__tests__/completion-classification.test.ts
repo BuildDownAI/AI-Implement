@@ -21,6 +21,37 @@ import { makeJob } from "./helpers/builders.js";
 
 const PR = "https://github.com/org/repo/pull/1";
 
+describe("classificationForFailure — code-specific next steps", () => {
+  const failure: FailureRecord = {
+    category: "config",
+    code: "PLAN_STATUS_WRITE_FAILED",
+    stage: "planning",
+    attempt: 1,
+    retryable: false,
+    message: "The tracker refused the Plan-Complete write. Grant the tracker permission to update issue status.",
+    evidence: { truncated: false },
+  };
+  const nextStep = "The tracker refused a write the plan needs. Fix the tracker setup that the message above names, then use Unpark at /admin#runners.";
+
+  it("gives plan status write failures tracker remediation", () => {
+    const classification = classificationForFailure(failure);
+    expect(classification.remediation).toBe(nextStep);
+    expect(classification.remediation).not.toMatch(/model id|env|config\.yml/i);
+  });
+
+  it("keeps the category remediation for other config failures", () => {
+    expect(classificationForFailure({ ...failure, code: "PROVIDER_CONFIG" }).remediation).toBe(
+      "The run configuration is invalid (model id, env). Fix the mapping or config.yml, then run it again.",
+    );
+  });
+
+  it("renders the tracker message and the code-specific next step", () => {
+    const rendered = renderFailureRecord(failure);
+    expect(rendered).toContain("```\n" + failure.message + "\n```");
+    expect(rendered).toContain(`**Next step:** ${nextStep}`);
+  });
+});
+
 // classifyCompletion only reads status/phase/conclusion/prUrl/failure, so those are the arguments.
 function jobOf(
   status: JobStatus,
@@ -295,9 +326,9 @@ describe("monitorFailureCommentPrefix", () => {
     expect(monitorFailureCommentPrefix("kg-refresh")).toBe("⚠️ KG refresh failed: ");
   });
 
-  it("uses the implementation phrase for a gap-analysis job — gap-analysis is implementation's retry path and has no comment shape of its own, and it's the only phase where the monitor is ever the sole commenter (BAC-27112 follow-up)", () => {
+  it("names a failed gap-fill in the monitor comment", () => {
     const prefix = monitorFailureCommentPrefix("gap-analysis");
-    expect(prefix.startsWith("⚠️ Implementation failed: ")).toBe(true);
+    expect(prefix.startsWith("⚠️ Gap-fill failed: ")).toBe(true);
   });
 });
 
@@ -805,4 +836,34 @@ describe("ACCOUNT_USAGE_LIMIT notice", () => {
 it("renders all exhausted account profiles from terminal error evidence", () => {
   const message = "Usage limit reached on every account: A, B, C";
   expect(renderFailureRecord({ category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message, evidence: { truncated: false, llmErrorMessage: message } })).toContain("A, B, C");
+});
+
+it("explains a Fly machine removed before start, including when no PR exists", () => {
+  expect(classifyCompletion(jobOf("failed", "implementation", "fly_machine_never_started"))).toMatchObject({
+    detail: "Fly removed the machine before it started.",
+    remediation: "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly).",
+  });
+});
+
+it("keeps structured failure detail and remediation authoritative over the Fly never-started conclusion", () => {
+  const failure: FailureRecord = {
+    category: "transient",
+    code: "PROVIDER_OVERLOADED",
+    stage: "implement",
+    attempt: 3,
+    retryable: true,
+    message: "The model provider was overloaded.",
+    evidence: { truncated: false },
+  };
+  const expected = classificationForFailure(failure);
+  expect(expected.detail).toContain(failure.message);
+  expect(expected.remediation).toBeTruthy();
+
+  const classification = classifyCompletion(
+    jobOf("failed", "implementation", "fly_machine_never_started", null, failure),
+  );
+  expect(classification).toMatchObject({
+    detail: expected.detail,
+    remediation: expected.remediation,
+  });
 });

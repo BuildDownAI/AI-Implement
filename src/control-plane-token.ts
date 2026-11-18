@@ -13,7 +13,9 @@ import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { serviceCaller, type Caller } from "./mcp-identity.js";
 
 export const CONTROL_PLANE_SCOPE = "orchestrator:read";
+export const CONTROL_PLANE_PROJECTS_SCOPE = "orchestrator:projects";
 export const CONTROL_PLANE_DEPLOY_SCOPE = "orchestrator:deploy";
+export const CONTROL_PLANE_SECRETS_SCOPE = "orchestrator:secrets";
 const CLOCK_TOLERANCE_SECONDS = 60;
 const DISCOVERY_TIMEOUT_MS = 5000;
 
@@ -115,8 +117,10 @@ export async function verifyControlPlaneToken(authorizationHeader: string | unde
       requiredClaims: ["exp"],
     });
     const deploy = hasScope(payload, CONTROL_PLANE_DEPLOY_SCOPE);
-    if (!hasScope(payload, CONTROL_PLANE_SCOPE) && !deploy) return refuse("invalid", started);
-    return serviceCaller({ grants: deploy ? ["deploy"] : [] });
+    const projects = hasScope(payload, CONTROL_PLANE_PROJECTS_SCOPE);
+    const secrets = hasScope(payload, CONTROL_PLANE_SECRETS_SCOPE);
+    if (!hasScope(payload, CONTROL_PLANE_SCOPE) && !deploy && !projects && !secrets) return refuse("invalid", started);
+    return serviceCaller({ grants: [...(deploy ? ["deploy" as const] : []), ...(projects ? ["projects" as const] : []), ...(secrets ? ["secrets" as const] : [])] });
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
     return refuse(code === "ERR_JWT_EXPIRED" ? "expired" : "invalid", started);

@@ -19,7 +19,9 @@ Each table has an init step that runs at boot. Two of them hold most of the sche
 Other modules own their tables and run their own `CREATE TABLE IF NOT EXISTS` and
 `ALTER TABLE` statements from an init function that `main()` in `src/index.ts` calls at boot:
 `initMappingsTable()`, `initDispatchBreakerTable()`, `initSettingsTable()`,
-`initAccessEntriesTable()` (`src/access-entries.ts`), `initReconciliationTable()`,
+`initAccessEntriesTable()` (`src/access-entries.ts`), `initKeyBindingsTable()`
+(`src/key-bindings.ts`, also creates the secret-free ingress fence table
+`key_binding_operations`), `initReconciliationTable()`,
 `initStepLogTable()` (`src/step-log.ts`), `initMcpOAuthTables()` (`src/mcp-oauth.ts`),
 `initAccessAuditTable()`, `initAccessPageGrantsTable()`, `initAuthEventsTable()`
 (`src/mcp-auth-events.ts`) and `initReviewFixEvidenceTable()` (`src/review-fix-evidence.ts`).
@@ -38,6 +40,30 @@ Every step is idempotent, so a second boot changes nothing:
 - Triggers use `CREATE TRIGGER IF NOT EXISTS`.
 - One trigger is the exception. `trg_dispatch_log_changed_at` is dropped and created at every
   boot, so an older form of it is replaced by the current form.
+
+### Project CPU kind
+
+`initMappingsTable()` creates `mappings.machine_cpu_kind TEXT NOT NULL DEFAULT 'shared'`.
+For an older database it checks `PRAGMA table_info(mappings)` and adds the missing
+column with the same default. Existing projects read as `shared`; repeated boots
+leave it unchanged. Older orchestrators ignore the column on rollback.
+
+### OpenRouter CHECK constraint rebuilds (AII-1883)
+
+`getDb()` creates `model_account_profile_revisions` and `model_invocation_attribution`
+with `openrouter` in their provider CHECK lists; profile revisions also accept
+`openrouter-api-key` in their auth mode CHECK. Types and application validators are unchanged.
+For each existing table independently, it reads `sqlite_master.sql`: if the stored SQL
+contains `openrouter`, no rebuild runs. Otherwise it creates a replacement table, copies
+all named columns, drops the old table and renames the replacement, in one transaction.
+A second boot skips both rebuilds, including after only one table was upgraded.
+
+The same transaction restores the profile revision immutable UPDATE trigger or the
+attribution `(dispatch_id, stage)` index. It also temporarily drops and restores the
+stored `trg_dispatch_log_pruned` definition, since its reference to attribution would
+prevent the rename while that table is absent. `initLogTable()` calls `getDb()` before
+`ensureAccountingTriggers()`, which recreates `trg_invocation_attribution_changed_at`
+after the rebuild. Historical copied rows therefore do not advance job timestamps.
 
 ## 2. The accounting parts (AII-1561)
 
@@ -94,6 +120,9 @@ Nothing undoes a schema change. If you deploy older code over a newer database:
 - Old code ignores the new tables and columns. Its inserts name their columns, and the new
   columns are nullable.
 - The triggers stay in the database and keep working under old code.
+- The OpenRouter rebuilds keep their wider provider and auth mode CHECK lists. Reverting
+  the code does not narrow them; an older orchestrator runs correctly only when no account
+  profile has provider `openrouter`. See [Roll back after OpenRouter](model-account-operations.md#roll-back-after-openrouter).
 - The prune trigger's deletes (section 4) stay active.
 
 ## 4. The one irreversible change
@@ -216,3 +245,14 @@ the scorecard counts historical resolved rows without evidence as ignored.
 with a primary key on dispatch and finding. Ingestion writes it atomically with
 the finding so callback retries reuse the original revision, while a new dispatch
 can reopen a resolved finding and clear stale fixed credit.
+
+`comment_gapfill_queue` admission refusal tracking uses additive, boot-time
+`PRAGMA table_info` guarded migrations (existing rows are preserved):
+
+| Column | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `refusal_count` | INTEGER NOT NULL | 0 | Admission refusals for this queue row |
+| `last_refusal_reason` | TEXT nullable | NULL | Last admission refusal, retained when skipped |
+| `last_refusal_dispatch_id` | TEXT nullable | NULL | Deduplicates reservation step retries |
+
+`comment_gapfill_refusals` stores durable reservation decisions with `queue_item_id INTEGER NOT NULL`, `dispatch_id TEXT NOT NULL`, and `reason TEXT NOT NULL`; the composite primary key is `(queue_item_id, dispatch_id)`. Boot uses additive `CREATE TABLE IF NOT EXISTS` and seeds the previously recorded last refusal with `INSERT OR IGNORE`. Decisions remain available after terminal queue transitions.

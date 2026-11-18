@@ -11,6 +11,7 @@ import type { RepoMapping } from "../config.js";
 import { makeMapping } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 import { testDir } from "./helpers/test-dir.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
 const SECRET = "filesystem-flow-secret";
 
@@ -55,6 +56,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   localDockerMock.startLocalRunnerContainer.mockReset();
   vi.restoreAllMocks();
 });
@@ -217,6 +219,11 @@ describe("filesystem tickets through the local PR loop", () => {
   });
 
   it("submits filesystem PR comment iteration to ImplementationRun on local Docker", async () => {
+    const http = fakeFetch({
+      "GET /repos/BuildDownAI/AI-Implement/pulls/9001": {
+        json: { merged: false, state: "open", head: { ref: "ai-implement/fs-202" } },
+      },
+    }).install();
     const mapping = filesystemMapping({
       maxTurns: 31,
       maxIterations: 4,
@@ -284,6 +291,7 @@ describe("filesystem tickets through the local PR loop", () => {
     expect(checkContract).not.toHaveBeenCalled();
     expect(localDockerMock.startLocalRunnerContainer).not.toHaveBeenCalled();
     expect(submit).toHaveBeenCalledTimes(1);
+    expect(http.calls).toHaveLength(1);
     const [dispatchId, input] = submit.mock.calls[0]!;
     expect(input).toMatchObject({
       dispatchId, teamKey: "FS", issueId: "FS-202", issueIdentifier: "FS-202",
@@ -297,6 +305,11 @@ describe("filesystem tickets through the local PR loop", () => {
   });
 
   it("does not dispatch filesystem PR comment iteration after leaving local runner mode", async () => {
+    const http = fakeFetch({
+      "GET /repos/BuildDownAI/AI-Implement/pulls/9002": {
+        json: { merged: false, state: "open", head: { ref: "ai-implement/fs-203" } },
+      },
+    }).install();
     const mapping = filesystemMapping();
     queue.enqueueCommentGapfill({
       owner: "BuildDownAI",
@@ -349,6 +362,7 @@ describe("filesystem tickets through the local PR loop", () => {
 
     expect(localDockerMock.startLocalRunnerContainer).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
+    expect(http.calls).toHaveLength(1);
     expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
   });
 });

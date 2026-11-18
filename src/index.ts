@@ -1,5 +1,8 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { bindKey, clearKeyBinding } from "./restate/key-binding.js";
+import { initKeyBindingsTable } from "./key-bindings.js";
+import { checkTrackerWrites } from "./tracker-write-gate.js";
 import { buildHealthBody } from "./health-body.js";
 import { BEFORE_FIRST_SYNC, createSetupCheckContext, getCachedSetupCheckRun, getSetupCheckProgress, runProjectSetupChecks, setupChecksHealthField } from "./setup-checks/index.js";
 import { createSetupCheckChangeDetector, readSavedSetup } from "./setup-checks/change-detector.js";
@@ -171,7 +174,7 @@ import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANN
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
-import { checkKgSidecarHealth } from "./restate/kg-sidecar-health.js";
+import { checkKgSidecarHealth, probeKgSidecarAfterBoot } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
@@ -699,7 +702,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     const inFlightIssueIds = getInFlightIssueIds();
     const candidateScopeKeyById = new Map(allCandidates.map((issue) => [issue.id, issue.scopeKey]));
     const dispatchDecision = (issueId: string) => {
-      const kind: DispatchKind = needsPlanningIds.has(issueId) ? "planning" : "implementation";
+      const kind: DispatchKind = needsPlanningIds.has(issueId) && teamRepoMap[candidateScopeKeyById.get(issueId) ?? ""]?.planningEnabled ? "planning" : "implementation";
       const teamKey = candidateScopeKeyById.get(issueId) ?? "";
       const maxInProgressAiIssues = teamRepoMap[teamKey]?.maxInProgressAiIssues ?? 0;
       return { kind, decision: canDispatch({ issueId, kind, teamKey, maxInProgressAiIssues }) };
@@ -791,6 +794,12 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
         };
         const issueProvider = await registry.forMapping(mapping);
         const isPlanning = needsPlanningIds.has(issue.id) && mapping.planningEnabled;
+
+        if (await checkTrackerWrites({
+          provider: issueProvider, issue, phase: isPlanning ? "planning" : "implementation",
+          park: parkIssue, comment: (id, body) => issueProvider.postComment(id, body),
+          log: (message) => console.log(message),
+        }) === "skip") continue;
 
         if (isPlanning) {
           const planningCtx = await preparePlanningDispatch(config, issueProvider, issue, mapping);
@@ -4137,9 +4146,12 @@ export function makeKgRefreshAdminDeps(
   client: KgRefreshIngressClient,
   callAsSystem: typeof callToolAsSystem = callToolAsSystem,
   deployHeld: () => boolean = isDeployHeld,
+  callAsCaller: typeof callTool = callTool,
 ): NonNullable<AdminDeps["kgRefresh"]> {
   return {
-    trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts }), deployHeld),
+    trigger: async (opts, caller) => kgToolAnswer(await (caller
+      ? callAsCaller("trigger_kg_refresh", { ...opts }, caller)
+      : callAsSystem("trigger_kg_refresh", { ...opts })), deployHeld),
     status: async () => {
       const r = await callAsSystem("get_kg_status", {});
       if (r.status === "unavailable" || r.status === "deploy-held") {
@@ -4901,7 +4913,7 @@ export function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: () => setupChecksClient.read(), startSetupChecks: () => setupChecksClient.start(), setupCheckProgress: getSetupCheckProgress,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, bindKey, clearKeyBinding, readSetupChecks: () => setupChecksClient.read(), startSetupChecks: () => setupChecksClient.start(), setupCheckProgress: getSetupCheckProgress,
         runCandidateChecks: (key, mapping) => runProjectSetupChecks(createSetupCheckContext({ restateStatus: getRestateStatus, mappings: () => ({ [key]: mapping }) }), key, BEFORE_FIRST_SYNC),
         runProjectSetupChecks: (project) => setupChecksClient.runProject(project),
         retention: {
@@ -5256,6 +5268,7 @@ async function main(): Promise<void> {
   initSettingsTable();
   seedSettingsFromEnv(); // SEED_ONCE_SETTINGS: each seeds once, inert thereafter (ADR 022)
   initAccessEntriesTable();
+  initKeyBindingsTable();
   initReconciliationTable();
   initStepLogTable();
   initMcpOAuthTables();
@@ -5297,7 +5310,7 @@ async function main(): Promise<void> {
   setKgMemoryProvider(memoryProvider);
   if (memoryProvider instanceof SidecarMemoryProvider) {
     const health = await probeWithTimeout(memoryProvider);
-    if (health.lastError) {
+    if (health.lastError !== null) {
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
     } else {
       console.error(`[kg] sidecar probe: ok (${REQUIRED_KG_TOOL_COUNT} required tools)`);
@@ -5531,7 +5544,7 @@ async function main(): Promise<void> {
     // Notice settings writes happen synchronously before its first await.
     // A hanging webhook must not delay the first poll.
     postBootNotice: () => { void postBootNotice(config, memoryProvider instanceof SidecarMemoryProvider
-      ? { probe: remainingMs => probeWithTimeout(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
+      ? { probe: remainingMs => probeKgSidecarAfterBoot(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
       : undefined); },
     poll: () => poll(config, registry),
     startInterval: () => {

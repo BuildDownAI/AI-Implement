@@ -504,6 +504,80 @@ for (const file of files) {
       expect("ownerGeneration" in delivered.credentials.modelAuthGrant.bindings[0]).toBe(false);
     });
 
+    function openRouterSnapshot(agent: string, authMode = "openrouter-api-key") {
+      return {
+        ...codexSnapshot,
+        stages: Object.fromEntries(stages.map((stage) => [stage,
+          { ...codexSnapshot.stages[stage], agent, provider: "openrouter" }])),
+        profiles: Object.fromEntries(stages.map((stage) => [stage,
+          { ...codexSnapshot.profiles[stage], agent, provider: "openrouter", authMode }])),
+      };
+    }
+
+    it.each(["claude", "codex", "fallback"])("delivers an OpenRouter %s selection or fallback grant to the runner", (kind) => {
+      const snapshot = kind === "fallback" ? codexSnapshot : openRouterSnapshot(kind);
+      const grant = {
+        ...codexGrant,
+        bindings: kind === "fallback"
+          ? [...codexGrant.bindings, { stage: "implementation", profileId: "prof-openrouter-fallback",
+            profileRevision: 1, authMode: "openrouter-api-key" }]
+          : codexGrant.bindings.map((binding) => ({ ...binding, authMode: "openrouter-api-key" })),
+      };
+      const credentials = { version: 1, ...tokens, modelAuthGrant: grant, modelAuthContext: managedCtx };
+      expect(() => validateResolvedAgentSnapshot(snapshot)).not.toThrow();
+      expect(() => validateRunCredentials(credentials)).not.toThrow();
+      const run_config = enc({ ...base, agentConfig: snapshot, credentials });
+      const r = handoff({ run_config });
+      expect(r.boot.status).toBe(0);
+      expect(r.boot.stderr).toBe("");
+      expect(r.done?.status).toBe(0);
+      expect(r.githubEnv).toBe("");
+      expect(r.env.AI_IMPLEMENT_RUN_CONFIG).toBe(run_config);
+      const delivered = JSON.parse(Buffer.from(r.env.AI_IMPLEMENT_RUN_CONFIG, "base64").toString("utf8"));
+      expect(delivered.agentConfig).toEqual(snapshot);
+      expect(delivered.credentials.modelAuthGrant).toEqual(grant);
+      expect(r.boot.stdout.split("\n")).toContain(`::add-mask::${grant.bearer}`);
+      const unmasked = r.boot.stdout.split("\n").filter((line) => !line.startsWith("::add-mask::")).join("\n");
+      expect(unmasked).not.toContain(grant.bearer);
+      expect(unmasked).not.toContain(run_config);
+    });
+
+    it.each([
+      ["claude", "anthropic-api-key"],
+      ["claude", "claude-subscription"],
+      ["claude", "bedrock"],
+      ["codex", "openai-api-key"],
+      ["codex", "codex-subscription"],
+    ])("rejects OpenRouter %s with auth mode %s before the runner", (agent, authMode) => {
+      const snapshot = openRouterSnapshot(agent, authMode);
+      expect(() => validateResolvedAgentSnapshot(snapshot)).toThrow();
+      const credentials = { version: 1, ...tokens, modelAuthGrant: {
+        ...codexGrant, bindings: codexGrant.bindings.map((binding) => ({ ...binding, authMode })),
+      }, modelAuthContext: managedCtx };
+      const r = handoff({ run_config: enc({ ...base, agentConfig: snapshot, credentials }) });
+      expect(r.boot.status).toBe(1);
+      expect(r.boot.stderr).toBe("::error::Private run_config bootstrap failed\n");
+      expect(r.done).toBeUndefined();
+      expect(r.githubEnv).toBe("");
+      expect(r.outputs).toBe("");
+      expect(r.boot.stdout.split("\n").filter((line) => line && !line.startsWith("::add-mask::"))).toEqual([]);
+    });
+
+    it("rejects an unknown fallback binding mode before the runner", () => {
+      const credentials = { version: 1, ...tokens, modelAuthGrant: {
+        ...codexGrant, bindings: [...codexGrant.bindings, { stage: "implementation",
+          profileId: "prof-fallback", profileRevision: 1, authMode: "unknown-api-key" }],
+      }, modelAuthContext: managedCtx };
+      expect(() => validateRunCredentials(credentials)).toThrow();
+      const r = handoff({ run_config: enc({ ...base, agentConfig: codexSnapshot, credentials }) });
+      expect(r.boot.status).toBe(1);
+      expect(r.boot.stderr).toBe("::error::Private run_config bootstrap failed\n");
+      expect(r.done).toBeUndefined();
+      expect(r.githubEnv).toBe("");
+      expect(r.outputs).toBe("");
+      expect(r.boot.stdout.split("\n").filter((line) => line && !line.startsWith("::add-mask::"))).toEqual([]);
+    });
+
     const ctx = {
       version: 1, dispatchId: "ctx-dispatch-sentinel", projectKey: "ctx-project-sentinel", backend: "gha",
       modelAuthUrl: "https://orchestrator.example.com/base",

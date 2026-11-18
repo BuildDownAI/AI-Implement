@@ -1,3 +1,4 @@
+import { accountCombinations } from "./helpers/account-combinations.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import type * as StoreModule from "../agent-config-store.js";
 import type * as DedupModule from "../dedup.js";
@@ -72,7 +73,7 @@ function seed(): void {
 describe("stage inputs fingerprint", () => {
   it("changes with a profile revision, a retired profile and the project head", () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     const base = store.readStageInputsFingerprint("AII");
     expect(store.readStageInputsFingerprint("AII")).toBe(base);
 
@@ -90,6 +91,13 @@ describe("stage inputs fingerprint", () => {
 });
 
 describe("profiles", () => {
+  it.each(accountCombinations)("save combination $agent/$provider/$authMode: $permitted", ({ permitted, ...combo }) => {
+    const before = dump();
+    const save = () => store.saveAccountProfileRevision(claudeProfile(combo));
+    if (permitted) expect(save().authMode).toBe(combo.authMode);
+    else { expect(save).toThrow("combination is unsupported"); expect(dump()).toBe(before); }
+  });
+
   it.each([
     ["claude", "anthropic", "anthropic-api-key"],
     ["claude", "anthropic", "claude-subscription"],
@@ -110,7 +118,7 @@ describe("profiles", () => {
     ["codex", "openai", "bedrock"],
   ] as const)("rejects mismatch %s/%s/%s without changes", (agent, provider, authMode) => {
     const before = dump();
-    expect(() => store.saveAccountProfileRevision(claudeProfile({ agent, provider, authMode }))).toThrow();
+    expect(() => store.saveAccountProfileRevision(claudeProfile({ agent, provider, authMode }))).toThrow("profile agent/provider/authentication combination is unsupported");
     expect(dump()).toBe(before);
   });
 
@@ -165,24 +173,43 @@ describe("profiles", () => {
 
 describe("stage configuration", () => {
   it("defaults to not opted in and legacy", () => {
-    expect(store.getProjectOptIn("AII")).toBe(false);
+    expect(store.isProjectConfigured("AII")).toBe(false);
     expect(store.resolveProjectStageConfig("AII").resolution).toEqual({ mode: "legacy" });
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     expect(store.getProjectStageConfig("AII")).toBeNull();
   });
 
   it("cannot opt in without valid defaults", () => {
     const before = dump();
-    expect(() => store.setProjectOptIn("AII", true)).toThrow();
+    expect(() => store.setProjectConfigured("AII", true)).toThrow();
     expect(dump()).toBe(before);
-    expect(store.getProjectOptIn("AII")).toBe(false);
+    expect(store.isProjectConfigured("AII")).toBe(false);
+  });
+
+  it("preserves stages across mode changes and appends nothing for unchanged modes", () => {
+    seed();
+    const stages = { review: { model: "project-review" } };
+    store.setProjectStageConfig("AII", { version: 1, mode: "legacy", stages });
+    for (const configured of [true, false]) {
+      store.setProjectConfigured("AII", configured);
+      expect(store.getProjectStageConfig("AII")?.config).toEqual({
+        version: 1, mode: configured ? "configured" : "legacy", stages,
+      });
+      const before = dump();
+      store.setProjectConfigured("AII", configured);
+      expect(dump()).toBe(before);
+    }
+    store.saveAccountProfileRevision(claudeProfile({ revision: 2, status: "disabled" }));
+    const before = dump();
+    expect(() => store.setProjectConfigured("AII", true)).toThrow();
+    expect(dump()).toBe(before);
   });
 
   it("opts in, inherits defaults, and clearing an override restores inheritance", () => {
     seed();
     store.saveAccountProfileRevision(codexProfile({ profileId: "codex-alt" }));
-    store.setProjectOptIn("AII", true);
-    expect(store.getProjectOptIn("AII")).toBe(true);
+    store.setProjectConfigured("AII", true);
+    expect(store.isProjectConfigured("AII")).toBe(true);
     store.setProjectStageConfig("AII", {
       version: 1,
       mode: "configured",
@@ -203,13 +230,13 @@ describe("stage configuration", () => {
     expect(r.resolution.stages.implementation.accountProfileId).toBe("codex-main");
     expect(r.resolution.sources.implementation.accountProfileId).toBe("orchestrator-default");
 
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     expect(store.resolveProjectStageConfig("AII").resolution).toEqual({ mode: "legacy" });
   });
 
   it("rejects invalid writes atomically", () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     const before = dump();
     const bad: StageAgentConfigurationV1[] = [
       { version: 1, mode: "configured", stages: { bogus: {} } as never },
@@ -226,7 +253,7 @@ describe("stage configuration", () => {
 
   it("disabled or archived profiles fail new resolution while retire still works", () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     store.retireAccountProfile("codex-main");
     expect(() => store.resolveProjectStageConfig("AII")).toThrow(/disabled/);
     expect(store.getAccountProfileRevision("codex-main", 1)?.status).toBe("disabled");
@@ -239,7 +266,7 @@ describe("stage configuration", () => {
 
   it("reads reproduce writes across restart", async () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     store.saveAccountProfileRevision(claudeProfile({ revision: 2 }));
     const profiles = store.listAccountProfiles();
     const defaultsRow = store.getOrchestratorDefaults();
@@ -249,14 +276,14 @@ describe("stage configuration", () => {
     expect(store.listAccountProfiles()).toEqual(profiles);
     expect(store.getOrchestratorDefaults()).toEqual(defaultsRow);
     expect(store.getProjectStageConfig("AII")).toEqual(projectRow);
-    expect(store.getProjectOptIn("AII")).toBe(true);
+    expect(store.isProjectConfigured("AII")).toBe(true);
     expect(store.resolveProjectStageConfig("AII")).toEqual(resolved);
     expect(store.getAccountProfileRevision("claude-main", 1)?.revision).toBe(1);
   });
 
   it("snapshots of resolved profiles carry no credential references", () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     const json = JSON.stringify(store.resolveProjectStageConfig("AII"));
     expect(json).not.toContain("vault/claude-main");
     expect(json).not.toContain("metadata");
@@ -271,7 +298,7 @@ describe("config references and frozen snapshots", () => {
 
   function optIn(): void {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
   }
 
   it("legacy resolution has no references or ids", () => {
@@ -338,7 +365,7 @@ describe("stored fallback models", () => {
     const config = defaults();
     config.stages!.review!.fallbackModel = "backup";
     store.setOrchestratorDefaults(config);
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     const before = dump();
 
     expect(() => store.setProjectStageConfig("AII", {
@@ -406,6 +433,16 @@ describe("default account list writes", () => {
     expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error(message));
     expect(dump()).toBe(before);
   });
+  it("refuses OpenRouter after a subscription without saving a revision", () => {
+    store.saveAccountProfileRevision(claudeProfile({ profileId: "plan", authMode: "claude-subscription" }));
+    store.saveAccountProfileRevision(claudeProfile({ profileId: "router", provider: "openrouter", authMode: "openrouter-api-key" }));
+    const config = defaults();
+    config.stages!.planning!.accounts = [{ accountProfileId: "plan", model: "m" }, { accountProfileId: "router", model: "m" }];
+    const before = dump();
+    expect(() => store.setOrchestratorDefaults(config)).toThrow("cannot use paid API after subscription");
+    expect(dump()).toBe(before);
+  });
+
   it("accepts Claude subscriptions and refuses paid entries after them", () => {
     store.saveAccountProfileRevision(claudeProfile({ profileId: "plan", authMode: "claude-subscription" }));
     const config = defaults();
@@ -440,4 +477,61 @@ it("refuses a historical incompatible profile without writing", () => {
   const before = dump();
   expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error("planning.accounts[0] does not resolve"));
   expect(dump()).toBe(before);
+});
+
+describe("stored open-model preference", () => {
+  it.each(["legacy", "configured"] as const)("clears optional implementation metadata in %s mode", (mode) => {
+    seed();
+    for (const preferOpenModel of [true, false]) {
+      const saved = store.setProjectStageConfig("AII", {
+        version: 1, mode, stages: { implementation: { model: "custom-model", preferOpenModel }, review: { model: "review-model" } },
+      });
+      const beforeResolution = store.resolveProjectStageConfig("AII").resolution;
+      const cleared = store.clearProjectStageField("AII", "implementation", "preferOpenModel");
+      expect(cleared.revision).toBe(saved.revision + 1);
+      expect(cleared.supersedesRevisionId).toBe(saved.configRevisionId);
+      expect(cleared.config).toEqual({
+        version: 1, mode, stages: { implementation: { model: "custom-model" }, review: { model: "review-model" } },
+      });
+      expect(store.getProjectStageConfig("AII")!.config).toEqual(cleared.config);
+      expect(store.resolveProjectStageConfig("AII").resolution).toEqual(beforeResolution);
+    }
+  });
+  it.each(["legacy", "configured"] as const)("rejects clearing metadata in invalid stages atomically in %s mode", (mode) => {
+    seed();
+    store.setProjectStageConfig("AII", { version: 1, mode, stages: { implementation: { preferOpenModel: true } } });
+    const before = dump();
+    for (const stage of ["planning", "review"] as const) {
+      expect(() => store.clearProjectStageField("AII", stage, "preferOpenModel")).toThrow("only supported in project implementation");
+      expect(dump()).toBe(before);
+    }
+    expect(() => store.clearProjectStageField("AII", "unknown" as never, "preferOpenModel")).toThrow("unknown stage");
+    expect(dump()).toBe(before);
+  });
+  it.each(["legacy", "configured"] as const)("round-trips booleans and old configs in %s mode", (mode) => {
+    seed();
+    for (const patch of [{}, { preferOpenModel: true }, { preferOpenModel: false }]) {
+      const config: StageAgentConfigurationV1 = { version: 1, mode, stages: { implementation: patch } };
+      store.setProjectStageConfig("AII", config);
+      expect(store.getProjectStageConfig("AII")!.config).toEqual(config);
+    }
+  });
+  it.each(["legacy", "configured"] as const)("rejects invalid project writes atomically in %s mode", (mode) => {
+    seed();
+    const before = dump();
+    for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
+      expect(() => store.setProjectStageConfig("AII", {
+        version: 1, mode, stages: { [stage as string]: { preferOpenModel: value } },
+      } as StageAgentConfigurationV1)).toThrow();
+      expect(dump()).toBe(before);
+    }
+  });
+  it.each(["planning", "implementation", "review"])("rejects defaults %s without appending a revision", (stage) => {
+    seed();
+    const before = dump();
+    expect(() => store.setOrchestratorDefaults({
+      ...defaults(), stages: { ...defaults().stages, [stage]: { preferOpenModel: false } },
+    })).toThrow("only supported");
+    expect(dump()).toBe(before);
+  });
 });

@@ -1707,6 +1707,44 @@ describe("poll implementation submission — ImplementationRun for every project
       .toEqual(mixed === true ? ["AII-1555", "LOCAL-1"] : ["LOCAL-1"]);
   });
 
+  it.each([
+    [false, true, "implementation"],
+    [true, true, "planning"],
+    [true, false, "implementation"],
+  ] as const)("tracker refusal gates poll (planning candidate=%s, enabled=%s)", async (planningCandidate, planningEnabled, phase) => {
+    fakeFetch(POLL_CYCLE_ROUTES).install();
+    const store = await import("../config.js");
+    const breaker = await import("../dispatch-breaker.js");
+    const docker = await import("../local-docker.js");
+    vi.mocked(docker.sweepExitedLocalContainers).mockResolvedValue([]);
+    const mapping = jiraMapping("AII", { planningEnabled, defaultBranch: "main" });
+    store.upsertMapping("AII", mapping);
+    const provider = jiraProvider();
+    const ensure = vi.fn().mockResolvedValue({ ok: false, permanent: true, label: "AI-Working", message: "Denied" });
+    provider.ensureLifecycleLabels = ensure;
+    vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+      needsPlanning: planningCandidate ? [issue] : [],
+      readyForImplementation: planningCandidate ? [] : [issue],
+      inProgressCountsByScope: {}, parentsToFinalize: [],
+    });
+    planningIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
+    const registry = makeRegistry({ provider, mappings: store.getMappings() });
+    await indexModule.poll(config, registry);
+    await indexModule.poll(config, registry);
+    expect(ensure).toHaveBeenCalledTimes(1);
+    expect(provider.postComment).toHaveBeenCalledTimes(1);
+    expect(breaker.isParked(issue.id, phase)).toBe(true);
+    expect(implementationIngress.submit).not.toHaveBeenCalled();
+    expect(planningIngress.submit).not.toHaveBeenCalled();
+    expect(rows()).toEqual([]);
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+    breaker.unpark(issue.id, phase);
+    ensure.mockResolvedValue({ ok: true });
+    await indexModule.poll(config, registry);
+    expect(ensure).toHaveBeenCalledTimes(2);
+    expect(planningCandidate && planningEnabled ? planningIngress.submit : implementationIngress.submit).toHaveBeenCalledTimes(1);
+  });
+
   it("skips unavailable Restate without admission or dedup", async () => {
     status.setRestateStatus({ sidecar: { state: "starting" } });
     const log = vi.spyOn(console, "log");
@@ -1748,7 +1786,7 @@ describe("poll implementation submission — ImplementationRun for every project
     });
     const stage = { agent: "codex" as const, provider: "openai" as const, model: "m", accountProfileId: "managed", invocationTimeoutMs: 60_000 };
     store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), {
       ...ctx, runnerMode: "shadow", baseBranch: "release", baseBranchFieldValue: "release",
     });

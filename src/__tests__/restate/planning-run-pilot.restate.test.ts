@@ -186,10 +186,11 @@ const backends = {
   inspectError: undefined as string | undefined,
   /** The launch writes its row and creates the machine, then throws once (the acknowledgement is lost). */
   crashNextLaunch: false,
+  neverStarted: false,
   async flyGet(id: string) {
     const state = this.machines.get(id);
     if (!state) throw new Error(`Failed to get machine ${id} (404): not found`);
-    return { id, state };
+    return { id, state, events: (this.neverStarted ? ["launch", "promote", "launch", "destroy"] : ["start"]).map(type => ({ type })) };
   },
   /** Parks the first machine destroy (the `cleanup` step on Fly) until the test releases it. */
   destroyGate: undefined as Gate | undefined,
@@ -216,6 +217,7 @@ const backends = {
   },
   reset() {
     this.machines.clear(); this.containers.clear(); this.created = 0; this.names.clear(); this.crashBeforeRow = false; this.destroyCalls = []; this.stopCalls = []; this.removeCalls = [];
+    this.neverStarted = false;
     this.inspectError = undefined; this.crashNextLaunch = false; this.destroyGate = undefined;
   },
 };
@@ -740,6 +742,23 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(gh.statusReads).not.toContain(1);
     expect(sim.remediateCalls).toBe(0);
   }, 60_000);
+
+  it.each([false, true])("Fly never-started planning parks and releases even when the diagnostic read fails (%s)", async failedRead => {
+    const w = await dispatch(labels[0], "PLT-NEVER", "fly-machines");
+    await waitForStep(w.read, "wait");
+    const { jobId } = await w.read();
+    backends.neverStarted = true;
+    backends.machines.set(jobId!, "destroyed");
+    // A missing machine is an ended status; the diagnostic read must also tolerate its 404.
+    if (failedRead) backends.machines.delete(jobId!);
+    await untilReleased(w.dispatchId);
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback" });
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    expect(planningFailedCalls).toHaveLength(1);
+    expect(planningFailedCalls[0].reason).toContain(failedRead ? "the run ended with no planning result" : "Fly removed the machine before it started");
+    expect(sim.notices).toHaveLength(1);
+  });
 
   describe.each(["fly-machines", "local-docker"] as const)("backend %s", (backend) => {
     const running = (id: string) => (backend === "fly-machines" ? backends.machines.get(id) === "started" : backends.containers.get(id) === true);

@@ -68,6 +68,12 @@ const bearer = (t: string) => `Bearer ${t}`;
 describe("verifyControlPlaneToken", () => {
   it.each([
     ["orchestrator:read", []],
+    ["orchestrator:projects", ["projects"]],
+    ["orchestrator:secrets", ["secrets"]],
+    ["orchestrator:secrets orchestrator:projects orchestrator:deploy", ["deploy", "projects", "secrets"]],
+    ["orchestrator:read orchestrator:deploy orchestrator:projects orchestrator:secrets", ["deploy", "projects", "secrets"]],
+    ["orchestrator:read orchestrator:secrets-extra", []],
+    ["orchestrator:projects orchestrator:deploy", ["deploy", "projects"]],
     ["orchestrator:deploy", ["deploy"]],
     ["orchestrator:read orchestrator:deploy", ["deploy"]],
   ])("maps %s to service/user with only its explicit grants", async (scope, grants) => {
@@ -91,6 +97,8 @@ describe("verifyControlPlaneToken", () => {
     ["wrong aud", () => token({ aud: "https://orch-b.example.com" })],
     ["audience array without the base URL", () => token({ aud: ["https://orch-b.example.com"] })],
     ["unknown write scope", () => token({ scope: "orchestrator:write" })],
+    ["secrets substring", () => token({ scope: "orchestrator:secrets-extra" })],
+    ["projects substring", () => token({ scope: "orchestrator:projects-extra" })],
     ["deploy substring", () => token({ scope: "orchestrator:deployment" })],
     ["missing scope", () => token({ scope: "openid" })],
     ["scope that only contains the name as a substring", () => token({ scope: "orchestrator:readwrite" })],

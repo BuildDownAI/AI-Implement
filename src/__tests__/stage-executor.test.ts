@@ -660,11 +660,33 @@ describe("account fallback", () => {
     [[B, C], ["A"], "ACCOUNT_USAGE_LIMIT", { kind: "switch", to: B }],
     [[B, C], ["A", "B"], "ACCOUNT_USAGE_LIMIT", { kind: "switch", to: C }],
     [[B, C], ["A", "B", "C"], "ACCOUNT_USAGE_LIMIT", { kind: "exhausted", profiles: ["A", "B", "C"] }],
+    ...["PROVIDER_AUTH", "PROVIDER_CONFIG"].map(code => [[B, C], ["A"], code, { kind: "switch", to: B }] as const),
+    ...["PROVIDER_RATE_LIMITED", "PROVIDER_TRANSPORT", "MODEL_AUTH_PROFILE_NOT_ALLOWED", "UNKNOWN", "GIT_ERROR", "SENSITIVE_FILES_BLOCKED"].map(code => [[B, C], ["A"], code, { kind: "none" }] as const),
     [[B, C], ["A", "B"], "AUTH_INVALID", { kind: "none" }],
     [[B, C], ["A"], "PROVIDER_OVERLOADED", { kind: "none" }],
     [[B, C], ["A"], "PROCESS_CRASH", { kind: "none" }],
   ] as const)("decides %j with used=%j and code=%s", (fallbacks, used, code, expected) => {
     expect(nextAccount(fallbacks, new Set(used), { code })).toEqual(expected);
+  });
+
+  it("does not rotate for an absent failure or max_turns", () => {
+    expect(nextAccount([B], new Set(["A"]))).toEqual({ kind: "none" });
+    const failure = classifyLlmResult({ ...ok, telemetry: { outcome: "max_turns" } as LLMResult["telemetry"] },
+      { stage: "implement", attempt: 1, expectsStructuredOutput: false });
+    expect(nextAccount([B], new Set(["A"]), failure)).toEqual({ kind: "none" });
+  });
+
+  it("reports the last code after mixed account failures", async () => {
+    const claude = fakeExec();
+    const failure = (code: string, message: string) => ({ category: "auth" as const, code,
+      message, stage: "implement", attempt: 1, retryable: false, evidence: { truncated: false } });
+    claude.invoke.mockResolvedValueOnce({ ...ok, failure: failure("ACCOUNT_USAGE_LIMIT", "limit") })
+      .mockResolvedValueOnce({ ...ok, failure: failure("PROVIDER_CONFIG", "unknown model") });
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot,
+      auth: fakeAuth(), accountFallbacks: { implementation: [B] }, createClaude: () => claude });
+    await executor.invoke({ ...base, agentStage: "implementation" });
+    expect((await executor.invoke({ ...base, agentStage: "implementation" })).failure)
+      .toMatchObject({ code: "PROVIDER_CONFIG", message: "unknown model" });
   });
 
   it.each([true, false])("preserves executor-produced exhaustion evidence (fallback list: %s)", async withFallbacks => {
@@ -690,6 +712,29 @@ describe("account fallback", () => {
       evidence: { llmErrorMessage: message } });
     expect(last.failure?.accountFallback).toBeUndefined();
     expect(auth.invoke.mock.calls.map(call => call[0])).toEqual(profiles);
+  });
+
+  it.each(["PROVIDER_AUTH", "PROVIDER_CONFIG"])("preserves %s messages and last-account evidence", async code => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    for (const fallbacks of [undefined, [], [B, C]]) {
+      const claude = fakeExec();
+      let attempt = 0;
+      claude.invoke.mockImplementation(async () => {
+        const message = `provider refused attempt ${++attempt}`;
+        return { ...ok, failure: { category: "auth", code, stage: "implement", attempt,
+          retryable: false, message, evidence: { truncated: false, llmErrorMessage: message } } };
+      });
+      const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot,
+        auth: fakeAuth(), accountFallbacks: { implementation: fallbacks }, createClaude: () => claude });
+      let last: LLMResult = ok;
+      for (let i = 0; i < 1 + (fallbacks?.length ?? 0); i++) {
+        last = await executor.invoke({ ...base, agentStage: "implementation" });
+      }
+      expect(last.failure).toMatchObject({ code, message: `provider refused attempt ${attempt}`,
+        evidence: { llmErrorMessage: `provider refused attempt ${attempt}` } });
+      expect(last.failure?.accountFallback).toBeUndefined();
+    }
+    expect(log).toHaveBeenCalledWith(`[account-fallback] stage=implementation from=p-impl to=B after=${code}`);
   });
 
   it("retains a fallback checkout failure without advancing to the next account", async () => {

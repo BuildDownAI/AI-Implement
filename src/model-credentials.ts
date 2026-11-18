@@ -1,3 +1,4 @@
+import { readKeyBinding } from "./key-bindings.js";
 /**
  * Replaceable resolver for operator-provisioned model account credentials (AII-950).
  *
@@ -253,6 +254,10 @@ export function resolveModelCredential(req: CredentialRequest, deps: ModelCreden
 
   const ref = lookupRef(profile, deps);
   if (!ref.ok) return ref;
+  let binding: ReturnType<typeof readKeyBinding>;
+  try { binding = readKeyBinding(ref.ref); }
+  catch { return fail("persistence_failed", "secret_unavailable"); }
+  if (binding && binding.destination !== `${req.provider}/${req.authMode}`) return fail("unauthorized", "account_mismatch");
   let raw: ProtectedSecretValue | null | undefined;
   try {
     raw = deps.resolveProtectedSecret(ref.ref);

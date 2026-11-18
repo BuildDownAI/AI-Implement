@@ -49,6 +49,11 @@ describe("repoProcessEnv", () => {
     expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
   });
 
+  it("strips an inherited OpenRouter key", () => {
+    saveAndSet("OPENROUTER_API_KEY", "sentinel-openrouter");
+    expect(repoProcessEnv({ configured: false })).not.toHaveProperty("OPENROUTER_API_KEY");
+  });
+
   it("strips CLAUDE_CODE_OAUTH_TOKEN", () => {
     process.env.CLAUDE_CODE_OAUTH_TOKEN = "sentinel-oauth-token";
     const env = repoProcessEnv();
@@ -299,6 +304,8 @@ describe("private envelope and model-auth bootstrap stripping (AII-981)", () => 
     CLAUDE_CODE_OAUTH_TOKEN: "SENTINEL-claude-sub",
     CLAUDE_CONFIG_DIR: "/sentinel/claude",
     OPENAI_API_KEY: "SENTINEL-openai",
+    OPENROUTER_API_KEY: "SENTINEL-openrouter",
+    ANTHROPIC_AUTH_TOKEN: "SENTINEL-bearer",
     CODEX_API_KEY: "SENTINEL-codex",
     CODEX_HOME: "/sentinel/codex-home",
     CLAUDE_CODE_USE_BEDROCK: "1",
@@ -389,6 +396,8 @@ describe("configured runs and selected authentication (AII-951)", () => {
   const AMBIENT: Record<string, string> = {
     AI_IMPLEMENT_MODEL_AUTH_BEARER: SENT,
     OPENAI_API_KEY: "SENTINEL-openai",
+    OPENROUTER_API_KEY: "SENTINEL-openrouter",
+    ANTHROPIC_AUTH_TOKEN: "SENTINEL-bearer",
     OPENAI_BASE_URL: "https://sentinel.example",
     CODEX_API_KEY: "SENTINEL-codex",
     CODEX_HOME: "/sentinel/codex",
@@ -405,7 +414,7 @@ describe("configured runs and selected authentication (AII-951)", () => {
   beforeEach(() => {
     for (const [k, v] of Object.entries(AMBIENT)) saveAndSet(k, v);
     saveAndSet("AI_IMPLEMENT_RUN_CONFIG", configuredEnvelope);
-    saveAndSet("AI_IMPLEMENT_FORWARDED_SECRETS", "REPO_HOOK_SECRET,OPENAI_API_KEY,CODEX_HOME");
+    saveAndSet("AI_IMPLEMENT_FORWARDED_SECRETS", "REPO_HOOK_SECRET,OPENAI_API_KEY,CODEX_HOME,OPENROUTER_API_KEY,ANTHROPIC_BASE_URL");
   });
   afterEach(() => restoreAll());
 
@@ -468,6 +477,20 @@ describe("configured runs and selected authentication (AII-951)", () => {
       expect(env).not.toHaveProperty("AI_IMPLEMENT_MODEL_AUTH_BEARER");
       for (const k of MODEL_SESSION_KEYS) expect(env).not.toHaveProperty(k);
     }
+  });
+
+  it("preserves all four selected OpenRouter values, including the empty API key", () => {
+    const selected = {
+      ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
+      ANTHROPIC_AUTH_TOKEN: "SYNTHETIC-selected",
+      ANTHROPIC_API_KEY: "",
+      OPENROUTER_API_KEY: "SYNTHETIC-selected",
+    };
+    expect(modelProcessEnv(false, { env: selected })).toEqual(selected);
+    // The selected environment is never merged into the runner's ambient environment.
+    expect(process.env.OPENROUTER_API_KEY).toBe(AMBIENT.OPENROUTER_API_KEY);
+    expect(repoProcessEnv()).not.toHaveProperty("ANTHROPIC_BASE_URL");
+    expect(repoProcessEnv()).not.toHaveProperty("OPENROUTER_API_KEY");
   });
 
   it("modelProcessEnv with selected auth returns only the selected credential and never mutates process.env", () => {

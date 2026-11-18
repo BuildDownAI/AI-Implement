@@ -20,15 +20,18 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
 import { effectiveAccessCode } from "../admin-session.js";
-import { getRunnerMode, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
+import { getRunnerMode, resolveExecutionPath, getFlyProcessLevelSecrets, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
 import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
 import {
-  getMachine, listMachines, fetchMachineLogs, readMachineExit,
+  classifyFlySecretNames, listAppSecrets, FlyApiError, getMachine, listMachines, fetchMachineLogs, readMachineExit,
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import { getOrchestratorDefaults, isProjectConfigured } from "../agent-config-store.js";
 import { summarizeSetupChecks } from "../setup-checks/index.js";
+import { listOpenPulls } from "../open-pulls.js";
+import { listIssueStatuses } from "../issue-statuses.js";
 import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
   listHeldReservations,
@@ -50,11 +53,12 @@ import { RunnerBackend } from "./runner-backend.js";
 import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
-import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
+import { getOrchestratorSettings, getFlySessionsConfig, getRunnerBackendSource, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
+  setProjectAgentModeAction,
   setRunnerModeAction,
   pauseProjectAction,
   upsertMappingAction,
@@ -70,7 +74,7 @@ const CallerSchema = z.object({
   kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
-  grants: z.array(z.literal("deploy")).readonly().default([]),
+  grants: z.array(z.enum(["deploy", "projects", "secrets"])).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -91,7 +95,7 @@ interface ToolOptions<I extends z.ZodType> {
   input: I;
   role: AccessRole;
   /** Alternate authority, accepted only by tools that explicitly request it. */
-  grant?: "deploy";
+  grant?: "deploy" | "projects" | "secrets";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
@@ -201,7 +205,7 @@ export function tool<I extends z.ZodType>(
 }
 
 export const GET_TENANT_HEALTH_DESCRIPTION =
-  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
+  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, stage agent modes (`stageAgents`: defaultsMode and projects with teamKey and agentMode only, sorted by teamKey; missing defaults or project rows mean legacy; only mapped projects appear), and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
 
 export const GetTenantHealthArgsSchema = z.object({});
 
@@ -221,7 +225,16 @@ export const getTenantHealth = tool(
     const { n: awaitingDecisionCount } = db
       .prepare("SELECT COUNT(*) as n FROM dispatch_log WHERE phase = 'kg-refresh' AND status = 'completed' AND conclusion = 'awaiting_decision'")
       .get() as { n: number };
-    const projectCount = Object.keys(getMappings()).length;
+    const projectKeys = Object.keys(getMappings()).sort();
+    const projectCount = projectKeys.length;
+    // Explicit projection: mapping values can contain runner environment secrets.
+    const stageAgents = {
+      defaultsMode: getOrchestratorDefaults()?.config.mode ?? "legacy",
+      projects: projectKeys.map(teamKey => ({
+        teamKey,
+        agentMode: isProjectConfigured(teamKey) ? "configured" : "legacy",
+      })),
+    };
     const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
     const kgRefreshPreflight = kgSourceRepo
       ? await runKgRefreshPreflight({
@@ -238,6 +251,7 @@ export const getTenantHealth = tool(
       awaitingDecisionCount,
       pendingGapfillCount,
       projectCount,
+      stageAgents,
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
       restate: getRestateStatus(),
@@ -293,6 +307,7 @@ export const listProjects = tool(
       dependencyTokenScope: m.dependencyTokenScope,
       sensitiveAddPatterns: m.sensitiveAddPatterns,
       sensitiveAllowPatterns: m.sensitiveAllowPatterns,
+      machineCpuKind: m.machineCpuKind,
       machineCpus: m.machineCpus,
       machineMemoryMb: m.machineMemoryMb,
       awsRegion: m.awsRegion,
@@ -497,6 +512,50 @@ export const getSessionMachine = tool(
         result.logs = await fetchMachineLogs(config.flySessionsToken, config.flySessionsApp, machineId, logLines);
       } catch (err) {
         result.logsError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const GetFlySetupArgsSchema = z.object({}).strict();
+
+export const getFlySetup = tool(
+  {
+    description: "Reports live Fly sessions connectivity and secret names by group, never values.",
+    input: GetFlySetupArgsSchema,
+    role: "admin",
+    grant: "secrets",
+    operation: "read",
+  },
+  async (): Promise<ToolResponse> => {
+    const config = mcpAdminConfig();
+    const mappings = getMappings();
+    const appSource = getRunnerBackendSource();
+    const configured = appSource !== "not-loaded" && !!config.flySessionsToken && !!config.flySessionsApp;
+    const result = {
+      usedBy: Object.keys(mappings).filter((key) => {
+        const path = resolveExecutionPath(getRunnerMode().mode, mappings[key].executionMode);
+        return path === "fly-machines" || path === "both";
+      }).sort(),
+      appSource, configured, app: config.flySessionsApp || null,
+      processLevelSecrets: getFlyProcessLevelSecrets(),
+      reachable: null as boolean | null,
+      reachError: null as string | null,
+      names: [] as Array<{ name: string; group: string; projects: string[]; createdAt: string }>,
+    };
+    if (configured) {
+      try {
+        const secrets = await listAppSecrets(config.flySessionsToken!, config.flySessionsApp!, 10_000);
+        result.names = secrets.map((secret) => {
+          const { group, projects } = classifyFlySecretNames([secret.name], Object.keys(mappings))[0];
+          return { name: secret.name, group, projects, createdAt: secret.created_at };
+        }).sort((a, b) => a.name.localeCompare(b.name));
+        result.reachable = true;
+      } catch (err) {
+        result.reachable = false;
+        result.reachError = err instanceof FlyApiError ? `http-${err.status}`
+          : err instanceof Error && err.name === "AbortError" ? "timeout" : "error";
       }
     }
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -1025,6 +1084,41 @@ export const getReviewFixActivityTool = tool(
   },
 );
 
+export const LIST_OPEN_PULLS_DESCRIPTION =
+  "One entry per open PR in every mapped repository. Returns a JSON array. GitHub lists are cached for 60 s; any unreadable repository fails the whole call. workflow is absent when the orchestrator has no verdict; workflow.state is active when work remains and settled when it does not. Times are epoch ms. Read.";
+
+export const listOpenPullsTool = tool(
+  {
+    description: LIST_OPEN_PULLS_DESCRIPTION,
+    input: z.object({}),
+    role: "user",
+    operation: "read",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    const entries = await ctx.run("list-open-pulls", () => listOpenPulls(), { maxRetryAttempts: 1 });
+    return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+  },
+);
+
+export const LIST_ISSUE_STATUSES_DESCRIPTION =
+  "Returns a JSON array with one entry per in-scope issue: open issues matching the pickup query in any state, plus merged and failed issues from the last 7 days. States: ready, planning, awaiting-approval, plan-approved, implementing, pr-ready, merged, failed, unknown. changedAt is the tracker's last-updated time, or a newer job time when there is one (epoch ms). Breaker parks mark nonmerged issues failed; jobs supply missing failure phase and newer changedAt. Tracker reads are cached for 60 s; one unreadable tracker fails the whole call. Linear and filesystem never report awaiting-approval. Read.";
+
+export const listIssueStatusesTool = tool(
+  {
+    description: LIST_ISSUE_STATUSES_DESCRIPTION,
+    input: z.object({}),
+    role: "user",
+    operation: "read",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    const entries = await ctx.run("list-issue-statuses", () => listIssueStatuses({
+      providerFor: (m) => providerRegistryForTools().forMapping(m),
+      now: Date.now,
+    }), { maxRetryAttempts: 1 });
+    return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+  },
+);
+
 export const LIST_JOB_ACCOUNTING_DESCRIPTION =
   "Returns one page of finished-job accounting records, oldest change first: dispatch id, phase, status, conclusion, lifecycle owner, times, changedAt, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). A job that changes after it was served (a second terminal write, a late review conclusion, a late invocation row) is served again with a newer changedAt: the newest copy of a job replaces older ones. usage is reported only when the runner's invocation list arrived whole, partial when some invocation rows exist without that, unknown when none exist. Args: optional cursor { changedAt, dispatchId }, optional pageSize 1..200 (default 100), optional includeUnsettled (boolean; also serves jobs that changed in the last 10 minutes — only for a caller about to lose the orchestrator; such records may still change and are replaced by changedAt). Returns records, nextCursor, oldestRetainedCompletedAt (information only) and prunedThrough ({ changedAt, dispatchId } of the newest finished job pruned, or null). Without includeUnsettled a record is returned 10 minutes after its last change. Read.";
 
@@ -1217,6 +1311,7 @@ export const triggerKgRefreshTool = tool(
     const opts = {
       ...(input.args.ref !== undefined ? { kgSourceRef: input.args.ref } : {}),
       actorEmail: input.caller.email ?? undefined,
+      trigger: input.caller.kind === "human" ? "manual" as const : "schedule" as const,
     };
     const result = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).trigger(opts);
     if ("status" in result) return answer(409, { error: "refresh-in-progress" });
@@ -1472,6 +1567,7 @@ export const addProjectArgsSchema = z.object({
   maxInProgressAiIssues: z.number().optional(),
   executionMode: z.enum(["github-actions", "fly-machines"]).optional(),
   sessionMode: z.enum(["autonomous", "interactive", "hybrid"]).optional(),
+  machineCpuKind: z.enum(["shared", "performance"]).optional(),
   machineCpus: z.number().optional(),
   machineMemoryMb: z.number().optional(),
   planningEnabled: z.boolean().optional(),
@@ -1510,6 +1606,30 @@ export const addProjectArgsSchema = z.object({
     "The project's review process. Restate coordinates AI-Implement fixes for every project. Omit to keep the stored value; pass null or \"ai-implement\" for the default. All review processes apply to every project.",
   ),
 });
+
+export const SetProjectAgentModeArgsSchema = z.object({
+  teamKey: z.string(),
+  mode: z.enum(["configured", "legacy"]),
+}).strict();
+
+export const setProjectAgentModeTool = tool(
+  {
+    description: "Change a project's agent mode to configured or legacy without readiness inspection. Refusals: mapping-not-found, resolution-failed.",
+    input: SetProjectAgentModeArgsSchema,
+    grant: "projects",
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `teamKey=${input.args.teamKey} mode=${input.args.mode}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("set-project-agent-mode", () =>
+      setProjectAgentModeAction(input.args.teamKey, input.args.mode, auditActor(input.caller, "system")),
+    { maxRetryAttempts: 1 });
+    if (!result.ok) return toolError(result.code);
+    return { content: [{ type: "text", text: JSON.stringify({ teamKey: result.teamKey, agentMode: result.agentMode }) }] };
+  },
+);
 
 export const addProjectTool = tool(
   {
@@ -1644,6 +1764,7 @@ export const orchestratorTools = restate.service({
     list_in_flight_jobs: listInFlightJobs,
     get_session_machine: getSessionMachine,
     list_session_machines: listSessionMachines,
+    get_fly_setup: getFlySetup,
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
     get_fleet_report: getFleetReportTool,
@@ -1653,6 +1774,8 @@ export const orchestratorTools = restate.service({
     get_review_fix_attempt: getReviewFixAttemptTool,
     get_review_fix_activity: getReviewFixActivityTool,
     list_job_accounting: listJobAccountingTool,
+    list_open_pulls: listOpenPullsTool,
+    list_issue_statuses: listIssueStatusesTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,
@@ -1673,6 +1796,7 @@ export const orchestratorTools = restate.service({
     pause_project: pauseProjectTool,
     start_deploy: startDeployTool,
     add_project: addProjectTool,
+    set_project_agent_mode: setProjectAgentModeTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
     list_dispatch_reservations: listDispatchReservationsTool,

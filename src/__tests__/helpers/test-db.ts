@@ -16,6 +16,7 @@ const BOOT_TABLE_INITS: ReadonlyArray<() => Promise<void>> = [
   async () => (await vi.importActual<typeof import("../../dispatch-breaker.js")>("../../dispatch-breaker.js")).initDispatchBreakerTable(),
   async () => (await vi.importActual<typeof import("../../runner-mode.js")>("../../runner-mode.js")).initSettingsTable(),
   async () => (await vi.importActual<typeof import("../../access-entries.js")>("../../access-entries.js")).initAccessEntriesTable(),
+  async () => (await vi.importActual<typeof import("../../key-bindings.js")>("../../key-bindings.js")).initKeyBindingsTable(),
   async () => (await vi.importActual<typeof import("../../reconciliation.js")>("../../reconciliation.js")).initReconciliationTable(),
   async () => (await vi.importActual<typeof import("../../step-log.js")>("../../step-log.js")).initStepLogTable(),
   async () => (await vi.importActual<typeof import("../../mcp-oauth.js")>("../../mcp-oauth.js")).initMcpOAuthTables(),

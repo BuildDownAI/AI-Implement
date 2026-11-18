@@ -1,3 +1,4 @@
+import { commentInstructionReviewRubric } from "../pipeline/feedback-loop-core.js";
 import { createStageExecutor } from "../pipeline/stage-executor.js";
 import { ModelAuthClientError, type ModelInvocation } from "../model-auth-client.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
@@ -241,17 +242,18 @@ describe("feedbackLoopStep — planning context routing", () => {
 
   it("sends acceptanceBar to review on every pass with new-format context", async () => {
     const ctx = makeContext();
+    const reviewRubric = commentInstructionReviewRubric("Fix the documentation only");
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, reviewRubric, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     const expectedBar = "## ✅ AI Planning: Acceptance Bar\n\n1. Foo.\n2. Bar.";
-    expect(mockReviewRun.mock.calls[0][1]).toMatchObject({ acceptanceBar: expectedBar });
-    expect(mockReviewRun.mock.calls[1][1]).toMatchObject({ acceptanceBar: expectedBar });
+    expect(mockReviewRun.mock.calls[0][1]).toMatchObject({ acceptanceBar: expectedBar, reviewRubric });
+    expect(mockReviewRun.mock.calls[1][1]).toMatchObject({ acceptanceBar: expectedBar, reviewRubric });
   });
 
   it("sends wrapped mapSection (with security guard) to implement on pass 2 with new-format context", async () => {
@@ -409,13 +411,13 @@ describe("account-switch retries", () => {
     expect(mockReviewRun).not.toHaveBeenCalled();
   });
 
-  it("gives a classified exit-zero usage-limit result an extra attempt for the next account", async () => {
+  it.each([["ACCOUNT_USAGE_LIMIT", "You've hit your usage limit."], ["PROVIDER_AUTH", "authentication_error"], ["PROVIDER_CONFIG", "unknown model"]])("gives a classified exit-zero %s result an extra attempt for the next account", async (code, errorMessage) => {
     const failure = classifyLlmResult({
       stdout: "", stderr: "", exitCode: 0, tokensUsed: 0, attempts: 1,
       terminalStatus: { isError: true, subtype: "turn.failed" },
-      errorMessage: "You've hit your usage limit.",
+      errorMessage,
     }, { stage: "implement", attempt: 1, expectsStructuredOutput: false });
-    expect(failure.code).toBe("ACCOUNT_USAGE_LIMIT");
+    expect(failure.code).toBe(code);
     failure.accountFallback = { stage: "implementation", from: "A", to: "B" };
     mockImplementRun.mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure });
     const ctx = makeContext();
@@ -427,9 +429,31 @@ describe("account-switch retries", () => {
     expect(mockImplementRun).toHaveBeenCalledTimes(2);
   });
 
-  it.each(["implementation", "review"] as const)("gives successive switches an attempt beyond the retry budget: %s", async stage => {
+  it.each(["PROVIDER_AUTH", "PROVIDER_CONFIG"])("continues dirty implementation work after a thrown %s switches accounts with zero retries", async code => {
+    const failure = {
+      category: "auth" as const, code, stage: "implement", attempt: 1, retryable: false,
+      message: "Provider refused the key or model", evidence: { truncated: false },
+      accountFallback: { stage: "implementation" as const, from: "A", to: "B" },
+    };
+    mockImplementRun.mockRejectedValueOnce(Object.assign(new Error(failure.message), { failure }))
+      .mockResolvedValueOnce(IMPLEMENT_SUCCESS);
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const ctx = makeContext();
+    ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+
+    const result = await feedbackLoopStep.run(ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
+      { report: vi.fn(async () => undefined) });
+
+    expect(result.approved).toBe(true);
+    expect(mockImplementRun).toHaveBeenCalledTimes(2);
+    expect(mockImplementRun.mock.calls[1][1].prompt).toContain("Continue from the current state; do not revert it.");
+    expect(mockReviewRun).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["ACCOUNT_USAGE_LIMIT", "PROVIDER_AUTH", "PROVIDER_CONFIG"].flatMap(code => (["implementation", "review"] as const).map(stage => ({ code, stage }))))("gives successive switches an attempt beyond the retry budget: $stage $code", async ({ stage, code }) => {
     const failure = (from: string, to: string) => ({
-      category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage, attempt: 1, retryable: false,
+      category: "auth" as const, code, stage, attempt: 1, retryable: false,
       message: "limit", evidence: { truncated: false }, accountFallback: { stage, from, to },
     });
     if (stage === "implementation") {
@@ -451,8 +475,8 @@ describe("account-switch retries", () => {
   });
 });
 
-it("preserves a terminal review account failure for the notice", async () => {
-  const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "review", attempt: 1, retryable: false,
+it.each(["ACCOUNT_USAGE_LIMIT", "PROVIDER_AUTH", "PROVIDER_CONFIG"])("preserves a terminal review account failure for the notice: %s", async code => {
+  const failure = { category: "auth" as const, code, stage: "review", attempt: 1, retryable: false,
     message: "Usage limit reached on every account: A, B, C", evidence: { truncated: false, llmErrorMessage: "Usage limit reached on every account: A, B, C" } };
   mockReviewRun.mockRejectedValueOnce(Object.assign(new Error(failure.message), { failure }));
   const result = await feedbackLoopStep.run(makeContext(),
@@ -471,8 +495,8 @@ it.each([false, true])("preserves terminal implement usage limits only for dirty
   expect(mockReviewRun).not.toHaveBeenCalled();
 });
 
-it("keeps changes after both implement accounts reach their usage limit with zero retries", async () => {
-  const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+it.each(["ACCOUNT_USAGE_LIMIT", "PROVIDER_AUTH", "PROVIDER_CONFIG"])("keeps changes after both implement accounts fail with zero retries: %s", async code => {
+  const failure = { category: "auth" as const, code, stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
   mockImplementRun.mockRejectedValueOnce(Object.assign(new Error("limit"), { failure: { ...failure, accountFallback: { stage: "implementation", from: "A", to: "B" } } }))
     .mockRejectedValueOnce(Object.assign(new Error("limit"), { failure }));
   vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });

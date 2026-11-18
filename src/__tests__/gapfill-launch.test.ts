@@ -110,3 +110,18 @@ it("carries advisory mode in Fly and GHA envelopes and rejects legacy GHA", asyn
   expect(decodeRunConfig(launch.inputs.run_config!).reviewOnly).toEqual(reviewOnly);
   await expect(prepareGhaGapfillLaunch({ ...args, checkContract: async () => "legacy" as const })).rejects.toThrow(/review-only requires/);
 });
+
+
+it.each([
+  { machineCpuKind: "shared" as const, review: false },
+  { machineCpuKind: "performance" as const, review: false },
+  { machineCpuKind: "performance" as const, review: true },
+])("builds the configured guest for gap-fill/review-fix: %j", async ({ machineCpuKind, review }) => {
+  await dispatchFlyGapfill(input({
+    mapping: makeMapping({ machineCpuKind, machineCpus: 4, machineMemoryMb: 8192 }),
+    ...(review ? { reviewFix: makeReviewFixRunConfig({ executionBackend: "fly-machines" }).reviewFix } : {}),
+  }));
+  expect(mocks.create.mock.calls[0][2].config.guest).toEqual({
+    cpu_kind: machineCpuKind, cpus: 4, memory_mb: 8192,
+  });
+});
