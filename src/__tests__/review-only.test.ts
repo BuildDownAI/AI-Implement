@@ -73,14 +73,19 @@ describe("advisory roll-up review", () => {
     }
   });
 
-  it("keeps distinct stable keys and blocking severity when reviewers disagree", async () => {
+  it.each([
+    ["minor", "blocking", "blocking"],
+    ["blocking", "minor", "blocking"],
+    ["minor", "medium", "medium"],
+    ["medium", "minor", "medium"],
+  ])("keeps distinct stable keys and strongest severity: %s then %s", async (first, second, strongest) => {
     let body = "";
     let invocation = 0;
     const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 1,
       terminalStatus: { subtype: "success", isError: false }, structuredOutput: {
         approved: false, summary: "Reviewed", checks: [{ check: "Contract", result: "passed", evidence: "diff" }],
         findings: [
-          { severity: ++invocation === 1 ? "minor" : "blocking", path: "one.ts", line: 7, body: "Shared evidence" },
+          { severity: ++invocation === 1 ? first : second, path: "one.ts", line: 7, body: "Shared evidence" },
           { severity: "minor", path: "two.ts", line: 7, body: "Shared evidence" },
           { severity: "minor", path: "one.ts", line: 8, body: "Shared evidence" },
           { severity: "minor", path: "one.ts", line: 7, body: "Different evidence" },
@@ -93,8 +98,8 @@ describe("advisory roll-up review", () => {
       if (args[1] === "comment") body = readFileSync(args[4], "utf8");
       return { exitCode: 0, stdout: args[1] === "view" ? "a".repeat(40) : args[1] === "diff" ? diff : "" };
     });
-    expect(body.match(/^- \*\*(?:blocking|minor)\*\* .* — /gm)).toHaveLength(4);
-    expect(body).toContain("**blocking** one.ts:7 — Shared evidence (Reviewers: code-review, integration-review)");
+    expect(body.match(/^- \*\*(?:blocking|medium|minor)\*\* .* — /gm)).toHaveLength(4);
+    expect(body).toContain(`**${strongest}** one.ts:7 — Shared evidence (Reviewers: code-review, integration-review)`);
   });
 
   it("reports diff buffer overflow without reviewing partial output", async () => {

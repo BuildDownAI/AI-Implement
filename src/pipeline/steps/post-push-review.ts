@@ -3057,13 +3057,14 @@ function rollupReviewBody(verdict: string, feedback: string, findings: ReviewLed
     return `${value.slice(0, end)}… [truncated]`;
   };
   const header = `<!-- ai-implement rollup-review -->\n\n## Roll-up review: ${verdict}\n\nThis verdict does not block the merge; blocking findings are filed as one [roll-up-review] child until the automatic follow-up limit is reached.\n\nReviewed head: \`${reviewedHead ? reviewedHead.slice(0, 7) : "unavailable"}\``;
+  const severityRank = { minor: 0, medium: 1, blocking: 2 };
   const grouped = new Map<string, { finding: ReviewLedgerFinding; reviewers: Set<string> }>();
   for (const finding of findings) {
     const key = stableReviewFindingKey(finding);
     const entry = grouped.get(key);
     if (entry) {
       if (finding.reviewerId) entry.reviewers.add(finding.reviewerId);
-      if (finding.severity === "blocking") entry.finding = finding;
+      if (severityRank[finding.severity] > severityRank[entry.finding.severity]) entry.finding = finding;
     } else grouped.set(key, { finding, reviewers: new Set(finding.reviewerId ? [finding.reviewerId] : []) });
   }
   const unique = [...grouped.values()];
