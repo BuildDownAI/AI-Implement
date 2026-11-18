@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { testDb } from "./helpers/test-db.js";
 import type { LinkPullRequestInput } from "../pr-links.js";
 
@@ -12,6 +12,15 @@ const fixture = () => testDb({ tables: "none", modules: {
 } });
 
 describe("pull request links", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it.each(["link", "find", "outcome", "issue", "set", "delete"])("creates both tables on first %s access", async (first) => {
     const { modules: { links, dedup } } = await fixture();
     switch (first) {
@@ -41,17 +50,16 @@ describe("pull request links", () => {
   it("refreshes metadata but preserves the first link and fills only missing refs across restarts", async () => {
     const f = await fixture();
     const { links, dedup } = f.modules;
-    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
     const first = links.linkPullRequest({ ...input, headRef: "first" });
     links.setLinkOutcome(input.repository, 1, "merged", 150);
-    clock.mockReturnValue(200);
+    vi.setSystemTime(200);
     const second = links.linkPullRequest({ ...input, headRef: "replacement", baseRef: "main", role: "roll-up", source: "result",
       issue: { ...input.issue, mappingKey: "other", title: "Updated", identifier: "AII-2", url: null } });
     expect(second).toEqual({ ...first, baseRef: "main", outcome: "merged", closedAt: 150,
       issue: { ...first.issue, title: "Updated", identifier: "AII-2", url: null, updatedAt: 200 } });
+    expect(second).toMatchObject({ linkedAt: 100, issue: { firstSeenAt: 100, updatedAt: 200 } });
     expect(dedup.getDb().prepare("SELECT count(*) AS n FROM tracked_issue").get()).toEqual({ n: 1 });
     expect(links.listLinksByOutcome("merged")).toEqual([second]);
-    clock.mockRestore();
     const reopened = await f.reopen();
     expect(reopened.links.findLinkByPr(input.repository, 1)).toEqual(second);
   });
