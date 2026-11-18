@@ -424,7 +424,6 @@ describe("handleRunnerResult — planning", () => {
       auth.configureLinearAuth("client-id", "client-secret");
       auth.__setLinearTokenForTest("test-token");
       fakeFetch({ "POST /graphql": [
-        { json: { data: { issue: { labels: { nodes: [] } } } } },
         { json: { data: { issue: { team: { key: "THR2" } } } } },
         { json: { data: { teams: { nodes: [{ id: "team-thr2" }] } } } },
         { json: { data: { issueLabels: { nodes: [] } } } },
