@@ -6933,7 +6933,7 @@ describe("roll-up review follow-up children", () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
-  it.each(["creation", "edit", "pending retry"])("serializes shared notices during overlapping %s callbacks", async stage => {
+  it.each(["creation", "edit", "failed edit", "pending retry"])("serializes shared notices during overlapping %s callbacks", async stage => {
     const { prepare, create, update } = await setup();
     const first = await prepare("a");
     const second = await prepare("a"); // Separate legacy dispatches share the same notice receipt.
@@ -6954,7 +6954,11 @@ describe("roll-up review follow-up children", () => {
         return actual(...args);
       });
     } else {
-      update.mockImplementationOnce(async () => { entered(); await gate; });
+      update.mockImplementationOnce(async () => {
+        entered();
+        await gate;
+        if (stage === "failed edit") throw new Error("comment unavailable");
+      });
     }
     const delivery = first.deliver();
     await started;
@@ -6963,9 +6967,9 @@ describe("roll-up review follow-up children", () => {
     await new Promise<void>(resolve => setImmediate(resolve));
     release();
     const results = await Promise.all([delivery, overlapping]);
-    expect(results.map(result => result.status)).toEqual([200, 200]);
+    expect(results.map(result => result.status)).toEqual(stage === "failed edit" ? [503, 200] : [200, 200]);
     expect(create).toHaveBeenCalledOnce();
-    expect(update).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledTimes(stage === "failed edit" ? 2 : 1);
     const child = await create.mock.results[0].value;
     const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
     expect(JSON.parse(row.value)).toEqual({
@@ -6974,6 +6978,7 @@ describe("roll-up review follow-up children", () => {
       delivered: true,
     });
     expect(update.mock.calls[0][4]).toContain(JSON.parse(row.value).text);
+    if (stage === "failed edit") expect(update.mock.calls[1][4]).toBe(update.mock.calls[0][4]);
   });
 
   it("retries a durable notice after child creation without filing or posting twice", async () => {
