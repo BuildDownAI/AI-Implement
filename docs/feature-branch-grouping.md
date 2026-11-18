@@ -276,7 +276,7 @@ modify the branch. Its verdict appears as a comment in the roll-up PR conversati
 showing the short reviewed head SHA and explaining that it does not block the merge; blockers
 are filed as one `[roll-up-review]` child until the limit is reached. Findings
 with the same `stableReviewFindingKey` appear once with all reporting reviewer
-IDs; findings are never merged by meaning.
+IDs and the strongest reported severity (`blocking` > `medium` > `minor`); findings are never merged by meaning.
 
 Blocking findings from a complete review on an open roll-up also produce
 **one pickup-ready child** under that tree's parent, containing all blockers and
