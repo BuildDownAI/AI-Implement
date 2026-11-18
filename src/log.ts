@@ -1,4 +1,4 @@
-import { linkPullRequest, type LinkSource, type TrackerKind } from "./pr-links.js";
+import { linkPullRequest, recordLinkJob, type LinkSource, type TrackerKind } from "./pr-links.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import type { InvocationUsageRow } from "./agent-usage.js";
 import { getDb } from "./dedup.js";
@@ -903,14 +903,15 @@ export function linkJobPullRequest(jobId: number, url: string, source: LinkSourc
   if (!match) return;
   try {
     const job = getDb().prepare(`SELECT issue_id, issue_identifier, issue_title, issue_url,
-      team_key, tracker_kind FROM dispatch_log WHERE id = ?`).get(jobId) as {
+      team_key, tracker_kind, grouping_parent, dispatched_at FROM dispatch_log WHERE id = ?`).get(jobId) as {
       issue_id: string; issue_identifier: string | null; issue_title: string | null;
       issue_url: string | null; team_key: string | null; tracker_kind: TrackerKind | null;
+      grouping_parent: number; dispatched_at: number;
     } | undefined;
     if (!job?.team_key) return;
     const mapping = getMappings()[job.team_key];
     if (!mapping) return;
-    linkPullRequest({
+    const link = linkPullRequest({
       repository: `${match[1]}/${match[2]}`, number: Number(match[3]), url,
       source, role: "implementation",
       issue: {
@@ -919,6 +920,10 @@ export function linkJobPullRequest(jobId: number, url: string, source: LinkSourc
         identifier: job.issue_identifier, title: job.issue_title, url: job.issue_url,
       },
     });
+    if (link.issue.trackerIssueId === job.issue_id &&
+        link.issue.trackerKind === (job.tracker_kind ?? mapping.ticketingConfig.kind)) {
+      recordLinkJob(link, job.grouping_parent === 1, job.dispatched_at, jobId);
+    }
   } catch (err) {
     console.error(`[log] Failed to link pull request for job ${jobId}:`, err);
   }

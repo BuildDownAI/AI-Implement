@@ -1,7 +1,7 @@
 import type { RepoMapping } from "./config.js";
-import { getInFlightIssueIds, getLatestPrUrlForIssue } from "./log.js";
-import { deleteDispatched, getDb } from "./dedup.js";
-import { listLinksByOutcome, listOpenLinksForIssue, listUncheckedClosedLinks, setCancelCheckedAt, setLinkOutcome } from "./pr-links.js";
+import { getInFlightIssueIds } from "./log.js";
+import { deleteDispatched } from "./dedup.js";
+import { isCurrentGroupingParent, listLinksByOutcome, listOpenLinksForIssue, listUncheckedClosedLinks, setCancelCheckedAt, setLinkOutcome } from "./pr-links.js";
 import type { PullRequestLink } from "./pr-links.js";
 import {
   enqueueReconciliation,
@@ -52,9 +52,9 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
     if (!state) continue;
     if (!state.merged && state.state !== "closed") continue;
     const outcome = state.merged ? "merged" : "closed-unmerged";
-    // Existing queue rows (including webhook deliveries during the read) only need
-    // outcome repair. Roll-ups are finalized by merge-up, never this queue.
-    if (link.role === "roll-up" || hasReconciliationForPr(repo, prNumber)) {
+    // A confirmed merge must promote any skipped close tombstone. Existing close
+    // decisions only need outcome repair; roll-ups are finalized by merge-up.
+    if (link.role === "roll-up" || (!state.merged && hasReconciliationForPr(repo, prNumber))) {
       setLinkOutcome(repo, prNumber, outcome, Date.now());
       continue;
     }
@@ -68,11 +68,7 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
       });
       console.log(`[merge-poll] Detected merge of PR #${prNumber} in ${repo}; queued reconciliation`);
     } else if (state.state === "closed") {
-      // Any surviving grouping row wins over later gap-fill rows.
-      const groupingParent = getDb().prepare(
-        "SELECT 1 FROM dispatch_log WHERE pr_url = ? AND grouping_parent = 1 LIMIT 1",
-      ).get(link.url);
-      if (groupingParent && getLatestPrUrlForIssue(issue.trackerIssueId) === link.url) {
+      if (isCurrentGroupingParent(link)) {
         // A run in flight may still change the picture; the next poll re-checks.
         if (getInFlightIssueIds().has(issue.trackerIssueId)) continue;
         try {
@@ -97,11 +93,11 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
   // Outcome repair runs first; tombstones must not suppress cancellation retries.
   for (const link of listUncheckedClosedLinks()) {
     const { issue, repository, number } = link;
-    const groupingParent = getDb().prepare(
-      "SELECT 1 FROM dispatch_log WHERE pr_url = ? AND grouping_parent = 1 LIMIT 1",
-    ).get(link.url);
+    // Superseded grouping PRs retain the parent's cancellation exemption even
+    // when the current PR closes in this same poll. Only finalization needs
+    // current-PR identity.
     if (link.role === "roll-up" ||
-        (groupingParent && getLatestPrUrlForIssue(issue.trackerIssueId) === link.url) ||
+        link.groupingParent ||
         listOpenLinksForIssue(issue.trackerKind, issue.trackerIssueId).length > 0) {
       setCancelCheckedAt(repository, number, Date.now());
       continue;

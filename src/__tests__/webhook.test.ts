@@ -853,6 +853,28 @@ describe("reconciliation enqueue", () => {
     expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
   });
 
+  it("promotes a close tombstone after reopening and merging, with repeated deliveries deduplicated", async () => {
+    link();
+    const poll = await import("../poll-merged-prs.js");
+    await poll.detectMergedPrs({
+      getPullRequestState: async () => ({ merged: false, state: "closed" }),
+      tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
+      finalizeGroupingParent: async () => true,
+      mappingForRepo: () => makeMapping({ owner: "org", repo: "repo" }),
+    });
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(0);
+    const before = dedup.getDb().prepare("SELECT id FROM reconciliation_queue").get();
+    links.setLinkOutcome("org/repo", 42, "open", null);
+    expect((await deliver()).queued).toBe(true);
+    expect(await deliver()).toEqual({ ignored: true, reason: "already queued" });
+    expect(links.findLinkByPr("org/repo", 42)?.outcome).toBe("merged");
+    expect(reconciliation.getPendingReconciliations()).toEqual([expect.objectContaining({
+      status: "pending", mergeCommitSha: "sha-abc123",
+    })]);
+    expect(dedup.getDb().prepare("SELECT id FROM reconciliation_queue").all()).toEqual([before]);
+  });
+
   it("queues the job's issue when its PR URL was written by updateJobPrUrl", async () => {
     hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
     const jobId = appendDispatch({

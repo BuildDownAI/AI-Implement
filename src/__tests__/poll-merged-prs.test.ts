@@ -21,6 +21,8 @@ beforeEach(async () => {
   );
   ({ log, recon, mod, links } = fixture.modules);
   db = fixture.modules.dedup.getDb();
+  const config = await import("../config.js");
+  config.upsertMapping("m", makeMapping({ owner: "o", repo: "r" }));
 });
 
 function seedLink(prNumber: number, issueId = "i1", identifier: string | null = "ENG-1", role: "implementation" | "roll-up" = "implementation") {
@@ -116,6 +118,29 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs(deps);
     expect(getPullRequestState).toHaveBeenCalledTimes(1);
   });
+  it("promotes a closed PR tombstone after reopen and merge, once", async () => {
+    seedLink(5);
+    let merged = false;
+    const deps: DetectDeps = {
+      getPullRequestState: async () => ({ merged, state: "closed" }),
+      tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
+      finalizeGroupingParent: async () => true,
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
+    };
+    await mod.detectMergedPrs(deps);
+    const before = db.prepare("SELECT id FROM reconciliation_queue").get();
+    expect(recon.getPendingReconciliations()).toHaveLength(0);
+    // The open-PR sweep resets terminal links when GitHub lists them again.
+    links.setLinkOutcome("o/r", 5, "open", null);
+    merged = true;
+    await mod.detectMergedPrs(deps);
+    await mod.detectMergedPrs(deps);
+    expect(links.findLinkByPr("o/r", 5)?.outcome).toBe("merged");
+    expect(recon.getPendingReconciliations()).toHaveLength(1);
+    expect(db.prepare("SELECT id FROM reconciliation_queue").all()).toEqual([before]);
+  });
+
   it("leaves an open PR alone", async () => {
     seedLink(5);
     const getPullRequestState = vi.fn(async () => ({ merged: false, state: "open" as const }));
@@ -299,7 +324,7 @@ describe("detectMergedPrs", () => {
     function seedParent(prNumber: number, opts: { issueId?: string; groupingParent?: boolean } = {}) {
       seedLink(prNumber, opts.issueId ?? "p1", "ENG-40");
       const jobId = log.appendLog({
-        issueId: opts.issueId ?? "p1", issueIdentifier: "ENG-40", repo: "o/r",
+        issueId: opts.issueId ?? "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m",
         groupingParent: opts.groupingParent ?? true,
       });
       log.updateJobStatus(jobId, "review_failed", "review_unapproved", url(prNumber));
@@ -329,7 +354,7 @@ describe("detectMergedPrs", () => {
 
     it("still applies when a newer gap-fill row has groupingParent false", async () => {
       seedParent(7);
-      const gap = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", groupingParent: false });
+      const gap = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m", groupingParent: false });
       log.updateJobStatus(gap, "completed", "success", url(7));
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
@@ -352,13 +377,43 @@ describe("detectMergedPrs", () => {
       }));
     });
 
-    it("does not finalize when no grouping row survives", async () => {
+    it("finalizes without cancelling when no grouping row survives", async () => {
       seedParent(7);
       db.prepare("DELETE FROM dispatch_log").run();
+      const deps = makeDeps(async () => false);
+      await mod.detectMergedPrs(deps);
+      expect(recon.hasReconciliationForPr("o/r", 7)).toBe(false);
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      deps.finalizeGroupingParent.mockResolvedValue(true);
+      await mod.detectMergedPrs(deps);
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).toHaveBeenCalledTimes(2);
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(recon.hasReconciliationForPr("o/r", 7)).toBe(true);
+      expect(links.findLinkByPr("o/r", 7)?.outcome).toBe("closed-unmerged");
+    });
+
+    it("finalizes only the replacement when both PRs close before polling after pruning", async () => {
+      const job = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40",
+        repo: "o/r", teamKey: "m", groupingParent: true });
+      log.updateJobPrUrl(job, url(7));
+      log.updateJobPrUrl(job, url(8));
+      db.exec("DELETE FROM dispatch_log");
+      db.prepare("INSERT INTO dispatched (issue_id, dispatched_at, team_key) VALUES ('p1', 1, 'm')").run();
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
-      expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
-      expect(links.findLinkByPr("o/r", 7)?.outcome).toBe("closed-unmerged");
+      expect(deps.finalizeGroupingParent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ number: 8 }));
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      for (const number of [7, 8]) {
+        expect(links.findLinkByPr("o/r", number)).toMatchObject({
+          outcome: "closed-unmerged", cancelCheckedAt: expect.any(Number),
+        });
+        expect(recon.hasReconciliationForPr("o/r", number)).toBe(true);
+      }
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ number: 8 }));
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(db.prepare("SELECT 1 FROM dispatched WHERE issue_id = 'p1'").get()).toBeDefined();
     });
 
     it("repairs a tombstoned parent's outcome without finalizing again", async () => {
@@ -381,7 +436,7 @@ describe("detectMergedPrs", () => {
 
     it("writes nothing while a run for the issue is in flight", async () => {
       seedParent(7);
-      log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r" }); // status dispatched
+      log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m" }); // status dispatched
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
@@ -391,7 +446,7 @@ describe("detectMergedPrs", () => {
 
     it("tombstones without finalizing when the closed PR is not the issue's latest", async () => {
       seedParent(7);
-      const newer = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", groupingParent: true });
+      const newer = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m", groupingParent: true });
       log.updateJobStatus(newer, "completed", "success", url(8));
       const deps = makeDeps(async () => true);
       deps.getPullRequestState.mockImplementation(async (_t, _o, _r, n) =>

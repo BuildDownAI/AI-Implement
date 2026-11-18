@@ -466,7 +466,7 @@ export async function handleGitHubWebhook(
     return;
   }
 
-  if (hasReconciliationForPr(repoFullName, prNumber)) {
+  if (hasReconciliationForPr(repoFullName, prNumber, false)) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true, reason: "already queued" }));
     return;

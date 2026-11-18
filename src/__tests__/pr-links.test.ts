@@ -33,7 +33,7 @@ describe("pull request links", () => {
     }
     const db = dedup.getDb();
     expect(db.prepare("PRAGMA table_info(tracked_issue)").all()).toHaveLength(9);
-    expect(db.prepare("PRAGMA table_info(pull_request_link)").all()).toHaveLength(13);
+    expect(db.prepare("PRAGMA table_info(pull_request_link)").all()).toHaveLength(17);
     expect(db.prepare("PRAGMA foreign_key_list(pull_request_link)").all()).toEqual([
       expect.objectContaining({ table: "tracked_issue", from: "issue_id", to: "id" }),
     ]);
@@ -44,7 +44,7 @@ describe("pull request links", () => {
     }
     expect(() => db.exec("UPDATE tracked_issue SET mapping_key = NULL")).toThrow(/NOT NULL/);
     expect(() => db.exec("INSERT INTO tracked_issue SELECT NULL, tracker_kind, mapping_key, tracker_issue_id, identifier, title, url, first_seen_at, updated_at FROM tracked_issue")).toThrow(/UNIQUE/);
-    expect(() => db.exec("INSERT INTO pull_request_link SELECT NULL, repository, number, url, head_ref, base_ref, issue_id, role, outcome, source, linked_at, closed_at, cancel_checked_at FROM pull_request_link")).toThrow(/UNIQUE/);
+    expect(() => db.exec("INSERT INTO pull_request_link (id, repository, number, url, head_ref, base_ref, issue_id, role, outcome, source, linked_at, closed_at, cancel_checked_at) SELECT NULL, repository, number, url, head_ref, base_ref, issue_id, role, outcome, source, linked_at, closed_at, cancel_checked_at FROM pull_request_link")).toThrow(/UNIQUE/);
   });
 
   it("refreshes metadata but preserves the first link and fills only missing refs across restarts", async () => {
@@ -69,8 +69,11 @@ describe("pull request links", () => {
     const { links, dedup } = f.modules;
     links.linkPullRequest(input);
     dedup.getDb().exec("ALTER TABLE pull_request_link DROP COLUMN cancel_checked_at");
+    for (const column of ["grouping_parent", "job_dispatched_at", "job_id"]) {
+      dedup.getDb().exec(`ALTER TABLE pull_request_link DROP COLUMN ${column}`);
+    }
     const firstBoot = await f.reopen();
-    expect(firstBoot.links.findLinkByPr(input.repository, 1)).toMatchObject({ cancelCheckedAt: null });
+    expect(firstBoot.links.findLinkByPr(input.repository, 1)).toMatchObject({ cancelCheckedAt: null, groupingParent: false, jobDispatchedAt: null, jobId: null });
     firstBoot.links.setLinkOutcome(input.repository, 1, "closed-unmerged", 150);
     expect(firstBoot.links.listUncheckedClosedLinks()).toHaveLength(1);
     firstBoot.links.setCancelCheckedAt(input.repository, 1, 200);
