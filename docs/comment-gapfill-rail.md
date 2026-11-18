@@ -8,7 +8,10 @@ flowchart TD
   W -->|pass| Q[(comment_gapfill_queue)]
   W -->|fail| R1[drop or reason reply]
   Q --> D[drain]
-  D --> L{PR lookup}
+  D --> S{Read PR state once}
+  S -->|merged or closed| T[item skipped with reason]
+  S -->|read failed| P
+  S -->|open| L{PR lookup}
   L -->|row found| G{canDispatch}
   L -->|no row| R2[reply, item failed]
   G -->|ok| RUN[gap-fill run]
@@ -37,14 +40,16 @@ The probe and the permission check each retry once with no sleep (GitHub's deliv
 
 ## Queue
 
-`comment_gapfill_queue` holds one row per comment (`owner`, `repo`, `prNumber`, `commentId`, `commenter`, `instruction`, `status`). `claimPendingCommentGapfills` hands rows to the drain; a row leaves `pending` only through `markCommentGapfillProcessed` (`dispatched`, `failed`, `skipped`).
+`comment_gapfill_queue` holds one row per comment (`owner`, `repo`, `prNumber`, `commentId`, `commenter`, `instruction`, `status`). `claimPendingCommentGapfills` hands rows to the drain; terminal PR checks and processing updates move rows out of `pending` (`dispatched`, `failed`, `skipped`).
 
 ## Drain and PR lookup
 
-For each claimed item the drain resolves the PR's dispatch row, in this order:
+For each claimed item with a repository mapping, the drain reads `getPullRequestState` before admission gates. Merged PRs immediately become `skipped` with `last_refusal_reason = pr_merged`; closed, unmerged PRs use `pr_closed`. This emits one terminal log line, consumes no refusal count, and posts no reply or budget notice. Subsequent ticks do not read the skipped row. A token acquisition failure or a null or thrown PR read leaves the entire row unchanged for retry.
+
+For an open PR, the drain resolves its dispatch row in this order:
 
 1. `getLatestDispatchForPr`: a row whose `pr_url` is the PR.
-2. On a miss, read the PR once (`getPullRequestState`), then:
+2. On a miss, reuse the same PR read for its head branch, then:
    1. Roll-up parent: head `ai-implement/<feature|multi-issue>/<key>` resolves to the parent issue's latest dispatch.
    2. In-flight run: the newest `dispatched`/`running` row in the same repo whose issue identifier matches the head branch (`branchMatchesIssueIdentifier`). The PR's own run has the branch identifier but no `pr_url` until it completes. Ended runs already have `pr_url` and are not matched.
 3. No match: "no record" reply.
@@ -71,7 +76,8 @@ When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left 
 
 | Condition | Reply | Item |
 |---|---|---|
-| PR cannot be read (null or throw) | "could not read this PR from GitHub just now … repost" | `failed` |
+| PR merged or closed | no reply (one log line) | `skipped`, reason `pr_merged` or `pr_closed` |
+| PR token acquisition fails or PR cannot be read (null or throw) | no reply; retry next tick | unchanged |
 | No dispatch row, no roll-up parent, no in-flight match; comment from a person | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
 | Same, but the commenter is `ROLLUP_REVIEW_COMMENTER` | no reply (one log line) | `skipped` |
 | PR dispatch budget reached | budget park message (once per park, also when the dispatch breaker parked the PR first) | `pending` |

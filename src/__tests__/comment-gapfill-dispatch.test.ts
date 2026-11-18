@@ -37,6 +37,7 @@ beforeEach(async () => {
   ({ queue, log, breaker, drain, admission, config, gapfill } = (await testDb({ modules })).modules);
   submit.mockReset().mockResolvedValue({ status: "accepted" });
   acquireSpy = vi.spyOn(admission, "acquire");
+  fakeFetch({ "GET /repos/acme/billing/pulls/42": openPrWithHead("ai-implement/aii-1554-caller-switch") }).install();
 });
 afterEach(() => {
   expect(launchSpies.fly).not.toHaveBeenCalled();
@@ -564,7 +565,7 @@ describe("ImplementationRun gap-fill ingress", () => {
           prDispatchBudget: 7, humanRequested: true } });
       expect(queue.getCommentGapfillItem(id)?.status).toBe("dispatched");
       expect(opts.dispatch).not.toHaveBeenCalled();
-      expect(opts.getInstallationToken).not.toHaveBeenCalled();
+      expect(opts.getInstallationToken).toHaveBeenCalledTimes(1);
       expect(opts.getTargetRepoToken).not.toHaveBeenCalled();
       expect(acquireSpy).not.toHaveBeenCalled();
       // Acceptance transfers launch ownership; a second drain cannot launch or submit it again.
@@ -601,11 +602,11 @@ describe("ImplementationRun gap-fill ingress", () => {
   it("no mapping skips", async () => {
     await checkNoSubmit(makeBaseDrainOpts(), seedItem(), "skipped");
   });
-  it("unreadable PR without a dispatch fails and replies", async () => {
+  it("unreadable PR without a dispatch stays pending without a reply", async () => {
     prLookup(42, githubError(404, "Not Found"));
     const opts = optsFor();
-    await checkNoSubmit(opts, seedItem(), "failed");
-    expect(opts.postComment).toHaveBeenCalledWith("gh-token", "acme", "billing", 42, expect.stringContaining("could not read this PR"));
+    await checkNoSubmit(opts, seedItem(), "pending");
+    expect(opts.postComment).not.toHaveBeenCalled();
   });
   it("readable PR without an identity fails and replies", async () => {
     prLookup(42, openPrWithHead("unrelated"));
@@ -665,7 +666,7 @@ describe("ImplementationRun gap-fill ingress", () => {
   });
   it("in-flight branch fallback defers until pr_url is written", async () => {
     const jobId = log.appendLog(makeAppendLogEntry({ issueId: "issue-1", issueIdentifier: "AII-1554", teamKey: "AII", repo: "acme/billing", status: "running" }));
-    prLookup(42, openPrWithHead("ai-implement/aii-1554-caller-switch"));
+    fakeFetch({ "GET /repos/acme/billing/pulls/42": [openPrWithHead("ai-implement/aii-1554-caller-switch"), openPrWithHead("ai-implement/aii-1554-caller-switch")] }).install();
     const id = seedItem();
     await checkNoSubmit(optsFor(), id, "pending");
     log.updateJobPrUrl(jobId, "https://github.com/acme/billing/pull/42");
@@ -822,4 +823,65 @@ it("skips after three late reservation refusals and never submits a fourth", asy
   for (let tick = 0; tick < 4; tick++) await drain.drainCommentGapfillQueue(optsFor(mapping));
   expect(submit).toHaveBeenCalledTimes(3);
   expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity" }));
+});
+
+
+describe("terminal PR check", () => {
+  it.each([[true, true], [false, true], [true, false], [false, false]])("skips a terminal parked PR (dispatch row: %s, merged: %s)", async (hasDispatch, merged) => {
+    if (hasDispatch) seedOrigin();
+    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    const id = queue.enqueueConflictResolution({ owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/aii-1554" });
+    const http = prLookup(42, { json: { merged, state: "closed" } });
+    const opts = optsFor();
+    const lines = vi.spyOn(console, "log").mockImplementation(() => {});
+    await checkNoSubmit(opts, id, "skipped");
+    expect(queue.getCommentGapfillItem(id)).toMatchObject({ lastRefusalReason: merged ? "pr_merged" : "pr_closed", refusalCount: 0 });
+    expect(opts.postComment).not.toHaveBeenCalled();
+    expect(opts.postTrackerComment).not.toHaveBeenCalled();
+    expect(lines.mock.calls.filter(([line]) => String(line).includes(merged ? "pr_merged" : "pr_closed"))).toHaveLength(1);
+    await drain.drainCommentGapfillQueue(opts);
+    expect(http.calls).toHaveLength(1);
+  });
+});
+
+it.each(["none", "parked", "running"] as const)("token refresh failure preserves the entire row (%s dispatch)", async dispatchState => {
+  if (dispatchState !== "none") seedOrigin(dispatchState === "running" ? "running" : "completed");
+  if (dispatchState === "parked") breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+  const id = seedItem();
+  const before = queue.getCommentGapfillItem(id);
+  const opts = optsFor();
+  vi.mocked(opts.getInstallationToken).mockRejectedValue(new Error("token refresh unavailable"));
+  const http = prLookup(42, openPrWithHead("ai-implement/aii-1554-caller-switch"));
+
+  await checkNoSubmit(opts, id, "pending");
+
+  expect(queue.getCommentGapfillItem(id)).toEqual(before);
+  expect(opts.getInstallationToken).toHaveBeenCalledTimes(1);
+  expect(http.calls).toHaveLength(0);
+  expect(opts.postComment).not.toHaveBeenCalled();
+  expect(opts.postTrackerComment).not.toHaveBeenCalled();
+});
+
+it.each([false, true])("failed PR read preserves the entire row (dispatch: %s)", async hasDispatch => {
+  if (hasDispatch) seedOrigin();
+  const id = seedItem();
+  const opts = optsFor();
+  const before = queue.getCommentGapfillItem(id);
+  for (const reply of [githubError(503, "Unavailable"), (() => { throw new Error("network failure"); })] satisfies Reply[]) {
+    const http = prLookup(42, reply);
+    await checkNoSubmit(opts, id, "pending");
+    expect(queue.getCommentGapfillItem(id)).toEqual(before);
+    expect(http.calls).toHaveLength(1);
+  }
+  expect(opts.postComment).not.toHaveBeenCalled();
+});
+
+it("open in-flight PR preserves the entire row and reads once", async () => {
+  seedOrigin("running");
+  const id = seedItem();
+  const before = queue.getCommentGapfillItem(id);
+  const http = prLookup(42, openPrWithHead("ai-implement/aii-1554-caller-switch"));
+  await checkNoSubmit(optsFor(), id, "pending");
+  expect(queue.getCommentGapfillItem(id)).toEqual(before);
+  expect(http.calls).toHaveLength(1);
 });
