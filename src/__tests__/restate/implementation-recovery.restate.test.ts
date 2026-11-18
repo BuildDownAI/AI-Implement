@@ -142,7 +142,14 @@ describe("implementation lost acceptance recovery", () => {
         expect(args.implementationSandbox).toEqual(!protectedLaunch ? { sandbox: "agent-default", reason: "unprotected" } : secrets ? { sandbox: "runner-isolated" } : { sandbox: "agent-default", reason: "process-secrets-off" });
         args.input.markLaunchAttempted({ sessionImage: "runner:fly", machineSize: { cpuKind: "shared", cpus: 2, memoryMb: 1024 }, computeStartedAt: Date.now() });
         nonce = args.input.machineNonce; runToken = args.input.runToken;
-        launches++; accepted = true; changeConfiguration(); throw new Error("lost Fly response");
+        launches++; accepted = true; changeConfiguration();
+        // Let the workflow wrapper crash after production records a successful
+        // launch; the other cases still simulate a lost backend response.
+        if (captured.crash) return {
+          machineId: "machine-1", sessionImage: "runner:fly", executionMode: "fly-machines",
+          statusComment: null, computeStartedAt: Date.now(),
+        };
+        throw new Error("lost Fly response");
       },
       launchImplementationLocalSession: async (args) => {
         nonce = args.input.machineNonce; runToken = args.input.runToken;
@@ -171,6 +178,7 @@ describe("implementation lost acceptance recovery", () => {
       expect(finalize).not.toHaveBeenCalled();
       return;
     }
+    if (captured.crash) await eventually(async () => captured.crashed, Boolean, { label: "post-launch crash" });
     await eventually(async () => log.getJobByDispatchId(run.dispatchId), (job) => Boolean(job), { label: "adopted row" });
     const row = log.getJobByDispatchId(run.dispatchId)!;
     expect(row.admissionGeneration).toBe(admission.read(run.dispatchId)!.generation);
