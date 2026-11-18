@@ -91,7 +91,7 @@ Boot waits for neither of its runs, and a run that throws logs one line.
 
 **During a deploy hold.** While a self-deploy holds new work back, nothing starts a run through the `SetupChecks` object ([restate.md](restate.md#a-call-or-send-that-starts-an-invocation-waits-out-a-deploy-hold) has the rule). Boot's run once Restate serves waits for the hold to clear, which on a boot after a self-deploy is when that deploy ends. The change detector's runs wait for a later cycle, a recheck is refused, and the Setup page's **Run checks** and **Check this project** answer 503 `restate-unavailable`. The stored run is still read.
 
-**After a saved change.** Each poll cycle, the change detector (`createSetupCheckChangeDetector`, `src/setup-checks/index.ts`) reads the saved setup (`readSavedSetup`) through the checks' own readers and compares it with the last cycle's. So a change made anywhere, from the admin UI, an MCP tool, the setup command, the control plane or by hand, gets its run.
+**After a saved change.** Each poll cycle, the change detector (`createSetupCheckChangeDetector`, `src/setup-checks/change-detector.ts`) reads the saved setup (`readSavedSetup`) through the checks' own readers and compares it with the last cycle's. So a change made anywhere, from the admin UI, an MCP tool, the setup command, the control plane or by hand, gets its run.
 
 | Change | Run sent |
 |---|---|
@@ -110,7 +110,7 @@ Each module keeps its setup-check times together, and these are all of them.
 
 | Time | Value | Where | What it is |
 |---|---|---|---|
-| `MIN_SETUP_CHECK_RUN_INTERVAL_MS` | 5 minutes | `src/setup-checks/index.ts` | the least time between two runs of one kind the change detector sends |
+| `MIN_SETUP_CHECK_RUN_INTERVAL_MS` | 5 minutes | `src/setup-checks/change-detector.ts` | the least time between two runs of one kind the change detector sends |
 | `RECHECK_HOLD_MS` | 1 hour | `src/setup-checks/index.ts` | how long a recheck answers for its rows |
 | `INGRESS_TIMEOUT_MS` | 10 seconds | `src/restate/setup-checks.ts` | bound on reading the stored run, and on Restate accepting a sent run |
 | `WAITED_RUN_TIMEOUT_MS` | 60 seconds | `src/restate/setup-checks.ts` | bound on a run its caller waits for: a project run, or boot's orchestrator-wide run |
@@ -124,7 +124,7 @@ Why each audience sees what it sees is [ADR 047](adr/047-orchestrator-setup-chec
 
 This is the one list of every check. Each group has its own heading, and each id links to the section of that group's reference that explains the value it reads. An id never changes, so search for the one the command printed.
 
-In the code, each group's checks are a module beside `src/setup-checks/index.ts`, which builds the list from them and runs it. A check is written against `src/setup-checks/contract.ts` (the ids, a result, the context it reads, and `waitOn` for a row that waits on another check), never against `index.ts`, which imports every check module at load, so the dependency runs one way.
+In the code, each group's checks are a module beside `src/setup-checks/index.ts`, which builds the list from them and runs it. A check is written against `src/setup-checks/contract.ts` (the ids, a result, the context it reads, and `waitOn` for a row that waits on another check), never against `index.ts`, which imports every check module at load, so the dependency runs one way. The change detector is `src/setup-checks/change-detector.ts`, which reads the saved setup through the same context and imports nothing from `index.ts`.
 
 ### orchestrator
 
