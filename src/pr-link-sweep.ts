@@ -49,7 +49,8 @@ export async function sweepUnlinkedPulls(deps: SweepUnlinkedPullsDeps): Promise<
         if (!entry) continue;
         const [teamKey, mapping] = entry;
         const provider = await deps.providerFor(mapping);
-        const issue = await provider.findByKey(identifier, teamKey);
+        // Generated branches lowercase tracker keys; providers expect canonical identifiers.
+        const issue = await provider.findByKey(identifier.toUpperCase(), teamKey);
         if (!issue) {
           missingIssues.add(pr);
           continue;

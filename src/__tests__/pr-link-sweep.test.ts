@@ -24,9 +24,9 @@ afterEach(() => vi.restoreAllMocks());
 
 describe("sweepUnlinkedPulls", () => {
   it.each([
-    ["ai-implement/aii-1981-some-slug", "implementation", "aii-1981"],
-    ["ai-implement/feature/aii-1979", "roll-up", "aii-1979"],
-    ["ai-implement/multi-issue/aii-1979", "roll-up", "aii-1979"],
+    ["ai-implement/aii-1981-some-slug", "implementation", "AII-1981"],
+    ["ai-implement/feature/aii-1979", "roll-up", "AII-1979"],
+    ["ai-implement/multi-issue/aii-1979", "roll-up", "AII-1979"],
   ])("links %s without job rows", async (head, role, key) => {
     const { sweep, links, github, deps, findByKey, issue } = await fixture();
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -42,6 +42,37 @@ describe("sweepUnlinkedPulls", () => {
         identifier: issue.identifier, title: issue.title, url: `https://linear.app/issue/${issue.identifier}` },
     });
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/test-org\/test-repo#1.*AII-1981.*branch-match/));
+  });
+
+  it.each([
+    ["ai-implement/aii-1981-some-slug", "AII-1981", "implementation"],
+    ["ai-implement/feature/aii-1979", "AII-1979", "roll-up"],
+    ["ai-implement/multi-issue/aii-1979", "AII-1979", "roll-up"],
+  ])("resolves %s through the real Linear provider", async (head, identifier, role) => {
+    const { sweep, links, deps } = await fixture();
+    const auth = await import("../linear-app-auth.js");
+    const { LinearProvider } = await import("../providers/linear.js");
+    auth.configureLinearAuth("client-id", "client-secret");
+    auth.__setLinearTokenForTest("test-token");
+    try {
+      const fake = fakeFetch({ "POST /graphql": { json: { data: { issues: { nodes: [{
+        id: "linear-issue-id", identifier, title: "Recovered issue", description: null,
+        team: { key: "AII" }, state: { name: "In Progress", type: "started" },
+      }] } } } } }).install();
+      deps.listRepoPulls.mockResolvedValue([pull({ head })]);
+      const provider = new LinearProvider({});
+      await sweep.sweepUnlinkedPulls({ ...deps, providerFor: async () => provider });
+      expect(fake.calls).toHaveLength(1);
+      expect(JSON.parse(fake.calls[0].body).variables).toEqual({
+        teamKey: "AII", number: Number(identifier.split("-")[1]),
+      });
+      expect(links.findLinkByPr("test-org/test-repo", 1)).toMatchObject({
+        role, source: "branch-match", headRef: head, baseRef: "main",
+        issue: { trackerKind: "linear", trackerIssueId: "linear-issue-id", identifier, title: "Recovered issue" },
+      });
+    } finally {
+      auth.__resetLinearAuthForTest();
+    }
   });
 
   it("rejects human/unknown authors, unknown bot login and unmatched branches", async () => {
@@ -76,7 +107,7 @@ describe("sweepUnlinkedPulls", () => {
     await sweep.sweepUnlinkedPulls({ ...deps, mappings: { OTHER: other, ...deps.mappings } });
     expect(deps.listRepoPulls).toHaveBeenCalledTimes(1);
     expect(deps.providerFor).toHaveBeenCalledWith(deps.mappings.AII);
-    expect(findByKey).toHaveBeenCalledExactlyOnceWith("aIi-1981", "AII");
+    expect(findByKey).toHaveBeenCalledExactlyOnceWith("AII-1981", "AII");
   });
 
   it("caches null results per repository/number across dependency objects", async () => {
