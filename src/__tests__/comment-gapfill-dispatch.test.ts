@@ -844,6 +844,24 @@ describe("terminal PR check", () => {
   });
 });
 
+it.each(["none", "parked", "running"] as const)("token refresh failure preserves the entire row (%s dispatch)", async dispatchState => {
+  if (dispatchState !== "none") seedOrigin(dispatchState === "running" ? "running" : "completed");
+  if (dispatchState === "parked") breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+  const id = seedItem();
+  const before = queue.getCommentGapfillItem(id);
+  const opts = optsFor();
+  vi.mocked(opts.getInstallationToken).mockRejectedValue(new Error("token refresh unavailable"));
+  const http = prLookup(42, openPrWithHead("ai-implement/aii-1554-caller-switch"));
+
+  await checkNoSubmit(opts, id, "pending");
+
+  expect(queue.getCommentGapfillItem(id)).toEqual(before);
+  expect(opts.getInstallationToken).toHaveBeenCalledTimes(1);
+  expect(http.calls).toHaveLength(0);
+  expect(opts.postComment).not.toHaveBeenCalled();
+  expect(opts.postTrackerComment).not.toHaveBeenCalled();
+});
+
 it.each([false, true])("failed PR read preserves the entire row (dispatch: %s)", async hasDispatch => {
   if (hasDispatch) seedOrigin();
   const id = seedItem();

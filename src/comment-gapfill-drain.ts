@@ -327,9 +327,10 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       }
 
       // Share one read between terminal-state detection and branch identity recovery.
-      const ghToken = await opts.getInstallationToken(item.owner);
+      let ghToken: string;
       let pr: Awaited<ReturnType<typeof getPullRequestState>>;
       try {
+        ghToken = await opts.getInstallationToken(item.owner);
         pr = await getPullRequestState(ghToken, item.owner, item.repo, item.prNumber);
       } catch (err) {
         console.warn(`[comment-gapfill] could not read PR #${item.prNumber} in ${fullRepo}:`, err);
