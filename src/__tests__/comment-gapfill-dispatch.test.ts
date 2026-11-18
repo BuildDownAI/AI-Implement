@@ -602,11 +602,11 @@ describe("ImplementationRun gap-fill ingress", () => {
   it("no mapping skips", async () => {
     await checkNoSubmit(makeBaseDrainOpts(), seedItem(), "skipped");
   });
-  it("unreadable PR without a dispatch stays pending without a reply", async () => {
+  it("unreadable PR without a dispatch fails and replies", async () => {
     prLookup(42, githubError(404, "Not Found"));
     const opts = optsFor();
-    await checkNoSubmit(opts, seedItem(), "pending");
-    expect(opts.postComment).not.toHaveBeenCalled();
+    await checkNoSubmit(opts, seedItem(), "failed");
+    expect(opts.postComment).toHaveBeenCalledWith("gh-token", "acme", "billing", 42, expect.stringContaining("could not read this PR"));
   });
   it("readable PR without an identity fails and replies", async () => {
     prLookup(42, openPrWithHead("unrelated"));
@@ -862,18 +862,33 @@ it.each(["none", "parked", "running"] as const)("token refresh failure preserves
   expect(opts.postTrackerComment).not.toHaveBeenCalled();
 });
 
-it.each([false, true])("failed PR read preserves the entire row (dispatch: %s)", async hasDispatch => {
-  if (hasDispatch) seedOrigin();
+it.each([
+  ["503", githubError(503, "Unavailable")],
+  ["throw", (() => { throw new Error("network failure"); })],
+] as Array<[string, Reply]>)("failed PR read with a dispatch log still reaches the gate (%s)", async (_label, reply) => {
+  seedOrigin();
+  seedItem();
+  const opts = optsFor();
+  const http = prLookup(42, reply);
+  await drain.drainCommentGapfillQueue(opts);
+  expect(http.calls).toHaveLength(1);
+  expect(acquireSpy.mock.calls.length + submit.mock.calls.length + vi.mocked(opts.dispatch).mock.calls.length).toBeGreaterThan(0);
+  expect(opts.postComment).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["503", githubError(503, "Unavailable")],
+  ["throw", (() => { throw new Error("network failure"); })],
+] as Array<[string, Reply]>)("failed PR read without a dispatch log replies once and ends failed (%s)", async (_label, reply) => {
   const id = seedItem();
   const opts = optsFor();
-  const before = queue.getCommentGapfillItem(id);
-  for (const reply of [githubError(503, "Unavailable"), (() => { throw new Error("network failure"); })] satisfies Reply[]) {
-    const http = prLookup(42, reply);
-    await checkNoSubmit(opts, id, "pending");
-    expect(queue.getCommentGapfillItem(id)).toEqual(before);
-    expect(http.calls).toHaveLength(1);
-  }
-  expect(opts.postComment).not.toHaveBeenCalled();
+  const http = prLookup(42, reply);
+  await checkNoSubmit(opts, id, "failed");
+  expect(http.calls).toHaveLength(1);
+  expect(opts.postComment).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(opts.postComment).mock.calls[0][4]).toContain("could not read this PR");
+  await checkNoSubmit(opts, id, "failed");
+  expect(http.calls).toHaveLength(1);
 });
 
 it("open in-flight PR preserves the entire row and reads once", async () => {

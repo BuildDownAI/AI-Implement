@@ -44,7 +44,7 @@ The probe and the permission check each retry once with no sleep (GitHub's deliv
 
 ## Drain and PR lookup
 
-For each claimed item with a repository mapping, the drain reads `getPullRequestState` before admission gates. Merged PRs immediately become `skipped` with `last_refusal_reason = pr_merged`; closed, unmerged PRs use `pr_closed`. This emits one terminal log line, consumes no refusal count, and posts no reply or budget notice. Subsequent ticks do not read the skipped row. A token acquisition failure or a null or thrown PR read leaves the entire row unchanged for retry.
+For each claimed item with a repository mapping, the drain reads `getPullRequestState` before admission gates. Merged PRs immediately become `skipped` with `last_refusal_reason = pr_merged`; closed, unmerged PRs use `pr_closed`. This emits one terminal log line, consumes no refusal count, and posts no reply or budget notice. Subsequent ticks do not read the skipped row. A null or thrown PR read does not change the flow that existed before this check. An item with a dispatch log goes on to the admission gates. An item with no dispatch log gets the reply "AI-Implement could not read this PR from GitHub just now … repost" and ends `failed`, so the drain does not read it again on each tick. A failure to get the installation token affects every row, so it leaves the row `pending` for the next tick.
 
 For an open PR, the drain resolves its dispatch row in this order:
 
