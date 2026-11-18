@@ -1,7 +1,11 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { IssueStatusRecord, TicketingProvider } from "../providers/types.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
+import { FilesystemProvider } from "../providers/filesystem.js";
+import { testDir } from "./helpers/test-dir.js";
 import { testDb } from "./helpers/test-db.js";
 import { FakeProvider } from "./providers/fake.js";
 
@@ -74,6 +78,24 @@ describe("listIssueStatuses", () => {
     ]);
     expect(fake.calls).toHaveLength(2);
     for (const call of fake.calls) expect(JSON.parse(call.body).variables.teamKey).toBe("ENG");
+  });
+
+  it.each([false, true])("handles a malformed filesystem timestamp with a matching job: %s", async (withJob) => {
+    const s = await setup();
+    const directory = testDir("fs-status-times");
+    const mapping = makeMapping({ ticketingProvider: "filesystem",
+      ticketingConfig: { kind: "filesystem", directory } });
+    s.config.upsertMapping("A", mapping);
+    await mkdir(join(directory, ".state", "A"), { recursive: true });
+    await writeFile(join(directory, "A-1.md"), "---\ntitle: Issue\n---\nBody");
+    await writeFile(join(directory, ".state", "A", "A-1.json"), JSON.stringify({
+      version: 1, status: "implementing", comments: [], prUrls: [], updatedAt: "invalid",
+    }));
+    s.deps.providerFor.mockResolvedValue(new FilesystemProvider(() => ({ A: mapping })));
+    if (withJob) s.job("implementation", 100, 150);
+    expect(await s.list()).toMatchObject([{
+      issue: { identifier: "A-1" }, state: "implementing", changedAt: withJob ? 150 : null,
+    }]);
   });
 
   it.each([null, "planning", "implementation"] as const)("keeps merged state and phase %s despite parks, but still updates its time (row 1)", async (phase) => {

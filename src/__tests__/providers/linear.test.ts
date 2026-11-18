@@ -1922,7 +1922,8 @@ describe("LinearProvider.listIssueStatuses", () => {
       const { query, variables: vars } = JSON.parse(call.body);
       expect(query).toContain("team: { key: { eq: $teamKey } }");
       expect(query).toContain("labels: { name: { eq: $label } }");
-      expect(query).toContain("id identifier title url updatedAt state { name type } labels { nodes { name } }");
+      expect(query).toContain("id identifier title updatedAt state { name type } labels { nodes { name } }");
+      expect(query).not.toMatch(/\burl\b/);
       expect(vars).toEqual({ teamKey: "ENG", label: i < 2 ? "First" : "Second", first: 100, after: null,
         ...(i % 2 ? { since: new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString() } : {}) });
       expect(query).toContain(i % 2 ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }');

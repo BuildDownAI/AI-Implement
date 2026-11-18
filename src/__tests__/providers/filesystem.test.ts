@@ -782,6 +782,17 @@ describe("listIssueStatuses", () => {
     expect(await readFile(join(directory, "TEST-1.md"), "utf8")).toContain("Status task");
   });
 
+  it("keeps an active task with a malformed timestamp as null", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "implementing");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+      version: 1, status: "implementing", comments: [], prUrls: [], updatedAt: "invalid",
+    }));
+    expect(await p.listIssueStatuses(config)).toMatchObject([{
+      identifier: "TEST-1", state: "implementing", updatedAt: null,
+    }]);
+  });
+
   it.each(["completed", "failed"] as const)("filters %s archives by timestamp", async (location) => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-11-16T12:00:00Z"));
