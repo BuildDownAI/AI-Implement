@@ -3,6 +3,8 @@
  * boundary where those adapters become Restate services. */
 import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
 import { getDb } from "../dedup.js";
+import { getModelAuthRuntime } from "../model-auth-runtime.js";
+import { createManagedReviewFixWorker } from "../managed-review-fix-worker.js";
 import { isManagedProject } from "../managed-dispatch-auth.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
 import { getPullRequestState } from "../github.js";
@@ -14,7 +16,7 @@ import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
 import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
 import { inspectPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
-import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
+import { createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
 import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDisposition } from "../review-fix-ports.js";
 import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
@@ -53,23 +55,21 @@ function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
   return selectedEntry(scope)?.[1] ?? null;
 }
 
-export type ReviewFixAdmission = "admit" | "defer" | "configuration_error";
+export type ReviewFixAdmission = "admit" | "defer";
 
 /** Verify the dispatch-ref contract immediately before a new reservation. A
  * changed workflow, runner mode, missing callback credential, or GitHub outage
- * defers admission with the queue still pending. An opted-in (managed) project is a
- * configuration error: GitHub Actions cannot carry a model-auth grant yet, so nothing
- * is checked on GitHub and nothing is reserved. */
+ * defers admission with the queue still pending. Managed projects additionally
+ * require private-envelope transport; model readiness is checked at launch. */
 export async function canAdmit(scope: ScopedPrIdentity, config: ReviewFixProductionConfig): Promise<ReviewFixAdmission> {
   const entry = selectedEntry(scope);
   if (!entry) return "defer";
   const [key, mapping] = entry;
-  if (isManagedProject(key)) return "configuration_error";
   if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return "defer";
-  return await verifyDispatchContract(scope, config, mapping) ? "admit" : "defer";
+  return await verifyDispatchContract(scope, config, mapping, isManagedProject(key)) ? "admit" : "defer";
 }
 
-async function verifyDispatchContract(scope: ScopedPrIdentity, config: ReviewFixProductionConfig, mapping: RepoMapping): Promise<boolean> {
+async function verifyDispatchContract(scope: ScopedPrIdentity, config: ReviewFixProductionConfig, mapping: RepoMapping, managed: boolean): Promise<boolean> {
   try {
     const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
     if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) return false;
@@ -77,7 +77,8 @@ async function verifyDispatchContract(scope: ScopedPrIdentity, config: ReviewFix
       workflowFile: mapping.workflowFile, token, ref: mapping.defaultBranch });
     const prState = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
     return capabilities.contract === "envelope" && capabilities.supportsAttemptCorrelation
-      && capabilities.supportsRunPublicationToken && prState?.state === "open" && !prState.merged;
+      && capabilities.supportsRunPublicationToken
+      && (!managed || capabilities.supportsPrivateRunConfig === true) && prState?.state === "open" && !prState.merged;
   } catch { return false; }
 }
 
@@ -96,8 +97,7 @@ export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queue
     + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
 }
 
-/** Reserve an attempt when the dispatch contract holds. An opted-in project fails its queue row and
- * reserves nothing; every other non-admit defers with the queue still pending. */
+/** Reserve only when the dispatch contract holds; otherwise leave the queue pending. */
 export async function admitReviewFix(
   request: ReviewFixAdmissionRequest,
   config: ReviewFixProductionConfig,
@@ -105,12 +105,6 @@ export async function admitReviewFix(
 ): Promise<ReviewFixAdmissionOutcome> {
   const verdict = await canAdmit(request.scope, config);
   if (verdict === "admit") return store.admit(request);
-  if (verdict === "configuration_error") {
-    const cursor = request.feedback.queueCursor;
-    // A failed row is no longer pending, so the PR object stops rechecking.
-    if (cursor) updateReviewFixStatus(cursor.queueId, "failed");
-    console.error(`[review-fix] ${request.scope.repository}#${request.scope.prNumber} not launched: configuration_error (gha_not_supported)`);
-  }
   return { status: "deferred", reason: "paused" };
 }
 
@@ -208,7 +202,7 @@ export function createProductionReviewFixServices(
 ): RestateService[] {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });
-  const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+  const worker = createManagedReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
     runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
     retryPolicy: getRetryPolicy,
     runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
@@ -222,7 +216,7 @@ export function createProductionReviewFixServices(
         runner_callback_url: config.runnerCallbackBaseUrl,
       };
     },
-  });
+  }, () => getModelAuthRuntime(config));
   const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
   const finalizer = createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview });
   const pr = createReviewFixPR({

@@ -73,7 +73,7 @@ import {
   type DispatchInputs,
   type DispatchResult,
 } from "./github.js";
-import { buildRunConfig, encodeRunConfig, encodeTrustedRunConfig, type RunCredentialsV1 } from "./run-config.js";
+import { buildRunConfig, encodeRunConfig, encodeTrustedRunConfig, type RunCredentialsV1, type ResolvedAgentSnapshotV1 } from "./run-config.js";
 import { resolveWorkflowCapabilities, type ResolveWorkflowContractInput, type WorkflowCapabilities } from "./workflow-probe.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import { RunnerImageNotAllowedError } from "./repo-image.js";
@@ -300,6 +300,7 @@ function buildLaunchInputs(
   runnerCallbackUrl?: string,
   privateBearers?: PrivateBearers,
   retryPolicy: RetryPolicy | null = null,
+  managed?: GithubReviewFixWorkerDeps["managedConfig"],
 ): DispatchInputs {
   const identifier = `review-fix-${plan.scope.prNumber}`;
   const runConfig = buildRunConfig({
@@ -328,6 +329,7 @@ function buildLaunchInputs(
       deadlineAt: plan.deadlineAt,
     },
     retryPolicy,
+    agentConfig: managed?.snapshot,
   });
 
   // run_attempt_token stays the public correlation marker on both paths (run-name/reconcile need
@@ -340,6 +342,7 @@ function buildLaunchInputs(
   };
   if (privateBearers) {
     const credentials: RunCredentialsV1 = {
+      ...managed?.credentials,
       version: 1,
       ...(privateBearers.run_token ? { resultToken: privateBearers.run_token } : {}),
       ...(privateBearers.run_progress_token ? { progressToken: privateBearers.run_progress_token } : {}),
@@ -455,6 +458,8 @@ export function reviewFixAttemptStoreScopeStore(source: ReviewFixWorkerAttemptSc
 
 export interface GithubReviewFixWorkerDeps {
   credentials: ReviewFixWorkerCredentialResolver;
+  /** Ephemeral launch-only material. Never put this in a launch plan or journal. */
+  managedConfig?: { snapshot: ResolvedAgentSnapshotV1; credentials: RunCredentialsV1 };
   /** Mint callback bearers inside the launch adapter, after preparation. The
    * returned values go only to the GitHub dispatch request, never to Restate. */
   callbackInputs?: (attemptId: AttemptId) => Promise<Pick<DispatchInputs, "run_token" | "run_progress_token" | "run_publication_token" | "runner_callback_url">>;
@@ -469,7 +474,7 @@ export interface GithubReviewFixWorkerDeps {
   /** Defaults to `resolveWorkflowCapabilities`. Injected by tests to observe the exact probe target. */
   resolveCapabilities?: (input: ResolveWorkflowContractInput) => Promise<WorkflowCapabilities>;
   /** True when this work must travel over protected (private-envelope) transport and may never
-   *  fall back to legacy top-level credentials. No review-fix work requires it today. */
+   *  fall back to legacy top-level credentials. Managed work also requires it whenever `managedConfig` is present. */
   requiresProtectedTransport?: (plan: WorkerLaunchPlan) => boolean;
   /** Orchestrator callback base URL, carried in the run envelope (not a secret). */
   runnerCallbackUrl?: string;
@@ -482,6 +487,7 @@ export interface GithubReviewFixWorkerDeps {
 }
 
 export class GithubReviewFixWorker implements ReviewFixWorkerPort {
+  private readonly managedConfig?: GithubReviewFixWorkerDeps["managedConfig"];
   private readonly credentials: ReviewFixWorkerCredentialResolver;
   private readonly transport: ReviewFixWorkerTransport;
   private readonly scopeStore: ReviewFixWorkerScopeStore;
@@ -493,6 +499,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly retryPolicy?: GithubReviewFixWorkerDeps["retryPolicy"];
 
   constructor(deps: GithubReviewFixWorkerDeps) {
+    this.managedConfig = deps.managedConfig;
     this.credentials = deps.credentials;
     this.transport = deps.transport ?? githubActionsReviewFixWorkerTransport;
     this.scopeStore = deps.scopeStore ?? inMemoryReviewFixWorkerScopeStore();
@@ -521,18 +528,23 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   }
 
   async launch(plan: WorkerLaunchPlan): Promise<WorkerLaunchOutcome> {
+    // These failures occur before dispatch; managed attempts can safely settle
+    // and release occupancy rather than reconcile a launch that never happened.
+    const unavailable: WorkerLaunchOutcome = this.managedConfig
+      ? { status: "rejected", reason: "managed review-fix launch prerequisites unavailable" }
+      : { status: "unknown" };
     const mapping = findMapping(plan.scope.repository);
-    if (!mapping) return { status: "unknown" };
+    if (!mapping) return unavailable;
 
     let credential: ReviewFixWorkerCredential;
     try {
       credential = await this.credentials.resolve(plan.scope);
     } catch {
-      return { status: "unknown" };
+      return unavailable;
     }
-    // The App not being installed under the exact installation this attempt was admitted
-    // under is not evidence the dispatch was rejected — it is unresolved identity.
-    if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
+    // Never dispatch under a different installation. Legacy work keeps its
+    // conservative unresolved-identity behavior.
+    if (credential.installationId !== plan.scope.installationId) return unavailable;
 
     let inputs: DispatchInputs;
     const retryPolicy = this.retryPolicy?.() ?? null;
@@ -540,7 +552,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
       if (this.callbackInputs) {
         const { run_token, run_progress_token, run_publication_token, runner_callback_url } = await this.callbackInputs(plan.attemptId);
         // A run with no callback URL can never report its result, so do not dispatch it.
-        if (!runner_callback_url) return { status: "unknown" };
+        if (!runner_callback_url) return unavailable;
         // Probe the exact target transport.dispatch will receive, with the same installation
         // token. Only a strict `true` selects private transport; a throw is "not private".
         let privateCapable = false;
@@ -557,20 +569,20 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
           privateCapable = false;
         }
         // Protected work never downgrades to top-level bearers.
-        if (!privateCapable && this.requiresProtectedTransport?.(plan)) return { status: "unknown" };
+        if (!privateCapable && (this.managedConfig || this.requiresProtectedTransport?.(plan))) return unavailable;
         // Destructured explicitly: only the three credentials join the inputs, and the URL
         // goes into the envelope rather than a top-level input.
         inputs = privateCapable
-          ? buildLaunchInputs(plan, mapping, runner_callback_url, { run_token, run_progress_token, run_publication_token }, retryPolicy)
+          ? buildLaunchInputs(plan, mapping, runner_callback_url, { run_token, run_progress_token, run_publication_token }, retryPolicy, this.managedConfig)
           : { ...buildLaunchInputs(plan, mapping, runner_callback_url, undefined, retryPolicy), run_token, run_progress_token, run_publication_token };
       } else {
-        if (this.requiresProtectedTransport?.(plan)) return { status: "unknown" };
+        if (this.managedConfig || this.requiresProtectedTransport?.(plan)) return unavailable;
         inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl, undefined, retryPolicy);
       }
     } catch {
-      // A missing/expired prepared credential is not proof that an earlier
-      // dispatch did not happen. The workflow reconciles under its launch intent.
-      return { status: "unknown" };
+      // No dispatch has occurred in this invocation. Legacy work retains its
+      // conservative reconciliation behavior; managed grants are settled by the caller.
+      return unavailable;
     }
     if (this.runnerImage) {
       try {

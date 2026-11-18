@@ -480,3 +480,125 @@ describe("classifyLaunchError", () => {
     }
   });
 });
+
+function reviewFixMapping(overrides: Partial<import("../config.js").RepoMapping> & Pick<import("../config.js").RepoMapping, "owner" | "repo"> = { owner: "eudoxus", repo: "ai-implement" }): import("../config.js").RepoMapping {
+  return {
+    workflowFile: "claude-implement.yml",
+    defaultBranch: "main",
+    maxInProgressAiIssues: 3,
+    executionMode: "github-actions",
+    sessionMode: "autonomous",
+    machineCpus: 2,
+    machineMemoryMb: 4096,
+    planningEnabled: false,
+    planningWorkflowFile: "",
+    autoApprovePlans: true,
+    autoMerge: false,
+    extraEnv: {},
+    provider: "anthropic",
+    ticketingProvider: "linear",
+    ticketingConfig: { kind: "linear" },
+    awsRegion: null,
+    paused: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
+    branchPrefix: null,
+    skillsRepo: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
+    memoryProviderId: null,
+    referenceRepos: null,
+    reviewers: null,
+    reviewFixLifecycle: null,
+    ...overrides,
+  };
+}
+
+
+describe("managed review-fix production worker", () => {
+  it.each(["accepted", "rejected", "unknown", "lost-response", "private-unavailable"])(
+    "freezes the attempt snapshot and settles %s without exposing its grant", async (scenario) => {
+      const config = await import("../config.js");
+      const { createManagedReviewFixWorker } = await import("../managed-review-fix-worker.js");
+      const { decodeRunConfig, decodeTrustedRunConfig } = await import("../run-config.js");
+      const { loadStoredSnapshot } = await import("../agent-run-preparation.js");
+      config.initMappingsTable();
+      config.upsertMapping("AII", reviewFixMapping(REPO));
+      gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+      const dispatch = vi.fn(async () => {
+        if (scenario === "lost-response") throw new Error("response lost");
+        return { success: scenario === "accepted", status: scenario === "rejected" ? 422 : 200,
+          outcome: scenario === "rejected" ? "rejected" as const : scenario === "accepted" ? "accepted" as const : "unknown" as const,
+          ...(scenario === "accepted" ? { runId: 99 } : {}) };
+      });
+      const transport = { dispatch, listRuns: vi.fn(async () => [{ runId: 99, runAttempt: 1,
+        displayTitle: "[attempt:attempt-managed]", headBranch: "main" }]),
+        getRun: vi.fn(async () => null), cancelRun: vi.fn(async () => true), getPullRequestHeadSha: vi.fn(async () => null) };
+      const deps = { credentials: { resolve: async () => ({ token: "synthetic-gh", installationId: 1 }) }, transport,
+        callbackInputs: async () => ({ run_token: "result", run_progress_token: "progress", run_publication_token: "publication", runner_callback_url: "https://example.com" }),
+        resolveCapabilities: async () => ({ contract: "envelope" as const, supportsAttemptCorrelation: true,
+          supportsRunPublicationToken: true, supportsPrivateRunConfig: scenario !== "private-unavailable" }) };
+      const { SqliteReviewFixAttemptStore } = await import("../review-fix-attempt-store.js");
+      const attemptStore = new SqliteReviewFixAttemptStore();
+      const admission = await attemptStore.admit({ scope: { installationId: 1, repository: "acme/app", prNumber: 7 },
+        feedback: { taskText: "Fix the finding", findings: [{ findingKey: "f1", version: 1 }] }, jobTimeoutMinutes: 10 });
+      if (admission.status !== "prepared") throw new Error(`admission failed: ${JSON.stringify(admission)}`);
+      const { reviewFixAttemptStoreScopeStore } = await import("../review-fix-worker.js");
+      const durableDeps = { ...deps, scopeStore: reviewFixAttemptStoreScopeStore(attemptStore) };
+      const worker = createManagedReviewFixWorker(durableDeps, () => runtime);
+      const attempt = admission.attempt;
+      expect(await attemptStore.recordLaunchIntent(attempt.attemptId)).toEqual({ status: "recorded" });
+      const plan = await worker.prepare(attempt);
+      const result = await worker.launch(plan);
+      const snapshot = loadStoredSnapshot(attempt.attemptId);
+      expect(snapshot).not.toBeNull();
+      expect(result.status).toBe(scenario === "accepted" ? "accepted" : ["rejected", "private-unavailable"].includes(scenario) ? "rejected" : "unknown");
+      expect(revokedAt(attempt.attemptId) === null).toBe(scenario === "accepted");
+      expect(dispatch).toHaveBeenCalledTimes(scenario === "private-unavailable" ? 0 : 1);
+      if (dispatch.mock.calls.length) {
+        const sent = dispatch.mock.calls[0] as unknown as [{ inputs: { run_config: string; run_token: string } }];
+        const encoded = sent[0].inputs.run_config;
+        expect(decodeTrustedRunConfig(encoded).agentConfig).toEqual(snapshot);
+        expect(decodeTrustedRunConfig(encoded).credentials).toMatchObject({ resultToken: "result", publicationToken: "publication",
+          modelAuthGrant: { dispatchId: attempt.attemptId, backend: "gha" } });
+        expect(decodeRunConfig(encoded).credentials).toBeUndefined();
+        expect(sent[0].inputs.run_token).toBe("");
+      }
+      expect(JSON.stringify({ plan, result })).not.toContain("bearer");
+      // Reconstructing the adapter cannot obtain a second bootstrap or dispatch a second run.
+      const recovered = createManagedReviewFixWorker(durableDeps, () => runtime);
+      expect((await recovered.launch(plan)).status).toBe("rejected");
+      expect(dispatch).toHaveBeenCalledTimes(scenario === "private-unavailable" ? 0 : 1);
+      expect(loadStoredSnapshot(attempt.attemptId)).toEqual(snapshot);
+      if (scenario === "lost-response") {
+        transport.listRuns.mockResolvedValueOnce([{ runId: 99, runAttempt: 1,
+          displayTitle: `Review fix · attempt ${attempt.attemptId}`, headBranch: "main" }]);
+        expect(await recovered.reconcile(attempt.attemptId, attempt.scope)).toEqual({
+          status: "found", execution: { githubRunId: 99, githubRunAttempt: 1 } });
+        expect(dispatch).toHaveBeenCalledTimes(1);
+      }
+      expect(await attemptStore.recordLaunchIntent(attempt.attemptId)).toEqual({ status: "already_recorded" });
+      if (scenario === "accepted") {
+        const execution = { githubRunId: 99, githubRunAttempt: 1 };
+        await attemptStore.bindExecution(attempt.attemptId, execution, Date.now());
+        const callback = { version: 1 as const, attemptId: attempt.attemptId, ...attempt.scope,
+          deadlineAt: attempt.deadlineAt, ...execution, outputCommit: "a".repeat(40) };
+        expect((await attemptStore.recordResult(attempt.attemptId, callback, Date.now())).status).toBe("stored");
+        expect((await attemptStore.recordResult(attempt.attemptId, callback, Date.now())).status).toBe("duplicate");
+        await recovered.cancel(attempt.attemptId, execution);
+        await attemptStore.revokeAuthority(attempt.attemptId, Date.now());
+        expect(await attemptStore.hasCurrentAuthority(attempt.attemptId)).toBe(false);
+        const terminal = { attemptId: attempt.attemptId, scope: attempt.scope, terminal: { status: "cancelled" as const } };
+        expect((await attemptStore.recordOutcome(terminal, Date.now())).status).toBe("recorded");
+        expect((await attemptStore.recordOutcome(terminal, Date.now())).status).toBe("already_recorded");
+        await attemptStore.releaseOwner(attempt.owner, "cancelled");
+        expect((await attemptStore.recordResult(attempt.attemptId, callback, Date.now())).status).toBe("stale");
+        expect(await attemptStore.getRecordedOutcome(attempt.attemptId)).toEqual(terminal);
+        expect(transport.cancelRun).toHaveBeenCalledTimes(1);
+        expect(dispatch).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
+});

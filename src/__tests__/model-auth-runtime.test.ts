@@ -1,6 +1,6 @@
 /**
  * Tests for `src/model-auth-runtime.ts` (AII-1385) against a temp SQLite file, a stub `fetchImpl` and a mocked
- * installation token. `npm run typecheck` excludes `src/__tests__`, so type-check this file with a throwaway tsconfig.
+ * installation token. Tests are also checked by `npm run typecheck`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
@@ -327,4 +327,61 @@ describe("getModelAuthRuntime", () => {
     mod.__resetModelAuthRuntimeForTests();
     expect(mod.getModelAuthRuntime(CONFIG)).not.toBe(a);
   });
+});
+
+
+describe("admin candidate readiness", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it.each(["private", "public", "internal", "unknown", "missing-sign-in", "unauthorized", "secondary-public"])(
+    "inspects an unpublished opt-in without writes: %s", async (scenario) => {
+      vi.stubGlobal("fetch", fetchImpl);
+      store.saveAccountProfileRevision({
+        profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
+        authMode: "codex-subscription", allowedProjectKeys: scenario === "unauthorized" ? ["OTHER"] : ["AII"],
+      });
+      const candidate = {
+        version: 1 as const, mode: "configured" as const,
+        stages: { planning: stage("cdx", "codex", "openai"), implementation: stage("cdx", "codex", "openai"), review: stage("cdx", "codex", "openai") },
+      };
+      store.setOrchestratorDefaults(candidate);
+      const { createModelSessionKeyProvider } = await import("../model-session-keys.js");
+      const { createModelSessionStore } = await import("../model-session-store.js");
+      const writer = createModelSessionStore({
+        keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: SECRET }),
+        verifyOwner: () => false, authorizeOperator: () => true, db: () => dedup.getDb(),
+      });
+      if (scenario !== "missing-sign-in") {
+        expect(writer.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: planRecord(), operator: "op" }).ok).toBe(true);
+      }
+      if (["public", "internal", "unknown"].includes(scenario)) repoResponse = { status: 200, body: { visibility: scenario } };
+      if (scenario === "secondary-public") {
+        vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => new Response(JSON.stringify({
+          visibility: String(url).endsWith("/secondary") ? "public" : "private",
+        }), { status: 200 })));
+      }
+      const admin = mod.createAgentConfigAdminDeps(CONFIG);
+      const request = {
+        projectKey: "AII", backend: "local-docker" as const, workflowRepository: "acme/app",
+        workflowFile: "claude-implement.yml", repositories: ["acme/app", "acme/secondary"],
+      };
+      // Compare all persisted rows, including config revisions, snapshots, grants and reservations.
+      const persisted = () => {
+        const tables = dedup.getDb().prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[];
+        return tables.map(({ name }) => [name, dedup.getDb().prepare(`SELECT * FROM "${name}"`).all()]);
+      };
+      const before = persisted();
+      const result = await admin.inspectReadiness(request, candidate);
+      if (scenario === "private") expect(result.status, JSON.stringify(result)).toBe("ready");
+      else expect(result.status).toBe("not-ready");
+      expect(await admin.inspectReadiness(request)).toEqual({ status: "legacy" });
+      repoResponse = { status: 200, body: { visibility: "private" } };
+      expect(await mod.getModelAuthRuntime(CONFIG).preparationDeps({ owner: "acme", repo: "app", projectKey: "AII" }).getRepoTrust("acme/app"))
+        .toMatchObject({ trustedForSubscription: false });
+      expect(await prep.prepareAgentRun({ ...request, dispatchId: "after-inspection" }, mod.getModelAuthRuntime(CONFIG).preparationDeps({ owner: "acme", repo: "app", projectKey: "AII" })))
+        .toMatchObject({ status: "legacy" });
+      expect(store.getProjectOptIn("AII")).toBe(false);
+      expect(persisted()).toEqual(before);
+    },
+  );
 });
