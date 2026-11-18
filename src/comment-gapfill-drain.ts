@@ -1,5 +1,5 @@
 import { getDb } from "./dedup.js";
-import { ROLLUP_REVIEW_COMMENTER } from "./comment-gapfill-queue.js";
+import { ROLLUP_REVIEW_COMMENTER, rollupReviewExpectedHead } from "./comment-gapfill-queue.js";
 import { resolveReviewerSelection } from "./config.js";
 import { createImplementationRunIngressClient, type ImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { restateCanServe } from "./restate/status.js";
@@ -520,10 +520,11 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 }
 
 /** Advisory roll-up review selection; project authority is retained for trusted resolution only. */
-export function rollupReviewMode(commenter: string, mapping: RepoMapping) {
+export function rollupReviewMode(commenter: string, mapping: RepoMapping, instruction?: string) {
   if (commenter !== ROLLUP_REVIEW_COMMENTER) return undefined;
   const reviewers = new Map(resolveReviewerSelection(mapping)
     .filter(r => r.gates).map(r => [r.id, r]));
   reviewers.set("integration-review", { id: "integration-review", gates: true });
-  return { reviewers: [...reviewers.values()] };
+  return { reviewers: [...reviewers.values()],
+    ...(instruction !== undefined ? { expectedHeadSha: rollupReviewExpectedHead(instruction) } : {}) };
 }

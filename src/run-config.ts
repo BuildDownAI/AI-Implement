@@ -136,7 +136,7 @@ export interface RunConfigV1 {
   accountFallbacks?: AccountFallbacks;
   v: 1;
   issue: { id: string; identifier: string; title: string; description: string };
-  reviewOnly?: { reviewers: ReviewerSelection[] };
+  reviewOnly?: { reviewers: ReviewerSelection[]; expectedHeadSha?: string };
   prNumber?: string;
   baseBranch?: string;
   runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
@@ -566,7 +566,7 @@ export interface RunConfigBuildInput {
   mapping: RepoMapping;
   baseBranch?: string;
   runnerCallbackUrl?: string;
-  reviewOnly?: { reviewers: ReviewerSelection[] };
+  reviewOnly?: { reviewers: ReviewerSelection[]; expectedHeadSha?: string };
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. */
   commentInstruction?: string;
@@ -705,10 +705,12 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (cfg.reviewOnly !== undefined) {
     if (!isRec(cfg.reviewOnly) || !isReviewerSelectionArray(cfg.reviewOnly.reviewers) || cfg.reviewOnly.reviewers.length === 0
+      || (cfg.reviewOnly.expectedHeadSha !== undefined && (typeof cfg.reviewOnly.expectedHeadSha !== "string" || !/^[a-f0-9]{40,64}$/i.test(cfg.reviewOnly.expectedHeadSha)))
       || !prNumber || runnerPhase !== "gap-analysis" || reviewFix !== undefined) {
       throw new Error("invalid run_config.reviewOnly");
     }
-    out.reviewOnly = { reviewers: cfg.reviewOnly.reviewers };
+    out.reviewOnly = { reviewers: cfg.reviewOnly.reviewers,
+      ...(cfg.reviewOnly.expectedHeadSha !== undefined ? { expectedHeadSha: cfg.reviewOnly.expectedHeadSha } : {}) };
   }
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
   if (runnerPhase !== undefined) out.runnerPhase = runnerPhase;

@@ -3100,6 +3100,14 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
     const head = gh(headArgs);
     if (head.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("Cannot read reviewed roll-up head");
     reviewedHead = head.stdout.trim();
+    const expectedHead = context.data.reviewOnly?.expectedHeadSha;
+    if (expectedHead && expectedHead.toLowerCase() !== reviewedHead.toLowerCase()) {
+      const skipReason = `Roll-up review skipped: PR head moved from queued head ${expectedHead} to ${reviewedHead}.`;
+      console.log(`[roll-up-review] ${skipReason}`);
+      return { approved: false, iterations: 0, finalFeedback: skipReason, terminationReason: "approved" as const,
+        passes: [], extraCostUsd: null, internalFindings: [],
+        rollupReview: { headSha: expectedHead, verdictUrl: "", skipReason } };
+    }
     // gh returns the entire base-to-head PR diff, including earlier commits and lockfiles.
     const diff = gh(["pr", "diff", prNumber]);
     if (diff.exitCode !== 0) throw new Error(`Cannot read PR diff: ${resultMessage(diff)}`);

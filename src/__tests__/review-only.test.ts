@@ -21,6 +21,18 @@ vi.mock("node:child_process", async (importOriginal) => {
 const diff = "diff --git a/earlier.ts b/earlier.ts\n+earlier commit\ndiff --git a/package-lock.json b/package-lock.json\n+lockfile change";
 
 describe("advisory roll-up review", () => {
+  it("skips a retry queued for head A when the PR has moved to B", async () => {
+    const invoke = vi.fn();
+    const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [{ id: "code-review", gates: true }],
+      expectedHeadSha: "a".repeat(40) } }, { invoke });
+    const gh = vi.fn(() => ({ exitCode: 0, stdout: "b".repeat(40) }));
+    const result = await runReviewOnly(ctx, "/unused", new NoopStepReporter(), gh);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(gh).toHaveBeenCalledTimes(1);
+    expect(result.rollupReview?.skipReason).toContain("head moved");
+    expect(result.iterations).toBe(0);
+  });
+
   it("publishes one bounded verdict for oversized reports from multiple reviewers", async () => {
     const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 1, terminalStatus: { subtype: "success", isError: false },
       structuredOutput: { approved: false, summary: "Summary ".repeat(30_000), checks: [{ check: "Integration", result: "passed", evidence: "Reviewed diff" }],
@@ -47,7 +59,7 @@ describe("advisory roll-up review", () => {
     expect(body).toContain("25 additional findings omitted");
   });
 
-  it.each(["wording", "head", "duplicates"])("regression: roll-up %s", async (check) => {
+  it.each(["wording", "head", "duplicates"])("roll-up %s (head matches or expected head omitted)", async (check) => {
     let body = "";
     const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 1,
       terminalStatus: { subtype: "success", isError: false }, structuredOutput: {
@@ -56,7 +68,7 @@ describe("advisory roll-up review", () => {
       } }));
     const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [
       { id: "code-review", gates: true }, { id: "integration-review", gates: true },
-    ] } }, { invoke });
+    ], ...(check === "head" ? { expectedHeadSha: "a".repeat(40) } : {}) } }, { invoke });
     await runReviewOnly(ctx, "/unused", new NoopStepReporter(), (args) => {
       if (args[1] === "comment") body = readFileSync(args[4], "utf8");
       return { exitCode: 0, stdout: args[1] === "view" ? "a".repeat(40) : args[1] === "diff" ? diff : "" };
