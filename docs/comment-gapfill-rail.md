@@ -119,11 +119,11 @@ dispositions and approval marks; it does not submit `LateExternalReview`. Findin
 are advisory and cannot authorize merging. The owning workflow preserves successful
 and failed `rollup_review` results, including when a deadline follows the callback,
 and releases the reservation without implementation tracker transitions or stuck
-remediation. Every terminal result gets a follow-up notice: it names the filed
+remediation. Each terminal result is given a follow-up notice: it names the filed
 child, says
 when no child is needed, or names failed reviewers for an incomplete review
 (with a fallback when review failed before a reviewer ran). At the two-child
-limit, including on incomplete reviews, it says a person must decide further fixes.
+limit, including on incomplete reviews, it says a person must decide further fixes. A notice can still be lost: when the verdict comment update fails after the child is reserved, the callback is acknowledged and the notice is not retried (AII-2011).
 Ordinary comment gap-fills are unchanged.
 
 ## Failed rounds

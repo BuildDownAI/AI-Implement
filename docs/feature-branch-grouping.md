@@ -285,11 +285,11 @@ links in the Problem / Task / Files / Acceptance Criteria template. Minor findin
 stay in the verdict comment. Incomplete reviews retain any partial findings in the
 verdict but create no child and consume none of the two-child budget. Titles start
 with `[roll-up-review]` and identify the repository, PR, and head. Each head gets at most one child; each PR gets at most
-two, including completed or cancelled children. Every terminal result gets a
+two, including completed or cancelled children. Each terminal result is given a
 follow-up notice naming the filed child or stating that no child was filed. Incomplete notices name the failed reviewers (or explain
 that no failed reviewer was identified for a failure before review). Once the
 two-child limit is reached, every notice, including an incomplete review, says a
-person must decide further fixes. Existing settings rows
+person must decide further fixes. A notice can still be lost: when the verdict comment update fails after the child is reserved, the callback is acknowledged and the notice is not retried (AII-2011). Existing settings rows
 reserve creation attempts atomically, including ambiguous tracker failures (which
 require a person to check the tracker); no new table is used. Tracker enumeration
 must finish successfully before filing, so an unreadable page cannot reset the cap.
