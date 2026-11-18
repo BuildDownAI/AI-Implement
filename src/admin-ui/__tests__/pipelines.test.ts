@@ -101,6 +101,13 @@ describe("stuck job badge", () => {
     expect(badge("timed_out", "stuck_requeued")).toEqual({ cls: "warn", label: "timed_out", title: "stuck_requeued" });
     expect(badge("completed", "stuck_giveup")).toEqual({ cls: "success", label: "completed", title: "stuck_giveup" });
   });
+  it.each(["machine_timeout", "run_not_found", null])("keeps ordinary timeout %s as a warning", (conclusion) => {
+    expect(badge("timed_out", conclusion)).toEqual({
+      cls: "warn",
+      label: "timed_out",
+      ...(conclusion ? { title: conclusion } : {}),
+    });
+  });
   it("distinguishes incomplete review infrastructure from code rejection", () => {
     expect(badge("review_failed", "REVIEWER_TURNS_EXHAUSTED", { code: "REVIEWER_TURNS_EXHAUSTED", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review incomplete", title: "REVIEWER_TURNS_EXHAUSTED" });
     expect(badge("review_failed", "PROVIDER_UNAVAILABLE", { code: "PROVIDER_UNAVAILABLE", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review incomplete", title: "PROVIDER_UNAVAILABLE" });
