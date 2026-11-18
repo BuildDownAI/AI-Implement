@@ -780,7 +780,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
       await eventually(() => fixture.runId !== null, Boolean, { label: "sandbox launch" });
       const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
-      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel");
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
       fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
       await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId);
       expect(fixture.dispatchCalls).toBe(1);
