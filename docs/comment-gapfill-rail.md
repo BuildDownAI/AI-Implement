@@ -92,6 +92,15 @@ Restate launch preparation sets the envelope's `reviewOnly` payload to
 id. An unset project selection uses the normal defaults; an empty selection still
 runs `integration-review`. Open ledger findings are not appended as fix instructions.
 
+An incomplete roll-up review with a nonempty list of failed reviewers, all classified
+`transient` (for example `PROVIDER_OVERLOADED`), queues one retry for the same head.
+`ROLLUP_REVIEW_RETRY_LIMIT = 1` caps retries per repository/PR/head across every queue
+state. Non-transient or unclassified failures and a second incomplete result get no
+retry. The initial queue key is unchanged; attempt 1 has a distinct hashed negative
+ID and retains `ROLLUP_REVIEW_COMMENTER`. The retry uses the normal drain and budget
+checks with `humanRequested=false`. The verdict follow-up says “one retry is queued”
+or “no retry is left; a person decides”. Partial findings remain advisory.
+
 The runner reviews the full PR diff once and posts one verdict comment marked
 `<!-- ai-implement rollup-review -->`, showing the short reviewed head SHA and
 explaining that the verdict does not block the merge: blockers are filed as one `[roll-up-review]` child until the two-child

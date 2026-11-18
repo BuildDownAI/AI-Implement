@@ -118,14 +118,21 @@ function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
   };
 }
 
+export const ROLLUP_REVIEW_RETRY_LIMIT = 1;
+
 export const ROLLUP_REVIEW_COMMENTER = "ai-implement-rollup-review";
 
 /** Returns true only for a newly inserted head, including across terminal states. */
-export function enqueueRollupReview(input: { owner: string; repo: string; prNumber: number; headSha: string }): boolean {
+export function enqueueRollupReview(input: { owner: string; repo: string; prNumber: number; headSha: string; attempt?: number }): boolean {
+  const attempt = input.attempt ?? 0;
+  if (!Number.isInteger(attempt) || attempt < 0 || attempt > ROLLUP_REVIEW_RETRY_LIMIT) return false;
   // 48 hash bits fit exactly in a JS number; reserve IDs below the existing
   // synthetic helpers' -2 billion range and keep real webhook IDs positive.
+  const key: Array<string | number> = ["rollup-review", input.owner, input.repo, input.prNumber, input.headSha];
+  // Keep the original key byte-for-byte for already queued initial reviews.
+  if (attempt > 0) key.push(attempt);
   const digest = createHash("sha256")
-    .update(JSON.stringify(["rollup-review", input.owner, input.repo, input.prNumber, input.headSha]))
+    .update(JSON.stringify(key))
     .digest();
   const commentId = -(digest.readUIntBE(0, 6) + 2_000_000_001);
   return insertCommentGapfill({

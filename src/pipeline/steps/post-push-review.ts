@@ -3091,6 +3091,7 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
   let feedback = "";
   let failed = false;
   let failedReviewers: string[] = [];
+  let incompleteReviews: import("../../runner-result.js").RollupReviewResult["incompleteReviews"] = [];
   let approved = false;
   let costUsd: number | null = null;
   try {
@@ -3117,6 +3118,8 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
       previousFindings: "", model: context.data.model ?? DEFAULT_MODEL, sleep: async () => {} });
     findings = result.findings;
     feedback = result.feedback;
+    incompleteReviews = result.incompleteReviews.map(({ reviewerId, failure }) => ({ reviewerId,
+      ...(failure ? { failure: { category: failure.category, code: failure.code } } : {}) }));
     failedReviewers = result.incompleteReviews.map(review => review.reviewerId);
     failed = failedReviewers.length > 0;
     approved = result.approved;
@@ -3139,5 +3142,5 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
   return { approved, iterations: 1, finalFeedback: feedback, terminationReason: failed ? "review_error" as const : "approved" as const,
-    passes: [], extraCostUsd: costUsd, internalFindings: findings, rollupReview: { headSha: reviewedHead, verdictUrl, failedReviewers } };
+    passes: [], extraCostUsd: costUsd, internalFindings: findings, rollupReview: { headSha: reviewedHead, verdictUrl, failedReviewers, incompleteReviews } };
 }

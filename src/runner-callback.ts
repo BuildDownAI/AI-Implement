@@ -1,3 +1,4 @@
+import { enqueueRollupReview, ROLLUP_REVIEW_RETRY_LIMIT } from "./comment-gapfill-queue.js";
 import { listRollupReviewChildren, reconcileRollupReviewChildren, ROLLUP_REVIEW_CHILD_PREFIX } from "./merge-up.js";
 import { getDb } from "./dedup.js";
 import { recordInternalReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
@@ -183,7 +184,7 @@ export interface RunnerResultBody {
   referenceRepoResults?: ReferenceRepoResult[];
   /** Internal findings collected across review iterations, validated before storage. */
   reviewOnly?: boolean;
-  rollupReview?: { headSha: string; verdictUrl: string; failedReviewers?: string[] };
+  rollupReview?: import("./runner-result.js").RollupReviewResult;
   internalFindings?: ReviewLedgerFinding[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
@@ -2200,8 +2201,23 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   const marker = "<!-- roll-up-review follow-up -->";
   const failedReviewers = Array.isArray(review.failedReviewers)
     ? review.failedReviewers.filter((id): id is string => typeof id === "string" && !!id.trim()) : [];
+  const failures = review.incompleteReviews;
+  const transientOnly = Array.isArray(failures) && failures.length > 0 &&
+    failures.every(r => r && typeof r.reviewerId === "string" && r.reviewerId.trim() && r.failure?.category === "transient") &&
+    failedReviewers.every(id => failures.some(r => r.reviewerId === id));
+  // Remember which callback inserted the retry so notice-write failures can be
+  // redelivered without describing that callback's queued retry as exhausted.
+  const retryNoticeKey = `roll-up-review:retry-notice:${job.dispatchId}`;
+  const retryQueued = getDb().transaction(() => {
+    const prior = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(retryNoticeKey);
+    if (prior) return true;
+    if (complete || closed || !review.headSha || !transientOnly) return false;
+    const queued = enqueueRollupReview({ owner, repo, prNumber, headSha: review.headSha, attempt: ROLLUP_REVIEW_RETRY_LIMIT });
+    if (queued) getDb().prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run(retryNoticeKey, review.headSha);
+    return queued;
+  })();
   const resultNotice = !complete
-    ? `The review did not finish. ${failedReviewers.length ? `Failed reviewers: ${failedReviewers.join(", ")}.` : "No failed reviewer was identified; the review could not complete."}`
+    ? `The review did not finish. ${failedReviewers.length ? `Failed reviewers: ${failedReviewers.join(", ")}.` : "No failed reviewer was identified; the review could not complete."} ${retryQueued ? "one retry is queued" : "no retry is left; a person decides"}.`
     : childIdentifier ? `Blocking findings filed as ${childIdentifier}.`
     : blockers.length ? "No additional child filed." : "No blocking findings; no child filed.";
   const notice = `${marker}\n\n${resultNotice}` +
