@@ -1011,8 +1011,10 @@ export function parseModelAuthContext(raw: unknown): ValidationResult<ModelAuthC
 
 /**
  * Operator-approved execution policy (AII-1437). The only authority source for Codex implementation full access:
- * a versioned, dispatcher-authored value that travels in the protected credential namespace beside the model-auth
- * context and must match it. Never part of `agentConfig`, repository config, the generic run_config or diagnostics.
+ * a versioned, dispatcher-authored value that travels in the protected credential namespace.
+ * A `gha` policy must match `modelAuthContext`. A `fly` policy requires a sealed Fly `modelAuthGrant`
+ * with the same `dispatchId` and no `modelAuthContext`; the runner checks `projectKey` after it opens the grant.
+ * Never part of `agentConfig`, repository config, the generic run_config or diagnostics.
  * Configured Codex implementation defaults to this policy on GHA. The v2 workflow proves the actual
  * runner.environment is github-hosted before projection; executor non-root/socket admission still applies.
  */

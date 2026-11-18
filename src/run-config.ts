@@ -210,7 +210,12 @@ export interface RunCredentialsV1 {
   modelAuthGrant?: ModelAuthGrantBootstrapV1 | SealedModelAuthBootstrapV1;
   /** Dispatcher-authored GHA launch context (AII-1427), independent of the grant. Protected-only. */
   modelAuthContext?: ModelAuthContextV1;
-  /** Operator-approved ephemeral full-access policy (AII-1437). Protected-only; must match `modelAuthContext`. */
+  /**
+   * Operator-approved ephemeral full-access policy (AII-1437). Protected-only.
+   * A `gha` policy must match `modelAuthContext`. A `fly` policy requires a sealed Fly
+   * `modelAuthGrant` with the same `dispatchId` and no `modelAuthContext`; the runner
+   * checks `projectKey` after it opens the grant.
+   */
   executionPolicy?: ExecutionPolicyV1;
 }
 
