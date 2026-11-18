@@ -1447,10 +1447,10 @@ describe("LinearProvider.markImplementationFailed", () => {
 });
 
 describe("LinearProvider.markMerged", () => {
-  it("moves a started issue to Done and drops the Ready for Review label", async () => {
+  it("moves a started issue to Done and drops the Ready for Review and Plan-Complete labels", async () => {
     const fake = linear(
       // 1. fetch issue state, team key, and labels
-      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }] } } }),
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "LP", name: "Plan-Complete" }, { id: "L2", name: "bug" }] } } }),
       // 2. getTeamIdByKey
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       // 3. getCompletedStateId: workflowStates query
@@ -1466,21 +1466,40 @@ describe("LinearProvider.markMerged", () => {
     expect(variables(fake, 3)).toMatchObject({ issueId: "issue-1", stateId: "s-done", labelIds: ["L2"] });
   });
 
-  it("no-ops when the issue is already completed", async () => {
-    const fake = linear(data({ issue: { state: { type: "completed" }, team: { key: "ENG" }, labels: { nodes: [] } } }));
+  describe.each(["completed", "canceled"])("already %s", (type) => {
+    it.each([
+      ["both", ["Ready for Review", "Plan-Complete"]],
+      ["review only", ["Ready for Review"]],
+      ["plan only", ["Plan-Complete"]],
+    ])("cleans %s labels without a state write or lookup", async (_name, names) => {
+      const fake = linear(
+        data({ issue: { state: { type }, team: { key: "ENG" }, labels: { nodes: [
+          ...names.map((name, i) => ({ id: `cleanup-${i}`, name })),
+          { id: "bug", name: "bug" }, { id: "pickup", name: "AI-Implement" },
+        ] } } }),
+        data({ issueUpdate: { success: true } }),
+      );
 
-    const p = new LinearProvider({});
-    await p.markMerged("issue-1", "ENG");
+      await new LinearProvider({}).markMerged("issue-1", "ENG");
 
-    expect(fake.calls).toHaveLength(1);
+      expect(fake.calls).toHaveLength(2);
+      expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["bug", "pickup"] });
+      const query = JSON.parse(fake.calls[1].body).query;
+      expect(query).toContain("issueUpdate");
+      expect(query).not.toContain("stateId");
+      expect(fake.calls.every(call => !JSON.parse(call.body).query.includes("workflowStates"))).toBe(true);
+    });
+
+    it.each([{ nodes: [] }, { nodes: [{ id: "bug", name: "bug" }] }])("does not write when labels are clean (%j)", async ({ nodes }) => {
+      const fake = linear(data({ issue: { state: { type }, team: { key: "ENG" }, labels: { nodes } } }));
+      await new LinearProvider({}).markMerged("issue-1", "ENG");
+      expect(fake.calls).toHaveLength(1);
+    });
   });
 
-  it("no-ops when the issue is already canceled", async () => {
-    const fake = linear(data({ issue: { state: { type: "canceled" }, team: { key: "ENG" }, labels: { nodes: [] } } }));
-
-    const p = new LinearProvider({});
-    await p.markMerged("issue-1", "ENG");
-
+  it("no-ops when the issue is missing", async () => {
+    const fake = linear(data({ issue: null }));
+    await new LinearProvider({}).markMerged("issue-1", "ENG");
     expect(fake.calls).toHaveLength(1);
   });
 
@@ -1502,9 +1521,9 @@ describe("LinearProvider.markMerged", () => {
     expect(variables(fake, 3).stateId).toBe("s-shipped");
   });
 
-  it("keeps all labels except Ready for Review", async () => {
+  it("keeps all labels except Ready for Review and Plan-Complete", async () => {
     const fake = linear(
-      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }, { id: "L3", name: "AI-Implement" }] } } }),
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "LP", name: "Plan-Complete" }, { id: "L2", name: "bug" }, { id: "L3", name: "AI-Implement" }] } } }),
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       data({ workflowStates: { nodes: [{ id: "s-done", name: "Done", type: "completed" }] } }),
       data({ issueUpdate: { success: true } }),
