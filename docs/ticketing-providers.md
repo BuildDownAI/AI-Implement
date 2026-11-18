@@ -240,7 +240,9 @@ Output contains only named public fields. Identifier collisions retain the first
 
 ## Pull request closed without a merge
 
-`markPrClosedUnmerged(issueId, scopeKey, prUrl)` returns `true` after cancelling the issue and posting one comment naming the PR URL. It returns `false` without a write for an already terminal issue. This provider write is available for future merge-poll integration; it has no production caller yet.
+`markPrClosedUnmerged(issueId, scopeKey, prUrl)` returns `true` after cancelling the issue and posting one comment naming the PR URL. It returns `false` without a write for an already terminal issue. The production merge poll (`detectMergedPrs` in `src/poll-merged-prs.ts`) calls it through the `cancelIssue` dependency wired in `src/index.ts`, resolving the provider from the linked issue's mapping key.
+
+Cancellation runs for paused projects too. Roll-up links, a grouping parent's own PR, and issues with another open PR link are excluded. An in-flight run defers the decision until a later poll. Final decisions set the link's `cancel_checked_at`; in-flight deferrals and provider errors leave it null so the next poll retries without a GitHub read. Either provider result (`true` or `false`) removes the issue's dispatch dedup row so a person can restart it.
 
 | Provider | Write | Terminal guard | Restart |
 |---|---|---|---|
