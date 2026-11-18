@@ -123,7 +123,7 @@ remediation. Each terminal result is given a follow-up notice: it names the file
 child, says
 when no child is needed, or names failed reviewers for an incomplete review
 (with a fallback when review failed before a reviewer ran). At the two-child
-limit, including on incomplete reviews, it says a person must decide further fixes. A notice can still be lost: when the verdict comment update fails after the child is reserved, the callback is acknowledged and the notice is not retried (AII-2011).
+limit, including on incomplete reviews, it says a person must decide further fixes. When the verdict comment update fails, the callback keeps the saved notice pending and answers 503, so the runner's bounded result-delivery retries post it without filing another child (see `docs/feature-branch-grouping.md` § 6).
 Ordinary comment gap-fills are unchanged.
 
 ## Failed rounds
