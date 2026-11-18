@@ -111,6 +111,8 @@ children`). Only once **all** its labelled children reach a terminal state does 
 work dispatch — onto its own feature branch. "Terminal" means completed or cancelled, and for Linear also Duplicate
 (state type `duplicate`), so these closed children do not block the parent forever.
 
+A child whose implementation PR closes without a merge is cancelled by the orchestrator once it has no other open PR and no run in flight (subject to the [grouping-parent exemptions](pull-request-links.md#cancellation-after-an-unmerged-close)). The cancelled child is terminal, so the parent's closing run can then start without that child's work.
+
 On both Linear and Jira, unlabelled children must also be terminal (Done or Cancelled, and also Duplicate for Linear) before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
 
 The internal gap-analysis and in-loop review grade a grouping parent's closing-work PR
