@@ -1181,7 +1181,9 @@ async function handleRunnerResultInternal(
     const job = getJobByDispatchId(claims.dispatchId);
     let trackerWriteReserved = false;
     try {
-      await fileRollupReviewChild(input, provider, job, mappingTeamKey, claims.issueId, () => { trackerWriteReserved = true; });
+      if (!input.body.rollupReview?.skipReason) {
+        await fileRollupReviewChild(input, provider, job, mappingTeamKey, claims.issueId, () => { trackerWriteReserved = true; });
+      }
     } catch (err) {
       warn("roll-up-review", err);
       if (!trackerWriteReserved) return { status: 503, body: { error: "Roll-up review follow-up unavailable", warnings } };
