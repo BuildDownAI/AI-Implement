@@ -267,7 +267,7 @@ export interface TicketingProvider {
   clearWorkingState(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
   /** Move the issue out of pickup so a human decides what happens next, and post no comment (the
    *  caller comments). Unlike `clearWorkingState`, the ticket must not look ready for pickup
-   *  (Jira: Planning Failed / Implementation Failed; Linear: the `AI-Needs-Human` label;
+   *  (Jira: Planning Failed / Implementation Failed; Linear: clears active labels; caller persists the park record;
    *  filesystem: a failed task). Returns whether the write was applied; false when refused
    *  because the issue is already terminal (Jira: Merged; Linear: completed or canceled;
    *  filesystem: a terminal task). Not the dispatch-breaker park (`src/dispatch-breaker.ts`),

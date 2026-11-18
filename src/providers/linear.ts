@@ -1,3 +1,4 @@
+import { listParked } from "../dispatch-breaker.js";
 import type {
   AIImplementSnapshot,
   FeatureBranchChainEntry,
@@ -59,9 +60,6 @@ export const LINEAR_LABELS = {
   planComplete: { name: "Plan-Complete", color: "#10B981" },
   working: { name: "AI-Working", color: "#F59E0B" },
   readyForReview: { name: "Ready for Review", color: "#4ecdc4" },
-  /** Marker a parked issue carries (`parkForHuman`). It keeps the pickup label, which is also its
-   *  identity in the feature-branch grouping tree; pickup skips it while this marker is present. */
-  needsHuman: { name: "AI-Needs-Human", color: "#EF4444" },
 } as const;
 
 type LinearLabel = (typeof LINEAR_LABELS)[keyof typeof LINEAR_LABELS];
@@ -156,7 +154,6 @@ export class LinearProvider implements TicketingProvider {
   private aiWorkingLabelCache = new Map<string, string>();
   private planCompleteLabelCache = new Map<string, string>();
   private readyForReviewLabelCache = new Map<string, string>();
-  private needsHumanLabelCache = new Map<string, string>();
   private teamIdByKey = new Map<string, string>();
   private inProgressStateByTeamKey = new Map<string, string>();
   private canceledStateByTeamKey = new Map<string, string>();
@@ -294,7 +291,6 @@ export class LinearProvider implements TicketingProvider {
     }
 
     const precedence: Array<[string, IssueStatusRecord["state"]]> = [
-      [LINEAR_LABELS.needsHuman.name, "failed"],
       [LINEAR_LABELS.readyForReview.name, "pr-ready"],
       [LINEAR_LABELS.working.name, "implementing"],
       [LINEAR_LABELS.planComplete.name, "plan-approved"],
@@ -560,16 +556,13 @@ export class LinearProvider implements TicketingProvider {
     const readyForImplementation: AIImplementSnapshot["readyForImplementation"] = [];
     const parentsToFinalize: AIImplementSnapshot["parentsToFinalize"] = [];
 
+    const parkedIds = new Set(listParked().map(row => row.issueId));
     let mappings: Record<string, RepoMapping> | undefined;
     for (const issue of allNodes) {
       const labelNames = new Set(issue.labels?.nodes?.map((l) => l.name) ?? []);
 
-      // Parked for a human by the stuck watchdog; a human restarts it by removing the marker.
-      // Checked before the capacity count so a half-failed park (marker added, AI-Working
-      // not removed) does not hold a slot forever.
-      if (labelNames.has(LINEAR_LABELS.needsHuman.name)) {
-        continue;
-      }
+      // The park record holds the issue and releases its capacity slot.
+      if (parkedIds.has(issue.id)) continue;
 
       // AI-Working or AI-Planning = slot is occupied; count against capacity
       if (labelNames.has(LINEAR_LABELS.working.name) || labelNames.has(LINEAR_LABELS.planning.name)) {
@@ -1025,7 +1018,6 @@ export class LinearProvider implements TicketingProvider {
       planComplete: this.planCompleteLabelCache,
       working: this.aiWorkingLabelCache,
       readyForReview: this.readyForReviewLabelCache,
-      needsHuman: this.needsHumanLabelCache,
     };
     for (const key of Object.keys(LINEAR_LABELS) as Array<keyof typeof LINEAR_LABELS>) {
       const label = LINEAR_LABELS[key];
@@ -1157,11 +1149,7 @@ export class LinearProvider implements TicketingProvider {
     );
     const type = data.issue?.state?.type;
     if (!data.issue || isTerminalStateType(type)) return false;
-    // Marker first: once it is on, pickup skips the issue even if a removal below fails. The
-    // pickup label stays, so the issue keeps its place in the feature-branch grouping tree and,
-    // being non-terminal, keeps holding its parent's roll-up.
-    const markerId = await this.ensureTeamLabel(data.issue.team.key, LINEAR_LABELS.needsHuman, this.needsHumanLabelCache);
-    await this.addLabelToIssue(issueId, markerId);
+    // Keep the pickup label for grouping identity; callers persist the park record.
     await this.removeLabelsByName(issueId, [LINEAR_LABELS.working.name, LINEAR_LABELS.planning.name]);
     return true;
   }

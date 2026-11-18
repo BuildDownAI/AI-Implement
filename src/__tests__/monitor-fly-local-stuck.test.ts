@@ -17,6 +17,8 @@ vi.mock("../log.js", () => ({
   getJobById: vi.fn().mockReturnValue(null),
 }));
 
+vi.mock("../dispatch-breaker.js", () => ({ parkIssue: vi.fn() }));
+
 vi.mock("../dedup.js", () => ({
   deleteDispatched: vi.fn(),
 }));
@@ -27,7 +29,8 @@ vi.mock("../notify.js", () => ({
 
 import { remediateStuckJob, remediateFailedJob, STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
 import { cancelWorkflowRun } from "../github.js";
-import { incrementStuckAttempts, updateJobStatus } from "../log.js";
+import { incrementStuckAttempts, resetStuckAttempts, updateJobStatus } from "../log.js";
+import { parkIssue } from "../dispatch-breaker.js";
 import { deleteDispatched } from "../dedup.js";
 import { notifyStuckGiveUp } from "../notify.js";
 
@@ -122,6 +125,12 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
       expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
       expect(provider.clearWorkingState).not.toHaveBeenCalled();
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+      expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "machine_timeout");
+      const parked = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+      expect(parked).toBeGreaterThan(vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0]);
+      expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
+      expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+      expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
     });
 
     it("fires notifyStuckGiveUp with machine_timeout lastRunStatus on hard-stop", async () => {
@@ -209,6 +218,12 @@ describe("remediateStuckJob — local-docker timeout path", () => {
       expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
       expect(provider.clearWorkingState).not.toHaveBeenCalled();
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+      expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "container_timeout");
+      const parked = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+      expect(parked).toBeGreaterThan(vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0]);
+      expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
+      expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+      expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
     });
 
     it("fires notifyStuckGiveUp with container_timeout lastRunStatus on hard-stop", async () => {
@@ -332,6 +347,12 @@ describe("remediateFailedJob — hard-stop (attempt 4+ = budget exhausted)", () 
     expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
     expect(provider.clearWorkingState).not.toHaveBeenCalled();
     expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "failure");
+    const parked = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+    expect(parked).toBeGreaterThan(vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0]);
+    expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
   });
 
   it("fires notifyStuckGiveUp with the failure lastRunStatus on hard-stop", async () => {

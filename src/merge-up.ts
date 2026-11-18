@@ -1,3 +1,4 @@
+import { parkIssue } from "./dispatch-breaker.js";
 import type { RepoMapping } from "./config.js";
 import type { FeatureNodeRollUp, IssueLifecycleState, TicketingProvider, TrackerIssueRecord } from "./providers/types.js";
 import { enqueueRollupReview } from "./comment-gapfill-queue.js";
@@ -290,6 +291,7 @@ export async function reconcileRollupReviewChildren(provider: TicketingProvider,
     if (!await provider.parkForHuman(child.id, scopeKey, "implementation")) {
       throw new Error(`Parking rejected for roll-up review child ${child.identifier}`);
     }
+    if (provider.id === "linear") parkIssue(child.id, "implementation", "rollup_review_closed");
     await provider.postComment(child.id, `${marker}\nThe tree merged first or its roll-up PR was closed. A person should re-file this fix against the base branch \`${mapping.defaultBranch}\`. The feature branch may have been deleted.`);
     getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(parkedKey, new Date().toISOString());
     console.log(`[roll-up-review] Parked ${child.identifier}: roll-up #${identity[2]} closed`);
