@@ -353,110 +353,99 @@ describe("installationIncludesRepo", () => {
 });
 
 describe("getScopedInstallationToken permission intersection", () => {
-  const futureExpiresAt = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
   const PUBLICATION = { contents: "write", pull_requests: "write", workflows: "write", checks: "read" };
-  const mintBody = (call: number) => JSON.parse((vi.mocked(fetch).mock.calls[call][1] as RequestInit).body as string);
+  // An org installation granting `granted` (omit for a reply with no permissions field), and mints answering in order.
+  const routes = (granted: Record<string, string> | undefined, ...minted: Reply[]) => fakeFetch({
+    [orgInstallation("my-org")]: installation(1, granted ? { permissions: granted } : {}),
+    [mint(1)]: minted.length > 0 ? minted : [token("t")],
+  }).install();
+  const mintCalls = (api: ReturnType<typeof routes>) => api.calls.filter((call) => `${call.method} ${call.path}` === mint(1));
+  const installationCalls = (api: ReturnType<typeof routes>) => api.calls.filter((call) => call.path.endsWith("/installation"));
+  const mintBody = (api: ReturnType<typeof routes>, n = 0) => JSON.parse(mintCalls(api)[n].body);
   let warn: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   });
-  afterEach(() => {
-    warn.mockRestore();
-  });
 
-  const mint = (perms: Record<string, string> = PUBLICATION, extra: Record<string, unknown> = {}) =>
+  const scoped = (perms: Record<string, string> = PUBLICATION, extra: Record<string, unknown> = {}) =>
     getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: perms, ...extra });
 
   it("leaves the body unchanged and does not warn when everything is granted", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 1, permissions: { ...PUBLICATION, metadata: "read" } } },
-      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
-    ]));
-    await mint();
-    expect(mintBody(1)).toEqual({ permissions: PUBLICATION });
+    const api = routes({ ...PUBLICATION, metadata: "read" });
+    await scoped();
+    expect(mintBody(api)).toEqual({ permissions: PUBLICATION });
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("drops a permission the installation lacks and warns once", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 1, permissions: { contents: "write", pull_requests: "write", workflows: "write" } } },
-      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
-    ]));
-    await mint();
-    expect(mintBody(1).permissions).toEqual({ contents: "write", pull_requests: "write", workflows: "write" });
+  it("drops a permission the installation lacks, warns once naming it and the owner, and still mints", async () => {
+    const api = routes({ contents: "write", pull_requests: "write", workflows: "write" });
+    const result = await scoped();
+    expect(result.token).toBe("t");
+    expect(mintBody(api).permissions).toEqual({ contents: "write", pull_requests: "write", workflows: "write" });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain("checks");
     expect(warn.mock.calls[0][0]).toContain("my-org");
   });
 
-  it("lowers write to read where only read is granted", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 1, permissions: { ...PUBLICATION, workflows: "read" } } },
-      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
-    ]));
-    await mint();
-    expect(mintBody(1).permissions).toEqual({ ...PUBLICATION, workflows: "read" });
+  it("lowers write to read where only read is granted, leaving the others unchanged", async () => {
+    const api = routes({ ...PUBLICATION, workflows: "read" });
+    await scoped();
+    expect(mintBody(api).permissions).toEqual({ ...PUBLICATION, workflows: "read" });
     expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain("workflows");
   });
 
-  it("passes through a level the rank does not know", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 1, permissions: { contents: "write" } } },
-      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
-    ]));
-    await mint({ contents: "superuser" });
-    expect(mintBody(1).permissions).toEqual({ contents: "superuser" });
+  it("keeps a read request when the installation grants write", async () => {
+    const api = routes({ contents: "write" });
+    await scoped({ contents: "read" });
+    expect(mintBody(api).permissions).toEqual({ contents: "read" });
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("warns once for the same owner and permission across mints", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 1, permissions: { contents: "write" } } },
-      { ok: true, json: { token: "t1", expires_at: futureExpiresAt() } },
-      { ok: true, json: { id: 1, permissions: { contents: "write" } } },
-      { ok: true, json: { token: "t2", expires_at: futureExpiresAt() } },
-    ]));
-    await mint({ contents: "write", checks: "read" });
-    await mint({ contents: "write", checks: "read" }, { forceRefresh: true });
+  it("passes through a level the rank does not know", async () => {
+    const api = routes({ contents: "write" });
+    await scoped({ contents: "superuser" });
+    expect(mintBody(api).permissions).toEqual({ contents: "superuser" });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns once for the same owner and permission across mints, and again after clearTokenCache", async () => {
+    routes({ contents: "write" }, token("t1"), token("t2"), token("t3"));
+    await scoped({ contents: "write", checks: "read" });
+    await scoped({ contents: "write", checks: "read" }, { forceRefresh: true });
     expect(warn).toHaveBeenCalledTimes(1);
+    clearTokenCache();
+    await scoped({ contents: "write", checks: "read" });
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 
   it("throws the same GitHubApiError when the installation lookup fails", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: false, status: 404, text: "Not Found" },
-      { ok: false, status: 404, text: "Not Found" },
-    ]));
-    await expect(mint()).rejects.toMatchObject({ status: 404, path: "/users/my-org/installation" });
+    fakeFetch({ [orgInstallation("my-org")]: notFound, [userInstallation("my-org")]: notFound }).install();
+    await expect(scoped()).rejects.toMatchObject({ status: 404, path: "/users/my-org/installation" });
   });
 
-  it("passes the request through when the installation response has no permissions", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 1 } },
-      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
-    ]));
-    await mint();
-    expect(mintBody(1)).toEqual({ permissions: PUBLICATION });
+  it("passes the request through when the installation response has no permissions field", async () => {
+    const api = routes(undefined);
+    await scoped();
+    expect(mintBody(api)).toEqual({ permissions: PUBLICATION });
     expect(warn).not.toHaveBeenCalled();
   });
 
   it("makes no installation request on a cache hit", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 1, permissions: { contents: "write" } } },
-      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
-    ]));
-    await mint({ contents: "write", checks: "read" });
-    expect(fetch).toHaveBeenCalledTimes(2);
-    await mint({ contents: "write", checks: "read" });
-    expect(fetch).toHaveBeenCalledTimes(2);
+    const api = routes({ contents: "write" });
+    await scoped({ contents: "write", checks: "read" });
+    expect(installationCalls(api)).toHaveLength(1);
+    expect(mintCalls(api)).toHaveLength(1);
+    await scoped({ contents: "write", checks: "read" });
+    expect(installationCalls(api)).toHaveLength(1);
+    expect(mintCalls(api)).toHaveLength(1);
   });
 
   it("throws without a mint request when nothing requested is granted", async () => {
-    vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 1, permissions: { metadata: "read" } } },
-    ]));
-    await expect(mint({ checks: "read" })).rejects.toThrow(/my-org.*checks/);
-    expect(fetch).toHaveBeenCalledTimes(1);
+    const api = routes({ metadata: "read" });
+    await expect(scoped({ checks: "read" })).rejects.toThrow(/my-org.*checks/);
+    expect(mintCalls(api)).toHaveLength(0);
   });
 });
 
