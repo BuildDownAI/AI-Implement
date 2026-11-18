@@ -249,6 +249,8 @@ Orchestrator sync is the only distribution path for workflow templates to target
 
 ## Workflow templates
 
+`claude-plan.yml` is a thin container shim over the shared runner image: `entrypoint.sh` with `RUNNER_PHASE=planning` invokes `run-planning.js`, so planning runs identically on GitHub Actions, Fly, and local Docker. Bedrock planning is GHA-only; Fly and local Docker reject `provider=bedrock`.
+
 `workflows/claude-implement.yml` and `claude-plan.yml` are synced to target repos under the mapping's Workflow File and Planning Workflow File names (defaults `claude-implement.yml`, `claude-plan.yml`); a sync never touches a workflow file the mapping does not name. `WORKFLOW.md` and `PLANNING.md` are **seeded once and never overwritten**, so every repo keeps whatever template it was created with. Sync also *removes* `comment-trigger.yml`, since the orchestrator webhook now handles `/ai-implement` for envelope repos. **Full reference: [docs/workflow-sync.md](docs/workflow-sync.md).**
 
 That seed-once rule has a consequence worth internalising: **a template correction never reaches an existing repo.** Fixing a bug in `workflows/WORKFLOW.md` fixes it for repos onboarded afterward and for nobody else.
