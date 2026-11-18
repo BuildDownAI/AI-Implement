@@ -55,6 +55,39 @@ describe("backfillLinksFromJobRows", () => {
     expect(log).toHaveBeenCalledExactlyOnceWith("Backfilled 1 pull request links from job rows");
   });
 
+  it("enriches existing links and preserves grouping ownership and current PR through pruning and restart", async () => {
+    const f = await fixture();
+    const { links, dedup } = f.modules;
+    const log = await import("../log.js");
+    // First create a link without grouping metadata, as an older version would.
+    f.seed({ dispatchedAt: 10 });
+    const original = links.listLinksByOutcome("open")[0]!;
+    dedup.getDb().exec("UPDATE pull_request_link SET job_dispatched_at = NULL, job_id = NULL");
+    dedup.getDb().exec("UPDATE dispatch_log SET grouping_parent = 1");
+    links.backfillLinksFromJobRows();
+    expect(links.findLinkByPr("owner/repo", 12)).toMatchObject({
+      groupingParent: true, jobDispatchedAt: 10,
+    });
+
+    const newer = log.appendLog({ issueId: original.issue.trackerIssueId,
+      issueIdentifier: original.issue.identifier!, repo: "owner/repo", teamKey: "ENG", groupingParent: true });
+    log.updateJobPrUrl(newer, "https://github.com/owner/repo/pull/13");
+    // A late report from the older job must not move current PR identity backward.
+    const old = dedup.getDb().prepare("SELECT id FROM dispatch_log ORDER BY id LIMIT 1").get() as { id: number };
+    log.updateJobPrUrl(old.id, original.url);
+    expect(links.isCurrentGroupingParent(links.findLinkByPr("owner/repo", 12)!)).toBe(false);
+    expect(links.isCurrentGroupingParent(links.findLinkByPr("owner/repo", 13)!)).toBe(true);
+
+    const gap = log.appendLog({ issueId: original.issue.trackerIssueId,
+      issueIdentifier: original.issue.identifier!, repo: "owner/repo", teamKey: "ENG", groupingParent: false });
+    log.updateJobPrUrl(gap, "https://github.com/owner/repo/pull/13");
+    expect(links.findLinkByPr("owner/repo", 13)?.groupingParent).toBe(true);
+    dedup.getDb().exec("DELETE FROM dispatch_log");
+    const restarted = await f.reopen();
+    expect(restarted.links.isCurrentGroupingParent(restarted.links.findLinkByPr("owner/repo", 13)!)).toBe(true);
+    expect(restarted.links.isCurrentGroupingParent(restarted.links.findLinkByPr("owner/repo", 12)!)).toBe(false);
+  });
+
   it("keeps the backfill source when a later job setter reports the same pull request", async () => {
     const f = await fixture();
     const log = await import("../log.js");

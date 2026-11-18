@@ -89,7 +89,7 @@ flowchart TD
 
 ## Cancellation after an unmerged close
 
-After outcome detection, `detectMergedPrs` walks `listUncheckedClosedLinks`. Cancellation applies to implementation links only, when there is no other open link for the same tracker issue and no run in flight. Roll-ups are exempt. A surviving `dispatch_log` row identifying the issue's latest PR as a grouping-parent PR is also exempt: its existing finalization path calls `markMerged` before tombstoning, deferring while a run is in flight or finalization fails.
+After outcome detection, `detectMergedPrs` walks `listUncheckedClosedLinks`. Cancellation applies to implementation links only, when there is no other open link for the same tracker issue and no run in flight. Roll-ups are exempt. A durable link identifying the issue's latest PR as a grouping-parent PR is also exempt: its existing finalization path calls `markMerged` before tombstoning, deferring while a run is in flight or finalization fails.
 
 Exempt links and links superseded by another open PR get `cancel_checked_at` immediately. An in-flight run defers the decision without setting it. Otherwise `src/index.ts` resolves the stored mapping and calls the provider's `markPrClosedUnmerged`. On a nonthrowing return (including a provider no-op), the poll removes the issue's `dispatched` dedup row and calls `setCancelCheckedAt`. Missing mappings and provider errors leave the decision unchecked for retry.
 
@@ -104,3 +104,17 @@ A cancelled child is terminal, so its parent's closing run can proceed without t
 ## Retention
 
 Nothing automatically prunes either table: job-history retention and reconciliation tombstones do not delete these rows. `deleteLinksForMapping` is an explicit deletion API that removes a mapping's links first and then its tracked issues. Retention therefore does not mean the rows are immutable or impossible to delete.
+
+Grouping ownership is retained on each PR link with an additive `grouping_parent`
+flag. Job writers and surviving-history backfill enrich it without clearing a
+previous grouping flag on later gap-fill reports. `job_dispatched_at` and `job_id`
+retain the newest dispatch ordering for each implementation link; finalization
+and cancellation use that ordering to identify the current PR after job pruning.
+Backfill enriches existing links only for the same tracker issue, preserving their
+metadata and role. Already-pruned grouping history cannot be reconstructed.
+
+A confirmed implementation merge atomically promotes a skipped reconciliation
+tombstone to pending in the same queue row, updating the merge SHA and resetting
+attempts. This handles a closed PR that reopens and later merges through either
+polling or webhook delivery. Pending, dispatched and failed rows remain deduplicated;
+roll-ups remain excluded.

@@ -42,6 +42,9 @@ export interface PullRequestLink extends Omit<LinkPullRequestInput, "issue" | "h
   linkedAt: number;
   closedAt: number | null;
   cancelCheckedAt: number | null;
+  groupingParent: boolean;
+  jobDispatchedAt: number | null;
+  jobId: number | null;
 }
 
 const initializedDatabases = new WeakSet<ReturnType<typeof getDb>>();
@@ -83,21 +86,33 @@ function database() {
   if (!columns.some((column) => column.name === "cancel_checked_at")) {
     db.exec("ALTER TABLE pull_request_link ADD COLUMN cancel_checked_at INTEGER");
   }
+  for (const [name, type] of [
+    ["grouping_parent", "INTEGER NOT NULL DEFAULT 0"],
+    ["job_dispatched_at", "INTEGER"],
+    ["job_id", "INTEGER"],
+  ]) {
+    if (!columns.some(column => column.name === name)) {
+      db.exec(`ALTER TABLE pull_request_link ADD COLUMN ${name} ${type}`);
+    }
+  }
   // Set the guard before backfilling: linkPullRequest calls database() too.
   initializedDatabases.add(db);
   backfillLinksFromJobRows();
   return db;
 }
 
-/** Import surviving job history without changing links already recorded. */
+/** Import surviving job history, enriching ownership without replacing existing links. */
 export function backfillLinksFromJobRows(): void {
   const db = database();
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dispatch_log'").get()) return;
 
   const mappings = getMappings();
-  const rows = db.prepare(`SELECT issue_id, issue_identifier, issue_title, team_key,
+  const jobColumns = db.prepare("PRAGMA table_info(dispatch_log)").all() as { name: string }[];
+  const groupingColumn = jobColumns.some(c => c.name === "grouping_parent") ? "grouping_parent" : "0 AS grouping_parent";
+  const rows = db.prepare(`SELECT id, dispatched_at, ${groupingColumn}, issue_id, issue_identifier, issue_title, team_key,
     pr_url, tracker_kind, issue_url FROM dispatch_log WHERE pr_url IS NOT NULL
     ORDER BY dispatched_at ASC, id ASC`).all() as Array<{
+      id: number; dispatched_at: number; grouping_parent: number;
       issue_id: string; issue_identifier: string | null; issue_title: string | null;
       team_key: string | null; pr_url: string; tracker_kind: TrackerKind | null; issue_url: string | null;
     }>;
@@ -108,8 +123,16 @@ export function backfillLinksFromJobRows(): void {
       if (!match || row.team_key === null || !Object.hasOwn(mappings, row.team_key)) continue;
       const repository = match[1]!;
       const number = Number(match[2]);
-      if (!Number.isSafeInteger(number) || findLinkByPr(repository, number)) continue;
-      linkPullRequest({
+      if (!Number.isSafeInteger(number)) continue;
+      const existing = findLinkByPr(repository, number);
+      if (existing) {
+        if (existing.issue.trackerIssueId === row.issue_id &&
+            existing.issue.trackerKind === (row.tracker_kind ?? mappings[row.team_key]!.ticketingConfig.kind)) {
+          recordLinkJob(existing, row.grouping_parent === 1, row.dispatched_at, row.id);
+        }
+        continue;
+      }
+      const link = linkPullRequest({
         repository, number, url: row.pr_url, role: "implementation", source: "backfill",
         issue: {
           trackerKind: row.tracker_kind ?? mappings[row.team_key]!.ticketingConfig.kind,
@@ -117,6 +140,7 @@ export function backfillLinksFromJobRows(): void {
           identifier: row.issue_identifier, title: row.issue_title, url: row.issue_url,
         },
       });
+      recordLinkJob(link, row.grouping_parent === 1, row.dispatched_at, row.id);
       written++;
     }
     return written;
@@ -127,7 +151,8 @@ export function backfillLinksFromJobRows(): void {
 const selectLinks = `SELECT p.id, p.repository, p.number, p.url,
   p.head_ref AS headRef, p.base_ref AS baseRef, p.issue_id AS issueId,
   p.role, p.outcome, p.source, p.linked_at AS linkedAt, p.closed_at AS closedAt,
-  p.cancel_checked_at AS cancelCheckedAt,
+  p.cancel_checked_at AS cancelCheckedAt, p.grouping_parent AS groupingParent,
+  p.job_dispatched_at AS jobDispatchedAt, p.job_id AS jobId,
   i.tracker_kind AS trackerKind, i.mapping_key AS mappingKey,
   i.tracker_issue_id AS trackerIssueId, i.identifier, i.title, i.url AS issueUrl,
   i.first_seen_at AS firstSeenAt, i.updated_at AS updatedAt
@@ -137,7 +162,7 @@ type LinkRow = Omit<PullRequestLink, "issue"> & Omit<TrackedIssue, "id" | "url">
 
 function toLink(row: LinkRow): PullRequestLink {
   const { trackerKind, mappingKey, trackerIssueId, identifier, title, issueUrl, firstSeenAt, updatedAt, ...link } = row;
-  return { ...link, issue: { id: link.issueId, trackerKind, mappingKey, trackerIssueId,
+  return { ...link, groupingParent: Boolean(link.groupingParent), issue: { id: link.issueId, trackerKind, mappingKey, trackerIssueId,
     identifier, title, url: issueUrl, firstSeenAt, updatedAt } };
 }
 
@@ -210,4 +235,24 @@ export function listUncheckedClosedLinks(): PullRequestLink[] {
 export function setCancelCheckedAt(repository: string, number: number, checkedAt: number): void {
   database().prepare("UPDATE pull_request_link SET cancel_checked_at = ? WHERE repository = ? AND number = ?")
     .run(checkedAt, repository, number);
+}
+
+/** Retain grouping ownership and the newest dispatch ordering independently of job retention. */
+export function recordLinkJob(link: PullRequestLink, groupingParent: boolean, dispatchedAt: number, jobId: number): void {
+  database().prepare(`UPDATE pull_request_link SET
+    grouping_parent = MAX(grouping_parent, ?),
+    job_dispatched_at = ?, job_id = ?
+    WHERE id = ? AND (job_dispatched_at IS NULL OR
+      job_dispatched_at < ? OR (job_dispatched_at = ? AND job_id <= ?))`)
+    .run(groupingParent ? 1 : 0, dispatchedAt, jobId, link.id, dispatchedAt, dispatchedAt, jobId);
+  // An older grouping run may be reported after a newer non-grouping gap-fill.
+  if (groupingParent) database().prepare("UPDATE pull_request_link SET grouping_parent = 1 WHERE id = ?").run(link.id);
+}
+
+export function isCurrentGroupingParent(link: PullRequestLink): boolean {
+  if (!link.groupingParent) return false;
+  const latest = database().prepare(`SELECT id FROM pull_request_link
+    WHERE issue_id = ? AND role = 'implementation' AND job_dispatched_at IS NOT NULL
+    ORDER BY job_dispatched_at DESC, job_id DESC LIMIT 1`).get(link.issueId) as { id: number } | undefined;
+  return latest?.id === link.id;
 }

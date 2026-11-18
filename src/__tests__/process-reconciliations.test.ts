@@ -10,7 +10,8 @@ beforeEach(async () => {
   ).modules);
 });
 describe("runReconciliations", () => {
-  it("calls markMerged and marks the row dispatched", async () => {
+  it("calls markMerged for a promoted tombstone and marks the row dispatched", async () => {
+    recon.recordReconciliationTombstone({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r" });
     recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "sha" });
     const markMerged = vi.fn(async () => {});
     const resolveProvider = vi.fn(async () => makeProvider({ markMerged }));
