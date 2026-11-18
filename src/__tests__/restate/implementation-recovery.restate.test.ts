@@ -8,7 +8,7 @@ import { callWorkflow, cancelInvocation, waitForStep, gate, type Gate, eventuall
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../../restate/implementation-run-production.js";
 
-const captured = vi.hoisted(() => ({ crash: false, crashed: false, deps: null as ImplementationRunDependencies | null, deadline: false, stopGate: undefined as Gate | undefined, wrapGate: undefined as Gate | undefined, wrapEffect: "", historical: false }));
+const captured = vi.hoisted(() => ({ crash: false, crashed: false, recovered: false, deps: null as ImplementationRunDependencies | null, deadline: false, stopGate: undefined as Gate | undefined, wrapGate: undefined as Gate | undefined, wrapEffect: "", historical: false }));
 vi.mock("../../restate/implementation-run-workflow.js", async (original) => {
   const actual = await original<typeof import("../../restate/implementation-run-workflow.js")>();
   return { ...actual, createImplementationRunWorkflow: (deps: ImplementationRunDependencies) => {
@@ -17,7 +17,11 @@ vi.mock("../../restate/implementation-run-workflow.js", async (original) => {
       // These values stand in for already-recorded historical effect outcomes. Their
       // production callbacks did not run and therefore wrote no new owner/target data.
       ...(captured.historical ? { reserve: async () => true, findExistingRun: async () => "historical-machine", launch: async () => ({ outcome: "accepted" as const, jobId: "historical-machine" }) } : {}),
-      ...(captured.crash ? { launch: async (...args: Parameters<ImplementationRunDependencies["launch"]>) => {
+      ...(captured.crash ? { findExistingRun: async (...args: Parameters<ImplementationRunDependencies["findExistingRun"]>) => {
+        const existing = await deps.findExistingRun(...args);
+        if (captured.crashed && existing !== null) captured.recovered = true;
+        return existing;
+      }, launch: async (...args: Parameters<ImplementationRunDependencies["launch"]>) => {
         const result = await deps.launch(...args);
         if (!captured.crashed) { captured.crashed = true; throw new Error("machine created before dispatch journal write"); }
         return result;
@@ -43,6 +47,7 @@ describe("implementation lost acceptance recovery", () => {
     ["alwaysReplay", "disableRetries"].flatMap(variant => [true, false].flatMap(protectedLaunch => [true, false].map(secrets => ({ backend: "fly-machines" as const, mode: "normal", protectedLaunch, secrets, variant }))))))("$backend $mode protected=$protectedLaunch secrets=$secrets $variant: adopts once and finalizes the exact retained owner", async ({ backend, mode, protectedLaunch, secrets, variant }) => {
     captured.crash = variant === "alwaysReplay" && protectedLaunch && secrets;
     captured.crashed = false;
+    captured.recovered = false;
     const historical = mode === "historical";
     captured.historical = historical;
     const cancelled = mode === "cancelled";
@@ -143,9 +148,9 @@ describe("implementation lost acceptance recovery", () => {
         args.input.markLaunchAttempted({ sessionImage: "runner:fly", machineSize: { cpuKind: "shared", cpus: 2, memoryMb: 1024 }, computeStartedAt: Date.now() });
         nonce = args.input.machineNonce; runToken = args.input.runToken;
         launches++; accepted = true; changeConfiguration();
-        // Let the workflow wrapper crash after production records a successful
-        // launch; the other cases still simulate a lost backend response.
-        if (captured.crash) return {
+        // The no-retry variant exercises a successful launch. Only retry-enabled
+        // cases inject failures, either here or after production records success.
+        if (captured.crash || variant === "disableRetries") return {
           machineId: "machine-1", sessionImage: "runner:fly", executionMode: "fly-machines",
           statusComment: null, computeStartedAt: Date.now(),
         };
@@ -178,8 +183,16 @@ describe("implementation lost acceptance recovery", () => {
       expect(finalize).not.toHaveBeenCalled();
       return;
     }
-    if (captured.crash) await eventually(async () => captured.crashed, Boolean, { label: "post-launch crash" });
+    if (captured.crash) {
+      await eventually(async () => captured.crashed, Boolean, { label: "post-launch crash" });
+      // A successful launch already wrote its row before the crash. Wait for the
+      // workflow's retry, rather than mistaking that row for evidence of adoption.
+      await eventually(async () => captured.recovered, Boolean, { label: "workflow adopts after post-launch crash" });
+    }
     await eventually(async () => log.getJobByDispatchId(run.dispatchId), (job) => Boolean(job), { label: "adopted row" });
+    if (!deadline && !cancelled && !wrap) {
+      await waitForStep(() => callWorkflow<{ step: string | null }>(env!.baseUrl(), "ImplementationRun", run.dispatchId, "status"), "wait");
+    }
     const row = log.getJobByDispatchId(run.dispatchId)!;
     expect(row.admissionGeneration).toBe(admission.read(run.dispatchId)!.generation);
     expect(row.executionMode).toBe(backend);
