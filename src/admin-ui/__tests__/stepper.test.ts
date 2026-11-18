@@ -790,3 +790,22 @@ describe("new-project stepper — Continue asks the save", () => {
     expect([m.shownStep(), m.error()]).toEqual([2, "Refused branchPrefix"]);
   });
 });
+
+describe("new-project stepper — Jira repository values", () => {
+  // Whoever administers the Jira field names its options, so a quote in one must stay inside its option.
+  const VALUE = 'acme/app"><option value="injected';
+
+  it("lists each option as one choice, its value and its text as Jira has them", async () => {
+    const { win, doc } = mountAdminPage({
+      html: stepperHtml,
+      script: stepperScript,
+      route: "projects",
+      api: async (url) => (url.startsWith("/api/jira/field-options") ? reply(200, [{ value: VALUE }]) : reply(200, {})),
+    });
+    const field = doc.getElementById("np-jira-repo-field") as HTMLSelectElement;
+    field.innerHTML = '<option value="customfield_1">Repo</option>';
+    await win.onStepperRepoFieldChange();
+    const options = Array.from((doc.getElementById("np-jira-repo-value") as HTMLSelectElement).options);
+    expect(options.map((o) => [o.value, o.textContent])).toEqual([["", "(select)"], [VALUE, VALUE]]);
+  });
+});

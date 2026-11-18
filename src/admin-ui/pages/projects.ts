@@ -1477,8 +1477,7 @@ export const projectsScript = `
       }
       let html = '<option value="">(select)</option>';
       for (const o of options) {
-        const v = window.esc(o.value);
-        html += '<option value="' + v + '">' + v + '</option>';
+        html += '<option value="' + window.escAttr(o.value) + '">' + window.esc(o.value) + '</option>';
       }
       select.innerHTML = html;
       select.classList.remove('hidden');
