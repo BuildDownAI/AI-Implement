@@ -267,13 +267,14 @@ describe("resolveDefaultRunnerImage source-branch channel", () => {
   it("a per-repo image.yml override beats the derived :next default", async () => {
     __clearRepoImageCacheForTests();
     const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_SOURCE_BRANCH: "testing" });
+    const github = imageYml(githubFile("image: ghcr.io/acme/my-runner:v3\n"));
     const image = await resolveRunnerImageForDispatch({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: r.image,
       runnerImageExplicit: r.explicit || r.channelDefault,
-      fetchImpl: mockFetch(200, contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n")),
+      fetchImpl: github.fetch,
     });
     expect(image).toBe("ghcr.io/acme/my-runner:v3");
   });

@@ -367,6 +367,7 @@ export function makeAppConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest",
     sessionImageStatus: "unused",
     runnerImageExplicit: false,
+    runnerImageChannelDefault: false,
     anthropicApiKey: null,
     claudeOAuthToken: null,
     githubWebhookSecret: null,
