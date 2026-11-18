@@ -173,3 +173,19 @@ export function runChildIssueContract(label: string, factory: () => Promise<{
     });
   });
 }
+
+/** Provider adapters verify the native writes and comments, including absence of terminal writes. */
+export function runPrClosedUnmergedContract(label: string, factory: (terminal: boolean) => Promise<{
+  provider: TicketingProvider; issueId: string; scopeKey: string;
+  verify: (terminal: boolean, comment: string) => Promise<void>;
+  restartSentence: string;
+}>): void {
+  describe(`TicketingProvider unmerged close: ${label}`, () => {
+    it.each([false, true])("handles terminal=%s", async (terminal) => {
+      const { provider, issueId, scopeKey, verify, restartSentence } = await factory(terminal);
+      const url = "https://github.com/acme/widgets/pull/42";
+      expect(await provider.markPrClosedUnmerged(issueId, scopeKey, url)).toBe(!terminal);
+      await verify(terminal, `The pull request ${url} was closed without a merge. AI-Implement cancelled this issue. ${restartSentence}`);
+    });
+  });
+}

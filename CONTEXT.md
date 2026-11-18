@@ -217,3 +217,9 @@ A self-deploy is the orchestrator moving itself to a newer build of its watched 
 The deploy hold is the flag that stops new work while a self-deploy drains. The self-deploy sets it at the start and clears it when the deploy ends, whether it succeeds, fails, or is cancelled.
 
 **Not to be confused with:** A KG hold, which pauses one KG refresh for an operator decision.
+
+## Pull request link
+
+The pull request link is the stored record that a pull request belongs to one issue. It holds the pull request's role (implementation or roll-up) and its outcome (open, merged, or closed without a merge). The orchestrator writes it when the pull request opens, and never prunes it.
+
+**Not to be confused with:** The run record, which is the row for one dispatched run. Run records are pruned; a pull request link is not.

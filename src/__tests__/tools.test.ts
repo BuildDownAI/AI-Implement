@@ -2227,7 +2227,7 @@ describe("list_open_pulls (AII-1964)", () => {
   it.each([false, true])("returns a top-level array (populated: %s) inside the named step", async (populated) => {
     const reader = vi.spyOn(github, "listAllOpenPullRequests").mockResolvedValue(populated ? [{
       number: 42, url: "https://github.com/acme/app/pull/42", head: "work",
-      base: "main", headSha: "sha", draft: false, title: "Title", createdAt: 123,
+      base: "main", headSha: "sha", author: null, draft: false, title: "Title", createdAt: 123,
     }] : []);
     let insideStep = false;
     const read = api.listOpenPulls;

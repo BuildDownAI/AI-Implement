@@ -58,7 +58,7 @@ export function initReconciliationTable(): void {
 
 /**
  * Enqueues a pending reconciliation for a merged PR. Idempotent per
- * (repo, pr_number): if a row already exists (any status), no new row is
+ * (repo, pr_number): skipped rows are promoted to pending; otherwise no new row is
  * inserted and the existing row's id is returned. This closes the race between
  * the two producers (webhook handler and merge poller) whose check→enqueue
  * pairs can interleave across the poller's awaits.
@@ -70,9 +70,14 @@ export function enqueueReconciliation(entry: {
   repo: string;
   mergeCommitSha: string;
 }): number {
-  const result = getDb()
+  getDb()
     .prepare(
-      "INSERT OR IGNORE INTO reconciliation_queue (issue_id, issue_identifier, pr_number, repo, merge_commit_sha, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+      `INSERT INTO reconciliation_queue
+        (issue_id, issue_identifier, pr_number, repo, merge_commit_sha, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        ON CONFLICT (repo, pr_number) DO UPDATE SET
+          status = 'pending', merge_commit_sha = excluded.merge_commit_sha, attempts = 0
+        WHERE reconciliation_queue.status = 'skipped'`,
     )
     .run(
       entry.issueId,
@@ -82,14 +87,14 @@ export function enqueueReconciliation(entry: {
       entry.mergeCommitSha,
       Date.now(),
     );
-  if (result.changes === 0) return existingRowId(entry.repo, entry.prNumber);
-  return Number(result.lastInsertRowid);
+  return existingRowId(entry.repo, entry.prNumber);
 }
 
-export function hasReconciliationForPr(repo: string, prNumber: number): boolean {
+/** Merge producers may exclude skipped close tombstones so confirmed merges can promote them. */
+export function hasReconciliationForPr(repo: string, prNumber: number, includeSkipped = true): boolean {
   const row = getDb()
-    .prepare("SELECT 1 FROM reconciliation_queue WHERE repo = ? AND pr_number = ? LIMIT 1")
-    .get(repo, prNumber);
+    .prepare("SELECT 1 FROM reconciliation_queue WHERE repo = ? AND pr_number = ? AND (? OR status != 'skipped') LIMIT 1")
+    .get(repo, prNumber, includeSkipped ? 1 : 0);
   return row !== undefined;
 }
 

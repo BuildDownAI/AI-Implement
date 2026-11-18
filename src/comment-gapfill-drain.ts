@@ -17,6 +17,7 @@ import {
 } from "./dispatch-admission.js";
 import { MAX_COMMENT_GAPFILL_REFUSALS, getCommentGapfillItem, recordCommentGapfillRefusal, claimPendingCommentGapfills, markCommentGapfillSubmitted, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, type Job } from "./log.js";
+import { findLinkByPr } from "./pr-links.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
 import { trackerAccounting as defaultTrackerAccounting, type TrackerAccounting } from "./job-accounting.js";
@@ -353,7 +354,18 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
-      let prLog = getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
+      let prLog: Pick<Job, "issueId" | "issueIdentifier" | "teamKey"> | null =
+        getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
+      if (!prLog) {
+        // Link identity survives job pruning; all mapping and admission checks below
+        // still apply, including the live GitHub terminal-state check above.
+        const link = findLinkByPr(fullRepo, item.prNumber);
+        if (link) prLog = {
+          issueId: link.issue.trackerIssueId,
+          issueIdentifier: link.issue.identifier,
+          teamKey: link.issue.mappingKey,
+        };
+      }
       if (!prLog) {
         if (!pr) {
           await opts.postComment(

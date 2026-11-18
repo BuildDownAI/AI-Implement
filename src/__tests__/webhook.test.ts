@@ -126,6 +126,7 @@ const loaders = {
   dedup: () => import("../dedup.js"),
   log: () => import("../log.js"),
   reconciliation: () => import("../reconciliation.js"),
+  links: () => import("../pr-links.js"),
   webhook: () => import("../webhook.js"),
   reviewStore: () => import("../review-ledger-store.js"),
   reviewFixQueue: () => import("../review-fix-queue.js"),
@@ -135,6 +136,7 @@ const loaders = {
 let webhook: typeof WebhookModule;
 let log: typeof LogModule;
 let reconciliation: typeof ReconciliationModule;
+let links: typeof import("../pr-links.js");
 let dedup: typeof DedupModule;
 let reviewStore: typeof ReviewLedgerStoreModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
@@ -143,7 +145,7 @@ let commentGapfillQueue: typeof CommentGapfillQueueModule;
 let unrouted: FakeFetch;
 
 beforeEach(async () => {
-  ({ dedup, log, reconciliation, webhook, reviewStore, reviewFixQueue, commentGapfillQueue } =
+  ({ dedup, log, reconciliation, links, webhook, reviewStore, reviewFixQueue, commentGapfillQueue } =
     (await testDb({ modules: loaders })).modules);
 
   // Reset hoisted mocks to safe defaults for each test
@@ -299,15 +301,15 @@ describe("workflow_run delivery", () => {
 // ---------- Non-AI PR matching ----------
 
 describe("non-AI PR matching", () => {
-  it("ignores a merged PR with no matching dispatch log entry", async () => {
-    // No dispatch log entries — nothing to match against
+  it("ignores a merged PR with no link even with a matching dispatch", async () => {
+    appendDispatch({ issueId: "issue-99", issueIdentifier: "AII-99", repo: "org/repo" });
     const { req, res } = makeRequest(SECRET, "pull_request", {
       action: "closed",
       pull_request: {
         number: 99,
         merged: true,
         html_url: "https://github.com/org/repo/pull/99",
-        head: { ref: "feature/random-branch" },
+        head: { ref: "AII-99/implement" },
         merge_commit_sha: "abc123",
       },
       repository: { full_name: "org/repo" },
@@ -317,7 +319,8 @@ describe("non-AI PR matching", () => {
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
     expect(body.ignored).toBe(true);
-    expect(body.reason).toMatch(/no matching dispatch/);
+    expect(body.reason).toBe("no pull request link");
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(0);
   });
 
   it("ignores a merged PR from a different repo", async () => {
@@ -816,121 +819,92 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 // ---------- Reconciliation enqueue ----------
 
 describe("reconciliation enqueue", () => {
-  it("enqueues a reconciliation job when branch matches issue identifier prefix", async () => {
-    appendDispatch({ issueId: "issue-1", issueIdentifier: "AII-27", repo: "org/repo" });
+  function link(role: "implementation" | "roll-up" = "implementation", identifier: string | null = "AII-27") {
+    return links.linkPullRequest({
+      repository: "org/repo", number: 42, url: "https://github.com/org/repo/pull/42",
+      role, source: "backfill",
+      issue: { trackerKind: "linear", mappingKey: "AII", trackerIssueId: "tracker-issue-27",
+        identifier, title: null, url: null },
+    });
+  }
 
+  async function deliver() {
     const { req, res } = makeRequest(SECRET, "pull_request", {
       action: "closed",
-      pull_request: {
-        number: 42,
-        merged: true,
-        html_url: "https://github.com/org/repo/pull/42",
-        head: { ref: "AII-27/implement-webhook" },
-        merge_commit_sha: "sha-abc123",
-      },
+      pull_request: { number: 42, merged: true, html_url: "https://github.com/org/repo/pull/42",
+        head: { ref: "unrelated-branch" }, merge_commit_sha: "sha-abc123" },
       repository: { full_name: "org/repo" },
     });
     webhook.handleGitHubWebhook(req as never, res as never, SECRET);
     await res.done;
-
     expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.queued).toBe(true);
-    expect(body.reconciliationId).toBeGreaterThan(0);
+    return JSON.parse(res.body);
+  }
 
-    const pending = reconciliation.getPendingReconciliations();
-    expect(pending).toHaveLength(1);
-    expect(pending[0].issueId).toBe("issue-1");
-    expect(pending[0].issueIdentifier).toBe("AII-27");
-    expect(pending[0].prNumber).toBe(42);
-    expect(pending[0].repo).toBe("org/repo");
-    expect(pending[0].mergeCommitSha).toBe("sha-abc123");
-    expect(pending[0].status).toBe("pending");
-  });
-
-  it("enqueues when matching by stored PR URL", async () => {
-    const jobId = appendDispatch({ issueId: "issue-2", issueIdentifier: "AII-10", repo: "org/repo" });
-    // Simulate a stored pr_url on the job
-    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/7");
-
-    const { req, res } = makeRequest(SECRET, "pull_request", {
-      action: "closed",
-      pull_request: {
-        number: 7,
-        merged: true,
-        html_url: "https://github.com/org/repo/pull/7",
-        head: { ref: "some-unrelated-branch-name" },
-        merge_commit_sha: "sha-xyz789",
-      },
-      repository: { full_name: "org/repo" },
-    });
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
-    await res.done;
-
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).queued).toBe(true);
-
-    const pending = reconciliation.getPendingReconciliations();
-    expect(pending[0].issueId).toBe("issue-2");
-    expect(pending[0].prNumber).toBe(7);
-  });
-
-  it("branch prefix match is case-insensitive", async () => {
-    appendDispatch({ issueId: "issue-3", issueIdentifier: "AII-99", repo: "org/repo" });
-
-    const { req, res } = makeRequest(SECRET, "pull_request", {
-      action: "closed",
-      pull_request: {
-        number: 55,
-        merged: true,
-        html_url: "https://github.com/org/repo/pull/55",
-        head: { ref: "aii-99/my-fix" }, // lowercase identifier
-        merge_commit_sha: "sha-case",
-      },
-      repository: { full_name: "org/repo" },
-    });
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
-    await res.done;
-
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).queued).toBe(true);
-  });
-
-  it("does not enqueue a second reconciliation row on a redelivered merged-PR webhook", async () => {
-    appendDispatch({ issueId: "issue-4", issueIdentifier: "AII-77", repo: "org/repo" });
-
-    const payload = {
-      action: "closed",
-      pull_request: {
-        number: 77,
-        merged: true,
-        html_url: "https://github.com/org/repo/pull/77",
-        head: { ref: "AII-77/add-feature" },
-        merge_commit_sha: "sha-dedup",
-      },
-      repository: { full_name: "org/repo" },
-    };
-
-    const redelivery = { "x-github-delivery": "delivery-77" };
-
-    // First delivery — should enqueue
-    const { req: req1, res: res1 } = makeRequest(SECRET, "pull_request", payload, undefined, redelivery);
-    webhook.handleGitHubWebhook(req1 as never, res1 as never, SECRET);
-    await res1.done;
-    expect(res1.statusCode).toBe(200);
-    expect(JSON.parse(res1.body).queued).toBe(true);
+  it.each(["AII-27", null])("queues the linked issue without a dispatch row (identifier %s)", async (identifier) => {
+    link("implementation", identifier);
+    expect((await deliver()).queued).toBe(true);
+    expect(reconciliation.getPendingReconciliations()).toEqual([expect.objectContaining({
+      issueId: "tracker-issue-27", issueIdentifier: identifier, repo: "org/repo", prNumber: 42,
+      mergeCommitSha: "sha-abc123", status: "pending",
+    })]);
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
+    expect(await deliver()).toEqual({ ignored: true, reason: "already queued" });
     expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
+  });
 
-    // Second delivery (redelivery) — should be ignored, no new row
-    const { req: req2, res: res2 } = makeRequest(SECRET, "pull_request", payload, undefined, redelivery);
-    webhook.handleGitHubWebhook(req2 as never, res2 as never, SECRET);
-    await res2.done;
-    expect(res2.statusCode).toBe(200);
-    const body2 = JSON.parse(res2.body);
-    expect(body2.ignored).toBe(true);
-    expect(body2.reason).toBe("already queued");
-    // Queue must still have exactly one row
+  it("promotes a close tombstone after reopening and merging, with repeated deliveries deduplicated", async () => {
+    link();
+    const poll = await import("../poll-merged-prs.js");
+    await poll.detectMergedPrs({
+      getPullRequestState: async () => ({ merged: false, state: "closed" }),
+      tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
+      finalizeGroupingParent: async () => true,
+      mappingForRepo: () => makeMapping({ owner: "org", repo: "repo" }),
+    });
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(0);
+    const before = dedup.getDb().prepare("SELECT id FROM reconciliation_queue").get();
+    links.setLinkOutcome("org/repo", 42, "open", null);
+    expect((await deliver()).queued).toBe(true);
+    expect(await deliver()).toEqual({ ignored: true, reason: "already queued" });
+    expect(links.findLinkByPr("org/repo", 42)?.outcome).toBe("merged");
+    expect(reconciliation.getPendingReconciliations()).toEqual([expect.objectContaining({
+      status: "pending", mergeCommitSha: "sha-abc123",
+    })]);
+    expect(dedup.getDb().prepare("SELECT id FROM reconciliation_queue").all()).toEqual([before]);
+  });
+
+  it("queues the job's issue when its PR URL was written by updateJobPrUrl", async () => {
+    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
+    const jobId = appendDispatch({
+      issueId: "tracker-issue-27", issueIdentifier: "AII-27", repo: "org/repo",
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/42");
+
+    expect((await deliver()).queued).toBe(true);
+    expect(reconciliation.getPendingReconciliations()).toEqual([expect.objectContaining({
+      issueId: "tracker-issue-27", issueIdentifier: "AII-27", repo: "org/repo", prNumber: 42,
+      mergeCommitSha: "sha-abc123", status: "pending",
+    })]);
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
+  });
+
+  it("records the merge even when reconciliation was already queued", async () => {
+    link();
+    reconciliation.enqueueReconciliation({ issueId: "tracker-issue-27", issueIdentifier: "AII-27",
+      repo: "org/repo", prNumber: 42, mergeCommitSha: "sha-abc123" });
+    expect(links.findLinkByPr("org/repo", 42)?.outcome).toBe("open");
+    expect(await deliver()).toEqual({ ignored: true, reason: "already queued" });
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
     expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
+  });
+
+  it("records a roll-up merge without queueing reconciliation", async () => {
+    link("roll-up");
+    expect(await deliver()).toEqual({ ignored: true });
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(0);
   });
 });
 

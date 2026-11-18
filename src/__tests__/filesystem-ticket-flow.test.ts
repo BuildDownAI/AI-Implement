@@ -98,7 +98,7 @@ function filesystemMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
 
 
 describe("filesystem tickets through the local PR loop", () => {
-  it("reconciles a merged filesystem PR using its recorded project when two projects share a repo", async () => {
+  it("reconciles a merged filesystem PR using its linked project without a dispatch when two projects share a repo", async () => {
     writeTicket("FS-303");
     const mapping = filesystemMapping({ paused: true });
     const other = filesystemMapping({ ticketingProvider: "linear", ticketingConfig: { kind: "linear" } });
@@ -108,9 +108,14 @@ describe("filesystem tickets through the local PR loop", () => {
     const provider = await registry.forMapping(mapping);
     const issue = (await provider.findByKey("FS-303"))!;
     await provider.markPrReady(issue.id, "FS", "https://github.com/BuildDownAI/AI-Implement/pull/303");
-    const job = log.appendLog({ issueId: issue.id, issueIdentifier: issue.identifier,
-      teamKey: "FS", repo: "BuildDownAI/AI-Implement", phase: "implementation" });
-    log.updateJobPrUrl(job, "https://github.com/BuildDownAI/AI-Implement/pull/303");
+    const { linkPullRequest } = await import("../pr-links.js");
+    linkPullRequest({
+      repository: "BuildDownAI/AI-Implement", number: 303,
+      url: "https://github.com/BuildDownAI/AI-Implement/pull/303",
+      role: "implementation", source: "backfill",
+      issue: { trackerKind: "filesystem", mappingKey: "FS", trackerIssueId: issue.id,
+        identifier: issue.identifier, title: issue.title, url: null },
+    });
     const recon = await import("../reconciliation.js");
     const { runReconciliations, resolvePrMapping } = await import("../reconcile-merged.js");
     recon.initReconciliationTable();

@@ -136,6 +136,14 @@ export class FakeProvider implements TicketingProvider {
     this.transition(issueId, "cleared");
     return true;
   }
+  async markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    await this.tick("markPrClosedUnmerged", [issueId, scopeKey, prUrl]);
+    if (this.issues.get(issueId)?.lifecycle !== "active") return false;
+    this.transition(issueId, "cleared");
+    this.setLifecycle(issueId, "cancelled");
+    this.appendComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the task status to its pickup value.`);
+    return true;
+  }
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
     await this.tick("markMerged", [issueId, scopeKey]);
     this.transition(issueId, "cleared");

@@ -25,12 +25,22 @@ describe("reconciliation pr-dedup", () => {
     expect(second).toBe(first);
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
-  it("enqueueReconciliation after a tombstone does not resurrect the PR", () => {
+  it("enqueueReconciliation promotes a tombstone when a merge is confirmed", () => {
     const tombstoneId = recon.recordReconciliationTombstone({ issueId: "i3", issueIdentifier: "ENG-3", prNumber: 7, repo: "o/r" });
     const enqueueId = recon.enqueueReconciliation({ issueId: "i3", issueIdentifier: "ENG-3", prNumber: 7, repo: "o/r", mergeCommitSha: "sha" });
     expect(enqueueId).toBe(tombstoneId);
-    expect(recon.getPendingReconciliations()).toHaveLength(0);
+    expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
+  it.each(["dispatched", "failed"] as const)("does not promote a %s merge", (status) => {
+    const entry = { issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "sha" };
+    const id = recon.enqueueReconciliation(entry);
+    recon.updateReconciliationStatus(id, status);
+    expect(recon.enqueueReconciliation({ ...entry, mergeCommitSha: "later" })).toBe(id);
+    expect(recon.getPendingReconciliations()).toHaveLength(0);
+    expect(dedup.getDb().prepare("SELECT status, merge_commit_sha FROM reconciliation_queue").all())
+      .toEqual([{ status, merge_commit_sha: "sha" }]);
+  });
+
   it("initReconciliationTable dedupes pre-index duplicate rows before creating the unique index", () => {
     const db = dedup.getDb();
     db.exec("DROP INDEX IF EXISTS reconciliation_queue_repo_pr");

@@ -541,6 +541,36 @@ async function checkNoSubmit(opts: DrainInput, id: number, status: string): Prom
 }
 
 describe("ImplementationRun gap-fill ingress", () => {
+  it.each(["admitted", "paused", "in-flight", "wrong-mapping", "closed"] as const)(
+    "recovers a pruned PR from its durable link while preserving %s safeguards", async (scenario) => {
+      const { linkPullRequest } = await import("../pr-links.js");
+      const { getDb } = await import("../dedup.js");
+      const jobId = seedOrigin();
+      linkPullRequest({ repository: "acme/billing", number: 42,
+        url: "https://github.com/acme/billing/pull/42", role: "implementation", source: "result",
+        issue: { trackerKind: "linear", mappingKey: scenario === "wrong-mapping" ? "OTHER" : "AII",
+          trackerIssueId: "issue-1", identifier: "AII-1554", title: "Caller switch", url: null } });
+      getDb().prepare("DELETE FROM dispatch_log WHERE id = ?").run(jobId);
+      expect(log.getLatestDispatchForPr("acme", "billing", 42)).toBeNull();
+      if (scenario === "in-flight") log.appendLog(makeAppendLogEntry({
+        issueId: "issue-1", teamKey: "AII", repo: "acme/billing", status: "running",
+      }));
+      if (scenario === "closed") prLookup(42, { json: { merged: false, state: "closed" } });
+      const opts = optsFor(makeMapping({ owner: "acme", repo: "billing", paused: scenario === "paused" }));
+      const id = seedItem();
+      await drain.drainCommentGapfillQueue(opts);
+      if (scenario === "admitted") {
+        expect(submit).toHaveBeenCalledExactlyOnceWith(expect.any(String), expect.objectContaining({
+          teamKey: "AII", issueId: "issue-1", issueIdentifier: "AII-1554",
+        }));
+      } else {
+        expect(submit).not.toHaveBeenCalled();
+        expect(queue.getCommentGapfillItem(id)?.status).toBe(
+          scenario === "in-flight" ? "pending" : scenario === "wrong-mapping" ? "failed" : "skipped");
+      }
+      expect(opts.postComment).not.toHaveBeenCalled();
+    },
+  );
   for (const lifecycle of [null, "legacy", "restate"] as const) {
     it.each([
       ["default", "github-actions", "github-actions"],

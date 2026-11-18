@@ -111,6 +111,8 @@ children`). Only once **all** its labelled children reach a terminal state does 
 work dispatch — onto its own feature branch. "Terminal" means completed or cancelled, and for Linear also Duplicate
 (state type `duplicate`), so these closed children do not block the parent forever.
 
+A child whose implementation PR closes without a merge is cancelled by the orchestrator once it has no other open PR and no run in flight (subject to the [grouping-parent exemptions](pull-request-links.md#cancellation-after-an-unmerged-close)). The cancelled child is terminal, so the parent's closing run can then start without that child's work.
+
 On both Linear and Jira, unlabelled children must also be terminal (Done or Cancelled, and also Duplicate for Linear) before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
 
 The internal gap-analysis and in-loop review grade a grouping parent's closing-work PR
@@ -347,15 +349,26 @@ For an automated roll-up review (commenter `ai-implement-rollup-review`, `ROLLUP
 > With the callback disabled, planning stalls at `AI-Planning` and the cascade can't advance
 > on its own.
 
+The merge poll checks stored open pull request links, so dispatch-log pruning does not
+prevent reconciliation. Merged implementation links queue completion; unmerged closes
+record a tombstone. Both persist the terminal outcome on the link. Roll-up links only
+record the outcome here because `merge-up` owns their reconciliation. Unreadable PRs and
+repositories without a mapping remain open for retry.
+
 ### A parent's own PR closed without merging (AII-1294)
 
 A feature-node parent never blocks its own roll-up. When the PR from the parent's own run
-(any dispatch row for that PR with `grouping_parent` set, even if a newer gap-fill row says
-otherwise) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
-parent, then writes the tombstone. It skips this while a run for the issue is in flight
+(identified for finalization by `isCurrentGroupingParent`: durable
+`pull_request_link.grouping_parent` ownership and the current PR of the issue's newest job,
+using `job_dispatched_at`/`job_id` ordering with `job_current` selecting a job's replacement PR) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
+parent, then writes the tombstone. Ownership survives dispatch-history pruning and
+a later gap-fill report does not clear it (`recordLinkJob` never clears the flag).
+Cancellation exempts every link with `groupingParent` set, current or superseded;
+only finalization requires current-PR identity. The poll skips finalization while a run for the issue is in flight
 (nothing is written; the next poll re-checks) and when the closed PR is not the issue's latest
 PR (tombstone only). If `markMerged` throws or no mapping resolves, no tombstone is written
-and the next poll retries. The poll does not check children; the roll-up gates above do that
+and the link stays open for the next poll to retry. Existing queue rows only repair the
+link outcome without repeating finalization. The poll does not check children; the roll-up gates above do that
 live, so a Done parent with a non-terminal designated child still gets no roll-up. A closed
 parent PR does not veto the tree; to stop a tree, cancel the parent issue.
 
