@@ -279,7 +279,7 @@ Secrets set through the admin UI Secrets panel are stored as classic Fly app sec
 
 Names are read from the Fly Machines API (`GET /v1/apps/{app}/secrets`), the same store Fly uses when starting a machine. The reply is an object that holds the list (`{ "secrets": [{ name, digest, created_at, updated_at }] }`), not a bare list; `listAppSecrets` reads `.secrets` and rejects any other shape. Admin set and delete operations use that API too. Admin writes deliberately ignore secrets versions and leave version pinning off; protected-run bootstrap still manages its own version.
 
-Before merging this change, compare `fly secrets list -a <sessions app>` with the historical GraphQL list on **each sessions app**. REST-only global names become visible to launch and pass to every machine in process-level mode. On `ai-implement-testing-sessions` on 2026-11-13, the only REST-only name was the protection key, which ordinary launch skips. The global admin list hides that key and rejects attempts to overwrite or delete it.
+Before you upgrade a deployment that reads Fly secrets through GraphQL, follow [Fly secrets migration](fly-secrets-migration.md).
 
 If Fly removes a machine before it starts, inspect `fly machine status <id> -a <sessions app>`. A missing requested secret produces a `launch` event followed by `destroy` from source `flyd`, with no `start` event. Check the requested names against `fly secrets list -a <sessions app>`. Remove a stale name with `fly secrets unset <name> -a <sessions app>` (or the corresponding admin delete route), then retry the run. Deleting an absent name succeeds; an unknown app can still return HTTP 404. Secret values stay on the admin API and never pass through a Restate journal.
 

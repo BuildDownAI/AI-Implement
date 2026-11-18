@@ -1,3 +1,4 @@
+import { linkPullRequest, recordLinkJob, type LinkSource, type TrackerKind } from "./pr-links.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import type { InvocationUsageRow } from "./agent-usage.js";
 import { getDb } from "./dedup.js";
@@ -657,6 +658,7 @@ export function updateJobStatus(
       isTerminal ? 1 : 0,
       jobId,
     );
+  if (prUrl) linkJobPullRequest(jobId, prUrl);
 }
 
 /**
@@ -712,6 +714,7 @@ export function stampJobApproved(jobId: number, prUrl: string): void {
        WHERE id = ?`,
     )
     .run(prUrl, Date.now(), jobId);
+  if (prUrl) linkJobPullRequest(jobId, prUrl);
 }
 
 /** Stores the head a Restate-lifecycle gap-fill pushed, for the late-review sweep to re-submit (AII-1596). */
@@ -894,10 +897,43 @@ export function getJobByDispatchId(dispatchId: string): Job | null {
   return mapRows([row])[0];
 }
 
+/** Best-effort link write shared by result setters and authenticated step reports. */
+export function linkJobPullRequest(jobId: number, url: string, source: LinkSource = "result"): void {
+  const match = /^https:\/\/github\.com\/([^/?#]+)\/([^/?#]+)\/pull\/([1-9]\d*)$/.exec(url);
+  if (!match) return;
+  try {
+    const job = getDb().prepare(`SELECT issue_id, issue_identifier, issue_title, issue_url,
+      team_key, tracker_kind, grouping_parent, dispatched_at FROM dispatch_log WHERE id = ?`).get(jobId) as {
+      issue_id: string; issue_identifier: string | null; issue_title: string | null;
+      issue_url: string | null; team_key: string | null; tracker_kind: TrackerKind | null;
+      grouping_parent: number; dispatched_at: number;
+    } | undefined;
+    if (!job?.team_key) return;
+    const mapping = getMappings()[job.team_key];
+    if (!mapping) return;
+    const link = linkPullRequest({
+      repository: `${match[1]}/${match[2]}`, number: Number(match[3]), url,
+      source, role: "implementation",
+      issue: {
+        trackerKind: job.tracker_kind ?? mapping.ticketingConfig.kind,
+        mappingKey: job.team_key, trackerIssueId: job.issue_id,
+        identifier: job.issue_identifier, title: job.issue_title, url: job.issue_url,
+      },
+    });
+    if (link.issue.trackerIssueId === job.issue_id &&
+        link.issue.trackerKind === (job.tracker_kind ?? mapping.ticketingConfig.kind)) {
+      recordLinkJob(link, job.grouping_parent === 1, job.dispatched_at, jobId);
+    }
+  } catch (err) {
+    console.error(`[log] Failed to link pull request for job ${jobId}:`, err);
+  }
+}
+
 export function updateJobPrUrl(jobId: number, prUrl: string): void {
   getDb()
     .prepare("UPDATE dispatch_log SET pr_url = ? WHERE id = ?")
     .run(prUrl, jobId);
+  if (prUrl) linkJobPullRequest(jobId, prUrl);
 }
 
 /**

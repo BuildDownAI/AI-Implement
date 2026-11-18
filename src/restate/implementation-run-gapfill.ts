@@ -6,12 +6,12 @@ import type { ImplementationRunDependencies, ImplementationRunInput } from "./im
 import { getMappings, type RepoMapping } from "../config.js";
 import { acquire, read } from "../dispatch-admission.js";
 import { isParked } from "../dispatch-breaker.js";
-import { confirmCommentGapfillLaunch, getCommentGapfillLaunch, stageCommentGapfillLaunch, rejectCommentGapfillLaunch, CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
-import { rollupReviewMode, buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
+import { getCommentGapfillRefusal, recordCommentGapfillRefusal, confirmCommentGapfillLaunch, getCommentGapfillLaunch, stageCommentGapfillLaunch, rejectCommentGapfillLaunch, CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
+import { notifyCommentGapfillSkipped, firePrBudgetPark, rollupReviewMode, buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, updateJobStatus, suppressStaleNotifications, setJobMachineId } from "../log.js";
 import { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
-import { defaultFetchSignal, dispatchWorkflow } from "../github.js";
+import { postPrComment, listPrComments, defaultFetchSignal, dispatchWorkflow } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill, dispatchFlyGapfill } from "../gapfill-launch.js";
@@ -94,17 +94,28 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     reserve: async (run) => {
       const gap = run.gapFill!;
       const mapping = mappingFor(run);
-      const result = acquire({ dispatchId: run.dispatchId, mappingKey: run.teamKey,
+      const refused = getCommentGapfillRefusal(gap.queueItemId, run.dispatchId);
+      const result = refused ? { ok: false as const, reason: refused } : acquire({ dispatchId: run.dispatchId, mappingKey: run.teamKey,
         scope: { kind: "pr", issueId: run.issueId, installationId: gap.installationId, repository: gap.repository, prNumber: gap.prNumber },
         kind: "gap-fill", backend: run.backend, lifecycleOwner: { kind: "restate", attemptId: run.dispatchId },
         cap: mapping.maxInProgressAiIssues, prDispatchBudget: gap.prDispatchBudget, humanRequested: gap.humanRequested, parked: isParked(run.issueId, "gap-analysis") });
-      if (!result.ok) markCommentGapfillProcessed(gap.queueItemId, "pending");
+      if (!result.ok) {
+        recordCommentGapfillRefusal(gap.queueItemId, result.reason, run.dispatchId);
+        await notifyCommentGapfillSkipped({ getInstallationToken: token, postComment: postPrComment,
+          listPrComments: (t, o, r, n) => listPrComments(t, o, r, n, { strict: true }) }, gap.queueItemId);
+        if (result.reason === "budget_exhausted") {
+          const [owner, repo] = gap.repository.split("/") as [string, string];
+          await firePrBudgetPark({ getInstallationToken: token, postComment: postPrComment,
+            listPrComments: (t, o, r, n) => listPrComments(t, o, r, n, { strict: true }),
+            postTrackerComment: async (m, id, body) => { await (await input.resolveProvider(m)).postComment(id, body); } }, mapping, run.issueId, owner, repo, gap.prNumber, gap.prDispatchBudget!);
+        }
+      }
       if (result.ok) {
         requireImplementationRunOwner(run, "reserved");
         onReserved?.(run, mapping);
       }
       if (result.ok && input.afterReserve) await input.afterReserve(run);
-      return result.ok;
+      return result.ok ? true : { ok: false, reason: result.reason };
     },
     findExistingRun: async (run, dispatchedAt) => {
       if (getCommentGapfillLaunch(run.dispatchId)?.rejected) return null;
@@ -206,7 +217,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         const target = initialTarget(run);
         mapping = target.mapping;
         const { item } = target;
-        reviewOnly = rollupReviewMode(item.commenter, mapping);
+        reviewOnly = rollupReviewMode(item.commenter, mapping, item.instruction);
         // Only the image paired with this orchestrator is known to honor reviewOnly.
         // Local Docker builds its runner alongside the orchestrator.
         if (reviewOnly && run.backend !== "local-docker") {

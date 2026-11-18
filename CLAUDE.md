@@ -91,6 +91,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Subsystem | Start at | Reference |
 |---|---|---|
 | Pipeline, steps, custom overrides | `src/pipeline/` | [docs/pipeline-architecture.md](docs/pipeline-architecture.md) |
+| Stored issue and pull request links | `src/pr-links.ts` | [docs/pull-request-links.md](docs/pull-request-links.md) |
 | Spotter PR and issue status read tools | `src/open-pulls.ts`, `src/issue-statuses.ts` | [docs/spotter-status-tools.md](docs/spotter-status-tools.md) |
 | Review findings → fix dispatches | `src/review-fix-queue.ts` | [docs/review-fix-rail.md](docs/review-fix-rail.md) |
 | Restate review-fix pilot setup, recovery, drain, rollback | `src/restate/review-fix-attempt.ts`, `src/restate/review-fix-pr.ts` | [docs/restate-review-fix-pilot.md](docs/restate-review-fix-pilot.md) |
@@ -205,7 +206,7 @@ Fixing a bug: write the failing test first, then the fix, in one pull request �
 
 ## Data layer
 
-One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 58 tables (including tables initialized on first use). `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 61 tables (including tables initialized on first use). `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
 
 Schema changes run at boot and a trigger can block a column change — read [docs/sqlite-schema.md](docs/sqlite-schema.md) before changing a table or column.
 
@@ -335,7 +336,7 @@ A child PR is auto-merged only when the project's Auto-merge setting is on and t
 
 ## Issue completion on PR merge
 
-Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll detector** that needs no configuration and catches everything within a tick, and a **webhook** that merely reduces latency. Completion runs even for paused projects. Jira target repos need a `Merged` option on their AI-Implement status field.
+Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll detector** that needs no configuration and catches everything within a tick, and a **webhook** that merely reduces latency. Both paths read the stored pull request link, independently of job-history retention. A close without a merge cancels an eligible implementation issue with a comment; roll-ups and grouping-parent finalization have separate handling, and cancellation waits for in-flight runs and requires no other open PR. Completion runs even for paused projects. Jira target repos need a `Merged` option on their AI-Implement status field.
 
 ## Admin UI and auth
 

@@ -1053,6 +1053,14 @@ export class JiraProvider implements TicketingProvider {
       phase === "planning" ? STATUS_VALUES.PLANNING_FAILED : STATUS_VALUES.IMPLEMENTATION_FAILED,
     );
   }
+  async markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    const ids = await this.fields(scopeKey);
+    const raw = await this.client.getIssue(issueId, [ids.statusFieldId, "status"]);
+    if (readStatusValue(raw.fields, ids.statusFieldId) === STATUS_VALUES.MERGED || isTerminalStatus(raw.fields)) return false;
+    await this.client.setField(issueId, ids.statusFieldId, { value: STATUS_VALUES.IMPLEMENTATION_FAILED });
+    await this.postComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the AI-Implement status to its pickup value.`);
+    return true;
+  }
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.MERGED);
   }

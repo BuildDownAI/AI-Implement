@@ -1415,6 +1415,7 @@ export async function listOpenPullRequests(
 }
 
 export interface OpenPullRequest {
+  author: string | null;
   number: number;
   url: string;
   base: string;
@@ -1438,6 +1439,7 @@ export async function listAllOpenPullRequests(
     }
     const data = (await res.json()) as Array<{
       number: number; html_url: string; draft?: boolean; title: string; created_at: string;
+      user?: { login?: string | null } | null;
       base: { ref: string }; head: { ref: string; sha: string };
     }>;
     for (const p of data) {
@@ -1448,7 +1450,7 @@ export async function listAllOpenPullRequests(
       pulls.push({
         number: p.number, url: p.html_url, base: p.base.ref,
         head: p.head.ref, headSha: p.head.sha, draft: p.draft === true,
-        title: p.title, createdAt,
+        title: p.title, createdAt, author: p.user?.login ?? null,
       });
     }
     url = parseLinkNext(res.headers.get("link"));

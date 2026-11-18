@@ -9,6 +9,6 @@
     "rootDir": ".",
     "declaration": false
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "scripts/fly-secrets-compare.ts"],
   "exclude": []
 }

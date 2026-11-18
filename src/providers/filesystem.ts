@@ -312,6 +312,16 @@ export class FilesystemProvider implements TicketingProvider {
     }, { activeOnly: true });
   }
 
+  async markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (state.status === "completed" || state.status === "cancelled") return null;
+      return appendComment(
+        { ...state, status: "cancelled" },
+        `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the task status to its pickup value.`,
+      );
+    }, { activeOnly: true });
+  }
+
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
     const updated = await this.updateTask(issueId, scopeKey, (state) => (
       state.status === "cancelled" ? state : { ...state, status: "completed" }

@@ -19,6 +19,7 @@ export interface IssueStatusesDeps {
 }
 
 const CACHE_MS = 60_000;
+const STALE_SERVE_MS = 300_000;
 const cache = new Map<string, { readAt: number; records: IssueStatusRecord[] }>();
 
 export function clearIssueStatusesCache(): void {
@@ -46,9 +47,15 @@ export async function listIssueStatuses(deps: IssueStatusesDeps): Promise<IssueS
     }
     let cached = cache.get(teamKey);
     if (!cached || deps.now() - cached.readAt >= CACHE_MS) {
-      const records = await provider.listIssueStatuses(mapping);
-      cached = { readAt: deps.now(), records };
-      cache.set(teamKey, cached);
+      try {
+        const records = await provider.listIssueStatuses(mapping);
+        cached = { readAt: deps.now(), records };
+        cache.set(teamKey, cached);
+      } catch (error) {
+        const age = cached ? deps.now() - cached.readAt : null;
+        if (!cached || age === null || age >= STALE_SERVE_MS) throw error;
+        console.warn(`Serving cached issue statuses for team ${teamKey} after refresh failure; copy age ${age} ms`);
+      }
     }
     for (const record of cached.records) {
       const firstTeam = teams.get(record.identifier);
