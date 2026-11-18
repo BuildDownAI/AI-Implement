@@ -1,5 +1,5 @@
 import http from "node:http";
-import { getJobByNonce } from "./log.js";
+import { getJobByNonce, linkJobPullRequest } from "./log.js";
 import { postStatusComment } from "./status-events.js";
 import type { StatusEvent } from "./status-events.js";
 import type { ProviderRegistry } from "./providers/registry.js";
@@ -80,6 +80,12 @@ export async function handleStepReport(
     }
 
     upsertStepRecord(job.id, step as Step);
+    if (s.id === "push" && s.outputs && typeof s.outputs === "object") {
+      const prUrl = (s.outputs as Record<string, unknown>).prUrl;
+      if (typeof prUrl === "string" && prUrl.length > 0) {
+        linkJobPullRequest(job.id, prUrl, "step-report");
+      }
+    }
     json(res, 200, { ok: true });
   } catch (err) {
     console.error("[session-api] Error handling step report:", err);
