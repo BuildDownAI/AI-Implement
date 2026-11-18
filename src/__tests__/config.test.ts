@@ -43,6 +43,7 @@ describe("config", () => {
     db.close();
 
     config.initMappingsTable();
+    expect(config.getMappings().LEG.machineCpuKind).toBe("shared");
     config.initMappingsTable();
     const reopened = new Database(dbPath);
     try {
@@ -51,6 +52,11 @@ describe("config", () => {
       expect((reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }> )
         .filter((item) => item.name === "review_fix_lifecycle")).toHaveLength(1);
       expect(config.getMappings().LEG.reviewFixLifecycle).toBeNull();
+      expect(config.getMappings().LEG.machineCpuKind).toBe("shared");
+      expect((reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>)
+        .filter((column) => column.name === "machine_cpu_kind")).toEqual([
+          expect.objectContaining({ type: "TEXT", notnull: 1, dflt_value: "'shared'" }),
+        ]);
     } finally { reopened.close(); }
   });
 
@@ -133,12 +139,14 @@ describe("config", () => {
       repo: "fly-repo",
       executionMode: "fly-machines",
       sessionMode: "hybrid",
+      machineCpuKind: "performance",
       machineCpus: 4,
       machineMemoryMb: 8192,
     }));
     const m = config.getMappings().FLY;
     expect(m.executionMode).toBe("fly-machines");
     expect(m.sessionMode).toBe("hybrid");
+    expect(m.machineCpuKind).toBe("performance");
     expect(m.machineCpus).toBe(4);
     expect(m.machineMemoryMb).toBe(8192);
   });
@@ -149,6 +157,7 @@ describe("config", () => {
     const m = config.getMappings().DEF;
     expect(m.executionMode).toBe("github-actions");
     expect(m.sessionMode).toBe("autonomous");
+    expect(m.machineCpuKind).toBe("shared");
     expect(m.machineCpus).toBe(2);
     expect(m.machineMemoryMb).toBe(4096);
   });
@@ -172,6 +181,7 @@ describe("config", () => {
     const m = config.getMappings().OLD;
     expect(m.executionMode).toBe("github-actions");
     expect(m.sessionMode).toBe("autonomous");
+    expect(m.machineCpuKind).toBe("shared");
     expect(m.machineCpus).toBe(2);
     expect(m.machineMemoryMb).toBe(4096);
   });

@@ -35,6 +35,7 @@ export interface RepoMapping {
   maxInProgressAiIssues: number;
   executionMode: ExecutionMode;
   sessionMode: SessionMode;
+  machineCpuKind: "shared" | "performance";
   machineCpus: number;
   machineMemoryMb: number;
   /** Whether to run the planning phase before implementation. Default true. */
@@ -167,6 +168,9 @@ function ensureMappingsColumns(): void {
   if (!names.has("session_mode")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN session_mode TEXT NOT NULL DEFAULT '${DEFAULT_SESSION_MODE}'`);
   }
+  if (!names.has("machine_cpu_kind")) {
+    db.exec("ALTER TABLE mappings ADD COLUMN machine_cpu_kind TEXT NOT NULL DEFAULT 'shared'");
+  }
   if (!names.has("machine_cpus")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN machine_cpus INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_CPUS}`);
   }
@@ -271,6 +275,7 @@ export function initMappingsTable(): void {
       max_in_progress_ai_issues INTEGER NOT NULL DEFAULT ${DEFAULT_MAX_IN_PROGRESS_AI_ISSUES},
       execution_mode TEXT NOT NULL DEFAULT '${DEFAULT_EXECUTION_MODE}',
       session_mode TEXT NOT NULL DEFAULT '${DEFAULT_SESSION_MODE}',
+      machine_cpu_kind TEXT NOT NULL DEFAULT 'shared',
       machine_cpus INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_CPUS},
       machine_memory_mb INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_MEMORY_MB},
       planning_enabled INTEGER NOT NULL DEFAULT 1,
@@ -311,10 +316,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId, m.reviewers ? JSON.stringify(m.reviewers) : null, m.prDispatchBudget ?? null, m.reviewFixLifecycle, m.trustedReviewAuthors ? JSON.stringify(m.trustedReviewAuthors) : null, m.reviewProcess ?? null);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpuKind, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId, m.reviewers ? JSON.stringify(m.reviewers) : null, m.prDispatchBudget ?? null, m.reviewFixLifecycle, m.trustedReviewAuthors ? JSON.stringify(m.trustedReviewAuthors) : null, m.reviewProcess ?? null);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -323,7 +328,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -334,6 +339,7 @@ export function getMappings(): Record<string, RepoMapping> {
       max_in_progress_ai_issues: number;
       execution_mode: string;
       session_mode: string;
+      machine_cpu_kind: "shared" | "performance";
       machine_cpus: number;
       machine_memory_mb: number;
       planning_enabled: number;
@@ -383,6 +389,7 @@ export function getMappings(): Record<string, RepoMapping> {
       maxInProgressAiIssues: row.max_in_progress_ai_issues ?? DEFAULT_MAX_IN_PROGRESS_AI_ISSUES,
       executionMode: (row.execution_mode as ExecutionMode) ?? DEFAULT_EXECUTION_MODE,
       sessionMode: (row.session_mode as SessionMode) ?? DEFAULT_SESSION_MODE,
+      machineCpuKind: row.machine_cpu_kind ?? "shared",
       machineCpus: row.machine_cpus ?? DEFAULT_MACHINE_CPUS,
       machineMemoryMb: row.machine_memory_mb ?? DEFAULT_MACHINE_MEMORY_MB,
       planningEnabled: Boolean(row.planning_enabled ?? DEFAULT_PLANNING_ENABLED),
@@ -418,7 +425,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -429,6 +436,7 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.maxInProgressAiIssues,
       mapping.executionMode,
       mapping.sessionMode,
+      mapping.machineCpuKind,
       mapping.machineCpus,
       mapping.machineMemoryMb,
       mapping.planningEnabled ? 1 : 0,

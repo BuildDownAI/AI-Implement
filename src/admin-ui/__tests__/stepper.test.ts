@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { JSDOM } from "jsdom";
+import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 import { stepperHtml, stepperScript } from "../stepper.js";
 
 /** Rail order. Inserting a step renumbers every later one, so this is the spine of the file. */
@@ -230,6 +231,7 @@ describe("new-project stepper — the four touch points a new field needs", () =
   });
 
   it.each([
+    ["machineCpuKind", "np-cpu-kind"],
     ["branchPrefix", "np-branch-prefix"],
     ["maxTurns", "np-maxTurns"],
     ["maxIterations", "np-maxIterations"],
@@ -358,5 +360,100 @@ describe("new-project stepper — review process and trusted authors", () => {
     expect(stepperScript).toContain("trustedReviewAuthors: data.trustedReviewAuthors");
     expect(stepperScript).toContain("window.esc(l)");
     expect(stepperScript).toContain("split('\\n')");
+  });
+});
+
+describe("new-project Fly CPU kind", () => {
+  function mountFly() {
+    const posts: unknown[] = [];
+    let error: string | undefined;
+    const mounted = mountAdminPage({
+      html: stepperHtml, script: stepperScript, route: "projects",
+      before: (win) => {
+        win.refRepoRowsHtml = () => "";
+        win.refRepoStage = () => null;
+      },
+      api: async (url, init) => {
+        if (url === "/api/mappings" && init?.method === "POST") {
+          posts.push(JSON.parse(init.body!));
+          return { ok: !error, status: error ? 400 : 200, json: async () => error ? { error } : {} };
+        }
+        return { ok: true, status: 200, json: async () => ({ linear: true, jira: true }) };
+      },
+    });
+    const { win, doc } = mounted;
+    const field = (id: string) => doc.getElementById(id) as HTMLInputElement;
+    function execution() {
+      win.stepperNext();
+      field("np-teamKey").value = "AII";
+      win.stepperNext();
+      field("np-owner").value = "BuildDownAI";
+      field("np-repo").value = "AI-Implement";
+      field("np-defaultBranch").value = "testing";
+      win.stepperNext();
+      win.stepperNext();
+      win.selectExecutionMode("fly-machines");
+    }
+    win.openNewProjectStepper();
+    execution();
+    return { ...mounted, field, posts, execution, refuse: (message?: string) => { error = message; } };
+  }
+
+  it("reviews and submits the kind, preserves it across Back/Next, and resets on reopen", async () => {
+    const { win, doc, field, posts, execution } = mountFly();
+    const select = doc.querySelector<HTMLSelectElement>("#np-cpu-kind")!;
+    expect(select.value).toBe("shared");
+    expect(Array.from(select.options, (o) => o.value)).toEqual(["shared", "performance"]);
+    expect(select.nextElementSibling?.textContent).toBe("Fly limits a shared CPU. Use performance for a project whose tests use the CPU for more than some minutes. Performance needs 2048 MB or more for each CPU.");
+    expect(select.closest("#np-fly-fields")!.hasAttribute("hidden")).toBe(false);
+    select.value = "performance";
+    field("np-cpus").value = "4";
+    field("np-mem").value = "8192";
+    win.stepperNext();
+    win.stepperBack();
+    expect(select.value).toBe("performance");
+    for (let i = 0; i < 4; i++) win.stepperNext();
+    expect(doc.querySelector('[data-review="runner"]')?.textContent).toContain("4cpu performance / 8192 MB");
+    await win.stepperSubmit();
+    expect(posts[0]).toMatchObject({ machineCpuKind: "performance", machineCpus: 4, machineMemoryMb: 8192 });
+    win.openNewProjectStepper();
+    expect(select.value).toBe("shared");
+    execution();
+    for (let i = 0; i < 4; i++) win.stepperNext();
+    expect(doc.querySelector('[data-review="runner"]')?.textContent).toContain("2cpu shared / 4096 MB");
+    await win.stepperSubmit();
+    expect(posts[1]).toMatchObject({ machineCpuKind: "shared" });
+  });
+
+  it("shows the server message literally and keeps values for correction and retry", async () => {
+    const { win, doc, field, posts, refuse } = mountFly();
+    field("np-cpu-kind").value = "performance";
+    field("np-cpus").value = "4";
+    field("np-mem").value = "2048";
+    for (let i = 0; i < 4; i++) win.stepperNext();
+    const error = "Performance needs more memory <b>per CPU</b>";
+    refuse(error);
+    await win.stepperSubmit();
+    expect(posts[0]).toMatchObject({ machineCpuKind: "performance", machineCpus: 4, machineMemoryMb: 2048 });
+    expect(doc.getElementById("np-error")?.textContent).toContain(error);
+    expect(doc.querySelector("#np-error b")).toBeNull();
+    expect(doc.getElementById("np-stepper-wrap")!.hasAttribute("hidden")).toBe(false);
+    for (let i = 0; i < 4; i++) win.stepperBack();
+    expect(["np-cpu-kind", "np-cpus", "np-mem"].map((id) => field(id).value)).toEqual(["performance", "4", "2048"]);
+    field("np-mem").value = "8192";
+    for (let i = 0; i < 4; i++) win.stepperNext();
+    refuse();
+    await win.stepperSubmit();
+    expect(posts[1]).toMatchObject({ machineCpuKind: "performance", machineCpus: 4, machineMemoryMb: 8192 });
+  });
+
+  it("hides the control with Fly fields for GitHub Actions and filesystem", () => {
+    const { win, doc, field } = mountFly();
+    win.selectExecutionMode("github-actions");
+    expect(doc.getElementById("np-cpu-kind")!.closest("#np-fly-fields")!.hasAttribute("hidden")).toBe(true);
+    win.selectExecutionMode("fly-machines");
+    field("np-ticketing-provider").value = "filesystem";
+    win.onStepperTicketingProviderChange();
+    expect(doc.getElementById("np-cpu-kind")!.closest("#np-fly-fields")!.hasAttribute("hidden")).toBe(true);
   });
 });

@@ -230,7 +230,7 @@ export const stepperHtml = `
           </div>
         </div>
         <div id="np-fly-fields" hidden style="margin-bottom:18px">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
             <div class="field">
               <label class="field-label">CPUs</label>
               <input class="input" id="np-cpus" type="number" min="1" value="2">
@@ -238,6 +238,14 @@ export const stepperHtml = `
             <div class="field">
               <label class="field-label">Memory (MB)</label>
               <input class="input" id="np-mem" type="number" min="256" step="256" value="4096">
+            </div>
+            <div class="field">
+              <label class="field-label" for="np-cpu-kind">CPU kind</label>
+              <select class="select" id="np-cpu-kind">
+                <option value="shared">shared</option>
+                <option value="performance">performance</option>
+              </select>
+              <div class="field-hint">Fly limits a shared CPU. Use performance for a project whose tests use the CPU for more than some minutes. Performance needs 2048 MB or more for each CPU.</div>
             </div>
           </div>
         </div>
@@ -511,7 +519,7 @@ export const stepperScript = `
     jiraBaseBranchFieldOverride: '',
     teamKey: '', owner: '', repo: '', defaultBranch: '', branchPrefix: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
     skillsRepo: '', referenceRepos: [], dependencyTokenScope: null,
-    executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
+    executionMode: 'github-actions', machineCpuKind: 'shared', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
     maxInProgressAiIssues: 3, maxTurns: null, maxIterations: null, prDispatchBudget: null, maxJobMinutes: null,
@@ -542,6 +550,7 @@ export const stepperScript = `
     data.sensitiveAllowPatterns = '';
     data.dependencyTokenScope = null;
     data.executionMode = 'github-actions';
+    data.machineCpuKind = 'shared';
     data.machineCpus = 2;
     data.machineMemoryMb = 4096;
     data.sessionMode = 'autonomous';
@@ -571,6 +580,7 @@ export const stepperScript = `
     }
     refRepoPending = null;
     npRenderRefRepos();
+    document.getElementById('np-cpu-kind').value = 'shared';
     const cpusEl = document.getElementById('np-cpus');
     if (cpusEl) cpusEl.value = '2';
     const memEl = document.getElementById('np-mem');
@@ -939,6 +949,7 @@ export const stepperScript = `
       const cpEl = document.getElementById('np-cpus');
       const memEl = document.getElementById('np-mem');
       if (smEl) data.sessionMode = smEl.value;
+      data.machineCpuKind = document.getElementById('np-cpu-kind').value;
       if (cpEl) data.machineCpus = parseInt(cpEl.value, 10) || 2;
       if (memEl) data.machineMemoryMb = parseInt(memEl.value, 10) || 4096;
     } else if (n === 5) {
@@ -1093,7 +1104,7 @@ export const stepperScript = `
       ? 'local Docker via RUNNER_MODE=local'
       : window.esc(data.executionMode);
     if (data.ticketingProvider !== 'filesystem' && data.executionMode === 'fly-machines') {
-      runnerText += ' &middot; ' + data.machineCpus + 'cpu / ' + data.machineMemoryMb + ' MB';
+      runnerText += ' &middot; ' + data.machineCpus + 'cpu ' + window.esc(data.machineCpuKind) + ' / ' + data.machineMemoryMb + ' MB';
     }
     set('runner', runnerText);
 
@@ -1448,6 +1459,7 @@ export const stepperScript = `
       maxInProgressAiIssues: data.maxInProgressAiIssues,
       executionMode: data.executionMode,
       sessionMode: data.sessionMode,
+      machineCpuKind: data.machineCpuKind,
       machineCpus: data.machineCpus,
       machineMemoryMb: data.machineMemoryMb,
       planningEnabled: data.planningEnabled,

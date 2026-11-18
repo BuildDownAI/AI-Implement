@@ -521,6 +521,21 @@ describe("launchPlanningSession", () => {
     expectFixture("local", vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0]);
   });
 
+  it.each(["shared", "performance"] as const)("Fly planning builds the project's %s guest", async (machineCpuKind) => {
+    const actual = await vi.importActual<typeof import("../fly-machines.js")>("../fly-machines.js");
+    vi.mocked(flyMachines.buildSessionMachineConfig).mockImplementationOnce(actual.buildSessionMachineConfig);
+    vi.mocked(flyMachines.createMachine).mockResolvedValue({ id: "m-kind", name: "kind" } as never);
+    const result = await call({
+      config: { ...baseConfig, flySessionsToken: "ft", flySessionsApp: "fa" },
+      execPath: "fly-machines", reservation,
+      mapping: { ...mapping, machineCpuKind, machineCpus: 4, machineMemoryMb: 8192 },
+    });
+    expect(result).toMatchObject({ outcome: "accepted" });
+    expect(vi.mocked(flyMachines.createMachine).mock.calls[0][2].config.guest).toEqual({
+      cpu_kind: machineCpuKind, cpus: 4, memory_mb: 8192,
+    });
+  });
+
   it("opted-out Fly launch: the machine input matches the fixture", async () => {
     vi.mocked(flyMachines.createMachine).mockResolvedValue({ id: "m-1", name: "mn" } as never);
     const flyConfig = { ...baseConfig, flySessionsToken: "ft", flySessionsApp: "fa" };
