@@ -217,7 +217,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         const target = initialTarget(run);
         mapping = target.mapping;
         const { item } = target;
-        reviewOnly = rollupReviewMode(item.commenter, mapping);
+        reviewOnly = rollupReviewMode(item.commenter, mapping, item.instruction);
         // Only the image paired with this orchestrator is known to honor reviewOnly.
         // Local Docker builds its runner alongside the orchestrator.
         if (reviewOnly && run.backend !== "local-docker") {
