@@ -121,7 +121,7 @@ describe("advisory roll-up review", () => {
 
   it.each(["findings", "clean", "failure"])("runs reviewers once and posts one verdict: %s", async (kind) => {
     const invoke = vi.fn(async () => kind === "failure"
-      ? { stdout: "", exitCode: 1, tokensUsed: 0, errorMessage: "reviewer unavailable" }
+      ? { stdout: "", exitCode: 1, tokensUsed: 0, errorMessage: "overloaded_error" }
       : { stdout: "", exitCode: 0, tokensUsed: 1, terminalStatus: { subtype: "success", isError: false }, structuredOutput: {
         approved: kind === "clean", findings: kind === "clean" ? [] : [
           { severity: "blocking", path: "earlier.ts", line: 7, body: "Missing shared contract" },
@@ -152,8 +152,15 @@ describe("advisory roll-up review", () => {
       expect(body).toContain("Missing shared contract");
     }
     expect(result.terminationReason).toBe(kind === "failure" ? "review_error" : "approved");
-    expect(result.rollupReview).toEqual({ headSha: "a".repeat(40), verdictUrl: "https://github.com/org/repo/pull/42#issuecomment-99",
+    expect(result.rollupReview).toMatchObject({ headSha: "a".repeat(40), verdictUrl: "https://github.com/org/repo/pull/42#issuecomment-99",
       failedReviewers: kind === "failure" ? ["code-review", "integration-review"] : [] });
+    if (kind === "failure") {
+      expect(result.rollupReview.incompleteReviews).toHaveLength(2);
+      expect(result.rollupReview.incompleteReviews).toEqual(expect.arrayContaining([
+        expect.objectContaining({ reviewerId: "code-review", failure: expect.objectContaining({ category: "transient", code: "PROVIDER_OVERLOADED" }) }),
+        expect.objectContaining({ reviewerId: "integration-review", failure: expect.objectContaining({ category: "transient", code: "PROVIDER_OVERLOADED" }) }),
+      ]));
+    } else expect(result.rollupReview.incompleteReviews).toEqual([]);
     expect(result.internalFindings.length).toBe(kind === "findings" ? 2 : 0);
   });
 });

@@ -6772,7 +6772,8 @@ describe("roll-up review follow-up children", () => {
       { source: "ai-implement-internal", severity: "minor", body: "minor nit" },
     ];
     async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success",
-      failedReviewers = outcome === "failure" ? ["code-review", "integration-review"] : []) {
+      failedReviewers = outcome === "failure" ? ["code-review", "integration-review"] : [],
+      incompleteReviews?: Array<{ reviewerId: string; failure?: { category: import("../pipeline/failure-classification.js").FailureCategory; code: string } }>) {
       const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis", ttlSeconds: 3600, secret: SECRET });
       const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
@@ -6780,7 +6781,7 @@ describe("roll-up review follow-up children", () => {
         resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
         watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
         body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [], internalFindings,
-          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99", failedReviewers } } });
+          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99", failedReviewers, incompleteReviews } } });
       return { deliver, dispatchId };
     }
     async function run(head: string, internalFindings = findings) {
@@ -6794,6 +6795,58 @@ describe("roll-up review follow-up children", () => {
     }
     return { provider, children, listing, create, update, run, prepare, findings };
   }
+
+  it("queues one retry for PROVIDER_OVERLOADED incomplete reviewers", async () => {
+    const { prepare, update } = await setup();
+    const first = await prepare("a", [], "failure", ["code-review"], [
+      { reviewerId: "code-review", failure: { category: "transient", code: "PROVIDER_OVERLOADED" } },
+    ]);
+    expect((await first.deliver()).status).toBe(200);
+    const rows = dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ owner: "org", repo: "repo", pr_number: 12, commenter: "ai-implement-rollup-review" });
+    expect(update.mock.calls.at(-1)?.[4]).toContain("one retry is queued");
+  });
+
+  it("does not retry a second incomplete result, including after terminal queue states", async () => {
+    const { prepare, update } = await setup();
+    const failures = ["code-review", "integration-review"].map(reviewerId => ({ reviewerId,
+      failure: { category: "transient" as const, code: "PROVIDER_OVERLOADED" } }));
+    const first = await prepare("a", [], "failure", failures.map(r => r.reviewerId), failures);
+    await first.deliver();
+    dedup.getDb().prepare("UPDATE comment_gapfill_queue SET status = 'completed'").run();
+    const second = await prepare("a", [], "failure", failures.map(r => r.reviewerId), failures);
+    expect((await second.deliver()).status).toBe(200);
+    expect((await second.deliver()).status).toBe(200);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(1);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("no retry is left; a person decides");
+  });
+
+  it.each(["auth", "missing", "empty", "complete"])("does not retry %s failures", async kind => {
+    const { prepare, update } = await setup();
+    const failures = kind === "empty" ? [] : [
+      { reviewerId: "code-review", failure: { category: "transient" as const, code: "PROVIDER_OVERLOADED" } },
+      { reviewerId: "integration-review", ...(kind === "missing" ? {} : {
+        failure: { category: "auth" as const, code: "AUTH_FAILED" } }) },
+    ];
+    const result = await prepare("a", [], kind === "complete" ? "success" : "failure",
+      ["code-review", "integration-review"], failures);
+    expect((await result.deliver()).status).toBe(200);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(0);
+    if (kind !== "complete") expect(update.mock.calls.at(-1)?.[4]).toContain("no retry is left; a person decides");
+  });
+
+  it("keeps a queued retry notice when the comment write needs redelivery", async () => {
+    const { prepare, update } = await setup();
+    update.mockRejectedValueOnce(new Error("comment unavailable"));
+    const first = await prepare("a", [], "failure", ["code-review"], [
+      { reviewerId: "code-review", failure: { category: "transient", code: "PROVIDER_OVERLOADED" } },
+    ]);
+    expect((await first.deliver()).status).toBe(503);
+    expect((await first.deliver()).status).toBe(200);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(1);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("one retry is queued");
+  });
 
   it("files both blockers in one templated child and keeps minors in the verdict", async () => {
     const { create, run, update } = await setup();

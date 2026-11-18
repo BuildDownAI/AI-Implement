@@ -366,6 +366,25 @@ describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
 
 
 describe("roll-up reviews", () => {
+  it("preserves the legacy key and gives only one retry its own durable key", () => {
+    const input = { owner: "org", repo: "repo", prNumber: 42, headSha: "head-a" };
+    expect(queue.enqueueRollupReview(input)).toBe(true);
+    const [initial] = queue.claimPendingCommentGapfills();
+    expect(initial.commentId).toBe(-153033412971482);
+    expect(queue.enqueueRollupReview({ ...input, attempt: 0 })).toBe(false);
+    expect(queue.enqueueRollupReview({ ...input, attempt: 1 })).toBe(true);
+    const retry = queue.claimPendingCommentGapfills()[1];
+    expect(retry.commentId).toBeLessThan(-2_000_000_000);
+    expect(retry.commentId).not.toBe(initial.commentId);
+    expect(retry.commenter).toBe(queue.ROLLUP_REVIEW_COMMENTER);
+    expect(retry.instruction).toContain(input.headSha);
+    for (const status of ["pending", "dispatched", "completed", "failed", "skipped"] as const) {
+      queue.markCommentGapfillProcessed(retry.id, status);
+      expect(queue.enqueueRollupReview({ ...input, attempt: 1 })).toBe(false);
+    }
+    expect(queue.enqueueRollupReview({ ...input, attempt: 2 })).toBe(false);
+  });
+
   it("deduplicates each head even after completion and isolates all key components", () => {
     const input = { owner: "org", repo: "repo", prNumber: 42, headSha: "head-a" };
     expect(queue.enqueueRollupReview(input)).toBe(true);
