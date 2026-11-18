@@ -853,6 +853,21 @@ describe("reconciliation enqueue", () => {
     expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
   });
 
+  it("queues the job's issue when its PR URL was written by updateJobPrUrl", async () => {
+    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
+    const jobId = appendDispatch({
+      issueId: "tracker-issue-27", issueIdentifier: "AII-27", repo: "org/repo",
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/42");
+
+    expect((await deliver()).queued).toBe(true);
+    expect(reconciliation.getPendingReconciliations()).toEqual([expect.objectContaining({
+      issueId: "tracker-issue-27", issueIdentifier: "AII-27", repo: "org/repo", prNumber: 42,
+      mergeCommitSha: "sha-abc123", status: "pending",
+    })]);
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
+  });
+
   it("records the merge even when reconciliation was already queued", async () => {
     link();
     reconciliation.enqueueReconciliation({ issueId: "tracker-issue-27", issueIdentifier: "AII-27",
