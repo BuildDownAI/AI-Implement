@@ -270,9 +270,13 @@ Idempotency is handled differently per path:
 - **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker, but **only when nothing on the branch is missing from the base**: it fetches the branch's current tip (`getBranchSha`) and deletes when that tip equals the merged PR's recorded head SHA, or — as a secondary fallback, for a real merge-commit strategy or a branch already gone — when `compareBranches` confirms 0 commits ahead. SHA equality is checked first because it is strategy-agnostic (unlike ancestry, it doesn't get confused by a squash/rebase merge); the ahead-count fallback exists for a fully-absorbed merge-commit branch or a since-deleted one, not as the primary defense against a squash/rebase false-ahead reading. A merged PR does not by itself mean the branch is safe to delete: a long-lived feature node's roll-up can merge early (an interim roll-up), after which more children merge into the same branch by hand or via the cascade — the branch's tip then moves past the PR's recorded head and it also shows genuinely ahead of the base. In that case the branch is kept, the already-merged roll-up is still finalized, and a further roll-up PR is opened for the new commits instead of deleting the branch ([AII-642](https://linear.app/eudoxus/issue/AII-642)). If the PR is still open, the step requests a review for its current head and returns to await the human. Only when no PR exists (or the last one merged but the branch has since moved on) is a new one opened (guarded by the same ahead-check so a missing branch exits early). The ahead-count fallback is a narrower version of the old git-ancestry-only heuristic that once gated the top-of-tree path, which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)) — the SHA check now covers that case directly instead of relying on ancestry alone.
 
 An automatic review-only run is queued when the top-of-tree roll-up PR opens and
-whenever polling observes a new head SHA on that open PR. Each head is queued only
-once, even after its review finishes. The review is advisory: it does not merge or
-modify the branch. Its verdict appears as a comment in the roll-up PR conversation.
+whenever polling observes a new head SHA on that open PR. Each head gets one initial queue entry, even after its review finishes;
+an incomplete transient failure can receive the single retry described below. The review is advisory: it does not merge or
+modify the branch. Its verdict appears as a comment in the roll-up PR conversation,
+showing the short reviewed head SHA and explaining that it does not block the merge; blockers
+are filed as one `[roll-up-review]` child until the limit is reached. Findings
+with the same `stableReviewFindingKey` appear once with all reporting reviewer
+IDs and the strongest reported severity (`blocking` > `medium` > `minor`); findings are never merged by meaning.
 
 Blocking findings from a complete review on an open roll-up also produce
 **one pickup-ready child** under that tree's parent, containing all blockers and
@@ -281,11 +285,23 @@ links in the Problem / Task / Files / Acceptance Criteria template. Minor findin
 stay in the verdict comment. Incomplete reviews retain any partial findings in the
 verdict but create no child and consume none of the two-child budget. Titles start
 with `[roll-up-review]` and identify the repository, PR, and head. Each head gets at most one child; each PR gets at most
-two, including completed or cancelled children. The second child's verdict notice
-announces the limit and leaves further fixes to a person. Existing settings rows
+two, including completed or cancelled children. Each terminal result is given a
+follow-up notice naming the filed child or stating that no child was filed. Incomplete notices name the failed reviewers (or explain
+that no failed reviewer was identified for a failure before review). Once the
+two-child limit is reached, every notice, including an incomplete review, says a
+person must decide further fixes. A notice can still be lost: when the verdict comment update fails after the child is reserved, the callback is acknowledged and the notice is not retried (AII-2011). Existing settings rows
 reserve creation attempts atomically, including ambiguous tracker failures (which
 require a person to check the tracker); no new table is used. Tracker enumeration
 must finish successfully before filing, so an unreadable page cannot reset the cap.
+
+An incomplete roll-up review with a nonempty list of failed reviewers, all classified
+`transient` (for example `PROVIDER_OVERLOADED`), queues one retry for the same head.
+`ROLLUP_REVIEW_RETRY_LIMIT = 1` caps retries per repository/PR/head across every queue
+state. Non-transient or unclassified failures and a second incomplete result get no
+retry. The initial queue key is unchanged; attempt 1 has a distinct hashed negative
+ID and retains `ROLLUP_REVIEW_COMMENTER`. The retry uses the normal drain and budget
+checks with `humanRequested=false`. The verdict follow-up says “one retry is queued”
+or “no retry is left; a person decides”. Partial findings remain advisory.
 
 A separate poll sweep finds marked children even when an active child excludes its
 parent from roll-up discovery, or the tree already has a handled marker. If its

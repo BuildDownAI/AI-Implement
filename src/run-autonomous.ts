@@ -1436,7 +1436,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       await reportRunnerResult(undefined, null, process.env, {
         workspaceDir, phase: runnerPhase, outcome: review.terminationReason === "review_error" ? "failure" : "success",
         reviewOnly: true, internalFindings: review.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[],
-        rollupReview: review.rollupReview as { headSha: string; verdictUrl: string },
+        rollupReview: review.rollupReview as import("./runner-result.js").RollupReviewResult,
         callbackUrl, retryPolicy, fetchImpl: opts.fetchImpl,
       });
       runCompleted = true;
