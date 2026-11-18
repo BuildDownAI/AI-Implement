@@ -289,7 +289,10 @@ two, including completed or cancelled children. Each terminal result is given a
 follow-up notice naming the filed child or stating that no child was filed. Incomplete notices name the failed reviewers (or explain
 that no failed reviewer was identified for a failure before review). Once the
 two-child limit is reached, every notice, including an incomplete review, says a
-person must decide further fixes. Before reading or updating the verdict comment, the callback saves the exact notice
+person must decide further fixes. Callbacks sharing a notice identity serialize
+preparation through delivery, including child creation, so overlapping deliveries
+preserve the child identifier and edit the verdict only once. Before reading or
+updating the verdict comment, the callback saves the exact notice
 text, reviewed head, and verdict comment ID in SQLite settings. A failed comment
 read, missing verdict, or failed edit leaves that notice pending and returns 503
 without consuming the callback credential or completing the job. The runner's

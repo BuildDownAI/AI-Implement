@@ -6933,6 +6933,49 @@ describe("roll-up review follow-up children", () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["creation", "edit", "pending retry"])("serializes shared notices during overlapping %s callbacks", async stage => {
+    const { prepare, create, update } = await setup();
+    const first = await prepare("a");
+    const second = await prepare("a"); // Separate legacy dispatches share the same notice receipt.
+    if (stage === "pending retry") {
+      update.mockRejectedValueOnce(new Error("comment unavailable"));
+      expect((await first.deliver()).status).toBe(503);
+      update.mockClear();
+    }
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    if (stage === "creation") {
+      const actual = create.getMockImplementation()!;
+      create.mockImplementationOnce(async (...args) => {
+        entered();
+        await gate;
+        return actual(...args);
+      });
+    } else {
+      update.mockImplementationOnce(async () => { entered(); await gate; });
+    }
+    const delivery = first.deliver();
+    await started;
+    const overlapping = second.deliver();
+    // Drain the mocked I/O in the second callback while the first remains suspended.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release();
+    const results = await Promise.all([delivery, overlapping]);
+    expect(results.map(result => result.status)).toEqual([200, 200]);
+    expect(create).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledOnce();
+    const child = await create.mock.results[0].value;
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toEqual({
+      headSha: "a".repeat(40), commentId: 99,
+      text: `<!-- roll-up-review follow-up -->\n\nBlocking findings filed as ${child.identifier}.`,
+      delivered: true,
+    });
+    expect(update.mock.calls[0][4]).toContain(JSON.parse(row.value).text);
+  });
+
   it("retries a durable notice after child creation without filing or posting twice", async () => {
     const { prepare, create, update, listing } = await setup();
     update.mockRejectedValueOnce(new Error("comment unavailable"));
