@@ -25,7 +25,7 @@ import {
   type DispatchOutcome,
 } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
-import { surfaceDispatchFailure } from "./dispatch-failure.js";
+import { dispatchFailureConclusion, surfaceDispatchFailure } from "./dispatch-failure.js";
 import { recordDispatchFailure } from "./dispatch-breaker.js";
 import { getInstallationToken, getScopedInstallationToken } from "./github-app-auth.js";
 import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
@@ -288,9 +288,10 @@ export async function launchImplementationRun(args: LaunchImplementationRunArgs)
       );
     }
     // No dedup row was written at this point (markDispatched is called only on success).
-    const _brImpl = recordDispatchFailure(issue.id, "implementation", "workflow_dispatch_failed");
+    const conclusion = dispatchFailureConclusion(result.status);
+    const _brImpl = recordDispatchFailure(issue.id, "implementation", conclusion, { project: issue.scopeKey, identifier: issue.identifier });
     if (_brImpl.tripped) {
-      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", _brImpl.failures, "workflow_dispatch_failed");
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", _brImpl.failures, conclusion);
     }
     return { outcome: result.outcome === "rejected" ? "rejected" : "unknown" };
   }

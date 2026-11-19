@@ -158,6 +158,7 @@ export const componentsCss = `
 
 .page-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   padding: 20px 32px 18px;
@@ -165,7 +166,8 @@ export const componentsCss = `
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-app);
 }
-.page-header-left { min-width: 0; }
+/* The title side keeps a readable width; below it the actions wrap underneath instead of squeezing the subtitle. */
+.page-header-left { min-width: 0; flex: 1 1 320px; }
 .page-title {
   font-size: 17px;
   font-weight: 600;
@@ -440,10 +442,9 @@ export const componentsCss = `
   font-variant-numeric: tabular-nums;
 }
 .tbl tbody tr:last-child td { border-bottom: none; }
-.tbl tbody tr {
-  cursor: pointer;
-  transition: background 80ms ease;
-}
+.tbl tbody tr { transition: background 80ms ease; }
+/* Only a row that opens something shows the pointer; today that is a job row, which opens the drawer. */
+.tbl tbody tr[data-job-id] { cursor: pointer; }
 .tbl tbody tr:hover { background: var(--bg-hover); }
 .tbl tbody tr.active { background: var(--bg-active); }
 .tbl tbody tr.failed-row td { background: rgba(220, 38, 38, 0.025); }
@@ -1136,11 +1137,39 @@ button.secondary,
   color: var(--fg-tertiary);
   font-weight: 500;
 }
-.np-review-h {
+/* A setup check stacked for a narrow container (window.setupCheckItem), at 12px so it reads after the settings it sits beside. */
+.setup-check-item {
+  padding: 9px 12px;
   font-size: 12px;
-  font-weight: 500;
   color: var(--fg-secondary);
-  margin: 18px 0 4px;
 }
-.np-review-h:first-child { margin-top: 0; }
+.setup-check-title { color: var(--fg-primary); }
+.setup-check-id { font-size: 10.5px; color: var(--fg-tertiary); margin-top: 2px; overflow-wrap: anywhere; }
+/* What was found and the fix, each labeled as the Setup page's columns are, the labels in a gutter so both texts line up. */
+.setup-check-line {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  gap: 6px;
+  margin-top: 5px;
+}
+.setup-check-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-primary);
+  padding-top: 1px;
+}
+/* A Review section's checks: a card under its settings, headed so what they are is said, the checks on a sunken body. */
+.np-review-checks .card { margin-top: 10px; }
+.np-checks-card .card-header { padding: 8px 12px; }
+.np-checks-card .card-title { font-size: 12px; font-weight: 500; color: var(--fg-secondary); }
+.np-checks-body { background: var(--bg-sunken); }
+/* Every other check a step lighter, mixed from the theme's own colors so the step reads alike in both themes.
+   The caller marks which items are shaded, so a fold between them does not break the alternation. */
+.setup-check-item.shaded { background: color-mix(in srgb, var(--bg-sunken), var(--fg-primary) 3%); }
+.np-review-fold { padding: 4px 6px; }
+.np-review-note { padding: 8px 12px; color: var(--fg-secondary); font-size: 12px; }
+/* A Review section's explanation, under its heading. */
+.np-review-lead { font-size: 12px; color: var(--fg-tertiary); margin: -4px 0 8px; }
 `;

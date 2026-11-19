@@ -19,7 +19,7 @@ export const routerJs = `
     });
     if (window.failedPages[route]) {
       var section = document.querySelector('[data-page="' + route + '"]');
-      if (section) section.innerHTML = '<div class="page-body"><p style="color:var(--color-danger,red)">Page failed to load. Check the browser console for details.</p></div>';
+      if (section) section.innerHTML = '<div class="page-body"><p style="color:var(--st-fail-fg)">Page failed to load. Check the browser console for details.</p></div>';
       return;
     }
     if (inits[route]) { inits[route](); inits[route] = null; /* once */ }

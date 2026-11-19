@@ -67,11 +67,11 @@ export const issuesScript = `
       const tr = document.createElement('tr');
       const stateKind = stateBadgeKind(issue.stateType);
       const planBadge = issue.bucket === 'ready'
-        ? '<span class="badge success"><span class="dot"></span>Ready</span>'
-        : '<span class="badge info"><span class="dot"></span>Plan pending</span>';
+        ? window.statusBadge('success', 'Ready')
+        : window.statusBadge('info', 'Plan pending');
       tr.innerHTML = '<td><span class="mono">' + window.esc(issue.identifier) + '</span> ' + window.esc(issue.title) + '</td>'
         + '<td><span class="mono">' + window.esc(issue.teamKey) + '</span></td>'
-        + '<td><span class="badge ' + stateKind + '"><span class="dot"></span>' + window.esc(issue.stateName) + '</span></td>'
+        + '<td>' + window.statusBadge(stateKind, issue.stateName) + '</td>'
         + '<td>' + planBadge + '</td>'
         + '<td>' + (issue.issueUrl ? '<a class="text-accent" href="' + window.safeUrl(issue.issueUrl) + '" target="_blank">Open \u2197</a>' : '<span class="text-tertiary">\u2014</span>') + '</td>';
       tbody.appendChild(tr);
@@ -112,7 +112,7 @@ export const issuesScript = `
     const el = document.getElementById('issues-partial');
     if (!failedTrackers || failedTrackers.length === 0) { el.hidden = true; return; }
     const named = failedTrackers.map(function (t) { return window.esc(t.provider) + ': ' + window.esc(t.error); }).join('; ');
-    el.innerHTML = '<div style="flex:1"><div class="alert-title">Some trackers did not answer</div><div class="alert-desc">' + named + '. Their issues, and the in-progress counts for their teams, are missing below until they answer.</div></div>';
+    el.innerHTML = '<div style="flex:1"><div class="alert-title">Some ticketing systems did not answer</div><div class="alert-desc">' + named + '. Their issues, and the in-progress counts for their teams, are missing below until they answer.</div></div>';
     el.hidden = false;
   }
 

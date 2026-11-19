@@ -54,7 +54,7 @@ This is why the default image stays public: a cross-org `GITHUB_TOKEN` cannot pu
 
 ### When a GitHub Actions image pull fails
 
-If GitHub Actions cannot pull the job-container image, the job fails in its `Initialize containers` step before the runner starts, so no callback reports a failure code. After a failed GitHub Actions implementation run, `remediateFailedJob` (`src/stuck-watchdog.ts`) reads the run's jobs (`getFailedContainerInitJob`, `src/github.ts`). The usual cause of a failed `Initialize containers` step is a denied or missing image, which a retry cannot fix; a short registry outage can also fail this step. So the orchestrator:
+If GitHub Actions cannot pull the job-container image, the job fails in its `Initialize containers` step before the runner starts, so no callback reports a failure code. After a failed GitHub Actions implementation run, `remediateFailedJob` (`src/stuck-watchdog.ts`) reads the run's jobs for a failed step of that name (`getFailedRunStepJob` with `CONTAINER_INIT_STEP`, `src/github.ts`). The usual cause of a failed `Initialize containers` step is a denied or missing image, which a retry cannot fix; a short registry outage can also fail this step. So the orchestrator:
 
 - retries **once**: the first such failure takes the normal retry (working state and dedup entry cleared);
 - gives up from the second attempt: it parks the ticket out of pickup (`parkForHuman`; see [ticketing-providers.md](ticketing-providers.md)), then clears the dedup entry and the stuck-attempt counter;

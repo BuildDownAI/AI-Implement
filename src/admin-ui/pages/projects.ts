@@ -12,13 +12,20 @@ export const projectsHtml = `
     </div>
   </header>
   <div class="page-body">
+    <div id="projects-setup-note" class="alert warn" hidden>
+      <div class="alert-icon">&#9888;</div>
+      <div>
+        <div class="alert-title">Setup checks to look at</div>
+        <div class="alert-desc"><span id="projects-setup-note-count"></span> The Setup page lists each project's checks with their fixes, and runs a project's checks again. <a href="#setup" class="text-accent">Open Setup &rarr;</a></div>
+      </div>
+    </div>
     <div class="card">
       <div class="card-body tight">
         <table class="tbl">
           <thead>
             <tr>
               <th>Team</th><th>Repo</th><th>Runner</th><th>Session</th>
-              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th>Status</th><th></th>
+              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th>Status</th><th style="width:132px;white-space:nowrap">Setup</th><th style="width:132px;white-space:nowrap">Optional setup</th><th></th>
             </tr>
           </thead>
           <tbody id="mappings-body"></tbody>
@@ -436,13 +443,84 @@ export const projectsScript = `
   let reviewerDraft = [];
   let reviewerDefaultUntouched = true;
 
+  // The stored setup-check run as { run }, its run null before the first run, or null while it cannot be read.
+  async function loadSetupRun() {
+    try {
+      const res = await window.api('/api/setup-checks');
+      if (!res.ok) return null;
+      return { run: (await res.json()).run || null };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // One marker for a set of a project's rows: their verdict, with how many to look at in its title.
+  // The page's one notice links to the Setup page, rather than each marker, since Setup lists every project.
+  function setupMarker(rows, checked) {
+    const verdict = window.setupVerdict(rows);
+    if (!verdict) return '<span class="text-tertiary" title="No optional feature applies to this project">—</span>';
+    const title = verdict.toLook ? verdict.toLook + ' ' + (verdict.toLook === 1 ? 'check' : 'checks') + ' to look at. ' + checked : checked;
+    return '<span title="' + window.escAttr(title) + '">' + window.statusBadge(verdict.kind, verdict.label) + '</span>';
+  }
+
+  // A project's own rows in the stored run, empty for a project no run has checked.
+  function ownSetupRows(key, stored) {
+    return stored && stored.run ? stored.run.results.filter(function (row) { return row.project === key; }) : [];
+  }
+
+  // A project's two setup cells from the stored run: the checks its configuration requires (core and mode tiers),
+  // then its optional features. A row that does not apply, or a check that can never be verified, moves neither.
+  // Null for a project no run has checked yet, which gets a button to check it instead.
+  function setupCells(key, stored) {
+    if (!stored) {
+      return ['<span class="text-tertiary" title="The stored setup checks cannot be read right now, so this project\\'s setup is unknown">Unavailable</span>', ''];
+    }
+    const own = ownSetupRows(key, stored);
+    if (!own.length) return null;
+    // Dated by the project's oldest row, since a recheck refreshes one row at a time.
+    const checked = 'Checked ' + window.fmtAgo(Math.min.apply(null, own.map(function (row) { return row.checkedAt || stored.run.checkedAt; })));
+    return [
+      setupMarker(own.filter(function (row) { return row.tier !== 'feature'; }), checked),
+      setupMarker(own.filter(function (row) { return row.tier === 'feature'; }), checked),
+    ];
+  }
+
+  // The page's one pointer to the Setup page, shown while any checked project has a marker that does not pass.
+  function renderSetupNote(keys, stored) {
+    const note = document.getElementById('projects-setup-note');
+    if (!note) return;
+    const toLook = keys.filter(function (key) {
+      const own = ownSetupRows(key, stored);
+      const verdict = own.length ? window.setupVerdict(own) : null;
+      return verdict && verdict.toLook > 0;
+    }).length;
+    note.hidden = toLook === 0;
+    document.getElementById('projects-setup-note-count').textContent = toLook === 1
+      ? '1 project has a setup check that does not pass.'
+      : toLook + ' projects have setup checks that do not pass.';
+  }
+
+  // Runs the checks of a project no run has checked yet, then redraws the table with its markers.
+  async function checkProjectSetup(key, button) {
+    button.disabled = true;
+    button.textContent = 'Checking…';
+    if (await runProjectSetupChecks(key)) {
+      await loadMappings();
+      return;
+    }
+    button.disabled = false;
+    button.textContent = 'Check setup';
+    alert('The setup checks for ' + key + ' could not run. Try again shortly.');
+  }
+
   async function loadMappings() {
-    const res = await window.api('/api/mappings');
+    const [res, storedSetup] = await Promise.all([window.api('/api/mappings'), loadSetupRun()]);
     mappingsData = await res.json();
     const tbody = document.getElementById('mappings-body');
     const emptyEl = document.getElementById('mappings-empty');
     tbody.innerHTML = '';
     const keys = Object.keys(mappingsData);
+    renderSetupNote(keys, storedSetup);
     if (keys.length === 0) {
       if (emptyEl) emptyEl.classList.remove('hidden');
       return;
@@ -466,15 +544,25 @@ export const projectsScript = `
         ? '<span class="badge warn">paused</span>'
         : '<span class="badge success">active</span>';
       const pauseLabel = m.paused ? 'Resume' : 'Pause';
+      const setup = setupCells(key, storedSetup);
       tr.innerHTML = '<td class="mono">' + ek + '</td>'
         + '<td class="mono">' + window.esc(m.owner) + '/' + window.esc(m.repo) + '</td>'
         + '<td>' + execBadge + '</td>'
-        + '<td style="color:#666;font-size:0.85em">' + window.esc(m.sessionMode || 'autonomous') + '</td>'
+        + '<td style="color:var(--fg-tertiary);font-size:0.85em">' + window.esc(m.sessionMode || 'autonomous') + '</td>'
         + '<td style="text-align:center">' + window.esc(String(m.maxInProgressAiIssues ?? 3)) + '</td>'
         + '<td>' + planBadge + '</td>'
         + '<td>' + providerBadge + '</td>'
         + '<td>' + statusBadge + '</td>'
+        + '<td class="setup-required" style="white-space:nowrap">' + (setup ? setup[0] : '') + '</td>'
+        + '<td style="white-space:nowrap">' + (setup ? setup[1] : '') + '</td>'
         + '<td style="white-space:nowrap"></td>';
+      if (!setup) {
+        const checkBtn = document.createElement('button');
+        checkBtn.className = 'btn btn-sm';
+        checkBtn.textContent = 'Check setup';
+        checkBtn.addEventListener('click', function () { checkProjectSetup(key, checkBtn); });
+        tr.querySelector('.setup-required').appendChild(checkBtn);
+      }
       const actionCell = tr.lastElementChild;
       const pauseBtn = document.createElement('button');
       pauseBtn.className = 'btn btn-sm';
@@ -1384,8 +1472,7 @@ export const projectsScript = `
       }
       let html = '<option value="">(select)</option>';
       for (const o of options) {
-        const v = window.esc(o.value);
-        html += '<option value="' + v + '">' + v + '</option>';
+        html += '<option value="' + window.escAttr(o.value) + '">' + window.esc(o.value) + '</option>';
       }
       select.innerHTML = html;
       select.classList.remove('hidden');
@@ -1469,7 +1556,7 @@ export const projectsScript = `
         status.style.color = 'var(--st-warn-fg, #c80)';
       } else {
         status.textContent = 'Valid';
-        status.style.color = 'var(--st-ok-fg, #2a8)';
+        status.style.color = 'var(--st-success-fg)';
       }
     } catch (err) {
       status.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
@@ -1700,6 +1787,16 @@ export const projectsScript = `
   const SYNC_POLL_MS = 2000;
   const SYNC_POLL_MAX_ATTEMPTS = 60; // ~2 min, then hand off to the background safety net
 
+  // Runs one project's setup checks, which store its rows in the stored run. Answers whether they ran; a failure leaves the row as it was.
+  async function runProjectSetupChecks(teamKey) {
+    try {
+      const res = await window.api('/api/setup-checks/project', { method: 'POST', body: JSON.stringify({ project: teamKey }) });
+      return res.ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
   // Poll GET /api/mappings/:teamKey/sync-status/:jobId until the job is terminal
   function pollSyncStatus(teamKey, jobId) {
     if (!jobId) return;
@@ -1728,6 +1825,8 @@ export const projectsScript = `
         if (job.status === 'pending' || job.status === 'running') return; // keep waiting
 
         stopSyncPoll(teamKey);
+        // An ended sync changes what the project's checks read, so its row shows them again before it redraws.
+        await runProjectSetupChecks(teamKey);
         if (job.status === 'completed') {
           noteSyncResult(teamKey, { ok: true, result: job.result });
           await loadMappings();

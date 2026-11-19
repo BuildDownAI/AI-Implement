@@ -14,8 +14,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import { isDeployHeld } from "../deploy-hold.js";
-import { restateCanServe } from "./status.js";
+import { restateCanStartWork } from "./status.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 export type BusyRead =
@@ -295,9 +294,7 @@ const CHECK_TIMEOUT_MS = 10_000;
  * A failed call logs one line and never throws: a schedule fault must not stop the poll cycle.
  */
 export async function checkPipelineSchedules(keys: readonly string[], deps: CheckPipelineSchedulesDeps = {}): Promise<void> {
-  if ((deps.deployHeld ?? isDeployHeld)()) return;
-  const ready = deps.restateReady ?? restateCanServe;
-  if (!ready()) return;
+  if (!restateCanStartWork({ deployHeld: deps.deployHeld, canServe: deps.restateReady })) return;
   const fetchImpl = deps.fetchImpl ?? fetch;
   for (const key of keys) {
     try {

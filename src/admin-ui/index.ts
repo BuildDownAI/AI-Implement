@@ -3,8 +3,10 @@ import { componentsCss } from "./components.js";
 import { sidebarHtml } from "./sidebar.js";
 import { themeJs } from "./theme.js";
 import { routerJs } from "./router.js";
+import { helpersJs } from "./helpers.js";
 import { authJs } from "./auth.js";
 import { accessHtml, accessScript } from "./pages/access.js";
+import { setupHtml, setupScript } from "./pages/setup.js";
 import { overviewHtml, overviewScript } from "./pages/overview.js";
 import { settingsHtml, settingsScript } from "./pages/settings.js";
 import { projectsHtml, projectsScript } from "./pages/projects.js";
@@ -62,6 +64,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${kgPipelinesHtml}
     ${deploymentsHtml}
     ${accessHtml}
+    ${setupHtml}
     ${stubsHtml}
     ${noAccessHtml}
   </main>
@@ -105,6 +108,7 @@ ${drawerHtml}
 ${filesystemIssueHtml}
 ${localJobLogsHtml}
 <script>${themeJs}</script>
+<script>${helpersJs}</script>
 <script>${authJs}</script>
 <script>${routerJs}</script>
 ${pageScript('overview', overviewScript)}
@@ -125,6 +129,7 @@ ${pageScript('reports', reportsScript)}
 ${pageScript('kg-pipelines', kgPipelinesScript)}
 ${pageScript('deployments', deploymentsScript)}
 ${pageScript('access', accessScript)}
+${pageScript('setup', setupScript)}
 ${pageScript('drawer', drawerScript)}
 ${pageScript('filesystem-issue', filesystemIssueScript)}
 ${pageScript('local-job-logs', localJobLogsScript)}

@@ -9,10 +9,11 @@
  */
 
 import { useReadOnlyDb } from "./dedup.js";
+import { readOrchestratorHealth } from "./health-body.js";
 import { parseHealthPort } from "./http-server.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
-import { countFailingCore, createSetupCheckContext, runSetupChecks, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus, type SetupCheckResult, type SetupCheckRun } from "./setup-checks/index.js";
+import { countFailingCore, createSetupCheckContext, runSetupChecks, SETUP_CHECK_GROUP_LABELS, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus, type SetupCheckResult, type SetupCheckRun } from "./setup-checks/index.js";
 
 export interface CheckSetupDependencies {
   checks: readonly SetupCheck[];
@@ -20,11 +21,12 @@ export interface CheckSetupDependencies {
   useReadOnlyDb: () => void;
   /** Configures tracker credentials as boot does, so the tracker checks can build their providers. */
   configureTrackers: () => void;
-  createContext: (restateStatus: () => SetupCheckRestateStatus) => SetupCheckContext;
+  /** Builds the context with what only the running orchestrator's own health endpoint can say. */
+  createContext: (own: Pick<SetupCheckContext, "restateStatus" | "orchestratorInstanceId">) => SetupCheckContext;
   /** Fills the Fly sessions cache from Restate, as the server does each poll. */
   refreshRunnerBackend: () => Promise<void>;
   fetch: typeof fetch;
-  /** The orchestrator's own port, whose `GET /` reports its Restate status. */
+  /** The orchestrator's own port, whose `GET /` reports its Restate status and instance identifier. */
   port: number;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
@@ -36,15 +38,13 @@ const DEFAULT_DEPENDENCIES: CheckSetupDependencies = {
   configureTrackers: () => {
     configureLinearAuthFromEnv();
   },
-  createContext: (restateStatus) => createSetupCheckContext({ restateStatus }),
+  createContext: (own) => createSetupCheckContext(own),
   refreshRunnerBackend: refreshRunnerBackendCache,
   fetch: (input, init) => fetch(input, init),
   port: parseHealthPort(process.env.PORT),
   writeStdout: (text) => process.stdout.write(text),
   writeStderr: (text) => process.stderr.write(text),
 };
-
-const HEALTH_TIMEOUT_MS = 5_000;
 
 const STATE_LABELS: Record<SetupCheckResult["state"], string> = {
   pass: "PASS",
@@ -61,20 +61,19 @@ const USAGE = `Usage: node dist/check-setup.js [--json]
   --json  print the run as JSON instead of a table
 `;
 
-/** The orchestrator's own Restate status, or why it could not be read. */
-async function readRestateStatus(deps: CheckSetupDependencies): Promise<SetupCheckRestateStatus | Error> {
-  let response: Response;
-  try {
-    response = await deps.fetch(`http://127.0.0.1:${deps.port}/`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
-  } catch {
-    return new Error(`The orchestrator is not answering on port ${deps.port}, so its Restate status cannot be read.`);
-  }
-  const body = (await response.json().catch(() => null)) as { restate?: SetupCheckRestateStatus } | null;
-  return body?.restate ?? new Error(`Port ${deps.port} answered without a Restate status, so it may not be this orchestrator.`);
+/** What the orchestrator's own health endpoint says of it, or why it could not be read. */
+async function readOwnHealth(deps: CheckSetupDependencies): Promise<{ restate: SetupCheckRestateStatus; instanceId: string } | Error> {
+  const read = await readOrchestratorHealth(`http://127.0.0.1:${deps.port}`, deps.fetch);
+  if (read.outcome === "no-response") return new Error(`The orchestrator is not answering on port ${deps.port}, so its health endpoint cannot be read.`);
+  if (read.outcome === "other-response") return new Error(`Port ${deps.port} answered without the orchestrator's health response, so it may not be this orchestrator.`);
+  return { restate: read.restate as SetupCheckRestateStatus, instanceId: read.instanceId as string };
 }
 
+/** A row as printed: a check's, or several checks' joined, whose `id` then lists theirs. */
+type PrintedRow = Pick<SetupCheckResult, "state" | "project" | "title" | "detail" | "fix"> & { id: string };
+
 /** One check's lines: its state, id and title, then its detail and fix beneath. The provisioning command prints its own checks this way too. */
-export function formatCheckRow(r: Pick<SetupCheckResult, "state" | "id" | "project" | "title" | "detail" | "fix">): string[] {
+export function formatCheckRow(r: PrintedRow): string[] {
   const indent = " ".repeat(LABEL_WIDTH + 4);
   const lines = [`  ${STATE_LABELS[r.state].padEnd(LABEL_WIDTH)}  ${r.id}${r.project ? ` (${r.project})` : ""}: ${r.title}`];
   if (r.detail) lines.push(`${indent}${r.detail}`);
@@ -82,11 +81,38 @@ export function formatCheckRow(r: Pick<SetupCheckResult, "state" | "id" | "proje
   return lines;
 }
 
+/**
+ * The rows to print: two or more of one project's rows that wait on the same check say only that it comes first, so they print as one,
+ * in the place of the first of them. The admin UI's groupWaitingRows shows them the same way.
+ */
+export function joinWaitingRows(rows: SetupCheckResult[]): PrintedRow[] {
+  const waiting = new Map<string, SetupCheckResult[]>();
+  const keyOf = (r: SetupCheckResult) => (r.waitsOn ? `${r.project ?? ""}\n${r.waitsOn}` : null);
+  for (const r of rows) {
+    const key = keyOf(r);
+    if (key) waiting.set(key, [...(waiting.get(key) ?? []), r]);
+  }
+  return rows.flatMap((r): PrintedRow[] => {
+    const group = waiting.get(keyOf(r) ?? "");
+    if (!group || group.length < 2) return [r];
+    if (group[0] !== r) return [];
+    const sameDetail = group.every((each) => each.detail === r.detail);
+    return [{
+      state: r.state,
+      id: group.map((each) => each.id).join(", "),
+      project: r.project,
+      title: `${group.length} checks wait on ${r.waitsOn}`,
+      detail: sameDetail ? r.detail : `None of them can be read until ${r.waitsOn} passes.`,
+      fix: r.fix,
+    }];
+  });
+}
+
 function formatRun(run: SetupCheckRun, failingCore: number): string {
   const lines: string[] = [];
   for (const group of new Set(run.results.map((r) => r.group))) {
-    lines.push(group);
-    for (const r of run.results.filter((result) => result.group === group)) lines.push(...formatCheckRow(r));
+    lines.push(SETUP_CHECK_GROUP_LABELS[group]);
+    for (const r of joinWaitingRows(run.results.filter((result) => result.group === group))) lines.push(...formatCheckRow(r));
     lines.push("");
   }
   lines.push(failingCore === 0 ? "No core check fails." : `${failingCore} core ${failingCore === 1 ? "check fails" : "checks fail"}.`);
@@ -111,13 +137,17 @@ export async function runCheckSetup(
 
   deps.useReadOnlyDb();
   deps.configureTrackers();
-  const restate = await readRestateStatus(deps);
+  const own = await readOwnHealth(deps);
   // The Fly sessions app can live only in Restate, so read it the way the server does once Restate answers.
-  if (!(restate instanceof Error) && restate.registration.state === "registered") await deps.refreshRunnerBackend();
+  if (!(own instanceof Error) && own.restate.registration.state === "registered") await deps.refreshRunnerBackend();
 
-  const context = deps.createContext(() => {
-    if (restate instanceof Error) throw restate;
-    return restate;
+  const ownOrThrow = () => {
+    if (own instanceof Error) throw own;
+    return own;
+  };
+  const context = deps.createContext({
+    restateStatus: () => ownOrThrow().restate,
+    orchestratorInstanceId: () => ownOrThrow().instanceId,
   });
   const run = await runSetupChecks(context, deps.checks);
   const failingCore = countFailingCore(run);

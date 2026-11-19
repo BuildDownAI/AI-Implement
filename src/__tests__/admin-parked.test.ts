@@ -22,10 +22,6 @@ vi.mock("../workflow-sync.js", () => ({
   }),
 }));
 
-vi.mock("../github-install-state.js", () => ({
-  probeInstallState: vi.fn(),
-}));
-
 class MockRequest extends EventEmitter {
   url?: string;
   method?: string;
@@ -123,7 +119,7 @@ async function login(): Promise<string> {
 
 function parkIssue(issueId: string, conclusion = "MAX_TURNS_EXHAUSTED"): void {
   for (let i = 0; i < 3; i++) {
-    breaker.recordDispatchFailure(issueId, "implementation", conclusion);
+    breaker.recordDispatchFailure(issueId, "implementation", conclusion, null);
   }
 }
 
@@ -189,6 +185,15 @@ describe("GET /api/parked", () => {
     expect(rows[0].repo).toBeNull();
   });
 
+  it("names an issue by the identifier its breaker recorded when no dispatch_log or dispatched row is left", async () => {
+    const token = await login();
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-pruned", "implementation", "MANAGED_REFUSED", { project: "SAN", identifier: "SAN-9" });
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueId: string; issueIdentifier: unknown; issueTitle: unknown; repo: unknown }>;
+    expect(rows).toEqual([expect.objectContaining({ issueId: "issue-pruned", issueIdentifier: "SAN-9", issueTitle: null, repo: null })]);
+  });
+
   it("falls back to a dispatch_log row from another phase", async () => {
     const token = await login();
     log.appendLog({ issueId: "issue-fb", issueIdentifier: "AII-737", issueTitle: "Mint token", repo: "org/repo", phase: "planning" });
@@ -242,9 +247,9 @@ describe("GET /api/parked", () => {
     log.appendLog({ issueId: "issue-multi", issueIdentifier: "AII-200", repo: "org/repo", phase: "implementation" });
 
     // Park in planning phase
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "planning", "DISPATCH_FAILED");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "planning", "DISPATCH_FAILED", null);
     // Park in implementation phase
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "implementation", "MAX_TURNS_EXHAUSTED");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "implementation", "MAX_TURNS_EXHAUSTED", null);
 
     const res = await makeRequest("/api/parked", "GET", token);
     expect(res.statusCode).toBe(200);
@@ -304,7 +309,7 @@ describe("POST /api/parked/unpark", () => {
     linearGraphql(page(), page()).install();
     const provider = new LinearProvider({});
     const input = { issueId: node.id, kind: "implementation" as const, teamKey: "AII", maxInProgressAiIssues: 1 };
-    breaker.parkIssue(node.id, "implementation", "failure");
+    breaker.parkIssue(node.id, "implementation", "failure", null);
     const parked = await provider.fetchAIImplementSnapshot();
     expect(parked.readyForImplementation).toEqual([]);
     expect(parked.needsPlanning).toEqual([]);

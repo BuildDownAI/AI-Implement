@@ -2,7 +2,7 @@
 // its header while the KG page renders both together through dispatchLogHtml.
 function dispatchLogControlsHtml(prefix: string): string {
   return `
-      <fieldset style="border:1px solid var(--border);border-radius:6px;padding:2px 10px 6px;margin:0;display:flex;align-items:center;gap:6px">
+      <fieldset style="border:1px solid var(--border-default);border-radius:6px;padding:2px 10px 6px;margin:0;display:flex;align-items:center;gap:6px">
         <legend style="font-size:0.7em;color:var(--fg-tertiary);padding:0 4px;margin-left:2px">Time Filter</legend>
         <select id="${prefix}-time-type" class="select" style="width:auto;height:30px" onchange="window.dispatchLogs['${prefix}'].onTimeTypeChange()">
           <option value="relative">Relative</option>
@@ -295,19 +295,19 @@ export const pipelinesScript = `
             const isRedispatch = !isIssuelessRunKind(impl.phase) && dn2 > 1;
             if (isRedispatch) tr.classList.add('redispatch-row');
             const dnBadge = isRedispatch
-              ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + window.esc(dn2) + '</span>'
+              ? '<span style="color:var(--st-warn-fg);font-weight:bold" title="Re-dispatch">' + window.esc(dn2) + '</span>'
               : window.esc((isIssuelessRunKind(impl.phase) ? 'run #' : '') + dn2);
-            const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:#aaa">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
+            const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:var(--fg-tertiary)">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
             const imageCell = impl.sessionImage
               ? '<td class="mono" title="' + window.escAttr(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
-              : '<td style="color:#aaa">—</td>';
+              : '<td style="color:var(--fg-tertiary)">—</td>';
             // A grouped row exists only when an implement dispatch followed this plan,
             // which requires plan approval — so a plan row stranded in a non-terminal
             // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
             const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
               ? 'completed' : plan.status;
             tr.setAttribute('data-planning-status', planStatus || 'dispatched');
-            const combinedStatus = statusBadge(planStatus, plan.conclusion, plan.failure) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion, impl.failure, impl.phase);
+            const combinedStatus = statusBadge(planStatus, plan.conclusion, plan.failure) + ' <span style="color:var(--fg-tertiary);font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion, impl.failure, impl.phase);
             const prLink = impl.prUrl ? '<a href="' + window.escAttr(window.safeUrl(impl.prUrl)) + '" target="_blank">View</a>' : '—';
             const logs = logsButton(impl);
             tr.innerHTML = '<td style="white-space:nowrap">' + window.esc(dt) + '</td>'
@@ -328,12 +328,12 @@ export const pipelinesScript = `
             const isRedispatch = !isIssuelessRunKind(entry.phase) && dn3 > 1;
             if (isRedispatch) tr.classList.add('redispatch-row');
             const dnBadge = isRedispatch
-              ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + window.esc(dn3) + '</span>'
+              ? '<span style="color:var(--st-warn-fg);font-weight:bold" title="Re-dispatch">' + window.esc(dn3) + '</span>'
               : window.esc((isIssuelessRunKind(entry.phase) ? 'run #' : '') + dn3);
             const runnerCell = phaseBadge(entry.phase) + ' ' + execBadge(entry.executionMode, entry.runnerMode);
             const imageCell = entry.sessionImage
               ? '<td class="mono" title="' + window.escAttr(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
-              : '<td style="color:#aaa">—</td>';
+              : '<td style="color:var(--fg-tertiary)">—</td>';
             let logCell;
             if (entry.machineId) {
               logCell = logsButton(entry);
@@ -346,7 +346,7 @@ export const pipelinesScript = `
             const isKgRefresh = entry.phase === 'kg-refresh';
             const cancelId = entry.machineId || (entry.executionMode === 'github-actions' ? String(entry.id) : null);
             const cancelCell = (isKgRefresh && isInflight && cancelId)
-              ? '<button data-cancel-id="' + window.escAttr(cancelId) + '" title="Cancel this run" style="background:none;border:none;cursor:pointer;padding:0 0 0 8px;color:var(--fail-fg,#dc2626);font:inherit">\u23f9 Stop</button>'
+              ? '<button data-cancel-id="' + window.escAttr(cancelId) + '" title="Cancel this run" style="background:none;border:none;cursor:pointer;padding:0 0 0 8px;color:var(--st-fail-fg);font:inherit">\u23f9 Stop</button>'
               : '';
             tr.innerHTML = '<td style="white-space:nowrap">' + window.esc(dt) + '</td>'
               + '<td style="text-align:center">' + dnBadge + '</td>'

@@ -1,4 +1,4 @@
-import { FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
+import { APP_TOKEN_STEP_FAILED, APP_TOKEN_STEP_FAILED_REMEDIATION, FLY_MACHINE_NEVER_STARTED, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,6 +15,7 @@ vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   getWorkflowRunStatus: vi.fn(),
   cancelWorkflowRun: vi.fn(),
+  getFailedRunStepJob: vi.fn().mockResolvedValue(null),
 }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn().mockResolvedValue("gh-token") }));
 vi.mock("../log.js", () => ({
@@ -38,7 +39,8 @@ vi.mock("../dispatch-admission.js", () => ({
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 
 import { acquireDispatch } from "../dispatch-gate.js";
-import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
+import { APP_TOKEN_STEP, cancelWorkflowRun, getFailedRunStepJob, getWorkflowRunStatus } from "../github.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { getJobByDispatchId, markJobFailureCommented, updateJobRunId, updateJobStatus } from "../log.js";
 import { parkIssue } from "../dispatch-breaker.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
@@ -451,7 +453,9 @@ describe("production deps", () => {
   });
 
   describe("finishJob", () => {
-    const row = { id: 7, issueId: "i-1", teamKey: "ENG", dispatchId: "d-1", status: "dispatched", conclusion: null };
+    const row = { id: 7, issueId: "i-1", issueIdentifier: "ENG-1", teamKey: "ENG", dispatchId: "d-1", status: "dispatched", conclusion: null };
+    // The park names the row's issue, so the breaker finds it once its dispatch rows are pruned.
+    const SUBJECT = { project: "ENG", identifier: "ENG-1" };
 
     it.each(["never-started", "started", "timeout", "read-error", "deadline"])("keeps planning semantics for %s", async scenario => {
       vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, executionMode: "fly-machines", machineId: "m-1" } as never);
@@ -463,7 +467,10 @@ describe("production deps", () => {
       await d.finishJob("d-1", { kind: scenario === "deadline" ? "deadline" : "run_ended" });
       const conclusion = scenario === "deadline" ? "deadline_exceeded" : "ended_without_callback";
       expect(updateJobStatus).toHaveBeenCalledWith(7, scenario === "deadline" ? "timed_out" : "failed", conclusion);
-      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", conclusion);
+      // Only a found cause re-closes the row, so the outcome step's own comment can name it.
+      expect(vi.mocked(updateJobStatus).mock.calls.map((call) => call[2])).toEqual(
+        scenario === "never-started" ? [conclusion, FLY_MACHINE_NEVER_STARTED] : [conclusion]);
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", conclusion, SUBJECT);
       if (scenario === "deadline") expect(getMachine).not.toHaveBeenCalled();
       else expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1", 10_000);
       const cause = scenario === "never-started" ? "Fly removed the machine before it started" :
@@ -472,6 +479,33 @@ describe("production deps", () => {
         cause + ". The issue is parked and will not be retried by itself. " +
         (scenario === "never-started" ? FLY_MACHINE_NEVER_STARTED_REMEDIATION + " " : "") +
         "Next: press Unpark at /admin#runners, then set the status to `Ready` (Jira) or keep the AI-Implement label (Linear).");
+    });
+
+    it.each([true, false])("names a failed GitHub App token step on a GitHub Actions run (failed=%s)", async (failed) => {
+      vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, executionMode: "github-actions", runId: 55 } as never);
+      if (failed) vi.mocked(getFailedRunStepJob).mockResolvedValueOnce({ jobName: "plan", htmlUrl: null });
+      const send = await recordRechecks();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      // Planning closes and parks first, before any network read, and then the row takes the cause the read found.
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback", SUBJECT);
+      expect(vi.mocked(updateJobStatus).mock.calls.map((call) => call[2])).toEqual(
+        failed ? ["ended_without_callback", APP_TOKEN_STEP_FAILED] : ["ended_without_callback"]);
+      expect(getFailedRunStepJob).toHaveBeenCalledWith("gh-token", expect.any(String), expect.any(String), 55, APP_TOKEN_STEP);
+      const reason = vi.mocked(provider.markPlanningFailed).mock.calls[0][2];
+      expect(reason.includes(APP_TOKEN_STEP_FAILED_REMEDIATION)).toBe(failed);
+      expect(reason.startsWith("GitHub Actions could not create the run's GitHub App token")).toBe(failed);
+      expect(send.mock.calls).toEqual(failed ? [[{ id: "github.target-secrets", project: "ENG", cause: "token-step" }]] : []);
+      if (failed) expect(warn).toHaveBeenCalledWith(expect.stringContaining("github.target-secrets"));
+    });
+
+    // A row this step re-closed with the cause it found is still its own, so a retry finishes the comment it owes.
+    it.each([FLY_MACHINE_NEVER_STARTED, APP_TOKEN_STEP_FAILED])("retries the handling of a row it closed as %s", async (conclusion) => {
+      vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, status: "failed", conclusion, executionMode: "github-actions", runId: 55 } as never);
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      expect(provider.markPlanningFailed).toHaveBeenCalledOnce();
     });
 
     it("does nothing for a row the callback already closed", async () => {
@@ -494,7 +528,7 @@ describe("production deps", () => {
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
       expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "ended_without_callback");
-      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback", SUBJECT);
       expect(provider.markPlanningFailed).toHaveBeenCalledWith("i-1", "ENG", expect.stringContaining("Unpark"));
       expect(markJobFailureCommented).toHaveBeenCalledWith(7);
       expect(remediateFailedJob).not.toHaveBeenCalled();
@@ -527,7 +561,7 @@ describe("production deps", () => {
       const { d } = compose();
       await d.finishJob("d-1", { kind: "deadline" });
       expect(updateJobStatus).toHaveBeenCalledWith(7, "timed_out", "deadline_exceeded");
-      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "deadline_exceeded");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "deadline_exceeded", SUBJECT);
     });
 
     it("does not throw when the tracker write fails, and leaves the failure comment unrecorded", async () => {

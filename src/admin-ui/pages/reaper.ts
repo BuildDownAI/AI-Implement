@@ -103,7 +103,7 @@ export const reaperScript = `
       let html = '<div style="display:flex;gap:20px;flex-wrap:wrap;font-size:0.9em">';
       html += '<span><b>24h total: ' + (summary.total24h != null ? summary.total24h : 0) + '</b></span>';
       for (const rule of rules) {
-        html += '<span style="color:#555">' + window.esc(rule) + ': <b>' + (byRule[rule] || 0) + '</b></span>';
+        html += '<span style="color:var(--fg-secondary)">' + window.esc(rule) + ': <b>' + (byRule[rule] || 0) + '</b></span>';
       }
       html += '</div>';
       summaryEl.innerHTML = html;
@@ -121,11 +121,9 @@ export const reaperScript = `
     empty.classList.add('hidden');
     for (const r of recent) {
       const tr = document.createElement('tr');
-      if (r.dryRun) tr.style.backgroundColor = '#f8f9fa';
+      if (r.dryRun) tr.style.backgroundColor = 'var(--bg-sunken)';
       const dt = new Date(r.createdAt).toLocaleString();
-      const modeBadge = r.dryRun
-        ? '<span class="badge" style="background:#6c757d;color:#fff">dry-run</span>'
-        : '<span class="badge" style="background:#e74c3c;color:#fff">destroyed</span>';
+      const modeBadge = r.dryRun ? window.labelBadge('neutral', 'dry-run') : window.labelBadge('fail', 'destroyed');
       tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
         + '<td class="mono">' + window.esc(r.ruleMatched) + '</td>'
         + '<td class="mono" title="' + window.escAttr(r.machineId) + '">' + window.esc(r.machineId.slice(0, 12)) + '</td>'

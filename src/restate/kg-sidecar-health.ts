@@ -7,12 +7,11 @@
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext } from "@restatedev/restate-sdk";
 import { clearKgRecoveryNotice, hasKgRecoveryNotice, postKgRecoveryNotice } from "../deploy-notify.js";
-import { isDeployHeld } from "../deploy-hold.js";
 import { isRemoteKgStore } from "../kg-sidecar.js";
 import type { SidecarHealth } from "../kg-provider.js";
 import { SidecarMemoryProvider, getKgMemoryProvider, isKgUnavailable, probeWithTimeout } from "../kg-provider.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
-import { restateCanServe } from "./status.js";
+import { restateCanStartWork } from "./status.js";
 
 export interface KgSidecarHealthDeps {
   /** A plain function (no ctx). Resolves `null` when there is nothing to probe. */
@@ -87,9 +86,7 @@ const SEND_TIMEOUT_MS = 10_000;
  * sidecar is available. A failed call logs one line and never throws.
  */
 export async function checkKgSidecarHealth(deps: CheckKgSidecarHealthDeps = {}): Promise<void> {
-  if ((deps.deployHeld ?? isDeployHeld)()) return;
-  const ready = deps.restateReady ?? restateCanServe;
-  if (!ready()) return;
+  if (!restateCanStartWork({ deployHeld: deps.deployHeld, canServe: deps.restateReady })) return;
   if (!(deps.unavailable ?? (() => isKgUnavailable() || hasKgRecoveryNotice()))()) return;
   try {
     const response = await (deps.fetchImpl ?? fetch)(

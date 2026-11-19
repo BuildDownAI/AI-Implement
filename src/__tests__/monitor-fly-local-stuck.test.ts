@@ -125,7 +125,7 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
       expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
       expect(provider.clearWorkingState).not.toHaveBeenCalled();
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
-      expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "machine_timeout");
+      expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "machine_timeout", { project: "AII", identifier: "AII-99" });
       const parked = vi.mocked(parkIssue).mock.invocationCallOrder[0];
       expect(parked).toBeGreaterThan(vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0]);
       expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
@@ -218,7 +218,7 @@ describe("remediateStuckJob — local-docker timeout path", () => {
       expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
       expect(provider.clearWorkingState).not.toHaveBeenCalled();
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
-      expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "container_timeout");
+      expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "container_timeout", { project: "AII", identifier: "AII-99" });
       const parked = vi.mocked(parkIssue).mock.invocationCallOrder[0];
       expect(parked).toBeGreaterThan(vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0]);
       expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
@@ -347,7 +347,7 @@ describe("remediateFailedJob — hard-stop (attempt 4+ = budget exhausted)", () 
     expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
     expect(provider.clearWorkingState).not.toHaveBeenCalled();
     expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
-    expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "failure");
+    expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "failure", { project: "AII", identifier: "AII-99" });
     const parked = vi.mocked(parkIssue).mock.invocationCallOrder[0];
     expect(parked).toBeGreaterThan(vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0]);
     expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(parked);

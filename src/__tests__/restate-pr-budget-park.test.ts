@@ -21,11 +21,11 @@ describe("Restate budget park composition", () => {
     const issueId = scenario === "no_tracker" ? null : "tracker-123";
     const parkId = issueId ?? "acme/app#7";
     if (scenario === "breaker_notified") {
-      breaker.parkIssue(parkId, "gap-analysis", "failed");
+      breaker.parkIssue(parkId, "gap-analysis", "failed", null);
       breaker.markTripNotified(parkId, "gap-analysis");
     }
     for (let i = 0; i < 2; i++) {
-      await index.parkRestatePrBudget(makeAppConfig(), registry, makeMapping(), issueId, "acme/app", 7, 2);
+      await index.parkRestatePrBudget(makeAppConfig(), registry, makeMapping(), issueId, { project: null, identifier: null }, "acme/app", 7, 2);
     }
     expect(breaker.isParked(parkId, "gap-analysis")).toBe(true);
     expect(postPr).toHaveBeenCalledTimes(1);
@@ -74,17 +74,19 @@ describe("Restate budget park composition", () => {
         (dispatch_id, repository, pr_number, request_kind, created_at) VALUES (?, ?, ?, ?, ?)`)
         .run("previous-run", scope.repository, 7, "automatic", Date.now());
       if (scenario === "breaker_first") {
-        breaker.parkIssue("tracker-123", "gap-analysis", "failed");
+        breaker.parkIssue("tracker-123", "gap-analysis", "failed", null);
         breaker.markTripNotified("tracker-123", "gap-analysis");
       }
       const attemptStore = new store.SqliteReviewFixAttemptStore();
       const appConfig = makeAppConfig({ runnerCallbackBaseUrl: "https://o", runnerTokenSecret: "s" });
       for (let i = 0; i < 3; i++) {
         expect(await production.admitReviewFix({ scope, feedback, jobTimeoutMinutes: 30 }, appConfig, attemptStore,
-          undefined, (m, issueId, repo, pr, budget) => index.parkRestatePrBudget(appConfig, registry, m, issueId, repo, pr, budget)))
+          undefined, (m, issueId, subject, repo, pr, budget) => index.parkRestatePrBudget(appConfig, registry, m, issueId, subject, repo, pr, budget)))
           .toEqual({ status: "deferred", reason: "budget_exhausted" });
         expect(breaker.isParked("tracker-123", "gap-analysis")).toBe(true);
       }
+      // The park names the queued issue's identifier and its project, so it is found once the PR's dispatch rows are pruned.
+      expect(breaker.breakersForIssue("ENG-123")).toEqual([expect.objectContaining({ issueId: "tracker-123", phase: "gap-analysis", project: "ENG", identifier: "ENG-123" })]);
       expect(comments).toHaveLength(1);
       expect(postPr).toHaveBeenCalledTimes(scenario === "pr_failure" ? 2 : 1);
       expect(postTracker).toHaveBeenCalledTimes(scenario === "breaker_first" ? 0 : scenario === "tracker_failure" ? 2 : 1);
@@ -101,7 +103,7 @@ describe("Restate budget park composition", () => {
       store: () => import("../review-fix-attempt-store.js"),
     } });
     config.upsertMapping("ENG", makeMapping({ owner: "acme", repo: "app" }));
-    breaker.parkIssue("acme/app#7", "gap-analysis", "pr_budget");
+    breaker.parkIssue("acme/app#7", "gap-analysis", "pr_budget", null);
     expect(await new store.SqliteReviewFixAttemptStore().admit({
       scope: { repository: "acme/app", prNumber: 7, installationId: 1 },
       feedback: { taskText: "fix", findings: [] }, jobTimeoutMinutes: 30,

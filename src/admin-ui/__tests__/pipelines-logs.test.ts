@@ -319,7 +319,7 @@ describe("recurring dispatch presentation", () => {
       const row = document.querySelector("#log-body tr")!;
       expect(row.classList.contains("redispatch-row")).toBe(true);
       expect(row.children[1].querySelector('[title="Re-dispatch"]')?.textContent).toBe("3");
-      expect(row.children[1].innerHTML).toContain("#d63384");
+      expect(row.children[1].innerHTML).toContain("var(--st-warn-fg)");
     } finally { dom.window.close(); }
   });
 });

@@ -1,4 +1,5 @@
 import { JSDOM } from "jsdom";
+import { helpersJs } from "../../../admin-ui/helpers.js";
 
 /** The part of a fetch `Response` the admin page scripts read. */
 export interface FakeApiResponse {
@@ -15,8 +16,8 @@ export type FakeApi = (url: string, init?: { method?: string; body?: string }) =
 export type AdminPageWindow = any;
 
 /**
- * Mounts one admin page's markup and script in jsdom the way the SPA runs it: the escaping helpers
- * `authJs` puts on `window` behave as they do in production, `window.api` answers from the test,
+ * Mounts one admin page's markup and script in jsdom the way the SPA runs it: the shared helpers
+ * `helpersJs` puts on `window` run as they do in production, `window.api` answers from the test,
  * and `registerPage` does nothing, so the test calls the page's loader itself.
  */
 export function mountAdminPage(options: {
@@ -32,32 +33,10 @@ export function mountAdminPage(options: {
     url: `http://localhost/admin#${options.route}`,
   });
   const win: AdminPageWindow = dom.window;
-  // esc, escAttr and safeUrl follow authJs in src/admin-ui/auth.ts; change them together.
-  win.esc = (s: unknown) => {
-    const d = win.document.createElement("div");
-    d.textContent = String(s == null ? "" : s);
-    return d.innerHTML;
-  };
-  win.escAttr = (s: unknown) =>
-    String(s == null ? "" : s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#x27;");
-  win.safeUrl = (s: unknown) => {
-    if (s == null) return "#";
-    const str = String(s);
-    if (!str) return "";
-    if (str[0] === "#" || str[0] === "/" || str[0] === "." || !str.includes(":")) return str;
-    try {
-      const url = new URL(str);
-      if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") return str;
-    } catch {
-      // a malformed URL with a colon is blocked, as in production
-    }
-    return "#";
-  };
+  // The real helpers.ts script, so the escaping, badge and time helpers are production's own.
+  const helpers = dom.window.document.createElement("script");
+  helpers.textContent = helpersJs;
+  dom.window.document.head.appendChild(helpers);
   win.registerPage = () => {};
   win.api = options.api;
   options.before?.(win);

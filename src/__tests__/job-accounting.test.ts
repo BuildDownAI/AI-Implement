@@ -661,7 +661,7 @@ describe("published value limits are enforced where the record is served (AII-15
   function rawJob(dispatchId: string, at: number): number {
     const id = log.appendLog({ issueId: `issue-${at}`, dispatchId, executionMode: "fly-machines" });
     dedup.getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(at, id);
-    // The trigger stamps the wall clock; pin changed_at to the completion time like a job that never changed again.
+    // As finishedJob does: the trigger stamps the wall clock over a changed_at set in the same write, so pin it after.
     dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(at, id);
     return id;
   }

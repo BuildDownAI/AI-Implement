@@ -449,7 +449,7 @@ export const settingsScript = `
           const tr = document.createElement('tr');
           const dt = s.createdAt ? new Date(s.createdAt).toLocaleString() : '—';
           tr.innerHTML = '<td class="mono">' + window.esc(s.name) + '</td>'
-            + '<td style="color:#888;font-size:0.85em">' + dt + '</td>'
+            + '<td style="color:var(--fg-tertiary);font-size:0.85em">' + dt + '</td>'
             + '<td></td>';
           const delSecretBtn = document.createElement('button');
           delSecretBtn.className = 'sm danger';

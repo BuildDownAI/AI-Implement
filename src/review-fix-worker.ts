@@ -80,6 +80,8 @@ import { resolveWorkflowCapabilities, type ResolveWorkflowContractInput, type Wo
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import { RunnerImageNotAllowedError } from "./repo-image.js";
 import { getMappings, type RepoMapping } from "./config.js";
+import { dispatchFailureChecks } from "./dispatch-failure.js";
+import { pointAtSetupChecks } from "./setup-checks/recheck.js";
 import type {
   AttemptId,
   ScopedPrIdentity,
@@ -275,15 +277,19 @@ export const githubActionsReviewFixWorkerTransport: ReviewFixWorkerTransport = {
 // adapter needs workflowFile/defaultBranch, which ScopedPrIdentity does not carry)
 // ---------------------------------------------------------------------------
 
-function findMapping(repository: string): RepoMapping | null {
+function findMappingEntry(repository: string): [string, RepoMapping] | null {
   const separator = repository.indexOf("/");
   if (separator < 0) return null;
   const owner = repository.slice(0, separator);
   const repo = repository.slice(separator + 1);
-  for (const mapping of Object.values(getMappings())) {
-    if (mapping.owner === owner && mapping.repo === repo) return mapping;
+  for (const entry of Object.entries(getMappings())) {
+    if (entry[1].owner === owner && entry[1].repo === repo) return entry;
   }
   return null;
+}
+
+function findMapping(repository: string): RepoMapping | null {
+  return findMappingEntry(repository)?.[1] ?? null;
 }
 
 /** Exact-suffix match against the AII-782 run-name format
@@ -548,8 +554,9 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     if ((plan.executionBackend ?? "github-actions") !== "github-actions") {
       return { status: "rejected", reason: "GitHub worker requires a github-actions launch plan" };
     }
-    const mapping = findMapping(plan.scope.repository);
-    if (!mapping) return { status: "unknown" };
+    const entry = findMappingEntry(plan.scope.repository);
+    if (!entry) return { status: "unknown" };
+    const [project, mapping] = entry;
 
     let credential: ReviewFixWorkerCredential;
     try {
@@ -640,7 +647,10 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     }
 
     if (result.outcome === "rejected") {
-      // The API response may echo the private request. Never journal it for a managed launch.
+      // The API response may echo the private request, so the line logs the status alone, and a managed launch never journals it.
+      const checks = dispatchFailureChecks(result.status);
+      console.warn(`[review-fix] GitHub refused the dispatch for ${plan.scope.repository}#${plan.scope.prNumber}: HTTP ${result.status}`
+        + (checks ? pointAtSetupChecks({ ...checks, project }) : ""));
       return finish({ status: "rejected", reason: managed
         ? `GitHub rejected the managed dispatch (HTTP ${result.status})`
         : result.error ?? `GitHub rejected the dispatch (HTTP ${result.status})` });

@@ -1,7 +1,21 @@
+import { onTestFinished, vi, type Mock } from "vitest";
 import { LINEAR_LABELS } from "../../../providers/linear.js";
 import type { FoundLabel, LinearSetupFacts } from "../../../providers/types.js";
-import type { SetupCheckContext } from "../../../setup-checks/index.js";
+import type { GitHubSetupFacts, SetupCheckContext } from "../../../setup-checks/index.js";
+import type { SetupCheckRecheck } from "../../../setup-checks/recheck.js";
 import { makeMapping } from "../builders.js";
+
+/**
+ * Records every recheck a runtime failure asks for during the test, and clears the sender when the test finishes.
+ * It imports the recheck module when called, so after testDb's reset it sets the sender on the copy the code under test reads.
+ */
+export async function recordRechecks(): Promise<Mock<(request: SetupCheckRecheck) => Promise<boolean>>> {
+  const recheck = await import("../../../setup-checks/recheck.js");
+  const send = vi.fn(async (_request: SetupCheckRecheck) => true);
+  recheck.setSetupCheckRecheckSender(send);
+  onTestFinished(() => recheck.setSetupCheckRecheckSender(null));
+  return send;
+}
 
 /** Every secret variable a check could read, each set to a value that names itself, so a test can assert none reaches any output. */
 export const SECRET_SENTINELS = {
@@ -15,6 +29,7 @@ export const SECRET_SENTINELS = {
   MICROSOFT_OAUTH_CLIENT_SECRET: "sentinel-microsoft-secret",
   BUILDDOWN_OIDC_CLIENT_SECRET: "sentinel-builddown-secret",
   LINEAR_CLIENT_SECRET: "sentinel-linear-secret",
+  GITHUB_WEBHOOK_SECRET: "sentinel-webhook-secret",
 } as const;
 
 /**
@@ -39,9 +54,33 @@ export function makeSetupCheckContext(overrides: Partial<SetupCheckContext> = {}
     restateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
     databasePath: () => ({ path: "/data/dedup.sqlite", configured: "/data/dedup.sqlite", fellBack: false }),
     onSeparateFilesystem: () => true,
-    trackerProvider: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} tracker`)),
+    trackerProvider: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} ticketing system`)),
     // A provider that cannot be built has no facts to read either, as in createSetupCheckContext.
-    trackerSetupFacts: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} tracker`)),
+    trackerSetupFacts: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} ticketing system`)),
+    githubSetupFacts: () => makeGitHubSetupFacts(),
+    // Nothing answers at any address, as on a refused connection.
+    orchestratorHealthAt: () => Promise.resolve({ outcome: "no-response", timedOut: false, error: "fetch failed: connect ECONNREFUSED" }),
+    orchestratorInstanceId: () => "this-orchestrator",
+    ...overrides,
+  };
+}
+
+/**
+ * GitHub's side for an orchestrator with no App credentials: every GitHub read refuses as the production reads do
+ * without them, and no project has ever been synced. A test overrides only the reads its check makes.
+ */
+export function makeGitHubSetupFacts(overrides: Partial<GitHubSetupFacts> = {}): GitHubSetupFacts {
+  const noApp = () => Promise.reject(new Error("GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY are not both set"));
+  return {
+    app: noApp,
+    installation: noApp,
+    installationRepositories: noApp,
+    repositories: noApp,
+    publicRepository: noApp,
+    deliveries: noApp,
+    kgSourceRepo: () => null,
+    kgPreflight: () => Promise.resolve(null),
+    workflowSync: () => null,
     ...overrides,
   };
 }

@@ -9,8 +9,8 @@ import {
   STATUS_VALUES,
   type ResolvedFieldIds,
 } from "../providers/jira-fields.js";
-import type { JiraFieldOptions, JiraProjectSetupFacts, JiraSetupFacts, LinearSetupFacts } from "../providers/types.js";
-import type { SetupCheck, SetupCheckContext, SetupCheckOutcome } from "./index.js";
+import type { JiraFieldOptions, JiraProjectSetupFacts, JiraSetupFacts, LinearSetupFacts, TrackerSetupFacts } from "../providers/types.js";
+import { forEachProject, waitOn, type SetupCheck, type SetupCheckContext, type SetupCheckOutcome } from "./contract.js";
 
 type MintedLinearFacts = Extract<LinearSetupFacts, { token: "minted" }>;
 type AcceptedJiraFacts = Extract<JiraSetupFacts, { credentials: "accepted" }>;
@@ -24,17 +24,36 @@ function projectsOn(ctx: SetupCheckContext, providerId: string): string[] {
   return Object.entries(ctx.mappings()).filter(([, mapping]) => mapping.ticketingProvider === providerId).map(([key]) => key);
 }
 
-/** Judges Linear's facts once its token is minted, or says why they cannot be read. */
+/** The setup facts `providerId` reads for `projects`, or a row for each of them saying why they could not be read. */
+async function readSetupFacts(ctx: SetupCheckContext, providerId: string, projects: string[]): Promise<{ facts: TrackerSetupFacts | null } | { unread: SetupCheckOutcome[] }> {
+  try {
+    return { facts: await ctx.trackerSetupFacts(providerId) };
+  } catch (err) {
+    // Most often a provider that cannot be built, which tracker.provider names with its fix.
+    return { unread: forEachProject(projects, {
+      state: "cannot-verify",
+      detail: `The ${providerId} setup facts could not be read: ${err instanceof Error ? err.message : String(err)}`,
+      ...waitOn("tracker.provider"),
+    }) };
+  }
+}
+
+/**
+ * Judges Linear's facts once its token is minted, or says for each project why they cannot be read.
+ * With no Linear project it answers nothing, since tracker.linear.credentials already says so.
+ */
 async function judgeLinear(
   ctx: SetupCheckContext,
   judge: (facts: MintedLinearFacts, projects: string[]) => SetupCheckOutcome[],
 ): Promise<SetupCheckOutcome[]> {
   const projects = projectsOn(ctx, "linear");
-  if (projects.length === 0) return NO_LINEAR_PROJECT;
-  const facts = await ctx.trackerSetupFacts("linear");
-  if (facts === null || facts.kind !== "linear") return [{ state: "cannot-verify", detail: "The Linear provider reads no setup facts", fix: "Check the team's labels and states by hand." }];
+  if (projects.length === 0) return [];
+  const read = await readSetupFacts(ctx, "linear", projects);
+  if ("unread" in read) return read.unread;
+  const { facts } = read;
+  if (facts === null || facts.kind !== "linear") return forEachProject(projects, { state: "cannot-verify", detail: "The Linear provider reads no setup facts", fix: "Check the team's labels and states by hand." });
   if (facts.token === "refused") {
-    return [{ state: "cannot-verify", detail: "Linear gave the app no token, so this cannot be read", fix: "Clear tracker.linear.credentials first." }];
+    return forEachProject(projects, { state: "cannot-verify", detail: "Linear gave the app no token, so the team's setup cannot be read", ...waitOn("tracker.linear.credentials") });
   }
   return judge(facts, projects);
 }
@@ -44,7 +63,7 @@ function perVisibleTeam(facts: MintedLinearFacts, projects: string[], judge: (te
   return projects.map((team): SetupCheckOutcome => ({
     ...(team in facts.teams
       ? judge(team)
-      : { state: "cannot-verify", detail: `The app cannot see team ${team}, so this cannot be read`, fix: "Clear tracker.linear.team-access first." }),
+      : { state: "cannot-verify", detail: `The app cannot see team ${team}, so its setup cannot be read`, ...waitOn("tracker.linear.team-access") }),
     project: team,
   }));
 }
@@ -54,17 +73,22 @@ function labelsInScope(facts: MintedLinearFacts, name: string, team: string) {
   return facts.labels[name].filter((label) => label.teamKey === null || label.teamKey === team);
 }
 
-/** Judges Jira's facts once Jira accepts the credentials, or says why they cannot be read. */
+/**
+ * Judges Jira's facts once Jira accepts the credentials, or says for each project why they cannot be read.
+ * With no Jira project it answers nothing, since tracker.jira.credentials already says so.
+ */
 async function judgeJira(
   ctx: SetupCheckContext,
   judge: (facts: AcceptedJiraFacts, projects: string[]) => SetupCheckOutcome[],
 ): Promise<SetupCheckOutcome[]> {
   const projects = projectsOn(ctx, "jira");
-  if (projects.length === 0) return NO_JIRA_PROJECT;
-  const facts = await ctx.trackerSetupFacts("jira");
-  if (facts === null || facts.kind !== "jira") return [{ state: "cannot-verify", detail: "The Jira provider reads no setup facts", fix: "Check the projects' fields and JQL by hand." }];
+  if (projects.length === 0) return [];
+  const read = await readSetupFacts(ctx, "jira", projects);
+  if ("unread" in read) return read.unread;
+  const { facts } = read;
+  if (facts === null || facts.kind !== "jira") return forEachProject(projects, { state: "cannot-verify", detail: "The Jira provider reads no setup facts", fix: "Check the projects' fields and JQL by hand." });
   if (facts.credentials === "refused") {
-    return [{ state: "cannot-verify", detail: "Jira did not accept the credentials, so this cannot be read", fix: "Clear tracker.jira.credentials first." }];
+    return forEachProject(projects, { state: "cannot-verify", detail: "Jira did not accept the credentials, so the project's setup cannot be read", ...waitOn("tracker.jira.credentials") });
   }
   return judge(facts, projects);
 }
@@ -80,7 +104,7 @@ function perResolvedProject(
     return {
       ...(project?.fields === "resolved"
         ? judge(project, key)
-        : { state: "cannot-verify", detail: "This project's Jira fields cannot be found, so this cannot be read", fix: "Clear tracker.jira.fields first." }),
+        : { state: "cannot-verify", detail: "This project's Jira fields cannot be found, so the rest of its setup cannot be read", ...waitOn("tracker.jira.fields") }),
       project: key,
     };
   });
@@ -129,10 +153,12 @@ function unreadOptions(options: Extract<JiraFieldOptions, { read: "failed" }>, f
 export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
   {
     id: "tracker.provider",
-    title: "Tracker providers",
+    title: "Ticketing system providers",
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: async (ctx) => {
       const byProvider = new Map<string, string[]>();
       for (const [key, mapping] of Object.entries(ctx.mappings())) {
@@ -146,8 +172,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
           if (provider.fetchSetupFacts) return { state: "pass", detail: `The ${id} provider is ready for ${names}` };
           return {
             state: "cannot-verify",
-            detail: `The ${id} provider has no setup checks, so the tracker setup of ${names} is not checked`,
-            fix: "Check the tracker's credentials, labels and states by hand.",
+            detail: `The ${id} provider has no setup checks, so the ticketing system setup of ${names} is not checked`,
+            fix: "Check the ticketing system's credentials, labels and states by hand.",
           };
         } catch (err) {
           return {
@@ -165,6 +191,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: async (ctx) => {
       if (projectsOn(ctx, "linear").length === 0) return NO_LINEAR_PROJECT;
       const facts = await ctx.trackerSetupFacts("linear");
@@ -186,6 +214,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeLinear(ctx, (facts, projects) => projects.map((team): SetupCheckOutcome => (team in facts.teams
       ? { project: team, state: "pass", detail: `The app can see team ${team}` }
       : {
@@ -201,6 +231,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeLinear(ctx, (facts, projects) => perVisibleTeam(facts, projects, (team) => {
       const pickup = facts.pickupLabel;
       const found = labelsInScope(facts, pickup, team);
@@ -225,6 +257,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeLinear(ctx, (facts, projects) => perVisibleTeam(facts, projects, (team) => {
       const lifecycle = Object.values(LINEAR_LABELS).map((label) => label.name);
       const missing: string[] = [];
@@ -259,6 +293,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeLinear(ctx, (facts, projects) => perVisibleTeam(facts, projects, (team) => {
       const missing = ["started", "completed"].filter((type) => !facts.teams[team].includes(type));
       if (missing.length === 0) return { state: "pass", detail: `Team ${team} has a started and a completed state` };
@@ -275,6 +311,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: async (ctx) => {
       if (projectsOn(ctx, "jira").length === 0) return NO_JIRA_PROJECT;
       const facts = await ctx.trackerSetupFacts("jira");
@@ -296,7 +334,7 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
       if (facts.oauth) {
         return [{
           state: "fail",
-          detail: "Jira accepted the OAuth access token, but it expires within an hour and the orchestrator never refreshes it, so every Jira call fails after that",
+          detail: "Jira accepted the OAuth access token, but it is short-lived and the orchestrator never refreshes it, so every Jira call fails once it expires",
           fix: "Use Basic mode: set JIRA_EMAIL to the account's address and JIRA_TOKEN to an API token, then restart the orchestrator.",
         }];
       }
@@ -309,6 +347,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeJira(ctx, (facts, projects) => projects.map((key): SetupCheckOutcome => {
       const project = facts.projects[key];
       if (project.fields === "unreadable") {
@@ -349,6 +389,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeJira(ctx, (facts, projects) => perResolvedProject(facts, projects, (project) => {
       if (project.cachedIds === null || sameFieldIds(project.ids, project.cachedIds)) {
         return { state: "pass", detail: "The poll uses this project's current field IDs" };
@@ -366,6 +408,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeJira(ctx, (facts, projects) => perResolvedProject(facts, projects, (project, key) => {
       const options = project.statusOptions;
       if (options.read === "failed") return unreadOptions(options, "status field");
@@ -393,6 +437,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeJira(ctx, (facts, projects) => perResolvedProject(facts, projects, (project, key) => {
       const options = project.repoOptions;
       if (options.read === "failed") return unreadOptions(options, "repo field");
@@ -413,6 +459,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeJira(ctx, (facts, projects) => perResolvedProject(facts, projects, (project) => {
       if (project.jql.accepted) return { state: "pass", detail: "Jira runs the project's JQL as the poll runs it" };
       const { status, error } = project.jql.failure;
@@ -436,12 +484,17 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "tracker",
     tier: "mode",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: async (ctx) => {
+      // With no Filesystem project it answers nothing, as each Jira project check does with no Jira project.
       const projects = projectsOn(ctx, "filesystem");
-      if (projects.length === 0) return [{ state: "not-applicable", detail: "No project uses Filesystem" }];
-      const facts = await ctx.trackerSetupFacts("filesystem");
+      if (projects.length === 0) return [];
+      const read = await readSetupFacts(ctx, "filesystem", projects);
+      if ("unread" in read) return read.unread;
+      const { facts } = read;
       if (facts === null || facts.kind !== "filesystem") {
-        return [{ state: "cannot-verify", detail: "The Filesystem provider reads no setup facts", fix: "Check each project's ticket directory by hand." }];
+        return forEachProject(projects, { state: "cannot-verify", detail: "The Filesystem provider reads no setup facts", fix: "Check each project's ticket directory by hand." });
       }
       return projects.map((key): SetupCheckOutcome => {
         const { directory, fault } = facts.directories[key];

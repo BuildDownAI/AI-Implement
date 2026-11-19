@@ -4,6 +4,8 @@
 // out), but private to this module and with an explicit reset seam — see AII-773.
 // No wiring into server.ts/endpoint.ts here; AII-724 and AII-807 consume this later.
 
+import { isDeployHeld } from "../deploy-hold.js";
+
 export type RestateSidecarStatus =
   | { state: "starting" }
   | { state: "ready" }
@@ -42,6 +44,14 @@ export function getRestateStatus(): RestateStatus {
 /** Whether Restate can take a call now: the sidecar ready and this endpoint registered. Before that, a call can reach a deployment that lacks its handler and retry forever (AII-1281). */
 export function restateCanServe(status: RestateStatus = getRestateStatus()): boolean {
   return status.sidecar.state === "ready" && status.registration.state === "registered";
+}
+
+/**
+ * Whether new work may start through Restate: it can serve, and no deploy holds new work back while this process is replaced.
+ * The rule for every call or send that starts an invocation (docs/restate.md lists the exemptions); a read of a shared handler needs only `restateCanServe`.
+ */
+export function restateCanStartWork({ deployHeld = isDeployHeld, canServe = restateCanServe }: { deployHeld?: () => boolean; canServe?: () => boolean } = {}): boolean {
+  return !deployHeld() && canServe();
 }
 
 /** Merges the supplied field(s) independently — a patch naming only one of `sidecar`/`registration` leaves the other untouched. */

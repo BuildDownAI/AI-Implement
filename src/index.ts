@@ -4,7 +4,9 @@ import { bindKey, clearKeyBinding } from "./restate/key-binding.js";
 import { initKeyBindingsTable } from "./key-bindings.js";
 import { checkTrackerWrites } from "./tracker-write-gate.js";
 import { buildHealthBody } from "./health-body.js";
-import { createSetupCheckContext, getLastSetupCheckRun } from "./setup-checks/index.js";
+import { BEFORE_FIRST_SYNC, createSetupCheckContext, getCachedSetupCheckRun, getSetupCheckProgress, runProjectSetupChecks, setupChecksHealthField } from "./setup-checks/index.js";
+import { gitHubAppErrorChecks, pointAtSetupChecks, readOnSetupPage, setSetupCheckRecheckSender } from "./setup-checks/recheck.js";
+import { createSetupCheckChangeDetector, readSavedSetup } from "./setup-checks/change-detector.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
@@ -33,13 +35,13 @@ import {
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, listAllOpenPullRequests, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
-import { surfaceDispatchFailure } from "./dispatch-failure.js";
+import { breakerSetupChecks, surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
-import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
+import { getIssueEnrichment, getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
 import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSnapshots, trackerReadChecks, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, onSelfDeployOutcome, postAvailableNotice, postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
@@ -56,14 +58,14 @@ import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
 import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
-import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor, claimPrBudgetNotice, prBudgetMarker, releasePrBudgetNotice, prBudgetTrackerCommentOwed, markTripNotified } from "./dispatch-breaker.js";
+import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor, breakerProject, claimPrBudgetNotice, prBudgetMarker, releasePrBudgetNotice, prBudgetTrackerCommentOwed, markTripNotified, type BreakerSubject } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
-import { createSetupChecksHydration, readSetupChecksViaObject, runSetupChecksViaObject } from "./restate/setup-checks.js";
+import { createProductionBootSetupChecks, createSetupChecksHydration, createSetupChecksIngressClient } from "./restate/setup-checks.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
@@ -250,7 +252,7 @@ export interface AppConfig {
   selfDeployTarget: SelfDeployTarget | null; // build-stamped; null when the image carries no stamps
 }
 
-function loadConfig(): AppConfig {
+export function loadConfig(): AppConfig {
   const required = (key: string): string => {
     const val = process.env[key];
     if (!val) throw new Error(`Missing required env var: ${key}`);
@@ -456,6 +458,16 @@ async function getTargetRepoToken(
 /** True once the KG composition (and so the `PipelineSchedule` service) is bound at boot. */
 let kgScheduleBound = false;
 
+/** Fills this process's cache of the stored setup-check run: at registration, then each cycle until a read answers. */
+const setupChecksClient = createSetupChecksIngressClient();
+const hydrateSetupChecks = createSetupChecksHydration(() => setupChecksClient.read());
+/** The setup checks' change detector. Each cycle compares with the one before, so its memory lives as long as the process. */
+const setupCheckChangeDetector = createSetupCheckChangeDetector({
+  readSavedSetup: () => readSavedSetup(createSetupCheckContext({ restateStatus: getRestateStatus })),
+  send: (run) => setupChecksClient.send(run),
+  log: (line) => { console.log(line); },
+});
+
 /** Tracker kind and issue URL for a review-fix job row; a lookup failure never blocks the row. */
 async function reviewFixAccounting(
   registry: ProviderRegistry,
@@ -482,6 +494,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     await checkPipelineSchedules(["kg-refresh"]);
     await checkKgSidecarHealth();
   }
+  // Outside the cycle deadline too: neither throws, and each bounds its own reads.
+  void hydrateSetupChecks();
+  await setupCheckChangeDetector.onPollCycle();
   await runWithDeadline(
     cycleId,
     started,
@@ -563,7 +578,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
       providerFor: (m) => registry.forMapping(m),
       clear: (id) => { deleteDispatched(id); },
       recordNotFound: async (id) => {
-        const br = recordDispatchFailure(id, "implementation", "reconcile_not found");
+        // The dedup row is already cleared, so the issue's newest dispatch row is the one place left that names it.
+        const br = recordDispatchFailure(id, "implementation", "reconcile_not found",
+          { project: getLatestTeamKeyForIssue(id), identifier: getIssueEnrichment(id, "implementation").issueIdentifier });
         if (br.tripped) {
           await fireBreakerTrip(config, null, id, null, "implementation", br.failures, "reconcile_not found");
         }
@@ -587,13 +604,15 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
           await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config);
         } catch (err) {
           reconciliationFailedScopes.add(scopeKey);
-          console.error(`[roll-up-review] ${provider.id}/${scopeKey} reconciliation failed; its issues sit out this cycle:`, err);
+          const pointer = pointAtSetupChecks({ ids: trackerReadChecks(provider.id), project: scopeKey, cause: "tracker-read" });
+          console.error(`[roll-up-review] ${provider.id}/${scopeKey} reconciliation failed; its issues sit out this cycle${pointer}:`, err);
         }
       }
     }
     const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
     for (const { providerId, error } of failed) {
-      console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle:`, error);
+      const pointer = pointAtSetupChecks({ ids: trackerReadChecks(providerId), cause: "tracker-read" });
+      console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle${pointer}:`, error);
     }
 
     // Finalize empty grouping parents (all children terminal, blank spec) — markMerged so the
@@ -830,8 +849,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
           // dispatching a run that cannot work.
           const eligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
           if (!eligibility.eligible) {
+            const pointer = pointAtSetupChecks({ ids: [eligibility.check], project: issue.scopeKey, cause: "launch-refused" });
             console.log(
-              `[poll] Skipping ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${eligibility.reason}`,
+              `[poll] Skipping ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${eligibility.reason}${pointer}`,
             );
             continue;
           }
@@ -890,7 +910,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
           });
         }
       } catch (err) {
-        console.error(`[poll] Error processing ${issue.identifier}:`, err);
+        // The token mint and the base-branch reads are GitHub App reads, so a setup fault shows here by its status and path.
+        const pointer = pointAtSetupChecks({ ids: gitHubAppErrorChecks(err), project: issue.scopeKey, cause: "github-read" });
+        console.error(`[poll] Error processing ${issue.identifier}${pointer}:`, err);
       }
     }
 
@@ -1096,8 +1118,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
 /**
  * Fires after recordDispatchFailure returns tripped=true. Posts a tracker
  * comment and a webhook notification, both best-effort. Never throws.
+ * Exported for direct testing.
  */
-async function fireBreakerTrip(
+export async function fireBreakerTrip(
   config: AppConfig,
   provider: TicketingProvider | null,
   issueId: string,
@@ -1111,6 +1134,9 @@ async function fireBreakerTrip(
   );
 
   const runUrls = getRecentFailedRunUrls(issueId, phase, 3);
+  // Names only: a tracker comment's readers are the tracker's, so a check's detail and fix stay on the Setup page.
+  const setup = breakerSetupChecks(getCachedSetupCheckRun(), conclusion, breakerProject(issueId, phase));
+  const named = `${setup.ids.map((id) => `\`${id}\``).join(", ")}. ${readOnSetupPage(setup.ids.length)}.`;
   const commentLines = [
     `**⛔ AI-Implement parked this issue**`,
     ``,
@@ -1119,6 +1145,9 @@ async function fireBreakerTrip(
     `- Phase: \`${phase}\``,
     `- Failures: ${failures}`,
     `- Last conclusion: \`${conclusion}\``,
+    ...(setup.ids.length === 0 ? [] : setup.failing
+      ? [`- ${setup.ids.length === 1 ? "Setup check" : "Setup checks"} failing for this project: ${named}`]
+      : [`- Setup checks that explain it: ${named}`]),
     ...(runUrls.length > 0
       ? [`- Failed runs:`, ...runUrls.map((u) => `  - ${u}`)]
       : []),
@@ -1161,11 +1190,12 @@ async function firePrBudgetPark(
   registry: ProviderRegistry,
   mapping: RepoMapping,
   issueId: string,
+  subject: BreakerSubject,
   repo: string,
   prNumber: number,
   budget: number,
 ): Promise<void> {
-  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget");
+  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget", subject);
   const parkedAt = claimPrBudgetNotice(issueId, "gap-analysis");
   if (parkedAt == null) return;
 
@@ -1210,7 +1240,7 @@ async function firePrBudgetPark(
 /** Preserve the proven park/notice mechanism for PRs with no tracker identity. */
 export async function parkRestatePrBudget(
   config: AppConfig, registry: ProviderRegistry, mapping: RepoMapping,
-  trackerIssueId: string | null, repo: string, prNumber: number, budget: number,
+  trackerIssueId: string | null, subject: BreakerSubject, repo: string, prNumber: number, budget: number,
 ): Promise<void> {
   // Only tracker delivery is suppressed. No provider needs to be configured for
   // an issueless PR; the stable PR identity still owns its park and notice claim.
@@ -1221,7 +1251,7 @@ export async function parkRestatePrBudget(
     },
   });
   await firePrBudgetPark(config, noticeRegistry, mapping, trackerIssueId || `${repo}#${prNumber}`,
-    repo, prNumber, budget);
+    subject, repo, prNumber, budget);
 }
 
 // ---------- Dispatch: GitHub Actions ----------
@@ -1326,7 +1356,7 @@ export async function dispatchGitHubActions(
       if (decision.kind === "refuse") {
         await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision));
         // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code);
+        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code, { project: issue.scopeKey, identifier: issue.identifier });
         if (breakerRefuse.tripped) {
           await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breakerRefuse.failures, decision.code);
         }
@@ -1457,8 +1487,9 @@ export async function preparePlanningDispatch(
   // AII-306: same forced-mode eligibility guard as implementation dispatch.
   const planningEligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
   if (!planningEligibility.eligible) {
+    const pointer = pointAtSetupChecks({ ids: [planningEligibility.check], project: issue.scopeKey, cause: "launch-refused" });
     console.log(
-      `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}`,
+      `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}${pointer}`,
     );
     return null;
   }
@@ -1469,7 +1500,7 @@ export async function preparePlanningDispatch(
   const callbackBlockReason = planningDispatchBlockReason(config);
   if (callbackBlockReason) {
     console.error(
-      `[poll] Refusing to dispatch planning for ${issue.identifier}: ${callbackBlockReason}`,
+      `[poll] Refusing to dispatch planning for ${issue.identifier}: ${callbackBlockReason}${pointAtSetupChecks({ ids: ["callback.config"], cause: "planning-refused" })}`,
     );
     return null;
   }
@@ -1787,13 +1818,13 @@ export async function dispatchSession(
       admission?.release("launch_rejected");
       if (decision.kind === "refuse") {
         const text = refusalText(decision);
-        if (opts.phase === "implementation") {
-          await provider.markImplementationFailed(issue.id, issue.scopeKey, text);
-        } else {
-          await provider.markPlanningFailed(issue.id, issue.scopeKey, text);
-        }
+        // A failed write must not skip the count below, or the refusal repeats every poll without parking.
+        await (opts.phase === "implementation"
+          ? provider.markImplementationFailed(issue.id, issue.scopeKey, text)
+          : provider.markPlanningFailed(issue.id, issue.scopeKey, text))
+          .catch((err) => console.error(`[poll] Refusal comment failed for ${issue.identifier}:`, err));
         // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code);
+        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code, { project: issue.scopeKey, identifier: issue.identifier });
         if (breakerRefuse.tripped) {
           await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, breakerRefuse.failures, decision.code);
         }
@@ -1907,7 +1938,7 @@ export async function dispatchSession(
     if (opts.doMarkDispatched) {
       deleteDispatched(issue.id);
     }
-    const _brSession = recordDispatchFailure(issue.id, opts.phase, "dispatch_error");
+    const _brSession = recordDispatchFailure(issue.id, opts.phase, "dispatch_error", { project: issue.scopeKey, identifier: issue.identifier });
     if (_brSession.tripped) {
       await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, _brSession.failures, "dispatch_error");
     }
@@ -3068,7 +3099,7 @@ export async function reportTerminalJob(
           // a flaky provider parks the issue (BAC-27134). Jobs with no classified failure at
           // all (pre-BAC-27112, or a synthetic dispatch-error conclusion) count as before.
           if (!job.failure || shouldCountFailure(job.failure)) {
-            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion, { project: job.teamKey, identifier: job.issueIdentifier });
             if (br.tripped && !isStuck) {
               pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
             }
@@ -3531,7 +3562,7 @@ async function processLegacyReviewFixQueue(config: AppConfig, registry: Provider
       });
       if (!gateDecision.ok) {
         if (gateDecision.reason === "pr_budget") {
-          await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+          await firePrBudgetPark(config, registry, mapping, fix.issueId, { project: scopeKey, identifier: fix.issueIdentifier }, fix.repo, fix.prNumber, prBudget);
         }
         console.log(`[review-fix] Deferring review fix #${fix.id} for PR #${fix.prNumber}: ${gateDecision.reason}`);
         continue;
@@ -3650,7 +3681,7 @@ async function processLegacyReviewFixQueue(config: AppConfig, registry: Provider
         });
         if (!admission.ok) {
           if (admission.reason === "budget_exhausted") {
-            await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+            await firePrBudgetPark(config, registry, mapping, fix.issueId, { project: scopeKey, identifier: fix.issueIdentifier }, fix.repo, fix.prNumber, prBudget);
           }
           console.log(`[review-fix] Deferring local review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
           continue;
@@ -3767,7 +3798,7 @@ async function processLegacyReviewFixQueue(config: AppConfig, registry: Provider
       });
       if (!admission.ok) {
         if (admission.reason === "budget_exhausted") {
-          await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+          await firePrBudgetPark(config, registry, mapping, fix.issueId, { project: scopeKey, identifier: fix.issueIdentifier }, fix.repo, fix.prNumber, prBudget);
         }
         console.log(`[review-fix] Deferring review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
         continue;
@@ -4095,7 +4126,7 @@ const submitLateExternalReview = createLateExternalReviewSubmitHook({
   restateReady: restateCanServe,
 });
 // A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
-const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
+export const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
   const mapping = Object.values(getMappings()).find((m) => m.owner === input.owner && m.repo === input.repo);
   const followHead = resolveReviewProcess(mapping?.reviewProcess).fixer === "repository";
   return submitLateExternalReview(followHead ? { ...input, followHead } : input);
@@ -4304,7 +4335,7 @@ export function handleReviewPublicationRequest(
   });
 }
 
-function startServer(
+export function startServer(
   config: AppConfig,
   registry: ProviderRegistry,
   memoryProvider: MemoryProvider | null,
@@ -4316,6 +4347,7 @@ function startServer(
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
   }), reviewFixIngressClient);
   setReviewFixAttemptsFacade(reviewFixAttempts);
+  setSetupCheckRecheckSender((request) => setupChecksClient.recheck(request));
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
@@ -4342,8 +4374,7 @@ function startServer(
         sidecarHealthFields,
         restateStatus: getRestateStatus,
         deployHealth,
-        lastSetupCheckRun: getLastSetupCheckRun,
-        setupCheckContext: () => createSetupCheckContext({ restateStatus: getRestateStatus }),
+        setupChecks: () => setupChecksHealthField(getCachedSetupCheckRun(), createSetupCheckContext({ restateStatus: getRestateStatus })),
       }).then((body) => {
         const json = JSON.stringify(body);
         res.writeHead(body.status === "unavailable" ? 503 : 200, { "Content-Type": "application/json" });
@@ -4930,7 +4961,9 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, bindKey, clearKeyBinding, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, bindKey, clearKeyBinding, readSetupChecks: () => setupChecksClient.read(), startSetupChecks: () => setupChecksClient.start(), setupCheckProgress: getSetupCheckProgress,
+        runCandidateChecks: (key, mapping) => runProjectSetupChecks(createSetupCheckContext({ restateStatus: getRestateStatus, mappings: () => ({ [key]: mapping }) }), key, BEFORE_FIRST_SYNC),
+        runProjectSetupChecks: (project) => setupChecksClient.runProject(project),
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
@@ -4982,7 +5015,7 @@ function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateR
 export interface RestateEndpointWireDeps {
   startRestateEndpoint: () => Promise<unknown>;
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
-  /** Runs after any non-conflict registration outcome, including `unreachable`; must not throw. */
+  /** Runs once the endpoint registers, before boot settles as serving. A throw settles boot as `hook-failed`. */
   onRegistered?: () => Promise<void>;
 }
 
@@ -5226,6 +5259,10 @@ export async function runMainBoot(deps: {
   isShuttingDown: () => boolean;
   shutdown: (reason: string, exitCode?: number) => Promise<void>;
   onServing?: () => void;
+  /** Starts the setup checks boot logs while Restate starts. Boot never waits for them. */
+  setupChecksBeforeRestate?: () => void;
+  /** Starts the setup checks boot stores once Restate serves. Boot never waits for them. */
+  setupChecksAfterServing?: () => void;
   logFly: () => void;
   refreshCache: () => Promise<void>;
   reconcile: () => Promise<void>;
@@ -5238,6 +5275,7 @@ export async function runMainBoot(deps: {
     deps.registerSignal(signal, () => { void deps.shutdown(signal); });
   }
   deps.startServer();
+  deps.setupChecksBeforeRestate?.();
   const now = deps.now ?? Date.now;
   const started = now();
   const result = await deps.wait();
@@ -5248,6 +5286,7 @@ export async function runMainBoot(deps: {
     return;
   }
   deps.onServing?.();
+  deps.setupChecksAfterServing?.();
   console.log(`[main] Restate serving after ${now() - started} ms`);
   deps.logFly();
   await deps.refreshCache();
@@ -5344,7 +5383,7 @@ async function main(): Promise<void> {
   // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
   const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config),
-    (mapping, issueId, repo, prNumber, budget) => parkRestatePrBudget(config, registry, mapping, issueId, repo, prNumber, budget));
+    (mapping, issueId, subject, repo, prNumber, budget) => parkRestatePrBudget(config, registry, mapping, issueId, subject, repo, prNumber, budget));
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;
@@ -5459,12 +5498,12 @@ async function main(): Promise<void> {
     // Only the notification/outcome copy carries diagnostic text; the durable record stays stable.
     onOutcome: createSelfDeployOutcomeHandler(config),
   })];
-  const hydrateSetupChecks = createSetupChecksHydration();
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
-      await hydrateSetupChecks();
+      // Boot settles as serving only once this hook returns, and the first poll waits for that.
+      void hydrateSetupChecks();
       await onRestateRegistered({
         sweep: () => sweepOnRegistered(config),
         scrub: async () => { await scrubOperatorLegacyTokens(); },
@@ -5527,6 +5566,7 @@ async function main(): Promise<void> {
   });
 
   let server: ReturnType<typeof startServer>;
+  const bootSetupChecks = createProductionBootSetupChecks(() => server, setupChecksClient);
   await runMainBoot({
     registerSignal: (signal, handler) => { process.on(signal, handler); },
     startServer: () => { server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic); },
@@ -5538,6 +5578,8 @@ async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     shutdown,
     onServing: () => restateExit.arm(shutdown),
+    setupChecksBeforeRestate: () => { void bootSetupChecks.beforeRestate(); },
+    setupChecksAfterServing: () => { void bootSetupChecks.afterServing(); },
     logFly: () => {
       // Check if Fly config is needed
       const hasFlyMappings = Object.values(teamRepoMap).some((m) => m.executionMode === "fly-machines");

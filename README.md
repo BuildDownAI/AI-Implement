@@ -388,11 +388,12 @@ Go to the orchestrator's admin UI → **Projects** → **+ New project**. The st
 
 - **Ticketing System** — `linear` or `jira`.
 - **Ticketing Config** — Linear: the team key (e.g. `ENG`). Jira: a scope JQL (e.g. `project = MYPROJECT` — no status clauses; the orchestrator adds those), the status/repo fields (leave at auto-discover if you used the exact names above), and the Repo Field Value option matching this repo (e.g. `your-org/your-repo`).
-- **Source** — GitHub owner, repo, and default branch. Click **Check installation**: the stepper probes whether the GitHub App is installed and can see the repo, and links straight to the fix when it can't (install the App, or add this repo to the installation). The check is advisory — you can still save without it.
+- **Source** — GitHub owner, repo, and default branch. Each step's **Continue** checks what you entered against the save's own rules, so a value the save would refuse is caught on the step that holds it.
 - **Runner** — `github-actions` (zero infrastructure) or `fly-machines`.
 - **Provider** — `anthropic` or `bedrock` (see [CLAUDE.md](CLAUDE.md) for Bedrock setup), plus planning toggles.
 - **Capacity** — max parallel AI issues (default 3, keep low while evaluating).
 - **Secrets** — optionally seed per-project secrets now (write-only; you can add more later from the Projects page). Secrets reach setup and verify hooks in every execution mode but are stripped from the model process — the agent never sees them. GHA-mode repos forward hook secrets via the `AI_IMPLEMENT_FORWARDED_ENV` Actions **secret** — set it to `KEY=VALUE` lines, one per line, and re-sync.
+- **Review** — every setting, with the project's setup checks under the settings each one reads: whether the GitHub App is installed and can see the repo, its permissions, the ticketing system's access, and more, each failing one with its fix. **Change** goes back to a section and returns. Create waits only while one of the project's own required checks fails; the rest are advisory.
 
 **Save.** The mapping persists immediately and the workflow sync runs in the background: the project row shows **"Syncing…"**, then **"Workflows synced — PR opened ↗"** — or reverts with an alert naming the failure. Per-run caps (Max Turns, Max Iterations, Job Timeout) are editable later via **Edit** on the project row.
 

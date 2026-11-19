@@ -215,8 +215,8 @@ describe("mapping dialog — retired legacy vocabulary", () => {
   });
 
   it("titles its sections in sentence case, not the uppercase page-section header", () => {
-    expect(projectsHtml).not.toContain('class="section-h"');
-    expect(projectsHtml).toContain('<h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Guardrails</h3>');
+    expect(dialogHtml).not.toContain('class="section-h"');
+    expect(dialogHtml).toContain('<h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Guardrails</h3>');
   });
 });
 

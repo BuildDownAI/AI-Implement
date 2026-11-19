@@ -429,6 +429,15 @@ describe("listLog strips evidence tails", () => {
   });
 });
 
+describe("parseFailureJson", () => {
+  const record = { category: "config", code: "PLAN_STATUS_WRITE_FAILED", stage: "planning-callback", attempt: 1, retryable: false, message: "Jira answered 400: bad option", evidence: { truncated: false } };
+
+  it("reads a stored record back, and anything else as no record", () => {
+    expect(log.parseFailureJson(JSON.stringify(record))).toEqual(record);
+    for (const raw of [null, "", "{not json", JSON.stringify({ message: "no category or code" })]) expect(log.parseFailureJson(raw)).toBeNull();
+  });
+});
+
 describe("late_review_pending outbox (AII-1362)", () => {
   const rows = () => dedup.getDb().prepare("SELECT * FROM late_review_pending").all() as Array<Record<string, unknown>>;
 

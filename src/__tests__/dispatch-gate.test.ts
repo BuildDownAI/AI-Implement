@@ -35,9 +35,9 @@ afterEach(() => {
 });
 
 function parkAt(issueId: string, phase: string): void {
-  breaker.recordDispatchFailure(issueId, phase, "failure");
-  breaker.recordDispatchFailure(issueId, phase, "failure");
-  breaker.recordDispatchFailure(issueId, phase, "failure");
+  breaker.recordDispatchFailure(issueId, phase, "failure", null);
+  breaker.recordDispatchFailure(issueId, phase, "failure", null);
+  breaker.recordDispatchFailure(issueId, phase, "failure", null);
 }
 
 describe("canDispatch — reason ordering", () => {

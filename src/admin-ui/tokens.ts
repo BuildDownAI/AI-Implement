@@ -19,7 +19,7 @@ export const tokensCss = `
 
   --fg-primary: #1a1a19;
   --fg-secondary: #525250;
-  --fg-tertiary: #8a8a86;
+  --fg-tertiary: #6b6b67;
   --fg-quaternary: #b4b4af;
   --fg-on-accent: #ffffff;
 
@@ -90,7 +90,7 @@ export const tokensCss = `
 
   --fg-primary: #ededeb;
   --fg-secondary: #a8a8a4;
-  --fg-tertiary: #707070;
+  --fg-tertiary: #868686;
   --fg-quaternary: #4a4c4b;
   --fg-on-accent: #042f2e;
 

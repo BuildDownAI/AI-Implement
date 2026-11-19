@@ -580,8 +580,8 @@ describe("roll-up review child cleanup", () => {
 
     await expect(reconcile()).rejects.toThrow("comment unavailable");
     expect(isParked("child", "implementation")).toBe(true);
-    expect(getDb().prepare("SELECT phase, last_conclusion FROM dispatch_breaker WHERE issue_id = ?").get("child"))
-      .toEqual({ phase: "implementation", last_conclusion: "rollup_review_closed" });
+    expect(getDb().prepare("SELECT phase, last_conclusion, project, issue_identifier FROM dispatch_breaker WHERE issue_id = ?").get("child"))
+      .toEqual({ phase: "implementation", last_conclusion: "rollup_review_closed", project: "OOL", issue_identifier: "OOL-108" });
     expect(bookkeeping()).toBeUndefined();
 
     await reconcile();

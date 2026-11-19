@@ -1,7 +1,7 @@
-import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 import { kgPipelinesHtml, kgPipelinesScript } from "../pages/kg-pipelines.js";
 import { deploymentsHtml, deploymentsScript } from "../pages/deployments.js";
+import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 describe("kg pipelines page", () => {
   it("is a hidden data-page section with its own message box", () => {
@@ -20,10 +20,6 @@ describe("kg pipelines page", () => {
   it("showMessage writes into #kg-pipelines-error, never #deployments-error", () => {
     expect(kgPipelinesScript).toContain("document.getElementById('kg-pipelines-error')");
     expect(kgPipelinesScript).not.toContain("deployments-error");
-  });
-
-  it("setBadge keeps the dot span", () => {
-    expect(kgPipelinesScript).toContain('<span class="dot"></span>');
   });
 
   it("registers the page with both 15s pollers", () => {
@@ -71,14 +67,14 @@ describe("kg refresh card", () => {
     expect(kgPipelinesScript).toContain("window.api('/api/kg/refresh', { method: 'POST' })");
   });
 
-  it("maps every stage to a badge via setBadge", () => {
-    // Each new stage must pass through setBadge — a textContent write drops the dot span.
+  it("maps every stage to a badge via the shared setStatusBadge", () => {
+    // Each new stage must pass through setStatusBadge — a textContent write drops the dot span.
     for (const [kind, label] of [
       ["running", "checking"],
       ["running", "running"],   // ingest-running
       ["running", "landing"],   // snapshot-landed
       ["running", "staging"],
-      ["ok", "serving"],
+      ["success", "serving"],
       ["warn", "awaiting decision"],
       ["warn", "reverted"],
       ["fail", "failed"],
@@ -173,18 +169,8 @@ describe("kg fly machine profile control (AII-1116)", () => {
   const profile = { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "profile" };
 
   function mount(opts: { flyMachine?: unknown; runProfile?: unknown; saveReply?: Reply }) {
-    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, {
-      runScripts: "dangerously",
-      url: "http://localhost/admin#kg-pipelines",
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const win = dom.window as any;
-    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    win.esc = esc;
-    win.escAttr = esc;
-    win.registerPage = () => {};
     const calls: { url: string; body: unknown }[] = [];
-    win.api = async (url: string, init?: { body?: string }) => {
+    const api = async (url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
       if (url === "/api/tools/get_kg_status") {
         const { source, ...config } = (opts.flyMachine ?? profile) as typeof profile;
@@ -197,10 +183,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
       }
       return { ok: false, status: 404, json: async () => ({}) };
     };
-    const script = dom.window.document.createElement("script");
-    script.textContent = kgPipelinesScript;
-    dom.window.document.head.appendChild(script);
-    const doc = dom.window.document;
+    const { win, doc } = mountAdminPage({ html: kgPipelinesHtml, script: kgPipelinesScript, route: "kg-pipelines", api });
     const el = (id: string) => doc.getElementById(id) as HTMLInputElement;
     const settle = () => new Promise((r) => setTimeout(r, 0));
     return { win, doc, el, calls, settle };
@@ -321,14 +304,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
 describe("kg backend control (AII-1218)", () => {
   function mount(executionMode: unknown) {
-    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const win = dom.window as any;
-    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    win.esc = esc;
-    win.escAttr = esc;
-    win.registerPage = () => {};
-    win.api = async (url: string) => {
+    const api = async (url: string) => {
       if (url === "/api/tools/get_kg_status") {
         const backend = (executionMode as { effective: string }).effective;
         const runProfile =
@@ -343,10 +319,7 @@ describe("kg backend control (AII-1218)", () => {
       if (url === "/api/kg/execution-mode") return { ok: true, status: 200, json: async () => ({ mode: "fly-machines", source: "db" }) };
       return { ok: false, status: 404, json: async () => ({}) };
     };
-    const script = dom.window.document.createElement("script");
-    script.textContent = kgPipelinesScript;
-    dom.window.document.head.appendChild(script);
-    const doc = dom.window.document;
+    const { win, doc } = mountAdminPage({ html: kgPipelinesHtml, script: kgPipelinesScript, route: "kg-pipelines", api });
     return { win, text: (id: string) => doc.getElementById(id)!.textContent, hidden: (id: string) => (doc.getElementById(id) as HTMLElement).hidden, doc };
   }
 
@@ -413,15 +386,8 @@ describe("kg github-actions run profile (AII-1245)", () => {
 
   function mount(saveReply?: { status: number; body: unknown }) {
     current = ghaProfile;
-    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const win = dom.window as any;
-    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    win.esc = esc;
-    win.escAttr = esc;
-    win.registerPage = () => {};
     const calls: { url: string; body: unknown }[] = [];
-    win.api = async (url: string, init?: { body?: string }) => {
+    const api = async (url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
       if (url === "/api/tools/get_kg_status") {
         return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify({ runProfile: current }) }] }) };
@@ -432,10 +398,7 @@ describe("kg github-actions run profile (AII-1245)", () => {
       }
       return { ok: false, status: 404, json: async () => ({}) };
     };
-    const script = dom.window.document.createElement("script");
-    script.textContent = kgPipelinesScript;
-    dom.window.document.head.appendChild(script);
-    const doc = dom.window.document;
+    const { win, doc } = mountAdminPage({ html: kgPipelinesHtml, script: kgPipelinesScript, route: "kg-pipelines", api });
     const el = (id: string) => doc.getElementById(id) as HTMLInputElement;
     return { win, el, calls };
   }
@@ -527,17 +490,8 @@ describe("kg current run card (AII-1260)", () => {
   };
 
   function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean; deployPolls?: number; lastRefresh?: unknown; deployHeld?: boolean }) {
-    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const win = dom.window as any;
-    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    win.esc = esc;
-    win.escAttr = esc;
-    win.safeUrl = (u: string) => (/^https?:/.test(u) ? u : "#");
-    win.confirm = () => opts.confirm ?? true;
-    win.registerPage = () => {};
     const calls: { url: string; body: unknown }[] = [];
-    win.api = async (url: string, init?: { body?: string }) => {
+    const api = async (url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
       if (url === "/api/kg/status") {
         if (opts.deployPolls && opts.deployPolls-- > 0) return { ok: false, status: 409, json: async () => ({ error: "deploy-in-progress" }) };
@@ -550,10 +504,13 @@ describe("kg current run card (AII-1260)", () => {
       }
       return { ok: false, status: 404, json: async () => ({}) };
     };
-    const script = dom.window.document.createElement("script");
-    script.textContent = kgPipelinesScript;
-    dom.window.document.head.appendChild(script);
-    const doc = dom.window.document;
+    const { win, doc } = mountAdminPage({
+      html: kgPipelinesHtml,
+      script: kgPipelinesScript,
+      route: "kg-pipelines",
+      api,
+      before: (w) => { w.confirm = () => opts.confirm ?? true; },
+    });
     const visibleButtons = () =>
       ["kg-refresh-btn", "kg-accept-btn", "kg-cancel-btn"]
         .map((id) => doc.getElementById(id) as HTMLElement)
@@ -820,21 +777,15 @@ describe("kg schedule control (AII-1434)", () => {
   const wrap = (v: unknown) => ({ content: [{ type: "text", text: JSON.stringify(v) }] });
 
   function mount(get: { status: number; body: unknown }, set?: { status: number; body: unknown }) {
-    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const win = dom.window as any;
-    win.registerPage = () => {};
     const calls: { url: string; body: unknown }[] = [];
-    win.api = async (url: string, init?: { body?: string }) => {
+    const api = async (url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
       const r = url === "/api/tools/get_pipeline_schedule" ? get : url === "/api/tools/set_pipeline_schedule" && set ? set : null;
       if (!r) return { ok: false, status: 404, json: async () => ({}) };
       return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
     };
-    const script = dom.window.document.createElement("script");
-    script.textContent = kgPipelinesScript;
-    dom.window.document.head.appendChild(script);
-    const el = (id: string) => dom.window.document.getElementById(id) as HTMLInputElement;
+    const { win, doc } = mountAdminPage({ html: kgPipelinesHtml, script: kgPipelinesScript, route: "kg-pipelines", api });
+    const el = (id: string) => doc.getElementById(id) as HTMLInputElement;
     return { win, el, calls };
   }
 

@@ -107,17 +107,6 @@ export const stepperHtml = `
       <div data-step="2" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Source</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Connect to the GitHub repository this mapping dispatches against.</p>
-        <div class="alert info" style="margin-bottom:18px">
-          <div class="alert-icon">&#8505;</div>
-          <div style="flex:1">
-            <div class="alert-title">GitHub App required</div>
-            <div class="alert-desc">The AI-Implement GitHub App must be installed on the target repo before it can sync. Enter the owner and repo, then check the installation.</div>
-            <div id="np-install-state" style="margin-top:10px;font-size:12px"></div>
-            <div class="alert-actions" style="margin-top:10px">
-              <button type="button" class="btn btn-sm" id="np-install-check" onclick="checkInstallState()">Check installation</button>
-            </div>
-          </div>
-        </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div class="field">
             <label class="field-label">GitHub Owner</label>
@@ -373,115 +362,160 @@ export const stepperHtml = `
 
       <div data-step="8" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Review</h3>
-        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Confirm your settings before creating the project.</p>
-        <div style="display:flex;flex-direction:column">
-          <div class="np-review-h">Ticketing</div>
-          <div class="np-review-row">
-            <div class="np-review-label">System</div>
-            <div data-review="ticketing"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Config</div>
-            <div data-review="ticketingConfig"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Team key</div>
-            <div data-review="teamKey"></div>
-          </div>
-
-          <div class="np-review-h">Source</div>
-          <div class="np-review-row">
-            <div class="np-review-label">Repository</div>
-            <div data-review="repo"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Default branch</div>
-            <div data-review="defaultBranch"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Branch prefix</div>
-            <div data-review="branchPrefix"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Protected files</div>
-            <div data-review="sensitiveAddPatterns"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Exceptions</div>
-            <div data-review="sensitiveAllowPatterns"></div>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Confirm your settings before creating the project. Each section shows the setup checks for its settings, run as the project would be saved.</p>
+        <div style="display:flex;flex-direction:column;gap:22px">
+          <div class="np-review-section" data-section="ticketing">
+            <div class="section-h"><h3>Ticketing</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('ticketing')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">System</div>
+                <div data-review="ticketing"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Config</div>
+                <div data-review="ticketingConfig"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Team key</div>
+                <div data-review="teamKey"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
 
-          <div class="np-review-h">Context</div>
-          <div class="np-review-row">
-            <div class="np-review-label">Skills repo</div>
-            <div data-review="skillsRepo"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Reference repositories</div>
-            <div data-review="referenceRepos"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Dependency token scope</div>
-            <div data-review="dependencyTokenScope"></div>
-          </div>
-
-          <div class="np-review-h">Execution</div>
-          <div class="np-review-row">
-            <div class="np-review-label">Mode</div>
-            <div data-review="runner"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Session mode</div>
-            <div data-review="session"></div>
-          </div>
-
-          <div class="np-review-h">Provider</div>
-          <div class="np-review-row">
-            <div class="np-review-label">Claude provider</div>
-            <div data-review="provider"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Planning</div>
-            <div data-review="planning"></div>
+          <div class="np-review-section" data-section="source">
+            <div class="section-h"><h3>Source</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('source')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Repository</div>
+                <div data-review="repo"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Default branch</div>
+                <div data-review="defaultBranch"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Branch prefix</div>
+                <div data-review="branchPrefix"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Protected files</div>
+                <div data-review="sensitiveAddPatterns"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Exceptions</div>
+                <div data-review="sensitiveAllowPatterns"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
 
-          <div class="np-review-h">Capacity</div>
-          <div class="np-review-row">
-            <div class="np-review-label">Parallel issues</div>
-            <div data-review="cap"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Run caps</div>
-            <div data-review="caps"></div>
-          </div>
-
-          <div class="np-review-row">
-            <div class="np-review-label">Review process</div>
-            <div data-review="reviewProcess"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Trusted authors</div>
-            <div data-review="trustedReviewAuthors"></div>
-          </div>
-
-          <div class="np-review-h">Secrets</div>
-          <div class="np-review-row">
-            <div class="np-review-label">Seeded</div>
-            <div data-review="secrets"></div>
+          <div class="np-review-section" data-section="context">
+            <div class="section-h"><h3>Context</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('context')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Skills repo</div>
+                <div data-review="skillsRepo"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Reference repositories</div>
+                <div data-review="referenceRepos"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Dependency token scope</div>
+                <div data-review="dependencyTokenScope"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
 
-          <div class="np-review-h">Pinned defaults <span style="font-weight:400;color:var(--fg-tertiary)">&mdash; most projects keep these; the Edit dialog can change them if yours needs to</span></div>
-          <div class="np-review-row">
-            <div class="np-review-label">Workflow file</div>
-            <div><span class="mono">claude-implement.yml</span></div>
+          <div class="np-review-section" data-section="execution">
+            <div class="section-h"><h3>Execution</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('execution')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Mode</div>
+                <div data-review="runner"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Session mode</div>
+                <div data-review="session"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Planning workflow</div>
-            <div><span class="mono">claude-plan.yml</span></div>
+
+          <div class="np-review-section" data-section="provider">
+            <div class="section-h"><h3>Provider</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('provider')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Claude provider</div>
+                <div data-review="provider"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Planning</div>
+                <div data-review="planning"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Extra env</div>
-            <div>none</div>
+
+          <div class="np-review-section" data-section="capacity">
+            <div class="section-h"><h3>Capacity</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('capacity')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Parallel issues</div>
+                <div data-review="cap"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Run caps</div>
+                <div data-review="caps"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Review process</div>
+                <div data-review="reviewProcess"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Trusted authors</div>
+                <div data-review="trustedReviewAuthors"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
+          </div>
+
+          <div class="np-review-section" data-section="secrets">
+            <div class="section-h"><h3>Secrets</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('secrets')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Seeded</div>
+                <div data-review="secrets"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
+          </div>
+
+          <div>
+            <div class="section-h"><h3>Pinned defaults</h3></div>
+            <p class="np-review-lead">Most projects keep these. The Edit dialog can change them if yours needs to.</p>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Workflow file</div>
+                <div><span class="mono">claude-implement.yml</span></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Planning workflow</div>
+                <div><span class="mono">claude-plan.yml</span></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Extra env</div>
+                <div>none</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="np-review-section" data-section="orchestrator" hidden>
+            <div class="section-h"><h3>This orchestrator</h3></div>
+            <p class="np-review-lead">Shared by every project, and fixed on the Setup page.</p>
+            <div class="np-review-checks"></div>
           </div>
         </div>
       </div>
@@ -495,6 +529,7 @@ export const stepperHtml = `
       <button class="btn btn-sm" onclick="closeNewProjectStepper()">Cancel</button>
       <div style="display:flex;gap:6px">
         <button id="np-back" class="btn btn-sm" onclick="stepperBack()" hidden>Back</button>
+        <button type="button" id="np-setup-check-btn" class="btn btn-sm" onclick="checkSetup()" hidden>Check setup</button>
         <button id="np-next" class="btn btn-primary btn-sm" onclick="stepperNext()">Continue &rarr;</button>
         <button id="np-create" class="btn btn-accent btn-sm" onclick="stepperSubmit()" hidden>Create project</button>
       </div>
@@ -530,7 +565,10 @@ export const stepperScript = `
 
   function openNewProjectStepper() {
     // Reset state
+    reviewReturnAt = null;
+    continueSeq++;
     step = 0;
+    clearSetupCheck();
     data.ticketingProvider = 'linear';
     data.filesystemDirectory = '';
     data.jiraJql = '';
@@ -724,12 +762,23 @@ export const stepperScript = `
     const createBtn = document.getElementById('np-create');
 
     if (backBtn) { if (n === 0) backBtn.setAttribute('hidden', ''); else backBtn.removeAttribute('hidden'); }
+    if (n === LAST_STEP) reviewReturnAt = null;
     if (nextBtn) { if (n === LAST_STEP) nextBtn.setAttribute('hidden', ''); else nextBtn.removeAttribute('hidden'); }
+    if (nextBtn) nextBtn.textContent = n === reviewReturnAt ? 'Back to review' : 'Continue →';
     if (createBtn) { if (n === LAST_STEP) createBtn.removeAttribute('hidden'); else createBtn.setAttribute('hidden', ''); }
+    const checkBtn = document.getElementById('np-setup-check-btn');
+    if (checkBtn) checkBtn.hidden = n !== LAST_STEP;
 
     renderRail();
     updateStepperNextButton();
-    if (n === LAST_STEP) populateReview();
+    if (n === LAST_STEP) {
+      populateReview();
+      showSetupCheckMessage();
+      refreshSetupCheck();
+    } else {
+      // The step arrived at owns the error area. A step that refused Continue stays where it is, so its own error is untouched.
+      hideError();
+    }
   }
 
   function updateStepperNextButton() {
@@ -759,63 +808,197 @@ export const stepperScript = `
       const rp = (document.getElementById('np-repo') || {}).value || '';
       const br = (document.getElementById('np-defaultBranch') || {}).value || '';
       if (!ow.trim() || !rp.trim() || !br.trim()) ok = false;
-      resetInstallState();
     }
     if (ok) nextBtn.removeAttribute('disabled');
     else nextBtn.setAttribute('disabled', '');
   }
 
-  async function checkInstallState() {
-    const owner = ((document.getElementById('np-owner') || {}).value || '').trim();
-    const repo = ((document.getElementById('np-repo') || {}).value || '').trim();
-    const out = document.getElementById('np-install-state');
-    const btn = document.getElementById('np-install-check');
-    if (!out || !btn) return;
-    if (!owner || !repo) {
-      out.innerHTML = '<span style="color:var(--fg-tertiary)">Enter owner and repo first.</span>';
-      return;
-    }
-    btn.disabled = true;
-    btn.textContent = 'Checking…';
-    out.innerHTML = '';
-    try {
-      const res = await window.api('/api/admin/github-install-state?owner=' + encodeURIComponent(owner) + '&repo=' + encodeURIComponent(repo));
-      const data = await res.json();
-      if (!res.ok) {
-        out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check: ' + window.esc(data.error || 'unknown error') + '</span>';
-        return;
-      }
-      out.innerHTML = renderInstallState(data);
-    } catch (_) {
-      out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check installation.</span>';
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Re-check';
-    }
-  }
-  
-  function renderInstallState(data) {
-    const state = data.state;
-    if (state === 'ready') {
-      return '<span class="badge success">Ready</span> The App is installed and can access this repo.';
-    }
-    if (state === 'app-not-installed') {
-      return '<span class="badge warn">Action needed</span> The App is not installed on this owner. '
-        + '<a class="text-accent" href="' + window.safeUrl(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Install the App &#8599;</a> then Re-check.';
-    }
-    if (state === 'repo-not-selected') {
-      return '<span class="badge warn">Action needed</span> The App is installed, but this repo is not in its selected repositories. '
-      + '<a class="text-accent" href="' + window.safeUrl(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Add this repo &#8599;</a> then Re-check.';
-    }
-    return '';
+  // The candidate the shown results were checked for, so Review runs the checks again only once the project changed.
+  let setupCheckedFor = null;
+  // Each check's number, so an answer to an older check never replaces a newer one's.
+  let setupCheckSeq = 0;
+  // Create waits while a check runs, and while any of the project's own required checks fails.
+  let setupCheckRunning = false;
+  let setupCheckBlocking = [];
+
+  // The project's own required rows that fail: the core and mode tiers, judged and stamped with the project, which a step here can fix.
+  // An orchestrator-wide row, or one that cannot be verified, never blocks, since nothing in this window fixes it.
+  function setupBlockingRows(results) {
+    return results.filter(function (row) {
+      return row.project !== undefined && row.tier !== 'feature' && row.verifiable !== false && row.state === 'fail';
+    });
   }
 
-  // Clears a stale probe result when owner/repo change, so a "Ready" for the old repo can't linger.
-  function resetInstallState() {
-    const out = document.getElementById('np-install-state');
-    const btn = document.getElementById('np-install-check');
-    if (out) out.innerHTML = '';
-    if (btn) btn.textContent = 'Check installation';
+  function updateCreateGate() {
+    const createBtn = document.getElementById('np-create');
+    if (!createBtn) return;
+    createBtn.disabled = setupCheckRunning || setupCheckBlocking.length > 0;
+    createBtn.title = setupCheckRunning ? 'Waiting for the setup checks' : setupCheckBlocking.length ? 'A required setup check fails' : '';
+  }
+
+  function listTitles(rows) {
+    const titles = rows.map(function (row) { return row.title; });
+    return titles.length < 2 ? titles.join('') : titles.slice(0, -1).join(', ') + ' and ' + titles[titles.length - 1];
+  }
+
+  // The project as Create would save it.
+  function setupCheckCandidate() {
+    for (let i = 0; i < LAST_STEP; i++) collectStep(i);
+    return mappingBody();
+  }
+
+  // Runs the checks as Review opens, unless the results shown are already for this project as it stands.
+  function refreshSetupCheck() {
+    if (JSON.stringify(setupCheckCandidate()) !== setupCheckedFor) checkSetup();
+  }
+
+  // What the last check has to say in the stepper's error area on Review: what keeps Create unavailable, or why it could not run.
+  let setupCheckMessage = '';
+
+  // Shows the check's message on Review. Other steps own the error area for their own validation.
+  function showSetupCheckMessage() {
+    if (step !== LAST_STEP) return;
+    if (setupCheckMessage) showError(setupCheckMessage);
+    else hideError();
+  }
+
+  function clearSetupCheck() {
+    setupCheckSeq++;
+    setupCheckedFor = null;
+    setupCheckRunning = false;
+    setupCheckBlocking = [];
+    setupCheckMessage = '';
+    updateCreateGate();
+    const btn = document.getElementById('np-setup-check-btn');
+    renderReviewChecks(null);
+    if (btn) { btn.disabled = false; btn.textContent = 'Check setup'; }
+  }
+
+  async function checkSetup() {
+    const btn = document.getElementById('np-setup-check-btn');
+    if (!btn) return;
+    const body = setupCheckCandidate();
+    const seq = ++setupCheckSeq;
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    setupCheckMessage = '';
+    showSetupCheckMessage();
+    renderReviewChecks(null);
+    setupCheckedFor = null;
+    setupCheckRunning = true;
+    setupCheckBlocking = [];
+    updateCreateGate();
+    try {
+      const res = await window.api('/api/setup-checks/candidate', { method: 'POST', body: JSON.stringify(body) });
+      let payload = {};
+      try { payload = await res.json(); } catch (_) {}
+      if (seq !== setupCheckSeq) return;
+      if (!res.ok) {
+        // A 400 is the save's own refusal, which names the field. Anything else is the run failing on the orchestrator's side.
+        setupCheckMessage = res.status === 400
+          ? 'Could not check: ' + (payload.error || 'unknown error')
+          : 'The checks could not run. The orchestrator\\'s log has the error.';
+        return;
+      }
+      setupCheckedFor = JSON.stringify(body);
+      setupCheckBlocking = setupBlockingRows(payload.results || []);
+      setupCheckMessage = setupGateLine(payload.results || []);
+      renderReviewChecks(payload.results || []);
+    } catch (_) {
+      if (seq === setupCheckSeq) setupCheckMessage = 'Could not check setup.';
+    } finally {
+      if (seq === setupCheckSeq) {
+        // Checks that could not run leave Create open, since a network failure should not stop a save.
+        setupCheckRunning = false;
+        updateCreateGate();
+        showSetupCheckMessage();
+        btn.disabled = false;
+        btn.textContent = 'Re-check';
+      }
+    }
+  }
+
+
+  function setupFoldLabel(rows) {
+    const passing = rows.filter(function (row) { return row.state === 'pass'; }).length;
+    const notApplicable = rows.length - passing;
+    return [passing ? passing + ' passing' : '', notApplicable ? notApplicable + ' not applicable' : ''].filter(Boolean).join(', ');
+  }
+
+  // The line that names what keeps Create unavailable, shown as text in the error area above it.
+  function setupGateLine(results) {
+    const blocking = setupBlockingRows(results);
+    if (!blocking.length) return '';
+    return 'Create is unavailable while ' + (blocking.length === 1 ? 'this check fails: ' : 'these checks fail: ')
+      + listTitles(blocking) + '. Fix ' + (blocking.length === 1 ? 'it' : 'each') + ', then check again.';
+  }
+
+  // The Review section holding the settings a check reads, where an id's prefix does not already say.
+  const SETUP_CHECK_SECTION = {
+    'github.reference-repos': 'context',
+    'github.skills-repo': 'context',
+    'github.target-secrets': 'execution',
+    'github.review-process': 'capacity',
+  };
+
+  // A row with no project is the orchestrator's own, shared by every project and fixed on the Setup page.
+  function reviewSectionOf(row) {
+    if (row.project === undefined) return 'orchestrator';
+    return SETUP_CHECK_SECTION[row.id] || (row.id.indexOf('tracker.') === 0 ? 'ticketing' : 'source');
+  }
+
+  // Each section's checks under its settings. Null clears them while no answer is shown.
+  function renderReviewChecks(results) {
+    // Shading counts on from the open checks into the folded ones, so the alternation holds once the fold opens.
+    const items = function (list, hidden, from) {
+      return list.map(function (row, i) { return window.setupCheckItem(row, hidden, (from + i) % 2 === 1); }).join('');
+    };
+    for (const section of document.querySelectorAll('#np-step-body .np-review-section')) {
+      const key = section.dataset.section;
+      // Worst first, so what needs fixing leads. The passing and not-applicable rows fold away, as on the Setup page.
+      const order = window.SETUP_STATE_ORDER;
+      const rows = (results || []).filter(function (row) { return reviewSectionOf(row) === key; })
+        .sort(function (a, b) { return order.indexOf(a.state) - order.indexOf(b.state); });
+      const open = window.groupWaitingRows(rows.filter(function (row) { return window.SETUP_ACTIONABLE.indexOf(row.state) !== -1; }));
+      const folded = rows.filter(function (row) { return window.SETUP_ACTIONABLE.indexOf(row.state) === -1; });
+      const checks = section.querySelector('.np-review-checks');
+      // A card headed so what the rows are is said, beneath the settings they check.
+      const card = function (body) {
+        return '<div class="card np-checks-card"><div class="card-header"><h4 class="card-title">Setup checks</h4></div><div class="np-checks-body">' + body + '</div></div>';
+      };
+      if (key === 'orchestrator') {
+        // Only what needs attention: the rest reads the same for every project.
+        section.hidden = !rows.length;
+        checks.innerHTML = rows.length ? card(open.length ? items(open, false, 0) : '<div class="np-review-note">The orchestrator\\'s own checks pass.</div>') : '';
+        continue;
+      }
+      const fold = folded.length
+        ? '<div class="np-review-fold"><button type="button" class="btn btn-ghost btn-sm text-accent" aria-expanded="false" onclick="toggleReviewFold(this)">'
+          + '<span style="display:inline-block">›</span> ' + window.esc(setupFoldLabel(folded)) + '</button></div>'
+        : '';
+      checks.innerHTML = rows.length ? card(items(open, false, 0) + fold + items(folded, true, open.length)) : '';
+    }
+  }
+
+  function toggleReviewFold(button) {
+    const opening = button.getAttribute('aria-expanded') !== 'true';
+    button.setAttribute('aria-expanded', opening ? 'true' : 'false');
+    button.firstElementChild.style.transform = opening ? 'rotate(90deg)' : '';
+    for (let item = button.parentElement.nextElementSibling; item; item = item.nextElementSibling) item.hidden = !opening;
+  }
+
+  // The first and last step behind each Review section. Ticketing starts at its system, since that decides what Config asks.
+  const REVIEW_SECTION_STEPS = { ticketing: [0, 1], source: [2, 2], context: [3, 3], execution: [4, 4], provider: [5, 5], capacity: [6, 6], secrets: [7, 7] };
+  // While a Review section is being changed, the step whose Continue returns to Review instead of walking the later steps.
+  let reviewReturnAt = null;
+
+  // Change: back to the section's first step with its values kept, shown as Continue shows it, so the step behaves as it does
+  // on the way through. Continue walks the section's steps, and its last one returns to Review, where the checks run again.
+  function changeReviewSection(key) {
+    const range = REVIEW_SECTION_STEPS[key];
+    reviewReturnAt = range[1];
+    step = range[0];
+    showStep(step);
   }
 
   // Row markup and rules come from the Projects page; this side owns its inputs and draft.
@@ -865,17 +1048,66 @@ export const stepperScript = `
   }
 
   function stepperBack() {
+    continueSeq++;
     collectStep(step);
     step--;
     showStep(step);
   }
 
-  function stepperNext() {
-    collectStep(step);
-    if (validateStep(step)) {
-      step++;
-      showStep(step);
+  // The step holding each field a save can refuse. A Jira or Filesystem project's key comes from Source's repository.
+  const FIELD_STEPS = {
+    ticketingProvider: 0, ticketingConfig: 1,
+    owner: 2, repo: 2, defaultBranch: 2, branchPrefix: 2, sensitiveAddPatterns: 2, sensitiveAllowPatterns: 2,
+    skillsRepo: 3, referenceRepos: 3, dependencyTokenScope: 3,
+    executionMode: 4, sessionMode: 4, machineCpus: 4, machineMemoryMb: 4,
+    provider: 5, awsRegion: 5,
+    maxInProgressAiIssues: 6, maxTurns: 6, maxIterations: 6, prDispatchBudget: 6, maxJobMinutes: 6, reviewProcess: 6, trustedReviewAuthors: 6,
+  };
+
+  function fieldStep(field) {
+    if (field === 'teamKey') return data.ticketingProvider === 'linear' ? 1 : 2;
+    return FIELD_STEPS[field];
+  }
+
+  // Each Continue's number, so an answer to an older one never moves the stepper.
+  let continueSeq = 0;
+
+  // The save's refusal of the project as entered, or null. A request that fails refuses nothing, since Create validates again.
+  async function saveRefusal() {
+    try {
+      const res = await window.api('/api/mappings/validate', { method: 'POST', body: JSON.stringify(mappingBody()) });
+      if (res.status !== 400) return null;
+      const payload = await res.json();
+      return { field: payload.field, error: payload.error || 'unknown error' };
+    } catch (_) {
+      return null;
     }
+  }
+
+  // Continue checks the step's own fields here, then asks the save whether it would accept the project so far. A refusal of
+  // a field on a step not reached yet waits for that step. One on an earlier step returns there, so it shows beside its field.
+  async function stepperNext() {
+    collectStep(step);
+    if (!validateStep(step)) return;
+    const from = step;
+    const seq = ++continueSeq;
+    const nextBtn = document.getElementById('np-next');
+    if (nextBtn) nextBtn.disabled = true;
+    const refusal = await saveRefusal();
+    if (seq !== continueSeq || step !== from) return;
+    updateStepperNextButton();
+    const at = refusal ? fieldStep(refusal.field) : undefined;
+    if (refusal && (at === undefined || at <= from)) {
+      if (at !== undefined && at < from) {
+        step = at;
+        showStep(step);
+      }
+      showError(refusal.error);
+      return;
+    }
+    // The last step of a Review section being changed returns to Review rather than walking the steps after it.
+    step = from === reviewReturnAt ? LAST_STEP : from + 1;
+    showStep(step);
   }
 
   // Blank means "use the built-in default", which the payload carries as null. Number()
@@ -1323,8 +1555,7 @@ export const stepperScript = `
       }
       let html = '<option value="">(select)</option>';
       for (const o of options) {
-        const v = window.esc(o.value);
-        html += '<option value="' + v + '">' + v + '</option>';
+        html += '<option value="' + window.escAttr(o.value) + '">' + window.esc(o.value) + '</option>';
       }
       select.innerHTML = html;
       select.classList.remove('hidden');
@@ -1404,7 +1635,7 @@ export const stepperScript = `
         status.style.color = 'var(--st-warn-fg, #c80)';
       } else {
         status.textContent = 'Valid';
-        status.style.color = 'var(--st-ok-fg, #2a8)';
+        status.style.color = 'var(--st-success-fg)';
       }
     } catch (err) {
       status.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
@@ -1438,20 +1669,10 @@ export const stepperScript = `
     }
   }
 
-  async function stepperSubmit() {
-    // Collect any final values from secrets step
-    collectStep(7);
-
-    // Validate all non-secret/non-review steps (0..6)
-    for (let i = 0; i < 7; i++) {
-      collectStep(i);
-      if (!validateStep(i)) return;
-    }
-
-    const teamKey = effectiveTeamKey();
-
-    const body = {
-      teamKey: teamKey,
+  // The body Create saves, which Check setup sends as its candidate, so the checks see what a save stores.
+  function mappingBody() {
+    return {
+      teamKey: effectiveTeamKey(),
       owner: data.owner,
       repo: data.repo,
       workflowFile: 'claude-implement.yml',
@@ -1496,11 +1717,26 @@ export const stepperScript = `
           ? { kind: 'filesystem', directory: data.filesystemDirectory }
           : { kind: 'linear' },
     };
+  }
+
+  async function stepperSubmit() {
+    if (setupCheckRunning || setupCheckBlocking.length) return;
+    // Collect any final values from secrets step
+    collectStep(7);
+
+    // Validate all non-secret/non-review steps (0..6)
+    for (let i = 0; i < 7; i++) {
+      collectStep(i);
+      if (!validateStep(i)) return;
+    }
+
+    const teamKey = effectiveTeamKey();
+    const body = mappingBody();
 
     const createBtn = document.getElementById('np-create');
     const origCreateLabel = createBtn ? createBtn.textContent : '';
     if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Creating...'; }
-    
+
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
     let resData = {};
     try { resData = await res.json(); } catch (_) {}
@@ -1558,6 +1794,8 @@ export const stepperScript = `
   window.onStepperRepoFieldChange = onStepperRepoFieldChange;
   window.stepperValidateJql = stepperValidateJql;
   window.updateStepperNextButton = updateStepperNextButton;
-  window.checkInstallState = checkInstallState;
+  window.checkSetup = checkSetup;
+  window.toggleReviewFold = toggleReviewFold;
+  window.changeReviewSection = changeReviewSection;
 })();
 `;

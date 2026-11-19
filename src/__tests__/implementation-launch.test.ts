@@ -30,7 +30,7 @@ vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
   return { ...actual, settleLaunch: vi.fn() };
 });
-vi.mock("../dispatch-failure.js", () => ({ surfaceDispatchFailure: vi.fn(async () => undefined) }));
+vi.mock("../dispatch-failure.js", async (importOriginal) => ({ ...(await importOriginal<typeof import("../dispatch-failure.js")>()), surfaceDispatchFailure: vi.fn(async () => undefined) }));
 vi.mock("../dispatch-breaker.js", () => ({ recordDispatchFailure: vi.fn(() => ({ tripped: false, failures: 1 })) }));
 vi.mock("../fly-machines.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../fly-machines.js")>();
@@ -147,6 +147,15 @@ describe("launchImplementationRun", () => {
     expect(result).toEqual({ outcome: "rejected" });
     expect(order).toEqual(["surface", "release", "record"]);
     expectNoToken(result);
+  });
+
+  // A 404 is a setup problem the park comment can name the checks for (AII-1546).
+  it.each([[404, "workflow_dispatch_not_found"], [403, "workflow_dispatch_failed"]] as const)("counts a %i for the issue's project as %s, and parks with that conclusion", async (status, conclusion) => {
+    vi.mocked(postWorkflowDispatch).mockResolvedValue({ success: false, outcome: "rejected", status, error: "no" } as never);
+    vi.mocked(recordDispatchFailure).mockReturnValueOnce({ tripped: true, failures: 3 });
+    await launchImplementationRun(args);
+    expect(recordDispatchFailure).toHaveBeenCalledWith(issue.id, "implementation", conclusion, { project: issue.scopeKey, identifier: issue.identifier });
+    expect(fireBreakerTrip).toHaveBeenCalledWith(config, provider, issue.id, issue.identifier, "implementation", 3, conclusion);
   });
 
   it("unknown: does not release the reservation", async () => {

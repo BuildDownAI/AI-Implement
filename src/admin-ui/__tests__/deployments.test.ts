@@ -1,6 +1,6 @@
-import { JSDOM } from "jsdom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { deploymentsHtml, deploymentsScript } from "../pages/deployments.js";
+import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 describe("deployments page", () => {
   it("declares the expected ids", () => {
@@ -124,13 +124,12 @@ describe("deployments page", () => {
     expect(deploymentsScript).toContain("window.escAttr(sha)");
   });
 
-  it("renders every badge through setBadge, so none loses its dot", () => {
+  it("renders every badge through the shared setStatusBadge, so none loses its dot", () => {
     // `.badge` alone is a dotless pill — the dot is a child span that `.badge .dot`
     // sizes and `.badge.running .dot` animates. Writing a badge with textContent drops
     // it silently: the pill still reads correctly, so nothing looks broken. Asserting
-    // the helper is the only writer is what makes the omission impossible rather than
-    // merely unlikely.
-    expect(deploymentsScript).toContain('<span class="dot"></span>');
+    // the page writes no badge of its own is what makes the omission impossible rather
+    // than merely unlikely.
     for (const [kind, label] of [
       ["warn", "Draining"],
       ["running", "Building"],
@@ -143,15 +142,15 @@ describe("deployments page", () => {
     ]) {
       expect(deploymentsScript).toContain(`, '${kind}', '${label}')`);
     }
-    // Exactly one writer — the helper itself. A second occurrence means a call site
-    // set a badge directly, which is precisely how the dots were lost before.
-    const writers = deploymentsScript.match(/className\s*=\s*'badge/g) ?? [];
-    expect(writers).toHaveLength(1);
+    // No writer of its own. A call site that set a badge directly is precisely how the
+    // dots were lost before.
+    expect(deploymentsScript).toContain("window.setStatusBadge(");
+    expect(deploymentsScript).not.toMatch(/className\s*=\s*'badge/);
   });
 
   it("leaves no superseded badge vocabulary behind", () => {
     // A renamed label is added by prepending the new branch and is easy to ship beside the
-    // old one: setBadge replaces className and innerHTML outright, so the second block wins
+    // old one: setStatusBadge replaces className and innerHTML outright, so the second block wins
     // and the page looks correct while running both. A toContain assertion cannot see that
     // — it passes on the new labels whether or not the old ones are still there. This
     // shipped once, dead, and was caught in review rather than by the suite.
@@ -159,7 +158,7 @@ describe("deployments page", () => {
       expect(deploymentsScript).not.toContain(gone);
     }
     // One write per outcome state: the empty state plus the four badge treatments.
-    const outcomeWrites = deploymentsScript.match(/setBadge\(outcomeBadge,/g) ?? [];
+    const outcomeWrites = deploymentsScript.match(/setStatusBadge\(outcomeBadge,/g) ?? [];
     expect(outcomeWrites).toHaveLength(5);
   });
 
@@ -361,7 +360,7 @@ describe("deployments page", () => {
     // It released. Every route works except /mcp — the same shape as review_failed in
     // drawer.ts, which is a run that shipped a PR without approval and gets warn, not fail.
     // Red here would have an operator roll back a deployment that is serving traffic.
-    expect(deploymentsScript).toContain("setBadge(outcomeBadge, 'warn', 'Degraded')");
+    expect(deploymentsScript).toContain("window.setStatusBadge(outcomeBadge, 'warn', 'Degraded')");
     expect(deploymentsScript).not.toContain("'fail', 'Degraded'");
     expect(deploymentsScript).toContain("outcomeAlert.className = 'alert ' + (degraded ? 'warn' : 'fail')");
   });
@@ -516,53 +515,10 @@ describe("deployments page", () => {
   });
 });
 
-describe("fmtElapsed", () => {
-  // The page ships as one concatenated script string, so its helpers are only reachable
-  // by extraction. Worth the reach here: the interesting behaviour is the 60s and 60m
-  // boundaries, and a toContain assertion cannot see which side of one the code lands on.
-  const source = deploymentsScript.match(/function fmtElapsed\(startedAt\) \{[\s\S]*?\n  \}/);
-  if (!source) throw new Error("fmtElapsed not found in deploymentsScript");
-  const fmtElapsed = new Function(`return (${source[0]});`)() as (startedAt: number) => string;
-
-  const NOW = 1_700_000_000_000;
-  const secondsAgo = (n: number) => NOW - n * 1000;
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("reads in seconds under a minute", () => {
-    expect(fmtElapsed(secondsAgo(0))).toBe("0s");
-    expect(fmtElapsed(secondsAgo(45))).toBe("45s");
-    expect(fmtElapsed(secondsAgo(59))).toBe("59s");
-  });
-
-  it("switches to whole minutes at exactly one minute", () => {
-    expect(fmtElapsed(secondsAgo(60))).toBe("1m");
-    expect(fmtElapsed(secondsAgo(90))).toBe("1m");
-    expect(fmtElapsed(secondsAgo(59 * 60))).toBe("59m");
-  });
-
-  it("switches to hours and minutes at exactly one hour", () => {
-    expect(fmtElapsed(secondsAgo(60 * 60))).toBe("1h 0m");
-    expect(fmtElapsed(secondsAgo(95 * 60))).toBe("1h 35m");
-  });
-
-  it("clamps a start in the future to zero rather than counting down", () => {
-    // The stamp is written by whichever process claimed the hold, and read by whichever
-    // is alive now. A host whose clock moved backwards must not render "-3s elapsed".
-    expect(fmtElapsed(NOW + 3000)).toBe("0s");
-  });
-});
-
 describe("deploy status tile", () => {
   it("reads the start time the status endpoint reports", () => {
     expect(deploymentsScript).toContain("data.deployStartedAt");
-    expect(deploymentsScript).toContain("fmtElapsed(data.deployStartedAt) + ' elapsed'");
+    expect(deploymentsScript).toContain("window.fmtDuration(Date.now() - data.deployStartedAt) + ' elapsed'");
   });
 
   it("puts the activity in the value and elapsed in the unit, matching Draining", () => {
@@ -581,48 +537,12 @@ describe("deploy status tile", () => {
     expect(deploymentsScript).toContain("statusUnit.textContent = elapsed || 'waiting for in-flight work to finish';");
   });
 
-  it("uses fmtAgo for past events and fmtElapsed for the running one", () => {
+  it("uses fmtAgo for past events and fmtDuration for the running one", () => {
     // fmtAgo bakes "ago" into its output, which is wrong for a duration still accruing.
-    expect(deploymentsScript).toContain("'checked ' + fmtAgo(data.checkedAt)");
-    expect(deploymentsScript).toContain("fmtAgo(outcome.timestamp)");
-    const elapsedCalls = deploymentsScript.match(/fmtElapsed\(/g) ?? [];
-    expect(elapsedCalls).toHaveLength(2); // the declaration and its single call site
-  });
-});
-
-describe("fmtAgo", () => {
-  const source = deploymentsScript.match(/function fmtAgo\(ms\) \{[\s\S]*?\n  \}/);
-  if (!source) throw new Error("fmtAgo not found in deploymentsScript");
-  const fmtAgo = new Function(`return (${source[0]});`)() as (ms: number) => string;
-
-  const NOW = 1_700_000_000_000;
-  const ago = (n: number, unitMs: number) => NOW - n * unitMs;
-  const MIN = 60_000;
-  const HOUR = 60 * MIN;
-  const DAY = 24 * HOUR;
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("steps through seconds, minutes and hours", () => {
-    expect(fmtAgo(ago(45, 1000))).toBe("45s ago");
-    expect(fmtAgo(ago(12, MIN))).toBe("12m ago");
-    expect(fmtAgo(ago(5, HOUR))).toBe("5h ago");
-    expect(fmtAgo(ago(23, HOUR))).toBe("23h ago");
-  });
-
-  // The availability check runs every poll, so it never leaves seconds. The last deploy of a
-  // quiet orchestrator is weeks old, and hours do not survive that: three weeks read as
-  // "504h ago" before this tier existed.
-  it("reaches days, so an old deploy does not read in hundreds of hours", () => {
-    expect(fmtAgo(ago(24, HOUR))).toBe("1d ago");
-    expect(fmtAgo(ago(21, DAY))).toBe("21d ago");
-    expect(fmtAgo(ago(400, DAY))).toBe("400d ago");
+    expect(deploymentsScript).toContain("'checked ' + window.fmtAgo(data.checkedAt)");
+    expect(deploymentsScript).toContain("window.fmtAgo(outcome.timestamp)");
+    const durationCalls = deploymentsScript.match(/fmtDuration\(/g) ?? [];
+    expect(durationCalls).toHaveLength(1); // its single call site, the elapsed time
   });
 });
 
@@ -637,16 +557,8 @@ describe("Retention card", () => {
   });
 
   function mount() {
-    const dom = new JSDOM(`<!DOCTYPE html><body>${deploymentsHtml}</body>`, {
-      runScripts: "dangerously",
-      url: "http://localhost/admin#deployments",
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const win = dom.window as any;
     const posts: Array<{ url: string; body: unknown }> = [];
-    win.registerPage = () => {};
-    win.esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+    const api = async (url: string, init?: { method?: string; body?: string }) => {
       if (url === "/api/retention" && init?.method === "POST") {
         posts.push({ url, body: JSON.parse(init.body as string) });
         return { ok: true, status: 200, json: async () => retentionBody(10, 20) };
@@ -654,10 +566,7 @@ describe("Retention card", () => {
       if (url === "/api/retention") return { ok: true, status: 200, json: async () => retentionBody(14, 20) };
       return { ok: true, status: 200, json: async () => ({}) };
     };
-    const script = dom.window.document.createElement("script");
-    script.textContent = deploymentsScript;
-    dom.window.document.head.appendChild(script);
-    const doc = dom.window.document;
+    const { win, doc } = mountAdminPage({ html: deploymentsHtml, script: deploymentsScript, route: "deployments", api });
     const el = (id: string) => doc.getElementById(id) as HTMLInputElement & HTMLButtonElement;
     return { win, doc, el, posts };
   }
@@ -698,6 +607,33 @@ describe("Retention card", () => {
   });
 });
 
+describe("held reservations", () => {
+  it("releases the clicked row's reservation from a listener, never an id read back from the markup (ADR 002)", async () => {
+    const released: unknown[] = [];
+    const reservation = (dispatchId: string) => ({
+      dispatchId, team: "ENG", issueId: "i", issueIdentifier: "ENG-1", phase: "implement", backend: "fly", lifecycleOwner: "poll", ageMs: 60_000, jobStatus: null, jobConclusion: null,
+    });
+    const api = async (url: string, init?: { method?: string; body?: string }) => {
+      if (url === "/api/dispatch-reservations") return { ok: true, status: 200, json: async () => ({ reservations: [reservation("d-1"), reservation('d-2"><img src=x>')] }) };
+      if (url === "/api/tools/release_dispatch_reservation") {
+        released.push(JSON.parse(init!.body as string));
+        return { ok: true, status: 200, json: async () => ({ content: [{ text: JSON.stringify({ status: "released", dispatchId: "d-2" }) }] }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    const { win, doc } = mountAdminPage({ html: deploymentsHtml, script: deploymentsScript, route: "deployments", api });
+    await win.loadDeployments();
+    const buttons = await vi.waitFor(() => {
+      const found = [...doc.querySelectorAll("#reservations-list button")] as HTMLButtonElement[];
+      expect(found).toHaveLength(2);
+      return found;
+    });
+    expect(buttons.map((b) => [b.getAttribute("onclick"), b.getAttribute("data-dispatch-id")])).toEqual([[null, null], [null, null]]);
+    buttons[1].click();
+    await vi.waitFor(() => expect(released).toEqual([{ args: { dispatchId: 'd-2"><img src=x>' } }]));
+  });
+});
+
 describe("self-deploy panel", () => {
   type Deploy = Record<string, unknown> | null;
   const record = (phase: string, extra: Record<string, unknown> = {}) => ({
@@ -712,19 +648,8 @@ describe("self-deploy panel", () => {
   });
 
   function mount(status: { deploy: Deploy; flyAllowed?: boolean; flyToml?: boolean; outcome?: unknown }, cancelBody: unknown = { cancelled: true }) {
-    const dom = new JSDOM(`<!DOCTYPE html><body>${deploymentsHtml}</body>`, {
-      runScripts: "dangerously",
-      url: "http://localhost/admin#deployments",
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const win = dom.window as any;
     const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
-    const esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    win.registerPage = () => {};
-    win.esc = esc;
-    win.escAttr = (s: unknown) => esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-    win.confirm = () => true;
-    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+    const api = async (url: string, init?: { method?: string; body?: string }) => {
       calls.push({ url, method: init?.method, body: init?.body ? JSON.parse(init.body) : undefined });
       if (url === "/api/deployment-status") {
         return {
@@ -749,10 +674,13 @@ describe("self-deploy panel", () => {
       if (url === "/api/deploy-policy") return { ok: true, status: 200, json: async () => ({}) };
       return { ok: true, status: 200, json: async () => ({ reservations: [] }) };
     };
-    const script = dom.window.document.createElement("script");
-    script.textContent = deploymentsScript;
-    dom.window.document.head.appendChild(script);
-    const doc = dom.window.document;
+    const { win, doc } = mountAdminPage({
+      html: deploymentsHtml,
+      script: deploymentsScript,
+      route: "deployments",
+      api,
+      before: (w) => { w.confirm = () => true; },
+    });
     const el = (id: string) => doc.getElementById(id) as HTMLInputElement & HTMLButtonElement;
     return { win, doc, el, calls };
   }

@@ -7,6 +7,7 @@ import { makeAppendLogEntry, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
 import { testDb, type LoadedModules } from "./helpers/test-db.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EPHEMERAL_FULL_ACCESS_ASSERTION } from "../model-auth-contract.js";
 
 const launchSpies = vi.hoisted(() => ({ fly: vi.fn(), local: vi.fn() }));
@@ -182,6 +183,8 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     expect(trackerMapping.owner).toBe("acme");
     expect(trackerIssueId).toBe("issue-20");
     expect(trackerBody).toContain("Needs Human");
+    // The park names the PR's issue, so the breaker finds it once the PR's dispatch rows are pruned.
+    expect(breaker.breakersForIssue("AII-200")).toEqual([expect.objectContaining({ issueId: "issue-20", phase: "gap-analysis", project: "AII" })]);
 
     // Left unprocessed so the next tick retries once unparked.
     const pending = queue.claimPendingCommentGapfills();
@@ -228,7 +231,7 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     seedGapAnalysisDispatch("issue-21", "AII-201", "Human bypass test", "acme", "billing", 42);
     seedGapAnalysisDispatch("issue-21", "AII-201", "Human bypass test", "acme", "billing", 42);
     // Simulate a PR already parked by an earlier tick.
-    breaker.parkIssue("issue-21", "gap-analysis", "pr_budget");
+    breaker.parkIssue("issue-21", "gap-analysis", "pr_budget", null);
 
     queue.enqueueCommentGapfill({
       owner: "acme", repo: "billing", prNumber: 42, commentId: 9401, commenter: "alice", instruction: "please retry",
@@ -253,7 +256,7 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     seedGapAnalysisDispatch("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
     seedGapAnalysisDispatch("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
     // Simulate the dispatch breaker parking the row (and telling the tracker) before the budget gate refuses.
-    breaker.parkIssue("issue-22", "gap-analysis", "breaker");
+    breaker.parkIssue("issue-22", "gap-analysis", "breaker", null);
     breaker.markTripNotified("issue-22", "gap-analysis");
 
     const queueId = queue.enqueueConflictResolution({
@@ -314,7 +317,7 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
   it("posts the tracker budget comment when a stuck fix run parked the row without a trip comment", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
     seedAtBudget("issue-23", "AII-203");
-    breaker.parkIssue("issue-23", "gap-analysis", "stuck_giveup");
+    breaker.parkIssue("issue-23", "gap-analysis", "stuck_giveup", null);
 
     const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
     const postTrackerCommentSpy = vi.fn<DrainInput["postTrackerComment"]>(async () => undefined);
@@ -335,7 +338,7 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
   it("keeps the breaker's last_conclusion when the budget gate refuses an already-parked row", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
     seedAtBudget("issue-25", "AII-205");
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-25", "gap-analysis", "crash");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-25", "gap-analysis", "crash", null);
 
     await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ AII: mapping }) }));
 
@@ -673,6 +676,26 @@ describe("ImplementationRun gap-fill ingress", () => {
     await checkNoSubmit(optsFor(makeMapping({ owner: "acme", repo: "billing",
       extraEnv: { [EPHEMERAL_FULL_ACCESS_EXTRA_ENV]: EPHEMERAL_FULL_ACCESS_ASSERTION } }), { runnerMode: "local" }), seedItem(), "pending");
   });
+  it("ephemeral full-access outside GHA names runner.project-backend and asks for it to run again for the project", async () => {
+    seedOrigin();
+    const send = await recordRechecks();
+    const lines = vi.spyOn(console, "log").mockImplementation(() => {});
+    await checkNoSubmit(optsFor(makeMapping({ owner: "acme", repo: "billing",
+      extraEnv: { [EPHEMERAL_FULL_ACCESS_EXTRA_ENV]: EPHEMERAL_FULL_ACCESS_ASSERTION } }), { runnerMode: "local" }), seedItem(), "pending");
+    expect(send.mock.calls).toEqual([[{ id: "runner.project-backend", project: "AII", cause: "launch-refused" }]]);
+    expect(lines.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith("[comment-gapfill] Deferring"))).toContain("runner.project-backend");
+  });
+  it("a token GitHub refuses names the checks behind it for the repository's project, and the item stays pending", async () => {
+    seedOrigin();
+    const { GitHubApiError } = await import("../github-errors.js");
+    const send = await recordRechecks();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const opts = optsFor();
+    vi.mocked(opts.getInstallationToken).mockRejectedValue(new GitHubApiError({ status: 404, path: "/repos/acme/billing/installation" }));
+    await checkNoSubmit(opts, seedItem(), "pending");
+    expect(send.mock.calls).toEqual([[{ id: "github.installation", project: "AII", cause: "github-read" }]]);
+    expect(warn.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith("[comment-gapfill] could not get a token"))).toContain("github.installation");
+  });
   it("conflict re-queue submits through the same ingress with humanRequested false", async () => {
     seedOrigin();
     const id = queue.enqueueConflictResolution({ owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/aii-1" });
@@ -789,7 +812,7 @@ it("counts parked automatic rows through three refusals across explicit ticks", 
   const lines = vi.spyOn(console, "log").mockImplementation(() => {});
   seedOrigin();
   const id = seedItem({ commenter: queue.ROLLUP_REVIEW_COMMENTER });
-  breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+  breaker.parkIssue("issue-1", "gap-analysis", "pr_budget", null);
   for (let tick = 1; tick <= 4; tick++) {
     await drain.drainCommentGapfillQueue(optsFor());
     expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({
@@ -813,7 +836,7 @@ it("previews budget exhaustion without admission writes and parks the PR", async
   expect(submit).not.toHaveBeenCalled();
   expect(admission.count("AII")).toBe(0);
   expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ refusalCount: 1, lastRefusalReason: "budget_exhausted" }));
-  expect(breaker.isParked("issue-1", "gap-analysis")).toBe(true);
+  expect(breaker.breakersForIssue("AII-1554")).toEqual([expect.objectContaining({ issueId: "issue-1", phase: "gap-analysis", parkedAt: expect.any(Number), project: "AII" })]);
   for (let tick = 2; tick <= 4; tick++) {
     await drain.drainCommentGapfillQueue(opts);
     expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({
@@ -859,7 +882,7 @@ it("skips after three late reservation refusals and never submits a fourth", asy
 describe("terminal PR check", () => {
   it.each([[true, true], [false, true], [true, false], [false, false]])("skips a terminal parked PR (dispatch row: %s, merged: %s)", async (hasDispatch, merged) => {
     if (hasDispatch) seedOrigin();
-    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget", null);
     const id = queue.enqueueConflictResolution({ owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/aii-1554" });
     const http = prLookup(42, { json: { merged, state: "closed" } });
     const opts = optsFor();
@@ -876,7 +899,7 @@ describe("terminal PR check", () => {
 
 it.each(["none", "parked", "running"] as const)("token refresh failure preserves the entire row (%s dispatch)", async dispatchState => {
   if (dispatchState !== "none") seedOrigin(dispatchState === "running" ? "running" : "completed");
-  if (dispatchState === "parked") breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+  if (dispatchState === "parked") breaker.parkIssue("issue-1", "gap-analysis", "pr_budget", null);
   const id = seedItem();
   const before = queue.getCommentGapfillItem(id);
   const opts = optsFor();

@@ -121,7 +121,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Stored key destination bindings and redaction | `src/restate/key-binding.ts`, `src/model-credentials.ts` | [docs/key-safety.md](docs/key-safety.md) |
-| Admin SPA | `src/admin-ui/` | |
+| Admin SPA: how it is built, routed and gated, which page owns which setting, adding a page | `src/admin-ui/` | [docs/admin-ui.md](docs/admin-ui.md) |
 | Restate engine: sidecar, endpoint, workflows, test job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
 | Unit test suite: setup files, the environment allowlist, shared fixture builders and harnesses, type checking, CI jobs | `src/__tests__/setup/`, `src/__tests__/helpers/`, `vitest.config.ts` | [docs/unit-tests.md](docs/unit-tests.md) |
 
@@ -233,7 +233,7 @@ A change that adds or alters an architectural feature must update the matching `
 
 ## Adding a new target repo
 
-1. Add the mapping at `/admin` via the **New project** stepper. On the Source step, **Check installation** probes whether the App is installed and can see the repo, linking straight to the fix — install the App, or add the repo to an existing install. The check is advisory; you can save regardless.
+1. Add the mapping at `/admin` via the **New project** stepper. Its Review step runs the project's setup checks before it is saved, each failing one with its fix. Only the project's own failing required checks hold Create; the rest are advisory, so a network blip or an orchestrator-wide fault never blocks a save. Full reference: [docs/admin-ui.md](docs/admin-ui.md) § What each page shows and changes.
 2. **Save.** The mapping persists immediately and sync runs in the background, polling to a terminal state. The mapping is saved however the sync resolves.
 3. Merge the sync PR in the target repo. Add the pickup label to the first issue only after the sync pull request merges.
 
@@ -348,7 +348,7 @@ Four things here are easy to state backwards. **A domain admits as `user`; only 
 
 Every authenticated request re-checks against an in-memory list, so a removal ends a session on the next request rather than at token expiry. **Full reference: [docs/access-model.md](docs/access-model.md)** — precedence, the audit trail, and the host command that recovers from lockout.
 
-The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — each module is emitted as its own inline `<script>` element (theme → auth → router → one per page → drawer → stepper). **Never merge them back into a single element**: a parse or runtime error in one page's `<script>` then stops only that element; login and routing (the first three elements) always run. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the HTML-escaping helpers (below) rather than bare globals. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts` — and it is ungrantable until listed in `PAGE_ROUTES` (`access-page-grants.ts`), which is deliberate: grantability is declared by naming what a page may read, so a new page and a new endpoint both fail closed.
+The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — each module is emitted as its own inline `<script>` element (theme → helpers → auth → router → one per page → the drawer, filesystem-issue, local-job-logs and stepper overlays). **Never merge them back into a single element**: a parse or runtime error in one page's `<script>` then stops only that element; the shared helpers, login and routing (the first four elements) always run. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the shared helpers in `helpers.ts` (the escaping helpers below, the badge builders, the time formatters) rather than bare globals or a copy of their own. **An admin UI module imports only other admin UI modules at runtime**: the server composes the page while its own modules load, so an import of server code joins the server's import cycle and throws `Cannot access … before initialization` at boot under Node, while vitest's transform hides it. Text the server owns reaches a page through its route; `bundle-syntax.test.ts` enforces the boundary. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts` — and it is ungrantable until listed in `PAGE_ROUTES` (`access-page-grants.ts`), which is deliberate: grantability is declared by naming what a page may read, so a new page and a new endpoint both fail closed.
 
 **HTML escaping — three-way rule** (full rationale: [docs/adr/002-admin-ui-html-escaping.md](docs/adr/002-admin-ui-html-escaping.md)):
 

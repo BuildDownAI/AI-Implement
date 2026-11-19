@@ -1,69 +1,9 @@
-// Shared auth utilities injected into every admin page as a script block.
-// Provides: token, API, api(), esc(), login(), showAdmin(), showLogin(), logout()
+// Sign-in for the admin page, as its own script block after helpers.ts.
+// Provides: token, API, api(), login(), showAdmin(), showLogin(), logout(), isAdmin()
 export const authJs = `
 (function () {
   const API = '';
   let token = localStorage.getItem('admin_token');
-
-  function esc(s) {
-    const d = document.createElement('div');
-    d.textContent = String(s == null ? '' : s);
-    return d.innerHTML;
-  }
-  window.esc = esc;
-
-  function escAttr(s) {
-    return String(s == null ? '' : s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#x27;');
-  }
-  window.escAttr = escAttr;
-
-  // Validates URL scheme; returns '#' for javascript:, data:, etc.
-  // Relative URLs (/path, ./path, #fragment) and http/https/mailto pass through.
-  function safeUrl(s) {
-    if (s == null) return '#';
-    const str = String(s);
-    if (!str) return '';
-    if (str[0] === '#' || str[0] === '/' || str[0] === '.' || !str.includes(':')) return str;
-    try {
-      const url = new URL(str);
-      if (url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'mailto:') return str;
-    } catch (_) { /* malformed URL with colon — block it */ }
-    return '#';
-  }
-  window.safeUrl = safeUrl;
-
-  function raw(s) {
-    return { __raw: true, value: String(s == null ? '' : s) };
-  }
-  window.raw = raw;
-
-  // Tagged template that escapes every interpolation with escAttr() by default.
-  // For href/src attributes, also validates the URL scheme via safeUrl().
-  // Wrap a value with raw() to inject pre-built markup without escaping.
-  // Residual: does not detect URL context when the attribute is split across
-  // multiple interpolations or the URL is built in a variable before the template.
-  function html(strings, ...values) {
-    let result = '';
-    for (let i = 0; i < strings.length; i++) {
-      result += strings[i];
-      if (i < values.length) {
-        const v = values[i];
-        if (v && typeof v === 'object' && v.__raw) {
-          result += v.value;
-        } else {
-          const inUrlAttr = /(?:href|src)\s*=\s*["']?$/i.test(strings[i]);
-          result += escAttr(inUrlAttr ? safeUrl(v) : v);
-        }
-      }
-    }
-    return result;
-  }
-  window.html = html;
 
   // Brand marks for the provider tiles; unknown providers render label-only.
   var PROVIDER_ICONS = {
@@ -118,7 +58,7 @@ export const authJs = `
     var ssoButtons = document.getElementById('sso-buttons');
     if (ssoButtons) ssoButtons.innerHTML = providers.map(function (p) {
       return '<a class="sso-tile" href="' + API + '/api/auth/' + encodeURIComponent(p.id) + '/start">' +
-             (PROVIDER_ICONS[p.id] || '') + '<span>' + esc(p.label) + '</span></a>';
+             (PROVIDER_ICONS[p.id] || '') + '<span>' + window.esc(p.label) + '</span></a>';
     }).join('');
 
     var hasSso = providers.length > 0;

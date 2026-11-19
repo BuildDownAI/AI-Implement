@@ -3,6 +3,7 @@ import type { AIImplementSnapshot, TicketIssue, TicketingProvider } from "./prov
 import type { ProviderRegistry } from "./providers/registry.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { DispatchBlockReason } from "./dispatch-gate.js";
+import type { SetupCheckId } from "./setup-checks/contract.js";
 
 export interface Blocker {
   issueId: string;
@@ -411,6 +412,18 @@ export interface ForeignTrackerIssue {
 export interface ProviderSnapshotEntry {
   provider: TicketingProvider;
   snapshot: AIImplementSnapshot;
+}
+
+/** The setup checks that explain a tracker read that failed: the provider's credentials, and for Jira the fields its reads resolve. */
+const TRACKER_READ_CHECKS: Readonly<Record<string, readonly SetupCheckId[]>> = {
+  linear: ["tracker.linear.credentials"],
+  jira: ["tracker.jira.credentials", "tracker.jira.fields"],
+  filesystem: ["tracker.filesystem.directory"],
+};
+
+/** The setup checks behind a failed read of `providerId`'s tracker, none for a provider with no checks of its own. */
+export function trackerReadChecks(providerId: string): readonly SetupCheckId[] {
+  return TRACKER_READ_CHECKS[providerId] ?? [];
 }
 
 /** A provider whose snapshot rejected this cycle: its issues sit out, and nothing reads them as gone. */

@@ -3,6 +3,7 @@
 // instead of passing silently through a per-file copy. Overrides are spread last.
 // Defaults are neutral literals, not the production DEFAULT_* constants, so a changed product default
 // never quietly changes every test that builds a mapping.
+import { generateKeyPairSync, type KeyObject } from "node:crypto";
 import { vi } from "vitest";
 import type { AccessEntry } from "../../access-entries.js";
 import type { RepoMapping } from "../../config.js";
@@ -149,6 +150,14 @@ export function makeScopedInstallationToken(overrides: Partial<ScopedInstallatio
     installationId: 1,
     ...overrides,
   };
+}
+
+let appKey: KeyObject | undefined;
+// A GitHub App private key that signs, so the App's JWT mints and the request after it is made: PKCS#8 by default,
+// or PKCS#1, the form GitHub's download takes. One RSA key per test file, made on first use, since generating one is slow.
+export function makeAppPrivateKey(format: "pkcs8" | "pkcs1" = "pkcs8"): string {
+  appKey ??= generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey;
+  return appKey.export({ type: format, format: "pem" }).toString();
 }
 
 // The deadline is an hour ahead of when the result is built, so a default attempt has not expired.

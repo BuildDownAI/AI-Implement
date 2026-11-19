@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import vm from "node:vm";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { adminHtml } from "../index.js";
 import { themeJs } from "../theme.js";
+import { helpersJs } from "../helpers.js";
 import { authJs } from "../auth.js";
 import { routerJs } from "../router.js";
 import { overviewScript } from "../pages/overview.js";
@@ -22,7 +26,10 @@ import { reportsScript } from "../pages/reports.js";
 import { kgPipelinesScript } from "../pages/kg-pipelines.js";
 import { deploymentsScript } from "../pages/deployments.js";
 import { accessScript } from "../pages/access.js";
+import { setupScript } from "../pages/setup.js";
 import { drawerScript } from "../drawer.js";
+import { filesystemIssueScript } from "../filesystem-issue.js";
+import { localJobLogsScript } from "../local-job-logs.js";
 import { stepperScript } from "../stepper.js";
 import { SIDEBAR_ROUTES, sidebarHtml } from "../sidebar.js";
 
@@ -44,14 +51,47 @@ import { SIDEBAR_ROUTES, sidebarHtml } from "../sidebar.js";
  * an init-callback throw without propagating to subsequent pages.
  */
 
+// Every module adminHtml emits as a <script> element, in emitted order: the infrastructure, the pages, then the overlays.
+const MODULES: [string, string][] = [
+  ["theme", themeJs],
+  ["helpers", helpersJs],
+  ["auth", authJs],
+  ["router", routerJs],
+  ["overview", overviewScript],
+  ["settings", settingsScript],
+  ["projects", projectsScript],
+  ["pipelines", pipelinesScript],
+  ["reaper", reaperScript],
+  ["sessions", sessionsScript],
+  ["audit", auditScript],
+  ["issues", issuesScript],
+  ["pulls", pullsScript],
+  ["blockers", blockersScript],
+  ["customizations", customizationsScript],
+  ["pipelines-and-steps", pipelinesAndStepsScript],
+  ["models-and-providers", modelsAndProvidersScript],
+  ["runners", runnersScript],
+  ["reports", reportsScript],
+  ["kg-pipelines", kgPipelinesScript],
+  ["deployments", deploymentsScript],
+  ["access", accessScript],
+  ["setup", setupScript],
+  ["drawer", drawerScript],
+  ["filesystem-issue", filesystemIssueScript],
+  ["local-job-logs", localJobLogsScript],
+  ["stepper", stepperScript],
+];
+
 // ─── element-level sweep ─────────────────────────────────────────────────────
 
 describe("admin UI inline bundle", () => {
   const scripts = [...adminHtml.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
 
-  it("contains at least one inline script per module (3 infra + 17 pages + 2 shared = 22)", () => {
-    // Each module emits its own <script>; merging them back would collapse this count.
-    expect(scripts.length).toBeGreaterThanOrEqual(22);
+  it("emits one inline script per module, each in an element of its own", () => {
+    // Merging modules back into one element would collapse the count, and a module added without its entry
+    // in MODULES fails here, so the per-module parse below cannot fall behind the page.
+    expect(scripts.length).toBe(MODULES.length);
+    for (const [name, src] of MODULES) expect(scripts.filter((element) => element.includes(src)), name).toHaveLength(1);
   });
 
   it("every emitted <script> element parses as valid JavaScript (a syntax error in one element stops only that element)", () => {
@@ -64,33 +104,7 @@ describe("admin UI inline bundle", () => {
 // ─── per-module named parse ───────────────────────────────────────────────────
 
 describe("per-module script parse", () => {
-  const modules: [string, string][] = [
-    ["theme", themeJs],
-    ["auth", authJs],
-    ["router", routerJs],
-    ["overview", overviewScript],
-    ["settings", settingsScript],
-    ["projects", projectsScript],
-    ["pipelines", pipelinesScript],
-    ["reaper", reaperScript],
-    ["sessions", sessionsScript],
-    ["audit", auditScript],
-    ["issues", issuesScript],
-    ["pulls", pullsScript],
-    ["blockers", blockersScript],
-    ["customizations", customizationsScript],
-    ["pipelines-and-steps", pipelinesAndStepsScript],
-    ["models-and-providers", modelsAndProvidersScript],
-    ["runners", runnersScript],
-    ["reports", reportsScript],
-    ["kg-pipelines", kgPipelinesScript],
-    ["deployments", deploymentsScript],
-    ["access", accessScript],
-    ["drawer", drawerScript],
-    ["stepper", stepperScript],
-  ];
-
-  it.each(modules)("%s module parses as valid JavaScript", (name, src) => {
+  it.each(MODULES)("%s module parses as valid JavaScript", (name, src) => {
     expect(() => new vm.Script(src, { filename: `${name}.js` })).not.toThrow();
   });
 });
@@ -98,21 +112,22 @@ describe("per-module script parse", () => {
 // ─── poison isolation ─────────────────────────────────────────────────────────
 
 describe("structural isolation", () => {
-  it("auth and router scripts still parse when a page script element contains invalid JS", () => {
+  it("helpers, auth and router scripts still parse when a page script element contains invalid JS", () => {
     // This is the test that would have structurally prevented the 2026-09-05 lockout:
     // with a single <script>, poisoning any content kills everything including login.
     // With per-element isolation, only the poisoned element fails.
     const elements = [...adminHtml.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-    // Elements: 0=theme, 1=auth, 2=router, 3+=page scripts
-    expect(elements.length).toBeGreaterThanOrEqual(4);
+    // Elements: 0=theme, 1=helpers, 2=auth, 3=router, 4+=page scripts
+    expect(elements.length).toBeGreaterThanOrEqual(5);
     const poisoned = [...elements];
-    poisoned[3] = "this is }{{{ not valid JS";
+    poisoned[4] = "this is }{{{ not valid JS";
     // The poisoned element fails
-    expect(() => new vm.Script(poisoned[3])).toThrow();
-    // Infrastructure elements (theme, auth, router) are unaffected
+    expect(() => new vm.Script(poisoned[4])).toThrow();
+    // Infrastructure elements (theme, helpers, auth, router) are unaffected
     expect(() => new vm.Script(poisoned[0]), "theme must survive").not.toThrow();
-    expect(() => new vm.Script(poisoned[1]), "auth must survive").not.toThrow();
-    expect(() => new vm.Script(poisoned[2]), "router must survive").not.toThrow();
+    expect(() => new vm.Script(poisoned[1]), "helpers must survive").not.toThrow();
+    expect(() => new vm.Script(poisoned[2]), "auth must survive").not.toThrow();
+    expect(() => new vm.Script(poisoned[3]), "router must survive").not.toThrow();
   });
 });
 
@@ -221,5 +236,28 @@ describe("journal removal (AII-1262)", () => {
     expect(html).not.toContain("renderRestateJournal");
     expect(sidebarHtml()).not.toContain("journal");
     expect(SIDEBAR_ROUTES).not.toContain("journal");
+  });
+});
+
+// ─── module boundary ──────────────────────────────────────────────────────────
+
+describe("admin UI module boundary", () => {
+  // The server composes the admin page while its own modules load, so a page module that imports server
+  // code joins the server's import cycle: Node then throws "Cannot access … before initialization" at
+  // boot, while vitest's transform hides it by reading the export as undefined. Data a page needs comes
+  // from its route instead.
+  const adminUi = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const modules = readdirSync(adminUi, { recursive: true, encoding: "utf8" })
+    .filter((file) => file.endsWith(".ts") && !file.split(/[\\/]/).includes("__tests__"));
+
+  it.each(modules)("%s imports only other admin UI modules at runtime", (file) => {
+    const source = readFileSync(join(adminUi, file), "utf8");
+    // A runtime import in any form: with bindings, bare for its side effects, or re-exported, in either quote style.
+    const runtimeImport = /^(?:import\s+(?!type\b)(?:[^;]*?\sfrom\s+)?|export\s+(?!type\b)(?:\*|\{)[^;]*?\sfrom\s+)["']([^"']+)["']/gm;
+    const imports = [...source.matchAll(runtimeImport)].map((m) => m[1]);
+    for (const spec of imports) {
+      const target = resolve(dirname(join(adminUi, file)), spec);
+      expect(relative(adminUi, target).startsWith(".."), spec).toBe(false);
+    }
   });
 });

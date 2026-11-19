@@ -57,6 +57,17 @@ export function onDeployHoldCleared(cb: () => void): () => void {
   };
 }
 
+/** Resolves at once when no deploy holds new work back, otherwise once clearDeployHold() clears the hold. */
+export function whenDeployHoldClears(): Promise<void> {
+  if (!isDeployHeld()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const stop = onDeployHoldCleared(() => {
+      stop();
+      resolve();
+    });
+  });
+}
+
 /**
  * Clears the hold. Returns whether one was set — at boot that means the previous
  * process died mid-deploy, which is the only place the distinction is observable.
