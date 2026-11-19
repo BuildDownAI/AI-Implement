@@ -315,9 +315,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
 
     const managedRuntime = getModelAuthRuntime(config);
     let managedDecision: Prelaunch["managedDecision"] = { kind: "legacy" };
-    if (isManagedProject(run.teamKey, run.dispatchId)) {
+    if (issue.issueModels !== undefined || isManagedProject(run.teamKey, run.dispatchId)) {
       const decision = await prepareManagedDispatch(
-        { dispatchId: run.dispatchId, projectKey: run.teamKey, backend: run.backend, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+        { dispatchId: run.dispatchId, projectKey: run.teamKey, issueModels: issue.issueModels, backend: run.backend, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
         managedRuntime,
       );
       if (decision.kind === "legacy" || decision.kind === "launch") {

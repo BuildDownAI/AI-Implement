@@ -1,3 +1,4 @@
+import type { IssueModels } from "../issue-config.js";
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
 import type { RepoMapping } from "../config.js";
 import type { ResolvedFieldIds } from "./jira-fields.js";
@@ -10,6 +11,7 @@ export interface FeatureBranchChainEntry {
 
 /** A ticket issue, normalized across providers. */
 export interface TicketIssue {
+  issueModels?: IssueModels | null;
   /** Provider-internal ID (Linear UUID, Jira issue ID). */
   id: string;
   /** Human-readable key (Linear "ENG-123", Jira "PROJ-456"). */

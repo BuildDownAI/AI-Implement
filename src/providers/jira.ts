@@ -33,7 +33,7 @@ import {
 import type { RepoMapping } from "../config.js";
 import { classifyByChildren, ancestorChain } from "./jira-hierarchy.js";
 import { nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
-import { parseIssueConfig } from "../issue-config.js";
+import { issueDispatchFields, parseIssueConfig } from "../issue-config.js";
 import { markdownToAdf } from "./markdown-to-adf.js";
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
 import { assemblePlanningContext } from "../planning-context-assembly.js";
@@ -748,7 +748,7 @@ export class JiraProvider implements TicketingProvider {
     scopeKey: string,
     fieldIds: ResolvedFieldIds,
   ): TicketIssue {
-    const descText = parseIssueConfig(descriptionText(raw.fields), raw.key).description;
+    const parsed = parseIssueConfig(descriptionText(raw.fields), raw.key);
     const statusOption = raw.fields[fieldIds.statusFieldId] as { value?: string } | null;
     const profiles = fieldIds.profilesFieldId
       ? parseMultiSelectValues(raw.fields[fieldIds.profilesFieldId])
@@ -761,7 +761,7 @@ export class JiraProvider implements TicketingProvider {
       id: raw.id,
       identifier: raw.key,
       title: (raw.fields.summary as string) ?? "",
-      description: descText,
+      ...issueDispatchFields(parsed),
       scopeKey,
       nativeStatus: statusOption?.value ?? "",
       ...(profiles.length > 0 ? { profiles } : {}),
@@ -1155,7 +1155,7 @@ export class JiraProvider implements TicketingProvider {
       identifier: issue.key,
       title: (issue.fields.summary as string) ?? "",
       // API v3 returns ADF: read it as text, the same way the poll does.
-      description: parseIssueConfig(descriptionText(issue.fields), issue.key).description,
+      ...issueDispatchFields(parseIssueConfig(descriptionText(issue.fields), issue.key)),
       scopeKey: "",
       nativeStatus: ((issue.fields.status as { name?: string } | null)?.name) ?? "",
     };

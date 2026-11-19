@@ -1297,7 +1297,7 @@ export async function dispatchBothMode(
   baseBranchFieldValue: string | null,
 ): Promise<void> {
   await dispatchGitHubActions(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue);
-  if (!isManagedProject(issue.scopeKey)) {
+  if (issue.issueModels === undefined && !isManagedProject(issue.scopeKey)) {
     await dispatchFlyMachine(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue, true);
   }
 }
@@ -1337,11 +1337,11 @@ export async function dispatchGitHubActions(
   // The decision carries the frozen snapshot and the one-shot bootstrap; a refusal launches nothing.
   const managedRuntime = getModelAuthRuntime(config);
   let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
-  if (isManagedProject(issue.scopeKey, dispatchId)) {
+  if (issue.issueModels !== undefined || isManagedProject(issue.scopeKey, dispatchId)) {
     let decision: ManagedDispatchDecision;
     try {
       decision = await prepareManagedDispatch(
-        { dispatchId, projectKey: issue.scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+        { dispatchId, projectKey: issue.scopeKey, issueModels: issue.issueModels, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
         managedRuntime,
       );
     } catch (err) {
@@ -1797,7 +1797,7 @@ export async function dispatchSession(
   // admission acquired here is released; a caller-held reservation is never ours to free.
   let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
   if (!opts.managedAuth) {
-    if (isManagedProject(issue.scopeKey, dispatchId)) {
+    if (issue.issueModels !== undefined || isManagedProject(issue.scopeKey, dispatchId)) {
       admission?.release("launch_rejected");
       console.warn(`[poll] Managed dispatch for ${issue.identifier}: phase_not_wired (${opts.phase}); nothing launched`);
       return { admitted: false, refusal: "phase_not_wired" };
@@ -1806,7 +1806,7 @@ export async function dispatchSession(
     return { admitted: false };
   } else {
     const decision = await prepareManagedDispatch(
-      { dispatchId, projectKey: issue.scopeKey, backend: opts.backendKind, owner: mapping.owner, repo: mapping.repo, workflowFile: opts.managedAuth.workflowFile },
+      { dispatchId, projectKey: issue.scopeKey, issueModels: issue.issueModels, backend: opts.backendKind, owner: mapping.owner, repo: mapping.repo, workflowFile: opts.managedAuth.workflowFile },
       opts.managedAuth.runtime,
     );
     console.log(

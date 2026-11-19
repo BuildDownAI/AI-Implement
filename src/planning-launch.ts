@@ -92,9 +92,9 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
   // throws, and the caller releases the reservation it holds.
   const managedRuntime = getModelAuthRuntime(config);
   let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
-  if (isManagedProject(issue.scopeKey, dispatchId)) {
+  if (issue.issueModels !== undefined || isManagedProject(issue.scopeKey, dispatchId)) {
     const decision = await prepareManagedDispatch(
-      { dispatchId, projectKey: issue.scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.planningWorkflowFile },
+      { dispatchId, projectKey: issue.scopeKey, issueModels: issue.issueModels, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.planningWorkflowFile },
       managedRuntime,
     );
     console.log(`[poll] Managed planning dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);

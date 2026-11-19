@@ -36,6 +36,7 @@
  * `inspectAgentReadiness` is the read-only companion for administration: it writes,
  * reserves and mints nothing, and reports unknown readiness as not ready.
  */
+import type { IssueModels } from "./issue-config.js";
 import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
 import {
@@ -90,6 +91,8 @@ export const RETIRED_WORKFLOW_PATHS = [
   ".github/workflows/claude-kg-refresh.yml",
 ] as const;
 
+export const ISSUE_MODELS_TEMPLATE_CAPABILITY = "ai-implement-capability: issue-models-v1";
+
 export const DEFAULT_GRANT_TTL_MS = 4 * 60 * 60 * 1000;
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -120,6 +123,7 @@ export interface AgentRunPreparationDeps extends AgentReadinessDeps {
 }
 
 export interface AgentRunRequest {
+  issueModels?: IssueModels | null;
   /** Stable identity of this attempt. A replacement attempt must use a new one. */
   dispatchId: string;
   projectKey: string;
@@ -131,6 +135,9 @@ export interface AgentRunRequest {
 }
 
 export type ConfigurationErrorCode =
+  | "issue_models_require_configured_project"
+  | "issue_models_invalid"
+  | "issue_model_unapproved"
   | "invalid_request"
   | "resolution_failed"
   | "resolution_unavailable"
@@ -290,10 +297,25 @@ function resolveCurrent(request: AgentRunRequest, candidate?: StageAgentConfigur
   } catch (err) {
     return { kind: "error", code: resolutionFailure(err) };
   }
-  if (projection.resolution.mode !== "configured") return { kind: "legacy" };
+  if (projection.resolution.mode !== "configured") {
+    return request.issueModels === undefined ? { kind: "legacy" } : { kind: "error", code: "issue_models_require_configured_project" };
+  }
   const refs = projection.configReferences;
   if (!refs) return { kind: "error", code: "resolution_failed" };
   const resolution: ConfiguredStageResolution = projection.resolution;
+  if (request.issueModels === null) return { kind: "error", code: "issue_models_invalid" };
+  for (const stage of STAGE_NAMES) {
+    const model = request.issueModels?.[stage];
+    if (model === undefined) continue;
+    const selection = resolution.stages[stage];
+    if (model !== selection.model && model !== resolution.fallbackModels[stage]) {
+      return { kind: "error", code: "issue_model_unapproved" };
+    }
+    selection.model = model;
+    resolution.sources[stage].model = "issue";
+    delete resolution.fallbackModels[stage];
+    delete resolution.accountFallbacks[stage];
+  }
   try {
     const snapshot = validateResolvedAgentSnapshot({
       version: 1,
@@ -317,7 +339,7 @@ function resolveForRequest(request: AgentRunRequest): Resolved {
     const snapshot = snapshotFromRow(row);
     return snapshot ? { kind: "snapshot", snapshot, stored: true, fallbackModels: fallbackModelsFromRow(row), metadata: metadataFromRow(row) } : { kind: "error", code: "snapshot_invalid" };
   }
-  if (!isProjectConfigured(request.projectKey)) return { kind: "legacy" };
+  if (request.issueModels === undefined && !isProjectConfigured(request.projectKey)) return { kind: "legacy" };
   return resolveCurrent(request);
 }
 
@@ -400,7 +422,7 @@ function backendSupported(snapshot: ResolvedAgentSnapshotV1, backend: DispatchAd
   return backend === "github-actions" || !profileList(snapshot).some((p) => p.authMode === "bedrock");
 }
 
-async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDeps, authModes: readonly AccountAuthMode[]): Promise<ConfigurationErrorCode | null> {
+async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDeps, authModes: readonly AccountAuthMode[], issueSelected: boolean): Promise<ConfigurationErrorCode | null> {
   if (request.backend !== "github-actions") {
     let capable = false;
     try {
@@ -426,6 +448,7 @@ async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDep
   if (RETIRED_WORKFLOW_PATHS.some((p) => files[p] !== null)) return "retired_workflow_present";
   const template = files[workflowPath];
   return typeof template === "string"
+    && (!issueSelected || template.includes(ISSUE_MODELS_TEMPLATE_CAPABILITY))
     && template.includes(AGENT_CONFIG_TEMPLATE_CAPABILITY)
     && template.includes(AGENT_LAUNCH_CONTEXT_TEMPLATE_CAPABILITY)
     && (!authModes.includes("openrouter-api-key") || template.includes(OPENROUTER_ACCOUNTS_TEMPLATE_CAPABILITY))
@@ -444,7 +467,7 @@ async function checkSelection(
   return checkCapability(request, deps, [
     ...profileList(snapshot).map(p => p.authMode),
     ...Object.values(accountFallbacks).flatMap(entries => entries?.map(entry => entry.authMode) ?? []),
-  ]);
+  ], STAGE_NAMES.some(stage => snapshot.sources[stage].model === "issue"));
 }
 
 function credentialRequest(snapshot: ResolvedAgentSnapshotV1, p: PreparedProfile, ownerGeneration?: number) {

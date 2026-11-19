@@ -4,6 +4,8 @@
  * credentials and injected fakes only: no network, no paid model calls.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { createStageExecutor } from "../pipeline/stage-executor.js";
+import { issueDispatchFields, parseIssueConfig } from "../issue-config.js";
 import crypto from "node:crypto";
 import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
@@ -184,6 +186,9 @@ describe("legacy", () => {
     store.setProjectConfigured("AII", false);
     const before = counts();
     expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "legacy" });
+    expect(await prep.prepareAgentRun(request({ issueModels: { implementation: "m" } }), deps)).toEqual({
+      status: "configuration-error", code: "issue_models_require_configured_project",
+    });
     expect(counts()).toEqual(before);
   });
 
@@ -246,6 +251,34 @@ describe("snapshot immutability and idempotence", () => {
     expect(first.fallbackModels).toEqual({});
     expect(first).not.toHaveProperty("accountFallbacks");
     expect(ready(await prep.prepareAgentRun(request(), deps)).fallbackModels).toEqual({});
+  });
+
+  it("pins an approved issue model through retry and refuses an unapproved new dispatch", async () => {
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { fallbackModel: "backup" } } });
+    const issue = issueDispatchFields(parseIssueConfig(["```yaml", "# ai-implement.yml", "models:", "  review: backup", "```"].join("\n")));
+    const selected = request({ issueModels: issue.issueModels });
+    expect(await prep.prepareAgentRun(selected, deps)).toMatchObject({ status: "configuration-error", code: "runner_incompatible" });
+    if (files === "throw") throw new Error("expected workflow fixture");
+    files[".github/workflows/claude-implement.yml"] += "\n# ai-implement-capability: issue-models-v1";
+    const run = ready(await prep.prepareAgentRun(selected, deps));
+    expect(run.snapshot.stages.review.model).toBe("backup");
+    expect(run.snapshot.sources.review.model).toBe("issue");
+    expect(run.snapshot.stages.implementation.model).toBe("m");
+    expect(run.fallbackModels.review).toBeUndefined();
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 }));
+    const executor = createStageExecutor({
+      workspaceDir: ".", snapshot: run.snapshot, legacy: { invoke },
+      createClaude: () => ({ invoke }),
+      auth: { invoke: (_profile, runModel) => runModel({ env: {}, strippedKeys: [] }) },
+    });
+    await executor.invoke({ prompt: "Review", agentStage: "review", model: "caller-default" });
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ model: "backup" }), expect.anything());
+
+    const changed = { review: "unapproved" };
+    expect(ready(await prep.prepareAgentRun(request({ issueModels: changed }), deps)).snapshot).toEqual(run.snapshot);
+    expect(await prep.prepareAgentRun(request({ dispatchId: "d2", issueModels: changed }), deps)).toMatchObject({
+      status: "configuration-error", code: "issue_model_unapproved",
+    });
   });
 
   it("freezes fallbacks separately from the snapshot", async () => {
