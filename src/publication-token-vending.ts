@@ -1,4 +1,5 @@
 import { getScopedInstallationToken } from "./github-app-auth.js";
+import { gitHubAppErrorChecks, pointAtSetupChecks } from "./setup-checks/recheck.js";
 import { releasePublicationClaim, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
 
 export interface HandlePublicationTokenInput {
@@ -111,7 +112,8 @@ export async function handlePublicationTokenRequest(
     if (!pilot && verified.consumedAt !== null) {
       releasePublicationClaim(verified.claims.dispatchId, verified.consumedAt);
     }
-    console.error("[publication-token] Failed to mint installation token:", err);
+    const pointer = pointAtSetupChecks({ ids: gitHubAppErrorChecks(err), project: verified.mappingTeamKey, cause: "token-vending" });
+    console.error(`[publication-token] Failed to mint installation token${pointer}:`, err);
     return { status: 500, body: { error: "Failed to mint token" } };
   }
 }

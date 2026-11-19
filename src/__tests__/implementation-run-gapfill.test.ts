@@ -1,5 +1,6 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { makeMapping, makeJob } from "./helpers/builders.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../restate/implementation-run-production.js";
 vi.mock("../agent-run-preparation.js", async original => ({ ...await original<object>(), persistedPreparationState: vi.fn(() => "absent"), loadStoredSnapshot: vi.fn(() => null) }));
@@ -495,6 +496,7 @@ it.each(containerBackends.flatMap(backend => ["bedrock", "no-key", ...(backend =
   if (reason === "no-key") { input.config.anthropicApiKey = null; input.config.claudeOAuthToken = null; }
   if (reason === "no-token") input.config.flySessionsToken = null;
   if (reason === "no-app") input.config.flySessionsApp = null;
+  const send = await recordRechecks();
   createProductionImplementationRunServices(input);
   const deps = captured.deps as ImplementationRunDependencies;
   if (reason === "no-token" || reason === "no-app") {
@@ -503,7 +505,11 @@ it.each(containerBackends.flatMap(backend => ["bedrock", "no-key", ...(backend =
   }
   expect(await deps.launch({ ...run, backend })).toEqual({ outcome: "rejected" });
   const message = reason === "bedrock" ? "provider=bedrock not supported" : reason === "no-key" ? "no API key configured" : "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set";
-  expect(console.error).toHaveBeenCalledWith(`[comment-gapfill] Cannot dispatch ENG-1 via ${backend === "fly-machines" ? "Fly Machines" : "local Docker"}: ${message}`);
+  const check = reason === "bedrock" ? "runner.project-backend" : reason === "no-key" ? "model.credentials-adopted" : "runner.fly-sessions";
+  const line = vi.mocked(console.error).mock.calls.map(([text]) => String(text)).find((text) => text.startsWith("[comment-gapfill] Cannot dispatch ENG-1"));
+  expect(line).toContain(`via ${backend === "fly-machines" ? "Fly Machines" : "local Docker"}: ${message}`);
+  expect(line).toContain(check);
+  expect(send.mock.calls).toEqual([[{ id: check, project: "ENG", cause: "launch-refused" }]]);
   expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "failed");
   expect(dispatchFlyGapfill).not.toHaveBeenCalled();
   expect(dispatchLocalGapfill).not.toHaveBeenCalled();
@@ -686,7 +692,11 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(db.prepare("SELECT COUNT(*) AS n FROM dispatch_log WHERE dispatch_id = 'dispatch'").get()).toEqual({ n: 1 });
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
   expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
-  expect(vi.mocked(fetch).mock.calls.at(-1)?.[0]).toContain("Org/repo/actions/workflows/");
+  // Every GitHub read after the mapping changed targets the run's frozen repository, the finish step's token-step read included.
+  const urls = vi.mocked(fetch).mock.calls.map(([url]) => String(url));
+  expect(urls.some((url) => url.includes("Org/repo/actions/workflows/"))).toBe(true);
+  expect(urls.filter((url) => url.includes("Changed/different"))).toEqual([]);
+  expect(urls.at(-1)).toContain("Org/repo/actions/runs/88/jobs");
 
   // Persist an intent without calling dispatch, then close SQLite and reconstruct modules.
   const preCall = { ...recoveryRun, dispatchId: "pre-call", gapFill: { ...recoveryRun.gapFill!, prNumber: 43 } };

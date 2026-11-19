@@ -95,9 +95,9 @@ describe("filesystem ticket lifecycle", () => {
     const id = issueId("FS-101");
     writeTicket("FS-101", { location: "failed", status: "failed", phase: "implementation" });
     dedup.markDispatched(id, "TEAM", "FS-101", "Retry me");
-    breaker.recordDispatchFailure(id, "implementation", "failure");
-    breaker.recordDispatchFailure(id, "implementation", "failure");
-    breaker.recordDispatchFailure(id, "implementation", "failure");
+    breaker.recordDispatchFailure(id, "implementation", "failure", null);
+    breaker.recordDispatchFailure(id, "implementation", "failure", null);
+    breaker.recordDispatchFailure(id, "implementation", "failure", null);
     dedup.getDb().prepare("INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at) VALUES (?, 4, ?)").run(id, Date.now());
     dedup.getDb().prepare("INSERT INTO runner_tokens (dispatch_id, audience, issue_id, phase, expires_at, mapping_team_key) VALUES (?, 'result', ?, 'implementation', ?, 'FS')").run("dispatch-1", id, Date.now() + 60_000);
     const staleJob = log.appendLog({ issueId: id, issueIdentifier: "FS-101", teamKey: "FS", phase: "implementation" });

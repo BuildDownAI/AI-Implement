@@ -37,6 +37,9 @@ import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken 
 import { getMappings } from "./config.js";
 import { parkIssue } from "./dispatch-breaker.js";
 import { LinearGraphQLError, LinearLabelWriteError } from "./providers/linear.js";
+import { recheckSetupChecks, referenceRepoChecks, runnerFailureChecks, trackerSetupChecksSentence } from "./setup-checks/recheck.js";
+import { isManagedProject } from "./managed-dispatch-auth.js";
+import type { SetupCheckId } from "./setup-checks/contract.js";
 import { JiraApiError } from "./providers/jira-client.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
@@ -789,6 +792,14 @@ async function withCallbackLifecycleLock<T>(dispatchId: string, effect: () => Pr
   }
 }
 
+/** The setup checks behind a refused plan-complete write: Jira's status options, or Linear's lifecycle labels or the app's team access. */
+export function planCompleteFailureChecks(providerId: string, err: unknown): SetupCheckId[] {
+  if (providerId === "jira") return ["tracker.jira.status-options"];
+  if (providerId !== "linear") return [];
+  if (err instanceof LinearLabelWriteError) return ["tracker.linear.lifecycle-labels"];
+  return err instanceof LinearGraphQLError ? ["tracker.linear.team-access"] : ["tracker.linear.lifecycle-labels"];
+}
+
 /** Describe the provider operation that failed after recording a plan. */
 export function planCompleteFailureText(providerId: string, awaitApproval: boolean, err: unknown): string {
   if (providerId === "jira") {
@@ -1202,10 +1213,13 @@ async function handleRunnerResultInternal(
 
   const missedRepos = (input.body.referenceRepoResults ?? []).filter((r) => !r.arrived);
   if (missedRepos.length > 0) {
+    const checks = referenceRepoChecks(missedRepos);
+    recheckSetupChecks({ ids: checks, project: mappingTeamKey, cause: "runner-reported" });
     const lines = [
       "⚠️ One or more reference repositories could not be cloned and were unavailable to the agent during this run.",
       "",
       ...missedRepos.map((r) => `- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`),
+      ...(checks.length > 0 ? ["", trackerSetupChecksSentence(checks)] : []),
     ];
     try {
       await provider.postComment(claims.issueId, lines.join("\n"));
@@ -1292,6 +1306,11 @@ async function handleRunnerResultInternal(
     // comment on `Job`.
     if (failure && job) updateJobFailure(job.id, failure);
 
+    // Whichever phase failed, the checks behind it run again for the project, and the failure comments below name them.
+    const failureChecks = runnerFailureChecks(failure?.code ?? input.body.failureCode, { managedCredential: isManagedProject(mappingTeamKey, claims.dispatchId) });
+    recheckSetupChecks({ ids: failureChecks, project: mappingTeamKey, cause: "runner-reported" });
+    const withFailureChecks = (comment: string) => (failureChecks.length > 0 ? `${comment}\n\n${trackerSetupChecksSentence(failureChecks)}` : comment);
+
     // AII-749: applies to any phase (including gap-analysis, which otherwise does
     // nothing on failure below) and runs ahead of the phase-specific chain — a run
     // record with no pr_url (an initial run) is left to that chain unchanged.
@@ -1343,7 +1362,7 @@ async function handleRunnerResultInternal(
         ? renderFailureRecord(failure, undefined, buildRunUrl(job), lastSuccessfulStage)
         : input.body.failureReason ?? "unspecified";
       try {
-        const commented = await provider.markPlanningFailed(claims.issueId, mappingTeamKey, reason);
+        const commented = await provider.markPlanningFailed(claims.issueId, mappingTeamKey, withFailureChecks(reason));
         if (job && commented) markJobFailureCommented(job.id);
       } catch (err) {
         warn("markPlanningFailed", err);
@@ -1394,13 +1413,13 @@ async function handleRunnerResultInternal(
           const commented = await provider.markImplementationFailed(
             claims.issueId,
             mappingTeamKey,
-            formatFailureComment(input.body.failureCode, input.body.failureReason, {
+            withFailureChecks(formatFailureComment(input.body.failureCode, input.body.failureReason, {
               prUrl: input.body.prUrl,
               failure,
               runUrl: buildRunUrl(job),
               lastSuccessfulStage,
               isInitialRun,
-            }),
+            })),
           );
           if (job && commented) markJobFailureCommented(job.id);
         } catch (err) {
@@ -1474,7 +1493,9 @@ async function handleRunnerResultInternal(
       await provider.markPlanComplete(claims.issueId, mappingTeamKey, { awaitApproval });
     } catch (err) {
       warn("markPlanComplete", err);
-      planStatusFailure = planCompleteFailureText(provider.id, awaitApproval, err);
+      const checks = planCompleteFailureChecks(provider.id, err);
+      recheckSetupChecks({ ids: checks, project: mappingTeamKey, cause: "tracker-write" });
+      planStatusFailure = `${planCompleteFailureText(provider.id, awaitApproval, err)} ${trackerSetupChecksSentence(checks)}`.trimEnd();
     }
     if (planStatusFailure !== null) {
       // The plan comments are recorded, so the response stays 200. Local writes come first so the

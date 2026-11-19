@@ -7,6 +7,7 @@ import type { RepoMapping } from "../config.js";
 import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
 import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { githubError } from "./helpers/replies/github.js";
 import { FilesystemProvider } from "../providers/filesystem.js";
 import { testDir } from "./helpers/test-dir.js";
@@ -1138,6 +1139,29 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
     expect(vi.mocked(github.getBranchSha)).toHaveBeenCalledWith(expect.anything(), mapping.owner, mapping.repo, "release/foo");
   });
 
+  describe("a refused planning dispatch names the check that explains it", () => {
+    const flatIssue = makeIssue({ identifier: "AII-934", scopeKey: "AII", nativeStatus: "Ready" });
+    let send: Awaited<ReturnType<typeof recordRechecks>>;
+    beforeEach(async () => {
+      send = await recordRechecks();
+    });
+
+    it("skips a project the forced runner mode cannot run, and asks for its check to run again for the project", async () => {
+      (await import("../runner-mode.js")).setRunnerMode("fly");
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      expect(await indexModule.preparePlanningDispatch(config, provider, flatIssue, { ...mapping, provider: "bedrock" })).toBeNull();
+      expect(send.mock.calls).toEqual([[{ id: "runner.project-backend", project: "AII", cause: "launch-refused" }]]);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/^\[poll\] Skipping planning for AII-934: .*runner\.project-backend/));
+    });
+
+    it("refuses without the callback settings, and asks for callback.config to run again", async () => {
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      expect(await indexModule.preparePlanningDispatch(makeAppConfig(), provider, flatIssue, mapping)).toBeNull();
+      expect(send.mock.calls).toEqual([[{ id: "callback.config", cause: "planning-refused" }]]);
+      expect(error).toHaveBeenCalledWith(expect.stringMatching(/^\[poll\] Refusing to dispatch planning for AII-934: .*callback\.config/));
+    });
+  });
+
   it("no chain and no field: resolves to the default branch, unchanged", async () => {
     const flatIssue = makeIssue({ identifier: "AII-933", scopeKey: "AII", nativeStatus: "Ready" });
 
@@ -1609,6 +1633,106 @@ describe("poll implementation submission — ImplementationRun for every project
       for (const call of [...legacyCalls, ...launchCalls]) expect(call).not.toHaveBeenCalled();
       expect(rows()).toEqual([]);
       expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+    });
+  });
+
+  it("skips a project the forced runner mode cannot run, naming the check and asking for it to run again for the project", async () => {
+    fakeFetch(POLL_CYCLE_ROUTES).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    const mode = await import("../runner-mode.js");
+    const send = await recordRechecks();
+    mode.setRunnerMode("fly");
+    store.upsertMapping("AII", jiraMapping("AII", { provider: "bedrock" }));
+    const provider = jiraProvider();
+    vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+      needsPlanning: [], readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [],
+    });
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
+    const log = vi.spyOn(console, "log");
+
+    await indexModule.poll(config, makeRegistry({ provider, mappings: store.getMappings() }));
+
+    expect(implementationIngress.submit).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledWith({ id: "runner.project-backend", project: "AII", cause: "launch-refused" });
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^\[poll\] Skipping AII-1555: .*runner\.project-backend/));
+  });
+
+  describe("a failed poll read names the setup checks that explain it and asks for them to run again", () => {
+    let send: Awaited<ReturnType<typeof recordRechecks>>;
+    let errorLines: () => string[];
+    beforeEach(async () => {
+      fakeFetch(POLL_CYCLE_ROUTES).install();
+      send = await recordRechecks();
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorLines = () => error.mock.calls.map(([line]) => String(line));
+    });
+    const pollWith = async (setUp: (provider: ReturnType<typeof jiraProvider>) => void | Promise<void>) => {
+      const store = await import("../config.js");
+      store.upsertMapping("AII", jiraMapping("AII"));
+      const provider = jiraProvider();
+      vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+        needsPlanning: [], readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [],
+      });
+      vi.mocked((await import("../github-app-auth.js")).getInstallationToken).mockResolvedValue("token");
+      await setUp(provider);
+      await indexModule.poll(config, makeRegistry({ provider, mappings: store.getMappings() }));
+    };
+
+    it("a failed snapshot, for every project on its tracker", async () => {
+      await pollWith((provider) => { vi.mocked(provider.fetchAIImplementSnapshot).mockRejectedValue(new Error("Jira down")); });
+      expect(send.mock.calls).toEqual([
+        [{ id: "tracker.jira.credentials", cause: "tracker-read" }],
+        [{ id: "tracker.jira.fields", cause: "tracker-read" }],
+      ]);
+      expect(errorLines().find((line) => line.startsWith("[poll] jira snapshot failed"))).toContain("tracker.jira.credentials");
+    });
+
+    it("a failed roll-up read, for its own project", async () => {
+      await pollWith((provider) => { vi.mocked(provider.listIssuesPage!).mockRejectedValue(new Error("Jira down")); });
+      expect(send.mock.calls).toEqual([
+        [{ id: "tracker.jira.credentials", project: "AII", cause: "tracker-read" }],
+        [{ id: "tracker.jira.fields", project: "AII", cause: "tracker-read" }],
+      ]);
+      expect(errorLines().find((line) => line.startsWith("[roll-up-review] jira/AII"))).toContain("tracker.jira.fields");
+    });
+
+    it("a GitHub App error while processing an issue, by its status and path, for the issue's project", async () => {
+      const { GitHubApiError } = await import("../github-errors.js");
+      await pollWith(async () => {
+        vi.mocked((await import("../github-app-auth.js")).getInstallationToken)
+          .mockRejectedValue(new GitHubApiError({ status: 404, path: "/orgs/acme/installation" }));
+      });
+      expect(send.mock.calls).toEqual([[{ id: "github.installation", project: "AII", cause: "github-read" }]]);
+      expect(errorLines().find((line) => line.startsWith("[poll] Error processing AII-1555"))).toContain("github.installation");
+    });
+
+    it("an issue error no setup fault explains keeps its line and asks for nothing", async () => {
+      await pollWith(async () => {
+        vi.mocked((await import("../github-app-auth.js")).getInstallationToken).mockRejectedValue(new Error("socket hang up"));
+      });
+      expect(send).not.toHaveBeenCalled();
+      expect(errorLines()).toContain("[poll] Error processing AII-1555:");
+    });
+
+    it("a dispatched issue the tracker no longer finds records its breaker failure for the project it last ran in", async () => {
+      await pollWith(async (provider) => {
+        (await import("../log.js")).appendLog(makeAppendLogEntry({ issueId: "gone-1", issueIdentifier: "AII-9", teamKey: "AII", repo: "acme/app", status: "completed" }));
+        (await import("../dedup.js")).markDispatched("gone-1", "AII", "AII-9", "Gone");
+        vi.mocked(provider.fetchLifecycleStates).mockResolvedValue(new Map());
+      });
+      expect((await import("../dispatch-breaker.js")).breakerProject("gone-1", "implementation")).toBe("AII");
+    });
+
+    it("a provider that fails to build", async () => {
+      const store = await import("../config.js");
+      store.upsertMapping("AII", jiraMapping("AII"));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      // The real registry, imported after testDb's reset so it shares index.ts's recheck module; with no Jira credentials its Jira provider cannot be built.
+      const { ProviderRegistry } = await import("../providers/registry.js");
+      await indexModule.poll(config, new ProviderRegistry({}, () => store.getMappings()));
+      expect(send.mock.calls).toEqual([[{ id: "tracker.provider", cause: "tracker-read" }]]);
+      expect(warn.mock.calls.map(([line]) => String(line)).find((line) => line.startsWith('[registry] Skipping provider "jira"'))).toContain("tracker.provider");
     });
   });
 

@@ -14,13 +14,14 @@ import {
 } from "../github.js";
 import { decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
-import { surfaceDispatchFailure } from "../dispatch-failure.js";
+import { dispatchFailureConclusion, surfaceDispatchFailure } from "../dispatch-failure.js";
 import { notify } from "../notify.js";
 import { closeDb } from "../dedup.js";
 import { initLogTable, appendLog, listLog, getJobById } from "../log.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
 import { makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { githubError } from "./helpers/replies/github.js";
 
 // Mock notify so surfaceDispatchFailure doesn't make real HTTP calls.
@@ -702,6 +703,48 @@ describe("surfaceDispatchFailure — 422 surfacing (case d)", () => {
     const [, , notification] = vi.mocked(notify).mock.calls[0];
     expect(notification.phase).toBe("dispatch-failed");
     expect(notification.hint).toBeUndefined();
+  });
+});
+
+describe("surfaceDispatchFailure — the setup checks behind a refused dispatch (AII-1546)", () => {
+  let send: Awaited<ReturnType<typeof recordRechecks>>;
+  const sent = () => send.mock.calls.map(([request]) => request);
+  beforeEach(async () => {
+    closeDb();
+    initLogTable();
+    send = await recordRechecks();
+  });
+  afterEach(() => {
+    closeDb();
+  });
+
+  const surface = (status: number) => surfaceDispatchFailure({ status, error: "refused" }, "slack", null, {
+    site: "poll", issueId: `${SURF_RUN}-s${status}`, issueIdentifier: "ENG-1", teamKey: "ENG",
+    repo: "acme/widgets", workflowFile: "claude-implement.yml", contract: "envelope",
+  });
+
+  it.each([
+    [404, ["github.installation", "github.workflow-default-branch", "github.workflow-mapping-branch"], "dispatch-404"],
+    [403, ["github.permissions"], "dispatch-refused"],
+  ] as const)("names the checks behind a %i in its log line and rechecks each for the project", async (status, checks, cause) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await surface(status);
+    expect(sent()).toEqual(checks.map((id) => ({ id, project: "ENG", cause })));
+    const line = String(error.mock.calls.at(-1)![0]);
+    for (const id of checks) expect(line).toContain(id);
+    expect(line).toContain("/admin#setup");
+  });
+
+  it.each([422, 500, 0])("names no check and rechecks nothing for a %i", async (status) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await surface(status);
+    expect(sent()).toEqual([]);
+    expect(error.mock.calls.at(-1)![0]).not.toContain("/admin#setup");
+  });
+
+  it("records a 404 as the setup problem it is, and keeps every other status's conclusion", () => {
+    expect(dispatchFailureConclusion(404)).toBe("workflow_dispatch_not_found");
+    for (const status of [403, 422, 500, 0]) expect(dispatchFailureConclusion(status)).toBe("workflow_dispatch_failed");
   });
 });
 

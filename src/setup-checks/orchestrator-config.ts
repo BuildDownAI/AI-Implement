@@ -9,7 +9,7 @@ import { appCredentialsProblem } from "../github-app-auth.js";
 import { SEED_ONCE_SETTINGS } from "../seed-once-settings.js";
 import { MAX_POLL_INTERVAL_MS, parsePollIntervalMs } from "../poll-cycle.js";
 import { parseBreakerThreshold } from "../dispatch-breaker.js";
-import { FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveExecutionPath, resolveFlyProcessLevelSecrets, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
+import { checkForcedPathEligibility, FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveExecutionPath, resolveFlyProcessLevelSecrets, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
 import { missingRunnerCallbackConfig } from "../runner-callback.js";
 import { ORCHESTRATOR_HEALTH_TIMEOUT_MS } from "../health-body.js";
 import { waitOn, type SetupCheck, type SetupCheckContext } from "./contract.js";
@@ -390,6 +390,30 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         detail: `${missing.join(" and ")} not set, so these projects cannot dispatch on Fly Machines: ${onFly.join(", ")}`,
         fix: "Set FLY_SESSIONS_TOKEN, and save the sessions app on /admin#settings.",
       }];
+    },
+  },
+  {
+    id: "runner.project-backend",
+    title: "Projects on their runner backend",
+    group: "orchestrator",
+    tier: "mode",
+    onAdminPath: false,
+    perProject: false,
+    verifiable: true,
+    run: ({ runnerMode, mappings }) => {
+      const projects = Object.entries(mappings());
+      if (projects.length === 0) return [{ state: "not-applicable", detail: "No project is saved" }];
+      const mode = runnerMode().mode;
+      // Dispatch's own two refusals: the skip it names this check for, and a container backend refusing Bedrock at launch.
+      // The sessions app is passed as set, since runner.fly-sessions judges it.
+      const refused = projects.filter(([, mapping]) => checkForcedPathEligibility(mode, mapping, true).check === "runner.project-backend"
+        || (mapping.provider === "bedrock" && resolvePlanningExecutionPath(mode, mapping.executionMode) !== "github-actions")).map(([key]) => key);
+      if (refused.length === 0) return [{ state: "pass", detail: "Every project runs on a backend that accepts its settings" }];
+      // A forced runner mode sends every project to one backend, so its fix is the runner mode rather than each project.
+      const fix = mode === "default"
+        ? "Set each listed project's Execution Mode to GitHub Actions at /admin#projects."
+        : "Set the runner mode back to default at /admin#runners, or set it to gha.";
+      return [{ state: "fail", detail: `These projects use Bedrock or the ephemeral full-access opt-in, which run only on GitHub Actions, but their runs go to Fly Machines or local Docker, which refuse them: ${refused.join(", ")}`, fix }];
     },
   },
   {

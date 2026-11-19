@@ -11,14 +11,15 @@ import type { AppConfig, HeldReservation } from "../index.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
-import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
+import { APP_TOKEN_STEP, defaultFetchSignal, cancelWorkflowRun, getFailedRunStepJob, getWorkflowRunStatus } from "../github.js";
+import { pointAtSetupChecks } from "../setup-checks/recheck.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { findLogIdByDispatchId, getJobByDispatchId, markJobFailureCommented, recordGhaRunCompleted, updateJobRunId, updateJobStatus, type Job } from "../log.js";
 import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
 import { listMachines, getMachine, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { parkIssue } from "../dispatch-breaker.js";
-import { buildRunUrl, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
+import { APP_TOKEN_STEP_FAILED_REMEDIATION, buildRunUrl, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
 import type { RestateService } from "./endpoint.js";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
 import {
@@ -247,6 +248,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     const mapping = job.teamKey ? getMapping(job.teamKey) : undefined;
     if (!mapping || !job.issueId) return;
     let neverStarted = false;
+    let tokenStepFailed = false;
     let cause = outcome.kind === "deadline" ? "the run deadline passed before a planning result arrived" : "the run ended with no planning result";
     if (outcome.kind === "run_ended" && job.executionMode === "fly-machines" && job.machineId) {
       try {
@@ -258,11 +260,23 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
       } catch {
         // Diagnostic only: a failed read must never delay admission release.
       }
+    } else if (outcome.kind === "run_ended" && job.executionMode === "github-actions" && job.runId) {
+      try {
+        tokenStepFailed = (await getFailedRunStepJob(await getToken(mapping.owner), mapping.owner, mapping.repo, job.runId, APP_TOKEN_STEP)) !== null;
+      } catch {
+        // Diagnostic only, as the Fly read is.
+      }
+      if (tokenStepFailed) {
+        cause = "GitHub Actions could not create the run's GitHub App token, so the run stopped before it started";
+        const pointer = pointAtSetupChecks({ ids: ["github.target-secrets"], project: job.teamKey, cause: "token-step" });
+        console.warn(`[planning-run] dispatch=${dispatchId} issue=${job.issueIdentifier} run=${job.runId} failed at its "${APP_TOKEN_STEP}" step${pointer}`);
+      }
     }
     const runUrl = buildRunUrl(job);
     const reason =
       `${cause}${runUrl ? ` (run: ${runUrl})` : ""}. The issue is parked and will not be retried by itself. ` +
       (neverStarted ? FLY_MACHINE_NEVER_STARTED_REMEDIATION + " " : "") +
+      (tokenStepFailed ? APP_TOKEN_STEP_FAILED_REMEDIATION + " " : "") +
       "Next: press Unpark at /admin#runners, then set the status to `Ready` (Jira) or keep the AI-Implement label (Linear).";
     try {
       const provider = await input.resolveProvider(mapping);

@@ -479,6 +479,13 @@ describe("runner-mode", () => {
       }
     });
 
+    it("names the setup check that explains each ineligible mapping", () => {
+      const optIn = { ...ghaMapping, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } };
+      expect(runnerMode.checkForcedPathEligibility("fly", bedrockMapping, true).check).toBe("runner.project-backend");
+      expect(runnerMode.checkForcedPathEligibility("fly", optIn, true).check).toBe("runner.project-backend");
+      expect(runnerMode.checkForcedPathEligibility("fly", ghaMapping, false).check).toBe("runner.fly-sessions");
+    });
+
     it("bedrock ineligibility wins over missing sessions app in the reason", () => {
       const r = runnerMode.checkForcedPathEligibility("fly", bedrockMapping, false);
       expect(r.eligible).toBe(false);

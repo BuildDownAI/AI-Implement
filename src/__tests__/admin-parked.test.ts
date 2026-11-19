@@ -118,7 +118,7 @@ async function login(): Promise<string> {
 
 function parkIssue(issueId: string, conclusion = "MAX_TURNS_EXHAUSTED"): void {
   for (let i = 0; i < 3; i++) {
-    breaker.recordDispatchFailure(issueId, "implementation", conclusion);
+    breaker.recordDispatchFailure(issueId, "implementation", conclusion, null);
   }
 }
 
@@ -237,9 +237,9 @@ describe("GET /api/parked", () => {
     log.appendLog({ issueId: "issue-multi", issueIdentifier: "AII-200", repo: "org/repo", phase: "implementation" });
 
     // Park in planning phase
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "planning", "DISPATCH_FAILED");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "planning", "DISPATCH_FAILED", null);
     // Park in implementation phase
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "implementation", "MAX_TURNS_EXHAUSTED");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "implementation", "MAX_TURNS_EXHAUSTED", null);
 
     const res = await makeRequest("/api/parked", "GET", token);
     expect(res.statusCode).toBe(200);

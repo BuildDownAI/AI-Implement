@@ -7,6 +7,7 @@ import { makeAppendLogEntry, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
 import { testDb, type LoadedModules } from "./helpers/test-db.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EPHEMERAL_FULL_ACCESS_ASSERTION } from "../model-auth-contract.js";
 
 const launchSpies = vi.hoisted(() => ({ fly: vi.fn(), local: vi.fn() }));
@@ -335,7 +336,7 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
   it("keeps the breaker's last_conclusion when the budget gate refuses an already-parked row", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
     seedAtBudget("issue-25", "AII-205");
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-25", "gap-analysis", "crash");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-25", "gap-analysis", "crash", null);
 
     await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ AII: mapping }) }));
 
@@ -642,6 +643,26 @@ describe("ImplementationRun gap-fill ingress", () => {
     seedOrigin();
     await checkNoSubmit(optsFor(makeMapping({ owner: "acme", repo: "billing",
       extraEnv: { [EPHEMERAL_FULL_ACCESS_EXTRA_ENV]: EPHEMERAL_FULL_ACCESS_ASSERTION } }), { runnerMode: "local" }), seedItem(), "pending");
+  });
+  it("ephemeral full-access outside GHA names runner.project-backend and asks for it to run again for the project", async () => {
+    seedOrigin();
+    const send = await recordRechecks();
+    const lines = vi.spyOn(console, "log").mockImplementation(() => {});
+    await checkNoSubmit(optsFor(makeMapping({ owner: "acme", repo: "billing",
+      extraEnv: { [EPHEMERAL_FULL_ACCESS_EXTRA_ENV]: EPHEMERAL_FULL_ACCESS_ASSERTION } }), { runnerMode: "local" }), seedItem(), "pending");
+    expect(send.mock.calls).toEqual([[{ id: "runner.project-backend", project: "AII", cause: "launch-refused" }]]);
+    expect(lines.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith("[comment-gapfill] Deferring"))).toContain("runner.project-backend");
+  });
+  it("a token GitHub refuses names the checks behind it for the repository's project, and the item stays pending", async () => {
+    seedOrigin();
+    const { GitHubApiError } = await import("../github-errors.js");
+    const send = await recordRechecks();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const opts = optsFor();
+    vi.mocked(opts.getInstallationToken).mockRejectedValue(new GitHubApiError({ status: 404, path: "/repos/acme/billing/installation" }));
+    await checkNoSubmit(opts, seedItem(), "pending");
+    expect(send.mock.calls).toEqual([[{ id: "github.installation", project: "AII", cause: "github-read" }]]);
+    expect(warn.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith("[comment-gapfill] could not get a token"))).toContain("github.installation");
   });
   it("conflict re-queue submits through the same ingress with humanRequested false", async () => {
     seedOrigin();

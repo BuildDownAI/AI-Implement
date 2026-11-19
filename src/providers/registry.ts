@@ -2,6 +2,7 @@ import type { RepoMapping } from "../config.js";
 import { resolveProvider } from "./index.js";
 import type { ProviderConfig, TicketIssue, TicketingProvider } from "./types.js";
 import { getRunnerMode } from "../runner-mode.js";
+import { pointAtSetupChecks } from "../setup-checks/recheck.js";
 
 export type KeyLookupResult =
   | { kind: "found"; provider: TicketingProvider; issue: TicketIssue; failedProviderIds: string[] }
@@ -69,7 +70,7 @@ export class ProviderRegistry {
         providers.push(await this.forMapping(m));
       } catch (err) {
         console.warn(
-          `[registry] Skipping provider "${id}" — construction failed: ${(err as Error).message}`,
+          `[registry] Skipping provider "${id}" — construction failed: ${(err as Error).message}${pointAtSetupChecks({ ids: ["tracker.provider"], cause: "tracker-read" })}`,
         );
       }
     }

@@ -185,3 +185,39 @@ describe("never-started diagnostic", () => {
     expect(job.conclusion).toBe(conclusion);
   });
 });
+
+// A GitHub Actions run whose token step failed never starts its runner, so it is told apart from a run that ended silently (AII-1546).
+describe("token-step diagnostic", () => {
+  it.each([
+    [true, "app_token_step_failed"],
+    [false, "ended_without_callback"],
+  ] as const)("an unreported run whose token step failed=%s closes as %s", async (failed, conclusion) => {
+    const job = makeJob({ status: "running" });
+    const deps = { ...setup(job), tokenStepFailed: vi.fn(async () => failed) };
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.tokenStepFailed).toHaveBeenCalledExactlyOnceWith(job);
+    expect(deps.closeRow).toHaveBeenCalledExactlyOnceWith(job, "failed", conclusion, { skipAdmissionRelease: true });
+    expect(deps.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "failed", conclusion }, job);
+  });
+
+  it("fails a grouping parent whose token step failed instead of finalizing no_work", async () => {
+    const job = makeJob({ status: "running", groupingParent: true, prUrl: null });
+    const deps = { ...setup(job), tokenStepFailed: vi.fn(async () => true) };
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "failed", conclusion: "app_token_step_failed" }, job);
+  });
+
+  it("is not read once the Fly diagnostic answered, nor for a run whose callback reported", async () => {
+    const unreported = makeJob({ status: "running" });
+    const fly = { ...setup(unreported), neverStarted: vi.fn(async () => true), tokenStepFailed: vi.fn(async () => true) };
+    await finishImplementationJob(fly, "d", { kind: "run_ended" });
+    expect(fly.tokenStepFailed).not.toHaveBeenCalled();
+    expect(fly.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "failed", conclusion: "fly_machine_never_started" }, unreported);
+
+    const reported = makeJob({ status: "running", failure: FAILURE, conclusion: "boom" });
+    const callback = { ...setup(reported), tokenStepFailed: vi.fn(async () => true) };
+    await finishImplementationJob(callback, "d", { kind: "run_ended" });
+    expect(callback.tokenStepFailed).not.toHaveBeenCalled();
+    expect(callback.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "failed", conclusion: "boom" }, reported);
+  });
+});

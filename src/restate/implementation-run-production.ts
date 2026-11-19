@@ -22,7 +22,7 @@ import type { AppConfig } from "../index.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
-import { cancelWorkflowRun, defaultFetchSignal, getPullRequestState, getWorkflowRunStatus } from "../github.js";
+import { APP_TOKEN_STEP, cancelWorkflowRun, defaultFetchSignal, getFailedRunStepJob, getPullRequestState, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import {
   appendLogIfAbsent,
@@ -40,6 +40,8 @@ import { generateMachineNonce, generateSessionToken, listMachines, getMachine, m
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { markDispatched } from "../dedup.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
+import type { SetupCheckId } from "../setup-checks/contract.js";
+import { pointAtSetupChecks } from "../setup-checks/recheck.js";
 import { postBranchComment } from "../base-branch.js";
 import { postStatusComment } from "../status-events.js";
 import { mintLaunchTokens, implementationTtlSeconds, type LaunchTokens } from "../runner-tokens.js";
@@ -268,17 +270,17 @@ export function createProductionImplementationRunServices(input: ImplementationR
     return { ...config, flySessionsApp: flyApp ?? null };
   }
 
-  /** Pure eligibility for a new launch; never evidence that an earlier launch is absent. */
-  function containerIneligibility(run: ImplementationRunInput, mapping: RepoMapping): string | null {
+  /** Pure eligibility for a new launch, with the setup check that explains a refusal; never evidence that an earlier launch is absent. */
+  function containerIneligibility(run: ImplementationRunInput, mapping: RepoMapping): { reason: string; check: SetupCheckId } | null {
     if (containerBackend(run)) {
       if (mapping.provider === "bedrock") {
-        return `provider=bedrock is not supported on ${run.backend}`;
+        return { reason: `provider=bedrock is not supported on ${run.backend}`, check: "runner.project-backend" };
       }
       if (run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
-        return "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set";
+        return { reason: "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set", check: "runner.fly-sessions" };
       }
       if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(run.teamKey, run.dispatchId)) {
-        return "neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set";
+        return { reason: "neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set", check: "model.credentials-adopted" };
       }
     }
 
@@ -308,7 +310,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       maxIterations: issue.maxIterations ?? storedMapping.maxIterations,
     };
     const ineligible = containerIneligibility(run, mapping);
-    if (ineligible) throw new Error(ineligible);
+    if (ineligible) throw new Error(ineligible.reason);
 
     const managedRuntime = getModelAuthRuntime(config);
     let managedDecision: Prelaunch["managedDecision"] = { kind: "legacy" };
@@ -323,7 +325,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
         if (decision.kind === "refuse") {
           await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision));
           // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-          const breaker = recordDispatchFailure(issue.id, "implementation", decision.code);
+          const breaker = recordDispatchFailure(issue.id, "implementation", decision.code, run.teamKey);
           if (breaker.tripped) {
             await input.fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breaker.failures, decision.code);
           }
@@ -609,6 +611,21 @@ export function createProductionImplementationRunServices(input: ImplementationR
             return false;
           }
         },
+        tokenStepFailed: async (job) => {
+          if (!owner || job.executionMode !== "github-actions" || !job.runId) return false;
+          const mapping = (owner.input.gapFill && getCommentGapfillLaunch(owner.input.dispatchId)?.target) || frozenMapping(owner.input);
+          let failed: boolean;
+          try {
+            failed = (await getFailedRunStepJob(await getToken(mapping.owner), mapping.owner, mapping.repo, job.runId, APP_TOKEN_STEP)) !== null;
+          } catch {
+            return false;
+          }
+          if (failed) {
+            const pointer = pointAtSetupChecks({ ids: ["github.target-secrets"], project: owner.input.teamKey, cause: "token-step" });
+            console.warn(`[implementation-run] dispatch=${dispatchId} issue=${job.issueIdentifier} run=${job.runId} failed at its "${APP_TOKEN_STEP}" step${pointer}`);
+          }
+          return failed;
+        },
         closeRow: (job, status, conclusion, opts) => updateJobStatus(job.id, status, conclusion, undefined, opts),
         isPrMerged: async (_job, prUrl) => {
           const target = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(prUrl);
@@ -672,7 +689,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
     if (!readAdmission(run.dispatchId) && !getJobByDispatchId(run.dispatchId)) {
       const ineligible = containerIneligibility(run, mapping);
       if (ineligible) {
-        console.log(`[implementation-run] skipped dispatch=${run.dispatchId} issue=${run.issueIdentifier}: ${ineligible}`);
+        const pointer = pointAtSetupChecks({ ids: [ineligible.check], project: run.teamKey, cause: "launch-refused" });
+        console.log(`[implementation-run] skipped dispatch=${run.dispatchId} issue=${run.issueIdentifier}: ${ineligible.reason}${pointer}`);
         return false;
       }
     }

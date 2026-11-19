@@ -104,7 +104,7 @@ export const SAVED_SETUP_READERS: { [K in Exclude<keyof SetupCheckContext, "gith
 export function runsForSavedChange(before: SavedSetup, after: SavedSetup): SetupCheckRunKind[] {
   if (after.allChecks !== before.allChecks) return [{ kind: "full" }];
   const runs: SetupCheckRunKind[] = [];
-  // tracker.provider, model.credentials-adopted and runner.fly-sessions name projects, so a project saved, added or deleted changes their rows too.
+  // tracker.provider, model.credentials-adopted, runner.fly-sessions and runner.project-backend name projects, so a project saved, added or deleted changes their rows too.
   let orchestratorWide = after.orchestratorWide !== before.orchestratorWide || Object.keys(before.perProject).some((project) => !(project in after.perProject));
   for (const [project, now] of Object.entries(after.perProject)) {
     const was = before.perProject[project];

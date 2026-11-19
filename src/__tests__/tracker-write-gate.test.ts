@@ -1,14 +1,21 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { checkTrackerWrites } from "../tracker-write-gate.js";
 import type { LifecycleLabelsResult } from "../providers/types.js";
 import { makeIssue } from "./helpers/builders.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { testDb } from "./helpers/test-db.js";
 
 const issue = makeIssue({ scopeKey: "AII" });
 const refusal = { ok: false, permanent: true, label: "AI-Working", message: 'Linear refused to create label "AI-Working" on team AII: not allowed to take action' } as const;
+// A refused label write names the lifecycle-labels check: plain in the log line, quoted as code in the tracker comment.
+const LOG_POINTER = ". Setup check: tracker.linear.lifecycle-labels. Read it on the Setup page at /admin#setup";
+const COMMENT = 'AI-Implement did not start this issue. Linear refused to create label "AI-Working" on team AII: not allowed to take action. Create the label "AI-Working" in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners. Setup check: `tracker.linear.lifecycle-labels`. Read it on the Setup page at /admin#setup.';
 let breaker: typeof import("../dispatch-breaker.js");
+let checkTrackerWrites: typeof import("../tracker-write-gate.js").checkTrackerWrites;
 beforeEach(async () => {
-  ({ modules: { breaker } } = await testDb({ modules: { breaker: () => import("../dispatch-breaker.js") } }));
+  // The gate is loaded after testDb's reset, so it reads the recheck module recordRechecks sets.
+  let gate: typeof import("../tracker-write-gate.js");
+  ({ modules: { breaker, gate } } = await testDb({ modules: { breaker: () => import("../dispatch-breaker.js"), gate: () => import("../tracker-write-gate.js") } }));
+  ({ checkTrackerWrites } = gate);
 });
 
 function options() {
@@ -43,15 +50,17 @@ it.each(["transient", "throw"])("skips and logs once without parking on %s", asy
 
 it.each(["planning", "implementation"] as const)("parks %s and comments once across repeated refusals; unpark permits retry", async (phase) => {
   const opts = { ...options(), phase };
+  const send = await recordRechecks();
   const ensureLifecycleLabels = vi.fn().mockResolvedValue(refusal);
   const check = () => checkTrackerWrites({ ...opts, provider: { ensureLifecycleLabels } });
   expect(await check()).toBe("skip");
   expect(await check()).toBe("skip");
   expect(opts.park).toHaveBeenCalledWith(issue.id, phase, "tracker_setup_refused");
   expect(breaker.listParked()).toEqual([expect.objectContaining({ issueId: issue.id, phase, lastConclusion: "tracker_setup_refused" })]);
-  expect(opts.comment).toHaveBeenCalledExactlyOnceWith(issue.id, 'AI-Implement did not start this issue. Linear refused to create label "AI-Working" on team AII: not allowed to take action. Create the label "AI-Working" in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners.');
+  expect(opts.comment).toHaveBeenCalledExactlyOnceWith(issue.id, COMMENT);
   expect(opts.comment.mock.calls[0][1].match(/Linear refused/g)).toHaveLength(1);
-  expect(opts.log).toHaveBeenNthCalledWith(1, `[poll] ${issue.identifier} tracker_setup_refused: ${refusal.message}`);
+  expect(opts.log).toHaveBeenNthCalledWith(1, `[poll] ${issue.identifier} tracker_setup_refused: ${refusal.message}${LOG_POINTER}`);
+  expect(send).toHaveBeenCalledWith({ id: "tracker.linear.lifecycle-labels", project: "AII", cause: "tracker-write" });
   expect(opts.log).toHaveBeenCalledTimes(2);
   breaker.unpark(issue.id, phase);
   ensureLifecycleLabels.mockResolvedValue({ ok: true });
@@ -72,5 +81,6 @@ it("does not double the refusal sentence's trailing period", async () => {
     ...opts,
     provider: { ensureLifecycleLabels: vi.fn().mockResolvedValue({ ...refusal, message: refusal.message + "." }) },
   });
-  expect(opts.comment).toHaveBeenCalledExactlyOnceWith(issue.id, 'AI-Implement did not start this issue. Linear refused to create label "AI-Working" on team AII: not allowed to take action. Create the label "AI-Working" in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners.');
+  expect(opts.comment).toHaveBeenCalledExactlyOnceWith(issue.id, COMMENT);
+  expect(opts.log).toHaveBeenCalledWith(`[poll] ${issue.identifier} tracker_setup_refused: ${refusal.message}${LOG_POINTER}`);
 });

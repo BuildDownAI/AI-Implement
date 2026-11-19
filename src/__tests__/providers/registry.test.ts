@@ -3,6 +3,7 @@ import { ProviderRegistry } from "../../providers/registry.js";
 import { configureLinearAuth } from "../../linear-app-auth.js";
 import type { TicketingProvider } from "../../providers/types.js";
 import { makeIssue, makeMapping, makeProvider, makeRegistry } from "../helpers/builders.js";
+import { recordRechecks } from "../helpers/fixtures/setup-checks.js";
 
 const linearMapping = makeMapping();
 const jiraMapping = makeMapping({
@@ -80,6 +81,17 @@ describe("ProviderRegistry", () => {
     expect(providers).toHaveLength(1);
     expect(providers[0].id).toBe("linear");
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("jira"));
+    warn.mockRestore();
+  });
+
+  it("forAllMappings names tracker.provider in a skipped provider's line and asks for it to run again", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const send = await recordRechecks();
+    await new ProviderRegistry({}, () => ({})).forAllMappings([linearMapping, jiraMapping]);
+    expect(send.mock.calls).toEqual([[{ id: "tracker.provider", project: undefined, cause: "tracker-read" }]]);
+    const lines = warn.mock.calls.map(([line]) => String(line));
+    expect(lines).toEqual([expect.stringContaining('"jira"')]);
+    expect(lines[0]).toContain("tracker.provider");
     warn.mockRestore();
   });
 

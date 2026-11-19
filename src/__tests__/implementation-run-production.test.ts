@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import { makeJob, makeMapping } from "./helpers/builders.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { makeLaunchDecision, makeSnapshot, SENTINEL_BEARER } from "./helpers/fixtures/configured-run.js";
 import { buildRunConfig } from "../run-config.js";
@@ -38,6 +39,7 @@ vi.mock("../github.js", async (importOriginal) => ({
   getWorkflowRunStatus: vi.fn(),
   cancelWorkflowRun: vi.fn(),
   getPullRequestState: vi.fn(),
+  getFailedRunStepJob: vi.fn().mockResolvedValue(null),
 }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn().mockResolvedValue("gh-token") }));
 vi.mock("../log.js", () => ({
@@ -79,7 +81,7 @@ import { releaseUnusedManagedPreparation } from "../agent-run-preparation.js";
 import { mintLaunchTokens } from "../runner-tokens.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
 import { acquireDispatch } from "../dispatch-gate.js";
-import { cancelWorkflowRun, getPullRequestState, getWorkflowRunStatus } from "../github.js";
+import { APP_TOKEN_STEP, cancelWorkflowRun, getFailedRunStepJob, getPullRequestState, getWorkflowRunStatus } from "../github.js";
 import { appendLogIfAbsent, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
 import { markDispatched } from "../dedup.js";
 import { read as readAdmission, release as releaseAdmission } from "../dispatch-admission.js";
@@ -301,6 +303,9 @@ describe("production deps", () => {
   describe("container eligibility in production preparation", () => {
     it.each(["fly-machines", "local-docker"] as const)("%s: skips ineligible first dispatch before production backend reconciliation", async (backend) => {
       const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
+      const send = await recordRechecks();
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const checkFor: Record<string, string> = { "bedrock": "runner.project-backend", "no-credentials": "model.credentials-adopted", "no-fly-token": "runner.fly-sessions", "no-fly-app": "runner.fly-sessions" };
       for (const failure of ["bedrock", "no-credentials", ...(backend === "fly-machines" ? ["no-fly-token", "no-fly-app"] : [])]) {
         vi.clearAllMocks();
         intents.clear();
@@ -343,6 +348,9 @@ describe("production deps", () => {
         expect(input.postDispatch).not.toHaveBeenCalled();
         expect(provider.markImplementationFailed).not.toHaveBeenCalled();
         for (const sentinel of SENTINELS) expect(JSON.stringify([INPUT, journal])).not.toContain(sentinel);
+        // The skip names the check that explains it, and asks for that check to run again for this project.
+        expect(send.mock.calls).toEqual([[{ id: checkFor[failure], project: INPUT.teamKey, cause: "launch-refused" }]]);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining(checkFor[failure]));
       }
     });
 
@@ -764,6 +772,29 @@ describe("production deps", () => {
       await d.finishJob("d-1", { kind: "run_ended" });
       expect(updateJobStatus).toHaveBeenCalledWith(expect.anything(), "failed", "ended_without_callback", undefined, { skipAdmissionRelease: true });
       if (["no-owner", "no-app", "github-actions", "local-docker", "no-id"].includes(scenario)) expect(getMachine).not.toHaveBeenCalled();
+    });
+
+    it("closes a GitHub Actions run whose token step failed as app_token_step_failed, naming github.target-secrets and asking for it to run again", async () => {
+      intents.set("owner:d-1", { snapshot: { input: INPUT, mapping: MAPPING }, done: false });
+      vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ status: "running", executionMode: "github-actions", runId: 55, teamKey: "ENG" }));
+      vi.mocked(getFailedRunStepJob).mockResolvedValueOnce({ jobName: "implement", htmlUrl: null });
+      const send = await recordRechecks();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      expect(getFailedRunStepJob).toHaveBeenCalledWith("gh-token", "Org", "repo", 55, APP_TOKEN_STEP);
+      expect(updateJobStatus).toHaveBeenCalledWith(expect.anything(), "failed", "app_token_step_failed", undefined, { skipAdmissionRelease: true });
+      expect(send.mock.calls).toEqual([[{ id: "github.target-secrets", project: "ENG", cause: "token-step" }]]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("github.target-secrets"));
+    });
+
+    it.each(["no failed token step", "a lookup that throws"])("keeps ended_without_callback for a GitHub Actions run with %s", async (scenario) => {
+      intents.set("owner:d-1", { snapshot: { input: INPUT, mapping: MAPPING }, done: false });
+      vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ status: "running", executionMode: "github-actions", runId: 55 }));
+      if (scenario === "a lookup that throws") vi.mocked(getFailedRunStepJob).mockRejectedValueOnce(new Error("boom"));
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      expect(updateJobStatus).toHaveBeenCalledWith(expect.anything(), "failed", "ended_without_callback", undefined, { skipAdmissionRelease: true });
     });
 
     it("returns {} for a missing job row", async () => {

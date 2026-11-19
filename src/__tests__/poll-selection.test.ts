@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { selectIssuesToDispatch, selectBlockers, mappingForProvider, fetchProviderSnapshots, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, diffSkipReasons, logSkipReasons, resetSkipReasons, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
+import { selectIssuesToDispatch, selectBlockers, mappingForProvider, fetchProviderSnapshots, trackerReadChecks, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, diffSkipReasons, logSkipReasons, resetSkipReasons, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
 import type { AIImplementSnapshot, TicketIssue, TicketingProvider } from "../providers/types.js";
 import type * as GateModule from "../dispatch-gate.js";
@@ -268,6 +268,17 @@ describe("selectBlockers — reservation-backed concurrency, not tracker labels"
     const candidate = issueOf("AII-3", "AII-3", "AII");
     const blockers = selectBlockers([candidate], { AII: mappingWithCap(1) }, { AII: admission.count("AII") }, () => false, () => null);
     expect(blockers).toHaveLength(0);
+  });
+});
+
+describe("trackerReadChecks", () => {
+  it.each([
+    ["linear", ["tracker.linear.credentials"]],
+    ["jira", ["tracker.jira.credentials", "tracker.jira.fields"]],
+    ["filesystem", ["tracker.filesystem.directory"]],
+    ["a fork's own provider", []],
+  ])("names the checks behind a failed %s read", (providerId, ids) => {
+    expect(trackerReadChecks(providerId)).toEqual(ids);
   });
 });
 

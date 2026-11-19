@@ -1,4 +1,4 @@
-import { FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
+import { APP_TOKEN_STEP_FAILED_REMEDIATION, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,6 +15,7 @@ vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   getWorkflowRunStatus: vi.fn(),
   cancelWorkflowRun: vi.fn(),
+  getFailedRunStepJob: vi.fn().mockResolvedValue(null),
 }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn().mockResolvedValue("gh-token") }));
 vi.mock("../log.js", () => ({
@@ -38,7 +39,8 @@ vi.mock("../dispatch-admission.js", () => ({
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 
 import { acquireDispatch } from "../dispatch-gate.js";
-import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
+import { APP_TOKEN_STEP, cancelWorkflowRun, getFailedRunStepJob, getWorkflowRunStatus } from "../github.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { getJobByDispatchId, markJobFailureCommented, updateJobRunId, updateJobStatus } from "../log.js";
 import { parkIssue } from "../dispatch-breaker.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
@@ -472,6 +474,23 @@ describe("production deps", () => {
         cause + ". The issue is parked and will not be retried by itself. " +
         (scenario === "never-started" ? FLY_MACHINE_NEVER_STARTED_REMEDIATION + " " : "") +
         "Next: press Unpark at /admin#runners, then set the status to `Ready` (Jira) or keep the AI-Implement label (Linear).");
+    });
+
+    it.each([true, false])("names a failed GitHub App token step on a GitHub Actions run (failed=%s)", async (failed) => {
+      vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, executionMode: "github-actions", runId: 55, issueIdentifier: "ENG-1" } as never);
+      if (failed) vi.mocked(getFailedRunStepJob).mockResolvedValueOnce({ jobName: "plan", htmlUrl: null });
+      const send = await recordRechecks();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      // Planning closes and parks first, before any network read, so the conclusion stays the same.
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback");
+      expect(getFailedRunStepJob).toHaveBeenCalledWith("gh-token", expect.any(String), expect.any(String), 55, APP_TOKEN_STEP);
+      const reason = vi.mocked(provider.markPlanningFailed).mock.calls[0][2];
+      expect(reason.includes(APP_TOKEN_STEP_FAILED_REMEDIATION)).toBe(failed);
+      expect(reason.startsWith("GitHub Actions could not create the run's GitHub App token")).toBe(failed);
+      expect(send.mock.calls).toEqual(failed ? [[{ id: "github.target-secrets", project: "ENG", cause: "token-step" }]] : []);
+      if (failed) expect(warn).toHaveBeenCalledWith(expect.stringContaining("github.target-secrets"));
     });
 
     it("does nothing for a row the callback already closed", async () => {

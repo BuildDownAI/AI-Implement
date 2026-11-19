@@ -17,7 +17,8 @@ import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
 import { whenDeployHoldClears } from "../deploy-hold.js";
-import { cacheSetupCheckRun, claimSetupCheckRun, createBootSetupChecks, createSetupCheckContext, endSetupCheckProgress, getCachedSetupCheckRun, mergeSetupCheckRun, projectRunNeedsFullRun, recheckHeld, recheckKey, recheckScope, recheckWaitedOn, rememberRecheck, runOrchestratorWideSetupChecks, runProjectSetupChecks, runSetupChecks, runSetupChecksBeforeRestate, runSetupChecksInScope, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckContext, type SetupCheckRecheck, type SetupCheckScope, type SetupCheckRun } from "../setup-checks/index.js";
+import { cacheSetupCheckRun, claimSetupCheckRun, createBootSetupChecks, createSetupCheckContext, endSetupCheckProgress, getCachedSetupCheckRun, mergeSetupCheckRun, projectRunNeedsFullRun, recheckHeld, recheckScope, recheckWaitedOn, runOrchestratorWideSetupChecks, runProjectSetupChecks, runSetupChecks, runSetupChecksBeforeRestate, runSetupChecksInScope, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckContext, type SetupCheckScope, type SetupCheckRun } from "../setup-checks/index.js";
+import { recheckKey, rememberRecheck, type SetupCheckRecheck } from "../setup-checks/recheck.js";
 import type { SetupCheckRunKind } from "../setup-checks/change-detector.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 import { getRestateStatus, restateCanServe, restateCanStartWork } from "./status.js";
@@ -53,7 +54,7 @@ export const SETUP_CHECKS_KEY = "orchestrator";
 const LAST_RUN = "lastRun";
 /** When each check last ran by a recheck, keyed by check and project, pruned to the hold. */
 const RECHECKED_AT = "recheckedAt";
-// The setup checks' times in this module, kept together. The change detector's is in src/setup-checks/change-detector.ts, the recheck hold in src/setup-checks/index.ts.
+// The setup checks' times in this module, kept together. The change detector's is in src/setup-checks/change-detector.ts, the recheck hold in src/setup-checks/recheck.ts.
 /** Bounds a read of the stored run, and the ingress's acceptance of a new run, which never waits for the run itself. */
 const INGRESS_TIMEOUT_MS = 10_000;
 /** Bounds a run its caller waits for, which waits for its own checks and for any run ahead of it in the object's queue. */

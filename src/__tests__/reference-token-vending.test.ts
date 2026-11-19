@@ -5,6 +5,7 @@ import type { RepoMapping } from "../config.js";
 import type { ReferenceRepo } from "../reference-repos.js";
 import { makeMapping } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -164,6 +165,17 @@ describe("handleReferenceTokenRequest", () => {
     expect(owners[0].token).toBeNull();
     expect(owners[0].expiresAt).toBeNull();
     expect(owners[0].authMode).toBe("public");
+  });
+
+  it("names github.reference-repos for an owner whose mint fails and asks for it to run again for the project, but not for an owner the App is not installed on", async () => {
+    const { GitHubApiError } = await import("../github-errors.js");
+    const send = await recordRechecks();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockGetScopedToken.mockRejectedValueOnce(new Error("GitHub API error (500)"));
+    mockGetScopedToken.mockRejectedValueOnce(new GitHubApiError({ status: 404, path: "/orgs/other/installation" }));
+    await callHandler({ authorization: `Bearer ${mintProgressToken()}`, resolveMapping: () => mapping({ referenceRepos: [REPO_A, REPO_B] }) });
+    expect(send.mock.calls).toEqual([[{ id: "github.reference-repos", project: "ENG", cause: "token-vending" }]]);
+    expect(String(error.mock.calls.find(([line]) => String(line).includes('owner "acme"'))?.[0])).toContain("github.reference-repos");
   });
 
   it("returns authMode: error for non-404 throws, does not fail the request", async () => {

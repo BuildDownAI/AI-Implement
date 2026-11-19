@@ -5,6 +5,7 @@ import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import type * as WorkflowSyncModule from "../workflow-sync.js";
 import type * as DeployHoldModule from "../deploy-hold.js";
 import { makeMapping } from "./helpers/builders.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { testDb } from "./helpers/test-db.js";
 
 // runWorkflowSync (the executor) imports syncWorkflowTemplates from this module; mock it so the
@@ -198,6 +199,37 @@ describe("runWorkflowSync executor", () => {
     const job = queue.getWorkflowSyncById(id);
     expect(job?.status).toBe("failed");
     expect(job?.error?.message).toBe("App not installed");
+  });
+
+  describe("a failed sync names the setup checks that explain it and asks for them to run again for the project", () => {
+    let send: Awaited<ReturnType<typeof recordRechecks>>;
+    let errorLine: () => string | undefined;
+    beforeEach(async () => {
+      send = await recordRechecks();
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorLine = () => error.mock.calls.map(([line]) => String(line)).find((line) => line.startsWith("[workflow-sync] sync failed for ENG"));
+    });
+
+    it("a GitHub App error, by its status and path", async () => {
+      // The same instance the queue's classification checks for, after testDb's reset.
+      const { GitHubApiError } = await import("../github-errors.js");
+      seedMapping("ENG");
+      const { id } = queue.enqueueWorkflowSync("ENG");
+      vi.mocked(workflowSync.syncWorkflowTemplates).mockRejectedValueOnce(new GitHubApiError({ status: 403, path: "/repos/acme/widgets/contents/.github/workflows/claude-implement.yml" }));
+      await queue.runWorkflowSync(id, CREDS);
+      expect(send.mock.calls).toEqual([[{ id: "github.permissions", project: "ENG", cause: "workflow-sync" }]]);
+      expect(errorLine()).toContain("github.permissions");
+      expect(queue.getWorkflowSyncById(id)?.status).toBe("failed");
+    });
+
+    it("an error no setup fault explains keeps its line and asks for nothing", async () => {
+      seedMapping("ENG");
+      const { id } = queue.enqueueWorkflowSync("ENG");
+      vi.mocked(workflowSync.syncWorkflowTemplates).mockRejectedValueOnce(new Error("socket hang up"));
+      await queue.runWorkflowSync(id, CREDS);
+      expect(send).not.toHaveBeenCalled();
+      expect(errorLine()).toBe("[workflow-sync] sync failed for ENG:");
+    });
   });
 
   it("fails the job without calling sync when the mapping was deleted before the run", async () => {

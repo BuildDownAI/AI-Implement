@@ -226,11 +226,10 @@ describe("Linear GraphQL failures", () => {
     ["planning label", (p: LinearProvider) => p.markPlanningStarted("i", "ENG"), 1],
     ["planning state", (p: LinearProvider) => p.markPlanningStarted("i", "ENG"), 2],
     ["plan complete", (p: LinearProvider) => p.markPlanComplete("i", "ENG", { awaitApproval: false }), 1],
-    ["planning failed", (p: LinearProvider) => p.markPlanningFailed("i", "ENG", "reason"), 1],
+    // The two failure setters log a refused label removal and still post their comment (their own block below).
     ["implementing", (p: LinearProvider) => p.markImplementing("i", "ENG"), 1],
     ["PR ready", (p: LinearProvider) => p.markPrReady("i", "ENG", "url"), 1],
     ["merged", (p: LinearProvider) => p.markMerged("i", "ENG"), 1],
-    ["implementation failed", (p: LinearProvider) => p.markImplementationFailed("i", "ENG", "reason"), 1],
     ["clear working", (p: LinearProvider) => p.clearWorkingState("i", "ENG", "planning"), 1],
     ["park", (p: LinearProvider) => p.parkForHuman("i", "ENG", "planning"), 1],
   ] as const)("names issueUpdate for %s failures", async (_name, run, failAt) => {
@@ -1443,6 +1442,23 @@ describe("LinearProvider.markImplementationFailed", () => {
     expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
     expect(variables(fake, fake.calls.length - 1).body).toContain("Implementation failed: tests timed out");
     expect(commented).toBe(true);
+  });
+});
+
+// A failure classification always reaches the ticket, even when Linear refuses the label removal (AII-1546).
+describe.each([
+  ["markPlanningFailed", "AI-Planning", "Planning failed"],
+  ["markImplementationFailed", "AI-Working", "Implementation failed"],
+] as const)("LinearProvider.%s when the label removal is refused", (method, label, phrase) => {
+  it("still posts its failure comment", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = linear(
+      data({ issue: { labels: { nodes: [{ id: "lbl", name: label }, { id: "lo", name: "Other" }] } } }),
+      { json: { errors: [{ message: "write refused" }] } },
+      data({ commentCreate: { success: true } }),
+    );
+    expect(await new LinearProvider({})[method]("issue-1", "ENG", "boom")).toBe(true);
+    expect(variables(fake, fake.calls.length - 1).body).toContain(`${phrase}: boom`);
   });
 });
 

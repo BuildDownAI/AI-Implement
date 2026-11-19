@@ -1,4 +1,7 @@
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
+import { pointAtSetupChecks, trackerSetupChecksSentence } from "./setup-checks/recheck.js";
+
+const LIFECYCLE_LABELS_CHECK = "tracker.linear.lifecycle-labels";
 
 /** Prepare tracker writes before either dispatch path spends a run. */
 export async function checkTrackerWrites({ provider, issue, phase, park, comment, log }: {
@@ -23,10 +26,12 @@ export async function checkTrackerWrites({ provider, issue, phase, park, comment
     return "skip";
   }
   const newlyParked = park(issue.id, phase, "tracker_setup_refused");
-  log(`[poll] ${issue.identifier} tracker_setup_refused: ${result.message}`);
+  // Only Linear prepares lifecycle labels, so its label check is the one that explains a refusal.
+  const pointer = pointAtSetupChecks({ ids: [LIFECYCLE_LABELS_CHECK], project: issue.scopeKey, cause: "tracker-write" });
+  log(`[poll] ${issue.identifier} tracker_setup_refused: ${result.message.replace(/\.$/, "")}${pointer}`);
   if (newlyParked) {
     try {
-      await comment(issue.id, `AI-Implement did not start this issue. ${result.message}${result.message.endsWith(".") ? "" : "."} Create the label "${result.label}" in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners.`);
+      await comment(issue.id, `AI-Implement did not start this issue. ${result.message}${result.message.endsWith(".") ? "" : "."} Create the label "${result.label}" in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners. ${trackerSetupChecksSentence([LIFECYCLE_LABELS_CHECK])}`);
     } catch (err) {
       log(`[poll] ${issue.identifier} tracker_setup_refused comment failed: ${String(err)}`);
     }

@@ -2,6 +2,7 @@ import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { syncWorkflowTemplates, classifySyncError, type WorkflowSyncResult, type ClassifiedSyncError } from "./workflow-sync.js";
 import { isDeployHeld } from "./deploy-hold.js";
+import { gitHubAppErrorChecks, pointAtSetupChecks } from "./setup-checks/recheck.js";
 
 export type WorkflowSyncStatus = "pending" | "running" | "completed" | "failed";
 
@@ -164,7 +165,8 @@ export async function runWorkflowSync(jobId: number, creds: WorkflowSyncCreds): 
     });
     updateWorkflowSyncStatus(jobId, "completed", { result });
   } catch (err) {
-    console.error(`[workflow-sync] sync failed for ${job.teamKey}:`, err);
+    const pointer = pointAtSetupChecks({ ids: gitHubAppErrorChecks(err), project: job.teamKey, cause: "workflow-sync" });
+    console.error(`[workflow-sync] sync failed for ${job.teamKey}${pointer}:`, err);
     updateWorkflowSyncStatus(jobId, "failed", { error: classifySyncError(err) });
   }
 }

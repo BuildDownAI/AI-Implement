@@ -270,6 +270,13 @@ describe("opted-in Fly implementation", () => {
     expect(provider.markImplementationFailed).toHaveBeenCalledOnce();
   });
 
+  it("a failure after the launch counts dispatch_error for the issue's project", async () => {
+    vi.mocked(provider.markImplementing).mockRejectedValueOnce(new Error("tracker down"));
+    await dispatchFly().catch(() => {});
+    expect(dedup.getDb().prepare("SELECT last_conclusion, project FROM dispatch_breaker WHERE issue_id = ?").get(issue.id))
+      .toEqual({ last_conclusion: "dispatch_error", project: issue.scopeKey });
+  });
+
   it("a Fly 4xx releases the admission and revokes the grant", async () => {
     vi.mocked(fly.createMachine).mockRejectedValue(new Error("Fly create machine failed (422): bad"));
     await expect(dispatchFly()).rejects.toThrow(/422/);

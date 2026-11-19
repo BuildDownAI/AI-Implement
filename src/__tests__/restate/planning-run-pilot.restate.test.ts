@@ -536,8 +536,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   it.each(labels)("a successful run resets the planning breaker count and marks the row notified (%s)", async (label) => {
     gh.statusGate = gate("first status read");
     const w = await dispatch(label, "PLT-20");
-    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback");
-    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback");
+    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback", null);
+    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback", null);
     expect(breakerFailures(w.issue.id)).toBe(2);
     await gh.statusGate.reached();
     await waitForStep(w.read, "wait");

@@ -545,6 +545,45 @@ describe("runner.fly-sessions", () => {
   });
 });
 
+describe("runner.project-backend", () => {
+  const OPT_IN = { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" };
+  const projects = (executionMode: "github-actions" | "fly-machines") => () => ({
+    BED: makeMapping({ provider: "bedrock", executionMode }),
+    OPT: makeMapping({ extraEnv: OPT_IN, executionMode }),
+    ENG: makeMapping({ executionMode }),
+  });
+  const under = (mode: "default" | "gha" | "fly" | "local" | "shadow", mappings: SetupCheckContext["mappings"]) =>
+    run("runner.project-backend", { mappings, runnerMode: () => ({ mode, source: "db" }) });
+
+  it("does not apply with no project saved", async () => {
+    expect(await under("default", () => ({}))).toMatchObject([{ state: "not-applicable" }]);
+  });
+
+  it.each([
+    ["projects on GitHub Actions under runner mode default", "default", projects("github-actions")],
+    ["projects on GitHub Actions under runner mode gha", "gha", projects("github-actions")],
+    ["projects forced to GitHub Actions from Fly Machines", "gha", projects("fly-machines")],
+  ] as const)("passes with %s", async (_name, mode, mappings) => {
+    expect(await under(mode, mappings)).toMatchObject([{ state: "pass" }]);
+  });
+
+  it("fails naming only the Bedrock and opted-in projects that run on Fly Machines, with each project's fix", async () => {
+    expect(await under("default", () => ({ ...projects("fly-machines")(), GHA: makeMapping({ provider: "bedrock" }) }))).toEqual([{
+      state: "fail",
+      detail: "These projects use Bedrock or the ephemeral full-access opt-in, which run only on GitHub Actions, but their runs go to Fly Machines or local Docker, which refuse them: BED, OPT",
+      fix: "Set each listed project's Execution Mode to GitHub Actions at /admin#projects.",
+    }]);
+  });
+
+  it.each(["fly", "local"] as const)("fails under runner mode %s for projects set to GitHub Actions, with the runner mode's fix", async (mode) => {
+    expect(await under(mode, projects("github-actions"))).toMatchObject([{
+      state: "fail",
+      detail: expect.stringMatching(/: BED, OPT$/),
+      fix: "Set the runner mode back to default at /admin#runners, or set it to gha.",
+    }]);
+  });
+});
+
 describe("admin.path", () => {
   it.each([
     ["nothing", {}],

@@ -1,5 +1,6 @@
 import { getDb } from "./dedup.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
+import type { SetupCheckId } from "./setup-checks/contract.js";
 
 declare global {
   namespace NodeJS {
@@ -85,10 +86,10 @@ export function resolveExecutionPath(
   return mappingMode;
 }
 
-export interface ForcedPathEligibility {
-  eligible: boolean;
-  reason: string | null;
-}
+/** An ineligible mapping carries its reason and the setup check that explains it. */
+export type ForcedPathEligibility =
+  | { eligible: true; reason: null; check?: undefined }
+  | { eligible: false; reason: string; check: SetupCheckId };
 
 /**
  * AII-306: when the global runner mode FORCES a path a mapping cannot run on,
@@ -105,14 +106,14 @@ export function checkForcedPathEligibility(
 ): ForcedPathEligibility {
   // AII-1437: the ephemeral full-access opt-in is GHA-only; any other resolved path would throw at launch.
   if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && resolveExecutionPath(runnerMode, mapping.executionMode) !== "github-actions") {
-    return { eligible: false, reason: "ephemeral full-access opt-in requires GitHub Actions execution" };
+    return { eligible: false, reason: "ephemeral full-access opt-in requires GitHub Actions execution", check: "runner.project-backend" };
   }
   if (runnerMode !== "fly") return { eligible: true, reason: null };
   if (mapping.provider === "bedrock") {
-    return { eligible: false, reason: "provider=bedrock is GHA-only (no role-assumption on Fly)" };
+    return { eligible: false, reason: "provider=bedrock is GHA-only (no role-assumption on Fly)", check: "runner.project-backend" };
   }
   if (!hasFlySessionsApp) {
-    return { eligible: false, reason: "no Fly sessions app configured (FLY_SESSIONS_APP)" };
+    return { eligible: false, reason: "no Fly sessions app configured (FLY_SESSIONS_APP)", check: "runner.fly-sessions" };
   }
   return { eligible: true, reason: null };
 }

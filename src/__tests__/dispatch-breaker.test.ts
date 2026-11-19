@@ -19,36 +19,36 @@ afterEach(() => {
 
 describe("recordDispatchFailure", () => {
   it("third consecutive failure parks the issue; second does not", () => {
-    const r1 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    const r1 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r1.tripped).toBe(false);
     expect(r1.failures).toBe(1);
 
-    const r2 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    const r2 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r2.tripped).toBe(false);
     expect(r2.failures).toBe(2);
 
-    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r3.tripped).toBe(true);
     expect(r3.failures).toBe(3);
     expect(breaker.isParked("issue-1", "implementation")).toBe(true);
   });
 
   it("tripped is true exactly once per park — fourth failure returns false", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r3.tripped).toBe(true);
 
-    const r4 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    const r4 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r4.tripped).toBe(false);
     expect(r4.failures).toBe(4);
   });
 
   it("failure count continues to increment after parking", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    const r4 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    const r4 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r4.failures).toBe(4);
     expect(r4.tripped).toBe(false);
   });
@@ -56,52 +56,72 @@ describe("recordDispatchFailure", () => {
   it("DISPATCH_BREAKER_THRESHOLD=0 never trips", () => {
     process.env.DISPATCH_BREAKER_THRESHOLD = "0";
     for (let i = 0; i < 10; i++) {
-      const r = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+      const r = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
       expect(r.tripped).toBe(false);
     }
     expect(breaker.isParked("issue-1", "implementation")).toBe(false);
   });
 
   it("phases count independently — planning failures do not park implementation", () => {
-    breaker.recordDispatchFailure("issue-1", "planning", "failure");
-    breaker.recordDispatchFailure("issue-1", "planning", "failure");
-    const r3 = breaker.recordDispatchFailure("issue-1", "planning", "failure");
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+    const r3 = breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
     expect(r3.tripped).toBe(true);
     expect(breaker.isParked("issue-1", "planning")).toBe(true);
     expect(breaker.isParked("issue-1", "implementation")).toBe(false);
   });
 
   it("different issues count independently", () => {
-    breaker.recordDispatchFailure("issue-A", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-A", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-A", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-A", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-A", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-A", "implementation", "failure", null);
     expect(breaker.isParked("issue-B", "implementation")).toBe(false);
+  });
+});
+
+// An issue whose every dispatch failed has no other row to find its project from (AII-1546).
+describe("the project a breaker row failed for", () => {
+  it("is the last project a failure named, kept through a failure that names none", () => {
+    expect(breaker.breakerProject("issue-1", "implementation")).toBeNull();
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    expect(breaker.breakerProject("issue-1", "implementation")).toBeNull();
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", "ENG");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    expect(breaker.breakerProject("issue-1", "implementation")).toBe("ENG");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", "OPS");
+    expect(breaker.breakerProject("issue-1", "implementation")).toBe("OPS");
+  });
+
+  it("is kept per phase", () => {
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", "ENG");
+    expect(breaker.breakerProject("issue-1", "planning")).toBe("ENG");
+    expect(breaker.breakerProject("issue-1", "implementation")).toBeNull();
   });
 });
 
 describe("recordDispatchSuccess", () => {
   it("resets counter to zero so failures must restart from scratch", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     breaker.recordDispatchSuccess("issue-1", "implementation");
 
-    const r1 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    const r1 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r1.failures).toBe(1);
     expect(r1.tripped).toBe(false);
 
-    const r2 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    const r2 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r2.failures).toBe(2);
     expect(r2.tripped).toBe(false);
 
-    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r3.failures).toBe(3);
     expect(r3.tripped).toBe(true);
   });
 
   it("does NOT clear parked_at — unpark is human-only", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(breaker.isParked("issue-1", "implementation")).toBe(true);
 
     breaker.recordDispatchSuccess("issue-1", "implementation");
@@ -120,24 +140,24 @@ describe("isParked", () => {
   });
 
   it("returns false after failures below threshold", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(breaker.isParked("issue-1", "implementation")).toBe(false);
   });
 
   it("returns true after threshold is reached", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(breaker.isParked("issue-1", "implementation")).toBe(true);
   });
 });
 
 describe("unpark", () => {
   it("clears parked_at and counter; two failures after unpark do not re-park", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(breaker.isParked("issue-1", "implementation")).toBe(true);
 
     const changed = breaker.unpark("issue-1", "implementation");
@@ -145,23 +165,23 @@ describe("unpark", () => {
     expect(breaker.isParked("issue-1", "implementation")).toBe(false);
 
     // Two failures after unpark — must not re-park (counter reset to 0)
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(breaker.isParked("issue-1", "implementation")).toBe(false);
 
     // Third failure re-parks (full threshold from zero)
-    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(r3.tripped).toBe(true);
     expect(breaker.isParked("issue-1", "implementation")).toBe(true);
   });
 
   it("unpark without phase clears all phases for the issue", () => {
-    breaker.recordDispatchFailure("issue-1", "planning", "failure");
-    breaker.recordDispatchFailure("issue-1", "planning", "failure");
-    breaker.recordDispatchFailure("issue-1", "planning", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(breaker.listParked()).toHaveLength(2);
 
     const changed = breaker.unpark("issue-1");
@@ -172,12 +192,12 @@ describe("unpark", () => {
   });
 
   it("unpark with specific phase only clears that phase", () => {
-    breaker.recordDispatchFailure("issue-1", "planning", "failure");
-    breaker.recordDispatchFailure("issue-1", "planning", "failure");
-    breaker.recordDispatchFailure("issue-1", "planning", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
 
     breaker.unpark("issue-1", "planning");
     expect(breaker.isParked("issue-1", "planning")).toBe(false);
@@ -196,9 +216,9 @@ describe("listParked", () => {
   });
 
   it("returns parked issues with correct shape", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "workflow_dispatch_failed");
-    breaker.recordDispatchFailure("issue-1", "implementation", "workflow_dispatch_failed");
-    breaker.recordDispatchFailure("issue-1", "implementation", "workflow_dispatch_failed");
+    breaker.recordDispatchFailure("issue-1", "implementation", "workflow_dispatch_failed", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "workflow_dispatch_failed", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "workflow_dispatch_failed", null);
 
     const parked = breaker.listParked();
     expect(parked).toHaveLength(1);
@@ -212,25 +232,25 @@ describe("listParked", () => {
   });
 
   it("does not include unparked issues", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     breaker.unpark("issue-1", "implementation");
 
     expect(breaker.listParked()).toHaveLength(0);
   });
 
   it("does not include issues with failures below threshold", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
 
     expect(breaker.listParked()).toHaveLength(0);
   });
 
   it("lists both phases when both are parked", () => {
     for (let i = 0; i < 3; i++) {
-      breaker.recordDispatchFailure("issue-1", "planning", "failure");
-      breaker.recordDispatchFailure("issue-1", "implementation", "failure");
+      breaker.recordDispatchFailure("issue-1", "planning", "failure", null);
+      breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     }
     const parked = breaker.listParked();
     expect(parked).toHaveLength(2);
@@ -241,28 +261,28 @@ describe("listParked", () => {
 
 describe("review_failed conclusion behavior", () => {
   it("three review_failed conclusions park the issue", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
-    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
-    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
+    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
     expect(r3.tripped).toBe(true);
     expect(r3.failures).toBe(3);
     expect(breaker.isParked("issue-1", "implementation")).toBe(true);
   });
 
   it("completed after two review_failed conclusions resets counter to zero", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
-    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
     breaker.recordDispatchSuccess("issue-1", "implementation");
 
-    const r1 = breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    const r1 = breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
     expect(r1.failures).toBe(1);
     expect(r1.tripped).toBe(false);
   });
 
   it("stores conclusion verbatim — REVIEW_UNAPPROVED when conclusion is present", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED");
-    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED");
-    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED");
+    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED", null);
 
     const parked = breaker.listParked();
     expect(parked).toHaveLength(1);
@@ -270,9 +290,9 @@ describe("review_failed conclusion behavior", () => {
   });
 
   it("stores review_failed as conclusion when no conclusion string is present", () => {
-    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
-    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
-    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed", null);
 
     const parked = breaker.listParked();
     expect(parked).toHaveLength(1);
@@ -335,8 +355,8 @@ describe("parkIssue", () => {
   });
 
   it("interleaves safely with recordDispatchFailure: parking after two prior failures keeps consecutive_failures at 2", () => {
-    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
-    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
+    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
 
     const result = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
     expect(result).toBe(true);
@@ -348,11 +368,11 @@ describe("parkIssue", () => {
   });
 
   it("a subsequent recordDispatchFailure call is unaffected by parkIssue's failure count", () => {
-    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
-    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
+    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
+    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
     breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
 
-    const r = breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
+    const r = breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
     expect(r.failures).toBe(3);
     // Already parked by parkIssue, so this call does not newly trip it.
     expect(r.tripped).toBe(false);
@@ -381,8 +401,9 @@ describe("initDispatchBreakerTable idempotency", () => {
     const names = (db.prepare("PRAGMA table_info(dispatch_breaker)").all() as Array<{ name: string }>).map((c) => c.name);
     expect(names).toContain("pr_budget_notified_at");
     expect(names).toContain("trip_notified_at");
-    expect(db.prepare("SELECT pr_budget_notified_at, trip_notified_at FROM dispatch_breaker WHERE issue_id = 'i'").get())
-      .toEqual({ pr_budget_notified_at: null, trip_notified_at: null });
+    expect(names).toContain("project");
+    expect(db.prepare("SELECT pr_budget_notified_at, trip_notified_at, project FROM dispatch_breaker WHERE issue_id = 'i'").get())
+      .toEqual({ pr_budget_notified_at: null, trip_notified_at: null, project: null });
     expect(breaker.prBudgetTrackerCommentOwed("i", "gap-analysis")).toBe(true);
     expect(breaker.claimPrBudgetNotice("i", "gap-analysis")).toBe(1);
     expect(breaker.claimPrBudgetNotice("i", "gap-analysis")).toBeNull();
@@ -419,14 +440,14 @@ describe("breakerPhaseFor", () => {
 
 describe("claimPrBudgetNotice", () => {
   it("claims once per park, regardless of who parked first", () => {
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("i1", "gap-analysis", "failure");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("i1", "gap-analysis", "failure", null);
     expect(breaker.parkIssue("i1", "gap-analysis", "pr_budget")).toBe(false);
     expect(breaker.claimPrBudgetNotice("i1", "gap-analysis")).toBe(breaker.listParked()[0]!.parkedAt);
     expect(breaker.claimPrBudgetNotice("i1", "gap-analysis")).toBeNull();
   });
 
   it("keeps the breaker's last_conclusion when the budget path parks an already-parked row", () => {
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("i2", "gap-analysis", "crash");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("i2", "gap-analysis", "crash", null);
     breaker.parkIssue("i2", "gap-analysis", "pr_budget");
     expect(breaker.listParked()[0]!.lastConclusion).toBe("crash");
   });
@@ -447,7 +468,7 @@ describe("claimPrBudgetNotice", () => {
   });
 
   it("does not claim a row that is not parked, and a release lets the next call claim", () => {
-    breaker.recordDispatchFailure("i4", "gap-analysis", "failure");
+    breaker.recordDispatchFailure("i4", "gap-analysis", "failure", null);
     expect(breaker.claimPrBudgetNotice("i4", "gap-analysis")).toBeNull();
     breaker.parkIssue("i5", "gap-analysis", "pr_budget");
     expect(breaker.claimPrBudgetNotice("i5", "gap-analysis")).not.toBeNull();
@@ -466,7 +487,7 @@ describe("prBudgetMarker", () => {
 describe("prBudgetTrackerCommentOwed", () => {
   it("is owed after a stuck park even when a later failure overwrites last_conclusion", () => {
     breaker.parkIssue("t1", "gap-analysis", "stuck_giveup");
-    breaker.recordDispatchFailure("t1", "gap-analysis", "failed");
+    breaker.recordDispatchFailure("t1", "gap-analysis", "failed", null);
     expect(breaker.prBudgetTrackerCommentOwed("t1", "gap-analysis")).toBe(true);
   });
 

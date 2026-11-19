@@ -845,6 +845,14 @@ it("explains a Fly machine removed before start, including when no PR exists", (
   });
 });
 
+it("explains a GitHub Actions run whose token step failed, naming both secrets, GitHub Free's limit and the setup check", () => {
+  const classification = classifyCompletion(jobOf("failed", "implementation", "app_token_step_failed"));
+  expect(classification?.detail).toContain("GitHub App token");
+  for (const fact of ["AI_IMPLEMENT_APP_ID", "AI_IMPLEMENT_PRIVATE_KEY", "GitHub Free", "github.target-secrets", "/admin#setup"]) {
+    expect(classification?.remediation).toContain(fact);
+  }
+});
+
 it("keeps structured failure detail and remediation authoritative over the Fly never-started conclusion", () => {
   const failure: FailureRecord = {
     category: "transient",

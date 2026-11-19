@@ -5,6 +5,7 @@ import { initKeyBindingsTable } from "./key-bindings.js";
 import { checkTrackerWrites } from "./tracker-write-gate.js";
 import { buildHealthBody } from "./health-body.js";
 import { BEFORE_FIRST_SYNC, createSetupCheckContext, getCachedSetupCheckRun, getSetupCheckProgress, runProjectSetupChecks, setupChecksHealthField } from "./setup-checks/index.js";
+import { gitHubAppErrorChecks, pointAtSetupChecks, readOnSetupPage, setSetupCheckRecheckSender } from "./setup-checks/recheck.js";
 import { createSetupCheckChangeDetector, readSavedSetup } from "./setup-checks/change-detector.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import { armModelPricesSchedule } from "./restate/model-prices.js";
@@ -34,13 +35,13 @@ import {
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
-import { surfaceDispatchFailure } from "./dispatch-failure.js";
+import { breakerSetupChecks, surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
 import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
 import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSnapshots, trackerReadChecks, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, onSelfDeployOutcome, postAvailableNotice, postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
@@ -57,7 +58,7 @@ import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
 import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
-import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor, claimPrBudgetNotice, prBudgetMarker, releasePrBudgetNotice, prBudgetTrackerCommentOwed, markTripNotified } from "./dispatch-breaker.js";
+import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor, breakerProject, claimPrBudgetNotice, prBudgetMarker, releasePrBudgetNotice, prBudgetTrackerCommentOwed, markTripNotified } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
@@ -573,7 +574,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
       providerFor: (m) => registry.forMapping(m),
       clear: (id) => { deleteDispatched(id); },
       recordNotFound: async (id) => {
-        const br = recordDispatchFailure(id, "implementation", "reconcile_not found");
+        const br = recordDispatchFailure(id, "implementation", "reconcile_not found", getLatestTeamKeyForIssue(id));
         if (br.tripped) {
           await fireBreakerTrip(config, null, id, null, "implementation", br.failures, "reconcile_not found");
         }
@@ -597,13 +598,15 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
           await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config);
         } catch (err) {
           reconciliationFailedScopes.add(scopeKey);
-          console.error(`[roll-up-review] ${provider.id}/${scopeKey} reconciliation failed; its issues sit out this cycle:`, err);
+          const pointer = pointAtSetupChecks({ ids: trackerReadChecks(provider.id), project: scopeKey, cause: "tracker-read" });
+          console.error(`[roll-up-review] ${provider.id}/${scopeKey} reconciliation failed; its issues sit out this cycle${pointer}:`, err);
         }
       }
     }
     const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
     for (const { providerId, error } of failed) {
-      console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle:`, error);
+      const pointer = pointAtSetupChecks({ ids: trackerReadChecks(providerId), cause: "tracker-read" });
+      console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle${pointer}:`, error);
     }
 
     // Finalize empty grouping parents (all children terminal, blank spec) — markMerged so the
@@ -840,8 +843,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
           // dispatching a run that cannot work.
           const eligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
           if (!eligibility.eligible) {
+            const pointer = pointAtSetupChecks({ ids: [eligibility.check], project: issue.scopeKey, cause: "launch-refused" });
             console.log(
-              `[poll] Skipping ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${eligibility.reason}`,
+              `[poll] Skipping ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${eligibility.reason}${pointer}`,
             );
             continue;
           }
@@ -900,7 +904,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
           });
         }
       } catch (err) {
-        console.error(`[poll] Error processing ${issue.identifier}:`, err);
+        // The token mint and the base-branch reads are GitHub App reads, so a setup fault shows here by its status and path.
+        const pointer = pointAtSetupChecks({ ids: gitHubAppErrorChecks(err), project: issue.scopeKey, cause: "github-read" });
+        console.error(`[poll] Error processing ${issue.identifier}${pointer}:`, err);
       }
     }
 
@@ -1080,8 +1086,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
 /**
  * Fires after recordDispatchFailure returns tripped=true. Posts a tracker
  * comment and a webhook notification, both best-effort. Never throws.
+ * Exported for direct testing.
  */
-async function fireBreakerTrip(
+export async function fireBreakerTrip(
   config: AppConfig,
   provider: TicketingProvider | null,
   issueId: string,
@@ -1095,6 +1102,9 @@ async function fireBreakerTrip(
   );
 
   const runUrls = getRecentFailedRunUrls(issueId, phase, 3);
+  // Names only: a tracker comment's readers are the tracker's, so a check's detail and fix stay on the Setup page.
+  const setup = breakerSetupChecks(getCachedSetupCheckRun(), conclusion, breakerProject(issueId, phase));
+  const named = `${setup.ids.map((id) => `\`${id}\``).join(", ")}. ${readOnSetupPage(setup.ids.length)}.`;
   const commentLines = [
     `**⛔ AI-Implement parked this issue**`,
     ``,
@@ -1103,6 +1113,9 @@ async function fireBreakerTrip(
     `- Phase: \`${phase}\``,
     `- Failures: ${failures}`,
     `- Last conclusion: \`${conclusion}\``,
+    ...(setup.ids.length === 0 ? [] : setup.failing
+      ? [`- ${setup.ids.length === 1 ? "Setup check" : "Setup checks"} failing for this project: ${named}`]
+      : [`- Setup checks that explain it: ${named}`]),
     ...(runUrls.length > 0
       ? [`- Failed runs:`, ...runUrls.map((u) => `  - ${u}`)]
       : []),
@@ -1310,7 +1323,7 @@ export async function dispatchGitHubActions(
       if (decision.kind === "refuse") {
         await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision));
         // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code);
+        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code, issue.scopeKey);
         if (breakerRefuse.tripped) {
           await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breakerRefuse.failures, decision.code);
         }
@@ -1441,8 +1454,9 @@ export async function preparePlanningDispatch(
   // AII-306: same forced-mode eligibility guard as implementation dispatch.
   const planningEligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
   if (!planningEligibility.eligible) {
+    const pointer = pointAtSetupChecks({ ids: [planningEligibility.check], project: issue.scopeKey, cause: "launch-refused" });
     console.log(
-      `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}`,
+      `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}${pointer}`,
     );
     return null;
   }
@@ -1453,7 +1467,7 @@ export async function preparePlanningDispatch(
   const callbackBlockReason = planningDispatchBlockReason(config);
   if (callbackBlockReason) {
     console.error(
-      `[poll] Refusing to dispatch planning for ${issue.identifier}: ${callbackBlockReason}`,
+      `[poll] Refusing to dispatch planning for ${issue.identifier}: ${callbackBlockReason}${pointAtSetupChecks({ ids: ["callback.config"], cause: "planning-refused" })}`,
     );
     return null;
   }
@@ -1777,7 +1791,7 @@ export async function dispatchSession(
           await provider.markPlanningFailed(issue.id, issue.scopeKey, text);
         }
         // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code);
+        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code, issue.scopeKey);
         if (breakerRefuse.tripped) {
           await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, breakerRefuse.failures, decision.code);
         }
@@ -1891,7 +1905,7 @@ export async function dispatchSession(
     if (opts.doMarkDispatched) {
       deleteDispatched(issue.id);
     }
-    const _brSession = recordDispatchFailure(issue.id, opts.phase, "dispatch_error");
+    const _brSession = recordDispatchFailure(issue.id, opts.phase, "dispatch_error", issue.scopeKey);
     if (_brSession.tripped) {
       await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, _brSession.failures, "dispatch_error");
     }
@@ -3052,7 +3066,7 @@ export async function reportTerminalJob(
           // a flaky provider parks the issue (BAC-27134). Jobs with no classified failure at
           // all (pre-BAC-27112, or a synthetic dispatch-error conclusion) count as before.
           if (!job.failure || shouldCountFailure(job.failure)) {
-            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion, job.teamKey ?? null);
             if (br.tripped && !isStuck) {
               pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
             }
@@ -4300,6 +4314,7 @@ export function startServer(
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
   }), reviewFixIngressClient);
   setReviewFixAttemptsFacade(reviewFixAttempts);
+  setSetupCheckRecheckSender((request) => setupChecksClient.recheck(request));
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,

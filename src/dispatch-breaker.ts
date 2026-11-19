@@ -53,10 +53,14 @@ export function initDispatchBreakerTable(): void {
   if (!cols.some((c) => c.name === "trip_notified_at")) {
     getDb().exec("ALTER TABLE dispatch_breaker ADD COLUMN trip_notified_at INTEGER");
   }
+  // An issue whose every dispatch failed has no dispatch_log or dispatched row to find its project from.
+  if (!cols.some((c) => c.name === "project")) {
+    getDb().exec("ALTER TABLE dispatch_breaker ADD COLUMN project TEXT");
+  }
 }
 
 /**
- * Records a consecutive dispatch failure for an issue+phase.
+ * Records a consecutive dispatch failure for an issue+phase, and the project (mapping key) it failed for when known.
  * Returns { tripped, failures } where tripped is true exactly once —
  * on the transition into parked state (count first reaches the threshold
  * and parked_at was null). Subsequent calls return tripped=false.
@@ -65,6 +69,7 @@ export function recordDispatchFailure(
   issueId: string,
   phase: string,
   conclusion: string,
+  project: string | null,
 ): { tripped: boolean; failures: number } {
   const db = getDb();
   const row = db
@@ -80,16 +85,25 @@ export function recordDispatchFailure(
   const now = Date.now();
 
   db.prepare(`
-    INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at, project)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (issue_id, phase) DO UPDATE SET
       consecutive_failures = excluded.consecutive_failures,
       last_conclusion      = excluded.last_conclusion,
       last_failure_at      = excluded.last_failure_at,
-      parked_at            = COALESCE(dispatch_breaker.parked_at, excluded.parked_at)
-  `).run(issueId, phase, failures, conclusion, now, tripped ? now : null);
+      parked_at            = COALESCE(dispatch_breaker.parked_at, excluded.parked_at),
+      project              = COALESCE(excluded.project, dispatch_breaker.project)
+  `).run(issueId, phase, failures, conclusion, now, tripped ? now : null, project);
 
   return { tripped, failures };
+}
+
+/** The project an issue+phase's breaker row last failed for, or null when no failure named one. */
+export function breakerProject(issueId: string, phase: string): string | null {
+  const row = getDb()
+    .prepare("SELECT project FROM dispatch_breaker WHERE issue_id = ? AND phase = ?")
+    .get(issueId, phase) as { project: string | null } | undefined;
+  return row?.project ?? null;
 }
 
 /**

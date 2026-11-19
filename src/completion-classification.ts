@@ -1,6 +1,15 @@
 export const FLY_MACHINE_NEVER_STARTED_REMEDIATION = "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly).";
 
+/** The conclusion of a GitHub Actions run that ended unreported because its GitHub App token step failed. */
+export const APP_TOKEN_STEP_FAILED = "app_token_step_failed";
+
+/** What to fix for that conclusion. It names only the check, as the park comment does, since a check's detail and fix stay on the Setup page. */
+export const APP_TOKEN_STEP_FAILED_REMEDIATION = "Check that AI_IMPLEMENT_APP_ID and AI_IMPLEMENT_PRIVATE_KEY are set in the repository's Actions secrets, or its organization's. "
+  + "On GitHub Free a private repository cannot read organization secrets, so set them on the repository. "
+  + trackerSetupChecksSentence(["github.target-secrets"]);
+
 import type { Job } from "./log.js";
+import { trackerSetupChecksSentence } from "./setup-checks/recheck.js";
 import { reasonCodeTag, SECOND_REVIEW } from "./run-autopsy.js";
 import { GUARDRAIL_REASON_MAX_CHARS, providerUnavailablePhrase, redactAndCap } from "./pipeline/failure-classification.js";
 import type { FailureCategory, FailureRecord } from "./pipeline/failure-classification.js";
@@ -480,8 +489,10 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
   }
   const exit = job.conclusion?.startsWith("exit_") ? job.conclusion.slice(5) : null;
   const neverStarted = job.conclusion === "fly_machine_never_started";
+  const tokenStep = job.conclusion === APP_TOKEN_STEP_FAILED;
   const detail =
     neverStarted ? "Fly removed the machine before it started." :
+    tokenStep ? "GitHub Actions could not create the run's GitHub App token, so the run stopped before it started." :
     exit && exit !== "0"
       ? `The runner exited with code ${exit}.`
       : job.phase === "implementation" && !job.prUrl
@@ -498,6 +509,7 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
     detail,
     remediation:
       neverStarted ? FLY_MACHINE_NEVER_STARTED_REMEDIATION :
+      tokenStep ? APP_TOKEN_STEP_FAILED_REMEDIATION :
       job.phase === "implementation"
         ? "Check the run logs — the run likely errored before pushing — then run it again."
         : "Check the run logs for the planning failure, then run it again.",

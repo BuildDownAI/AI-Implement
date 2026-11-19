@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
+import { gitHubAppErrorChecks, pointAtSetupChecks } from "./setup-checks/recheck.js";
 import { canDispatch } from "./dispatch-gate.js";
 import { isParked, claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
 import {
@@ -335,7 +336,10 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       try {
         ghToken = await opts.getInstallationToken(item.owner);
       } catch (err) {
-        console.warn(`[comment-gapfill] could not get a token for ${fullRepo}; item #${item.id} stays pending:`, err);
+        // For the repository's project, or every project when several share the repository.
+        const project = repoMappingEntries.length === 1 ? repoMappingEntries[0][0] : undefined;
+        const pointer = pointAtSetupChecks({ ids: gitHubAppErrorChecks(err), project, cause: "github-read" });
+        console.warn(`[comment-gapfill] could not get a token for ${fullRepo}; item #${item.id} stays pending${pointer}:`, err);
         continue;
       }
       let pr: Awaited<ReturnType<typeof getPullRequestState>> = null;
@@ -433,7 +437,8 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       // AII-1437: an ephemeral full-access opt-in cannot run off GHA; defer rather than throw at launch.
       const pathEligibility = checkForcedPathEligibility(opts.runnerMode, mapping, true);
       if (!pathEligibility.eligible && hasEphemeralFullAccessOptIn(mapping.extraEnv)) {
-        console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${pathEligibility.reason}`);
+        const pointer = pointAtSetupChecks({ ids: [pathEligibility.check], project: scopeKey, cause: "launch-refused" });
+        console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${pathEligibility.reason}${pointer}`);
         continue;
       }
 

@@ -3819,7 +3819,7 @@ describe("admin blockers endpoint", () => {
     // Planning and implementation park only through the breaker: the third failed run in a row parks the phase.
     const { recordDispatchFailure } = modules.dispatchBreaker;
     const park = (issueId: string, phase: string) => {
-      for (let run = 0; run < 3; run++) recordDispatchFailure(issueId, phase, "failure");
+      for (let run = 0; run < 3; run++) recordDispatchFailure(issueId, phase, "failure", null);
     };
     const mk = (id: string, identifier: string) => makeIssue({ id, identifier, scopeKey: "CORE" });
     park("impl-1", "implementation");

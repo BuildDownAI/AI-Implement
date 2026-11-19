@@ -21,6 +21,10 @@ import type { RecentAppDeliveries } from "../webhook-redelivery.js";
 import type { WorkflowSyncJob } from "../workflow-sync-queue.js";
 
 export type SetupCheckState = "pass" | "warn" | "fail" | "cannot-verify" | "not-applicable";
+
+/** The states of a row someone should look at. */
+export const NEEDS_ATTENTION: readonly SetupCheckState[] = ["fail", "cannot-verify", "warn"];
+
 export type SetupCheckTier = "core" | "mode" | "feature";
 
 /**
@@ -44,6 +48,7 @@ export const SETUP_CHECK_IDS = [
   "callback.config",
   "callback.reachable",
   "runner.fly-sessions",
+  "runner.project-backend",
   "admin.path",
   "admin.providers",
   "admin.redirect-url",
@@ -81,7 +86,7 @@ export const SETUP_CHECK_IDS = [
 export type SetupCheckId = (typeof SETUP_CHECK_IDS)[number];
 
 /** The runtime failures that ask for a check to run again, each kept as the `cause` of the rows its recheck answers. */
-export const SETUP_RECHECK_CAUSES = ["dispatch-404", "launch-refused", "planning-refused", "token-step"] as const;
+export const SETUP_RECHECK_CAUSES = ["dispatch-404", "dispatch-refused", "launch-refused", "planning-refused", "token-step", "tracker-read", "tracker-write", "github-read", "workflow-sync", "runner-reported", "token-vending"] as const;
 
 export type SetupRecheckCause = (typeof SETUP_RECHECK_CAUSES)[number];
 

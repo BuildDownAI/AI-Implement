@@ -48,6 +48,10 @@ For an older database it checks `PRAGMA table_info(mappings)` and adds the missi
 column with the same default. Existing projects read as `shared`; repeated boots
 leave it unchanged. Older orchestrators ignore the column on rollback.
 
+### Breaker project
+
+`initDispatchBreakerTable()` (`src/dispatch-breaker.ts`) adds the nullable `dispatch_breaker.project TEXT` when `PRAGMA table_info(dispatch_breaker)` shows it missing. It holds the project (the mapping key) an issue and phase last failed for, since an issue whose every dispatch failed may have no `dispatch_log` or `dispatched` row to find its project from. `recordDispatchFailure` writes it when the failure names a project and keeps the stored one when it names none; `recordDispatchSuccess` and `parkIssue` leave it alone. Rows from before the column read `null` until their next failure. The park comment (`breakerProject`) and `get_issue_dispatch_status` read it. Older orchestrators ignore the column on rollback, since their writes name their columns.
+
 ### OpenRouter CHECK constraint rebuilds (AII-1883)
 
 `getDb()` creates `model_account_profile_revisions` and `model_invocation_attribution`
