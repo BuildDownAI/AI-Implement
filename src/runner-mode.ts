@@ -104,8 +104,8 @@ export function checkForcedPathEligibility(
   mapping: { executionMode: "github-actions" | "fly-machines"; provider?: string; extraEnv?: Readonly<Record<string, string>> | null },
   hasFlySessionsApp: boolean,
 ): ForcedPathEligibility {
-  // AII-1437: the ephemeral full-access opt-in is GHA-only; any other resolved path would throw at launch.
-  if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && resolveExecutionPath(runnerMode, mapping.executionMode) !== "github-actions") {
+  // AII-1437: the ephemeral full-access opt-in is GHA-only; any other backend would throw at launch.
+  if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && resolvePlanningExecutionPath(runnerMode, mapping.executionMode) !== "github-actions") {
     return { eligible: false, reason: "ephemeral full-access opt-in requires GitHub Actions execution", check: "runner.project-backend" };
   }
   if (runnerMode !== "fly") return { eligible: true, reason: null };
@@ -119,9 +119,9 @@ export function checkForcedPathEligibility(
 }
 
 /**
- * Planning-specific execution path resolution. Identical to resolveExecutionPath
- * except shadow ("both") collapses to "github-actions": planning posts user-visible
- * Linear comments, so a shadow second backend would double-post.
+ * The backend a run goes to: resolveExecutionPath with shadow ("both") collapsed to
+ * "github-actions", since shadow mode runs every run kind on GitHub Actions alone.
+ * Named for planning, its first caller, which collapsed it so a second backend never double-posted.
  */
 export function resolvePlanningExecutionPath(
   runnerMode: RunnerMode,

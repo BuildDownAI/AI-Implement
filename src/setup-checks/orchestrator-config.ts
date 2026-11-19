@@ -9,7 +9,7 @@ import { appCredentialsProblem } from "../github-app-auth.js";
 import { SEED_ONCE_SETTINGS } from "../seed-once-settings.js";
 import { MAX_POLL_INTERVAL_MS, parsePollIntervalMs } from "../poll-cycle.js";
 import { parseBreakerThreshold } from "../dispatch-breaker.js";
-import { checkForcedPathEligibility, FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveExecutionPath, resolveFlyProcessLevelSecrets, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
+import { checkForcedPathEligibility, FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveFlyProcessLevelSecrets, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
 import { missingRunnerCallbackConfig } from "../runner-callback.js";
 import { ORCHESTRATOR_HEALTH_TIMEOUT_MS } from "../health-body.js";
 import { waitOn, type SetupCheck, type SetupCheckContext } from "./contract.js";
@@ -372,7 +372,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     run: ({ runnerMode, mappings, flySessions, runnerBackendSource }) => {
       const mode = runnerMode().mode;
       const onFly = Object.entries(mappings())
-        .filter(([, mapping]) => ["fly-machines", "both"].includes(resolveExecutionPath(mode, mapping.executionMode)))
+        .filter(([, mapping]) => resolvePlanningExecutionPath(mode, mapping.executionMode) === "fly-machines")
         .map(([key]) => key);
       if (onFly.length === 0) return [{ state: "not-applicable", detail: "No project runs on Fly Machines" }];
       if (runnerBackendSource() === "not-loaded") return [{

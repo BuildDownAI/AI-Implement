@@ -483,6 +483,8 @@ describe("runner.fly-sessions", () => {
     ["only GitHub Actions projects", "default", onGha],
     ["a Fly project under runner mode gha", "gha", onFly],
     ["a Fly project under runner mode local", "local", onFly],
+    // Shadow mode runs every run kind on GitHub Actions alone.
+    ["a Fly project under runner mode shadow", "shadow", onFly],
   ] as const)("does not apply with %s", async (_name, mode, mappings) => {
     expect(await run("runner.fly-sessions", { mappings, runnerMode: () => ({ mode, source: "db" }), flySessions: unconfigured })).toMatchObject([
       { state: "not-applicable" },
@@ -528,7 +530,6 @@ describe("runner.fly-sessions", () => {
 
   it.each([
     ["fly", "ENG, OPS"],
-    ["shadow", "ENG, OPS"],
     ["default", "ENG"],
   ] as const)("under runner mode %s, fails naming what is unset and the projects it strands (%s)", async (mode, projects) => {
     expect(await run("runner.fly-sessions", { mappings: onFly, runnerMode: () => ({ mode, source: "db" }), flySessions: unconfigured })).toMatchObject([{
@@ -563,6 +564,9 @@ describe("runner.project-backend", () => {
     ["projects on GitHub Actions under runner mode default", "default", projects("github-actions")],
     ["projects on GitHub Actions under runner mode gha", "gha", projects("github-actions")],
     ["projects forced to GitHub Actions from Fly Machines", "gha", projects("fly-machines")],
+    // Shadow mode runs every run kind on GitHub Actions alone, so neither setting is refused there.
+    ["projects on GitHub Actions under runner mode shadow", "shadow", projects("github-actions")],
+    ["projects on Fly Machines under runner mode shadow", "shadow", projects("fly-machines")],
   ] as const)("passes with %s", async (_name, mode, mappings) => {
     expect(await under(mode, mappings)).toMatchObject([{ state: "pass" }]);
   });
