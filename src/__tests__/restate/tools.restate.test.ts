@@ -45,6 +45,7 @@ function adminToolArgs(name: string, fallback: Record<string, unknown>): Record<
       provider: "openrouter", authMode: "openrouter-api-key",
     };
     case "set_project_stage": return { teamKey: "BDS", stage: "implementation" };
+    case "set_kg_graph_source": return { source: "sidecar" };
     default: return fallback;
   }
 }

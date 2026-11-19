@@ -97,9 +97,9 @@ KG repo is needed. These values are environment-only for now;
 | `KG_STARDOG_RUN_CONSOLE` | Endpoint console URL. |
 | `KG_NAMESPACE` | Graph IRI namespace; a nonempty value takes precedence over `sources.yml`, including for the boot probe. |
 
-`src/kg-graph-source.ts` provides the database storage for the forthcoming KG
-page. It has no runtime callers yet, so the environment behavior above still
-applies. `kg_graph_source` defaults to `sidecar`; the non-secret rows are
+`src/kg-graph-source.ts` holds the stored values the sidecar reads at start; the
+environment above seeds them on first boot. `kg_graph_source` defaults to
+`sidecar`; the non-secret rows are
 `kg_stardog_db`, `kg_stardog_run_endpoint`, `kg_stardog_run_console`, and
 `kg_stardog_run_platform`. The import platform defaults to
 `https://app.stardog.run`, distinct from the console host. Namespace and graph
@@ -107,6 +107,33 @@ name use the shared `kg_namespace` and `kg_graph_name` rows. Names accept letter
 digits, underscores and hyphens, beginning with a letter or digit; namespaces and
 endpoint/console/platform values must be absolute HTTP(S) URLs without userinfo.
 Empty fields clear their rows, and partial updates preserve omitted fields.
+
+With the `/app/kg/.base-only` marker there is no local graph, so the remote store
+is the effective source whatever the row says. `isRemoteKgStore()` is the one test
+of that: true with the marker, else when the row is `stardog_run`.
+
+### Switching the source
+
+`set_kg_graph_source` (admin, `src/restate/tools.ts`) is the only writer of
+`kg_graph_source`. For `stardog_run` it first sends one real COUNT query with the
+stored values (`src/stardog-client.ts`: the console `POST /api/token` exchange,
+then the edge's `/edge/token`), retrying for up to 6 minutes because a sleeping
+endpoint takes 2–5 minutes to wake. Only a passing test saves the row and restarts
+the sidecar. A failing test changes nothing. `sidecar` saves and restarts with no
+test, and is refused with `no-sidecar-graph` on a base-only image. There is
+nothing to undo: switching back is another call.
+
+The switch is a Restate handler, so a client that gives up at its own timeout must
+repeat the call with the same `Idempotency-Key`; the repeat attaches to the first
+invocation instead of testing again. Restarting starts a sidecar that did not start
+at boot and installs a probed provider, so `/mcp` lists the `kg_*` tools again
+without an orchestrator restart. Switching back to `sidecar` clears the recorded
+Stardog error, and `GET /` reports `sidecar.lastError: null`.
+
+Values are set without a refresh rail: `GET`/`POST /api/settings` carry the
+non-secret fields (`kg_stardog_*`, `stardogTokenSet`, the effective `kgGraphSource`
+and `kgCustomerRepo`), never the token, and `POST /api/kg/stardog` stores the token
+alone (an empty token is a 400).
 
 The token is encrypted in `model_protected_secrets` at
 `kg-store:stardog-run-token`, with reference-bound authentication. The public

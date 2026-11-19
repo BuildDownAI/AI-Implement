@@ -116,7 +116,7 @@ import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider, getKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { parseHealthPort, withRequestErrorBoundary } from "./http-server.js";
 import { initMcpOAuthTables, routeMcpOAuth } from "./mcp-oauth.js";
@@ -172,7 +172,12 @@ import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRA
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
-import { setKgRefreshToolDeps } from "./restate/tools.js";
+import { setKgRefreshToolDeps, setKgGraphSourceToolDeps, STARDOG_TEST_PAUSE_MS, type KgGraphSourceToolDeps } from "./restate/tools.js";
+import { createStardogClient } from "./stardog-client.js";
+import { isRemoteKgStore, KG_DIR } from "./kg-sidecar.js";
+import { setKgGraphSource, type KgGraphSource } from "./kg-graph-source.js";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
 import { checkKgSidecarHealth, probeKgSidecarAfterBoot } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
@@ -4200,6 +4205,46 @@ export function makeKgRefreshAdminDeps(
   };
 }
 
+/**
+ * The `set_kg_graph_source` dependencies (AII-1974), extracted from `main()` so the switch's
+ * restart step is testable without booting the orchestrator. Bound even when no KG source
+ * repo is configured: a base-only image switches between its absent sidecar graph and Stardog.
+ *
+ * The restart step starts a sidecar that did not start at boot (for example a base-only image
+ * whose Stardog values arrived later), then installs a probed provider so `/mcp`'s `tools/list`
+ * advertises `kg_*` with no orchestrator restart. It keeps a provider that already exists.
+ */
+export function createKgGraphSourceToolDeps(opts: {
+  /** Only `restart()` is used; a fake in tests can be a bare object. */
+  sidecar: Pick<KgSidecar, "restart">;
+  memoryProviderId?: string | null;
+  /** Defaults to `KG_DIR`; a test points it at a temp directory. */
+  kgDir?: string;
+  /** Test seam for the production global `fetch`. */
+  fetchImpl?: typeof fetch;
+}): KgGraphSourceToolDeps {
+  const stardogClient = createStardogClient(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {});
+  return {
+    countTriples: () => stardogClient.countTriples(),
+    saveGraphSource: (source: KgGraphSource) => setKgGraphSource(source),
+    restartSidecar: async () => {
+      await opts.sidecar.restart();
+      const current = getKgMemoryProvider();
+      const provider = current instanceof SidecarMemoryProvider
+        ? current
+        : resolveMemoryProvider(process.env.KG_SIDECAR_URL || null, opts.memoryProviderId);
+      if (provider === null) return;
+      if (provider !== current) setKgMemoryProvider(provider);
+      if (provider instanceof SidecarMemoryProvider) {
+        // list-only for a remote store: the restart must not bill another store query.
+        await probeWithTimeout(provider, undefined, isRemoteKgStore() ? "list-only" : "full");
+      }
+    },
+    sidecarGraphPresent: () => !existsSync(join(opts.kgDir ?? KG_DIR, ".base-only")),
+    testPauseMs: STARDOG_TEST_PAUSE_MS,
+  };
+}
+
 // The settings key the deleted legacy state machine persisted its stage under.
 const LEGACY_KG_STAGE_SETTINGS_KEY = "kg_refresh_stage";
 
@@ -5396,6 +5441,9 @@ async function main(): Promise<void> {
     })
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
+  // set_kg_graph_source (AII-1974): bound even without KG_SOURCE_REPO, because a base-only
+  // image switches between its absent sidecar graph and Stardog.
+  setKgGraphSourceToolDeps(createKgGraphSourceToolDeps({ sidecar, memoryProviderId: config.memoryProviderId }));
   kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
   // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every project on every backend.

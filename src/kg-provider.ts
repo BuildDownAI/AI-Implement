@@ -383,6 +383,9 @@ export class SidecarMemoryProvider implements MemoryProvider {
    * call is never skipped.
    */
   async probe(mode: "full" | "list-only" = "full"): Promise<SidecarHealth> {
+    // A cached Stardog store error describes a remote store that is no longer selected.
+    // Clear it before anything reads it so an old error does not stay on `GET /` (AII-1974).
+    if (!isRemoteKgStore()) this.storeError = null;
     const target = new URL(this.kgSidecarUrl);
     const transport = target.protocol === "https:" ? https : http;
     const forwardHeaders: SidecarHeaders = { ...PROBE_HEADERS };
