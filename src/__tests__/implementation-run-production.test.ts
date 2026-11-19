@@ -88,6 +88,7 @@ import { read as readAdmission, release as releaseAdmission } from "../dispatch-
 import { destroyMachine, getMachine, listMachines, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer } from "../local-docker.js";
 import { classifyLaunchError, isManagedProject, prepareManagedDispatch, settleLaunch } from "../managed-dispatch-auth.js";
+import { recordDispatchFailure } from "../dispatch-breaker.js";
 import {
   IMPLEMENTATION_RUN_TITLE_PREFIX,
   createImplementationFindExistingRun,
@@ -599,6 +600,16 @@ describe("production deps", () => {
       expect(await d.launch(INPUT)).toEqual({ outcome: "rejected" });
       expect(provider.markImplementationFailed).toHaveBeenCalledWith("i-1", "ENG", "refused");
       expect(input.prepareImplementationLaunch).not.toHaveBeenCalled();
+    });
+
+    // A refusal whose tracker write throws would otherwise repeat every poll without ever parking.
+    it("a managed refusal still counts for the project when its tracker comment fails", async () => {
+      vi.mocked(isManagedProject).mockReturnValue(true);
+      vi.mocked(prepareManagedDispatch).mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "x" });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      provider.markImplementationFailed.mockRejectedValueOnce(new Error("tracker down"));
+      expect(await compose().d.launch(INPUT)).toEqual({ outcome: "rejected" });
+      expect(recordDispatchFailure).toHaveBeenCalledWith("i-1", "implementation", "x", "ENG");
     });
 
     it("overrides an empty scopeKey from findByKey (Jira) with the run's mapping key", async () => {

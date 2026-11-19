@@ -626,6 +626,21 @@ describe("preparePlanningLaunch for an opted-in project", () => {
     expect(fireBreakerTrip).toHaveBeenCalledTimes(1);
     expect(breaker.isParked("i-gha", "planning")).toBe(true);
   });
+
+  // A refusal whose tracker write throws would otherwise repeat every poll without ever parking.
+  it("still counts the refusal when its tracker comment fails", async () => {
+    vi.mocked(managed.prepareManagedDispatch).mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const provider = makeProvider({ markPlanningFailed: vi.fn().mockRejectedValue(new Error("tracker down")) });
+    const args = {
+      config: makeAppConfig(), provider, issue: makeIssue({ id: "i-down" }), mapping: makeMapping(),
+      dispatchId: "d", resolvedPlanningBranch: "main", resolveRunnerImage: vi.fn(), fireBreakerTrip: vi.fn(),
+    };
+    for (let i = 0; i < 3; i++) {
+      await expect(mod.preparePlanningLaunch(args)).rejects.toThrow("managed dispatch refused: runner_incompatible");
+    }
+    expect(breaker.isParked("i-down", "planning")).toBe(true);
+  });
 });
 
 describe("preparePlanningLaunch tokens", () => {

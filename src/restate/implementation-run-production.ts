@@ -323,7 +323,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
         managedDecision = decision;
       } else {
         if (decision.kind === "refuse") {
-          await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision));
+          // A failed write must not skip the count below, or the refusal repeats every poll without parking.
+          await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision))
+            .catch((err) => console.error(`[implementation-run] refusal comment failed issue=${issue.identifier}:`, err));
           // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
           const breaker = recordDispatchFailure(issue.id, "implementation", decision.code, run.teamKey);
           if (breaker.tripped) {

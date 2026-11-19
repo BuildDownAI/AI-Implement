@@ -270,6 +270,18 @@ describe("opted-in Fly implementation", () => {
     expect(provider.markImplementationFailed).toHaveBeenCalledOnce();
   });
 
+  // A refusal whose tracker write throws would otherwise repeat every poll without ever parking (AII-1546).
+  it("a refusal still counts for the issue's project when its tracker comment fails", async () => {
+    dedup.getDb().prepare("DELETE FROM model_session_generations").run();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    for (let i = 0; i < 3; i++) {
+      vi.mocked(provider.markImplementationFailed).mockRejectedValueOnce(new Error("tracker down"));
+      await dispatchFly();
+    }
+    expect(dedup.getDb().prepare("SELECT parked_at IS NOT NULL AS parked, project FROM dispatch_breaker WHERE issue_id = ?").get(issue.id))
+      .toEqual({ parked: 1, project: issue.scopeKey });
+  });
+
   it("a failure after the launch counts dispatch_error for the issue's project", async () => {
     vi.mocked(provider.markImplementing).mockRejectedValueOnce(new Error("tracker down"));
     await dispatchFly().catch(() => {});

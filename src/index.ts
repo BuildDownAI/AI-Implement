@@ -1785,11 +1785,11 @@ export async function dispatchSession(
       admission?.release("launch_rejected");
       if (decision.kind === "refuse") {
         const text = refusalText(decision);
-        if (opts.phase === "implementation") {
-          await provider.markImplementationFailed(issue.id, issue.scopeKey, text);
-        } else {
-          await provider.markPlanningFailed(issue.id, issue.scopeKey, text);
-        }
+        // A failed write must not skip the count below, or the refusal repeats every poll without parking.
+        await (opts.phase === "implementation"
+          ? provider.markImplementationFailed(issue.id, issue.scopeKey, text)
+          : provider.markPlanningFailed(issue.id, issue.scopeKey, text))
+          .catch((err) => console.error(`[poll] Refusal comment failed for ${issue.identifier}:`, err));
         // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
         const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code, issue.scopeKey);
         if (breakerRefuse.tripped) {

@@ -102,7 +102,9 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
       managedDecision = decision;
     } else {
       if (decision.kind === "refuse") {
-        await provider.markPlanningFailed(issue.id, issue.scopeKey, refusalText(decision));
+        // A failed write must not skip the count below, or the refusal repeats every poll without parking.
+        await provider.markPlanningFailed(issue.id, issue.scopeKey, refusalText(decision))
+          .catch((err) => console.error(`[poll] Refusal comment failed for ${issue.identifier}:`, err));
         // Neither caller counts a throw from here, so count it or the next poll re-comments every 60 s.
         const breakerRefuse = recordDispatchFailure(issue.id, "planning", decision.code, issue.scopeKey);
         if (breakerRefuse.tripped && fireBreakerTrip) {
