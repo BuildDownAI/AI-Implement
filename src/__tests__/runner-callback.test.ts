@@ -34,6 +34,7 @@ import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 import { testDir } from "./helpers/test-dir.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { makeContext } from "./helpers/builders.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -1964,7 +1965,7 @@ describe("handleRunnerResult — a runner-reported failure names the setup check
   const record = (code: string, category: FailureRecord["category"] = "auth"): FailureRecord =>
     ({ category, code, stage: "push", attempt: 1, retryable: false, message: "refused", evidence: { truncated: false } });
 
-  async function fail(phase: "implementation" | "planning", body: { failure?: FailureRecord; failureCode?: string; referenceRepoResults?: ReferenceRepoResult[] }) {
+  async function fail(phase: "implementation" | "planning", body: { failure?: FailureRecord; failureCode?: string; referenceRepoResults?: ReferenceRepoResult[] }, beforeResult?: (dispatchId: string) => void) {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
@@ -1972,6 +1973,7 @@ describe("handleRunnerResult — a runner-reported failure names the setup check
       ttlSeconds: phase === "planning" ? runnerTokens.PLANNING_TTL_SECONDS : runnerTokens.IMPLEMENTATION_TTL_SECONDS,
       secret: SECRET,
     });
+    beforeResult?.(dispatchId);
     // The dispatch's job row, which every dispatch writes before its run starts.
     log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Fix it", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions", phase });
     const fake = new FakeProvider({ recordCalls: true });
@@ -2009,6 +2011,19 @@ describe("handleRunnerResult — a runner-reported failure names the setup check
     store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
     store.setProjectConfigured("ENG", true);
     const { comment } = await fail("implementation", { failure: record("PROVIDER_AUTH") });
+    expect(send).not.toHaveBeenCalled();
+    expect(comment).not.toContain("/admin#setup");
+  });
+
+  it("a refused model credential on a run dispatched with a managed credential names no check, though its project has since gone back to legacy", async () => {
+    // The dispatch's frozen stage snapshot, the row agent-run preparation writes when it launches a managed run.
+    const snapshot = makeSnapshot();
+    const { comment } = await fail("implementation", { failure: record("PROVIDER_AUTH") }, (dispatchId) => {
+      dedup.getDb().prepare(`INSERT INTO run_agent_config_snapshots
+        (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+        VALUES (?, ?, 'ENG', ?, ?, ?, ?)`).run(snapshot.snapshotId, dispatchId,
+        JSON.stringify({ stages: snapshot.stages, profiles: snapshot.profiles }), JSON.stringify(snapshot.sources), JSON.stringify(snapshot.configRevisions), Date.now());
+    });
     expect(send).not.toHaveBeenCalled();
     expect(comment).not.toContain("/admin#setup");
   });
