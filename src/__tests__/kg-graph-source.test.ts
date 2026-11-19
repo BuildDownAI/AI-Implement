@@ -122,6 +122,94 @@ it("seeds values and encrypted token once, preserving even an unreadable token r
   expect(dedup.getDb().prepare("SELECT 1 FROM settings WHERE key = 'kg_stardog_dataset'").get()).toBeUndefined();
 });
 
+const STARDOG_SEED_ENV = {
+  KG_BACKEND: "stardog_run",
+  KG_STARDOG_DB: "graph",
+  KG_STARDOG_RUN_ENDPOINT: "https://query.example/",
+  KG_STARDOG_RUN_CONSOLE: "https://console.example/",
+  KG_NAMESPACE: "https://kg.example/",
+  KG_STARDOG_RUN_TOKEN: "seed-token",
+} as const;
+
+it.each([
+  ["KG_STARDOG_DB", { db: "" }, "db"],
+  ["KG_STARDOG_RUN_ENDPOINT", { runEndpoint: "" }, "runEndpoint"],
+  ["KG_STARDOG_RUN_CONSOLE", { runConsole: "" }, "runConsole"],
+  ["KG_NAMESPACE", { namespace: "" }, "namespace"],
+] as const)("keeps a cleared %s value cleared after reboot and reseed", async (variable, clear, field) => {
+  const f = await fixture();
+  f.modules.seed.seedSettingsFromEnv(STARDOG_SEED_ENV);
+  expect(f.modules.kg.getStardogValues()[field]).toBe(STARDOG_SEED_ENV[variable]);
+  f.modules.kg.setStardogValues(clear);
+  expect(f.modules.kg.getStardogValues()[field]).toBe("");
+  const restarted = await f.reopen();
+  restarted.seed.seedSettingsFromEnv(STARDOG_SEED_ENV);
+  expect(restarted.kg.getStardogValues()[field]).toBe("");
+});
+
+it("keeps a cleared token cleared after reboot and reseed", async () => {
+  const f = await fixture();
+  f.modules.seed.seedSettingsFromEnv(STARDOG_SEED_ENV);
+  expect(f.modules.kg.getStardogValues().tokenSet).toBe(true);
+  f.modules.kg.setStardogValues({ token: "" });
+  expect(f.modules.kg.getStardogValues().tokenSet).toBe(false);
+  const restarted = await f.reopen();
+  restarted.seed.seedSettingsFromEnv(STARDOG_SEED_ENV);
+  expect(restarted.kg.getStardogValues().tokenSet).toBe(false);
+  expect(restarted.kg.getStardogRunToken()).toBeUndefined();
+  expect(restarted.dedup.getDb().prepare("SELECT * FROM model_protected_secrets").all()).toEqual([]);
+});
+
+it("keeps a sidecar switch after reboot and reseed with KG_BACKEND=stardog_run", async () => {
+  const f = await fixture();
+  f.modules.seed.seedSettingsFromEnv(STARDOG_SEED_ENV);
+  expect(f.modules.kg.getKgGraphSource()).toBe("stardog_run");
+  f.modules.kg.setKgGraphSource("sidecar");
+  const restarted = await f.reopen();
+  restarted.seed.seedSettingsFromEnv(STARDOG_SEED_ENV);
+  expect(restarted.kg.getKgGraphSource()).toBe("sidecar");
+});
+
+it("keeps pre-seed saves, clears, and a sidecar choice through reboot and seeds only untouched values", async () => {
+  const f = await fixture();
+  f.modules.kg.setKgGraphSource("sidecar");
+  f.modules.kg.setStardogValues({ db: "saved-db", runConsole: "", token: "saved-token" });
+  const restarted = await f.reopen();
+  restarted.seed.seedSettingsFromEnv(STARDOG_SEED_ENV);
+  expect(restarted.kg.getKgGraphSource()).toBe("sidecar");
+  expect(restarted.kg.getStardogValues()).toMatchObject({
+    db: "saved-db", runConsole: "", runEndpoint: STARDOG_SEED_ENV.KG_STARDOG_RUN_ENDPOINT,
+    namespace: STARDOG_SEED_ENV.KG_NAMESPACE, tokenSet: true,
+  });
+  expect(restarted.kg.getStardogRunToken()).toBe("saved-token");
+});
+
+it("keeps a token cleared before the first seed absent through reboot and seed", async () => {
+  const f = await fixture();
+  f.modules.kg.setStardogValues({ token: "" });
+  expect(f.modules.kg.getStardogValues().tokenSet).toBe(false);
+  const restarted = await f.reopen();
+  restarted.seed.seedSettingsFromEnv(STARDOG_SEED_ENV);
+  expect(restarted.kg.getStardogValues().tokenSet).toBe(false);
+  expect(restarted.kg.getStardogRunToken()).toBeUndefined();
+  expect(restarted.dedup.getDb().prepare("SELECT * FROM model_protected_secrets").all()).toEqual([]);
+});
+
+it("still seeds a value that was never seeded or saved on a later boot", async () => {
+  const f = await fixture();
+  f.modules.seed.seedSettingsFromEnv({});
+  const restarted = await f.reopen();
+  restarted.seed.seedSettingsFromEnv({
+    KG_STARDOG_DB: "graph",
+    KG_STARDOG_RUN_ENDPOINT: "https://query.example/",
+    KG_STARDOG_RUN_TOKEN: "seed-token",
+  });
+  expect(restarted.kg.getStardogValues()).toMatchObject({
+    db: "graph", runEndpoint: "https://query.example/", tokenSet: true,
+  });
+  expect(restarted.kg.getStardogRunToken()).toBe("seed-token");
+});
+
 it.each([undefined, "sidecar", "STARDOG_RUN", "stardog_run "])("does not seed source from %s", async (backend) => {
   const { modules: { seed, dedup } } = await fixture();
   seed.seedSettingsFromEnv({ KG_BACKEND: backend });
@@ -137,11 +225,13 @@ it.each([undefined, ""])("continues seeding without an encryption key (%s) and r
     expect(() => f.modules.seed.seedSettingsFromEnv(env)).not.toThrow();
     expect(f.modules.kg.getStardogValues()).toMatchObject({ db: "graph", tokenSet: false });
     expect(f.modules.dedup.getDb().prepare("SELECT * FROM model_protected_secrets").all()).toEqual([]);
+    expect(f.modules.dedup.getDb().prepare("SELECT 1 FROM settings WHERE key = ?").get(f.modules.kg.KG_STARDOG_RUN_TOKEN_HANDLED_SETTING_KEY)).toBeUndefined();
     expect(warn).toHaveBeenCalledOnce();
     expect(JSON.stringify(warn.mock.calls)).not.toContain(env.KG_STARDOG_RUN_TOKEN);
     vi.stubEnv("RUNNER_TOKEN_SECRET", "configured-key");
     const restarted = await f.reopen();
     restarted.seed.seedSettingsFromEnv(env);
     expect(restarted.kg.stardogChildEnv().KG_STARDOG_RUN_TOKEN).toBe(env.KG_STARDOG_RUN_TOKEN);
+    expect(restarted.dedup.getDb().prepare("SELECT 1 FROM settings WHERE key = ?").get(restarted.kg.KG_STARDOG_RUN_TOKEN_HANDLED_SETTING_KEY)).toBeDefined();
   } finally { warn.mockRestore(); }
 });
