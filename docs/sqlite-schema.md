@@ -48,6 +48,12 @@ For an older database it checks `PRAGMA table_info(mappings)` and adds the missi
 column with the same default. Existing projects read as `shared`; repeated boots
 leave it unchanged. Older orchestrators ignore the column on rollback.
 
+### Breaker project and identifier
+
+`initDispatchBreakerTable()` (`src/dispatch-breaker.ts`) adds two nullable columns when `PRAGMA table_info(dispatch_breaker)` shows them missing: `project TEXT`, the project (the mapping key) an issue and phase last failed or parked for, and `issue_identifier TEXT`, the tracker's identifier for the issue (such as `AII-123`). An issue whose every dispatch failed may have no `dispatch_log` or `dispatched` row, and `dispatch_log` rows are pruned, so the breaker row keeps both itself. Every writer passes what it knows as a `BreakerSubject` (`recordDispatchFailure` and `parkIssue`); a field it names replaces the stored value and a field it leaves `null` keeps it, and `recordDispatchSuccess` leaves both alone. Rows from before a column read `null` until their next failure or park names it.
+
+Code outside the module reads the table through it, never by SQL of its own: `breakersForIssue` finds an issue's rows by identifier, plus any issue ids the caller passes for rows that recorded none (rows from before the column, and PR-budget parks for a PR with no tracker issue, keyed `owner/repo#n`); `listParked` lists parked rows with both columns; `breakerProject` gives one row's project. `get_issue_dispatch_status` and the park comment read them, and `GET /api/parked` takes a parked row's identifier from it before falling back to the dispatch rows. Older orchestrators ignore the columns on rollback, since their writes name their columns.
+
 ### OpenRouter CHECK constraint rebuilds (AII-1883)
 
 `getDb()` creates `model_account_profile_revisions` and `model_invocation_attribution`

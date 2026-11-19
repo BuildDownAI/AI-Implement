@@ -5,6 +5,7 @@ import { getMappings, resolvePrDispatchBudget, type RepoMapping } from "../confi
 import { randomUUID } from "node:crypto";
 import { ContainerReviewFixWorker } from "../review-fix-container-worker.js";
 import { read as readAdmission } from "../dispatch-admission.js";
+import type { BreakerSubject } from "../dispatch-breaker.js";
 import { destroyMachineRecorded } from "../backend-run.js";
 import { removeLocalContainer } from "../local-docker.js";
 import { getJobByDispatchId, updateJobStatus, invalidateNonce } from "../log.js";
@@ -205,7 +206,7 @@ export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queue
     + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
 }
 
-export type OnBudgetExhausted = (mapping: RepoMapping, trackerIssueId: string | null,
+export type OnBudgetExhausted = (mapping: RepoMapping, trackerIssueId: string | null, subject: BreakerSubject,
   repository: string, prNumber: number, budget: number) => Promise<void>;
 
 /** Reserve an attempt when the dispatch contract holds. Configuration errors fail their
@@ -221,14 +222,15 @@ export async function admitReviewFix(
   if (verdict === "admit") {
     const outcome = await store.admit(request);
     if (outcome.status === "deferred" && outcome.reason === "budget_exhausted" && onBudgetExhausted) {
-      const mapping = mappedEntry(request.scope)?.[1];
-      if (mapping) {
+      const entry = mappedEntry(request.scope);
+      if (entry) {
+        const [project, mapping] = entry;
         const cursor = request.feedback.queueCursor;
-        const queue = cursor ? getDb().prepare(`SELECT issue_id FROM review_fix_queue
+        const queue = cursor ? getDb().prepare(`SELECT issue_id, issue_identifier FROM review_fix_queue
           WHERE id = ? AND repo = ? AND pr_number = ?`)
-          .get(cursor.queueId, request.scope.repository, request.scope.prNumber) as { issue_id: string | null } | undefined : undefined;
-        await onBudgetExhausted(mapping, queue?.issue_id || null, request.scope.repository,
-          request.scope.prNumber, resolvePrDispatchBudget(mapping));
+          .get(cursor.queueId, request.scope.repository, request.scope.prNumber) as { issue_id: string | null; issue_identifier: string | null } | undefined : undefined;
+        await onBudgetExhausted(mapping, queue?.issue_id || null, { project, identifier: queue?.issue_identifier ?? null },
+          request.scope.repository, request.scope.prNumber, resolvePrDispatchBudget(mapping));
       }
     }
     return outcome;

@@ -80,3 +80,13 @@ Returning `escAttr(safeUrl(url))` from every Tier 2a site would be more defensiv
 ### Converting the SPA to a framework (React, Lit, etc.)
 
 A compiled template layer with automatic context-aware escaping would eliminate the discipline problem entirely. Rejected: it requires a build step that the SPA deliberately avoids, a significant migration effort against 154 call sites and every page module, and ongoing build tooling maintenance. The tagged template achieves 80% of the safety benefit with 1% of the cost, for new code only.
+
+---
+
+## Amendment (2026-11-11): the helpers' home, and two fixes
+
+**The helpers moved out of `auth.ts`** into `src/admin-ui/helpers.ts`, a script element of its own between the theme and auth, beside the badge and time helpers every page shares (AII-1541). Every escaping rule above stands; only the home changed, so the shared test mount now runs the real helpers rather than copies.
+
+**`html`'s URL detection now accepts spaces around `=`**, as its pattern always meant to: inside the module's template literal, the pattern's `\s` had lost its backslash and matched a literal `s`, so `href = "…"` skipped `safeUrl()`. A test with a spaced `href` pins it.
+
+**The last two `data-*` plus inline `onclick` sites follow the decision above.** The Deployments page's reservation Release button read its dispatch id back through `this.dataset.dispatchId`, and the Access page's Clear bindings button its entry through `this.dataset.value`; each now binds an `addEventListener` closure per row. An inline handler that passes only a row's index, such as the Access page's Remove, serializes nothing from data and stays.

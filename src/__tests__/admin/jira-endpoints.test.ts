@@ -287,10 +287,7 @@ describe("/api/admin/config-status", () => {
     const token = await login("secret");
     const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({
-      linear: true, jira: false, jiraSiteUrl: null,
-      runnerCallback: false,
-    });
+    expect(JSON.parse(res.body)).toEqual({ linear: true, jira: false, jiraSiteUrl: null });
   });
 
   it("returns linear: false / jira: true when only Jira vars set", async () => {
@@ -300,13 +297,10 @@ describe("/api/admin/config-status", () => {
     const token = await login("secret");
     const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({
-      linear: false, jira: true, jiraSiteUrl: "https://x.atlassian.net",
-      runnerCallback: false,
-    });
+    expect(JSON.parse(res.body)).toEqual({ linear: false, jira: true, jiraSiteUrl: "https://x.atlassian.net" });
   });
 
-  it("returns everything ON when all env vars set", async () => {
+  it("returns both providers ON, and no runner callback field, when every variable is set", async () => {
     process.env.LINEAR_CLIENT_ID = "cid";
     process.env.LINEAR_CLIENT_SECRET = "csec";
     process.env.JIRA_TOKEN = "t";
@@ -317,19 +311,8 @@ describe("/api/admin/config-status", () => {
     const token = await login("secret");
     const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({
-      linear: true, jira: true, jiraSiteUrl: "https://x.atlassian.net",
-      runnerCallback: true,
-    });
-  });
-
-  it("runnerCallback is false if only one of the two env vars is set", async () => {
-    process.env.RUNNER_CALLBACK_BASE_URL = "https://cb";
-    // RUNNER_TOKEN_SECRET intentionally unset
-    const token = await login("secret");
-    const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).runnerCallback).toBe(false);
+    // The callback's readiness is the setup checks' callback.config and callback.reachable, which also derive local mode's address.
+    expect(JSON.parse(res.body)).toEqual({ linear: true, jira: true, jiraSiteUrl: "https://x.atlassian.net" });
   });
 
   it("returns 401 without auth", async () => {

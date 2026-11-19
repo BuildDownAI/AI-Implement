@@ -536,8 +536,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   it.each(labels)("a successful run resets the planning breaker count and marks the row notified (%s)", async (label) => {
     gh.statusGate = gate("first status read");
     const w = await dispatch(label, "PLT-20");
-    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback");
-    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback");
+    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback", null);
+    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback", null);
     expect(breakerFailures(w.issue.id)).toBe(2);
     await gh.statusGate.reached();
     await waitForStep(w.read, "wait");
@@ -752,7 +752,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     // A missing machine is an ended status; the diagnostic read must also tolerate its 404.
     if (failedRead) backends.machines.delete(jobId!);
     await untilReleased(w.dispatchId);
-    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback" });
+    // A cause the read found goes on the row, so the outcome step's own comment can name it.
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: failedRead ? "ended_without_callback" : "fly_machine_never_started" });
     expect(isParked(w.issue.id, "planning")).toBe(true);
     expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
     expect(planningFailedCalls).toHaveLength(1);

@@ -23,6 +23,7 @@ import { allowlistFromEnv, parseAccessEntries } from "./access-entries.js";
 import { formatCheckRow } from "./check-setup.js";
 import { parseKgSourceRepo } from "./deploy.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
+import { GITHUB_APP_EVENTS } from "./github-app-permissions.js";
 import { redactEvidence } from "./pipeline/failure-classification.js";
 import { REPO_SHORTHAND } from "./reference-repos.js";
 import type { SetupCheckContext, SetupCheckOutcome, SetupCheckResult } from "./setup-checks/index.js";
@@ -235,6 +236,9 @@ function envOnlyContext(env: Record<string, string>): SetupCheckContext {
     onSeparateFilesystem: unavailable,
     trackerProvider: unavailable,
     trackerSetupFacts: unavailable,
+    githubSetupFacts: unavailable,
+    orchestratorHealthAt: unavailable,
+    orchestratorInstanceId: unavailable,
   };
 }
 
@@ -1252,7 +1256,8 @@ function printNextSteps(io: Io, client: ClientFile, answers: Answers, stillToRun
       ]),
     );
   }
-  io.explain("Set the GitHub App's webhook to this address, with the Issue comment, Pull request, Pull request review and Pull request review comment events:");
+  const events = new Intl.ListFormat("en", { type: "conjunction" }).format(GITHUB_APP_EVENTS.map((event) => event.title));
+  io.explain(`Set the GitHub App's webhook to this address, with the ${events} events:`);
   // As the redirect addresses: a callback base kept on Fly and never remembered here is unknown.
   const callbackBase =
     answers.env.RUNNER_CALLBACK_BASE_URL ??

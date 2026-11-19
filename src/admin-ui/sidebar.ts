@@ -23,10 +23,13 @@ const groups: NavGroup[] = [
     { key: "pipelines", label: "Pipelines & steps",   icon: "flow" },
     { key: "models",    label: "Models & providers",  icon: "bolt",
       grantBlocker: "Reads the project-mapping payload, which carries runner environment values." },
-    { key: "channels",  label: "Triggers & channels", icon: "broadcast" },
-    { key: "policies",  label: "Policies & risk",     icon: "shield" },
+    { key: "channels",  label: "Triggers & channels", icon: "broadcast",
+      grantBlocker: "Not built yet, so there is nothing to grant." },
+    { key: "policies",  label: "Policies & risk",     icon: "shield",
+      grantBlocker: "Not built yet, so there is nothing to grant." },
   ]},
   { label: "Platform", items: [
+    { key: "setup",       label: "Setup",       icon: "check" },
     { key: "runners",     label: "Runners",     icon: "cpu",
       grantBlocker: "The runner mode is a global failover control, not a read-only view." },
     { key: "sessions",    label: "Sessions",    icon: "server" },
@@ -41,10 +44,12 @@ const groups: NavGroup[] = [
       grantBlocker: "Exposes global secrets and infrastructure settings." },
   ]},
   { label: "Developer", items: [
-    { key: "webhooks",       label: "Webhooks",       icon: "webhook" },
+    { key: "webhooks",       label: "Webhooks",       icon: "webhook",
+      grantBlocker: "Not built yet, so there is nothing to grant." },
     { key: "audit",          label: "Audit log",      icon: "history" },
     { key: "customizations", label: "Customizations", icon: "fork" },
-    { key: "updates",        label: "Updates",        icon: "download" },
+    { key: "updates",        label: "Updates",        icon: "download",
+      grantBlocker: "Not built yet, so there is nothing to grant." },
   ]},
 ];
 

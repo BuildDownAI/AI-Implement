@@ -1048,24 +1048,30 @@ export async function getWorkflowRunStatus(
   };
 }
 
-export interface FailedContainerInitJob {
+export interface FailedRunStepJob {
   /** The job's name, or `"unknown"` when the API omitted it. */
   jobName: string;
   htmlUrl: string | null;
 }
 
+/** The step where GitHub pulls a job's container image, so a denied or missing runner image fails there. */
+export const CONTAINER_INIT_STEP = "Initialize containers";
+
+/** The synced templates' step that mints a run's GitHub App token from the AI_IMPLEMENT_APP_ID and AI_IMPLEMENT_PRIVATE_KEY secrets. */
+export const APP_TOKEN_STEP = "Generate GitHub App token";
+
 /**
- * Finds a job of a run whose `Initialize containers` step failed — GitHub's job-container image
- * pull happens there, so this is how a denied or missing runner image shows up. Returns null for any
- * other shape, a non-OK response, or a thrown error: a lookup failure must never make a run less
- * retryable.
+ * Finds a job of a run whose step named `stepName` failed, one of the steps above that fail before
+ * the runner starts. Returns null for any other shape, a non-OK response, or a thrown error: a lookup
+ * failure must never make a run less retryable.
  */
-export async function getFailedContainerInitJob(
+export async function getFailedRunStepJob(
   token: string,
   owner: string,
   repo: string,
   runId: number,
-): Promise<FailedContainerInitJob | null> {
+  stepName: string,
+): Promise<FailedRunStepJob | null> {
   try {
     const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`;
     const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
@@ -1079,7 +1085,7 @@ export async function getFailedContainerInitJob(
     };
     for (const job of data.jobs ?? []) {
       const failed = (job.steps ?? []).some(
-        (step) => step.name === "Initialize containers" && step.conclusion === "failure",
+        (step) => step.name === stepName && step.conclusion === "failure",
       );
       if (failed) return { jobName: job.name || "unknown", htmlUrl: job.html_url || null };
     }
@@ -1805,4 +1811,113 @@ export async function getDefaultBranchFileText(token: string, owner: string, rep
   const body = (await res.json()) as { content?: string; encoding?: string; type?: string };
   if (body.type !== "file" || body.encoding !== "base64" || typeof body.content !== "string") return null;
   return Buffer.from(body.content, "base64").toString("utf8");
+}
+
+/** What an unauthenticated read sees of a repository. */
+export interface PublicRepositoryRead {
+  /** The HTTP status of `GET /repos/{owner}/{repo}`: 200 for a public repository, 404 for a private or missing one. */
+  status: number;
+  /** Whether the requested ref resolves, or null when no ref was asked or the repository read failed. */
+  refExists: boolean | null;
+  /** When GitHub refused a read for its rate limit, the time it may be read again, in epoch milliseconds. */
+  rateLimitedUntil?: number;
+}
+
+/**
+ * When a refused response may be retried, by GitHub's rate-limit rules, or null when GitHub did not refuse it for a rate limit:
+ * `retry-after` seconds from now, else the primary limit's `x-ratelimit-reset` (UTC epoch seconds), else a minute.
+ */
+export function gitHubRateLimitedUntil(res: Response, now: number = Date.now()): number | null {
+  if (res.status !== 403 && res.status !== 429) return null;
+  const retryAfter = res.headers.get("retry-after");
+  if (retryAfter !== null && /^\d+$/.test(retryAfter)) return now + Number(retryAfter) * 1000;
+  if (res.headers.get("x-ratelimit-remaining") !== "0") return null;
+  const reset = Number(res.headers.get("x-ratelimit-reset"));
+  return reset > 0 ? reset * 1000 : now + 60_000;
+}
+
+/**
+ * Reads a repository without a token, as a run clones one on an owner the App is not installed on.
+ * GitHub limits unauthenticated reads to 60 an hour per IP, so a caller makes these only for such owners.
+ */
+export async function readPublicRepository(owner: string, repo: string, ref?: string): Promise<PublicRepositoryRead> {
+  const base = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const res = await fetch(base, { headers: srcHeaders(null), signal: defaultFetchSignal() });
+  const limited = gitHubRateLimitedUntil(res);
+  if (limited !== null) return { status: res.status, refExists: null, rateLimitedUntil: limited };
+  if (!res.ok || ref === undefined) return { status: res.status, refExists: null };
+  const commit = await fetch(`${base}/commits?sha=${encodeURIComponent(ref)}&per_page=1`, { headers: srcHeaders(null), signal: defaultFetchSignal() });
+  // getRefSha's reading: 404 is a missing repository and 422 an invalid ref. Anything else is not an answer about the ref.
+  if (commit.status === 404 || commit.status === 422) return { status: res.status, refExists: false };
+  const commitLimited = gitHubRateLimitedUntil(commit);
+  if (commitLimited !== null) return { status: res.status, refExists: null, rateLimitedUntil: commitLimited };
+  if (!commit.ok) throw new GitHubApiError({ status: commit.status, path: `/repos/${owner}/${repo}/commits`, bodyText: await commit.text() });
+  return { status: res.status, refExists: true };
+}
+
+/** One repository's reads for `readRepositoryFacts`. */
+export interface RepositoryFactsRequest {
+  repo: string;
+  /** Git revision expressions, as `git rev-parse` reads them: `HEAD:<path>` for a file on the default branch, `<ref>:<path>`, or a bare `<ref>`. */
+  expressions: string[];
+  /** Head branch names whose open pull request to look up. */
+  openPullRequestHeads: string[];
+}
+
+/** What a token sees of one repository. */
+export interface RepositoryFacts {
+  /** False when the token cannot see the repository or it does not exist, which GitHub answers alike. */
+  visible: boolean;
+  /** Whether a visible repository is private; false when it is not visible. */
+  private: boolean;
+  defaultBranch: string | null;
+  /** Whether each requested expression names an existing Git object. */
+  exists: Record<string, boolean>;
+  /** The newest open pull request from each requested head branch, as workflow sync picks its own, or null. */
+  openPullRequests: Record<string, { number: number; url: string } | null>;
+}
+
+/**
+ * Reads every requested repository of one owner in a single GraphQL query.
+ * Values travel as variables, never inside the query text. Throws on a failed request or any error other than an unseen repository.
+ */
+export async function readRepositoryFacts(token: string, owner: string, requests: RepositoryFactsRequest[]): Promise<Map<string, RepositoryFacts>> {
+  const variables: Record<string, string> = { owner };
+  const declarations = ["$owner: String!"];
+  const declare = (name: string, value: string) => {
+    variables[name] = value;
+    declarations.push(`$${name}: String!`);
+    return `$${name}`;
+  };
+  const selections = requests.map((request, r) => {
+    const objects = request.expressions.map((expression, e) => `e${e}: object(expression: ${declare(`r${r}e${e}`, expression)}) { __typename }`);
+    const pulls = request.openPullRequestHeads.map((head, p) =>
+      `p${p}: pullRequests(states: OPEN, headRefName: ${declare(`r${r}p${p}`, head)}, first: 1, orderBy: { field: CREATED_AT, direction: DESC }) { nodes { number url } }`);
+    return `r${r}: repository(owner: $owner, name: ${declare(`r${r}`, request.repo)}) { isPrivate defaultBranchRef { name } ${[...objects, ...pulls].join(" ")} }`;
+  });
+  const query = `query(${declarations.join(", ")}) { ${selections.join(" ")} }`;
+
+  const res = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: { ...ghHeaders(token), "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) throw new GitHubApiError({ status: res.status, path: "/graphql", bodyText: await res.text() });
+  const body = (await res.json()) as {
+    data?: Record<string, { isPrivate: boolean; defaultBranchRef: { name: string } | null; [alias: string]: unknown } | null>;
+    errors?: Array<{ type?: string; path?: string[]; message?: string }>;
+  };
+  const unseen = new Set((body.errors ?? []).filter((e) => e.type === "NOT_FOUND" && e.path?.length === 1).map((e) => e.path![0]));
+  const unexpected = (body.errors ?? []).filter((e) => !(e.type === "NOT_FOUND" && e.path?.length === 1));
+  if (unexpected.length > 0 || !body.data) throw new Error(`readRepositoryFacts ${owner} failed: ${unexpected.map((e) => e.message).join("; ") || "no data"}`);
+
+  return new Map(requests.map((request, r): [string, RepositoryFacts] => {
+    const node = body.data![`r${r}`];
+    if (!node || unseen.has(`r${r}`)) return [request.repo, { visible: false, private: false, defaultBranch: null, exists: {}, openPullRequests: {} }];
+    const exists = Object.fromEntries(request.expressions.map((expression, e) => [expression, node[`e${e}`] != null]));
+    const openPullRequests = Object.fromEntries(request.openPullRequestHeads.map((head, p) =>
+      [head, (node[`p${p}`] as { nodes: Array<{ number: number; url: string }> }).nodes[0] ?? null]));
+    return [request.repo, { visible: true, private: node.isPrivate === true, defaultBranch: node.defaultBranchRef?.name ?? null, exists, openPullRequests }];
+  }));
 }

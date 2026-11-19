@@ -1,6 +1,6 @@
 # 047. Orchestrator setup checks only read, and what they show depends on who can reach an admin
 
-**Status:** Accepted. The result contract and the orchestrator's own checks land with [AII-1532](https://linear.app/eudoxus/issue/AII-1532); the surfaces in decisions 2 and 3 land with later children of [AII-1531](https://linear.app/eudoxus/issue/AII-1531).
+**Status:** Accepted. The result contract and the orchestrator's own checks landed with [AII-1532](https://linear.app/eudoxus/issue/AII-1532); the surfaces in decisions 2 and 3 landed with later children of [AII-1531](https://linear.app/eudoxus/issue/AII-1531), as the amendments below record.
 **Date:** 2026-10-23
 **References:** ADR 015, ADR 022, [orchestrator-configuration.md](../orchestrator-configuration.md), [access-model.md](../access-model.md), [deployment.md](../deployment.md) § "The health body (`GET /`)", [mcp-server.md](../mcp-server.md)
 
@@ -84,14 +84,20 @@ Project, tracker and repository checks are never named on `GET /`. Projects are 
 
 **Decision 1's example no longer arises.** The orchestrator now creates `Ready for Review` in the issue's team, as it creates the other lifecycle labels, which needs no workspace admin ([AII-231](https://linear.app/eudoxus/issue/AII-231)). So no check asks whether the Linear app may create a workspace-scoped label, and `tracker.linear.lifecycle-labels` passes a missing lifecycle label, since the orchestrator creates it at first use. The rule stands: a fact only a write could prove still reports `cannot-verify`.
 
-**`get_tenant_health` shows a little more than decision 2's table names.** It landed with [AII-1538](https://linear.app/eudoxus/issue/AII-1538) as the `setupChecks` field, holding each row's `id`, `title`, `state` and `project`, the count of failing core rows (`failingCore`) and the run's `checkedAt`. A row's `project` is a configured value, unlike the three fields the decision names, but it is the project's key, which `list_projects` (`role: "user"`) already shows the same audience, so it discloses nothing new. Detail and fix stay on the admin surfaces. The admin API route landed with the same issue, as `GET /api/setup-checks` and `POST /api/setup-checks/run`. `GET /`, bootstrap mode and the admin setup page land with later children of [AII-1531](https://linear.app/eudoxus/issue/AII-1531).
-
+**`get_tenant_health` shows a little more than decision 2's table names.** It landed with [AII-1538](https://linear.app/eudoxus/issue/AII-1538) as the `setupChecks` field, holding each row's `id`, `title`, `state` and `project`, the count of failing core rows (`failingCore`) and the run's `checkedAt`. A row's `project` is a configured value, unlike the three fields the decision names, but it is the project's key, which `list_projects` (`role: "user"`) already shows the same audience, so it discloses nothing new. Detail and fix stay on the admin surfaces. The admin API route landed with the same issue, as `GET /api/setup-checks` and `POST /api/setup-checks/run`. `GET /` and bootstrap mode landed with [AII-1539](https://linear.app/eudoxus/issue/AII-1539) (the amendment below), and the admin setup page landed with [AII-1541](https://linear.app/eudoxus/issue/AII-1541) (the 2026-11-11 amendment below).
 
 ## Amendment (2026-11-05): public health bootstrap checks
 
-Decision 3 now names all eight ids the code marks `onAdminPath`, including
-`env.admin-access-code` and `admin.path`, which its earlier bullet list omitted.
-Decision 2's table now uses the contract field `title` where it previously said
-"name". These corrections follow standing rule 3: the ADR follows the code it
-governs. Public health exposes only the failing core count and last-run time,
-plus failing admin-path ids during bootstrap; titles remain off `GET /`.
+**Decision 3 names all eight ids the code marks `onAdminPath`.** Its list once left out `env.admin-access-code` and `admin.path`, both on the path to an admin. **Decision 2's table says `title`**, the result contract's field, where it once said "name". Both follow the code, as standing rule 3 asks of an ADR. **`GET /` landed with [AII-1539](https://linear.app/eudoxus/issue/AII-1539)** as the `setupChecks` field: the last known run's `checkedAt` and its failing core count, plus, in bootstrap mode, the ids of the failing admin-path checks, run afresh on each request. Titles, details and fixes stay off `GET /`.
+
+## Amendment (2026-11-11): the Setup page, and checks with nothing to apply to
+
+**The admin setup page landed with [AII-1541](https://linear.app/eudoxus/issue/AII-1541)**, as `/admin#setup`, with decision 2's audience: a user granted the page reads every check with its detail and fix, and only an admin starts a run, since a grant reaches a page's `GET` routes alone. A run now starts without waiting: `POST /api/setup-checks/run` answers 202 at once, and `GET /api/setup-checks` carries the run in progress beside the stored run. While Restate cannot serve, that route's 503 names the setup command, which runs every check without Restate.
+
+**A check whose prerequisite does not apply answers with no row.** With no project on Linear or on Jira, only that provider's credentials check reports it; with no project at all, only `tracker.provider` does, for the GitHub checks that run once per project as well. One row then speaks for the checks that depend on it, so every surface shows that row once rather than the same not-applicable answer from each dependent check. Decision 2's tiers are unchanged, and a check that cannot read what another check reports still answers `cannot-verify`, naming that check.
+
+## Amendment (2026-11-13): one project's checks, and checks that can never pass
+
+**Onboarding surfaces landed with [AII-1543](https://linear.app/eudoxus/issue/AII-1543), all within decision 2's admin row.** The New project stepper's Review shows an unsaved project's checks (`POST /api/setup-checks/candidate`, run in process, storing nothing), and the Projects page shows each project's markers from the stored run, with a project's own checks run from its row before any run has checked it, from its card on the Setup page, and after a sync the admin UI started. Those runs go through `POST /api/setup-checks/project` into the `SetupChecks` object's `runProject`, which merges the project's rows into the stored run, or runs every check when a check all projects share fails, since that fault reaches each of them. Both routes are admin-only, and every run still only reads (decision 1).
+
+**The result contract gained two fields, by addition.** A row from a run narrower than a full one carries its own `checkedAt`, while the run's `startedAt` and `checkedAt` keep dating the last full run, which `GET /` and `get_tenant_health` show. A check that can never be verified marks its rows `verifiable: false`: `github.target-secrets`, and now `github.review-process`, which names a review process's outside reviewer, since no App credential can see another App's installation on a repository. The first consequence below holds for both, and the admin UI's markers and the stepper's Create gate leave those rows out, so a project is not held for a fact no check can settle. `get_tenant_health`'s summary picks its fields by name and carries neither.

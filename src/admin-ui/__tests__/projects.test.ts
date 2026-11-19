@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { projectsHtml, projectsScript } from "../pages/projects.js";
 import { componentsCss } from "../components.js";
 import type { RepoMapping } from "../../config.js";
@@ -61,6 +61,264 @@ describe("projects table containment", () => {
     edit!.click();
     expect(doc.querySelector<HTMLDialogElement>("#mapping-dialog")!.open).toBe(true);
     expect(doc.querySelector<HTMLInputElement>("#md-team-key-orig")!.value).toBe("AII");
+  });
+});
+
+describe("projects page setup columns", () => {
+  const CHECKED = Date.parse("2026-11-12T10:00:00Z");
+
+  type Row = { id: string; state: string; tier: string; project?: string; checkedAt?: number; verifiable?: false };
+  type Run = { checkedAt: number; results: Row[] };
+  /** A required (core) row of AII's unless the extras say otherwise. */
+  const row = (id: string, state: string, extra: Partial<Row> = {}): Row => ({ id, state, tier: "core", project: "AII", ...extra });
+  const feature = (id: string, state: string, extra: Partial<Row> = {}): Row => row(id, state, { tier: "feature", ...extra });
+
+  /**
+   * The page with the stored run `run`, or its read answering `status`, its clock an hour after the run.
+   * The project route answers `projectRun` (null for a failure) and stores it, so the next read returns it.
+   * The page lists the projects `keys`, AII alone by default.
+   */
+  function mountWithRun(run: Run | null, status = 200, projectRun: Run | null = null, keys = ["AII"]) {
+    let stored = run;
+    const calls: string[] = [];
+    const alerts: string[] = [];
+    const { win, doc } = mountAdminPage({
+      html: projectsHtml,
+      script: projectsScript,
+      route: "projects",
+      api: async (url, init) => {
+        if (init?.method === "POST") calls.push(`${url} ${init.body}`);
+        if (url === "/api/setup-checks") return { ok: status < 400, status, json: async () => ({ run: stored, progress: null, groups: {} }) };
+        if (url === "/api/setup-checks/project") {
+          if (!projectRun) return { ok: false, status: 503, json: async () => ({ error: "restate-unavailable" }) };
+          stored = projectRun;
+          return { ok: true, status: 200, json: async () => ({ run: projectRun, groups: {} }) };
+        }
+        if (url === "/api/mappings") return { ok: true, status: 200, json: async () => Object.fromEntries(keys.map((key) => [key, makeMapping()])) };
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+      before: (w) => {
+        w.Date.now = () => CHECKED + 60 * 60 * 1000;
+        w.alert = (message: string) => alerts.push(message);
+      },
+    });
+    const column = (name: string) => {
+      const table = doc.getElementById("mappings-body")!.closest("table")!;
+      const header = Array.from(table.querySelectorAll("thead th"), (th) => (th as HTMLElement).textContent);
+      return doc.querySelector("#mappings-body tr")!.children[header.indexOf(name)] as HTMLElement;
+    };
+    const note = () => doc.getElementById("projects-setup-note") as HTMLElement;
+    return { win, calls, alerts, note, required: () => column("Setup"), optional: () => column("Optional setup") };
+  }
+
+  /** The marker's badge kind and label, whether it links anywhere, and its title. */
+  function marker(cell: HTMLElement) {
+    const holder = cell.firstElementChild as HTMLElement;
+    return { badge: holder.querySelector(".badge")?.className, label: holder.textContent, link: holder.getAttribute("href"), title: holder.title };
+  }
+
+  it("offers a project no run has checked a button that checks it, before the first run or after", async () => {
+    for (const run of [null, { checkedAt: CHECKED, results: [row("github.permissions", "fail", { project: "SAN" }), row("env.poll-interval", "fail", { project: undefined })] }]) {
+      const { win, required, optional } = mountWithRun(run);
+      await win.loadMappings();
+      expect(required().querySelector("button")!.textContent).toBe("Check setup");
+      expect(optional().innerHTML).toBe("");
+    }
+  });
+
+  it("runs the project's checks from that button and shows what they found", async () => {
+    const { win, calls, required } = mountWithRun(null, 200, { checkedAt: CHECKED, results: [row("github.installation", "fail")] });
+    await win.loadMappings();
+    required().querySelector("button")!.click();
+    await vi.waitFor(() => expect(required().querySelector("button")).toBeNull());
+    expect(calls).toEqual(['/api/setup-checks/project {"project":"AII"}']);
+    expect(marker(required()).label).toBe("Fail");
+  });
+
+  it("gives the button back, and says so, when the project's checks cannot run", async () => {
+    const { win, alerts, required } = mountWithRun(null);
+    await win.loadMappings();
+    const button = required().querySelector("button")!;
+    button.click();
+    await vi.waitFor(() => expect(alerts).toHaveLength(1));
+    expect(alerts[0]).toContain("AII");
+    expect(button.disabled).toBe(false);
+  });
+
+  it("reads Unavailable, not a button, while the stored run cannot be read", async () => {
+    const { win, required, optional } = mountWithRun({ checkedAt: CHECKED, results: [row("github.permissions", "fail")] }, 503);
+    await win.loadMappings();
+    expect(required().textContent).toBe("Unavailable");
+    expect(required().querySelector("button")).toBeNull();
+    expect(optional().innerHTML).toBe("");
+  });
+
+  it.each([
+    [["fail", "cannot-verify", "warn", "pass"], "badge fail", "Fail", 3],
+    [["cannot-verify", "warn", "pass"], "badge info", "Cannot verify", 2],
+    [["warn", "pass"], "badge warn", "Warning", 1],
+  ])("turns the required marker to its worst row's state: %j", async (states, badge, label, toLook) => {
+    const { win, required } = mountWithRun({ checkedAt: CHECKED, results: states.map((state, i) => row(`check-${i}`, state, { tier: i % 2 ? "mode" : "core" })) });
+    await win.loadMappings();
+    // The title's facts: how many checks to look at, and when they ran.
+    const shown = marker(required());
+    expect(shown).toMatchObject({ badge, label, link: null });
+    expect(shown.title).toMatch(new RegExp(`^${toLook}\\b`));
+    expect(shown.title).toContain("1h ago");
+  });
+
+  it("reads Pass when every required row passes, with nothing to look at", async () => {
+    const { win, required } = mountWithRun({ checkedAt: CHECKED, results: [row("github.installation", "pass"), row("github.workflow-default-branch", "pass", { tier: "mode" })] });
+    await win.loadMappings();
+    const shown = marker(required());
+    expect(shown).toMatchObject({ badge: "badge success", label: "Pass", link: null });
+    expect(shown.title).not.toMatch(/^\d/);
+    expect(shown.title).toContain("1h ago");
+  });
+
+  it("judges the optional features apart from the required checks", async () => {
+    const { win, required, optional } = mountWithRun({ checkedAt: CHECKED, results: [row("github.installation", "pass"), feature("github.skills-repo", "fail")] });
+    await win.loadMappings();
+    expect(marker(required()).label).toBe("Pass");
+    expect(marker(optional())).toMatchObject({ badge: "badge fail", label: "Fail", link: null });
+  });
+
+  // One pointer for the page rather than a link per marker, since the Setup page lists every project.
+  it("points to the Setup page once, counting each checked project with a marker that does not pass", async () => {
+    const { win, note } = mountWithRun({
+      checkedAt: CHECKED,
+      results: [
+        row("github.installation", "pass"),
+        feature("github.skills-repo", "warn", { project: "SAN" }),
+        row("github.permissions", "fail", { project: "TEST" }),
+        row("github.permissions", "fail", { project: "TEST", id: "github.installation" }),
+        row("tracker.linear.credentials", "fail", { project: undefined }),
+      ],
+    }, 200, null, ["AII", "SAN", "TEST", "NEW"]);
+    await win.loadMappings();
+    expect(note().hidden).toBe(false);
+    // SAN and TEST: TEST's two failing rows count once, AII passes, NEW was never checked, and an orchestrator row is no project's.
+    expect(note().querySelector("#projects-setup-note-count")!.textContent).toMatch(/^2\b/);
+    expect(note().querySelectorAll('a[href="#setup"]')).toHaveLength(1);
+    expect(note().ownerDocument.querySelectorAll('#mappings-body a[href="#setup"]')).toHaveLength(0);
+  });
+
+  it.each([
+    ["every checked project passes", { checkedAt: CHECKED, results: [row("github.installation", "pass"), row("github.target-secrets", "cannot-verify", { verifiable: false })] }, 200],
+    ["no run has checked a project", null, 200],
+    ["the stored run cannot be read", { checkedAt: CHECKED, results: [row("github.installation", "fail")] }, 503],
+  ] as [string, Run | null, number][])("shows no pointer when %s", async (_case, run, status) => {
+    const { win, note } = mountWithRun(run, status);
+    await win.loadMappings();
+    expect(note().hidden).toBe(true);
+  });
+
+  it("lets neither a row that does not apply nor a check that can never be verified move a marker", async () => {
+    const { win, required, optional } = mountWithRun({
+      checkedAt: CHECKED,
+      results: [
+        row("github.installation", "pass"),
+        row("github.target-secrets", "cannot-verify", { tier: "mode", verifiable: false }),
+        row("tracker.filesystem.directory", "not-applicable", { tier: "mode" }),
+        feature("github.review-process", "cannot-verify", { verifiable: false }),
+        feature("github.skills-repo", "not-applicable"),
+      ],
+    });
+    await win.loadMappings();
+    expect(marker(required()).label).toBe("Pass");
+    // A placeholder rather than a marker, which an unchecked project's empty cell is told apart from.
+    expect(optional().querySelector(".badge")).toBeNull();
+    expect(optional().textContent).not.toBe("");
+  });
+
+  it("leaves other projects' rows and the orchestrator-wide rows out", async () => {
+    const { win, required } = mountWithRun({
+      checkedAt: CHECKED,
+      results: [row("github.installation", "pass"), row("github.installation", "fail", { project: "SAN" }), row("tracker.linear.credentials", "fail", { project: undefined })],
+    });
+    await win.loadMappings();
+    expect(marker(required()).label).toBe("Pass");
+  });
+
+  it("dates the markers by the project's own run when one has checked it since the full run", async () => {
+    const { win, required } = mountWithRun({ checkedAt: CHECKED - 24 * 60 * 60 * 1000, results: [row("github.permissions", "pass", { checkedAt: CHECKED })] });
+    await win.loadMappings();
+    expect(marker(required()).title).toContain("1h ago");
+  });
+
+  // A recheck refreshes one row, so the project's other rows can be older than its newest.
+  it("dates the markers by the project's oldest row", async () => {
+    const rechecked = row("github.installation", "fail", { checkedAt: CHECKED + 50 * 60 * 1000 });
+    const { win, required } = mountWithRun({ checkedAt: CHECKED, results: [rechecked, row("github.permissions", "pass")] });
+    await win.loadMappings();
+    expect(marker(required()).title).toContain("1h ago");
+  });
+});
+
+describe("projects page sync poll — the project's setup checks", () => {
+  /** The page with one sync poll started for AII, whose status read answers `job` (or the HTTP `status`), and a record of every call in order. */
+  function startPoll(job: unknown, status = 200, projectRun: () => Promise<unknown> = async () => ({})) {
+    const calls: string[] = [];
+    let tick!: () => Promise<void>;
+    const { win } = mountAdminPage({
+      html: projectsHtml,
+      script: projectsScript,
+      route: "projects",
+      api: async (url, init) => {
+        calls.push(`${init?.method ?? "GET"} ${url}${init?.body ? " " + init.body : ""}`);
+        if (url.includes("/sync-status/")) return { ok: status < 400, status, json: async () => job };
+        if (url === "/api/setup-checks/project") await projectRun();
+        if (url === "/api/mappings") return { ok: true, status: 200, json: async () => ({ AII: makeMapping() }) };
+        return { ok: true, status: 200, json: async () => ({ run: null }) };
+      },
+      // The poll's interval is driven by hand, one tick at a time.
+      before: (w) => {
+        w.setInterval = (fn: () => Promise<void>) => { tick = fn; return 1; };
+        w.clearInterval = () => {};
+        w.alert = () => {};
+      },
+    });
+    win.pollSyncStatus("AII", "job-1");
+    return { calls, tick: () => tick() };
+  }
+
+  const PROJECT_RUN = 'POST /api/setup-checks/project {"project":"AII"}';
+
+  it.each([
+    ["completed", { status: "completed", result: { prUrl: null } }],
+    ["failed", { status: "failed", error: { message: "permission denied" } }],
+  ])("runs the project's checks once a sync has %s, before the table redraws", async (_name, job) => {
+    const { calls, tick } = startPoll(job);
+    await tick();
+    const run = calls.indexOf(PROJECT_RUN);
+    expect(run).toBeGreaterThan(-1);
+    expect(calls.indexOf("GET /api/mappings", run)).toBeGreaterThan(run);
+    expect(calls.filter((call) => call === PROJECT_RUN)).toHaveLength(1);
+  });
+
+  it("does not run them while the sync is still going", async () => {
+    const { calls, tick } = startPoll({ status: "running" });
+    await tick();
+    expect(calls).not.toContain(PROJECT_RUN);
+  });
+
+  it("does not run them when the sync job is gone, or the poll gives up waiting", async () => {
+    const gone = startPoll({}, 404);
+    await gone.tick();
+    expect(gone.calls).not.toContain(PROJECT_RUN);
+    expect(gone.calls).toContain("GET /api/mappings");
+
+    const waiting = startPoll({ status: "running" });
+    for (let attempt = 0; attempt <= 60; attempt++) await waiting.tick();
+    expect(waiting.calls).not.toContain(PROJECT_RUN);
+  });
+
+  it("still redraws the table when the project's checks cannot run", async () => {
+    const { calls, tick } = startPoll({ status: "completed", result: { prUrl: null } }, 200, async () => {
+      throw new Error("Restate unavailable");
+    });
+    await tick();
+    expect(calls.slice(calls.indexOf(PROJECT_RUN))).toContain("GET /api/mappings");
   });
 });
 
@@ -805,6 +1063,25 @@ describe("projects page agents tab", () => {
     await save(m.win);
     expect(JSON.stringify(m.posts[0])).not.toMatch(/agent|stages/i);
     expect(puts(m)).toHaveLength(0);
+  });
+});
+
+describe("the Edit dialog's Jira repository values", () => {
+  // Whoever administers the Jira field names its options, so a quote in one must stay inside its option.
+  const VALUE = 'acme/app"><option value="injected';
+
+  it("lists each option as one choice, its value and its text as Jira has them", async () => {
+    const { win, doc } = mountAdminPage({
+      html: projectsHtml,
+      script: projectsScript,
+      route: "projects",
+      api: async (url) => ({ ok: true, status: 200, json: async () => (url.startsWith("/api/jira/field-options") ? [{ value: VALUE }] : {}) }),
+    });
+    const field = doc.getElementById("md-jira-repo-field") as HTMLSelectElement;
+    field.innerHTML = '<option value="customfield_1">Repo</option>';
+    await win.onRepoFieldChange();
+    const options = Array.from((doc.getElementById("md-jira-repo-value") as HTMLSelectElement).options);
+    expect(options.map((o) => [o.value, o.textContent])).toEqual([["", "(select)"], [VALUE, VALUE]]);
   });
 });
 

@@ -5,6 +5,7 @@ import type * as LogModule from "../log.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import { testDb } from "./helpers/test-db.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -157,6 +158,18 @@ describe("token-vending", () => {
     const res = await callTokenEndpoint({ nonce: "fail-nonce", owner: "acme" });
     expect(res.statusCode).toBe(500);
     expect(JSON.parse(res.body).error).toContain("Failed to generate token");
+  });
+
+  it("names the checks behind a GitHub App error in its line and asks for them to run again for the job's project", async () => {
+    log.appendLog({ issueId: "issue-5", repo: "acme/my-repo", teamKey: "ENG", machineNonce: "refused-nonce" });
+    // Imported after testDb's reset, so it is the class the vending code checks for.
+    const { GitHubApiError } = await import("../github-errors.js");
+    mockGetScopedInstallationToken.mockRejectedValueOnce(new GitHubApiError({ status: 404, path: "/repos/acme/my-repo/installation" }));
+    const send = await recordRechecks();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect((await callTokenEndpoint({ nonce: "refused-nonce", owner: "acme" })).statusCode).toBe(500);
+    expect(send.mock.calls).toEqual([[{ id: "github.installation", project: "ENG", cause: "token-vending" }]]);
+    expect(String(error.mock.calls[0]?.[0])).toContain("github.installation");
   });
 
   it("returns 403 after nonce is invalidated", async () => {

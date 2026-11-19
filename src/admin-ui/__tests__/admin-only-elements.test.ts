@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, beforeEach, vi, afterEach } from "vitest";
+import { helpersJs } from "../helpers.js";
 import { authJs } from "../auth.js";
 import { routerJs } from "../router.js";
 import { auditHtml, auditScript } from "../pages/audit.js";
@@ -40,7 +41,8 @@ async function boot(role: string): Promise<FakeFetch> {
   // The page fetches paths relative to its own origin, which a Request outside a browser refuses.
   vi.stubGlobal("fetch", (input: string, init?: RequestInit) => fake.fetch(new URL(input, location.href), init));
 
-  // Same order the page ships them in: auth defines isAdmin, the router defines registerPage.
+  // Same order the page ships them in: helpers defines esc, auth defines isAdmin, the router defines registerPage.
+  new Function(helpersJs)();
   new Function(authJs)();
   new Function(routerJs)();
   new Function(auditScript)();

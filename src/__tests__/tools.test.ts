@@ -78,6 +78,8 @@ import type * as InFlightModule from "../in-flight-work.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
 import { makeAppendLogEntry, makeMapping, makeProvider, makeRegistry, makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
+import type { SetupCheckId, SetupCheckResult } from "../setup-checks/contract.js";
+import type { SetupCheckRun } from "../setup-checks/index.js";
 import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -1076,6 +1078,111 @@ describe("migrated read handlers (AII-711)", () => {
         ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastRefresh", "materialize", "restate", "runProfile", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
+  });
+});
+
+// The breaker and the project's setup-check rows beside an issue's dispatches (AII-1546).
+describe("get_issue_dispatch_status on the real tables", () => {
+  let tools: typeof ToolsModule;
+  let log: typeof LogModule;
+  let breaker: typeof import("../dispatch-breaker.js");
+  let dedup: typeof import("../dedup.js");
+
+  beforeEach(async () => {
+    ({ tools, log, breaker, dedup } = (await testDb({ modules: {
+      tools: () => import("../restate/tools.js"),
+      log: () => import("../log.js"),
+      breaker: () => import("../dispatch-breaker.js"),
+      dedup: () => import("../dedup.js"),
+    } })).modules);
+  });
+
+  const row = (id: SetupCheckId, state: SetupCheckResult["state"], project?: string): SetupCheckResult =>
+    ({ id, title: `Title of ${id}`, group: "github", tier: "core", onAdminPath: false, state, ...(project ? { project } : {}) });
+  const STORED: SetupCheckRun = { checkedAt: 1234, results: [
+    row("github.installation", "fail", "SAN"),
+    row("github.workflow-default-branch", "fail", "OPS"),
+    row("github.app-identity", "warn"),
+    row("github.permissions", "pass", "SAN"),
+  ] };
+  async function status(identifier: string, stored: SetupCheckRun | null) {
+    const ctx = { ...fakeContext("get_issue_dispatch_status"), objectClient: () => ({ get: async () => stored }) } as unknown as restate.Context;
+    return JSON.parse((await tools.getIssueDispatchStatus(ctx, { caller: SYSTEM_ADMIN, args: { identifier } })).content[0].text);
+  }
+  const dispatchRow = (overrides: Partial<Parameters<typeof log.appendLog>[0]> = {}) =>
+    log.appendLog(makeAppendLogEntry({ issueId: "issue-7", issueIdentifier: "SAN-7", teamKey: "SAN", repo: "acme/app", ...overrides }));
+
+  it("a 404 breaker reads as a configuration problem naming the checks failing for its project, beside the project's rows needing attention", async () => {
+    dispatchRow({ status: "dispatch-failed" });
+    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: null });
+    const data = await status("SAN-7", STORED);
+    expect(data.breakers).toEqual([{
+      phase: "implementation", failures: 1, lastConclusion: "workflow_dispatch_not_found", lastFailureAt: expect.any(Number),
+      parked: false, parkedAt: null, project: "SAN", configurationProblem: true, setupChecks: ["github.installation"],
+    }]);
+    expect(data.projectSetupChecks).toEqual({ project: "SAN", checkedAt: 1234, needingAttention: [
+      { id: "github.installation", title: "Title of github.installation", state: "fail" },
+      { id: "github.app-identity", title: "Title of github.app-identity", state: "warn" },
+    ] });
+  });
+
+  it("with no stored run, names every check that can cause a 404 and no project rows", async () => {
+    dispatchRow();
+    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: null });
+    const data = await status("SAN-7", null);
+    expect(data.breakers[0].setupChecks).toEqual(["github.installation", "github.workflow-default-branch", "github.workflow-mapping-branch"]);
+    expect(data.projectSetupChecks).toBeNull();
+  });
+
+  it("a parked breaker with a conclusion no setup fault explains names no check, and the project comes from the dispatch rows", async () => {
+    dispatchRow();
+    breaker.recordDispatchFailure("issue-7", "planning", "dispatch_error", null);
+    breaker.parkIssue("issue-7", "planning", "dispatch_error", null);
+    const data = await status("SAN-7", STORED);
+    expect(data.breakers).toEqual([expect.objectContaining({ phase: "planning", parked: true, parkedAt: expect.any(Number), project: null, configurationProblem: false, setupChecks: [] })]);
+    expect(data.projectSetupChecks.project).toBe("SAN");
+  });
+
+  it("finds the breaker of an issue known only by its dedup row, and takes the project from the breaker", async () => {
+    dedup.markDispatched("issue-7", "SAN", "SAN-7", "Fix it");
+    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: null });
+    const data = await status("SAN-7", STORED);
+    expect(data.breakers).toEqual([expect.objectContaining({ project: "SAN", setupChecks: ["github.installation"] })]);
+    expect(data.projectSetupChecks.project).toBe("SAN");
+  });
+
+  // A managed refusal writes no dispatch row, and a refused dispatch's rows are pruned in time, so the breaker names the issue itself.
+  it("finds a parked issue's breaker by its identifier when no dispatch or dedup row names the issue", async () => {
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-7", "implementation", "MANAGED_REFUSED", { project: "SAN", identifier: "SAN-7" });
+    const data = await status("SAN-7", STORED);
+    expect(data.recentDispatches).toEqual([]);
+    expect(data.breakers).toEqual([expect.objectContaining({ phase: "implementation", failures: 3, parked: true, project: "SAN" })]);
+    expect(data.projectSetupChecks.project).toBe("SAN");
+  });
+
+  it("shows no breaker and no project rows for an issue it has no record of", async () => {
+    breaker.recordDispatchFailure("issue-8", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: "SAN-8" });
+    const data = await status("NONE-1", STORED);
+    expect(data.breakers).toEqual([]);
+    expect(data.projectSetupChecks).toBeNull();
+  });
+
+  it("an issue with a dispatch still going is in flight, and in the dedup window while its dedup row holds", async () => {
+    dispatchRow();
+    dedup.markDispatched("issue-7", "SAN", "SAN-7", "Fix it");
+    const data = await status("SAN-7", null);
+    expect(data).toEqual(expect.objectContaining({ identifier: "SAN-7", inFlight: true, inDedupWindow: true }));
+    expect(data.recentDispatches).toHaveLength(1);
+  });
+
+  it("each dispatch carries its failure record's message, null for one with none", async () => {
+    const failed = dispatchRow({ phase: "planning" });
+    log.updateJobFailure(failed, { category: "config", code: "PLAN_STATUS_WRITE_FAILED", stage: "planning-callback", attempt: 1, retryable: false, message: "Jira answered 400: bad option", evidence: { truncated: false } });
+    log.updateJobStatus(failed, "failed", "plan_status_write_failed");
+    log.updateJobStatus(dispatchRow({ phase: "planning", dispatchedAt: Date.now() - 1000 }), "completed");
+    const data = await status("SAN-7", null);
+    expect(data.inFlight).toBe(false);
+    expect(data.recentDispatches.map((d: { failureMessage: string | null }) => d.failureMessage)).toEqual(["Jira answered 400: bad option", null]);
   });
 });
 
@@ -2837,8 +2944,8 @@ describe("unpark_issue (AII-2018)", () => {
   afterEach(() => vi.restoreAllMocks());
 
   function park(issueId = "tracker-id", phase = "implementation") {
-    breaker.recordDispatchFailure(issueId, phase, "failure");
-    breaker.parkIssue(issueId, phase, "failure");
+    breaker.recordDispatchFailure(issueId, phase, "failure", null);
+    breaker.parkIssue(issueId, phase, "failure", null);
     breaker.claimPrBudgetNotice(issueId, phase);
     breaker.markTripNotified(issueId, phase);
   }
@@ -2883,13 +2990,13 @@ describe("unpark_issue (AII-2018)", () => {
   it("leaves nonparked rows and missing breaker rows unchanged", async () => {
     expect(parse(await call({ identifier: "CON-146" })).unparked).toBe(false);
     expect(rows()).toEqual([]);
-    breaker.recordDispatchFailure("tracker-id", "planning", "failure");
+    breaker.recordDispatchFailure("tracker-id", "planning", "failure", null);
     park("tracker-id", "implementation");
     const before = rows();
     expect(parse(await call({ identifier: "CON-146", phase: "planning" })).unparked).toBe(false);
     expect(rows()).toEqual(before);
     breaker.unpark("tracker-id");
-    breaker.recordDispatchFailure("tracker-id", "planning", "failure");
+    breaker.recordDispatchFailure("tracker-id", "planning", "failure", null);
     const nonparked = rows();
     expect(parse(await call({ identifier: "CON-146" })).unparked).toBe(false);
     expect(rows()).toEqual(nonparked);

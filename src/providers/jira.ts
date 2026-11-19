@@ -430,6 +430,19 @@ export class JiraProvider implements TicketingProvider {
   }
 
   /**
+   * A failure setter's status write. One that throws is logged and read as written, so the failure
+   * comment still posts: a failure classification always reaches the ticket. False only for a Merged issue.
+   */
+  private async setFailureStatus(issueId: string, scopeKey: string, value: string): Promise<boolean> {
+    try {
+      return await this.setStatus(issueId, scopeKey, value);
+    } catch (err) {
+      console.warn(`[jira] Could not set ${issueId} to ${value}, so its failure comment posts without it:`, err);
+      return true;
+    }
+  }
+
+  /**
    * One page of a mapping's issues for the knowledge-graph export. The cursor is Jira's
    * `nextPageToken` (null → first page). The repo-field filter runs after the search, so a
    * page can hold fewer issues, or none, while `hasNextPage` is still true; callers follow
@@ -1014,7 +1027,7 @@ export class JiraProvider implements TicketingProvider {
   async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
     // Same misleading-late-comment rule as the implementation setters: when the write
     // is refused (issue already Merged), do not post "Planning failed" over it.
-    if (!(await this.setStatus(issueId, scopeKey, STATUS_VALUES.PLANNING_FAILED))) return false;
+    if (!(await this.setFailureStatus(issueId, scopeKey, STATUS_VALUES.PLANNING_FAILED))) return false;
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
     return true;
   }
@@ -1032,7 +1045,7 @@ export class JiraProvider implements TicketingProvider {
   async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
     // Unlike markPrReady, a refused failure write keeps its report: a failure on a
     // merged issue may still describe real problems worth a human's glance.
-    if (!(await this.setStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTATION_FAILED))) {
+    if (!(await this.setFailureStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTATION_FAILED))) {
       await this.postComment(
         issueId,
         `⚠️ A run reported a failure after this issue's PR had already merged; status left at Merged. Late report: ${reason}`,

@@ -1235,6 +1235,22 @@ describe("registration hook settlement", () => {
     expect(calls).toEqual(["endpoint", "server", "hold", "prices", "sweep", "scrub", "seed", "refresh", "Fly logs", "cache", "reconciliation", "notice", "poll", "interval"]);
   });
 
+  // Boot starts its setup checks and never waits for them: the first poll runs while both are still going.
+  it("starts the setup checks right after the server and once Restate serves, and polls without waiting for them", async () => {
+    const calls: string[] = [];
+    const step = (name: string) => async () => { calls.push(name); };
+    await runMainBoot({
+      registerSignal: () => {}, startServer: () => { calls.push("server"); },
+      setupChecksBeforeRestate: () => { calls.push("checks before Restate"); },
+      setupChecksAfterServing: () => { calls.push("checks once serving"); },
+      wait: async () => { calls.push("wait"); return "serving"; },
+      isShuttingDown: () => false, shutdown: async () => {},
+      onServing: () => { calls.push("serving"); }, logFly: () => {}, refreshCache: step("cache"),
+      reconcile: step("reconciliation"), postBootNotice: () => {}, poll: step("poll"), startInterval: () => {},
+    });
+    expect(calls).toEqual(["server", "checks before Restate", "wait", "serving", "checks once serving", "cache", "reconciliation", "poll"]);
+  });
+
   it("distinguishes a thrown hook from an endpoint failure", async () => {
     const gate = createRestateRegistrationGate(() => false, {
       startRestateEndpoint: async () => {}, registerRestateEndpoint: async () => ({ outcome: "registered-no-force" }),

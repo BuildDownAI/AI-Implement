@@ -1,5 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
+import { gitHubAppErrorChecks, pointAtSetupChecks } from "./setup-checks/recheck.js";
 import { verifyRunToken } from "./runner-tokens.js";
 
 export interface HandleDependencyTokenInput {
@@ -68,7 +69,8 @@ export async function handleDependencyTokenRequest(
     );
     return { status: 200, body: { token, expires_at: expiresAt } };
   } catch (err) {
-    console.error("[dependency-token] Failed to mint installation token:", err);
+    const pointer = pointAtSetupChecks({ ids: gitHubAppErrorChecks(err), project: verified.mappingTeamKey, cause: "token-vending" });
+    console.error(`[dependency-token] Failed to mint installation token${pointer}:`, err);
     return { status: 500, body: { error: "Failed to mint token" } };
   }
 }

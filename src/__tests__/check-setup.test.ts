@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { parseEnv } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { runCheckSetup, type CheckSetupDependencies } from "../check-setup.js";
-import { SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus } from "../setup-checks/index.js";
+import { SETUP_CHECK_GROUP_LABELS, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus } from "../setup-checks/index.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 import { makeSetupCheckContext } from "./helpers/fixtures/setup-checks.js";
@@ -11,7 +11,7 @@ const REGISTERED: SetupCheckRestateStatus = { sidecar: { state: "ready" }, regis
 
 /** The orchestrator's `GET /`, answering with the Restate status given, as `src/index.ts`'s health route does. */
 function orchestratorAnswering(restate: SetupCheckRestateStatus = REGISTERED) {
-  return fakeFetch({ "GET /": { json: { status: "ok", restate } } });
+  return fakeFetch({ "GET /": { json: { status: "ok", instanceId: "the-server", restate } } });
 }
 
 /** Nothing listening on the port: `fetch` rejects as it does on a refused connection. */
@@ -28,6 +28,8 @@ function check(overrides: Partial<SetupCheck> = {}): SetupCheck {
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: () => [{ state: "pass" }],
     ...overrides,
   };
@@ -44,7 +46,7 @@ function deps(overrides: Partial<CheckSetupDependencies> = {}, context: Partial<
     checks: [check()],
     useReadOnlyDb: vi.fn(),
     configureTrackers: vi.fn(),
-    createContext: (restateStatus) => makeSetupCheckContext({ ...context, restateStatus }),
+    createContext: (own) => makeSetupCheckContext({ ...context, ...own }),
     refreshRunnerBackend: vi.fn(async () => {}),
     fetch: orchestratorAnswering().fetch,
     port: 8080,
@@ -137,7 +139,7 @@ describe("Restate's status, from the orchestrator's own health route", () => {
     const d = deps({ fetch: notAnswering, checks: [RESTATE_CHECK] });
 
     expect(await runCheckSetup([], d.deps)).toBe(0);
-    expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +The orchestrator is not answering on port 8080, so its Restate status cannot be read\./);
+    expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +The orchestrator is not answering on port 8080, so its health endpoint cannot be read\./);
   });
 
   it.each([
@@ -147,7 +149,7 @@ describe("Restate's status, from the orchestrator's own health route", () => {
     const d = deps({ fetch: fakeFetch({ "GET /": reply }).fetch, checks: [RESTATE_CHECK] });
 
     expect(await runCheckSetup([], d.deps)).toBe(0);
-    expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +Port 8080 answered without a Restate status, so it may not be this orchestrator\./);
+    expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +Port 8080 answered without the orchestrator's health response, so it may not be this orchestrator\./);
   });
 
   it("gives up on a health route that never answers after five seconds", async () => {
@@ -156,6 +158,25 @@ describe("Restate's status, from the orchestrator's own health route", () => {
 
     expect(await runCheckSetup([], d.deps)).toBe(0);
     expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +The orchestrator is not answering on port 8080/);
+  });
+});
+
+describe("the server's instance identifier, from the same health read", () => {
+  const INSTANCE_CHECK = check({ run: (ctx) => [{ state: "pass", detail: `instance ${ctx.orchestratorInstanceId()}` }] });
+
+  it("hands the checks the identifier the orchestrator's own GET / carries, not this process's own", async () => {
+    const d = deps({ checks: [INSTANCE_CHECK] });
+
+    await runCheckSetup([], d.deps);
+
+    expect(d.stdout()).toContain("instance the-server");
+  });
+
+  it("makes a check that asks for it cannot-verify, with the same reason as Restate's, when the orchestrator is not answering", async () => {
+    const d = deps({ fetch: notAnswering, checks: [INSTANCE_CHECK] });
+
+    expect(await runCheckSetup([], d.deps)).toBe(0);
+    expect(d.stdout()).toMatch(/CANNOT VERIFY +env\.github-app: .*\n +The orchestrator is not answering on port 8080, so its health endpoint cannot be read\./);
   });
 });
 
@@ -186,6 +207,35 @@ describe("the Fly sessions cache", () => {
   });
 });
 
+describe("output of rows waiting on another check", () => {
+  const waiting = { state: "cannot-verify" as const, detail: "The linear setup facts could not be read", fix: "More information is needed. Address the tracker.provider check first.", waitsOn: "tracker.provider" as const };
+  const CHECKS: SetupCheck[] = [
+    check({ id: "tracker.linear.team-access", group: "tracker", run: () => [{ ...waiting, project: "ENG" }, { ...waiting, project: "OPS" }] }),
+    check({ id: "tracker.linear.pickup-label", group: "tracker", run: () => [{ ...waiting, project: "ENG" }, { ...waiting, project: "OPS" }] }),
+    check({ id: "tracker.linear.workflow-states", group: "tracker", run: () => [{ ...waiting, project: "SAN" }] }),
+  ];
+  const linesFor = (out: string, project: string) => out.split("\n").filter((line) => line.includes(`(${project})`));
+
+  it("prints one line for each project's rows waiting on the same check, naming every check, and a lone waiting row as it is", async () => {
+    const d = deps({ checks: CHECKS });
+    await runCheckSetup([], d.deps);
+    for (const project of ["ENG", "OPS"]) {
+      const lines = linesFor(d.stdout(), project);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("tracker.linear.team-access, tracker.linear.pickup-label");
+      expect(lines[0]).toContain("tracker.provider");
+    }
+    expect(linesFor(d.stdout(), "SAN")).toEqual([expect.stringContaining("tracker.linear.workflow-states (SAN)")]);
+    expect(d.stdout().split("\n").filter((line) => line.includes("Fix: More information is needed. Address the tracker.provider check first."))).toHaveLength(3);
+  });
+
+  it("keeps every row in --json", async () => {
+    const d = deps({ checks: CHECKS });
+    await runCheckSetup(["--json"], d.deps);
+    expect(JSON.parse(d.stdout()).results).toHaveLength(5);
+  });
+});
+
 describe("output", () => {
   const CHECKS: SetupCheck[] = [
     check({ id: "env.github-app", title: "First", run: () => [{ state: "pass", detail: "Read the key" }] }),
@@ -193,21 +243,22 @@ describe("output", () => {
     check({ id: "env.admin-access-code", title: "Third", group: "tracker", run: () => [{ state: "fail", fix: "Do it." }] }),
   ];
 
-  it("prints a table grouped by check group, with each state, detail and fix, and a summary", async () => {
+  it("prints a table grouped by check group under each group's operator label, with each state, detail and fix, and a summary", async () => {
     const d = deps({ checks: CHECKS });
 
     await runCheckSetup([], d.deps);
 
+    // The labels are read from the map, so rewording one never breaks this test, while printing a raw key does.
     expect(d.stdout()).toBe(
       [
-        "orchestrator",
+        SETUP_CHECK_GROUP_LABELS.orchestrator,
         "  PASS           env.github-app: First",
         "                 Read the key",
         "  WARN           runner.fly-sessions (ENG): Second",
         "                 A detail",
         "                 Fix: A fix.",
         "",
-        "tracker",
+        SETUP_CHECK_GROUP_LABELS.tracker,
         "  FAIL           env.admin-access-code: Third",
         "                 Fix: Do it.",
         "",
@@ -234,6 +285,7 @@ describe("output", () => {
 
     expect(await runCheckSetup(["--json"], d.deps)).toBe(1);
     expect(JSON.parse(d.stdout())).toEqual({
+      startedAt: expect.any(Number),
       checkedAt: expect.any(Number),
       results: [
         { id: "env.github-app", title: "First", group: "orchestrator", tier: "core", onAdminPath: false, state: "pass", detail: "Read the key" },

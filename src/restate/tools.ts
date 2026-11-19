@@ -34,6 +34,9 @@ import {
 import { getDb } from "../dedup.js";
 import { getOrchestratorDefaults, isProjectConfigured } from "../agent-config-store.js";
 import { summarizeSetupChecks } from "../setup-checks/index.js";
+import { rowNeedsAttention } from "../setup-checks/recheck.js";
+import { breakersForIssue } from "../dispatch-breaker.js";
+import { breakerSetupChecks } from "../dispatch-failure.js";
 import { listOpenPulls } from "../open-pulls.js";
 import { listIssueStatuses } from "../issue-statuses.js";
 import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
@@ -607,7 +610,11 @@ export const listSessionMachines = tool(
 );
 
 export const GET_ISSUE_DISPATCH_STATUS_DESCRIPTION =
-  "Returns the dispatch status for a specific issue identifier (e.g. 'AII-123'): in-flight flag, dedup-window flag, and the last five dispatch log entries. Use this to diagnose why a ticket is not being picked up.";
+  "Returns the dispatch status for a specific issue identifier (e.g. 'AII-123'): in-flight flag, dedup-window flag, the last five dispatch log entries, "
+  + "the dispatch breaker for each phase (failures, last conclusion, whether it is parked, and the project), "
+  + "and the setup-check rows the last run shows needing attention for the issue's project (projectSetupChecks: each check's id, title and state). "
+  + "A breaker whose last conclusion a setup fault explains, such as a 404 from the workflow dispatch, has configurationProblem true and names its setupChecks: "
+  + "the ones failing for the project, otherwise every check that can cause it. Use this to diagnose why a ticket is not being picked up.";
 
 export const getIssueDispatchStatus = tool(
   {
@@ -615,7 +622,7 @@ export const getIssueDispatchStatus = tool(
     input: z.object({ identifier: z.string().optional() }),
     role: "user",
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     const identifier = input.args.identifier;
     if (typeof identifier !== "string" || !identifier) {
       const result = { error: "identifier is required and must be a non-empty string" };
@@ -624,10 +631,12 @@ export const getIssueDispatchStatus = tool(
     const db = getDb();
     const recentRows = db
       .prepare(
-        "SELECT id, status, dispatched_at, repo, phase, pr_url, conclusion, failure_json FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
+        "SELECT id, issue_id, team_key, status, dispatched_at, repo, phase, pr_url, conclusion, failure_json FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
       )
       .all(identifier) as Array<{
         id: number;
+        issue_id: string;
+        team_key: string | null;
         status: string | null;
         dispatched_at: number;
         repo: string | null;
@@ -639,6 +648,10 @@ export const getIssueDispatchStatus = tool(
     const dedupRow = db
       .prepare("SELECT issue_id, dispatched_at FROM dispatched WHERE issue_identifier = ?")
       .get(identifier) as { issue_id: string; dispatched_at: number } | undefined;
+    const issueIds = [...new Set([...recentRows.map((j) => j.issue_id), ...(dedupRow ? [dedupRow.issue_id] : [])])];
+    const breakerRows = breakersForIssue(identifier, issueIds);
+    const setupRun = await ctx.objectClient(SetupChecks, SETUP_CHECKS_KEY).get();
+    const project = breakerRows.find((b) => b.project)?.project ?? recentRows.find((j) => j.team_key)?.team_key ?? null;
     const inFlight = recentRows.some((j) => j.status === "dispatched" || j.status === "running");
     const latestPrUrl = recentRows.find((j) => j.pr_url)?.pr_url ?? null;
     const mergeVerdict = latestPrUrl
@@ -660,6 +673,27 @@ export const getIssueDispatchStatus = tool(
         conclusion: j.conclusion,
         failureMessage: parseFailureJson(j.failure_json)?.message ?? null,
       })),
+      breakers: breakerRows.map((b) => {
+        const setup = breakerSetupChecks(setupRun, b.lastConclusion, b.project);
+        return {
+          phase: b.phase,
+          failures: b.failures,
+          lastConclusion: b.lastConclusion,
+          lastFailureAt: b.lastFailureAt,
+          parked: b.parkedAt !== null,
+          parkedAt: b.parkedAt,
+          project: b.project,
+          configurationProblem: setup.ids.length > 0,
+          setupChecks: setup.ids,
+        };
+      }),
+      projectSetupChecks: project === null || setupRun === null ? null : {
+        project,
+        checkedAt: setupRun.checkedAt,
+        needingAttention: setupRun.results
+          .filter((row) => rowNeedsAttention(row, project))
+          .map(({ id, title, state }) => ({ id, title, state })),
+      },
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },

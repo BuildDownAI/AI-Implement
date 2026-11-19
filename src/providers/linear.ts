@@ -1054,9 +1054,18 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
-    await this.removeLabelsByName(issueId, [LINEAR_LABELS.planning.name]);
+    await this.removeFailedRunLabel(issueId, LINEAR_LABELS.planning.name);
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
     return true;
+  }
+
+  /** A failure setter's label removal. One that throws is logged, so the failure comment still posts: a failure classification always reaches the ticket. */
+  private async removeFailedRunLabel(issueId: string, name: string): Promise<void> {
+    try {
+      await this.removeLabelsByName(issueId, [name]);
+    } catch (err) {
+      console.warn(`[linear] Could not remove ${name} from ${issueId}, so its failure comment posts without it:`, err);
+    }
   }
 
   async markImplementing(issueId: string, _scopeKey: string): Promise<void> {
@@ -1132,7 +1141,7 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
-    await this.removeLabelsByName(issueId, [LINEAR_LABELS.working.name]);
+    await this.removeFailedRunLabel(issueId, LINEAR_LABELS.working.name);
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
     return true;
   }

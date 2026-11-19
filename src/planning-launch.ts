@@ -16,7 +16,9 @@ import {
   type DispatchOutcome,
 } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
-import { surfaceDispatchFailure } from "./dispatch-failure.js";
+import { dispatchFailureConclusion, surfaceDispatchFailure } from "./dispatch-failure.js";
+import type { SetupCheckId } from "./setup-checks/contract.js";
+import { pointAtSetupChecks } from "./setup-checks/recheck.js";
 import { notify } from "./notify.js";
 import { recordDispatchFailure } from "./dispatch-breaker.js";
 import { getInstallationToken, getScopedInstallationToken } from "./github-app-auth.js";
@@ -100,9 +102,11 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
       managedDecision = decision;
     } else {
       if (decision.kind === "refuse") {
-        await provider.markPlanningFailed(issue.id, issue.scopeKey, refusalText(decision));
+        // A failed write must not skip the count below, or the refusal repeats every poll without parking.
+        await provider.markPlanningFailed(issue.id, issue.scopeKey, refusalText(decision))
+          .catch((err) => console.error(`[poll] Refusal comment failed for ${issue.identifier}:`, err));
         // Neither caller counts a throw from here, so count it or the next poll re-comments every 60 s.
-        const breakerRefuse = recordDispatchFailure(issue.id, "planning", decision.code);
+        const breakerRefuse = recordDispatchFailure(issue.id, "planning", decision.code, { project: issue.scopeKey, identifier: issue.identifier });
         if (breakerRefuse.tripped && fireBreakerTrip) {
           await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", breakerRefuse.failures, decision.code);
         }
@@ -314,9 +318,10 @@ export async function launchPlanningRun(args: LaunchPlanningRunArgs): Promise<Pl
       );
     }
     // Planning never writes a dedup row (intentional), but we still count the failure.
-    const _brPlan = recordDispatchFailure(issue.id, "planning", "workflow_dispatch_failed");
+    const conclusion = dispatchFailureConclusion(result.status);
+    const _brPlan = recordDispatchFailure(issue.id, "planning", conclusion, { project: issue.scopeKey, identifier: issue.identifier });
     if (_brPlan.tripped) {
-      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", _brPlan.failures, "workflow_dispatch_failed");
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", _brPlan.failures, conclusion);
     }
     return { outcome: result.outcome === "rejected" ? "rejected" : "unknown" };
   }
@@ -406,23 +411,24 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
   const { config, provider, issue, mapping, execPath, runnerMode, resolvedPlanningBranch, planningFieldValue, reservation, deps } = args;
   const isDefinitiveLaunchFailure = execPath === "fly-machines" ? deps.isDefinitiveFlyRejectionError : deps.isDefinitiveLocalDockerLaunchFailure;
   // Bedrock is not supported on container runners.
+  const refused = (check: SetupCheckId) => pointAtSetupChecks({ ids: [check], project: issue.scopeKey, cause: "launch-refused" });
   if (mapping.provider === "bedrock") {
     console.error(
-      `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: provider=bedrock is not supported on fly-machines/local-docker`,
+      `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: provider=bedrock is not supported on fly-machines/local-docker${refused("runner.project-backend")}`,
     );
     return { outcome: "rejected", executionMode: execPath };
   }
 
   if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
     console.error(
-      `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`,
+      `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set${refused("model.credentials-adopted")}`,
     );
     return { outcome: "rejected", executionMode: execPath };
   }
 
   if (execPath === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
     console.error(
-      `[poll] Cannot dispatch planning for ${issue.identifier} via Fly Machines: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set`,
+      `[poll] Cannot dispatch planning for ${issue.identifier} via Fly Machines: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set${refused("runner.fly-sessions")}`,
     );
     return { outcome: "rejected", executionMode: execPath };
   }

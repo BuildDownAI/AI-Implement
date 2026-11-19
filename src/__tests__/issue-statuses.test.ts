@@ -117,7 +117,7 @@ describe("listIssueStatuses", () => {
     const underlying = record({ state: "implementing", phase: "implementation" });
     s.read.mockResolvedValue([underlying]);
     expect(await s.list()).toMatchObject([{ tracker: "linear", state: "implementing" }]);
-    s.breaker.parkIssue("internal", "planning", "failure");
+    s.breaker.parkIssue("internal", "planning", "failure", null);
     expect(await s.list()).toMatchObject([{ state: "failed", phase: "planning" }]);
     expect(s.breaker.unpark("internal")).toBe(true);
     expect(await s.list()).toMatchObject([{ tracker: "linear", state: "implementing", phase: "implementation" }]);

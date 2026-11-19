@@ -252,11 +252,17 @@ export const accessScript = `
         + '<td class="text-tertiary">' + window.esc(boundLabel(e)) + '</td>'
         + '<td class="text-tertiary">' + window.esc(addedLabel(e)) + '</td>'
         + '<td style="text-align:right;white-space:nowrap">'
-        + (readOnly || !hasBindings(e) ? '' : '<button class="btn btn-sm" style="margin-right:6px" data-value="' + window.escAttr(e.value) + '" onclick="clearAccessBindings(this.dataset.value)">Clear bindings</button>')
+        + (readOnly || !hasBindings(e) ? '' : '<button class="btn btn-sm access-clear-bindings" style="margin-right:6px">Clear bindings</button>')
         + (readOnly ? '' : '<button class="btn btn-sm btn-danger" onclick="removeAccessEntry(' + i + ')">Remove</button>')
         + '</td>'
         + '</tr>';
     }).join('');
+    // Each Clear bindings button clears its own row's entry, captured here rather than read back from the markup (ADR 002).
+    body.querySelectorAll('tr').forEach(function (tr, i) {
+      var button = tr.querySelector('.access-clear-bindings');
+      var value = state.draft[i].value;
+      if (button) button.addEventListener('click', function () { clearAccessBindings(value); });
+    });
   }
 
   /** Returns markup, so the call site must not escape it \u2014 values are escaped here. */
@@ -491,7 +497,6 @@ export const accessScript = `
     }
     apply(payload);
   }
-  window.clearAccessBindings = clearAccessBindings;
 
   async function loadAccess() {
     var payload;

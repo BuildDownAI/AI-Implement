@@ -25,6 +25,15 @@ describe("sidebar", () => {
     expect(Object.keys(PAGE_ROUTES)).not.toContain("kg-pipelines");
   });
 
+  // A page in neither list is missing from the grant editor, so nobody can tell whether it is grantable.
+  it.each(SIDEBAR_ROUTES)("lists %s in the grant editor: grantable, or with the reason it never is", (key) => {
+    expect(key in PAGE_ROUTES !== key in GRANT_BLOCKERS, key).toBe(true);
+  });
+
+  it("makes Setup grantable by its read route alone, so a grant never starts a run", () => {
+    expect(PAGE_ROUTES.setup).toEqual(["/api/setup-checks"]);
+  });
+
   it("includes a data-route attribute for every routable item", () => {
     const html = sidebarHtml();
     for (const key of SIDEBAR_ROUTES) {

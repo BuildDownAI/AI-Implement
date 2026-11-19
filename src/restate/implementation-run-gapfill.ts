@@ -19,6 +19,8 @@ import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill, dispatchFlyGapfill } from "../gapfill-launch.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
 import { settleLaunch, classifyLaunchError, isManagedProject, type ManagedDispatchDecision } from "../managed-dispatch-auth.js";
+import type { SetupCheckId } from "../setup-checks/contract.js";
+import { pointAtSetupChecks } from "../setup-checks/recheck.js";
 import { persistedPreparationState, releaseUnconfirmedLaunch } from "../agent-run-preparation.js";
 import { trackerAccounting } from "../job-accounting.js";
 import { mintLaunchTokens, implementationTtlSeconds } from "../runner-tokens.js";
@@ -109,7 +111,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           const [owner, repo] = gap.repository.split("/") as [string, string];
           await firePrBudgetPark({ getInstallationToken: token, postComment: postPrComment,
             listPrComments: (t, o, r, n) => listPrComments(t, o, r, n, { strict: true }),
-            postTrackerComment: async (m, id, body) => { await (await input.resolveProvider(m)).postComment(id, body); } }, mapping, run.issueId, owner, repo, gap.prNumber, gap.prDispatchBudget!);
+            postTrackerComment: async (m, id, body) => { await (await input.resolveProvider(m)).postComment(id, body); } }, mapping, run.issueId, { project: run.teamKey, identifier: run.issueIdentifier }, owner, repo, gap.prNumber, gap.prDispatchBudget!);
         }
       }
       if (result.ok) {
@@ -233,12 +235,13 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         }
         if (run.backend !== "github-actions") {
           const backendLabel = run.backend === "fly-machines" ? "Fly Machines" : "local Docker";
-          const reason = run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)
-            ? "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set"
-            : mapping.provider === "bedrock" ? "provider=bedrock not supported"
-            : !isManagedProject(run.teamKey) && !config.anthropicApiKey && !config.claudeOAuthToken ? "no API key configured" : null;
-          if (reason) {
-            console.error(`[comment-gapfill] Cannot dispatch ${run.issueIdentifier} via ${backendLabel}: ${reason}`);
+          const refusal: { reason: string; check: SetupCheckId } | null = run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)
+            ? { reason: "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set", check: "runner.fly-sessions" }
+            : mapping.provider === "bedrock" ? { reason: "provider=bedrock not supported", check: "runner.project-backend" }
+            : !isManagedProject(run.teamKey) && !config.anthropicApiKey && !config.claudeOAuthToken ? { reason: "no API key configured", check: "model.credentials-adopted" } : null;
+          if (refusal) {
+            const pointer = pointAtSetupChecks({ ids: [refusal.check], project: run.teamKey, cause: "launch-refused" });
+            console.error(`[comment-gapfill] Cannot dispatch ${run.issueIdentifier} via ${backendLabel}: ${refusal.reason}${pointer}`);
             markCommentGapfillProcessed(gap.queueItemId, "failed");
             return { outcome: "rejected" };
           }

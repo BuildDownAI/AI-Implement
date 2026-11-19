@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
-import { JiraProvider, createJiraProviderFromConfig } from "../../providers/jira.js";
+import { JiraProvider, adfToPlainText, createJiraProviderFromConfig } from "../../providers/jira.js";
 import { JiraApiError, JiraClient, type JiraIssue } from "../../providers/jira-client.js";
 import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
@@ -8,6 +8,7 @@ import { validateIssueBaseBranch } from "../../base-branch.js";
 import type { RepoMapping } from "../../config.js";
 import { makeIssue, makeMapping } from "../helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type ReplyInit, type Routes } from "../helpers/fake-fetch.js";
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
 
 // The client reaches Jira through the OAuth gateway for cloud id "c", so every request path starts here.
 const API = "/ex/jira/c/rest/api/3";
@@ -379,6 +380,24 @@ describe("JiraProvider lifecycle status setters", () => {
     expectStatusBody(fake, "Implementation Failed");
   });
 
+  // A failure classification always reaches the ticket, even when Jira refuses the status write (AII-1546).
+  it.each([
+    ["markPlanningFailed", "Planning failed"],
+    ["markImplementationFailed", "Implementation failed"],
+  ] as const)("%s still posts its failure comment when the status write is refused", async (method, phrase) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: statusRead("Implementing"),
+      [STATUS_WRITE]: jiraError(400, "Option id 'x' is not valid"),
+      [COMMENT]: commented,
+    }).install();
+    const p = makeProvider({ cacheScope: `c-refused-${method}`, mappings: { "acme/x": jiraMapping() } });
+    expect(await p[method]("10001", "acme/x", "boom")).toBe(true);
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT", "POST"]);
+    expect(commentText(fake)).toContain(`${phrase}: boom`);
+  });
+
   it("clearWorkingState resets status to Plan Approved", async () => {
     const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c7", mappings: { "acme/x": jiraMapping() } });
@@ -533,6 +552,17 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     expect(snap.readyForImplementation[0].description).toBe("desc");
     expect(snap.needsPlanning[0].nativeStatus).toBe("Ready");
     expect(snap.needsPlanning[0].scopeKey).toBe("acme/x");
+  });
+
+  it("searches with the one bucket query the setup check also runs, from the shared builder", async () => {
+    const fields = await import("../../providers/jira-fields.js");
+    const shared = vi.spyOn(fields, "buildBucketQuery").mockReturnValue("the poll's query");
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [SEARCH]: jqlSearch({ when: /^the poll's query$/ }, inFlight()) }).install();
+
+    await makeProvider({ cacheScope: "c-shared-bucket", mappings: { "acme/x": jiraMapping() } }).fetchAIImplementSnapshot();
+
+    expect(shared).toHaveBeenCalledWith(expect.any(String), "customfield_10100");
+    expect(searchBodies(fake)[0].jql).toBe("the poll's query");
   });
 
   it("references custom fields with cf[n] syntax in the JQL wrapper", async () => {
@@ -2025,9 +2055,6 @@ describe("JiraProvider.fetchSetupFacts", () => {
     expect(facts.credentials === "accepted" && Object.keys(facts.projects)).toEqual(["X"]);
   });
 });
-
-import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
-import { adfToPlainText } from "../../providers/jira.js";
 
 for (const repo of ["acme/x", { id: "option", value: "acme/x" }]) {
   runChildIssueContract(`JiraProvider Repo=${typeof repo}`, async () => {

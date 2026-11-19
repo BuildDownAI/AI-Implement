@@ -24,6 +24,7 @@ import type { ReviewFixAttemptsFacade, ReviewFixAttemptDetail } from "../../admi
 import type { SelfDeployRecord, SelfDeployStartResult, SelfDeployStatus } from "../../restate/self-deploy.js";
 import { serviceCaller, systemCaller, type Caller } from "../../mcp-identity.js";
 import * as dedup from "../../dedup.js";
+import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import { initLogTable } from "../../log.js";
 import { initMappingsTable, getMappings } from "../../config.js";
 import { initSettingsTable } from "../../runner-mode.js";
@@ -191,7 +192,14 @@ const SETUP_RUN: SetupCheckRun = {
   checkedAt: 4242,
   results: [{ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines" }],
 };
-const setupChecks = createSetupChecks({ runChecks: async () => SETUP_RUN });
+const setupChecks = createSetupChecks({
+  runChecks: async () => SETUP_RUN,
+  runChecksQuietly: async () => SETUP_RUN,
+  runProjectChecks: async () => null,
+  runOrchestratorWideChecks: async () => SETUP_RUN,
+  mappedProjects: () => [],
+  runScope: async () => null,
+});
 
 describe("orchestratorTools (Restate)", () => {
   let environments: Map<string, RestateEnvironment>;
@@ -206,6 +214,8 @@ describe("orchestratorTools (Restate)", () => {
     // get_tenant_health also reads `mappings` (getMappings) and `settings` (getRunnerMode).
     initMappingsTable();
     initSettingsTable();
+    // get_issue_dispatch_status reads the breaker for every identifier, as boot's table always allows.
+    initDispatchBreakerTable();
     // One fixture mapping for list_projects, with a non-empty extra_env the handler must drop.
     dedup.getDb().prepare(
       "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, extra_env) VALUES (?, ?, ?, ?, ?, ?)",
@@ -724,14 +734,19 @@ describe("orchestratorTools (Restate)", () => {
       });
       const shape = JSON.parse(ok?.content?.[0]?.text as string) as Record<string, unknown>;
       expect(Object.keys(shape).sort()).toEqual([
+        "breakers",
         "dedupEntry",
         "identifier",
         "inDedupWindow",
         "inFlight",
         "mergeVerdict",
+        "projectSetupChecks",
         "recentDispatches",
       ]);
       expect(shape.inFlight).toBe(false);
+      // An issue with no dispatch rows has no breaker and no project to read setup checks for.
+      expect(shape.breakers).toEqual([]);
+      expect(shape.projectSetupChecks).toBeNull();
 
       // zod rejects a number before the handler body runs: the ingress answers 4xx, which
       // callService surfaces as a thrown error carrying the status.

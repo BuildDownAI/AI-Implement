@@ -1256,78 +1256,7 @@ describe("handleMcpRequest", () => {
       expect(data[0].elapsedSeconds).toBeGreaterThanOrEqual(30);
     });
 
-    it("handles get_issue_dispatch_status for an in-flight issue", async () => {
-      const now = Date.now();
-      (dedupMock.getDb as ReturnType<typeof vi.fn>).mockReturnValue({
-        prepare: (sql: string) => {
-          if (sql.includes("dispatch_log")) {
-            return {
-              all: vi.fn(() => [{
-                id: 10, status: "running", dispatched_at: now - 5000,
-                repo: "org/repo", phase: "implementation", pr_url: null, conclusion: null,
-              }]),
-            };
-          }
-          // dispatched dedup table
-          return { get: vi.fn(() => ({ issue_id: "uuid-123", dispatched_at: now - 5000 })) };
-        },
-      });
-
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({
-          jsonrpc: "2.0", id: 5, method: "tools/call",
-          params: { name: "get_issue_dispatch_status", arguments: { identifier: "AII-99" } },
-        }),
-      );
-
-      const parsed = JSON.parse(result.body);
-      const data = JSON.parse(parsed.result.content[0].text);
-      expect(data.identifier).toBe("AII-99");
-      expect(data.inFlight).toBe(true);
-      expect(data.inDedupWindow).toBe(true);
-      expect(data.recentDispatches).toHaveLength(1);
-    });
-
-    it("get_issue_dispatch_status returns failureMessage for a failed row, null otherwise", async () => {
-      const now = Date.now();
-      const failure = {
-        category: "config", code: "PLAN_STATUS_WRITE_FAILED", stage: "planning-callback", attempt: 1,
-        retryable: false, message: "Jira answered 400: bad option", evidence: { truncated: false },
-      };
-      (dedupMock.getDb as ReturnType<typeof vi.fn>).mockReturnValue({
-        prepare: (sql: string) => {
-          if (sql.includes("dispatch_log")) {
-            const base = { dispatched_at: now, repo: "org/repo", phase: "planning", pr_url: null };
-            return {
-              all: vi.fn(() => [
-                { ...base, id: 12, status: "failed", conclusion: "plan_status_write_failed", failure_json: JSON.stringify(failure) },
-                { ...base, id: 11, status: "failed", conclusion: "x", failure_json: "{not json" },
-                { ...base, id: 10, status: "completed", conclusion: null, failure_json: null },
-              ]),
-            };
-          }
-          return { get: vi.fn(() => undefined) };
-        },
-      });
-
-      const result = await callMcp(
-        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
-        JSON.stringify({
-          jsonrpc: "2.0", id: 7, method: "tools/call",
-          params: { name: "get_issue_dispatch_status", arguments: { identifier: "AII-98" } },
-        }),
-      );
-      const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
-      expect(data.recentDispatches.map((d: { failureMessage: string | null }) => d.failureMessage)).toEqual([
-        "Jira answered 400: bad option", null, null,
-      ]);
-    });
-
+    // Through /mcp only the route is proven here; the handler's reads of real rows are tools.test.ts's.
     it("handles get_issue_dispatch_status for an unknown issue", async () => {
       (dedupMock.getDb as ReturnType<typeof vi.fn>).mockReturnValue({
         prepare: (_sql: string) => ({
