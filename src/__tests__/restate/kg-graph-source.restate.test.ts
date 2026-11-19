@@ -10,15 +10,16 @@ import {
   type KgGraphSourceToolDeps,
   STARDOG_TEST_MAX_RETRY_DURATION_MS,
 } from "../../restate/tools.js";
-import { createKgRepo } from "../../restate/kg-repo.js";
+import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   setObjectStates, VARIANTS, callService, journaledRunResult, journalEntries, journalText,
-  queryInvocations, startVariants, stopAll,
+  awaitSentInvocations, callObject, cancelInvocationIfLive, eventually, gate, queryInvocations, startVariants, stopAll,
 } from "./harness.js";
 import type { RestateEnvironment } from "./harness.js";
 import { KG_GRAPH_SOURCE_SETTING_KEY, setKgGraphSource, setStardogValues, type KgGraphSource } from "../../kg-graph-source.js";
 import { getDb } from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
+import * as restate from "@restatedev/restate-sdk";
 
 interface ToolResult {
   content?: Array<{ type: string; text: string }>;
@@ -26,8 +27,21 @@ interface ToolResult {
 }
 
 const REPO_KEY = "org/kg";
+const FIXED_SWITCH_REPO_KEY = "kg-graph-source-switch";
+const FAKE_REFRESH_NAME = "KgGraphSourceRefresh";
 const ADMIN = { kind: "system", email: null, role: "admin" } as const;
 const USER = { kind: "human", email: "user@example.com", role: "user", grants: [] } as const;
+
+const refreshRuns: string[] = [];
+const fakeKgRefresh = restate.object({
+  name: FAKE_REFRESH_NAME,
+  handlers: {
+    run: async (ctx: restate.ObjectContext, input: { triggerId: string }): Promise<void> => {
+      refreshRuns.push(input.triggerId);
+      await ctx.sleep(24 * 60 * 60 * 1000);
+    },
+  },
+});
 
 interface Fixture {
   source: KgGraphSource;
@@ -100,6 +114,19 @@ async function switchSource(env: RestateEnvironment, source: "sidecar" | "stardo
   return callService<ToolResult>(env.baseUrl(), "orchestratorTools", "set_kg_graph_source", { caller: ADMIN, args: { source } }, headers);
 }
 
+async function triggerRefresh(env: RestateEnvironment): Promise<KgRepoTriggerResult> {
+  return callObject<KgRepoTriggerResult>(env.baseUrl(), "KgRepo", REPO_KEY, "trigger", {});
+}
+
+/** An admitted trigger is exactly `{ triggerId }`; a refusal carries `status` as well. */
+function refreshAdmitted(result: KgRepoTriggerResult): boolean {
+  return !("status" in result);
+}
+
+function expectRefreshAdmitted(result: KgRepoTriggerResult): void {
+  expect(result).toEqual({ triggerId: expect.any(String) });
+}
+
 function resultBody(result: ToolResult): Record<string, unknown> {
   return JSON.parse(result.content![0]!.text) as Record<string, unknown>;
 }
@@ -114,7 +141,7 @@ describe("set_kg_graph_source (Restate)", () => {
     process.env.RUNNER_TOKEN_SECRET = "kg-graph-source-restate-test-key";
     bindRefreshDeps();
     bindFixture();
-    environments = await startVariants([orchestratorTools, createKgRepo({ workflowName: "KgRefresh" })]);
+    environments = await startVariants([orchestratorTools, createKgRepo({ workflowName: FAKE_REFRESH_NAME }), fakeKgRefresh]);
   }, 60_000);
 
   beforeEach(() => {
@@ -160,6 +187,36 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.restarts).toBe(1);
   });
 
+  it("a switch suspended on a failing Stardog test keeps the lock until it ends (alwaysReplay)", async () => {
+    const env = environments.get("alwaysReplay")!;
+    const retry = gate("the Stardog test's second attempt");
+    setKgGraphSourceToolDeps(kgGraphSourceDeps({
+      countTriples: async () => {
+        fixture.calls += 1;
+        // The first attempt fails, so the engine suspends the invocation and retries the test.
+        if (fixture.calls === 1) throw new Error("Stardog Run count query answered HTTP 503");
+        return retry.wait().then(() => 42);
+      },
+    }));
+
+    const first = switchSource(env, "stardog_run", { "idempotency-key": "switch-suspended-first" });
+    await retry.reached();
+    // The first switch is between attempts; the lock must still be its own, not released by the unwind.
+    const second = await switchSource(env, "stardog_run", { "idempotency-key": "switch-suspended-second" });
+    expect(second.isError).not.toBe(true);
+    expect(resultBody(second)).toEqual({ switched: false, error: "switch-in-flight" });
+    expect(fixture.saves).toEqual([]);
+    expect(fixture.restarts).toBe(0);
+
+    retry.release();
+    expect(resultBody(await first)).toEqual({ switched: true, source: "stardog_run", triples: 42 });
+    expect(fixture.calls).toBe(2);
+    expect(fixture.saves).toEqual(["stardog_run"]);
+    expect(fixture.restarts).toBe(1);
+    // The switch's own end frees the lock; a new refresh is admitted without waiting for `watchSwitch`.
+    expectRefreshAdmitted(await triggerRefresh(env));
+  }, 60_000);
+
   it.each(VARIANTS.map(([label]) => label))("a fake that never passes returns switched:false and runs no effect (%s)", async (label) => {
     const env = environments.get(label)!;
     fixture = newFixture({ tries: ["fail"] });
@@ -172,6 +229,154 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.restarts).toBe(0);
     expect(getDb().prepare("SELECT value FROM settings WHERE key = ?").get(KG_GRAPH_SOURCE_SETTING_KEY)).toBeUndefined();
   });
+
+  it.each(VARIANTS.map(([label]) => label))("a refresh trigger while a switch waits in its Stardog test is refused; the switch then completes (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const stardogTest = gate("Stardog test before a refresh trigger");
+    setKgGraphSourceToolDeps(kgGraphSourceDeps({
+      countTriples: async () => {
+        fixture.calls += 1;
+        return stardogTest.wait().then(() => 42);
+      },
+    }));
+
+    const switching = switchSource(env, "stardog_run", { "idempotency-key": `switch-refresh-race-${label}` });
+    await stardogTest.reached();
+    expect(await triggerRefresh(env)).toMatchObject({ status: "refresh-in-progress" });
+    expect(fixture.saves).toEqual([]);
+    expect(fixture.restarts).toBe(0);
+
+    stardogTest.release();
+    const result = await switching;
+    expect(resultBody(result)).toEqual({ switched: true, source: "stardog_run", triples: 42 });
+    expect(fixture.saves).toEqual(["stardog_run"]);
+    expect(fixture.restarts).toBe(1);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("a switch while a refresh owns the lock answers refresh-in-flight and does not save (%s)", async (label) => {
+    const env = environments.get(label)!;
+    expectRefreshAdmitted(await triggerRefresh(env));
+
+    const result = await switchSource(env, "stardog_run");
+    expect(result.isError).not.toBe(true);
+    expect(resultBody(result)).toEqual({ switched: false, error: "refresh-in-flight" });
+    expect(fixture.calls).toBe(0);
+    expect(fixture.saves).toEqual([]);
+    expect(fixture.restarts).toBe(0);
+  });
+
+  it.each(VARIANTS.flatMap(([label]) => [
+    [`${label} with a refresh rail`, label, true] as const,
+    [`${label} with no refresh rail`, label, false] as const,
+  ]))("two switches with different keys: the second answers switch-in-flight and only one restart runs (%s)", async (_description, label, bindRefresh) => {
+    const env = environments.get(label)!;
+    if (!bindRefresh) setKgRefreshToolDeps(null);
+    try {
+      const stardogTest = gate(`first switch (${bindRefresh ? "configured" : "fixed"} lock)`);
+      setKgGraphSourceToolDeps(kgGraphSourceDeps({
+        countTriples: async () => {
+          fixture.calls += 1;
+          return stardogTest.wait().then(() => 42);
+        },
+      }));
+
+      const first = switchSource(env, "stardog_run", { "idempotency-key": `switch-a-${label}-${bindRefresh}` });
+      await stardogTest.reached();
+      const second = await switchSource(env, "stardog_run", { "idempotency-key": `switch-b-${label}-${bindRefresh}` });
+      expect(second.isError).not.toBe(true);
+      expect(resultBody(second)).toEqual({ switched: false, error: "switch-in-flight" });
+      expect(fixture.restarts).toBe(0);
+
+      stardogTest.release();
+      expect(resultBody(await first)).toEqual({ switched: true, source: "stardog_run", triples: 42 });
+      expect(fixture.calls).toBe(1);
+      expect(fixture.saves).toEqual(["stardog_run"]);
+      expect(fixture.restarts).toBe(1);
+    } finally {
+      bindRefreshDeps();
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("a new refresh is admitted after a failed Stardog test (%s)", async (label) => {
+    const env = environments.get(label)!;
+    fixture = newFixture({ tries: ["fail"] });
+    const result = await switchSource(env, "stardog_run");
+    expect(resultBody(result).switched).toBe(false);
+    expect(fixture.saves).toEqual([]);
+
+    expectRefreshAdmitted(await triggerRefresh(env));
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("a new refresh is admitted after a failed restart (%s)", async (label) => {
+    const env = environments.get(label)!;
+    fixture = newFixture({ sidecarPresent: false });
+    const result = await switchSource(env, "stardog_run");
+    expect(resultBody(result)).toMatchObject({ switched: false, error: "sidecar-restart-failed" });
+    expect(fixture.saves).toEqual(["stardog_run"]);
+    expect(fixture.restarts).toBe(1);
+
+    expectRefreshAdmitted(await triggerRefresh(env));
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("a cancelled switch releases the lock, so a new refresh is admitted (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const stardogTest = gate("Stardog test cancelled before release");
+    setKgGraphSourceToolDeps(kgGraphSourceDeps({
+      countTriples: async () => {
+        fixture.calls += 1;
+        return stardogTest.wait().then(() => 42);
+      },
+    }));
+
+    // `watchSwitch` is sent by the switch's `acquireSwitch` call, so identify this test's watcher
+    // as the one row that did not exist before the switch.
+    const knownWatches = new Set((await queryInvocations(
+      env.adminAPIBaseUrl(),
+      `target_service_name = 'KgRepo' AND target_service_key = '${REPO_KEY}' AND target_handler_name = 'watchSwitch'`,
+    )).map((row) => String(row.id)));
+
+    // The ingress call may never return after a cancel in the replay variant: the release is proved
+    // by admission, not by the canceled caller's response.
+    void switchSource(env, "stardog_run", { "idempotency-key": `switch-cancelled-${label}` }).catch(() => undefined);
+    await stardogTest.reached();
+    const rows = await eventually(
+      () => queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'set_kg_graph_source' ORDER BY created_at DESC LIMIT 1"),
+      (found) => found.length === 1,
+      { label: "the switch invocation row" },
+    );
+    const switchId = String(rows[0]!.id);
+    await cancelInvocationIfLive(env.adminAPIBaseUrl(), switchId);
+
+    // A Restate cancel does not interrupt a running `ctx.run`: the switch sees it at its next
+    // await. Let the gated step end, then the switch's finally and its `watchSwitch` release.
+    stardogTest.release();
+    // Wait for the watcher's own release send before proving admission: a barrier call to `KgRepo`
+    // does not order a send made by another invocation.
+    const watchId = await eventually(
+      async () => (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${REPO_KEY}' AND target_handler_name = 'watchSwitch'`,
+      )).find((row) => !knownWatches.has(String(row.id)))?.id,
+      (id) => id !== undefined,
+      { label: "the switch watcher invocation", timeoutMs: 30_000 },
+    );
+    await awaitSentInvocations(
+      env.adminAPIBaseUrl(),
+      env.baseUrl(),
+      { service: "KgRepo", key: REPO_KEY, handler: "releaseSwitch" },
+      `invoked_by_id = '${String(watchId)}'`,
+    );
+
+    // The finally's release, or watchSwitch, must free the lock; a refusal here is not
+    // admission, so the predicate rejects every `{ status, triggerId }` shape.
+    expectRefreshAdmitted(await eventually(
+      () => triggerRefresh(env),
+      refreshAdmitted,
+      { label: "a refresh admitted after the switch is cancelled", timeoutMs: 30_000 },
+    ));
+    expect(fixture.saves).toEqual([]);
+    expect(fixture.restarts).toBe(0);
+  }, 60_000);
 
   it.each(VARIANTS.map(([label]) => label))("a sidecar switch saves and restarts with no test (%s)", async (label) => {
     const env = environments.get(label)!;
@@ -261,9 +466,8 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.restarts).toBe(0);
   });
 
-  it.each(VARIANTS.map(([label]) => label))("switches with no refresh configured, skipping the admission read (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("switches with no refresh configured, using the fixed switch lock (%s)", async (label) => {
     const env = environments.get(label)!;
-    // The KgRepo object still has no marker: the point is that the tool never reads it.
     setKgRefreshToolDeps(null);
     try {
       const result = await switchSource(env, "stardog_run");
@@ -271,6 +475,7 @@ describe("set_kg_graph_source (Restate)", () => {
       expect(fixture.calls).toBe(1);
       expect(fixture.saves).toEqual(["stardog_run"]);
       expect(fixture.restarts).toBe(1);
+      expect(await callObject<unknown>(env.baseUrl(), "KgRepo", FIXED_SWITCH_REPO_KEY, "status", {})).toBeNull();
     } finally {
       bindRefreshDeps();
     }

@@ -655,6 +655,72 @@ describe("restart()", () => {
       await sidecar.stop();
     }
   });
+
+  it("two concurrent restarts spawn children one at a time, and only one child is live at the end", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const spawns: Array<{ pid?: number; liveAtSpawn: number }> = [];
+    let live = 0;
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      {
+        httpGet: async () => true,
+        spawn: (cmd, args, opts) => {
+          const child = testSpawn(cmd, args, opts);
+          live += 1;
+          spawns.push({ pid: child.pid, liveAtSpawn: live });
+          child.once("close", () => { live -= 1; });
+          return child;
+        },
+      },
+    );
+    await sidecar.start();
+
+    try {
+      const firstPid = spawns[0]?.pid;
+      const [first, second] = [sidecar.restart(), sidecar.restart()];
+      await Promise.all([first, second]);
+
+      // Each restart ran, in order, and the second one's spawn happened only after the first child closed.
+      expect(spawns).toHaveLength(3);
+      expect(spawns.map((s) => s.liveAtSpawn)).toEqual([1, 1, 1]);
+      expect(spawns[1]?.pid).not.toBe(firstPid);
+      expect(spawns[2]?.pid).not.toBe(spawns[1]?.pid);
+      expect(live).toBe(1);
+      expect(() => process.kill(spawns[1]!.pid!, 0)).toThrow();
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("a rejected restart does not poison the chain", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    let calls = 0;
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      {
+        httpGet: async () => true,
+        spawn: (cmd, args, opts) => {
+          calls += 1;
+          if (calls === 2) throw new Error("spawn failed");
+          return testSpawn(cmd, args, opts);
+        },
+      },
+    );
+    await sidecar.start();
+    try {
+      await expect(sidecar.restart()).rejects.toThrow("spawn failed");
+      await expect(sidecar.restart()).resolves.toBeUndefined();
+      expect(calls).toBe(3);
+    } finally {
+      await sidecar.stop();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -872,5 +938,28 @@ describe("stored graph configuration", () => {
     expect(spawn).not.toHaveBeenCalled();
     expect(httpGet).not.toHaveBeenCalled();
     expect(process.env.KG_SIDECAR_URL).toBeUndefined();
+  });
+
+  it("getServedNamespace reads the stored namespace for a remote store, ignoring KG_NAMESPACE and sources.yml", async () => {
+    const { modules: { kg, sidecar: module } } = await storedFixture();
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "namespace: https://baked.example/\n");
+    kg.setKgGraphSource("stardog_run");
+    kg.setStardogValues({ db: "stored-db", namespace: "https://stored.example/", token: "stored-token" });
+    vi.stubEnv("KG_NAMESPACE", "https://environment.example/");
+    expect(await module.getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://stored.example/");
+
+    vi.stubEnv("KG_NAMESPACE", "");
+    expect(await module.getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://stored.example/");
+  });
+
+  it("getServedNamespace reads the stored namespace on a base-only image with no sources.yml and no KG_NAMESPACE", async () => {
+    const { modules: { kg, sidecar: module } } = await storedFixture();
+    const kgDir = makeKgDir();
+    touch(join(kgDir, ".base-only"));
+    kg.setStardogValues({ db: "stored-db", namespace: "https://stored.example/", token: "stored-token" });
+    vi.stubEnv("KG_NAMESPACE", undefined);
+    expect(module.isRemoteKgStore({}, kgDir)).toBe(true);
+    expect(await module.getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://stored.example/");
   });
 });

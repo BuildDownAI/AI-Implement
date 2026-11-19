@@ -124,7 +124,7 @@ interface RunCall {
 
 function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Context {
   return {
-    request: () => ({ target: { handler: handlerName } }),
+    request: () => ({ id: "inv-test", target: { handler: handlerName } }),
     // get_tenant_health reads the stored setup-check run, and none has run yet; every other object client is ModelPrices.
     objectClient: (definition: { name: string }) => (definition.name === "SetupChecks" ? { get: async () => null } : { current: async () => ({ prices: [] }) }),
     run: async (name: unknown, action?: unknown, options?: unknown) => {
@@ -2802,7 +2802,10 @@ describe("set_kg_graph_source (AII-1974)", () => {
     });
     const ctx = {
       ...fakeContext("set_kg_graph_source", opts.runCalls ?? []),
-      objectClient: () => ({ status: async () => opts.status ?? null }),
+      objectClient: () => ({
+        acquireSwitch: async () => opts.status ? { status: "refresh-in-flight" } : { acquired: true },
+        releaseSwitch: async () => {},
+      }),
     } as unknown as restate.Context;
     return { ctx, restarts, logs };
   }
@@ -2853,7 +2856,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
     const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "sidecar" } });
     expect(parse(result)).toEqual({ switched: true, source: "sidecar" });
     expect(countTriples).not.toHaveBeenCalled();
-    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "save", "restart"]);
+    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "save", "restart", "log-source"]);
     expect(restarts).toEqual(["restart"]);
   });
 
@@ -2862,7 +2865,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
     const { ctx, restarts } = stage({ runCalls, sidecarGraphPresent: false });
     const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "sidecar" } });
     expect(parse(result)).toEqual({ switched: false, error: "no-sidecar-graph" });
-    expect(runCalls.map((c) => c.name)).toEqual(["read-source"]);
+    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "log-source"]);
     expect(restarts).toEqual([]);
   });
 
@@ -2871,7 +2874,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
     const { ctx, restarts } = stage({ runCalls, status: { triggerId: "t1", startedAt: 1, pending: [], held: null } });
     const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
     expect(parse(result)).toEqual({ switched: false, error: "refresh-in-flight" });
-    expect(runCalls.map((c) => c.name)).toEqual(["read-source"]);
+    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "log-source"]);
     expect(restarts).toEqual([]);
   });
 
@@ -2895,13 +2898,16 @@ describe("set_kg_graph_source (AII-1974)", () => {
       testPauseMs: 0,
       log: (from, to, ok) => { logs.push(`[kg] graph source ${from} -> ${to}: ${ok ? "ok" : "failed"}`); },
     });
-    const ctx = { ...fakeContext("set_kg_graph_source", runCalls), objectClient: () => ({ status: async () => null }) } as unknown as restate.Context;
+    const ctx = {
+      ...fakeContext("set_kg_graph_source", runCalls),
+      objectClient: () => ({ acquireSwitch: async () => ({ acquired: true }), releaseSwitch: async () => {} }),
+    } as unknown as restate.Context;
     const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
     expect(parse(result)).toMatchObject({ switched: false, error: "sidecar-restart-failed" });
     expect(parse(result).message).toContain("source row was already saved");
     expect(result.isError).not.toBe(true);
     // The save ran before the restart failed; only the restart step's logged result is absent.
-    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "stardog-test", "save"]);
+    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "stardog-test", "save", "log-source"]);
     expect(logs).toEqual(["[kg] graph source sidecar -> stardog_run: failed"]);
   });
 
@@ -2914,7 +2920,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
     const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
     expect(parse(result)).toEqual({ switched: false, error: "Stardog Run count query answered HTTP 503" });
     // The fake records a step only after it resolves, so the failed `stardog-test` is absent.
-    expect(runCalls.map((c) => c.name)).toEqual(["read-source"]);
+    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "log-source"]);
     expect(runCalls.some((c) => c.name === "save" || c.name === "restart")).toBe(false);
     expect(restarts).toEqual([]);
   });
