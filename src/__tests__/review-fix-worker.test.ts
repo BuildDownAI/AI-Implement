@@ -8,7 +8,7 @@
  *
  * This file is type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  */
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, onTestFinished, vi } from "vitest";
 import path from "node:path";
 import fs from "node:fs";
 import type * as ConfigModule from "../config.js";
@@ -21,6 +21,7 @@ import { makeMapping, makeScopedPrIdentity } from "./helpers/builders.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 
 let config: typeof ConfigModule;
 let workerModule: typeof WorkerModule;
@@ -474,6 +475,30 @@ describe("GithubReviewFixWorker.launch", () => {
     const outcome = await worker.launch(plan);
 
     expect(outcome).toEqual({ status: "rejected", reason: "Unprocessable Entity" });
+  });
+
+  it.each([
+    [404, ["github.installation", "github.workflow-default-branch", "github.workflow-mapping-branch"], "dispatch-404"],
+    [403, ["github.permissions"], "dispatch-refused"],
+    [422, [], undefined],
+  ] as const)("logs a %d refusal by status alone, naming the checks behind it for the project and asking for each to run again", async (status, ids, cause) => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: false, status, error: "echo of the request", outcome: "rejected" }));
+    const send = await recordRechecks();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // This file restores no spies between tests.
+    onTestFinished(() => warn.mockRestore());
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.launch(await worker.prepare(makeAttempt()));
+
+    const line = warn.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith("[review-fix] GitHub refused the dispatch"));
+    expect(line).toContain(`HTTP ${status}`);
+    expect(line).not.toContain("echo of the request");
+    for (const id of ids) expect(line).toContain(id);
+    expect(send.mock.calls).toEqual(ids.map((id) => [{ id, project: "AII", cause }]));
   });
 
   it("returns unknown when the credential's installation does not match the attempt's scope", async () => {
