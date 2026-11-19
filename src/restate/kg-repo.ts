@@ -62,14 +62,6 @@ interface PendingDryRun {
   enqueuedAt: number;
 }
 
-/** One source switch that holds the graph-source reservation through its save and restart. */
-interface SourceSwitchMarker {
-  switchId: string;
-  /** The switch invocation whose lifetime owns this reservation. Absent on markers written before invocation-lifetime ownership. */
-  invocationId?: string;
-  startedAt: number;
-}
-
 export interface KgRepoDependencies {
   /** The Restate service name of the workflow this object starts — "KgRefresh" in production. */
   workflowName: string;
@@ -81,9 +73,6 @@ export type KgRepoTriggerResult = { triggerId: string } | { status: "refresh-in-
 export type KgRepoDecideResult = { triggerId: string } | null;
 
 export type KgRepoEnqueueResult = { triggerId: string } | { queued: true } | { duplicate: true } | { closed: true };
-
-/** `claimSourceSwitch`'s answer: the reservation is this switch's, or the switch already holding it. */
-export type KgRepoSourceSwitchResult = { claimed: true } | { claimed: false; switchId: string };
 
 const triggerInputSchema = kgRefreshOptionsSchema.optional();
 
@@ -102,9 +91,6 @@ const recordOutcomeInputSchema = z.object({
 }).strict();
 
 const leaseInputSchema = z.object({ triggerId: z.string().min(1) }).strict();
-
-const sourceSwitchSwitchSchema = z.object({ switchId: z.string().min(1) }).strict();
-const sourceSwitchWatchSchema = z.object({ switchId: z.string().min(1), invocationId: z.string().min(1) }).strict();
 
 /** `release`'s input. `ended` is how the run ended, from `watch` (AII-1493); the run's own `finally` sends none, which reads as `returned`. */
 const releaseInputSchema = z.object({
@@ -130,8 +116,6 @@ export type KgRepoTriggerInput = z.infer<typeof kgRefreshOptionsSchema>;
 export type KgRepoPrInput = z.infer<typeof prInputSchema>;
 export type KgRepoRecordOutcomeInput = { report: KgDryRunReportTarget; outcome: RefreshOutcome };
 export type KgRepoEnqueueInput = z.infer<typeof enqueueInputSchema> & { report: KgDryRunReportTarget };
-export type KgRepoSourceSwitchInput = z.infer<typeof sourceSwitchSwitchSchema>;
-export type KgRepoSourceSwitchWatchInput = z.infer<typeof sourceSwitchWatchSchema>;
 
 const outcomeStateKey = (repo: string, prNumber: number): string => `outcome:${repo}#${prNumber}`;
 const closedKey = (repo: string, prNumber: number): string => `${repo}#${prNumber}`;
@@ -160,20 +144,6 @@ export function createKgRepo(deps: KgRepoDependencies) {
     return (await ctx.get<InFlightMarker>("inFlight")) ?? null;
   }
 
-  /**
-   * The live source-switch reservation, or null. Its owner's `watchSourceSwitch` clears it when
-   * the switch invocation ends. A marker from the age-expiry revision has no invocation id and no
-   * watcher, so it is abandoned here rather than holding the lock forever.
-   */
-  async function liveSourceSwitch(ctx: ObjectContext): Promise<SourceSwitchMarker | null> {
-    const marker = await ctx.get<SourceSwitchMarker>("sourceSwitch");
-    if (marker && marker.invocationId === undefined) {
-      ctx.clear("sourceSwitch");
-      return null;
-    }
-    return marker ?? null;
-  }
-
   /** Marks a new refresh in flight, hands it to `KgRefresh.run` by one-way send, and starts the `watch` that frees the lock when the run invocation ends. */
   async function submit(ctx: ObjectContext, now: number, opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget }, resume?: KgRefreshResume): Promise<string> {
     const triggerId = ctx.rand.uuidv4();
@@ -188,10 +158,6 @@ export function createKgRepo(deps: KgRepoDependencies) {
     const now = await ctx.date.now();
     const live = await liveInFlight(ctx);
     if (live) return { status: "refresh-in-progress", triggerId: live.triggerId };
-    // A source switch holds these tools to the source it is about to serve: refuse rather than
-    // race the switch's save/restart. The switch's reservation is the marker name, so the tool
-    // can distinguish this refusal from a real run in flight.
-    if (await liveSourceSwitch(ctx)) return { status: "refresh-in-progress", triggerId: "kg-graph-source-switch" };
     return { triggerId: await submit(ctx, now, opts) };
   }
 
@@ -208,8 +174,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
     ctx.set(shaKey, report.sha);
     const now = await ctx.date.now();
     const live = await liveInFlight(ctx);
-    const switching = await liveSourceSwitch(ctx);
-    if (!live && !switching) return { triggerId: await submit(ctx, now, { dryRun: true, kgSourceRef: ref, report }) };
+    if (!live) return { triggerId: await submit(ctx, now, { dryRun: true, kgSourceRef: ref, report }) };
 
     const pending = (await ctx.get<Record<string, PendingDryRun>>("pending")) ?? {};
     // A newer head for the same PR replaces the held one and takes the back of the line.
@@ -226,46 +191,14 @@ export function createKgRepo(deps: KgRepoDependencies) {
     return { queued: true };
   }
 
-  /**
-   * Reserves the refresh lock for a source switch. The switch claims before its Stardog test and
-   * releases after its save and restart, so a refresh admitted mid-test is refused rather than
-   * racing the restart. The reservation lives until the owning invocation ends, not until a clock
-   * expires: `watchSourceSwitch` attaches to that invocation and sends `releaseSourceSwitch` on
-   * completion or termination. The reservation is exclusive with `trigger` and `enqueueDryRun`
-   * because all three are exclusive handlers on this object; the claim sees a live marker and
-   * answers the holder.
-   */
-  async function claimSourceSwitch(ctx: ObjectContext, input: KgRepoSourceSwitchInput): Promise<KgRepoSourceSwitchResult> {
-    const live = await liveInFlight(ctx);
-    if (live) return { claimed: false, switchId: live.triggerId };
-    const now = await ctx.date.now();
-    const current = await liveSourceSwitch(ctx);
-    if (current) {
-      if (current.switchId !== input.switchId) return { claimed: false, switchId: current.switchId };
-      // The same invocation resumed after a suspension: its watch is already attached.
-      if (current.invocationId === input.switchId) return { claimed: true };
-    }
-    ctx.set<SourceSwitchMarker>("sourceSwitch", { switchId: input.switchId, invocationId: input.switchId, startedAt: now });
-    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).watchSourceSwitch({
-      switchId: input.switchId,
-      invocationId: input.switchId,
-    });
-    return { claimed: true };
-  }
+  /** Clears the marker when it belongs to `triggerId`, then submits the oldest held dry-run. Returns whether it cleared. */
+  async function clearAndDrain(ctx: ObjectContext, triggerId: string | undefined): Promise<boolean> {
+    const inFlight = await ctx.get<InFlightMarker>("inFlight");
+    if (!inFlight || inFlight.triggerId !== triggerId) return false;
+    // A held snapshot keeps the lock after its gate run ends; only `decide` hands it on.
+    if ((await ctx.get<KgHold>("held"))?.triggerId === triggerId) return false;
+    ctx.clear("inFlight");
 
-  /** Clears only this switch's reservation; a delayed release cannot drop a newer switch's. */
-  async function releaseSourceSwitch(ctx: ObjectContext, input: KgRepoSourceSwitchInput): Promise<{ released: boolean }> {
-    const current = await ctx.get<SourceSwitchMarker>("sourceSwitch");
-    if (current?.switchId !== input.switchId) return { released: false };
-    ctx.clear("sourceSwitch");
-    // A PR-check dry run received during the switch was queued, not dropped. It starts now
-    // unless a refresh holds the lock; `trigger`/`enqueueDryRun` refuse while a switch is live.
-    if ((await liveInFlight(ctx)) === null) await drainOldestPending(ctx);
-    return { released: true };
-  }
-
-  /** Submits the oldest queued PR-check dry run when the lock is free. */
-  async function drainOldestPending(ctx: ObjectContext): Promise<boolean> {
     const pending = await ctx.get<Record<string, PendingDryRun>>("pending");
     const headKey = pending ? oldestPendingKey(pending) : undefined;
     if (!pending || headKey === undefined) return true;
@@ -274,17 +207,6 @@ export function createKgRepo(deps: KgRepoDependencies) {
     if (Object.keys(pending).length === 0) ctx.clear("pending");
     else ctx.set("pending", pending);
     await submit(ctx, await ctx.date.now(), { dryRun: true, kgSourceRef: ref, report });
-    return true;
-  }
-
-  /** Clears the marker when it belongs to `triggerId`, then submits the oldest held dry-run. Returns whether it cleared. */
-  async function clearAndDrain(ctx: ObjectContext, triggerId: string | undefined): Promise<boolean> {
-    const inFlight = await ctx.get<InFlightMarker>("inFlight");
-    if (!inFlight || inFlight.triggerId !== triggerId) return false;
-    // A held snapshot keeps the lock after its gate run ends; only `decide` hands it on.
-    if ((await ctx.get<KgHold>("held"))?.triggerId === triggerId) return false;
-    ctx.clear("inFlight");
-    await drainOldestPending(ctx);
     return true;
   }
 
@@ -398,22 +320,6 @@ export function createKgRepo(deps: KgRepoDependencies) {
     ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).release({ triggerId: input.triggerId, ended });
   }
 
-  /**
-   * Waits for the source-switch invocation to end and releases its reservation. Shared, so it
-   * never blocks the object's exclusive handlers while it is suspended. A returned, failed,
-   * killed or cancelled switch all end the invocation; every attach error means the reservation
-   * is no longer protected, so `releaseSourceSwitch` runs either way. That release also drains a
-   * PR-check dry run queued while the switch held the lock.
-   */
-  async function watchSourceSwitch(ctx: ObjectSharedContext, input: KgRepoSourceSwitchWatchInput): Promise<void> {
-    try {
-      await ctx.invocation(input.invocationId as InvocationId).attach();
-    } catch (err) {
-      if (restate.internal.isSuspendedError(err)) throw err;
-    }
-    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).releaseSourceSwitch({ switchId: input.switchId });
-  }
-
   /** Clears a legacy marker (no `invocationId`) that never released. A marker with an `invocationId` is held by its run, never by a clock. */
   async function expire(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
     const inFlight = await liveInFlight(ctx);
@@ -474,12 +380,9 @@ export function createKgRepo(deps: KgRepoDependencies) {
       release: restate.handlers.object.exclusive({ input: serde.zod(releaseInputSchema), ingressPrivate: true }, release),
       expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, expire),
       watch: restate.handlers.object.shared({ input: serde.zod(watchInputSchema), ingressPrivate: true, explicitCancellation: true }, watch),
-      watchSourceSwitch: restate.handlers.object.shared({ input: serde.zod(sourceSwitchWatchSchema), ingressPrivate: true, explicitCancellation: true }, watchSourceSwitch),
       recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema), ingressPrivate: true }, recordDryRunOutcome),
       recordAdminDryRun: restate.handlers.object.exclusive({ ingressPrivate: true }, recordAdminDryRun),
       forgetPr: restate.handlers.object.exclusive({ input: serde.zod(prInputSchema) }, forgetPr),
-      claimSourceSwitch: restate.handlers.object.exclusive({ input: serde.zod(sourceSwitchSwitchSchema), ingressPrivate: true }, claimSourceSwitch),
-      releaseSourceSwitch: restate.handlers.object.exclusive({ input: serde.zod(sourceSwitchSwitchSchema), ingressPrivate: true }, releaseSourceSwitch),
       status: restate.handlers.object.shared(status),
     },
   });

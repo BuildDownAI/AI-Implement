@@ -112,7 +112,6 @@ export class KgSidecar {
   private readonly _spawn: (cmd: string, args: string[], opts: object) => ChildProcess;
   private _child: ChildProcess | null = null;
   private _stopPromise: Promise<void> | null = null;
-  private _restartPromise: Promise<void> | null = null;
 
   constructor(opts?: KgSidecarOptions, _deps?: KgSidecarDeps) {
     this._kgDir = opts?.kgDir ?? KG_DIR;
@@ -197,20 +196,10 @@ export class KgSidecar {
     return this._stopPromise;
   }
 
-  /**
-   * Stops then starts the sidecar; used by the graph-refresh trigger (AII-426) and the
-   * graph-source switch (AII-2031). Re-entrant: concurrent calls share one stop/start
-   * cycle, so two callers can never both spawn a child and orphan one.
-   */
-  restart(): Promise<void> {
-    if (this._restartPromise !== null) return this._restartPromise;
-    this._restartPromise = (async () => {
-      await this.stop();
-      await this.start();
-    })().finally(() => {
-      this._restartPromise = null;
-    });
-    return this._restartPromise;
+  /** Stops then starts the sidecar; used by the graph-refresh trigger (AII-426). */
+  async restart(): Promise<void> {
+    await this.stop();
+    await this.start();
   }
 
   private _findEntryPoint(): EntryPoint | null {

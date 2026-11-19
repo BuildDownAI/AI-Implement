@@ -12,14 +12,6 @@ No key value belongs in an object input, result, state, log or error. The admin 
 writes the secret locally; it sends only the destination through Restate ingress, whose
 request and response bodies are journaled.
 
-The Stardog Run token is the one non-model-account reference accepted by
-`model_protected_secrets`: `kg-store:stardog-run-token`. It is written by
-`POST /api/kg/stardog` and read only to build the KG sidecar's child environment; the admin
-page shows `tokenSet`, never the value. It has no model account or destination binding, so
-the `KeyBinding` rules above do not apply to it. The reference constant lives in
-`src/kg-secret-refs.ts`, shared by the reader/writer and the validator, and the token's
-behavior is documented further in [kg-sidecar.md](kg-sidecar.md).
-
 ## Storage and handlers
 
 `src/key-bindings.ts` provides the schema initializer and synchronous reader.

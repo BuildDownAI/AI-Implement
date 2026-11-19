@@ -1,13 +1,12 @@
 /** Persisted KG configuration. Startup/seeding and UI callers are added separately. */
 import { getDb } from "./dedup.js";
 import { createModelProtectedSecrets } from "./model-protected-secrets.js";
-import { STARDOG_RUN_TOKEN_REF } from "./kg-secret-refs.js";
 
 export const KG_GRAPH_SOURCE_SETTING_KEY = "kg_graph_source";
 export const KG_NAMESPACE_SETTING_KEY = "kg_namespace";
 export const KG_GRAPH_NAME_SETTING_KEY = "kg_graph_name";
 export const KG_STARDOG_RUN_TOKEN_HANDLED_SETTING_KEY = "kg_stardog_run_token_handled";
-export { STARDOG_RUN_TOKEN_REF };
+export const STARDOG_RUN_TOKEN_REF = "kg-store:stardog-run-token";
 export const DEFAULT_STARDOG_RUN_PLATFORM = "https://app.stardog.run";
 export type KgGraphSource = "sidecar" | "stardog_run";
 

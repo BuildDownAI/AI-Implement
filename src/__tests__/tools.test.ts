@@ -47,7 +47,6 @@ import {
   setReviewFixAttemptsFacade,
   setKgGraphSourceToolDeps,
   setKgGraphSourceTool,
-  switchKgGraphSource,
   STARDOG_TEST_PAUSE_MS,
 } from "../restate/tools.js";
 import { KG_REFRESH_RUNNER_STEPS } from "../restate/kg-refresh-types.js";
@@ -2767,6 +2766,7 @@ describe("model administration acceptance through shared actions", () => {
 });
 
 describe("set_kg_graph_source (AII-1974)", () => {
+  const admin: Caller = { kind: "human", email: "admin@example.com", role: "admin", grants: [] };
   const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
 
   beforeEach(() => {
@@ -2784,7 +2784,6 @@ describe("set_kg_graph_source (AII-1974)", () => {
   function stage(opts: {
     runCalls?: RunCall[];
     status?: unknown;
-    statuses?: unknown[];
     countTriples?: () => Promise<number>;
     sidecarGraphPresent?: boolean;
     testPauseMs?: number;
@@ -2792,8 +2791,6 @@ describe("set_kg_graph_source (AII-1974)", () => {
   } = {}) {
     const restarts: string[] = [];
     const logs: string[] = [];
-    const claims: string[] = [];
-    const statuses = [...(opts.statuses ?? [])];
     setKgGraphSourceToolDeps({
       countTriples: opts.countTriples ?? (async () => 7),
       saveGraphSource: () => {},
@@ -2805,21 +2802,10 @@ describe("set_kg_graph_source (AII-1974)", () => {
     });
     const ctx = {
       ...fakeContext("set_kg_graph_source", opts.runCalls ?? []),
-      request: () => ({ id: "switch-invocation-1", target: { handler: "set_kg_graph_source" } }),
-      objectClient: () => ({
-        status: async () => statuses.length > 0 ? statuses.shift() : opts.status ?? null,
-        claimSourceSwitch: async () => {
-          claims.push("claim");
-          return { claimed: true };
-        },
-        releaseSourceSwitch: async () => { claims.push("release"); return { released: true }; },
-      }),
+      objectClient: () => ({ status: async () => opts.status ?? null }),
     } as unknown as restate.Context;
-    return { ctx, restarts, logs, claims };
+    return { ctx, restarts, logs };
   }
-
-  const callSwitch = (ctx: restate.Context, source: "sidecar" | "stardog_run") =>
-    switchKgGraphSource(ctx as unknown as restate.ObjectContext, { source });
 
   afterEach(() => {
     setKgGraphSourceToolDeps(null);
@@ -2830,7 +2816,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
   it("keeps the production pause at 15 s, not the SDK's 10 s cap", async () => {
     const runCalls: RunCall[] = [];
     const { ctx } = stage({ runCalls });
-    await callSwitch(ctx, "stardog_run");
+    await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
     const test = runCalls.find((c) => c.name === "stardog-test");
     expect(test?.options).toMatchObject({
       maxRetryDuration: 6 * 60_000,
@@ -2848,7 +2834,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
     getDb().prepare("DELETE FROM settings WHERE key = 'kg_graph_source'").run();
     const runCalls: RunCall[] = [];
     const { ctx, logs } = stage({ runCalls, effectiveSource: () => "stardog_run" });
-    const result = await callSwitch(ctx, "sidecar");
+    const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "sidecar" } });
     expect(parse(result)).toEqual({ switched: true, source: "sidecar" });
     expect(logs).toEqual(["[kg] graph source stardog_run -> sidecar: ok"]);
   });
@@ -2856,7 +2842,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
   it("logs the row-backed source when no marker is present", async () => {
     const runCalls: RunCall[] = [];
     const { ctx, logs } = stage({ runCalls, effectiveSource: () => "sidecar" });
-    await callSwitch(ctx, "stardog_run");
+    await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
     expect(logs).toEqual(["[kg] graph source sidecar -> stardog_run: ok"]);
   });
 
@@ -2864,7 +2850,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
     const runCalls: RunCall[] = [];
     const countTriples = vi.fn(async () => 7);
     const { ctx, restarts } = stage({ runCalls, countTriples });
-    const result = await callSwitch(ctx, "sidecar");
+    const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "sidecar" } });
     expect(parse(result)).toEqual({ switched: true, source: "sidecar" });
     expect(countTriples).not.toHaveBeenCalled();
     expect(runCalls.map((c) => c.name)).toEqual(["read-source", "save", "restart"]);
@@ -2874,7 +2860,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
   it("refuses sidecar with no local graph and changes nothing", async () => {
     const runCalls: RunCall[] = [];
     const { ctx, restarts } = stage({ runCalls, sidecarGraphPresent: false });
-    const result = await callSwitch(ctx, "sidecar");
+    const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "sidecar" } });
     expect(parse(result)).toEqual({ switched: false, error: "no-sidecar-graph" });
     expect(runCalls.map((c) => c.name)).toEqual(["read-source"]);
     expect(restarts).toEqual([]);
@@ -2883,7 +2869,7 @@ describe("set_kg_graph_source (AII-1974)", () => {
   it("refuses while a refresh is in flight", async () => {
     const runCalls: RunCall[] = [];
     const { ctx, restarts } = stage({ runCalls, status: { triggerId: "t1", startedAt: 1, pending: [], held: null } });
-    const result = await callSwitch(ctx, "stardog_run");
+    const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
     expect(parse(result)).toEqual({ switched: false, error: "refresh-in-flight" });
     expect(runCalls.map((c) => c.name)).toEqual(["read-source"]);
     expect(restarts).toEqual([]);
@@ -2909,12 +2895,8 @@ describe("set_kg_graph_source (AII-1974)", () => {
       testPauseMs: 0,
       log: (from, to, ok) => { logs.push(`[kg] graph source ${from} -> ${to}: ${ok ? "ok" : "failed"}`); },
     });
-    const ctx = {
-      ...fakeContext("set_kg_graph_source", runCalls),
-      request: () => ({ id: "switch-invocation-1", target: { handler: "set_kg_graph_source" } }),
-      objectClient: () => ({ status: async () => null, claimSourceSwitch: async () => ({ claimed: true }), releaseSourceSwitch: async () => ({ released: true }) }),
-    } as unknown as restate.Context;
-    const result = await callSwitch(ctx, "stardog_run");
+    const ctx = { ...fakeContext("set_kg_graph_source", runCalls), objectClient: () => ({ status: async () => null }) } as unknown as restate.Context;
+    const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
     expect(parse(result)).toMatchObject({ switched: false, error: "sidecar-restart-failed" });
     expect(parse(result).message).toContain("source row was already saved");
     expect(result.isError).not.toBe(true);
@@ -2929,26 +2911,12 @@ describe("set_kg_graph_source (AII-1974)", () => {
       runCalls,
       countTriples: async () => { throw new restate.TerminalError("Stardog Run count query answered HTTP 503"); },
     });
-    const result = await callSwitch(ctx, "stardog_run");
+    const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
     expect(parse(result)).toEqual({ switched: false, error: "Stardog Run count query answered HTTP 503" });
     // The fake records a step only after it resolves, so the failed `stardog-test` is absent.
     expect(runCalls.map((c) => c.name)).toEqual(["read-source"]);
     expect(runCalls.some((c) => c.name === "save" || c.name === "restart")).toBe(false);
     expect(restarts).toEqual([]);
-  });
-
-  it("refuses a refresh that arrives during the Stardog test before saving or restarting", async () => {
-    const runCalls: RunCall[] = [];
-    const { ctx, restarts, claims } = stage({
-      runCalls,
-      statuses: [null, { triggerId: "t-mid-test", startedAt: 2, pending: [], held: null }],
-      countTriples: async () => 7,
-    });
-    const result = await callSwitch(ctx, "stardog_run");
-    expect(parse(result)).toEqual({ switched: false, error: "refresh-in-flight" });
-    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "stardog-test"]);
-    expect(restarts).toEqual([]);
-    expect(claims).toEqual(["claim", "release"]);
   });
 });
 

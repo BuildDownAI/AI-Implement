@@ -10,7 +10,7 @@ import { createKgGraphSourceToolDeps } from "../index.js";
 import {
   SidecarMemoryProvider, getKgMemoryProvider, setKgMemoryProvider, sidecarHealth, sidecarHealthFields,
 } from "../kg-provider.js";
-import { setKgGraphSourceToolDeps, switchKgGraphSource } from "../restate/tools.js";
+import { setKgGraphSourceTool, setKgGraphSourceToolDeps } from "../restate/tools.js";
 import { getDb } from "../dedup.js";
 import { initSettingsTable } from "../runner-mode.js";
 import { setKgGraphSource, setStardogValues } from "../kg-graph-source.js";
@@ -21,6 +21,8 @@ const TOOLS = [
   { name: "kg_search" }, { name: "kg_neighbors" }, { name: "kg_hybrid_search" },
   { name: "kg_semantic_search" }, { name: "kg_path" }, { name: "kg_provenance" },
 ];
+const ADMIN = { kind: "system", email: null, role: "admin", grants: [] } as const;
+
 function toolsList(): string {
   return JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", result: { tools: TOOLS } });
 }
@@ -67,12 +69,8 @@ describe("createKgGraphSourceToolDeps restart step (AII-1974)", () => {
   /** The tool's Restate context with each step run immediately. The fake tool's log captures lines. */
   function toolContext() {
     return {
-      request: () => ({ id: "switch-invocation-1", target: { handler: "switch" } }),
-      objectClient: () => ({
-        status: async () => null,
-        claimSourceSwitch: async () => ({ claimed: true }),
-        releaseSourceSwitch: async () => ({ released: true }),
-      }),
+      request: () => ({ target: { handler: "set_kg_graph_source" } }),
+      objectClient: () => ({ status: async () => null }),
       run: async (name: unknown, action?: unknown) => {
         // This fake handles both ctx.run(action) and ctx.run(name, action).
         const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
@@ -151,7 +149,7 @@ describe("createKgGraphSourceToolDeps restart step (AII-1974)", () => {
     const deps = createKgGraphSourceToolDeps({ sidecar: { restart: async () => {} }, kgDir });
     const logs: string[] = [];
     setKgGraphSourceToolDeps({ ...deps, countTriples: async () => 7, log: logTo(logs) });
-    const result = await switchKgGraphSource(toolContext(), { source: "stardog_run" });
+    const result = await setKgGraphSourceTool(toolContext(), { caller: ADMIN, args: { source: "stardog_run" } });
     const body = JSON.parse(result.content[0].text);
     expect(body).toMatchObject({ switched: false, error: "sidecar-restart-failed" });
     expect(body.message).toContain("source row was already saved");
@@ -168,7 +166,7 @@ describe("createKgGraphSourceToolDeps restart step (AII-1974)", () => {
     const logs: string[] = [];
     setKgGraphSourceToolDeps({ ...deps, countTriples: async () => 7, log: logTo(logs) });
     queueConnectionError();
-    const result = await switchKgGraphSource(toolContext(), { source: "stardog_run" });
+    const result = await setKgGraphSourceTool(toolContext(), { caller: ADMIN, args: { source: "stardog_run" } });
     const body = JSON.parse(result.content[0].text);
     expect(body).toMatchObject({ switched: false, error: "sidecar-restart-failed" });
     expect(body.message).toContain("source row was already saved");

@@ -129,18 +129,6 @@ the sidecar. A failing test changes nothing. `sidecar` saves and restarts with n
 test, and is refused with `no-sidecar-graph` on a base-only image. There is
 nothing to undo: switching back is another call.
 
-Switches run on the exclusive `KgGraphSourceSwitch` Restate object (one key for the
-whole orchestrator), so two overlapping invocations serialize. When the refresh rail
-is configured, the switch also reserves the `KgRepo` object for its whole
-test/save/restart and rechecks that lock before saving; a refresh or PR-check dry run
-arriving during the Stardog test is refused or queued rather than racing the restart.
-The reservation belongs to the switch invocation, not to a clock: a shared `KgRepo`
-watcher attaches to it and releases the reservation when the invocation returns,
-fails, is killed or is cancelled, then drains queued dry-run work. A switch that
-suspends for longer than the Stardog retry budget therefore keeps the refresh lock
-for as long as it is live. `KgSidecar.restart()` is single-flight, so the switch and
-`swapGate` can never spawn overlapping children.
-
 The switch is a Restate handler, so a client that gives up at its own timeout must
 repeat the call with the same `Idempotency-Key`; the repeat attaches to the first
 invocation instead of testing again. Restarting starts a sidecar that did not start
