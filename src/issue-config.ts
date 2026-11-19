@@ -1,4 +1,5 @@
-import { parse as parseYaml } from "yaml";
+import { STAGE_NAMES, type StageName } from "./agent-config.js";
+import { parseDocument } from "yaml";
 import type { FeatureBranchMode } from "./pipeline/branch-name.js";
 
 /**
@@ -18,11 +19,13 @@ import type { FeatureBranchMode } from "./pipeline/branch-name.js";
  * This module is location-agnostic by design — it takes text. Moving config to a comment later
  * would change only the caller, not this file.
  *
- * Fails open in every direction: any absent, unreadable, or unrecognized config resolves to
- * today's behaviour (feature-node mode). A bad config can never strand a dispatch or invent a
- * branch.
+ * Grouping defaults to feature mode. Invalid model requests are carried to dispatch for refusal.
  */
+export type IssueModels = Partial<Record<StageName, string>>;
+
 export interface IssueConfig {
+  /** null records a malformed explicit selection. */
+  issueModels?: IssueModels | null;
   featureBranch: { mode: FeatureBranchMode };
 }
 
@@ -80,33 +83,54 @@ export function parseIssueConfig(
     );
     const result = (config: IssueConfig): ParsedIssueConfig => ({ config, description: stripped });
 
+    const document = parseDocument(body);
     let doc: unknown;
     try {
-      doc = parseYaml(body);
+      if (document.errors.length) throw document.errors[0];
+      doc = document.toJS();
     } catch (err) {
       // The marker proves this block was meant to be ours, so a parse failure is a real
       // misconfiguration worth surfacing — no substring sniffing needed.
       console.warn(`[issue-config] ${issueKey}: ai-implement.yml is not valid YAML; using feature-node mode:`, err);
-      return result(DEFAULT_CONFIG);
+      return result(document.has("models") ? { ...DEFAULT_CONFIG, issueModels: null } : DEFAULT_CONFIG);
     }
 
+    const config = doc && typeof doc === "object" && "models" in doc
+      ? { ...DEFAULT_CONFIG, issueModels: parseModels(doc.models) }
+      : DEFAULT_CONFIG;
+
     // A marked block with no feature_branch key is ordinary config once other keys exist.
-    if (!doc || typeof doc !== "object" || !(CONFIG_KEY in doc)) return result(DEFAULT_CONFIG);
+    if (!doc || typeof doc !== "object" || !(CONFIG_KEY in doc)) return result(config);
 
     const featureBranch = (doc as Record<string, unknown>)[CONFIG_KEY];
     if (!featureBranch || typeof featureBranch !== "object") {
       console.warn(`[issue-config] ${issueKey}: ${CONFIG_KEY} is not a mapping; using feature-node mode`);
-      return result(DEFAULT_CONFIG);
+      return result(config);
     }
 
     const mode = (featureBranch as Record<string, unknown>).mode;
-    if (mode === "feature" || mode === "multi-issue") return result({ featureBranch: { mode } });
+    if (mode === "feature" || mode === "multi-issue") return result({ ...config, featureBranch: { mode } });
 
     console.warn(
       `[issue-config] ${issueKey}: unknown ${CONFIG_KEY}.mode ${JSON.stringify(mode)}; using feature-node mode`,
     );
-    return result(DEFAULT_CONFIG);
+    return result(config);
   }
 
   return { config: DEFAULT_CONFIG, description };
+}
+
+function parseModels(value: unknown): IssueModels | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = Object.entries(value);
+  if (!entries.length || entries.some(([key, model]) =>
+    !STAGE_NAMES.some(stage => stage === key) || typeof model !== "string" || !model.trim())) return null;
+  return Object.fromEntries(entries);
+}
+
+export function issueDispatchFields(parsed: ParsedIssueConfig) {
+  return {
+    description: parsed.description,
+    ...(parsed.config.issueModels !== undefined ? { issueModels: parsed.config.issueModels } : {}),
+  };
 }

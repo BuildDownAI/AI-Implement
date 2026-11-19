@@ -1550,7 +1550,7 @@ describe("LinearProvider.findByKey", () => {
     linear(data({
       issues: {
         nodes: [{
-          id: "issue-uuid", identifier: "ENG-1", title: "Hello", description: "World",
+          id: "issue-uuid", identifier: "ENG-1", title: "Hello", description: "World\n\n```yaml\n# ai-implement.yml\nmodels: { review: specialist }\n```",
           team: { key: "ENG" }, state: { name: "Todo", type: "unstarted" },
         }],
       },
@@ -1559,7 +1559,7 @@ describe("LinearProvider.findByKey", () => {
     const issue = await p.findByKey("ENG-1");
     expect(issue).toEqual({
       id: "issue-uuid", identifier: "ENG-1", title: "Hello", description: "World",
-      scopeKey: "ENG", nativeStatus: "Todo (unstarted)",
+      issueModels: { review: "specialist" }, scopeKey: "ENG", nativeStatus: "Todo (unstarted)",
     });
   });
 });

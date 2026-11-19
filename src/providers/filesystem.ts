@@ -1,3 +1,4 @@
+import { issueDispatchFields, parseIssueConfig } from "../issue-config.js";
 import { randomUUID } from "node:crypto";
 import {
   access,
@@ -510,7 +511,7 @@ export class FilesystemProvider implements TicketingProvider {
                 id: `filesystem:${scopeKey}:${identifier}`,
                 identifier,
                 title: parsed.issue.title,
-                description: parsed.issue.description,
+                ...issueDispatchFields(parseIssueConfig(parsed.issue.description, identifier)),
                 scopeKey,
                 ...(state?.parentRef ? { parentRef: state.parentRef } : {}),
                 nativeStatus: state?.status ?? (mapping.planningEnabled ? "ready" : "plan-approved"),

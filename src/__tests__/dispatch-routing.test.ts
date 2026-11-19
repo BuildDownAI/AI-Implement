@@ -1572,6 +1572,11 @@ describe("poll implementation submission — ImplementationRun for every project
     expect(implementationIngress.submit.mock.calls[0]![1].launchContext.groupingParent).toBe("true");
   });
 
+  it.each([null, { implementation: "requested" }])("carries explicit model selection into reservation preflight", async issueModels => {
+    await indexModule.submitImplementationRun(config, { ...issue, issueModels }, jiraMapping("AII"), { ...ctx, execPath: "local-docker" });
+    expect(implementationIngress.submit.mock.calls[0]![1].launchContext.hasIssueModels).toBe("true");
+  });
+
   it.each(["github-actions", "fly-machines", "local-docker", "both"] as const)("submits %s with a schema-valid credential-free input", async (execPath) => {
     const { implementationRunInputSchema } = await import("../restate/implementation-run-workflow.js");
     const { normalizeGithubActionsJobTimeoutMinutes } = await import("../github-actions-watchdog.js");

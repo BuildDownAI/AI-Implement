@@ -1272,7 +1272,7 @@ describe("JiraProvider — grouping mode from ai-implement.yml", () => {
       {
         type: "codeBlock",
         attrs: { language: "yaml" },
-        content: [{ type: "text", text: '# ai-implement.yml\nfeature_branch:\n  mode: "multi-issue"' }],
+        content: [{ type: "text", text: '# ai-implement.yml\nmodels: { review: specialist }\nfeature_branch:\n  mode: "multi-issue"' }],
       },
     ],
   };
@@ -1358,6 +1358,7 @@ describe("JiraProvider — grouping mode from ai-implement.yml", () => {
     }).install();
     const snap = await provider().fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "BAC-1")!;
+    expect(parent.issueModels).toEqual({ review: "specialist" });
     expect(parent.description).toBe("Group of unrelated work.");
     expect(parent.description).not.toContain("feature_branch");
   });

@@ -17,7 +17,7 @@ import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableE
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
 import { getLinearToken, isLinearAuthConfigured, LinearApiError, withLinearToken } from "../linear-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
-import { parseIssueConfig } from "../issue-config.js";
+import { issueDispatchFields, parseIssueConfig } from "../issue-config.js";
 import { hasCompatibleFeatureMapping, nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
 import { DEFAULT_LINEAR_PICKUP_LABEL, getLinearPickupLabel } from "../orchestrator-settings.js";
 
@@ -212,7 +212,7 @@ export class LinearProvider implements TicketingProvider {
       id: node.id,
       identifier: node.identifier,
       title: node.title,
-      description: node.description,
+      ...issueDispatchFields(parseIssueConfig(node.description, node.identifier)),
       scopeKey: node.team.key,
       nativeStatus: `${node.state.name} (${node.state.type})`,
     };
@@ -648,7 +648,7 @@ export class LinearProvider implements TicketingProvider {
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
-        description: parsed.description,
+        ...issueDispatchFields(parsed),
         scopeKey: issue.team.key,
         nativeStatus: `${issue.state.name} (${issue.state.type})`,
         ...(issue.parent ? { parentRef: { identifier: issue.parent.identifier } } : {}),

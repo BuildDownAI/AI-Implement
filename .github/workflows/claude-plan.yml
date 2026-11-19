@@ -2,6 +2,7 @@
 # ai-implement-capability: private-run-config-v1
 # ai-implement-capability: stage-agent-config-v1
 # ai-implement-capability: stage-agent-launch-context-v1
+# ai-implement-capability: issue-models-v1
 # ai-implement-capability: openrouter-accounts-v1
 # All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
@@ -265,7 +266,7 @@ jobs:
             def src:
               isobj and only(["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"])
               and (. as $o | all("agent", "provider", "model", "accountProfileId", "invocationTimeoutMs";
-                     . as $f | $o[$f] | IN("orchestrator-default", "project", "job-deadline")));
+                     . as $f | ($o[$f] | IN("orchestrator-default", "project", "job-deadline")) or ($f == "model" and $o[$f] == "issue")));
             def prof:
               isobj and only(["id", "identity", "revision", "agent", "provider", "authMode"])
               and (.id | snapstr) and (.identity | snapstr) and (.revision | posint)

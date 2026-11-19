@@ -193,17 +193,15 @@ could hand the implementer a plan built on a false premise (observed on AII-894)
 
 ## 5. `ai-implement.yml` — per-issue grouping config
 
-A parent issue can embed a fenced code block in its description to configure the
-orchestrator. Today the only config key is `feature_branch.mode`, which selects the
-grouping branch path segment.
-
-This is a general-purpose issue-config channel; `feature_branch` is its first key. Future
-per-issue settings will extend this block without changing the discovery logic.
+An issue can embed a fenced YAML block in its description to select stage models.
+Grouping parents can use the same block to select the grouping branch path segment.
 
 ### Schema
 
 ```
 # ai-implement.yml (example)
+models:
+  implementation: approved-model-id
 feature_branch:
   mode: "multi-issue"   # "feature" (default) | "multi-issue"
 ```
@@ -211,6 +209,14 @@ feature_branch:
 `feature_branch.mode` selects the branch path segment for the parent's shared branch —
 `ai-implement/feature/<key>` or `ai-implement/multi-issue/<key>`. Any unrecognized value
 (or an absent block) silently defaults to `"feature"`.
+
+For ticket-driven planning and implementation dispatches in a managed project, each entry in `models` selects the effective primary or
+fallback model already configured for that stage (`planning`, `implementation`,
+or `review`). Use the exact model ID. The run pins that model on the selected
+account, records `issue` as the source, and disables automatic model/account
+substitution for that stage. An edit affects the next dispatch. Other stages
+keep their project settings. An invalid or unapproved selection refuses dispatch.
+GitHub Actions projects need synced planning and implementation templates and a runner image with issue-model support. Separate review-fix and comment-triggered dispatches use the project settings.
 
 ### Block selection
 
@@ -231,15 +237,16 @@ sees it, even when the block is broken YAML. Config is orchestrator metadata, no
 implementation spec — removing it prevents the agent from trying to create or manage the
 configuration file as part of the work. An unmatched block is never touched.
 
-### Fail-open ladder
+### Grouping defaults and model selection errors
 
-Every failure path silently resolves to `"feature"` mode so no dispatch is ever blocked by
-a config error:
+Grouping errors resolve to `"feature"` mode.
 
 | Condition | Outcome |
 |-----------|---------|
 | No marked block found in description | `feature` mode (no warning) |
-| Marked block present, YAML invalid | `feature` mode + `[issue-config]` warning |
+| Marked block declares `models` and contains invalid YAML anywhere | Managed dispatch refuses the selection (`issue_models_invalid`) |
+| Valid YAML with a malformed `models` mapping | Managed dispatch refuses the selection (`issue_models_invalid`) |
+| Marked block without `models`, YAML invalid | `feature` mode + `[issue-config]` warning |
 | Marked block present, no `feature_branch` key | `feature` mode (no warning) |
 | `feature_branch` is not a mapping | `feature` mode + `[issue-config]` warning |
 | `feature_branch.mode` is an unrecognized string | `feature` mode + `[issue-config]` warning |

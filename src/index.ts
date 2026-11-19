@@ -170,7 +170,7 @@ import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
-import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
+import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, IMPLEMENTATION_CONTEXT_ISSUE_MODELS_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
@@ -1297,7 +1297,7 @@ export async function dispatchBothMode(
   baseBranchFieldValue: string | null,
 ): Promise<void> {
   await dispatchGitHubActions(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue);
-  if (!isManagedProject(issue.scopeKey)) {
+  if (issue.issueModels === undefined && !isManagedProject(issue.scopeKey)) {
     await dispatchFlyMachine(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue, true);
   }
 }
@@ -1337,11 +1337,11 @@ export async function dispatchGitHubActions(
   // The decision carries the frozen snapshot and the one-shot bootstrap; a refusal launches nothing.
   const managedRuntime = getModelAuthRuntime(config);
   let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
-  if (isManagedProject(issue.scopeKey, dispatchId)) {
+  if (issue.issueModels !== undefined || isManagedProject(issue.scopeKey, dispatchId)) {
     let decision: ManagedDispatchDecision;
     try {
       decision = await prepareManagedDispatch(
-        { dispatchId, projectKey: issue.scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+        { dispatchId, projectKey: issue.scopeKey, issueModels: issue.issueModels, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
         managedRuntime,
       );
     } catch (err) {
@@ -1576,6 +1576,7 @@ export async function submitImplementationRun(
     [IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY]: ctx.runnerMode,
     [IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY]: String(isGroupingParentDispatch(issue)),
   };
+  if (issue.issueModels !== undefined) launchContext[IMPLEMENTATION_CONTEXT_ISSUE_MODELS_KEY] = "true";
   if (ctx.baseBranchFieldValue) {
     launchContext[IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY] = ctx.baseBranchFieldValue;
   }
@@ -1797,7 +1798,7 @@ export async function dispatchSession(
   // admission acquired here is released; a caller-held reservation is never ours to free.
   let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
   if (!opts.managedAuth) {
-    if (isManagedProject(issue.scopeKey, dispatchId)) {
+    if (issue.issueModels !== undefined || isManagedProject(issue.scopeKey, dispatchId)) {
       admission?.release("launch_rejected");
       console.warn(`[poll] Managed dispatch for ${issue.identifier}: phase_not_wired (${opts.phase}); nothing launched`);
       return { admitted: false, refusal: "phase_not_wired" };
@@ -1806,7 +1807,7 @@ export async function dispatchSession(
     return { admitted: false };
   } else {
     const decision = await prepareManagedDispatch(
-      { dispatchId, projectKey: issue.scopeKey, backend: opts.backendKind, owner: mapping.owner, repo: mapping.repo, workflowFile: opts.managedAuth.workflowFile },
+      { dispatchId, projectKey: issue.scopeKey, issueModels: issue.issueModels, backend: opts.backendKind, owner: mapping.owner, repo: mapping.repo, workflowFile: opts.managedAuth.workflowFile },
       opts.managedAuth.runtime,
     );
     console.log(
@@ -1978,7 +1979,7 @@ export async function dispatchFlyMachine(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && issue.issueModels === undefined && !isManagedProject(issue.scopeKey)) {
     const level = shadow ? "warn" : "error";
     console[level](`[poll] ${shadow ? "Shadow Fly dispatch skipped" : "Cannot dispatch"} ${issue.identifier} via Fly Machines: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
@@ -2022,7 +2023,7 @@ export async function dispatchLocalDocker(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && issue.issueModels === undefined && !isManagedProject(issue.scopeKey)) {
     console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
   }

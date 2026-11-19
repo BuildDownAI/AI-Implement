@@ -17,7 +17,7 @@ export type AccountAuthMode =
   | "codex-subscription"
   | "openrouter-api-key";
 export type StageConfigMode = "legacy" | "configured";
-export type FieldSource = "orchestrator-default" | "project" | "job-deadline";
+export type FieldSource = "orchestrator-default" | "project" | "job-deadline" | "issue";
 
 export interface AccountProfile {
   id: string;

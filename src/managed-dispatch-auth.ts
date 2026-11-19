@@ -10,6 +10,7 @@
  * `JSON.stringify` and structured logging never see. Refusal text is fixed and built from `kind`, `category`
  * and `code` only.
  */
+import type { IssueModels } from "./issue-config.js";
 import type { StageName } from "./agent-config.js";
 import { isProjectConfigured, resolveProjectStageConfig } from "./agent-config-store.js";
 import {
@@ -23,6 +24,7 @@ import type { ModelAuthRuntime } from "./model-auth-runtime.js";
 import { copyAccountFallbacks, type AccountFallbacks, copyModelFallbacks, type ResolvedAgentSnapshotV1, type RunCredentialsV1 } from "./run-config.js";
 
 export interface ManagedDispatchRequest {
+  issueModels?: IssueModels | null;
   dispatchId: string;
   /** Mapping key (`issue.scopeKey`). */
   projectKey: string;
@@ -84,7 +86,7 @@ export async function prepareManagedDispatch(
   req: ManagedDispatchRequest,
   runtime: ModelAuthRuntime,
 ): Promise<ManagedDispatchDecision> {
-  if (!isManagedProject(req.projectKey, req.dispatchId)) return { kind: "legacy" };
+  if (req.issueModels === undefined && !isManagedProject(req.projectKey, req.dispatchId)) return { kind: "legacy" };
 
   const repository = `${req.owner}/${req.repo}`;
   let result;
@@ -96,6 +98,7 @@ export async function prepareManagedDispatch(
         backend: req.backend,
         workflowRepository: repository,
         workflowFile: req.workflowFile,
+        issueModels: req.issueModels,
       },
       runtime.preparationDeps({ owner: req.owner, repo: req.repo, projectKey: req.projectKey }),
     );
