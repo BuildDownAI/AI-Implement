@@ -318,6 +318,48 @@ describe("KG page — switching the graph source", () => {
 });
 
 describe("KG page — Stardog values", () => {
+  it("does not save after a failed initial settings load, then enables saving after a successful load", async () => {
+    const calls: ApiCall[] = [];
+    let settingsAttempt = 0;
+    const { win } = mount(async (url, init) => {
+      calls.push({ url, init });
+      if (url === "/api/settings") {
+        settingsAttempt += 1;
+        return settingsAttempt === 1
+          ? response(500, { error: "settings-unavailable" })
+          : response(200, SETTINGS);
+      }
+      throw new Error(`unexpected api call ${url}`);
+    });
+    const doc = win.document as Document;
+    const select = doc.getElementById("kg-graph-source") as HTMLSelectElement;
+    const saveButton = doc.getElementById("btn-kg-stardog-save") as HTMLButtonElement;
+
+    await win.loadKgGraphSettings();
+
+    expect(select.disabled).toBe(true);
+    expect(saveButton.disabled).toBe(true);
+    select.value = "stardog_run";
+    (doc.getElementById("kg-stardog-db") as HTMLInputElement).value = "";
+    (doc.getElementById("kg-stardog-token") as HTMLInputElement).value = "SENTINEL-initial-load-token";
+
+    await win.saveKgGraphSource();
+    await win.saveKgStardog();
+
+    expect(calls.filter((c) => c.url === "/api/settings" && c.init?.method === "POST")).toHaveLength(0);
+    expect(calls.filter((c) => c.url === "/api/kg/stardog")).toHaveLength(0);
+    expect(calls.filter((c) => c.url === "/api/tools/set_kg_graph_source")).toHaveLength(0);
+    expect(doc.getElementById("kg-graph-source-error")?.textContent).toContain("before switching");
+    expect(doc.getElementById("kg-stardog-error")?.textContent).toContain("before saving");
+
+    await win.loadKgGraphSettings();
+
+    expect(select.disabled).toBe(false);
+    expect(saveButton.disabled).toBe(false);
+    expect(select.value).toBe("sidecar");
+    expect((doc.getElementById("kg-stardog-db") as HTMLInputElement).value).toBe("builddown-kg");
+  });
+
   it("saves the non-secret fields, sends the token once, and leaves no token in the DOM", async () => {
     const calls: ApiCall[] = [];
     const token = "SENTINEL-stardog-token-page-test";

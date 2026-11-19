@@ -92,21 +92,24 @@ KG repo is needed.
 | `KG_STARDOG_RUN_TOKEN` | Access token, passed to the sidecar without logging it. |
 | `KG_STARDOG_DB` | Database name. |
 | `KG_STARDOG_RUN_ENDPOINT` | SPARQL endpoint URL. |
-| `KG_STARDOG_DATASET` | Fallback dataset sent as `default-graph-uri`, used only when no graph name is set. The page derives the dataset from the graph name. |
+| `KG_STARDOG_DATASET` | Fallback dataset sent as `default-graph-uri`, used only when no graph name is stored. A stored graph name derives the dataset. |
 | `KG_STARDOG_RUN_CONSOLE` | Endpoint console URL. |
 | `KG_NAMESPACE` | Graph IRI namespace; a nonempty value takes precedence over `sources.yml`, including for the boot probe. |
 
 `src/kg-graph-source.ts` holds the stored values the sidecar reads at start. The
-environment above seeds them at first boot only; from then on, change them on the
-KG page. `kg_graph_source` defaults to
+environment above seeds them at first boot only. From then on, change the graph
+source and the database, endpoint, console, import-host and token values on the
+KG page; `KG_NAMESPACE` and the graph name remain settings rows with no field
+there yet. `kg_graph_source` defaults to
 `sidecar`; the non-secret rows are
 `kg_stardog_db`, `kg_stardog_run_endpoint`, `kg_stardog_run_console`, and
 `kg_stardog_run_platform`. The import platform defaults to
 `https://app.stardog.run`, distinct from the console host; an empty
 `kg_stardog_run_console` uses `https://console.stardog.run`. There is no import-host
-environment variable; the row default is enough. Namespace and graph
-name use the shared `kg_namespace` and `kg_graph_name` rows on the Graph details
-card. Names accept letters,
+environment variable; the row default is enough. Namespace and graph name use the
+shared `kg_namespace` and `kg_graph_name` rows; this page deliberately adds no
+fields for them. `KG_NAMESPACE` seeds `kg_namespace` at first boot and has no
+admin-UI field yet. Names accept letters,
 digits, underscores and hyphens, beginning with a letter or digit; namespaces and
 endpoint/console/platform values must be absolute HTTP(S) URLs without userinfo.
 Empty fields clear their rows, and partial updates preserve omitted fields.

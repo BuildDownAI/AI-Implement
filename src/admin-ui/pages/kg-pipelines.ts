@@ -83,7 +83,7 @@ export const kgPipelinesHtml = `
         <div class="field">
           <label for="kg-graph-source">Graph source</label>
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-            <select class="input" id="kg-graph-source" style="flex:1;min-width:180px" onchange="window.saveKgGraphSource()">
+            <select class="input" id="kg-graph-source" style="flex:1;min-width:180px" onchange="window.saveKgGraphSource()" disabled>
               <option value="sidecar">Sidecar graph</option>
               <option value="stardog_run">Stardog</option>
             </select>
@@ -119,7 +119,7 @@ export const kgPipelinesHtml = `
           <div class="text-tertiary" style="font-size:11px;margin-top:3px">The token is sent once and never shown again.</div>
         </div>
         <div style="margin-top:12px">
-          <button class="btn btn-primary btn-sm" id="btn-kg-stardog-save" onclick="window.saveKgStardog()">Save Stardog values</button>
+          <button class="btn btn-primary btn-sm" id="btn-kg-stardog-save" onclick="window.saveKgStardog()" disabled>Save Stardog values</button>
           <span class="kpi-trend text-secondary" id="kg-stardog-save-status"></span>
         </div>
         <div id="kg-stardog-error" class="error" hidden></div>
@@ -466,6 +466,7 @@ export const kgPipelinesScript = `
   // above only choose where a refresh runs. Keep the two surfaces apart.
   let kgGraphSourceSaved = null;
   let kgGraphSourceBusy = false;
+  let kgGraphSettingsLoaded = false;
   let kgStardogSaved = null;
 
   function kgGraphSourceLabel(value) {
@@ -485,7 +486,7 @@ export const kgPipelinesScript = `
   function kgPaintGraphSource(value) {
     const select = document.getElementById('kg-graph-source');
     select.value = value === 'stardog_run' ? 'stardog_run' : 'sidecar';
-    select.disabled = kgGraphSourceBusy;
+    select.disabled = kgGraphSourceBusy || !kgGraphSettingsLoaded;
   }
 
   function kgStardogInputs() {
@@ -509,9 +510,9 @@ export const kgPipelinesScript = `
       const res = await window.api('/api/settings');
       if (!res.ok) return;
       const data = await res.json();
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return;
       const source = data.kgGraphSource === 'stardog_run' ? 'stardog_run' : 'sidecar';
       kgGraphSourceSaved = source;
-      if (!kgGraphSourceBusy) kgPaintGraphSource(source);
       const importHost = document.getElementById('kg-stardog-import-host');
       if (!kgStardogDirty()) {
         document.getElementById('kg-stardog-db').value = data.kg_stardog_db || '';
@@ -523,6 +524,9 @@ export const kgPipelinesScript = `
       document.getElementById('kg-stardog-token-status').textContent =
         data.stardogTokenSet ? 'Token set' : 'Token not set';
       document.getElementById('kg-graph-customer-repo-note').hidden = !data.kgCustomerRepo;
+      kgGraphSettingsLoaded = true;
+      document.getElementById('btn-kg-stardog-save').disabled = false;
+      if (!kgGraphSourceBusy) kgPaintGraphSource(source);
     } catch (e) { /* transient — next poll retries */ }
   }
 
@@ -539,6 +543,11 @@ export const kgPipelinesScript = `
   // the switch already running; at most 10 total calls, and only a 503 is retried.
   window.saveKgGraphSource = async function () {
     if (kgGraphSourceBusy) return;
+    if (!kgGraphSettingsLoaded) {
+      kgShowGraphSourceStatus('');
+      kgShowGraphSourceError('Load the graph settings before switching the source.');
+      return;
+    }
     const select = document.getElementById('kg-graph-source');
     const previous = kgGraphSourceSaved || 'sidecar';
     const source = select.value === 'stardog_run' ? 'stardog_run' : 'sidecar';
@@ -604,6 +613,12 @@ export const kgPipelinesScript = `
     const status = document.getElementById('kg-stardog-save-status');
     const error = document.getElementById('kg-stardog-error');
     const input = document.getElementById('kg-stardog-token');
+    if (!kgGraphSettingsLoaded) {
+      status.textContent = '';
+      error.textContent = 'Load the Stardog values before saving.';
+      error.hidden = false;
+      return;
+    }
     const token = input.value;
     error.hidden = true;
     error.textContent = '';
@@ -641,7 +656,7 @@ export const kgPipelinesScript = `
       error.textContent = (valuesSaved ? 'Stardog values saved, but the token could not be saved' : 'Could not save the Stardog values') + ' \\u2014 ' + String(err);
       error.hidden = false;
     } finally {
-      btn.disabled = false;
+      btn.disabled = !kgGraphSettingsLoaded;
     }
   };
 
