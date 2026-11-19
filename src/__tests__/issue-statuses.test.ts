@@ -1,7 +1,11 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { IssueStatusRecord, TicketingProvider } from "../providers/types.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
+import { FilesystemProvider } from "../providers/filesystem.js";
+import { testDir } from "./helpers/test-dir.js";
 import { testDb } from "./helpers/test-db.js";
 import { FakeProvider } from "./providers/fake.js";
 
@@ -76,6 +80,24 @@ describe("listIssueStatuses", () => {
     for (const call of fake.calls) expect(JSON.parse(call.body).variables.teamKey).toBe("ENG");
   });
 
+  it.each([false, true])("handles a malformed filesystem timestamp with a matching job: %s", async (withJob) => {
+    const s = await setup();
+    const directory = testDir("fs-status-times");
+    const mapping = makeMapping({ ticketingProvider: "filesystem",
+      ticketingConfig: { kind: "filesystem", directory } });
+    s.config.upsertMapping("A", mapping);
+    await mkdir(join(directory, ".state", "A"), { recursive: true });
+    await writeFile(join(directory, "A-1.md"), "---\ntitle: Issue\n---\nBody");
+    await writeFile(join(directory, ".state", "A", "A-1.json"), JSON.stringify({
+      version: 1, status: "implementing", comments: [], prUrls: [], updatedAt: "invalid",
+    }));
+    s.deps.providerFor.mockResolvedValue(new FilesystemProvider(() => ({ A: mapping })));
+    if (withJob) s.job("implementation", 100, 150);
+    expect(await s.list()).toMatchObject([{
+      issue: { identifier: "A-1" }, state: "implementing", changedAt: withJob ? 150 : null,
+    }]);
+  });
+
   it.each([null, "planning", "implementation"] as const)("keeps merged state and phase %s despite parks, but still updates its time (row 1)", async (phase) => {
     const s = await setup();
     s.read.mockResolvedValue([record({ state: "merged", phase })]);
@@ -88,6 +110,19 @@ describe("listIssueStatuses", () => {
     const s = await setup();
     s.park(phase);
     expect(await s.list()).toMatchObject([{ state: "failed", phase: phase === "planning" ? "planning" : "implementation" }]);
+  });
+
+  it("removes the park overlay from cached Linear status immediately after unpark", async () => {
+    const s = await setup();
+    const underlying = record({ state: "implementing", phase: "implementation" });
+    s.read.mockResolvedValue([underlying]);
+    expect(await s.list()).toMatchObject([{ tracker: "linear", state: "implementing" }]);
+    s.breaker.parkIssue("internal", "planning", "failure", null);
+    expect(await s.list()).toMatchObject([{ state: "failed", phase: "planning" }]);
+    expect(s.breaker.unpark("internal")).toBe(true);
+    expect(await s.list()).toMatchObject([{ tracker: "linear", state: "implementing", phase: "implementation" }]);
+    expect(s.read).toHaveBeenCalledTimes(1);
+    expect(underlying).toEqual(record({ state: "implementing", phase: "implementation" }));
   });
 
   it("reads parks once and uses the newest phase, refreshing overlays on cache hits", async () => {
@@ -144,6 +179,101 @@ describe("listIssueStatuses", () => {
     s.statuses.clearIssueStatusesCache();
     await s.list();
     expect(s.read).toHaveBeenCalledTimes(6);
+  });
+
+  it.each([120_000, 299_999])("serves the full cached list at age %s and logs once", async (age) => {
+    const s = await setup();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    s.read.mockResolvedValue([record(), record({ identifier: "A-2" })]);
+    const original = await s.list();
+    s.setNow(age);
+    s.read.mockRejectedValue(new Error("tracker unavailable"));
+    expect(await s.list()).toEqual(original);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]).toHaveLength(1);
+    expect(warn.mock.calls[0][0]).toContain("A");
+    expect(warn.mock.calls[0][0]).toContain(`${age}`);
+  });
+
+  it.each([300_000, 300_001])("rejects with the refresh error at age %s", async (age) => {
+    const s = await setup();
+    await s.list();
+    s.setNow(age);
+    const error = new Error("tracker unavailable");
+    s.read.mockRejectedValue(error);
+    await expect(s.list()).rejects.toBe(error);
+  });
+
+  it("retries after each fallback and starts a new freshness window on success", async () => {
+    const s = await setup();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await s.list();
+    s.setNow(120_000);
+    s.read.mockRejectedValueOnce(new Error("tracker unavailable"));
+    await s.list();
+    s.read.mockResolvedValue([record({ title: "Refreshed" })]);
+    expect(await s.list()).toMatchObject([{ issue: { title: "Refreshed" } }]);
+    expect(s.read).toHaveBeenCalledTimes(3);
+    s.setNow(179_999);
+    await s.list();
+    expect(s.read).toHaveBeenCalledTimes(3);
+    s.setNow(180_000);
+    await s.list();
+    expect(s.read).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not extend the stale window and measures age after the failed read", async () => {
+    const s = await setup();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await s.list();
+    s.setNow(120_000);
+    s.read.mockRejectedValueOnce(new Error("temporary failure"));
+    await s.list();
+    s.setNow(299_999);
+    const error = new Error("expired during refresh");
+    s.read.mockImplementationOnce(async () => { s.setNow(300_000); throw error; });
+    await expect(s.list()).rejects.toBe(error);
+  });
+
+  it("combines a fresh team with a stale team, but rejects when that copy expires", async () => {
+    const s = await setup();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    s.config.upsertMapping("B", makeMapping());
+    s.read.mockImplementation(async (mapping) => [record({ identifier: `${mapping.teamKey}-1` })]);
+    await s.list();
+    s.read.mockImplementation(async (mapping) => {
+      if (mapping.teamKey === "B") throw new Error("B unavailable");
+      return [record({ identifier: "A-2" })];
+    });
+    s.setNow(120_000);
+    expect((await s.list()).map(entry => entry.issue.identifier)).toEqual(["A-2", "B-1"]);
+    s.setNow(300_000);
+    await expect(s.list()).rejects.toThrow("B unavailable");
+  });
+
+  it("applies current park and job overlays to stale records", async () => {
+    const s = await setup();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await s.list();
+    s.park("planning");
+    s.job("implementation", 50, 150);
+    s.setNow(120_000);
+    s.read.mockRejectedValue(new Error("tracker unavailable"));
+    expect(await s.list()).toEqual([{
+      teamKey: "A", tracker: "linear", issue: { identifier: "A-1", title: "Issue", url: null },
+      state: "failed", phase: "planning", raw: { labels: ["AI-Implement"], workflowState: "Todo" },
+      changedAt: 150,
+    }]);
+  });
+
+  it("serves a successful empty copy on refresh failure", async () => {
+    const s = await setup();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    s.read.mockResolvedValue([]);
+    await s.list();
+    s.setNow(120_000);
+    s.read.mockRejectedValue(new Error("tracker unavailable"));
+    expect(await s.list()).toEqual([]);
   });
 
   it("throws for unsupported providers", async () => {

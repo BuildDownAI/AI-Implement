@@ -58,6 +58,7 @@ vi.mock("../log.js", () => ({
 
 vi.mock("../dispatch-breaker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../dispatch-breaker.js")>()),
+  parkIssue: vi.fn(),
   recordDispatchSuccess: vi.fn(),
   recordDispatchFailure: vi.fn().mockReturnValue({ tripped: false, failures: 1 }),
   // The trip comment reads the row's project, and this file has no database.
@@ -91,7 +92,7 @@ vi.mock("../notify.js", () => ({
 
 import { remediateStuckJob, STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
 import { cancelWorkflowRun } from "../github.js";
-import { incrementStuckAttempts, updateJobStatus, getInFlightJobs, getJobById } from "../log.js";
+import { incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getInFlightJobs, getJobById } from "../log.js";
 import { deleteDispatched } from "../dedup.js";
 import { notifyStuckGiveUp, notifyCompletion } from "../notify.js";
 import { getMappings } from "../config.js";
@@ -100,7 +101,7 @@ import { removeLocalContainer } from "../local-docker.js";
 import { fireBreakerTrip, monitorJobs, reportTerminalJob } from "../index.js";
 import { breakerProject } from "../dispatch-breaker.js";
 import { cacheSetupCheckRun, type SetupCheckResult } from "../setup-checks/index.js";
-import { recordDispatchSuccess, recordDispatchFailure } from "../dispatch-breaker.js";
+import { parkIssue, recordDispatchSuccess, recordDispatchFailure } from "../dispatch-breaker.js";
 import type { AppConfig } from "../index.js";
 
 const mockConfig = {
@@ -185,6 +186,12 @@ describe("remediateStuckJob", () => {
       expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
       expect(provider.clearWorkingState).not.toHaveBeenCalled();
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+      expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "implementation", "queued", { project: "ENG", identifier: "ENG-42" });
+      const parked = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+      expect(parked).toBeGreaterThan(vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0]);
+      expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
+      expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+      expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(parked);
     });
 
     it("fires notifyStuckGiveUp on hard-stop", async () => {

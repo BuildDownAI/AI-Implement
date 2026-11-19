@@ -1,3 +1,4 @@
+import { listParked } from "../dispatch-breaker.js";
 import type {
   AIImplementSnapshot,
   FeatureBranchChainEntry,
@@ -59,9 +60,6 @@ export const LINEAR_LABELS = {
   planComplete: { name: "Plan-Complete", color: "#10B981" },
   working: { name: "AI-Working", color: "#F59E0B" },
   readyForReview: { name: "Ready for Review", color: "#4ecdc4" },
-  /** Marker a parked issue carries (`parkForHuman`). It keeps the pickup label, which is also its
-   *  identity in the feature-branch grouping tree; pickup skips it while this marker is present. */
-  needsHuman: { name: "AI-Needs-Human", color: "#EF4444" },
 } as const;
 
 type LinearLabel = (typeof LINEAR_LABELS)[keyof typeof LINEAR_LABELS];
@@ -156,9 +154,9 @@ export class LinearProvider implements TicketingProvider {
   private aiWorkingLabelCache = new Map<string, string>();
   private planCompleteLabelCache = new Map<string, string>();
   private readyForReviewLabelCache = new Map<string, string>();
-  private needsHumanLabelCache = new Map<string, string>();
   private teamIdByKey = new Map<string, string>();
   private inProgressStateByTeamKey = new Map<string, string>();
+  private canceledStateByTeamKey = new Map<string, string>();
   private completedStateByTeamKey = new Map<string, string>();
 
   constructor(config: ProviderConfig) {
@@ -258,7 +256,7 @@ export class LinearProvider implements TicketingProvider {
     const label = AI_IMPLEMENT_LABEL;
     const since = new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString();
     type StatusNode = {
-      id: string; identifier: string; title: string; url: string; updatedAt: string;
+      id: string; identifier: string; title: string; updatedAt: string;
       state: { name: string; type: string };
       labels: { nodes: Array<{ name: string }> };
     };
@@ -274,7 +272,7 @@ export class LinearProvider implements TicketingProvider {
           labels: { name: { eq: $label } }
           ${recent ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }'}
         }) {
-          nodes { id identifier title url updatedAt state { name type } labels { nodes { name } } }
+          nodes { id identifier title updatedAt state { name type } labels { nodes { name } } }
           pageInfo { hasNextPage endCursor }
         }
       }`;
@@ -293,7 +291,6 @@ export class LinearProvider implements TicketingProvider {
     }
 
     const precedence: Array<[string, IssueStatusRecord["state"]]> = [
-      [LINEAR_LABELS.needsHuman.name, "failed"],
       [LINEAR_LABELS.readyForReview.name, "pr-ready"],
       [LINEAR_LABELS.working.name, "implementing"],
       [LINEAR_LABELS.planComplete.name, "plan-approved"],
@@ -559,16 +556,13 @@ export class LinearProvider implements TicketingProvider {
     const readyForImplementation: AIImplementSnapshot["readyForImplementation"] = [];
     const parentsToFinalize: AIImplementSnapshot["parentsToFinalize"] = [];
 
+    const parkedIds = new Set(listParked().map(row => row.issueId));
     let mappings: Record<string, RepoMapping> | undefined;
     for (const issue of allNodes) {
       const labelNames = new Set(issue.labels?.nodes?.map((l) => l.name) ?? []);
 
-      // Parked for a human by the stuck watchdog; a human restarts it by removing the marker.
-      // Checked before the capacity count so a half-failed park (marker added, AI-Working
-      // not removed) does not hold a slot forever.
-      if (labelNames.has(LINEAR_LABELS.needsHuman.name)) {
-        continue;
-      }
+      // The park record holds the issue and releases its capacity slot.
+      if (parkedIds.has(issue.id)) continue;
 
       // AI-Working or AI-Planning = slot is occupied; count against capacity
       if (labelNames.has(LINEAR_LABELS.working.name) || labelNames.has(LINEAR_LABELS.planning.name)) {
@@ -908,6 +902,30 @@ export class LinearProvider implements TicketingProvider {
     return state.id;
   }
 
+  private async getCanceledStateId(teamKey: string): Promise<string> {
+    const cached = this.canceledStateByTeamKey.get(teamKey);
+    if (cached) return cached;
+    const teamId = await this.getTeamIdByKey(teamKey);
+    const data = await this.linearMutation<{
+      workflowStates: { nodes: Array<{ id: string; name: string; type: string }> };
+    }>(
+      `query($teamId: ID!) {
+        workflowStates(filter: { team: { id: { eq: $teamId } }, type: { eq: "canceled" } }) {
+          nodes { id name type }
+        }
+      }`,
+      { teamId },
+    );
+    const state =
+      data.workflowStates.nodes.find((s) => ["canceled", "cancelled"].includes(s.name.toLowerCase())) ??
+      data.workflowStates.nodes[0];
+    if (!state) {
+      throw new Error(`No "canceled" workflow state found for team ${teamId}`);
+    }
+    this.canceledStateByTeamKey.set(teamKey, state.id);
+    return state.id;
+  }
+
   private async updateIssueState(issueId: string, stateId: string): Promise<void> {
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
       `mutation($issueId: String!, $stateId: String!) {
@@ -920,32 +938,34 @@ export class LinearProvider implements TicketingProvider {
     );
   }
 
-  private async addLabelToIssue(issueId: string, labelId: string): Promise<void> {
-    const getData = await this.linearMutation<{
-      issue: { labels: { nodes: Array<{ id: string }> } };
-    }>(
-      `query($issueId: String!) {
-        issue(id: $issueId) {
-          labels { nodes { id } }
-        }
-      }`,
-      { issueId },
-    );
-    const currentIds = getData.issue.labels.nodes.map((l) => l.id);
-    if (currentIds.includes(labelId)) return;
+  /**
+   * The one label writer. It sends only the labels that change (`addedLabelIds` /
+   * `removedLabelIds`), never a full `labelIds` set, so a stale read can never restore a
+   * label another writer removed (AII-889). Sends nothing when both lists are empty.
+   */
+  private async updateIssueLabels(
+    issueId: string,
+    change: { addedLabelIds?: string[]; removedLabelIds?: string[]; stateId?: string },
+  ): Promise<void> {
+    const input: { addedLabelIds?: string[]; removedLabelIds?: string[]; stateId?: string } = {};
+    if (change.stateId) input.stateId = change.stateId;
+    if (change.addedLabelIds?.length) input.addedLabelIds = change.addedLabelIds;
+    if (change.removedLabelIds?.length) input.removedLabelIds = change.removedLabelIds;
+    if (!input.stateId && !input.addedLabelIds && !input.removedLabelIds) return;
 
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
+      `mutation($issueId: String!, $input: IssueUpdateInput!) {
+        issueUpdate(id: $issueId, input: $input) {
           success
         }
       }`,
-      { issueId, labelIds: [...currentIds, labelId] },
+      { issueId, input },
       "issueUpdate",
     );
   }
 
-  private async removeLabelByName(issueId: string, name: string): Promise<void> {
+  /** IDs of the named labels the issue carries now. The read is safe: the write it feeds only removes. */
+  private async labelIdsByName(issueId: string, names: string[]): Promise<string[]> {
     const getData = await this.linearMutation<{
       issue: { labels: { nodes: Array<{ id: string; name: string }> } };
     }>(
@@ -956,18 +976,15 @@ export class LinearProvider implements TicketingProvider {
       }`,
       { issueId },
     );
-    const remaining = getData.issue.labels.nodes.filter((l) => l.name !== name);
-    if (remaining.length === getData.issue.labels.nodes.length) return;
+    return getData.issue.labels.nodes.filter((l) => names.includes(l.name)).map((l) => l.id);
+  }
 
-    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
-          success
-        }
-      }`,
-      { issueId, labelIds: remaining.map((l) => l.id) },
-      "issueUpdate",
-    );
+  private async addLabelToIssue(issueId: string, labelId: string): Promise<void> {
+    await this.updateIssueLabels(issueId, { addedLabelIds: [labelId] });
+  }
+
+  private async removeLabelsByName(issueId: string, names: string[]): Promise<void> {
+    await this.updateIssueLabels(issueId, { removedLabelIds: await this.labelIdsByName(issueId, names) });
   }
 
   private async transitionToInProgressIfMovable(issueId: string, scopeKey: string): Promise<void> {
@@ -1001,7 +1018,6 @@ export class LinearProvider implements TicketingProvider {
       planComplete: this.planCompleteLabelCache,
       working: this.aiWorkingLabelCache,
       readyForReview: this.readyForReviewLabelCache,
-      needsHuman: this.needsHumanLabelCache,
     };
     for (const key of Object.keys(LINEAR_LABELS) as Array<keyof typeof LINEAR_LABELS>) {
       const label = LINEAR_LABELS[key];
@@ -1028,10 +1044,13 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async markPlanComplete(issueId: string, _scopeKey: string, _opts: { awaitApproval: boolean }): Promise<void> {
-    await this.removeLabelByName(issueId, LINEAR_LABELS.planning.name);
     const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(teamKey, LINEAR_LABELS.planComplete, this.planCompleteLabelCache);
-    await this.addLabelToIssue(issueId, labelId);
+    // One write for the swap, so nothing can interleave between the remove and the add.
+    await this.updateIssueLabels(issueId, {
+      removedLabelIds: await this.labelIdsByName(issueId, [LINEAR_LABELS.planning.name]),
+      addedLabelIds: [labelId],
+    });
   }
 
   async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
@@ -1043,7 +1062,7 @@ export class LinearProvider implements TicketingProvider {
   /** A failure setter's label removal. One that throws is logged, so the failure comment still posts: a failure classification always reaches the ticket. */
   private async removeFailedRunLabel(issueId: string, name: string): Promise<void> {
     try {
-      await this.removeLabelByName(issueId, name);
+      await this.removeLabelsByName(issueId, [name]);
     } catch (err) {
       console.warn(`[linear] Could not remove ${name} from ${issueId}, so its failure comment posts without it:`, err);
     }
@@ -1060,35 +1079,11 @@ export class LinearProvider implements TicketingProvider {
     const teamKey = await this.getTeamKeyForIssue(issueId);
     const readyLabelId = await this.ensureTeamLabel(teamKey, LINEAR_LABELS.readyForReview, this.readyForReviewLabelCache);
 
-    // Atomic label swap: remove AI-Working, add Ready for Review in a single
-    // issueUpdate (matches legacy markIssueReadyForReview behaviour).
-    const getData = await this.linearMutation<{
-      issue: { labels: { nodes: Array<{ id: string; name: string }> } };
-    }>(
-      `query($issueId: String!) {
-        issue(id: $issueId) {
-          labels { nodes { id name } }
-        }
-      }`,
-      { issueId },
-    );
-    const currentLabels = getData.issue.labels.nodes;
-    const newLabelIds = currentLabels
-      .filter((l) => l.name !== LINEAR_LABELS.working.name)
-      .map((l) => l.id);
-    if (!newLabelIds.includes(readyLabelId)) {
-      newLabelIds.push(readyLabelId);
-    }
-
-    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
-          success
-        }
-      }`,
-      { issueId, labelIds: newLabelIds },
-      "issueUpdate",
-    );
+    // Atomic label swap: remove AI-Working, add Ready for Review in a single issueUpdate.
+    await this.updateIssueLabels(issueId, {
+      removedLabelIds: await this.labelIdsByName(issueId, [LINEAR_LABELS.working.name]),
+      addedLabelIds: [readyLabelId],
+    });
 
     await this.postComment(issueId, `AI implementation PR: ${prUrl}`);
     // Label swaps have no Merged-regression hazard (Done is a state, not a label),
@@ -1115,20 +1110,34 @@ export class LinearProvider implements TicketingProvider {
     );
     const issue = data.issue;
     if (!issue) return;
-    if (isTerminalStateType(issue.state.type)) return;
-    const stateId = await this.getCompletedStateId(issue.team.key);
-    const labelIds = issue.labels.nodes
-      .filter((l) => l.name !== LINEAR_LABELS.readyForReview.name)
+    const removedLabelIds = issue.labels.nodes
+      .filter((l) => l.name === LINEAR_LABELS.readyForReview.name || l.name === LINEAR_LABELS.planComplete.name)
       .map((l) => l.id);
-    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $stateId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { stateId: $stateId, labelIds: $labelIds }) {
-          success
-        }
-      }`,
-      { issueId, stateId, labelIds },
-      "issueUpdate",
+    if (isTerminalStateType(issue.state.type)) {
+      // Native integrations can close the issue before merge reconciliation runs.
+      // Clean up labels without changing its terminal state or looking up Done.
+      await this.updateIssueLabels(issueId, { removedLabelIds });
+      return;
+    }
+    const stateId = await this.getCompletedStateId(issue.team.key);
+    await this.updateIssueLabels(issueId, { stateId, removedLabelIds });
+  }
+
+  async markPrClosedUnmerged(issueId: string, _scopeKey: string, prUrl: string): Promise<boolean> {
+    const data = await this.linearMutation<{
+      issue: { state: { type: string }; team: { key: string }; labels: { nodes: Array<{ id: string; name: string }> } } | null;
+    }>(
+      `query($id: String!) { issue(id: $id) { state { type } team { key } labels { nodes { id name } } } }`,
+      { id: issueId },
     );
+    const issue = data.issue;
+    if (!issue || isTerminalStateType(issue.state.type)) return false;
+    const stateId = await this.getCanceledStateId(issue.team.key);
+    const removedLabelIds = issue.labels.nodes.filter((l) => l.name === LINEAR_LABELS.readyForReview.name).map((l) => l.id);
+    // Comment first: a failed comment must leave the issue active for the next retry.
+    await this.postComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, move the issue back to Todo.`);
+    await this.updateIssueLabels(issueId, { stateId, removedLabelIds });
+    return true;
   }
 
   async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
@@ -1138,8 +1147,7 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async clearWorkingState(issueId: string, _scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
-    await this.removeLabelByName(issueId, LINEAR_LABELS.working.name);
-    await this.removeLabelByName(issueId, LINEAR_LABELS.planning.name);
+    await this.removeLabelsByName(issueId, [LINEAR_LABELS.working.name, LINEAR_LABELS.planning.name]);
     return true;
   }
   async parkForHuman(issueId: string, _scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
@@ -1150,13 +1158,8 @@ export class LinearProvider implements TicketingProvider {
     );
     const type = data.issue?.state?.type;
     if (!data.issue || isTerminalStateType(type)) return false;
-    // Marker first: once it is on, pickup skips the issue even if a removal below fails. The
-    // pickup label stays, so the issue keeps its place in the feature-branch grouping tree and,
-    // being non-terminal, keeps holding its parent's roll-up.
-    const markerId = await this.ensureTeamLabel(data.issue.team.key, LINEAR_LABELS.needsHuman, this.needsHumanLabelCache);
-    await this.addLabelToIssue(issueId, markerId);
-    await this.removeLabelByName(issueId, LINEAR_LABELS.working.name);
-    await this.removeLabelByName(issueId, LINEAR_LABELS.planning.name);
+    // Keep the pickup label for grouping identity; callers persist the park record.
+    await this.removeLabelsByName(issueId, [LINEAR_LABELS.working.name, LINEAR_LABELS.planning.name]);
     return true;
   }
   async postComment(issueId: string, body: string): Promise<void> {

@@ -2,14 +2,16 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { makeMapping, makeProvider } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 let recon: typeof import("../reconciliation.js");
+let links: typeof import("../pr-links.js");
 let mod: typeof import("../reconcile-merged.js");
 beforeEach(async () => {
-  ({ recon, mod } = (
-    await testDb({ modules: { recon: () => import("../reconciliation.js"), mod: () => import("../reconcile-merged.js") } })
+  ({ recon, mod, links } = (
+    await testDb({ modules: { links: () => import("../pr-links.js"), recon: () => import("../reconciliation.js"), mod: () => import("../reconcile-merged.js") } })
   ).modules);
 });
 describe("runReconciliations", () => {
-  it("calls markMerged and marks the row dispatched", async () => {
+  it("calls markMerged for a promoted tombstone and marks the row dispatched", async () => {
+    recon.recordReconciliationTombstone({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r" });
     recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "sha" });
     const markMerged = vi.fn(async () => {});
     const resolveProvider = vi.fn(async () => makeProvider({ markMerged }));
@@ -53,5 +55,34 @@ describe("runReconciliations", () => {
     expect(markMerged).toHaveBeenCalledTimes(recon.MAX_RECONCILIATION_ATTEMPTS);
     // The failed row still counts for PR dedup.
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(true);
+  });
+});
+
+describe("resolvePrMapping", () => {
+  const first = makeMapping({ owner: "o", repo: "r" });
+  const second = makeMapping({ owner: "o", repo: "r" });
+
+  function link(mappingKey: string) {
+    links.linkPullRequest({ repository: "o/r", number: 5, url: "https://github.com/o/r/pull/5",
+      role: "implementation", source: "backfill",
+      issue: { trackerKind: "linear", mappingKey, trackerIssueId: "i1", identifier: null, title: null, url: null } });
+  }
+
+  it("resolves two repository mappings using the link without a job row", () => {
+    link("second");
+    expect(mod.resolvePrMapping({ first, second }, "o/r", 5)).toEqual({ scopeKey: "second", mapping: second });
+  });
+
+  it("resolves a single candidate without a link", () => {
+    expect(mod.resolvePrMapping({ first }, "o/r", 5)).toEqual({ scopeKey: "first", mapping: first });
+  });
+
+  it("does not resolve multiple candidates without a link", () => {
+    expect(mod.resolvePrMapping({ first, second }, "o/r", 5)).toBeUndefined();
+  });
+
+  it.each(["missing", "otherRepo"])("does not fall back when linked key %s is outside repository candidates", (key) => {
+    link(key);
+    expect(mod.resolvePrMapping({ first, otherRepo: makeMapping({ owner: "o", repo: "other" }) }, "o/r", 5)).toBeUndefined();
   });
 });

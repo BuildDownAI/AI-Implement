@@ -313,7 +313,7 @@ describe("LinearProvider.fetchSetupFacts — pickup label", () => {
 });
 
 describe("LinearProvider.fetchFeatureNodeRollUps — parked child", () => {
-  it("defers the roll-up while a parked child (pickup label + AI-Needs-Human) is not terminal", async () => {
+  it("defers the roll-up while a parked child (pickup label + Other) is not terminal", async () => {
     linearAnswers({ issues: { nodes: [{
       id: "node-id",
       identifier: "ENG-1",
@@ -321,7 +321,7 @@ describe("LinearProvider.fetchFeatureNodeRollUps — parked child", () => {
       team: { key: "ENG" },
       children: { nodes: [
         { identifier: "ENG-1-c0", state: { type: "completed" }, labels: { nodes: [{ name: "AI-Implement" }] } },
-        { identifier: "ENG-1-c1", state: { type: "started" }, labels: { nodes: [{ name: "AI-Implement" }, { name: "AI-Needs-Human" }] } },
+        { identifier: "ENG-1-c1", state: { type: "started" }, labels: { nodes: [{ name: "AI-Implement" }, { name: "Other" }] } },
       ] },
       parent: null,
     }] } });

@@ -1,3 +1,4 @@
+import { parkIssue } from "./dispatch-breaker.js";
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import type { Job } from "./log.js";
 import { cancelWorkflowRun, getWorkflowRunStatus, getFailedRunStepJob, CONTAINER_INIT_STEP } from "./github.js";
@@ -100,10 +101,10 @@ function ticketPhase(job: Job): "planning" | "implementation" {
   return job.phase === "planning" ? "planning" : "implementation";
 }
 
-/** The restart instruction; on Linear only the AI-Needs-Human marker holds a parked issue. */
+/** Linear parks are released through the orchestrator admin UI. */
 function restartSentence(provider: TicketingProvider | null): string {
   return provider?.id === "linear"
-    ? "To start AI-Implement again, remove the AI-Needs-Human label from the ticket."
+    ? "To start AI-Implement again, unpark the issue at /admin#runners."
     : "To start AI-Implement again, reset the AI-Implement status or label on the ticket.";
 }
 
@@ -191,6 +192,10 @@ async function boundedCleanup(
       try {
         const parked = await provider.parkForHuman(job.issueId!, job.teamKey ?? "", ticketPhase(job));
         if (parked) {
+          if (provider.id === "linear") {
+            parkIssue(job.issueId!, ticketPhase(job), imagePullGiveUp ? IMAGE_PULL_FAILED_STATUS : lastRunStatus,
+              { project: job.teamKey, identifier: job.issueIdentifier });
+          }
           deleteDispatched(job.issueId!);
           resetStuckAttempts(job.issueId!);
         } else {

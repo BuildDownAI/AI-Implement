@@ -1,3 +1,5 @@
+import { decideImplementationSandbox } from "../implementation-launch.js";
+import { getFlyProcessLevelSecrets } from "../runner-mode.js";
 import { requireImplementationRunOwner } from "./implementation-run-owner.js";
 /** Gap-fill-only launch dependencies. Credentials and instructions never leave a step. */
 import type { ImplementationRunProductionInput } from "./implementation-run-production.js";
@@ -219,7 +221,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         const target = initialTarget(run);
         mapping = target.mapping;
         const { item } = target;
-        reviewOnly = rollupReviewMode(item.commenter, mapping);
+        reviewOnly = rollupReviewMode(item.commenter, mapping, item.instruction);
         // Only the image paired with this orchestrator is known to honor reviewOnly.
         // Local Docker builds its runner alongside the orchestrator.
         if (reviewOnly && run.backend !== "local-docker") {
@@ -320,7 +322,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
             runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
             commentInstruction };
           if (run.backend === "fly-machines") {
-            const result = await dispatchFlyGapfill({ ...common, issue, owner: mapping.owner, repo: mapping.repo,
+            const result = await dispatchFlyGapfill({ implementationSandbox: decideImplementationSandbox({ protectedLaunch: decision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }), ...common, issue, owner: mapping.owner, repo: mapping.repo,
               issueIdentifier: run.issueIdentifier, scopeKey: run.teamKey, allTeamKeys: Object.keys(getMappings()),
               flySessionsToken: config.flySessionsToken!, flySessionsApp: flyApp!,
               flySessionsRegion: config.flySessionsRegion, flyOrchestratorApp: config.flyOrchestratorApp,

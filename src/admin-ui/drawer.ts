@@ -59,6 +59,8 @@ export const drawerScript = `
   // rather than ever accumulating unbounded pages in one render pass.
   const PILOT_ACTIVITY_PAGE_SIZE = 50;
   let currentJobId = null;
+  let planningJobId = null;
+  let planningStatus = null;
   let currentJobTerminal = false;
   let mappingsCache = null;
   let drawerRefreshTimer = null;
@@ -248,7 +250,7 @@ export const drawerScript = `
     if (job.teamKey) parts.push('<span class="mono">' + window.esc(job.teamKey) + '</span>');
     if (job.repo) parts.push(window.esc(job.repo));
     if (job.executionMode) parts.push(window.esc(job.executionMode));
-    parts.push('started ' + fmtAgo(job.dispatchedAt));
+    parts.push('Dispatched ' + window.esc(new Date(job.dispatchedAt).toLocaleString()) + ' · started ' + window.esc(fmtAgo(job.dispatchedAt)));
     meta.innerHTML = parts.join(' · ');
   }
 
@@ -486,16 +488,24 @@ export const drawerScript = `
   function renderContext(job, mappings) {
     const contextEl = document.getElementById('drawer-context');
     const fields = [];
+    fields.push({ label: 'Dispatch #', value: window.esc(job.dispatchNumber || 1) });
+    fields.push({ label: 'Phase', value: window.esc(job.phase || 'implementation') });
+    if (job.issueState) fields.push({ label: 'Issue state', value: window.esc(job.issueState) });
+    if (job.sessionImage) fields.push({ label: 'Image', value: '<span class="mono">' + window.esc(job.sessionImage) + '</span>' });
+    if (planningJobId) {
+      fields.push({ label: 'Planning', value: '<button type="button" class="btn btn-sm" id="drawer-planning-job">' + window.esc(planningStatus || 'dispatched') + ' — Open planning dispatch</button>' });
+    }
 
     const mapping = mappings && job.teamKey ? mappings[job.teamKey] : null;
     const repoParts = repoPartsForJob(job, mapping);
 
-    if (job.issueIdentifier) {
+    const issueLabel = job.issueIdentifier || job.issueId;
+    if (issueLabel) {
       // The server resolves issueUrl through the mapping's ticketing provider, so the
       // drawer never has to know which tracker (or which Jira site) a project uses.
       const valueHtml = job.issueUrl
-        ? '<a class="text-accent" href="' + window.escAttr(window.safeUrl(job.issueUrl)) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>'
-        : window.esc(job.issueIdentifier);
+        ? '<a class="text-accent" href="' + window.escAttr(window.safeUrl(job.issueUrl)) + '" target="_blank">' + window.esc(issueLabel) + ' &#8599;</a>'
+        : window.esc(issueLabel);
       fields.push({ label: 'Issue', value: valueHtml });
     }
 
@@ -533,6 +543,11 @@ export const drawerScript = `
       html += '<div class="field"><div class="field-label">' + window.esc(f.label) + '</div><div style="font-size:12.5px">' + f.value + '</div></div>';
     }
     contextEl.innerHTML = html;
+    const planningButton = document.getElementById('drawer-planning-job');
+    if (planningButton) {
+      const planId = planningJobId;
+      planningButton.addEventListener('click', function () { openJobDrawer(planId); });
+    }
   }
 
   function renderLogsLink(job, mappings) {
@@ -1145,7 +1160,9 @@ export const drawerScript = `
     }
   }
 
-  async function openJobDrawer(id) {
+  async function openJobDrawer(id, planId, planStatus) {
+    planningJobId = planId || null;
+    planningStatus = planStatus || null;
     stopDrawerAutoRefresh();
     currentJobId = id;
     // Only refreshJobDrawer's success path updates this — reset it here too, or a

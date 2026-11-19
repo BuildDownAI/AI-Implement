@@ -33,7 +33,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, listAllOpenPullRequests, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { breakerSetupChecks, surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -144,7 +144,8 @@ import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
-import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
+import { sweepUnlinkedPulls } from "./pr-link-sweep.js";
+import { detectMergedPrs } from "./poll-merged-prs.js";
 import {
   githubActionsWatchdogDecision,
   jobTtlDecision,
@@ -234,6 +235,8 @@ export interface AppConfig {
   sessionImageStatus: SessionImageStatus;
   /** True when an explicit orchestrator-wide default image was set (either runner-image env var); drives GHA dispatch forwarding. */
   runnerImageExplicit: boolean;
+  /** True when the default image was derived from the `testing` source-branch stamp (no image variable set). */
+  runnerImageChannelDefault: boolean;
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   githubWebhookSecret: string | null;
@@ -341,7 +344,8 @@ export function loadConfig(): AppConfig {
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
     sessionImage: defaultRunner.image,
     sessionImageStatus: defaultRunner.sessionImageStatus,
-    runnerImageExplicit: defaultRunner.explicit,
+    runnerImageExplicit: defaultRunner.explicit || defaultRunner.channelDefault,
+    runnerImageChannelDefault: defaultRunner.channelDefault,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
     githubWebhookSecret,
@@ -979,24 +983,50 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     console.log(`[review-fix-evidence] expired ${evidenceSweep.purgedAttemptIds.length} attempt(s): ${evidenceSweep.purgedAttemptIds.join(", ")}`);
   }
 
+  try {
+    let appBotLogin: string | undefined;
+    try {
+      appBotLogin = `${await getAppSlug(config.githubAppId, config.githubAppPrivateKey)}[bot]`;
+    } catch {
+      // Unknown App identity prevents new branch-based links; existing links still reopen.
+    }
+    await sweepUnlinkedPulls({
+      mappings: getMappings(),
+      appBotLogin,
+      providerFor: (mapping) => registry.forMapping(mapping),
+      listRepoPulls: async (owner, repo) => listAllOpenPullRequests(
+        await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner), owner, repo,
+      ),
+    });
+  } catch (err) {
+    console.error("[poll] PR link sweep failed:", err);
+  }
+
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
   // for merged PRs the webhook may have missed.
   await detectMergedPrs({
+    cancelIssue: async (link) => {
+      const entry = resolvePrMapping(getMappings(), link.repository, link.number);
+      if (!entry) {
+        throw new Error(`No mapping resolves for ${link.issue.identifier} (${link.repository} #${link.number}); not cancelling`);
+      }
+      const provider = await registry.forMapping(entry.mapping);
+      return provider.markPrClosedUnmerged(link.issue.trackerIssueId, entry.scopeKey, link.url);
+    },
     mappingForRepo: (repo) =>
       Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repo),
     tokenForOwner: (owner) =>
       getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
     getPullRequestState,
     // AII-1294: a parent's own PR closed unmerged must not block its roll-up.
-    finalizeGroupingParent: async (job) => {
-      const prNumber = job.prUrl ? prNumberFromUrl(job.prUrl) : null;
-      const entry = job.repo && prNumber !== null ? resolvePrMapping(getMappings(), job.repo, prNumber) : undefined;
+    finalizeGroupingParent: async (link) => {
+      const entry = resolvePrMapping(getMappings(), link.repository, link.number);
       if (!entry) {
-        console.error(`[merge-poll] No mapping resolves for grouping parent ${job.issueIdentifier} (${job.repo} ${job.prUrl}); not finalizing`);
+        console.error(`[merge-poll] No mapping resolves for grouping parent ${link.issue.identifier} (${link.repository} #${link.number}); not finalizing`);
         return false;
       }
       const provider = await registry.forMapping(entry.mapping);
-      await provider.markMerged(job.issueId, entry.scopeKey);
+      await provider.markMerged(link.issue.trackerIssueId, entry.scopeKey);
       return true;
     },
   });
@@ -5507,6 +5537,11 @@ async function main(): Promise<void> {
   } else if (config.sessionImageStatus === "shadowed") {
     console.warn(
       "[main] SESSION_IMAGE is set but ignored because AI_IMPLEMENT_RUNNER_IMAGE takes precedence. Remove SESSION_IMAGE.",
+    );
+  }
+  if (config.runnerImageChannelDefault) {
+    console.log(
+      `[main] Runner image ${config.sessionImage} derived from source branch "testing" (no AI_IMPLEMENT_RUNNER_IMAGE set)`,
     );
   }
   console.log(`[main] Mapped teams: ${Object.keys(teamRepoMap).join(", ")}`);

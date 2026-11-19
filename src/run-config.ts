@@ -136,7 +136,7 @@ export interface RunConfigV1 {
   accountFallbacks?: AccountFallbacks;
   v: 1;
   issue: { id: string; identifier: string; title: string; description: string };
-  reviewOnly?: { reviewers: ReviewerSelection[] };
+  reviewOnly?: { reviewers: ReviewerSelection[]; expectedHeadSha?: string };
   prNumber?: string;
   baseBranch?: string;
   runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
@@ -210,7 +210,12 @@ export interface RunCredentialsV1 {
   modelAuthGrant?: ModelAuthGrantBootstrapV1 | SealedModelAuthBootstrapV1;
   /** Dispatcher-authored GHA launch context (AII-1427), independent of the grant. Protected-only. */
   modelAuthContext?: ModelAuthContextV1;
-  /** Operator-approved ephemeral full-access policy (AII-1437). Protected-only; must match `modelAuthContext`. */
+  /**
+   * Operator-approved ephemeral full-access policy (AII-1437). Protected-only.
+   * A `gha` policy must match `modelAuthContext`. A `fly` policy requires a sealed Fly
+   * `modelAuthGrant` with the same `dispatchId` and no `modelAuthContext`; the runner
+   * checks `projectKey` after it opens the grant.
+   */
   executionPolicy?: ExecutionPolicyV1;
 }
 
@@ -388,10 +393,19 @@ export function validateRunCredentials(value: unknown): RunCredentialsV1 {
     const parsed = parseExecutionPolicy(value.executionPolicy);
     if (!parsed.ok) credentialsFail(".executionPolicy", "is invalid");
     const ctx = out.modelAuthContext;
-    // The policy is bound to the trusted launch context: no context, or a different dispatch/project, is refused.
-    if (!ctx || ctx.dispatchId !== parsed.value.dispatchId || ctx.projectKey !== parsed.value.projectKey
-        || ctx.backend !== parsed.value.backend) {
-      credentialsFail(".executionPolicy", "does not match the launch context");
+    const policy = parsed.value;
+    if (policy.backend === "gha") {
+      if (!ctx || ctx.dispatchId !== policy.dispatchId || ctx.projectKey !== policy.projectKey
+          || ctx.backend !== policy.backend) {
+        credentialsFail(".executionPolicy", "does not match the launch context");
+      }
+    } else {
+      const grant = out.modelAuthGrant;
+      // The sealed wrapper binds dispatch/backend; project binding is checked after opening it.
+      if (ctx || !grant || !("algorithm" in grant) || grant.backend !== "fly"
+          || grant.dispatchId !== policy.dispatchId) {
+        credentialsFail(".executionPolicy", "does not match the sealed launch grant");
+      }
     }
     out.executionPolicy = parsed.value;
   }
@@ -566,7 +580,7 @@ export interface RunConfigBuildInput {
   mapping: RepoMapping;
   baseBranch?: string;
   runnerCallbackUrl?: string;
-  reviewOnly?: { reviewers: ReviewerSelection[] };
+  reviewOnly?: { reviewers: ReviewerSelection[]; expectedHeadSha?: string };
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. */
   commentInstruction?: string;
@@ -705,10 +719,12 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (cfg.reviewOnly !== undefined) {
     if (!isRec(cfg.reviewOnly) || !isReviewerSelectionArray(cfg.reviewOnly.reviewers) || cfg.reviewOnly.reviewers.length === 0
+      || (cfg.reviewOnly.expectedHeadSha !== undefined && (typeof cfg.reviewOnly.expectedHeadSha !== "string" || !/^[a-f0-9]{40,64}$/i.test(cfg.reviewOnly.expectedHeadSha)))
       || !prNumber || runnerPhase !== "gap-analysis" || reviewFix !== undefined) {
       throw new Error("invalid run_config.reviewOnly");
     }
-    out.reviewOnly = { reviewers: cfg.reviewOnly.reviewers };
+    out.reviewOnly = { reviewers: cfg.reviewOnly.reviewers,
+      ...(cfg.reviewOnly.expectedHeadSha !== undefined ? { expectedHeadSha: cfg.reviewOnly.expectedHeadSha } : {}) };
   }
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
   if (runnerPhase !== undefined) out.runnerPhase = runnerPhase;

@@ -283,6 +283,8 @@ export const componentsCss = `
   margin-top: 2px;
 }
 .card-body { padding: 16px 18px; }
+.tbl-scroll { max-width: 100%; overflow-x: auto; }
+.tbl-scroll .tbl th, .tbl-scroll .tbl td { white-space: nowrap; }
 .card-body.tight { padding: 0; overflow-x: auto; }
 
 /* A card that IS the control — a real <button>, so focus and Enter/Space come with the element. */

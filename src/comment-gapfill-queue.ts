@@ -122,6 +122,13 @@ export const ROLLUP_REVIEW_RETRY_LIMIT = 1;
 
 export const ROLLUP_REVIEW_COMMENTER = "ai-implement-rollup-review";
 
+/** Read only the exact instruction emitted by enqueueRollupReview, including existing rows. */
+export function rollupReviewExpectedHead(instruction: string): string {
+  const match = /^Review the feature-branch roll-up at head ([a-f0-9]{40,64})\. Post an advisory verdict in the PR conversation\.$/i.exec(instruction);
+  if (!match) throw new Error("Cannot read queued roll-up review head");
+  return match[1];
+}
+
 /** Returns true only for a newly inserted head, including across terminal states. */
 export function enqueueRollupReview(input: { owner: string; repo: string; prNumber: number; headSha: string; attempt?: number }): boolean {
   const attempt = input.attempt ?? 0;
