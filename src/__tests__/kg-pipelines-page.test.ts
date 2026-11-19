@@ -414,4 +414,41 @@ describe("KG page — Stardog values", () => {
     expect(calls.filter((c) => c.url === "/api/kg/stardog")).toHaveLength(0);
     expect(doc.getElementById("kg-stardog-token-status")?.textContent).toBe("Token set");
   });
+
+  it("keeps Save disabled during a pending save when the settings poll reloads", async () => {
+    const calls: ApiCall[] = [];
+    let releaseSettingsPost!: (value: ReturnType<typeof response>) => void;
+    const pendingSettingsPost = new Promise<ReturnType<typeof response>>((resolve) => {
+      releaseSettingsPost = resolve;
+    });
+    const { win } = mount(async (url, init) => {
+      calls.push({ url, init });
+      if (url === "/api/settings" && !init) return response(200, SETTINGS);
+      if (url === "/api/settings" && init?.method === "POST") return pendingSettingsPost;
+      if (url === "/api/kg/stardog" && init?.method === "POST") return response(200, { tokenSet: true });
+      throw new Error(`unexpected api call ${url}`);
+    });
+    await win.loadKgGraphSettings();
+    const doc = win.document as Document;
+    const saveButton = doc.getElementById("btn-kg-stardog-save") as HTMLButtonElement;
+    (doc.getElementById("kg-stardog-token") as HTMLInputElement).value = "SENTINEL-pending-save-token";
+
+    const saving = win.saveKgStardog();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(saveButton.disabled).toBe(true);
+
+    await win.loadKgGraphSettings();
+    expect(saveButton.disabled).toBe(true);
+
+    await win.saveKgStardog();
+    expect(calls.filter((c) => c.url === "/api/settings" && c.init?.method === "POST")).toHaveLength(1);
+    expect(calls.filter((c) => c.url === "/api/kg/stardog")).toHaveLength(0);
+
+    releaseSettingsPost(response(200, SETTINGS));
+    await saving;
+
+    expect(calls.filter((c) => c.url === "/api/kg/stardog")).toHaveLength(1);
+    expect(saveButton.disabled).toBe(false);
+  });
 });

@@ -467,6 +467,7 @@ export const kgPipelinesScript = `
   let kgGraphSourceSaved = null;
   let kgGraphSourceBusy = false;
   let kgGraphSettingsLoaded = false;
+  let kgStardogBusy = false;
   let kgStardogSaved = null;
 
   function kgGraphSourceLabel(value) {
@@ -505,6 +506,10 @@ export const kgPipelinesScript = `
       || now.console !== kgStardogSaved.console || now.importHost !== kgStardogSaved.importHost;
   }
 
+  function kgPaintStardogSave() {
+    document.getElementById('btn-kg-stardog-save').disabled = kgStardogBusy || !kgGraphSettingsLoaded;
+  }
+
   async function loadKgGraphSettings() {
     try {
       const res = await window.api('/api/settings');
@@ -525,7 +530,7 @@ export const kgPipelinesScript = `
         data.stardogTokenSet ? 'Token set' : 'Token not set';
       document.getElementById('kg-graph-customer-repo-note').hidden = !data.kgCustomerRepo;
       kgGraphSettingsLoaded = true;
-      document.getElementById('btn-kg-stardog-save').disabled = false;
+      kgPaintStardogSave();
       if (!kgGraphSourceBusy) kgPaintGraphSource(source);
     } catch (e) { /* transient — next poll retries */ }
   }
@@ -609,10 +614,10 @@ export const kgPipelinesScript = `
   };
 
   window.saveKgStardog = async function () {
-    const btn = document.getElementById('btn-kg-stardog-save');
     const status = document.getElementById('kg-stardog-save-status');
     const error = document.getElementById('kg-stardog-error');
     const input = document.getElementById('kg-stardog-token');
+    if (kgStardogBusy) return;
     if (!kgGraphSettingsLoaded) {
       status.textContent = '';
       error.textContent = 'Load the Stardog values before saving.';
@@ -623,7 +628,8 @@ export const kgPipelinesScript = `
     error.hidden = true;
     error.textContent = '';
     status.textContent = 'Saving\\u2026';
-    btn.disabled = true;
+    kgStardogBusy = true;
+    kgPaintStardogSave();
     let tokenSaved = false;
     let valuesSaved = false;
     try {
@@ -656,7 +662,8 @@ export const kgPipelinesScript = `
       error.textContent = (valuesSaved ? 'Stardog values saved, but the token could not be saved' : 'Could not save the Stardog values') + ' \\u2014 ' + String(err);
       error.hidden = false;
     } finally {
-      btn.disabled = !kgGraphSettingsLoaded;
+      kgStardogBusy = false;
+      kgPaintStardogSave();
     }
   };
 
@@ -965,7 +972,7 @@ export const kgPipelinesScript = `
     setInterval(loadKgExecutionMode, 15000);
     setInterval(loadKgMaterializeMode, 15000);
     setInterval(loadKgRunProfile, 15000);
-    setInterval(function () { if (!kgGraphSourceBusy) loadKgGraphSettings(); }, 15000);
+    setInterval(function () { if (!kgGraphSourceBusy && !kgStardogBusy) loadKgGraphSettings(); }, 15000);
     // createDispatchLog comes from the Pipelines page script; the card works without it.
     if (window.createDispatchLog) window.createDispatchLog('kglog', { filter: function (e) { return e.phase === 'kg-refresh'; } }).start();
   });
