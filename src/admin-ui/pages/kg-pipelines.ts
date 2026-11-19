@@ -8,7 +8,7 @@ export const kgPipelinesHtml = `
       <div class="page-subtitle">Refresh the knowledge graph and watch its runs</div>
     </div>
     <div class="page-header-actions">
-      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgRunProfile(); loadKgSchedule()">&#8635; Refresh</button>
+      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgRunProfile(); loadKgSchedule(); loadKgGraphSettings()">&#8635; Refresh</button>
     </div>
   </header>
   <div class="page-body">
@@ -74,6 +74,55 @@ export const kgPipelinesHtml = `
         </div>
         <div class="kpi-trend text-secondary" id="kg-schedule-next">Next run: —</div>
         <div class="kpi-trend text-secondary" id="kg-schedule-last"></div>
+      </div>
+    </div>
+
+    <div class="card" id="kg-graph-source-card">
+      <div class="card-header"><h2 class="card-title">Graph source</h2></div>
+      <div class="card-body">
+        <div class="field">
+          <label for="kg-graph-source">Graph source</label>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <select class="input" id="kg-graph-source" style="flex:1;min-width:180px" onchange="window.saveKgGraphSource()" disabled>
+              <option value="sidecar">Sidecar graph</option>
+              <option value="stardog_run">Stardog</option>
+            </select>
+            <span class="kpi-trend text-secondary" id="kg-graph-source-status"></span>
+          </div>
+          <div id="kg-graph-source-error" class="error" hidden></div>
+        </div>
+        <div class="kpi-trend text-secondary" id="kg-graph-source-billing-note">Stardog bills each query.</div>
+        <div class="kpi-trend text-secondary" id="kg-graph-customer-repo-note" hidden>Only a base-repo refresh loads Stardog. With a customer KG repo, nothing refreshes the Stardog graph.</div>
+        <div class="field">
+          <label for="kg-stardog-db">Database</label>
+          <input class="input" id="kg-stardog-db" placeholder="e.g. builddown-kg">
+        </div>
+        <div class="field">
+          <label for="kg-stardog-endpoint">Endpoint</label>
+          <input class="input" id="kg-stardog-endpoint" placeholder="https://tenant.stardog.run/kg">
+        </div>
+        <div class="field">
+          <label for="kg-stardog-console">Console</label>
+          <input class="input" id="kg-stardog-console" placeholder="https://console.stardog.run">
+        </div>
+        <div class="field">
+          <label for="kg-stardog-import-host">Import host</label>
+          <input class="input" id="kg-stardog-import-host" placeholder="https://app.stardog.run">
+          <div class="text-tertiary" style="font-size:11px;margin-top:3px">Empty means https://app.stardog.run.</div>
+        </div>
+        <div class="field">
+          <label for="kg-stardog-token">Token</label>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input class="input" id="kg-stardog-token" type="password" autocomplete="off" placeholder="Leave blank to keep the stored token" style="flex:1;min-width:180px">
+            <span class="kpi-trend text-secondary" id="kg-stardog-token-status"></span>
+          </div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:3px">The token is sent once and never shown again.</div>
+        </div>
+        <div style="margin-top:12px">
+          <button class="btn btn-primary btn-sm" id="btn-kg-stardog-save" onclick="window.saveKgStardog()" disabled>Save Stardog values</button>
+          <span class="kpi-trend text-secondary" id="kg-stardog-save-status"></span>
+        </div>
+        <div id="kg-stardog-error" class="error" hidden></div>
       </div>
     </div>
     ${dispatchLogHtml("kglog", { title: "Runs", emptyText: "No knowledge-graph refresh runs in the selected time range" })}
@@ -413,6 +462,211 @@ export const kgPipelinesScript = `
     } catch (e) { /* transient \u2014 next poll retries */ }
   }
 
+  // AII-1975: the graph source is what answers the next kg_* call; the Backend controls
+  // above only choose where a refresh runs. Keep the two surfaces apart.
+  let kgGraphSourceSaved = null;
+  let kgGraphSourceBusy = false;
+  let kgGraphSettingsLoaded = false;
+  let kgStardogBusy = false;
+  let kgStardogSaved = null;
+
+  function kgGraphSourceLabel(value) {
+    return value === 'stardog_run' ? 'Stardog' : 'Sidecar graph';
+  }
+
+  function kgShowGraphSourceStatus(text) {
+    document.getElementById('kg-graph-source-status').textContent = text || '';
+  }
+
+  function kgShowGraphSourceError(text) {
+    const el = document.getElementById('kg-graph-source-error');
+    el.textContent = text || '';
+    el.hidden = !text;
+  }
+
+  function kgPaintGraphSource(value) {
+    const select = document.getElementById('kg-graph-source');
+    select.value = value === 'stardog_run' ? 'stardog_run' : 'sidecar';
+    select.disabled = kgGraphSourceBusy || !kgGraphSettingsLoaded;
+  }
+
+  function kgStardogInputs() {
+    return {
+      db: document.getElementById('kg-stardog-db').value,
+      endpoint: document.getElementById('kg-stardog-endpoint').value,
+      console: document.getElementById('kg-stardog-console').value,
+      importHost: document.getElementById('kg-stardog-import-host').value,
+    };
+  }
+
+  function kgStardogDirty() {
+    if (!kgStardogSaved) return false;
+    const now = kgStardogInputs();
+    return now.db !== kgStardogSaved.db || now.endpoint !== kgStardogSaved.endpoint
+      || now.console !== kgStardogSaved.console || now.importHost !== kgStardogSaved.importHost;
+  }
+
+  function kgPaintStardogSave() {
+    document.getElementById('btn-kg-stardog-save').disabled = kgStardogBusy || !kgGraphSettingsLoaded;
+  }
+
+  async function loadKgGraphSettings() {
+    try {
+      const res = await window.api('/api/settings');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+      const source = data.kgGraphSource === 'stardog_run' ? 'stardog_run' : 'sidecar';
+      kgGraphSourceSaved = source;
+      const importHost = document.getElementById('kg-stardog-import-host');
+      if (!kgStardogDirty()) {
+        document.getElementById('kg-stardog-db').value = data.kg_stardog_db || '';
+        document.getElementById('kg-stardog-endpoint').value = data.kg_stardog_run_endpoint || '';
+        document.getElementById('kg-stardog-console').value = data.kg_stardog_run_console || '';
+        importHost.value = data.kg_stardog_run_platform || 'https://app.stardog.run';
+        kgStardogSaved = kgStardogInputs();
+      }
+      document.getElementById('kg-stardog-token-status').textContent =
+        data.stardogTokenSet ? 'Token set' : 'Token not set';
+      document.getElementById('kg-graph-customer-repo-note').hidden = !data.kgCustomerRepo;
+      kgGraphSettingsLoaded = true;
+      kgPaintStardogSave();
+      if (!kgGraphSourceBusy) kgPaintGraphSource(source);
+    } catch (e) { /* transient — next poll retries */ }
+  }
+
+  function kgIdempotencyKey() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return 'kg-source-' + window.crypto.randomUUID();
+    }
+    const bytes = [];
+    for (let i = 0; i < 16; i++) bytes.push(Math.floor(Math.random() * 256).toString(16).padStart(2, '0'));
+    return 'kg-source-' + bytes.join('');
+  }
+
+  // The 60 s call limit answers 503. Re-send with the same key so the retry attaches to
+  // the switch already running; at most 10 total calls, and only a 503 is retried.
+  window.saveKgGraphSource = async function () {
+    if (kgGraphSourceBusy) return;
+    if (!kgGraphSettingsLoaded) {
+      kgShowGraphSourceStatus('');
+      kgShowGraphSourceError('Load the graph settings before switching the source.');
+      return;
+    }
+    const select = document.getElementById('kg-graph-source');
+    const previous = kgGraphSourceSaved || 'sidecar';
+    const source = select.value === 'stardog_run' ? 'stardog_run' : 'sidecar';
+    kgShowGraphSourceError('');
+    kgGraphSourceBusy = true;
+    select.disabled = true;
+    kgShowGraphSourceStatus(source === 'stardog_run'
+      ? 'Switching\\u2026 Stardog can take up to 5 minutes to wake.'
+      : 'Switching\\u2026');
+    const key = kgIdempotencyKey();
+    let out = null;
+    try {
+      for (let attempt = 1; attempt <= 10; attempt++) {
+        const res = await window.api('/api/tools/set_kg_graph_source', {
+          method: 'POST',
+          headers: { 'Idempotency-Key': key },
+          body: JSON.stringify({ args: { source: source } }),
+        });
+        if (res.status === 503) {
+          if (attempt < 10) continue;
+          out = { ok: false, status: 503, body: {} };
+          break;
+        }
+        out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
+        break;
+      }
+      if (!out || out.status === 503) {
+        kgGraphSourceBusy = false;
+        kgPaintGraphSource(previous);
+        kgShowGraphSourceStatus('The switch may still be running. Reload the page to see the source.');
+        return;
+      }
+      if (out.status === 403) {
+        kgGraphSourceBusy = false;
+        kgPaintGraphSource(previous);
+        kgShowGraphSourceStatus('');
+        kgShowGraphSourceError('admin only');
+        return;
+      }
+      if (!out.ok || out.body.switched !== true) {
+        kgGraphSourceBusy = false;
+        kgPaintGraphSource(previous);
+        kgShowGraphSourceStatus('');
+        const reason = out.body.error || out.body.message || out.status;
+        const detail = out.body.message && out.body.message !== reason ? ' \\u2014 ' + out.body.message : '';
+        kgShowGraphSourceError('Switch failed \\u2014 ' + reason + detail);
+        return;
+      }
+      kgGraphSourceBusy = false;
+      kgGraphSourceSaved = out.body.source === 'stardog_run' ? 'stardog_run' : source;
+      kgPaintGraphSource(kgGraphSourceSaved);
+      kgShowGraphSourceStatus('Now answering from ' + kgGraphSourceLabel(kgGraphSourceSaved) + '.');
+    } catch (err) {
+      kgGraphSourceBusy = false;
+      kgPaintGraphSource(previous);
+      kgShowGraphSourceStatus('');
+      kgShowGraphSourceError('Switch failed \\u2014 ' + String(err));
+    }
+  };
+
+  window.saveKgStardog = async function () {
+    const status = document.getElementById('kg-stardog-save-status');
+    const error = document.getElementById('kg-stardog-error');
+    const input = document.getElementById('kg-stardog-token');
+    if (kgStardogBusy) return;
+    if (!kgGraphSettingsLoaded) {
+      status.textContent = '';
+      error.textContent = 'Load the Stardog values before saving.';
+      error.hidden = false;
+      return;
+    }
+    const token = input.value;
+    error.hidden = true;
+    error.textContent = '';
+    status.textContent = 'Saving\\u2026';
+    kgStardogBusy = true;
+    kgPaintStardogSave();
+    let tokenSaved = false;
+    let valuesSaved = false;
+    try {
+      const values = {
+        kg_stardog_db: document.getElementById('kg-stardog-db').value.trim(),
+        kg_stardog_run_endpoint: document.getElementById('kg-stardog-endpoint').value.trim(),
+        kg_stardog_run_console: document.getElementById('kg-stardog-console').value.trim(),
+        kg_stardog_run_platform: document.getElementById('kg-stardog-import-host').value.trim(),
+      };
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify(values) });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(data.error || String(res.status));
+      valuesSaved = true;
+      if (token) {
+        const tokenRes = await window.api('/api/kg/stardog', { method: 'POST', body: JSON.stringify({ token: token }) });
+        const tokenBody = await tokenRes.json().catch(function () { return {}; });
+        // Clear the browser copy as soon as the request is answered; the value stays only
+        // on the server, encrypted, and a failure below still leaves no credential on screen.
+        input.value = '';
+        if (!tokenRes.ok) throw new Error(tokenBody.error || String(tokenRes.status));
+        tokenSaved = true;
+      }
+      kgStardogSaved = null;
+      await loadKgGraphSettings();
+      status.textContent = tokenSaved ? 'Saved, including the token.' : 'Saved.';
+    } catch (err) {
+      // Never echo the field back into an error: it may be the credential the save was carrying.
+      input.value = '';
+      status.textContent = '';
+      error.textContent = (valuesSaved ? 'Stardog values saved, but the token could not be saved' : 'Could not save the Stardog values') + ' \\u2014 ' + String(err);
+      error.hidden = false;
+    } finally {
+      kgStardogBusy = false;
+      kgPaintStardogSave();
+    }
+  };
+
   window.setKgMaterializeDirect = async function (direct) {
     try {
       const res = await window.api('/api/kg/materialize-mode', { method: 'POST', body: JSON.stringify({ direct: direct }) });
@@ -704,6 +958,7 @@ export const kgPipelinesScript = `
   window.loadKgExecutionMode = loadKgExecutionMode;
   window.loadKgMaterializeMode = loadKgMaterializeMode;
   window.loadKgRunProfile = loadKgRunProfile;
+  window.loadKgGraphSettings = loadKgGraphSettings;
 
   window.registerPage('kg-pipelines', function () {
     loadKgStatus();
@@ -711,11 +966,13 @@ export const kgPipelinesScript = `
     loadKgMaterializeMode();
     loadKgRunProfile();
     loadKgSchedule();
+    loadKgGraphSettings();
     setInterval(loadKgSchedule, 15000);
     setInterval(loadKgStatus, 15000);
     setInterval(loadKgExecutionMode, 15000);
     setInterval(loadKgMaterializeMode, 15000);
     setInterval(loadKgRunProfile, 15000);
+    setInterval(function () { if (!kgGraphSourceBusy && !kgStardogBusy) loadKgGraphSettings(); }, 15000);
     // createDispatchLog comes from the Pipelines page script; the card works without it.
     if (window.createDispatchLog) window.createDispatchLog('kglog', { filter: function (e) { return e.phase === 'kg-refresh'; } }).start();
   });

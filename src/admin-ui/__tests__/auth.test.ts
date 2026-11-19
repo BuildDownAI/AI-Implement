@@ -61,6 +61,37 @@ describe("escAttr", () => {
   });
 });
 
+describe("api", () => {
+  it("keeps the caller's headers when it adds authentication", async () => {
+    const win = mountAuth();
+    let seen: Record<string, string> | undefined;
+    win.startRouting = () => {};
+    win.fetch = async (path: string, init: { headers: Record<string, string> }) => {
+      if (String(path).endsWith("/api/auth")) {
+        return { ok: true, status: 200, json: async () => ({ token: "test-token" }) };
+      }
+      if (String(path).endsWith("/api/session-identity")) {
+        return { ok: true, status: 200, json: async () => ({ role: "admin", email: "admin@example.com" }) };
+      }
+      seen = init.headers;
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    win.document.getElementById("access-code").value = "secret";
+    await win.login();
+
+    await win.api("/api/tools/set_kg_graph_source", {
+      method: "POST",
+      headers: { "Idempotency-Key": "kg-switch-test" },
+      body: "{}",
+    });
+
+    expect(seen).toMatchObject({
+      "Content-Type": "application/json",
+      "Idempotency-Key": "kg-switch-test",
+    });
+  });
+});
+
 describe("safeUrl", () => {
   it("blocks javascript: URLs and returns '#'", () => {
     const win = mountAuth();
