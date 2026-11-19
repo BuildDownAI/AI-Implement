@@ -1,7 +1,21 @@
+import { onTestFinished, vi, type Mock } from "vitest";
 import { LINEAR_LABELS } from "../../../providers/linear.js";
 import type { FoundLabel, LinearSetupFacts } from "../../../providers/types.js";
 import type { GitHubSetupFacts, SetupCheckContext } from "../../../setup-checks/index.js";
+import type { SetupCheckRecheck } from "../../../setup-checks/recheck.js";
 import { makeMapping } from "../builders.js";
+
+/**
+ * Records every recheck a runtime failure asks for during the test, and clears the sender when the test finishes.
+ * It imports the recheck module when called, so after testDb's reset it sets the sender on the copy the code under test reads.
+ */
+export async function recordRechecks(): Promise<Mock<(request: SetupCheckRecheck) => Promise<boolean>>> {
+  const recheck = await import("../../../setup-checks/recheck.js");
+  const send = vi.fn(async (_request: SetupCheckRecheck) => true);
+  recheck.setSetupCheckRecheckSender(send);
+  onTestFinished(() => recheck.setSetupCheckRecheckSender(null));
+  return send;
+}
 
 /** Every secret variable a check could read, each set to a value that names itself, so a test can assert none reaches any output. */
 export const SECRET_SENTINELS = {

@@ -1,6 +1,7 @@
 import http from "node:http";
 import { getJobByNonce } from "./log.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
+import { gitHubAppErrorChecks, pointAtSetupChecks } from "./setup-checks/recheck.js";
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -22,6 +23,7 @@ export async function handleTokenRequest(
   githubAppId: string,
   githubAppPrivateKey: string,
 ): Promise<void> {
+  let project: string | null = null;
   try {
     const body = JSON.parse(await readBody(req)) as {
       nonce?: string;
@@ -50,11 +52,12 @@ export async function handleTokenRequest(
     // testing: a vend must return a full-lifetime token, never a cache hit that may be
     // minutes from expiry.
     const repoName = job.repo!.split("/")[1];
+    project = job.teamKey;
     const { token, expiresAt } = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, body.owner, { repositories: [repoName], forceRefresh: true });
 
     json(res, 200, { token, expires_at: expiresAt });
   } catch (err) {
-    console.error("[token-vending] Error:", err);
+    console.error(`[token-vending] Error${pointAtSetupChecks({ ids: gitHubAppErrorChecks(err), project, cause: "token-vending" })}:`, err);
     json(res, 500, { error: "Failed to generate token" });
   }
 }

@@ -123,7 +123,7 @@ describe("what a change since the last cycle sends", () => {
 
   it.each([
     ["nothing", after({}), []],
-    ["a project's mapping, which three orchestrator-wide checks list", after({ perProject: { ENG: { mapping: "m2", sync: "s1" } } }), [{ kind: "project", project: "ENG" }, { kind: "orchestrator-wide" }]],
+    ["a project's mapping, which four orchestrator-wide checks list", after({ perProject: { ENG: { mapping: "m2", sync: "s1" } } }), [{ kind: "project", project: "ENG" }, { kind: "orchestrator-wide" }]],
     ["a new project", after({ perProject: { ...base.perProject, OPS: { mapping: "m1", sync: "s1" } } }), [{ kind: "project", project: "OPS" }, { kind: "orchestrator-wide" }]],
     ["a project's workflow sync", after({ perProject: { ENG: { mapping: "m1", sync: "s2" } } }), [{ kind: "project", project: "ENG" }]],
     ["a deleted project, whose rows the merge drops", after({ perProject: {} }), [{ kind: "orchestrator-wide" }]],

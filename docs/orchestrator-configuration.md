@@ -61,7 +61,7 @@ After `loadConfig()`, `main()` logs these lines in this order, among others:
 | `[main] WARNING: fly-machines mappings exist but FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP is not set` | A mapping uses `fly-machines` and the token or the sessions app is missing |
 | `[main] Fly sessions app: <app>` and `[main] Session image: <image>` | A mapping uses `fly-machines` and both are present |
 
-The Fly rows read only each mapping's own execution mode, so under runner mode `fly` or `shadow` a mapping set to GitHub Actions is sent to Fly without this warning (under `fly` with no sessions app it is skipped at dispatch instead, by `checkForcedPathEligibility`). The `runner.fly-sessions` check resolves each mapping's path the way dispatch does (`resolveExecutionPath`, `src/runner-mode.ts`) and reports that case too.
+The Fly rows read only each mapping's own execution mode, so under runner mode `fly` a mapping set to GitHub Actions is sent to Fly without this warning (with no sessions app it is skipped at dispatch instead, by `checkForcedPathEligibility`). Under `shadow` every run goes to GitHub Actions alone, whatever the mapping says. The `runner.fly-sessions` check resolves each mapping's path the way dispatch does (`resolvePlanningExecutionPath`, `src/runner-mode.ts`, which reads `shadow` as GitHub Actions) and reports the `fly` case too.
 
 The sessions app in the last two rows comes from the cache refreshed by the completed successful registration hook. These Fly logs print after the boot wait.
 

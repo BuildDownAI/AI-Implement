@@ -4,7 +4,8 @@
  * This module holds the list, the context every caller starts from and the runner, with a project's own run and the stored
  * run's merge, the scoped runs a recheck makes, and boot's runs. The contract a check is written against (the check ids, a result,
  * the context a check reads) is contract.ts, re-exported here. The change detector, which sends runs after a saved change, is
- * change-detector.ts. The checks sit beside this module, one module per group, each named `<group>-config.ts`:
+ * change-detector.ts. How a runtime failure names its checks and asks for a recheck is recheck.ts, which reads no check, so any
+ * runtime path imports it without this module's imports. The checks sit beside this module, one module per group, each named `<group>-config.ts`:
  * `orchestrator-config.ts` holds the orchestrator's own environment and settings checks.
  */
 
@@ -24,16 +25,13 @@ import type { TrackerSetupFacts } from "../providers/types.js";
 import { getRunnerMode } from "../runner-mode.js";
 import { listRecentAppDeliveries } from "../webhook-redelivery.js";
 import { getWorkflowSyncByTeam } from "../workflow-sync-queue.js";
-import type { GitHubSetupFacts, SetupCheck, SetupCheckContext, SetupCheckId, SetupCheckResult, SetupCheckState, SetupRecheckCause } from "./contract.js";
+import { NEEDS_ATTENTION, type GitHubSetupFacts, type SetupCheck, type SetupCheckContext, type SetupCheckId, type SetupCheckResult } from "./contract.js";
+import { RECHECK_HOLD_MS, recheckKey } from "./recheck.js";
 import { GITHUB_CONFIG_CHECKS, ownerRepositoryRequests } from "./github-config.js";
 import { isAdminPathConfigured, ORCHESTRATOR_CONFIG_CHECKS } from "./orchestrator-config.js";
 import { TRACKER_CONFIG_CHECKS } from "./tracker-config.js";
 
 export * from "./contract.js";
-
-// The setup checks' time in this module. The change detector's interval is in change-detector.ts, the ingress bounds in src/restate/setup-checks.ts, the Setup page's polls in its own module.
-/** How long a recheck answers for its rows: within it, another recheck of them does nothing. */
-export const RECHECK_HOLD_MS = 60 * 60_000;
 
 /** How each group is named to an operator. The keys stay as they are, since stored runs and their readers use them. */
 export const SETUP_CHECK_GROUP_LABELS: Record<SetupCheckResult["group"], string> = {
@@ -249,9 +247,6 @@ export async function runProjectSetupChecks(
 /** The checks whose rows no one project owns. */
 const ORCHESTRATOR_WIDE_CHECKS = SETUP_CHECKS.filter((check) => !check.perProject);
 
-/** The states of a row someone should look at. */
-const NEEDS_ATTENTION: readonly SetupCheckState[] = ["fail", "cannot-verify", "warn"];
-
 /**
  * Runs every check whose rows no one project owns: the orchestrator's own, each ticketing system's credentials, the App's.
  * The credentials checks judge only whether a ticketing system accepts the app, which a read for no project answers, so no project's setup is read.
@@ -276,13 +271,6 @@ export async function runSetupChecksInScope(ctx: SetupCheckContext, scope: Setup
   return { ...run, results, scope };
 }
 
-/** A runtime failure's request to run a check again: the check, the project it failed for, and what kind of failure named it. */
-export interface SetupCheckRecheck {
-  id: SetupCheckId;
-  project?: string;
-  cause?: SetupRecheckCause;
-}
-
 /** The scope of a recheck: one project's rows of a per-project check given one, else every row of the check. Null for a check not on the list. */
 export function recheckScope(id: string, project?: string): SetupCheckScope | null {
   const check = SETUP_CHECKS.find((candidate) => candidate.id === id);
@@ -290,16 +278,6 @@ export function recheckScope(id: string, project?: string): SetupCheckScope | nu
   return check.perProject && project !== undefined ? { checks: [check.id], projects: [project] } : { checks: [check.id] };
 }
 
-
-/** The key a recheck's time is kept under: its scope's checks, and its projects when it names some. */
-export function recheckKey(scope: SetupCheckScope): string {
-  return scope.projects === undefined ? scope.checks.join(",") : `${scope.checks.join(",")} ${scope.projects.join(",")}`;
-}
-
-/** The recheck times still within the hold, with this one added, so the kept times never outgrow the hour. */
-export function rememberRecheck(times: Readonly<Record<string, number>>, key: string, now: number): Record<string, number> {
-  return { ...Object.fromEntries(Object.entries(times).filter(([, at]) => now - at < RECHECK_HOLD_MS)), [key]: now };
-}
 
 /**
  * Whether a recheck does nothing, so a failure path that fires on every poll runs its check at most once an hour: a recheck of the same rows

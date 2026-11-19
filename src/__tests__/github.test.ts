@@ -1,5 +1,7 @@
 import { describe, it, expect, onTestFinished, vi } from "vitest";
-import { listAllOpenPullRequests, dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob, readPublicRepository, readRepositoryFacts } from "../github.js";
+import { listAllOpenPullRequests, dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedRunStepJob, CONTAINER_INIT_STEP, APP_TOKEN_STEP, readPublicRepository, readRepositoryFacts } from "../github.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { decodeRunConfig } from "../run-config.js";
 import { buildIssueBranchName } from "../pipeline/branch-name.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -1174,45 +1176,50 @@ describe("listPrComments strict option (AII-1309)", () => {
   });
 });
 
-describe("getFailedContainerInitJob", () => {
+describe("getFailedRunStepJob", () => {
   const JOBS = "GET /repos/o/r/actions/runs/5/jobs" as const;
   const jobs = (steps: Array<{ name: string; conclusion: string | null }>): ReplyInit => ({
     json: { jobs: [{ name: "implement", html_url: "https://github.com/o/r/actions/runs/5/job/9", steps }] },
   });
 
-  it("returns the job name and URL when Initialize containers failed", async () => {
+  it.each([CONTAINER_INIT_STEP, APP_TOKEN_STEP])("returns the job name and URL when %s failed", async (step) => {
     const fake = fakeFetch({ [JOBS]: jobs([
       { name: "Set up job", conclusion: "success" },
-      { name: "Initialize containers", conclusion: "failure" },
+      { name: step, conclusion: "failure" },
     ]) }).install();
-    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toEqual({
+    expect(await getFailedRunStepJob("token", "o", "r", 5, step)).toEqual({
       jobName: "implement",
       htmlUrl: "https://github.com/o/r/actions/runs/5/job/9",
     });
     expect(fake.calls[0].url.search).toBe("?filter=latest&per_page=100");
   });
 
-  it("matches a failed Initialize containers step on a job without name or html_url", async () => {
-    fakeFetch({ [JOBS]: { json: { jobs: [{ steps: [{ name: "Initialize containers", conclusion: "failure" }] }] } } }).install();
-    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toEqual({ jobName: "unknown", htmlUrl: null });
+  it("matches a failed step on a job without name or html_url", async () => {
+    fakeFetch({ [JOBS]: { json: { jobs: [{ steps: [{ name: CONTAINER_INIT_STEP, conclusion: "failure" }] }] } } }).install();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, CONTAINER_INIT_STEP)).toEqual({ jobName: "unknown", htmlUrl: null });
   });
 
-  it("returns null when a different step failed", async () => {
+  it("returns null when only a step other than the one asked for failed", async () => {
     fakeFetch({ [JOBS]: jobs([
-      { name: "Initialize containers", conclusion: "success" },
-      { name: "Run pipeline", conclusion: "failure" },
+      { name: CONTAINER_INIT_STEP, conclusion: "success" },
+      { name: APP_TOKEN_STEP, conclusion: "failure" },
     ]) }).install();
-    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toBeNull();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, CONTAINER_INIT_STEP)).toBeNull();
   });
 
   it("returns null on a non-OK response", async () => {
     fakeFetch({ [JOBS]: githubError(403, "Forbidden") }).install();
-    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toBeNull();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, APP_TOKEN_STEP)).toBeNull();
   });
 
   it("returns null when the request throws", async () => {
     fakeFetch({ [JOBS]: () => { throw new Error("network down"); } }).install();
-    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toBeNull();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, APP_TOKEN_STEP)).toBeNull();
+  });
+
+  // The orchestrator recognizes the step by name, so the synced templates must keep naming it so.
+  it.each(["claude-implement.yml", "claude-plan.yml"])("names the token step in workflows/%s", (file) => {
+    expect(readFileSync(join(process.cwd(), "workflows", file), "utf8")).toContain(`- name: ${APP_TOKEN_STEP}\n`);
   });
 });
 

@@ -6,6 +6,7 @@ import type { ModelAuthGrantBootstrapV1 } from "../model-auth-contract.js";
 import { decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
 import { makeLaunchDecision, makeSnapshot, type LaunchDecision } from "./helpers/fixtures/configured-run.js";
 import { makeAppConfig, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github.js", async (importOriginal) => {
@@ -251,6 +252,15 @@ describe("launchPlanningRun", () => {
     expect(count.n).toBe(0);
   });
 
+  // A 404 is a setup problem the park comment can name the checks for (AII-1546).
+  it("counts a 404 for the issue's project as workflow_dispatch_not_found, and parks with that conclusion", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: false, status: 404, error: "Not Found", outcome: "rejected" });
+    for (let i = 0; i < 3; i++) await launchModule.launchPlanningRun(args());
+    expect(dedup.getDb().prepare("SELECT last_conclusion, project, issue_identifier FROM dispatch_breaker WHERE issue_id = ? AND phase = 'planning'").get(issue.id))
+      .toEqual({ last_conclusion: "workflow_dispatch_not_found", project: issue.scopeKey, issue_identifier: issue.identifier });
+    expect(fireBreakerTrip).toHaveBeenCalledWith(config, provider, issue.id, issue.identifier, "planning", 3, "workflow_dispatch_not_found");
+  });
+
   it("unknown: writes no row for the dispatch, returns unknown, does not call onRejected", async () => {
     vi.mocked(github.postWorkflowDispatch).mockResolvedValue({
       success: false, status: 503, error: "upstream timeout", outcome: "unknown",
@@ -365,6 +375,23 @@ describe("launchPlanningSession", () => {
     expect(await call({ config: { ...baseConfig, anthropicApiKey: null, claudeOAuthToken: null } })).toMatchObject({ outcome: "rejected" });
     expect(await call({ execPath: "fly-machines" })).toEqual({ outcome: "rejected", executionMode: "fly-machines" });
     expect(dispatchSession).not.toHaveBeenCalled();
+  });
+
+  it("each config guard names the check that explains it and asks for it to run again for the project", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const send = await recordRechecks();
+    const guards = [
+      [{ mapping: { ...mapping, provider: "bedrock" } }, "runner.project-backend"],
+      [{ config: { ...baseConfig, anthropicApiKey: null, claudeOAuthToken: null } }, "model.credentials-adopted"],
+      [{ execPath: "fly-machines" }, "runner.fly-sessions"],
+    ] as const;
+    for (const [over, check] of guards) {
+      send.mockClear();
+      error.mockClear();
+      await call(over);
+      expect(send.mock.calls).toEqual([[{ id: check, project: issue.scopeKey, cause: "launch-refused" }]]);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining(check));
+    }
   });
 
   it("accepted result carries no secrets", async () => {
@@ -598,6 +625,21 @@ describe("preparePlanningLaunch for an opted-in project", () => {
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
     expect(fireBreakerTrip).toHaveBeenCalledTimes(1);
     expect(breaker.isParked("i-gha", "planning")).toBe(true);
+  });
+
+  // A refusal whose tracker write throws would otherwise repeat every poll without ever parking.
+  it("still counts the refusal when its tracker comment fails", async () => {
+    vi.mocked(managed.prepareManagedDispatch).mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const provider = makeProvider({ markPlanningFailed: vi.fn().mockRejectedValue(new Error("tracker down")) });
+    const args = {
+      config: makeAppConfig(), provider, issue: makeIssue({ id: "i-down" }), mapping: makeMapping(),
+      dispatchId: "d", resolvedPlanningBranch: "main", resolveRunnerImage: vi.fn(), fireBreakerTrip: vi.fn(),
+    };
+    for (let i = 0; i < 3; i++) {
+      await expect(mod.preparePlanningLaunch(args)).rejects.toThrow("managed dispatch refused: runner_incompatible");
+    }
+    expect(breaker.isParked("i-down", "planning")).toBe(true);
   });
 });
 

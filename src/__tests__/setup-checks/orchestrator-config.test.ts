@@ -483,6 +483,8 @@ describe("runner.fly-sessions", () => {
     ["only GitHub Actions projects", "default", onGha],
     ["a Fly project under runner mode gha", "gha", onFly],
     ["a Fly project under runner mode local", "local", onFly],
+    // Shadow mode runs every run kind on GitHub Actions alone.
+    ["a Fly project under runner mode shadow", "shadow", onFly],
   ] as const)("does not apply with %s", async (_name, mode, mappings) => {
     expect(await run("runner.fly-sessions", { mappings, runnerMode: () => ({ mode, source: "db" }), flySessions: unconfigured })).toMatchObject([
       { state: "not-applicable" },
@@ -528,7 +530,6 @@ describe("runner.fly-sessions", () => {
 
   it.each([
     ["fly", "ENG, OPS"],
-    ["shadow", "ENG, OPS"],
     ["default", "ENG"],
   ] as const)("under runner mode %s, fails naming what is unset and the projects it strands (%s)", async (mode, projects) => {
     expect(await run("runner.fly-sessions", { mappings: onFly, runnerMode: () => ({ mode, source: "db" }), flySessions: unconfigured })).toMatchObject([{
@@ -542,6 +543,48 @@ describe("runner.fly-sessions", () => {
     expect(await run("runner.fly-sessions", { mappings: onFly, flySessions: tokenOnly })).toMatchObject([
       { state: "fail", detail: expect.stringMatching(/^the sessions app not set/) },
     ]);
+  });
+});
+
+describe("runner.project-backend", () => {
+  const OPT_IN = { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" };
+  const projects = (executionMode: "github-actions" | "fly-machines") => () => ({
+    BED: makeMapping({ provider: "bedrock", executionMode }),
+    OPT: makeMapping({ extraEnv: OPT_IN, executionMode }),
+    ENG: makeMapping({ executionMode }),
+  });
+  const under = (mode: "default" | "gha" | "fly" | "local" | "shadow", mappings: SetupCheckContext["mappings"]) =>
+    run("runner.project-backend", { mappings, runnerMode: () => ({ mode, source: "db" }) });
+
+  it("does not apply with no project saved", async () => {
+    expect(await under("default", () => ({}))).toMatchObject([{ state: "not-applicable" }]);
+  });
+
+  it.each([
+    ["projects on GitHub Actions under runner mode default", "default", projects("github-actions")],
+    ["projects on GitHub Actions under runner mode gha", "gha", projects("github-actions")],
+    ["projects forced to GitHub Actions from Fly Machines", "gha", projects("fly-machines")],
+    // Shadow mode runs every run kind on GitHub Actions alone, so neither setting is refused there.
+    ["projects on GitHub Actions under runner mode shadow", "shadow", projects("github-actions")],
+    ["projects on Fly Machines under runner mode shadow", "shadow", projects("fly-machines")],
+  ] as const)("passes with %s", async (_name, mode, mappings) => {
+    expect(await under(mode, mappings)).toMatchObject([{ state: "pass" }]);
+  });
+
+  it("fails naming only the Bedrock and opted-in projects that run on Fly Machines, with each project's fix", async () => {
+    expect(await under("default", () => ({ ...projects("fly-machines")(), GHA: makeMapping({ provider: "bedrock" }) }))).toEqual([{
+      state: "fail",
+      detail: "These projects use Bedrock or the ephemeral full-access opt-in, which run only on GitHub Actions, but their runs go to Fly Machines or local Docker, which refuse them: BED, OPT",
+      fix: "Set each listed project's Execution Mode to GitHub Actions at /admin#projects.",
+    }]);
+  });
+
+  it.each(["fly", "local"] as const)("fails under runner mode %s for projects set to GitHub Actions, with the runner mode's fix", async (mode) => {
+    expect(await under(mode, projects("github-actions"))).toMatchObject([{
+      state: "fail",
+      detail: expect.stringMatching(/: BED, OPT$/),
+      fix: "Set the runner mode back to default at /admin#runners, or set it to gha.",
+    }]);
   });
 });
 

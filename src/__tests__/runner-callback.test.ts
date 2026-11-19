@@ -34,6 +34,8 @@ import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 import { testDir } from "./helpers/test-dir.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { makeContext } from "./helpers/builders.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
@@ -51,7 +53,7 @@ const hoisted = vi.hoisted(() => ({
   >(() => Promise.resolve({ merged: false, state: "open", headRef: "ai-implement/eng-1" })),
   getCommitAuthorType: vi.fn<() => Promise<"Bot" | "User" | null>>(() => Promise.resolve("Bot")),
   postOrUpdateStickyComment: vi.fn<() => Promise<void>>(() => Promise.resolve()),
-  getFailedContainerInitJob: vi.fn<() => Promise<null>>(() => Promise.resolve(null)),
+  getFailedRunStepJob: vi.fn<() => Promise<null>>(() => Promise.resolve(null)),
 }));
 
 vi.mock("../github-app-auth.js", async (importOriginal) => {
@@ -67,7 +69,7 @@ vi.mock("../github.js", async (importOriginal) => {
     getPullRequestState: hoisted.getPullRequestState,
     getCommitAuthorType: hoisted.getCommitAuthorType,
     postOrUpdateStickyComment: hoisted.postOrUpdateStickyComment,
-    getFailedContainerInitJob: hoisted.getFailedContainerInitJob,
+    getFailedRunStepJob: hoisted.getFailedRunStepJob,
   };
 });
 
@@ -350,6 +352,7 @@ describe("handleRunnerResult — planning", () => {
     vi.spyOn(fake, "markPlanComplete").mockRejectedValue(error);
     const failSpy = vi.spyOn(fake, "markPlanningFailed");
     const commentSpy = vi.spyOn(fake, "postComment");
+    const send = await recordRechecks();
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
       body: { phase: "planning", outcome: "success", comments: [] },
@@ -362,11 +365,15 @@ describe("handleRunnerResult — planning", () => {
     const row = log.getJobByDispatchId(dispatchId);
     expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
     expect(row?.failure?.code).toBe("PLAN_STATUS_WRITE_FAILED");
-    expect(row?.failure?.message).toBe(runnerCallback.planCompleteFailureText(providerId, false, error));
+    // The failure text names the setup check behind the refused write, and asks for it to run again for the project.
+    const check = providerId === "jira" ? "tracker.jira.status-options" : "tracker.linear.lifecycle-labels";
+    expect(row?.failure?.message?.startsWith(runnerCallback.planCompleteFailureText(providerId, false, error))).toBe(true);
+    expect(row?.failure?.message).toContain(`\`${check}\``);
+    expect(send.mock.calls).toEqual([[{ id: check, project: "ENG", cause: "tracker-write" }]]);
     expect(row?.failure?.message).toContain("Unpark at /admin#runners");
     expect(failSpy).toHaveBeenCalledWith("i", "ENG", row?.failure?.message);
     expect(row?.failureCommentedAt).toBeTruthy();
-    expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
+    expect(dispatchBreaker.breakersForIssue("ENG-1")).toEqual([expect.objectContaining({ issueId: "i", phase: "planning", parkedAt: expect.any(Number), project: "ENG" })]);
   });
 
   it("still parks the issue and answers 200 when the failure write is refused too", async () => {
@@ -391,6 +398,16 @@ describe("handleRunnerResult — planning", () => {
     expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
     expect(row?.failureCommentedAt ?? null).toBeNull();
     expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
+  });
+
+  it("names the setup checks behind each kind of refused plan-complete write", async () => {
+    const { LinearGraphQLError, LinearLabelWriteError } = await import("../providers/linear.js");
+    const graphql = new LinearGraphQLError("issueUpdate", "access denied");
+    expect(runnerCallback.planCompleteFailureChecks("jira", new Error("x"))).toEqual(["tracker.jira.status-options"]);
+    expect(runnerCallback.planCompleteFailureChecks("linear", new LinearLabelWriteError("Plan-Complete", "ENG", graphql))).toEqual(["tracker.linear.lifecycle-labels"]);
+    expect(runnerCallback.planCompleteFailureChecks("linear", graphql)).toEqual(["tracker.linear.team-access"]);
+    expect(runnerCallback.planCompleteFailureChecks("linear", new Error("network"))).toEqual(["tracker.linear.lifecycle-labels"]);
+    expect(runnerCallback.planCompleteFailureChecks("filesystem", new Error("x"))).toEqual([]);
   });
 
   describe("planCompleteFailureText", () => {
@@ -1935,6 +1952,100 @@ describe("handleRunnerResult — implementation", () => {
     // Proves the provider was actually reached — without this, the assertions above would
     // pass identically if markImplementationFailed were never called at all.
     expect(markImplementationFailedCalls).toBe(1);
+  });
+});
+
+// A failure only the runner sees reaches the setup checks through its authenticated result (AII-1546).
+describe("handleRunnerResult — a runner-reported failure names the setup checks that explain it", () => {
+  let send: Awaited<ReturnType<typeof recordRechecks>>;
+  beforeEach(async () => {
+    send = await recordRechecks();
+  });
+
+  const record = (code: string, category: FailureRecord["category"] = "auth"): FailureRecord =>
+    ({ category, code, stage: "push", attempt: 1, retryable: false, message: "refused", evidence: { truncated: false } });
+
+  async function fail(phase: "implementation" | "planning", body: { failure?: FailureRecord; failureCode?: string; referenceRepoResults?: ReferenceRepoResult[] }, beforeResult?: (dispatchId: string) => void) {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase,
+      ttlSeconds: phase === "planning" ? runnerTokens.PLANNING_TTL_SECONDS : runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    beforeResult?.(dispatchId);
+    // The dispatch's job row, which every dispatch writes before its run starts.
+    log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Fix it", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions", phase });
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase, outcome: "failure", failureReason: "refused", comments: [], ...body },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    const method = phase === "planning" ? "markPlanningFailed" : "markImplementationFailed";
+    return { comment: String(fake.recordedCalls().find((c) => c.method === method)?.args[2]), comments: fake.commentsFor("i") };
+  }
+
+  it.each([
+    ["a refused git push", { failure: record("GIT_AUTH") }],
+    ["an unreadable check run, reported by code alone", { failureCode: "CHECKS_PERMISSION_DENIED" }],
+  ])("%s names github.permissions in the failure comment and asks for it to run again for the project", async (_name, body) => {
+    const { comment } = await fail("implementation", body);
+    expect(send.mock.calls).toEqual([[{ id: "github.permissions", project: "ENG", cause: "runner-reported" }]]);
+    expect(comment).toContain("`github.permissions`");
+  });
+
+  it("a refused model credential on a run without a managed credential names the adoption check, in planning's comment too", async () => {
+    const { comment } = await fail("planning", { failure: record("PROVIDER_AUTH") });
+    expect(send.mock.calls).toEqual([[{ id: "model.credentials-adopted", project: "ENG", cause: "runner-reported" }]]);
+    expect(comment).toContain("`model.credentials-adopted`");
+  });
+
+  it("a refused model credential on a project with configured model access names no check, since the adoption check passes for it", async () => {
+    // Imported after testDb's reset, so it writes the database runner-callback.ts reads.
+    const store = await import("../agent-config-store.js");
+    store.saveAccountProfileRevision({ profileId: "claude-main", identity: "Claude Main", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "vault/claude-main" } });
+    const stage = { agent: "claude", provider: "anthropic", model: "m-1", accountProfileId: "claude-main", invocationTimeoutMs: 60_000 } as const;
+    store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
+    store.setProjectConfigured("ENG", true);
+    const { comment } = await fail("implementation", { failure: record("PROVIDER_AUTH") });
+    expect(send).not.toHaveBeenCalled();
+    expect(comment).not.toContain("/admin#setup");
+  });
+
+  it("a refused model credential on a run dispatched with a managed credential names no check, though its project has since gone back to legacy", async () => {
+    // The dispatch's frozen stage snapshot, the row agent-run preparation writes when it launches a managed run.
+    const snapshot = makeSnapshot();
+    const { comment } = await fail("implementation", { failure: record("PROVIDER_AUTH") }, (dispatchId) => {
+      dedup.getDb().prepare(`INSERT INTO run_agent_config_snapshots
+        (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+        VALUES (?, ?, 'ENG', ?, ?, ?, ?)`).run(snapshot.snapshotId, dispatchId,
+        JSON.stringify({ stages: snapshot.stages, profiles: snapshot.profiles }), JSON.stringify(snapshot.sources), JSON.stringify(snapshot.configRevisions), Date.now());
+    });
+    expect(send).not.toHaveBeenCalled();
+    expect(comment).not.toContain("/admin#setup");
+  });
+
+  it("a failure no setup fault explains keeps its comment as it was and asks for nothing", async () => {
+    const { comment } = await fail("implementation", { failure: record("PROVIDER_OVERLOADED", "transient") });
+    expect(send).not.toHaveBeenCalled();
+    expect(comment).not.toContain("/admin#setup");
+  });
+
+  it.each([
+    ["the App cannot reach a private one", "no-auth", true],
+    ["its declared ref is missing", "ref-not-found", true],
+    ["its token could not be minted", "token-error", true],
+    ["a network or git error stopped its clone", "clone-error", false],
+    ["its declared path is invalid", "path-invalid", false],
+  ] as const)("a reference repository that missed the run because %s names github.reference-repos only for a cause that check reads", async (_name, cause, named) => {
+    const referenceRepoResults: ReferenceRepoResult[] = [{ repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause }];
+    const { comments } = await fail("implementation", { failure: record("PROVIDER_OVERLOADED", "transient"), referenceRepoResults });
+    const refComment = comments.find((c) => c.includes("reference repositor"));
+    expect(send.mock.calls).toEqual(named ? [[{ id: "github.reference-repos", project: "ENG", cause: "runner-reported" }]] : []);
+    expect(refComment?.includes("`github.reference-repos`")).toBe(named);
   });
 });
 
@@ -3913,7 +4024,7 @@ describe("watchdogConfig — remediateFailedJob gating", () => {
     });
     log.updateJobRunId(log.getJobByDispatchId(dispatchId)!.id, 77);
     log.incrementStuckAttempts("i");
-    hoisted.getFailedContainerInitJob.mockClear();
+    hoisted.getFailedRunStepJob.mockClear();
 
     await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
@@ -3923,7 +4034,7 @@ describe("watchdogConfig — remediateFailedJob gating", () => {
       watchdogConfig,
     });
 
-    expect(hoisted.getFailedContainerInitJob).not.toHaveBeenCalled();
+    expect(hoisted.getFailedRunStepJob).not.toHaveBeenCalled();
   });
 
   it("skips remediateFailedJob for an INSTALL_FAILED callback carrying prUrl", async () => {

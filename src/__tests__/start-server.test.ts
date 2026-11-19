@@ -125,6 +125,18 @@ describe("the admin setup-check routes", () => {
   });
 });
 
+// The one sender every runtime failure's recheck goes through is set as the server starts (AII-1546).
+describe("a runtime failure's recheck", () => {
+  it("reaches the SetupChecks object once the server has started", async () => {
+    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/recheck/send": { json: { invocationId: "inv_2", status: "Accepted" } } }).install();
+    await serve();
+    // Imported after testDb's reset, so it is the instance startServer set the sender on.
+    (await import("../setup-checks/recheck.js")).recheckSetupCheck({ id: "github.installation", project: "SAN", cause: "dispatch-404" });
+    await vi.waitFor(() => expect(fake.calls).toHaveLength(1));
+    expect(JSON.parse(fake.calls[0]!.body)).toEqual({ id: "github.installation", project: "SAN", cause: "dispatch-404" });
+  });
+});
+
 describe("while Restate cannot serve", () => {
   const SECRET = "runner-token-secret";
   const NOTHING: Routes = {};

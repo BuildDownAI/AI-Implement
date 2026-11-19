@@ -1,6 +1,6 @@
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import type { Job } from "./log.js";
-import { cancelWorkflowRun, getWorkflowRunStatus, getFailedContainerInitJob } from "./github.js";
+import { cancelWorkflowRun, getWorkflowRunStatus, getFailedRunStepJob, CONTAINER_INIT_STEP } from "./github.js";
 import { getStuckAttempts, incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getJobById } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
 import { IMAGE_PULL_FAILED_STATUS, notifyStuckGiveUp } from "./notify.js";
@@ -473,7 +473,7 @@ export async function remediateFailedJob(
     if (owner && repo) {
       try {
         const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-        const found = await getFailedContainerInitJob(ghToken, owner, repo, job.runId);
+        const found = await getFailedRunStepJob(ghToken, owner, repo, job.runId, CONTAINER_INIT_STEP);
         if (found) imagePullFailure = { jobName: found.jobName, htmlUrl: found.htmlUrl };
       } catch (err) {
         console.warn(`[monitor] Could not inspect jobs for run ${job.runId}:`, err);

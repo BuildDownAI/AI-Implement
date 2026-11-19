@@ -3,6 +3,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as PublicationTokenModule from "../publication-token-vending.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import { testDb } from "./helpers/test-db.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -209,6 +210,16 @@ describe("handlePublicationTokenRequest", () => {
     expect((await callHandler(token)).status).toBe(200);
     expect((await callHandler(token)).status).toBe(403);
     expect(mockGetScopedToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("names the checks behind a GitHub App error in its line and asks for them to run again for the project", async () => {
+    const { GitHubApiError } = await import("../github-errors.js");
+    const send = await recordRechecks();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockGetScopedToken.mockRejectedValueOnce(new GitHubApiError({ status: 403, path: "/app/installations/1/access_tokens" }));
+    expect((await callHandler(mintPublicationToken())).status).toBe(500);
+    expect(send.mock.calls).toEqual([[{ id: "github.permissions", project: "ENG", cause: "token-vending" }]]);
+    expect(String(error.mock.calls[0]?.[0])).toContain("github.permissions");
   });
 
   it("rejects a concurrent exchange while a mint is in flight and keeps a successful claim consumed", async () => {

@@ -60,6 +60,8 @@ vi.mock("../dispatch-breaker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../dispatch-breaker.js")>()),
   recordDispatchSuccess: vi.fn(),
   recordDispatchFailure: vi.fn().mockReturnValue({ tripped: false, failures: 1 }),
+  // The trip comment reads the row's project, and this file has no database.
+  breakerProject: vi.fn(() => null),
 }));
 
 vi.mock("../config.js", () => ({
@@ -95,7 +97,9 @@ import { notifyStuckGiveUp, notifyCompletion } from "../notify.js";
 import { getMappings } from "../config.js";
 import { destroyMachine } from "../fly-machines.js";
 import { removeLocalContainer } from "../local-docker.js";
-import { monitorJobs, reportTerminalJob } from "../index.js";
+import { fireBreakerTrip, monitorJobs, reportTerminalJob } from "../index.js";
+import { breakerProject } from "../dispatch-breaker.js";
+import { cacheSetupCheckRun, type SetupCheckResult } from "../setup-checks/index.js";
 import { recordDispatchSuccess, recordDispatchFailure } from "../dispatch-breaker.js";
 import type { AppConfig } from "../index.js";
 
@@ -699,7 +703,7 @@ describe("reportTerminalJob — fix runs", () => {
       if (status === "review_failed" && bucket === "gap-analysis") {
         expect(recordDispatchFailure).not.toHaveBeenCalled();
       } else {
-        expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", bucket, "x");
+        expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", bucket, "x", { project: "ENG", identifier: "ENG-1" });
       }
     }
   });
@@ -715,7 +719,7 @@ describe("reportTerminalJob — fix runs", () => {
       await reportTerminalJob(config, makeRegistry(makeProvider()), makeJob({ phase: "gap-analysis", status: "failed", conclusion: "failure" } as Partial<Job>));
     }
     expect(recordDispatchFailure).toHaveBeenCalledTimes(3);
-    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "failure");
+    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "failure", { project: "ENG", identifier: "ENG-1" });
   });
 
   it("posts no second comment and no completion notice for stuck_review_fix", async () => {
@@ -725,7 +729,7 @@ describe("reportTerminalJob — fix runs", () => {
       makeRegistry(provider),
       makeJob({ phase: "gap-analysis", status: "timed_out", conclusion: "stuck_review_fix" } as Partial<Job>),
     );
-    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "stuck_review_fix");
+    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "stuck_review_fix", { project: "ENG", identifier: "ENG-1" });
     expect(provider.postComment).not.toHaveBeenCalled();
     expect(notifyCompletion).not.toHaveBeenCalled();
   });
@@ -752,6 +756,44 @@ describe("reportTerminalJob — fix runs", () => {
     const trip = vi.mocked(provider.postComment).mock.calls.map((c) => c[1]).find((b) => b.includes("parked this issue"));
     expect(trip).toContain(`\`${phase}\``);
     expect(trip).not.toContain("A person can still comment `/ai-implement`");
+  });
+
+  // A 404's park comment names the setup checks behind it, never a check's detail or fix (AII-1546).
+  describe("a park after dispatches GitHub answered 404", () => {
+    const row = (id: SetupCheckResult["id"], state: SetupCheckResult["state"], project: string): SetupCheckResult =>
+      ({ id, title: "", group: "github", tier: "core", onAdminPath: false, state, project, detail: "The App is not installed on acme", fix: "Install the App." });
+    const park = async (conclusion: string) => {
+      const provider = makeProvider();
+      await fireBreakerTrip(config, provider, "issue-1", "ENG-1", "implementation", 3, conclusion);
+      return vi.mocked(provider.postComment).mock.calls[0][1];
+    };
+
+    it("names the checks failing for the issue's project, and not another project's", async () => {
+      vi.mocked(breakerProject).mockReturnValue("ENG");
+      cacheSetupCheckRun({ checkedAt: 0, results: [row("github.installation", "fail", "ENG"), row("github.workflow-default-branch", "fail", "OPS")] });
+      const comment = await park("workflow_dispatch_not_found");
+      expect(comment).toContain("failing for this project: `github.installation`");
+      expect(comment).toContain("/admin#setup");
+      expect(comment).not.toContain("github.workflow-default-branch");
+      expect(comment).not.toContain("The App is not installed");
+      expect(comment).not.toContain("Install the App.");
+    });
+
+    it("names every check that can cause it while none fails yet", async () => {
+      vi.mocked(breakerProject).mockReturnValue("ENG");
+      cacheSetupCheckRun({ checkedAt: 0, results: [row("github.installation", "pass", "ENG")] });
+      expect(await park("workflow_dispatch_not_found")).toContain(
+        "Setup checks that explain it: `github.installation`, `github.workflow-default-branch`, `github.workflow-mapping-branch`",
+      );
+    });
+
+    it("names no check for any other conclusion, even one failing for the project", async () => {
+      vi.mocked(breakerProject).mockReturnValue("ENG");
+      cacheSetupCheckRun({ checkedAt: 0, results: [row("github.installation", "fail", "ENG")] });
+      const comment = await park("workflow_dispatch_failed");
+      expect(comment).not.toContain("github.installation");
+      expect(comment).not.toContain("/admin#setup");
+    });
   });
 
   it.each(["stuck_giveup", "stuck_requeued"])("keeps the breaker trip silent for %s", async (conclusion) => {

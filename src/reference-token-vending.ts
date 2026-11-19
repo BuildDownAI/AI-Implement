@@ -3,6 +3,7 @@ import { getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
 import { githubRepoParts } from "./reference-repos.js";
 import { verifyRunToken } from "./runner-tokens.js";
+import { pointAtSetupChecks } from "./setup-checks/recheck.js";
 
 export interface HandleReferenceTokenInput {
   authorization: string | undefined;
@@ -95,7 +96,8 @@ export async function handleReferenceTokenRequest(
           console.log(`[reference-token] App not installed on "${owner}"; proceeding without token (public)`);
           return { owner, token: null, expiresAt: null, authMode: "public" as const };
         }
-        console.error(`[reference-token] Failed to mint token for owner "${owner}":`, err);
+        const pointer = pointAtSetupChecks({ ids: ["github.reference-repos"], project: verified.mappingTeamKey, cause: "token-vending" });
+        console.error(`[reference-token] Failed to mint token for owner "${owner}"${pointer}:`, err);
         return { owner, token: null, expiresAt: null, authMode: "error" as const };
       }
     }),

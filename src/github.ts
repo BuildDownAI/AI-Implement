@@ -1048,24 +1048,30 @@ export async function getWorkflowRunStatus(
   };
 }
 
-export interface FailedContainerInitJob {
+export interface FailedRunStepJob {
   /** The job's name, or `"unknown"` when the API omitted it. */
   jobName: string;
   htmlUrl: string | null;
 }
 
+/** The step where GitHub pulls a job's container image, so a denied or missing runner image fails there. */
+export const CONTAINER_INIT_STEP = "Initialize containers";
+
+/** The synced templates' step that mints a run's GitHub App token from the AI_IMPLEMENT_APP_ID and AI_IMPLEMENT_PRIVATE_KEY secrets. */
+export const APP_TOKEN_STEP = "Generate GitHub App token";
+
 /**
- * Finds a job of a run whose `Initialize containers` step failed — GitHub's job-container image
- * pull happens there, so this is how a denied or missing runner image shows up. Returns null for any
- * other shape, a non-OK response, or a thrown error: a lookup failure must never make a run less
- * retryable.
+ * Finds a job of a run whose step named `stepName` failed, one of the steps above that fail before
+ * the runner starts. Returns null for any other shape, a non-OK response, or a thrown error: a lookup
+ * failure must never make a run less retryable.
  */
-export async function getFailedContainerInitJob(
+export async function getFailedRunStepJob(
   token: string,
   owner: string,
   repo: string,
   runId: number,
-): Promise<FailedContainerInitJob | null> {
+  stepName: string,
+): Promise<FailedRunStepJob | null> {
   try {
     const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`;
     const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
@@ -1079,7 +1085,7 @@ export async function getFailedContainerInitJob(
     };
     for (const job of data.jobs ?? []) {
       const failed = (job.steps ?? []).some(
-        (step) => step.name === "Initialize containers" && step.conclusion === "failure",
+        (step) => step.name === stepName && step.conclusion === "failure",
       );
       if (failed) return { jobName: job.name || "unknown", htmlUrl: job.html_url || null };
     }

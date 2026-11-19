@@ -8,8 +8,9 @@ import crypto from "node:crypto";
 import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
+import { gitHubAppErrorChecks, pointAtSetupChecks } from "./setup-checks/recheck.js";
 import { canDispatch } from "./dispatch-gate.js";
-import { isParked, claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
+import { isParked, claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice, type BreakerSubject } from "./dispatch-breaker.js";
 import {
   checkAdmission,
   acquire as acquireAdmission,
@@ -259,12 +260,13 @@ export async function firePrBudgetPark(
   opts: Pick<DrainCommentGapfillsInput, "getInstallationToken" | "listPrComments" | "postComment" | "postTrackerComment">,
   mapping: RepoMapping,
   issueId: string,
+  subject: BreakerSubject,
   owner: string,
   repo: string,
   prNumber: number,
   budget: number,
 ): Promise<void> {
-  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget");
+  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget", subject);
   const parkedAt = claimPrBudgetNotice(issueId, "gap-analysis");
   if (parkedAt == null) return;
 
@@ -335,7 +337,10 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       try {
         ghToken = await opts.getInstallationToken(item.owner);
       } catch (err) {
-        console.warn(`[comment-gapfill] could not get a token for ${fullRepo}; item #${item.id} stays pending:`, err);
+        // For the repository's project, or every project when several share the repository.
+        const project = repoMappingEntries.length === 1 ? repoMappingEntries[0][0] : undefined;
+        const pointer = pointAtSetupChecks({ ids: gitHubAppErrorChecks(err), project, cause: "github-read" });
+        console.warn(`[comment-gapfill] could not get a token for ${fullRepo}; item #${item.id} stays pending${pointer}:`, err);
         continue;
       }
       let pr: Awaited<ReturnType<typeof getPullRequestState>> = null;
@@ -433,7 +438,8 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       // AII-1437: an ephemeral full-access opt-in cannot run off GHA; defer rather than throw at launch.
       const pathEligibility = checkForcedPathEligibility(opts.runnerMode, mapping, true);
       if (!pathEligibility.eligible && hasEphemeralFullAccessOptIn(mapping.extraEnv)) {
-        console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${pathEligibility.reason}`);
+        const pointer = pointAtSetupChecks({ ids: [pathEligibility.check], project: scopeKey, cause: "launch-refused" });
+        console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${pathEligibility.reason}${pointer}`);
         continue;
       }
 
@@ -453,7 +459,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         recordCommentGapfillRefusal(item.id, admission.reason, dispatchId);
         await notifyCommentGapfillSkipped(opts, item.id);
         if (admission.reason === "budget_exhausted" || (!gateDecision.ok && gateDecision.reason === "pr_budget")) {
-          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+          await firePrBudgetPark(opts, mapping, prLog.issueId, { project: scopeKey, identifier: prLog.issueIdentifier }, item.owner, item.repo, item.prNumber, prBudget);
         }
         continue;
       }
@@ -465,7 +471,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         recordCommentGapfillRefusal(item.id, reason, dispatchId);
         await notifyCommentGapfillSkipped(opts, item.id);
         if (reason === "budget_exhausted") {
-          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+          await firePrBudgetPark(opts, mapping, prLog.issueId, { project: scopeKey, identifier: prLog.issueIdentifier }, item.owner, item.repo, item.prNumber, prBudget);
         }
         console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${gateDecision.reason}`);
         continue;

@@ -380,6 +380,24 @@ describe("JiraProvider lifecycle status setters", () => {
     expectStatusBody(fake, "Implementation Failed");
   });
 
+  // A failure classification always reaches the ticket, even when Jira refuses the status write (AII-1546).
+  it.each([
+    ["markPlanningFailed", "Planning failed"],
+    ["markImplementationFailed", "Implementation failed"],
+  ] as const)("%s still posts its failure comment when the status write is refused", async (method, phrase) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: statusRead("Implementing"),
+      [STATUS_WRITE]: jiraError(400, "Option id 'x' is not valid"),
+      [COMMENT]: commented,
+    }).install();
+    const p = makeProvider({ cacheScope: `c-refused-${method}`, mappings: { "acme/x": jiraMapping() } });
+    expect(await p[method]("10001", "acme/x", "boom")).toBe(true);
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT", "POST"]);
+    expect(commentText(fake)).toContain(`${phrase}: boom`);
+  });
+
   it("clearWorkingState resets status to Plan Approved", async () => {
     const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c7", mappings: { "acme/x": jiraMapping() } });

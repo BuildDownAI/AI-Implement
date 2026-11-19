@@ -667,18 +667,6 @@ describe("a recheck", () => {
     expect(checks.recheckHeld(run, { checks: ["tracker.linear.team-access"], projects: ["ENG"] }, lastRecheckAt, HOUR)).toBe(held);
   });
 
-  it("keeps each project's recheck time apart, and the check's own for rows with no project", () => {
-    expect(new Set([
-      checks.recheckKey({ checks: ["tracker.linear.team-access"], projects: ["ENG"] }),
-      checks.recheckKey({ checks: ["tracker.linear.team-access"], projects: ["OPS"] }),
-      checks.recheckKey({ checks: ["tracker.linear.team-access"] }),
-    ]).size).toBe(3);
-  });
-
-  it("keeps only the recheck times within the hour, and adds the new one", () => {
-    expect(checks.rememberRecheck({ old: 0, recent: 1 }, "new", HOUR)).toEqual({ recent: 1, new: HOUR });
-  });
-
   describe("of the checks a rechecked run's rows wait on", () => {
     const waiting = (id: SetupCheckId, waitsOn?: SetupCheckId): SetupCheckResult =>
       ({ id, title: "", group: "tracker", tier: "core", onAdminPath: false, state: "cannot-verify", ...(waitsOn ? { waitsOn } : {}) });

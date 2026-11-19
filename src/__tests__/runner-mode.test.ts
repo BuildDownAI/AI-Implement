@@ -456,9 +456,9 @@ describe("runner-mode", () => {
       expect(r.reason).toMatch(/FLY_SESSIONS_APP/);
     });
 
-    it("ephemeral full-access opt-in is ineligible on fly, local, shadow and fly-machines mappings, eligible on gha", () => {
+    it("ephemeral full-access opt-in is ineligible on fly, local and fly-machines mappings, eligible on gha", () => {
       const optIn = { ...ghaMapping, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } };
-      for (const mode of ["fly", "local", "shadow"] as const) {
+      for (const mode of ["fly", "local"] as const) {
         const r = runnerMode.checkForcedPathEligibility(mode, optIn, true);
         expect(r.eligible).toBe(false);
         expect(r.reason).toMatch(/GitHub Actions/);
@@ -466,6 +466,12 @@ describe("runner-mode", () => {
       expect(runnerMode.checkForcedPathEligibility("default", { ...optIn, executionMode: "fly-machines" }, true).eligible).toBe(false);
       expect(runnerMode.checkForcedPathEligibility("default", optIn, true).eligible).toBe(true);
       expect(runnerMode.checkForcedPathEligibility("gha", optIn, true).eligible).toBe(true);
+    });
+
+    // Shadow mode runs every run kind on GitHub Actions alone (AII-1555), so the opt-in it carries can run.
+    it.each(["github-actions", "fly-machines"] as const)("ephemeral full-access opt-in is eligible under shadow mode for a %s mapping", (executionMode) => {
+      const optIn = { ...ghaMapping, executionMode, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } };
+      expect(runnerMode.checkForcedPathEligibility("shadow", optIn, true)).toEqual({ eligible: true, reason: null });
     });
 
     it("forced fly + fly-capable mapping → eligible", () => {
@@ -477,6 +483,13 @@ describe("runner-mode", () => {
       for (const mode of ["default", "gha"] as const) {
         expect(runnerMode.checkForcedPathEligibility(mode, bedrockMapping, false).eligible).toBe(true);
       }
+    });
+
+    it("names the setup check that explains each ineligible mapping", () => {
+      const optIn = { ...ghaMapping, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } };
+      expect(runnerMode.checkForcedPathEligibility("fly", bedrockMapping, true).check).toBe("runner.project-backend");
+      expect(runnerMode.checkForcedPathEligibility("fly", optIn, true).check).toBe("runner.project-backend");
+      expect(runnerMode.checkForcedPathEligibility("fly", ghaMapping, false).check).toBe("runner.fly-sessions");
     });
 
     it("bedrock ineligibility wins over missing sessions app in the reason", () => {
