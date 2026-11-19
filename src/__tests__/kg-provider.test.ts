@@ -551,6 +551,22 @@ describe("SidecarMemoryProvider probe", () => {
       expect(await makeProvider().probe()).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
     });
 
+    it("clears a cached store error once the source is no longer remote (AII-1974)", async () => {
+      // One provider instance owns the cache: a fresh provider here would start clean and
+      // make this test pass even if probe() never cleared the old remote-store error.
+      const provider = makeProvider();
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify({ result: { isError: true, content: [{ type: "text", text: "bad token" }] } }));
+      expect((await provider.probe()).lastError).toBe("bad token");
+      expect(sidecarHealthFields().sidecar.lastError).toBe("bad token");
+      // Switching back to sidecar makes isRemoteKgStore() false; the next probe must not
+      // carry the old Stardog error onto GET /.
+      vi.stubEnv("KG_BACKEND", "sidecar");
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect(await provider.probe("list-only")).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+      expect(sidecarHealthFields().sidecar.lastError).toBeNull();
+    });
+
     it("accepts a boot query timeout and logs the wake-up explanation", async () => {
       const log = vi.spyOn(console, "error").mockImplementation(() => {});
       queueResponse(200, toolsListResult(ALL_SIX_TOOLS));

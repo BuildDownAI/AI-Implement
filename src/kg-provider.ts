@@ -214,6 +214,15 @@ export class SidecarMemoryProvider implements MemoryProvider {
   // A list-only recovery proves transport health, not store health.
   private storeError: string | null = null;
 
+  /**
+   * Drops a cached remote-store error (AII-1974). Called after a tested switch to
+   * Stardog: the old error describes the store the test just proved reachable, so a
+   * following list-only probe must not carry it onto `GET /`. Sends no Stardog query.
+   */
+  clearStoreError(): void {
+    this.storeError = null;
+  }
+
   constructor(
     private readonly kgSidecarUrl: string,
     private readonly resolveServedNamespace: () => Promise<string | null> = getServedNamespace,
@@ -383,6 +392,9 @@ export class SidecarMemoryProvider implements MemoryProvider {
    * call is never skipped.
    */
   async probe(mode: "full" | "list-only" = "full"): Promise<SidecarHealth> {
+    // A cached Stardog store error describes a remote store that is no longer selected.
+    // Clear it before anything reads it so an old error does not stay on `GET /` (AII-1974).
+    if (!isRemoteKgStore()) this.storeError = null;
     const target = new URL(this.kgSidecarUrl);
     const transport = target.protocol === "https:" ? https : http;
     const forwardHeaders: SidecarHeaders = { ...PROBE_HEADERS };

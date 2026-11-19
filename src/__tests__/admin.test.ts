@@ -188,6 +188,7 @@ const loaders = {
   dispatchBreaker: () => import("../dispatch-breaker.js"),
   dispatchAdmission: () => import("../dispatch-admission.js"),
   orchestratorSettings: () => import("../orchestrator-settings.js"),
+  kgGraphSource: () => import("../kg-graph-source.js"),
   filesystemProvider: () => import("../providers/filesystem.js"),
   deployHold: () => import("../deploy-hold.js"),
   deployPolicy: () => import("../deploy-policy.js"),
@@ -2636,6 +2637,120 @@ describe("admin settings", () => {
     expect(body).toHaveProperty("flySessionsRegion");
     expect(body.flySessionsApp.runtimeValue).toBeNull();
     expect(body.flySessionsApp.dbValue).toBeNull();
+  });
+
+  describe("KG graph source settings (AII-1974)", () => {
+    const savedSecret = process.env.RUNNER_TOKEN_SECRET;
+    const TOKEN = "SENTINEL-stardog-token-987654321";
+    const getSettings = async (token: string) => JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    const postStardog = async (token: string, body: unknown) =>
+      request("/api/kg/stardog", "POST", "secret", body as never, token);
+
+    beforeEach(() => {
+      process.env.RUNNER_TOKEN_SECRET = "admin-kg-source-test-key";
+    });
+    afterEach(() => {
+      if (savedSecret === undefined) delete process.env.RUNNER_TOKEN_SECRET;
+      else process.env.RUNNER_TOKEN_SECRET = savedSecret;
+    });
+
+    it("POST /api/kg/stardog stores the token encrypted and no response holds it", async () => {
+      const token = await login("secret");
+      const res = await postStardog(token, { token: TOKEN });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ tokenSet: true });
+      expect(res.body).not.toContain(TOKEN);
+      const row = dedup.getDb().prepare("SELECT ciphertext FROM model_protected_secrets WHERE secret_ref = ?").get("kg-store:stardog-run-token") as { ciphertext: Buffer };
+      expect(row.ciphertext.toString()).not.toContain(TOKEN);
+      const settings = await getSettings(token);
+      expect(settings.stardogTokenSet).toBe(true);
+      expect(JSON.stringify(settings)).not.toContain(TOKEN);
+    });
+
+    it("POST /api/kg/stardog trims a trailing newline before storing the token", async () => {
+      const token = await login("secret");
+      const res = await postStardog(token, { token: `${TOKEN}\n` });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ tokenSet: true });
+      expect(res.body).not.toContain(TOKEN);
+      expect(modules.kgGraphSource.getStardogRunToken()).toBe(TOKEN);
+    });
+
+    it("POST /api/kg/stardog answers 400 for an empty token and does not clear a stored one", async () => {
+      const token = await login("secret");
+      await postStardog(token, { token: TOKEN });
+      for (const body of [{ token: "" }, { token: " \n\t " }, {}, { token: 5 }]) {
+        const res = await postStardog(token, body);
+        expect(res.statusCode).toBe(400);
+        expect(res.body).not.toContain(TOKEN);
+      }
+      expect((await getSettings(token)).stardogTokenSet).toBe(true);
+    });
+
+    it("POST /api/kg/stardog answers with no KG refresh configured", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps("/api/kg/stardog", "POST", token, {}, { token: TOKEN });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("a non-admin session gets 403 on POST /api/kg/stardog", async () => {
+      const token = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+      const res = await postStardog(token, { token: TOKEN });
+      expect(res.statusCode).toBe(403);
+      const row = dedup.getDb().prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get("kg-store:stardog-run-token");
+      expect(row).toBeUndefined();
+    });
+
+    it("POST /api/settings stores the non-secret Stardog values and never the token", async () => {
+      const token = await login("secret");
+      const res = await request("/api/settings", "POST", "secret", {
+        kg_stardog_db: "builddown-kg",
+        kg_stardog_run_endpoint: "https://tenant.stardog.run/kg",
+        kg_stardog_run_console: "https://console.stardog.run",
+        kg_stardog_run_platform: "https://import.stardog.run",
+      } as never, token);
+      expect(res.statusCode).toBe(200);
+      const settings = await getSettings(token);
+      expect(settings).toMatchObject({
+        kg_stardog_db: "builddown-kg",
+        kg_stardog_run_endpoint: "https://tenant.stardog.run/kg",
+        kg_stardog_run_console: "https://console.stardog.run",
+        kg_stardog_run_platform: "https://import.stardog.run",
+        stardogTokenSet: false,
+      });
+      expect(settings).not.toHaveProperty("token");
+    });
+
+    it("POST /api/settings with kgGraphSource does not change the source", async () => {
+      const token = await login("secret");
+      const res = await request("/api/settings", "POST", "secret", { kgGraphSource: "stardog_run" } as never, token);
+      expect(res.statusCode).toBe(200);
+      expect((await getSettings(token)).kgGraphSource).toBe("sidecar");
+      expect(dedup.getDb().prepare("SELECT value FROM settings WHERE key = 'kg_graph_source'").get()).toBeUndefined();
+    });
+
+    it("GET /api/settings reports kgCustomerRepo from KG_SOURCE_REPO", async () => {
+      const saved = process.env.KG_SOURCE_REPO;
+      try {
+        delete process.env.KG_SOURCE_REPO;
+        const token = await login("secret");
+        expect((await getSettings(token)).kgCustomerRepo).toBe(false);
+        process.env.KG_SOURCE_REPO = "owner/kg";
+        expect((await getSettings(token)).kgCustomerRepo).toBe(true);
+      } finally {
+        if (saved === undefined) delete process.env.KG_SOURCE_REPO;
+        else process.env.KG_SOURCE_REPO = saved;
+      }
+    });
+
+    it("GET /api/settings shows the base-only image as stardog_run while the row is unset", async () => {
+      const token = await login("secret");
+      // `isRemoteKgStore` is true with the `.base-only` marker (src/__tests__/kg-sidecar.test.ts
+      // proves the marker itself); the admin read must report that effective source, not the row.
+      expect(dedup.getDb().prepare("SELECT value FROM settings WHERE key = 'kg_graph_source'").get()).toBeUndefined();
+      const res = await requestWithDeps("/api/settings", "GET", token, { isRemoteKgStore: () => true });
+      expect(JSON.parse(res.body).kgGraphSource).toBe("stardog_run");
+    });
   });
 
   describe("runnerImageAllowedPrefixes (AII-1321)", () => {

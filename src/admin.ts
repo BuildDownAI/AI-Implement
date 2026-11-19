@@ -86,6 +86,8 @@ import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { SelfDeployClient } from "./restate/self-deploy.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
+import { getStardogValues, setStardogValues } from "./kg-graph-source.js";
+import { isRemoteKgStore } from "./kg-sidecar.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
 import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
@@ -545,6 +547,8 @@ export interface AdminDeps {
   readSetupChecks?: () => Promise<SetupChecksIngressResult<SetupCheckRun | null>>;
   /** Runs the setup checks through `SetupChecks.run` and answers the new run. Same injection as `readSetupChecks`. */
   runSetupChecks?: () => Promise<SetupChecksIngressResult<SetupCheckRun>>;
+  /** The effective KG graph source test (`isRemoteKgStore`, AII-1974). Defaults to the real one; a test seam. */
+  isRemoteKgStore?: () => boolean;
 }
 
 export interface AgentConfigAdminDeps {
@@ -1301,12 +1305,20 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/settings" && method === "GET") {
-      handleGetSettings(req, res, config);
+      handleGetSettings(req, res, config, deps);
       return true;
     }
 
     if (url === "/api/settings" && method === "POST") {
       handlePostSettings(req, res, config, gate, deps);
+      return true;
+    }
+
+    // Stores the Stardog Run token only (AII-1974). Admin-only through the blanket rule
+    // above; it does not need the KG refresh rail, so a base-only image without one still
+    // accepts a token. The token never appears in a response, a log line or an error.
+    if (url === "/api/kg/stardog" && method === "POST") {
+      handlePostStardogToken(req, res);
       return true;
     }
 
@@ -2905,8 +2917,11 @@ function handleGetSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   _config: AdminConfig,
+  deps: AdminDeps = {},
 ): void {
   const dbSettings = getOrchestratorSettings();
+  const stardog = getStardogValues();
+  const kgGraphSource = (deps.isRemoteKgStore ?? isRemoteKgStore)() ? "stardog_run" : "sidecar";
 
   json(res, 200, {
     ...flySettingsView(),
@@ -2916,6 +2931,14 @@ function handleGetSettings(
     kgBaseRepo: {
       value: dbSettings.kgBaseRepo,
     },
+    // The effective source, not the raw row: the base-only marker forces the remote store.
+    kgGraphSource,
+    kg_stardog_db: stardog.db,
+    kg_stardog_run_endpoint: stardog.runEndpoint,
+    kg_stardog_run_console: stardog.runConsole,
+    kg_stardog_run_platform: stardog.runPlatform,
+    stardogTokenSet: stardog.tokenSet,
+    kgCustomerRepo: Boolean(process.env.KG_SOURCE_REPO),
     linearPickupLabel: {
       value: dbSettings.linearPickupLabel,
       effective: getLinearPickupLabel(),
@@ -2943,6 +2966,11 @@ async function handlePostSettings(
     flySessionsRegion?: string | null;
     kgRefreshReportIssue?: string | null;
     kgBaseRepo?: string | null;
+    kg_stardog_db?: string | null;
+    kg_stardog_run_endpoint?: string | null;
+    kg_stardog_run_console?: string | null;
+    kg_stardog_run_platform?: string | null;
+    kgGraphSource?: unknown;
     linearPickupLabel?: string | null;
     runnerImageAllowedPrefixes?: string | null;
     retryPolicy?: Partial<RetryPolicy> | null;
@@ -3057,7 +3085,37 @@ async function handlePostSettings(
     setOrchestratorSetting("kgBaseRepo", val);
   }
 
+  // The non-secret Stardog values. `kgGraphSource` is deliberately ignored: only
+  // set_kg_graph_source writes that row, after it has tested Stardog. An empty value
+  // clears its row; an omitted one preserves it.
+  const stardogPatch: Parameters<typeof setStardogValues>[0] = {};
+  const stardogFields = {
+    kg_stardog_db: "db",
+    kg_stardog_run_endpoint: "runEndpoint",
+    kg_stardog_run_console: "runConsole",
+    kg_stardog_run_platform: "runPlatform",
+  } as const;
+  for (const field of Object.keys(stardogFields) as Array<keyof typeof stardogFields>) {
+    const raw = body[field];
+    if (raw === undefined) continue;
+    if (raw !== null && typeof raw !== "string") {
+      json(res, 400, { error: `${field} must be a string or null` });
+      return;
+    }
+    stardogPatch[stardogFields[field]] = raw ?? "";
+  }
+  if (Object.keys(stardogPatch).length > 0) {
+    try {
+      setStardogValues(stardogPatch);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : "Invalid Stardog values" });
+      return;
+    }
+  }
+
   const dbSettings = getOrchestratorSettings();
+  const stardog = getStardogValues();
+  const kgGraphSource = (deps.isRemoteKgStore ?? isRemoteKgStore)() ? "stardog_run" : "sidecar";
 
   json(res, 200, {
     ...flySettingsView(),
@@ -3067,6 +3125,13 @@ async function handlePostSettings(
     kgBaseRepo: {
       value: dbSettings.kgBaseRepo,
     },
+    kgGraphSource,
+    kg_stardog_db: stardog.db,
+    kg_stardog_run_endpoint: stardog.runEndpoint,
+    kg_stardog_run_console: stardog.runConsole,
+    kg_stardog_run_platform: stardog.runPlatform,
+    stardogTokenSet: stardog.tokenSet,
+    kgCustomerRepo: Boolean(process.env.KG_SOURCE_REPO),
     linearPickupLabel: {
       value: dbSettings.linearPickupLabel,
       effective: getLinearPickupLabel(),
@@ -3080,6 +3145,37 @@ async function handlePostSettings(
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
   });
+}
+
+/** `POST /api/kg/stardog`: stores only the token. An empty token is refused, not treated as a clear. */
+async function handlePostStardogToken(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  let body: { token?: unknown };
+  try {
+    const parsed = JSON.parse(await readBody(req));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      json(res, 400, { error: "Invalid request body" });
+      return;
+    }
+    body = parsed as { token?: unknown };
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+    return;
+  }
+  // A pasted token often carries a trailing newline; store the trimmed value so the
+  // console exchange is not sent a bearer with whitespace in it.
+  const token = typeof body.token === "string" ? body.token.trim() : "";
+  if (token.length === 0) {
+    json(res, 400, { error: "token must be a nonempty string" });
+    return;
+  }
+  try {
+    setStardogValues({ token });
+  } catch (err) {
+    // setStardogValues never puts the supplied value in its error.
+    json(res, 400, { error: err instanceof Error ? err.message : "Invalid Stardog token" });
+    return;
+  }
+  json(res, 200, { tokenSet: getStardogValues().tokenSet });
 }
 
 function handleGetAccess(res: http.ServerResponse, identity: SessionIdentity | null): void {

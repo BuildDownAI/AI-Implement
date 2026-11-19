@@ -54,6 +54,11 @@ function token(): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/** The decrypted Stardog Run token. Contains a credential: never log it or return it to a caller. */
+export function getStardogRunToken(): string | undefined {
+  return token();
+}
+
 /** Safe for setup checks and admin responses: never includes the token. */
 export function getStardogValues(): StardogValues {
   return {

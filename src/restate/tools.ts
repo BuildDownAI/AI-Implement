@@ -45,6 +45,8 @@ import {
 } from "../dispatch-admission.js";
 import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
+import { getStardogValues, type KgGraphSource } from "../kg-graph-source.js";
+import { isRemoteKgStore } from "../kg-sidecar.js";
 import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./retention.js";
 import { getRestateStatus } from "./status.js";
 import { SETUP_CHECKS_KEY, SetupChecks } from "./setup-checks.js";
@@ -783,6 +785,36 @@ const KgRepo: KgRepoDefinition = { name: "KgRepo" } as KgRepoDefinition;
 const KgRefresh: KgRefreshDefinition = { name: "KgRefresh" } as KgRefreshDefinition;
 
 let kgRefreshToolDeps: KgRefreshToolDeps | null = null;
+
+/**
+ * Dependencies for `set_kg_graph_source` (AII-1974), bound in src/index.ts. Unlike the
+ * refresh handlers above these are present even when no KG source repo is configured: a
+ * base-only image still switches between its (absent) sidecar graph and Stardog.
+ */
+export interface KgGraphSourceToolDeps {
+  /** The Stardog client's one real query. Each try is billed; the Restate step repeats it. */
+  countTriples(): Promise<number>;
+  /** Writes the `kg_graph_source` row. Called inside a journaled step. */
+  saveGraphSource(source: KgGraphSource): void;
+  /** Restarts the sidecar (starting it if it did not start at boot) and ensures a probed provider exists. */
+  restartSidecar(): Promise<void>;
+  /** False when the image carries the `/app/kg/.base-only` marker, so there is no sidecar graph. */
+  sidecarGraphPresent(): boolean;
+  /** The effective source for the log line: `isRemoteKgStore()`, not the raw row. Defaults to the real test. */
+  effectiveSource?(): KgGraphSource;
+  /** Pause between test tries in production; 0 in tests. */
+  testPauseMs: number;
+  /** The test step's total budget. Defaults to the production 6 minutes; a test shortens it. */
+  testMaxRetryDurationMs?: number;
+  /** One sanitized line per switch; never receives a value. Defaults to `console.log`. */
+  log?(from: KgGraphSource, to: KgGraphSource, ok: boolean): void;
+}
+
+let kgGraphSourceToolDeps: KgGraphSourceToolDeps | null = null;
+
+export function setKgGraphSourceToolDeps(deps: KgGraphSourceToolDeps | null): void {
+  kgGraphSourceToolDeps = deps;
+}
 
 /**
  * Set once at boot (src/index.ts's main()) from `createProductionKgRefreshServices`. The tools
@@ -1848,6 +1880,100 @@ export const unparkIssueTool = tool(
   },
 );
 
+/** The Stardog test step's budget: long enough for a sleeping endpoint (2–5 min) to wake. */
+export const STARDOG_TEST_MAX_RETRY_DURATION_MS = 6 * 60_000;
+/** Production pause between tries. Tests pass 0. */
+export const STARDOG_TEST_PAUSE_MS = 15_000;
+
+export const SET_KG_GRAPH_SOURCE_DESCRIPTION =
+  "Switch which graph answers the kg_* tools (admin role). `stardog_run` first sends one real COUNT query with the stored Stardog values, retrying for up to 6 minutes so a sleeping endpoint can wake; only when it passes are the source saved and the sidecar restarted. A failed test changes nothing and returns { switched: false, error }. `sidecar` saves and restarts with no test. There is nothing to undo.";
+
+/**
+ * The source answering `kg_*` right now: `isRemoteKgStore()`, so a base-only image with an
+ * unset row logs Stardog as the previous source. The raw row would say sidecar there.
+ */
+function effectiveKgGraphSource(deps: KgGraphSourceToolDeps): KgGraphSource {
+  return (deps.effectiveSource ?? (() => (isRemoteKgStore() ? "stardog_run" : "sidecar")))();
+}
+
+function kgGraphSourceError(error: string, message?: string): ToolResponse {
+  // Not an `isError`: the shape is the contract, and a caller must read `switched` either way.
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify(message === undefined ? { switched: false, error } : { switched: false, error, message }),
+    }],
+  };
+}
+
+export const setKgGraphSourceTool = tool(
+  {
+    description: SET_KG_GRAPH_SOURCE_DESCRIPTION,
+    input: z.object({ source: z.enum(["sidecar", "stardog_run"]) }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `source=${input.args.source}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const deps = kgGraphSourceToolDeps;
+    if (!deps) return kgGraphSourceError("kg-graph-source-not-configured");
+    const to = input.args.source;
+    // Journaled so a replay logs the state the first attempt saw, not the saved row.
+    const from = await ctx.run("read-source", () => effectiveKgGraphSource(deps), { maxRetryAttempts: 1 });
+    const log = deps.log ?? ((f: KgGraphSource, t: KgGraphSource, ok: boolean) => console.log(`[kg] graph source ${f} -> ${t}: ${ok ? "ok" : "failed"}`));
+    const fail = (error: string, message?: string): ToolResponse => {
+      log(from, to, false);
+      return kgGraphSourceError(error, message);
+    };
+
+    // Refuse while the exclusive refresh lock is held. The status read is shared, so it
+    // still answers while a run or a decision hold owns the object.
+    const toolDeps = kgRefreshToolDeps;
+    if (toolDeps) {
+      const status = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+      if (status != null) return fail("refresh-in-flight");
+    }
+
+    if (to === "sidecar" && !deps.sidecarGraphPresent()) return fail("no-sidecar-graph");
+
+    let triples: number | undefined;
+    if (to === "stardog_run") {
+      const values = getStardogValues();
+      if (!values.db || !values.namespace || !values.tokenSet) return fail("stardog-values-missing");
+      try {
+        // One journaled step: Restate repeats it within the budget, and the pause between
+        // tries is bounded by maxRetryInterval (15 s in production, not the SDK's 10 s cap).
+        triples = await ctx.run("stardog-test", () => deps.countTriples(), {
+          maxRetryDuration: deps.testMaxRetryDurationMs ?? STARDOG_TEST_MAX_RETRY_DURATION_MS,
+          initialRetryInterval: deps.testPauseMs,
+          maxRetryInterval: deps.testPauseMs,
+          retryIntervalFactor: 1,
+        });
+      } catch (err) {
+        // Exhausted retries arrive as a TerminalError; a suspended invocation unwinds instead.
+        if (!(err instanceof restate.TerminalError)) throw err;
+        return fail(err.message);
+      }
+    }
+
+    await ctx.run("save", () => deps.saveGraphSource(to), { maxRetryAttempts: 1 });
+    try {
+      await ctx.run("restart", () => deps.restartSidecar(), { maxRetryAttempts: 1 });
+    } catch (err) {
+      // A suspended invocation unwinds so Restate can resume it; any other failure means the
+      // restart step could not prove a serving sidecar. The save already ran, so say so.
+      if (restate.internal.isSuspendedError(err)) throw err;
+      return fail(
+        "sidecar-restart-failed",
+        "the source row was already saved, but the sidecar did not come up; retry the switch or restart the orchestrator",
+      );
+    }
+    log(from, to, true);
+    const result = triples === undefined ? { switched: true, source: to } : { switched: true, source: to, triples };
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+  },
+);
+
 export const orchestratorTools = restate.service({
   name: "orchestratorTools",
   handlers: {
@@ -1879,6 +2005,7 @@ export const orchestratorTools = restate.service({
     kg_repo_history: kgRepoHistory,
     trigger_kg_refresh: triggerKgRefreshTool,
     decide_kg_refresh: decideKgRefreshTool,
+    set_kg_graph_source: setKgGraphSourceTool,
     set_runner_mode: setRunnerModeTool,
     set_fly_machine_profile: setFlyMachineProfileTool,
     set_run_profile: setRunProfileTool,
