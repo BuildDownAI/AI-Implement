@@ -1940,71 +1940,125 @@ function kgGraphSourceError(error: string, message?: string): ToolResponse {
   };
 }
 
+const KgGraphSourceSwitchInput = z.object({ source: z.enum(["sidecar", "stardog_run"]) }).strict();
+export type KgGraphSourceSwitchInput = z.infer<typeof KgGraphSourceSwitchInput>;
+
+/** The fixed object key: one source switch at a time for the whole orchestrator. */
+export const KG_GRAPH_SOURCE_SWITCH_KEY = "kg";
+
+/**
+ * The switch body, run by the exclusive `KgGraphSourceSwitch` object so two overlapping
+ * invocations serialize even when no refresh rail is configured. When the rail is bound it
+ * also reserves `KgRepo` for the whole test/save/restart, so a refresh cannot start mid-test.
+ */
+export async function switchKgGraphSource(ctx: restate.ObjectContext, input: KgGraphSourceSwitchInput): Promise<ToolResponse> {
+  const deps = kgGraphSourceToolDeps;
+  if (!deps) return kgGraphSourceError("kg-graph-source-not-configured");
+  const to = input.source;
+  // Journaled so a replay logs the state the first attempt saw, not the saved row.
+  const from = await ctx.run("read-source", () => effectiveKgGraphSource(deps), { maxRetryAttempts: 1 });
+  const log = deps.log ?? ((f: KgGraphSource, t: KgGraphSource, ok: boolean) => console.log(`[kg] graph source ${f} -> ${t}: ${ok ? "ok" : "failed"}`));
+  const fail = (error: string, message?: string): { response: ToolResponse; ok: false } => ({
+    response: kgGraphSourceError(error, message), ok: false,
+  });
+
+  const toolDeps = kgRefreshToolDeps;
+  const repo = toolDeps ? ctx.objectClient<KgRepoDefinition>(KgRepo, toolDeps.kgSourceRepo) : null;
+  const switchId = String(ctx.request().id);
+
+  // The refresh dependency is optional, but when present the switch reserves the same object
+  // for its whole duration. `claimSourceSwitch` is exclusive with `trigger`/`enqueueDryRun`,
+  // so a refresh arriving during the Stardog test is refused rather than racing the restart.
+  if (repo) {
+    const status = await repo.status();
+    if (status != null) {
+      log(from, to, false);
+      return fail("refresh-in-flight").response;
+    }
+    const claim = await repo.claimSourceSwitch({ switchId });
+    if (!claim.claimed) {
+      log(from, to, false);
+      return fail("refresh-in-flight").response;
+    }
+  }
+
+  // A suspended invocation unwinds so Restate can resume it. Releasing the reservation there
+  // would let a refresh enter during the gap, so keep it for the resumed attempt to reuse.
+  let suspended = false;
+  let outcome: { response: ToolResponse; ok: boolean };
+  try {
+    outcome = await (async (): Promise<{ response: ToolResponse; ok: boolean }> => {
+      if (to === "sidecar" && !deps.sidecarGraphPresent()) return fail("no-sidecar-graph");
+
+      let triples: number | undefined;
+      if (to === "stardog_run") {
+        const values = getStardogValues();
+        if (!values.db || !values.namespace || !values.tokenSet) return fail("stardog-values-missing");
+        try {
+          // One journaled step: Restate repeats it within the budget, and the pause between
+          // tries is bounded by maxRetryInterval (15 s in production, not the SDK's 10 s cap).
+          triples = await ctx.run("stardog-test", () => deps.countTriples(), {
+            maxRetryDuration: deps.testMaxRetryDurationMs ?? STARDOG_TEST_MAX_RETRY_DURATION_MS,
+            initialRetryInterval: deps.testPauseMs,
+            maxRetryInterval: deps.testPauseMs,
+            retryIntervalFactor: 1,
+          });
+        } catch (err) {
+          // Exhausted retries arrive as a TerminalError; a suspended invocation unwinds instead.
+          if (!(err instanceof restate.TerminalError)) throw err;
+          return fail(err.message);
+        }
+      }
+
+      // Re-read after the long test as a second guard: the reservation makes this null, but a
+      // stale/recovered marker or a manual state repair must not turn into a racing save.
+      if (repo && (await repo.status()) != null) return fail("refresh-in-flight");
+
+      await ctx.run("save", () => deps.saveGraphSource(to), { maxRetryAttempts: 1 });
+      try {
+        await ctx.run("restart", () => deps.restartSidecar(), { maxRetryAttempts: 1 });
+      } catch (err) {
+        // A suspended invocation unwinds so Restate can resume it; any other failure means the
+        // restart step could not prove a serving sidecar. The save already ran, so say so.
+        if (restate.internal.isSuspendedError(err)) throw err;
+        return fail(
+          "sidecar-restart-failed",
+          "the source row was already saved, but the sidecar did not come up; retry the switch or restart the orchestrator",
+        );
+      }
+      const result = triples === undefined ? { switched: true, source: to } : { switched: true, source: to, triples };
+      return { response: { content: [{ type: "text", text: JSON.stringify(result) }] }, ok: true };
+    })();
+  } catch (err) {
+    if (restate.internal.isSuspendedError(err)) suspended = true;
+    throw err;
+  } finally {
+    if (repo && !suspended) await repo.releaseSourceSwitch({ switchId });
+  }
+  // After the release call, so a replay caused by that call cannot log the switch twice.
+  log(from, to, outcome.ok);
+  return outcome.response;
+}
+
+export const KgGraphSourceSwitch = restate.object({
+  name: "KgGraphSourceSwitch",
+  handlers: {
+    switch: restate.handlers.object.exclusive({ input: serde.zod(KgGraphSourceSwitchInput), ingressPrivate: true }, switchKgGraphSource),
+  },
+});
+
+export type KgGraphSourceSwitchDefinition = typeof KgGraphSourceSwitch;
+
 export const setKgGraphSourceTool = tool(
   {
     description: SET_KG_GRAPH_SOURCE_DESCRIPTION,
-    input: z.object({ source: z.enum(["sidecar", "stardog_run"]) }),
+    input: KgGraphSourceSwitchInput,
     role: "admin",
     retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
     auditDetail: (input) => `source=${input.args.source}`,
   },
   async (ctx, input): Promise<ToolResponse> => {
-    const deps = kgGraphSourceToolDeps;
-    if (!deps) return kgGraphSourceError("kg-graph-source-not-configured");
-    const to = input.args.source;
-    // Journaled so a replay logs the state the first attempt saw, not the saved row.
-    const from = await ctx.run("read-source", () => effectiveKgGraphSource(deps), { maxRetryAttempts: 1 });
-    const log = deps.log ?? ((f: KgGraphSource, t: KgGraphSource, ok: boolean) => console.log(`[kg] graph source ${f} -> ${t}: ${ok ? "ok" : "failed"}`));
-    const fail = (error: string, message?: string): ToolResponse => {
-      log(from, to, false);
-      return kgGraphSourceError(error, message);
-    };
-
-    // Refuse while the exclusive refresh lock is held. The status read is shared, so it
-    // still answers while a run or a decision hold owns the object.
-    const toolDeps = kgRefreshToolDeps;
-    if (toolDeps) {
-      const status = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
-      if (status != null) return fail("refresh-in-flight");
-    }
-
-    if (to === "sidecar" && !deps.sidecarGraphPresent()) return fail("no-sidecar-graph");
-
-    let triples: number | undefined;
-    if (to === "stardog_run") {
-      const values = getStardogValues();
-      if (!values.db || !values.namespace || !values.tokenSet) return fail("stardog-values-missing");
-      try {
-        // One journaled step: Restate repeats it within the budget, and the pause between
-        // tries is bounded by maxRetryInterval (15 s in production, not the SDK's 10 s cap).
-        triples = await ctx.run("stardog-test", () => deps.countTriples(), {
-          maxRetryDuration: deps.testMaxRetryDurationMs ?? STARDOG_TEST_MAX_RETRY_DURATION_MS,
-          initialRetryInterval: deps.testPauseMs,
-          maxRetryInterval: deps.testPauseMs,
-          retryIntervalFactor: 1,
-        });
-      } catch (err) {
-        // Exhausted retries arrive as a TerminalError; a suspended invocation unwinds instead.
-        if (!(err instanceof restate.TerminalError)) throw err;
-        return fail(err.message);
-      }
-    }
-
-    await ctx.run("save", () => deps.saveGraphSource(to), { maxRetryAttempts: 1 });
-    try {
-      await ctx.run("restart", () => deps.restartSidecar(), { maxRetryAttempts: 1 });
-    } catch (err) {
-      // A suspended invocation unwinds so Restate can resume it; any other failure means the
-      // restart step could not prove a serving sidecar. The save already ran, so say so.
-      if (restate.internal.isSuspendedError(err)) throw err;
-      return fail(
-        "sidecar-restart-failed",
-        "the source row was already saved, but the sidecar did not come up; retry the switch or restart the orchestrator",
-      );
-    }
-    log(from, to, true);
-    const result = triples === undefined ? { switched: true, source: to } : { switched: true, source: to, triples };
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    return ctx.objectClient(KgGraphSourceSwitch, KG_GRAPH_SOURCE_SWITCH_KEY).switch(input.args);
   },
 );
 

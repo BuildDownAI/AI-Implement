@@ -655,6 +655,28 @@ describe("restart()", () => {
       await sidecar.stop();
     }
   });
+
+  it("concurrent restart() calls share one stop/start cycle and spawn exactly one child", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+    const spawn = vi.fn(testSpawn);
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn },
+    );
+    await sidecar.start();
+    expect(spawn).toHaveBeenCalledTimes(1);
+
+    try {
+      await Promise.all([sidecar.restart(), sidecar.restart(), sidecar.restart()]);
+      expect(spawn).toHaveBeenCalledTimes(2);
+      expect((sidecar as unknown as { _child: unknown })._child).not.toBeNull();
+    } finally {
+      await sidecar.stop();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

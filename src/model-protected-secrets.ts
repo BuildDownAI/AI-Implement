@@ -15,6 +15,8 @@ import { getDb } from "./dedup.js";
 import { parseModelAuthCheckoutResponse } from "./model-auth-contract.js";
 import { MODEL_ACCOUNT_REF_PATTERN, type ProtectedSecretResolver, type ProtectedSecretValue } from "./model-credentials.js";
 import { deriveModelProtectedSecretKey } from "./model-session-keys.js";
+// The constant lives in its own module because kg-graph-source.ts imports this one at runtime.
+import { STARDOG_RUN_TOKEN_REF } from "./kg-secret-refs.js";
 
 export const PROTECTED_SECRET_KEY_ID = "mps-v1";
 const NONCE_BYTES = 12;
@@ -59,7 +61,7 @@ function aad(ref: string): Buffer {
 }
 
 function validRef(ref: unknown): ref is string {
-  return typeof ref === "string" && (MODEL_ACCOUNT_REF_PATTERN.test(ref) || ref === "kg-store:stardog-run-token");
+  return typeof ref === "string" && (MODEL_ACCOUNT_REF_PATTERN.test(ref) || ref === STARDOG_RUN_TOKEN_REF);
 }
 
 /** Same validator the reader applies, so a stored value is always one the reader accepts. */

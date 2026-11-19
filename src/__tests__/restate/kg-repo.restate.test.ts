@@ -12,6 +12,7 @@ import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callServi
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 const MARKER_AGE_WAIT_MS = 1_500;
 const HOLD_MS = 24 * 60 * 60 * 1000;
+const PAST_OLD_SWITCH_EXPIRY_MS = 60 * 60_000;
 
 interface RunSend {
   key: string;
@@ -34,9 +35,20 @@ const privateCaller = restate.service({
       }),
   },
 });
-async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "hold" | "recordDryRunOutcome" | "recordAdminDryRun", body: unknown): Promise<unknown> {
+async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "hold" | "recordDryRunOutcome" | "recordAdminDryRun" | "claimSourceSwitch" | "releaseSourceSwitch", body: unknown): Promise<unknown> {
   return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler, body });
 }
+
+// A switch invocation that stays live like the Stardog test does. The test claims against its
+// invocation id and owns when it ends, so no query budget or wall clock decides the reservation lifetime.
+const longRunningSourceSwitch = restate.object({
+  name: "LongRunningSourceSwitch",
+  handlers: {
+    run: async (ctx: restate.ObjectContext): Promise<void> => {
+      await ctx.sleep(HOLD_MS);
+    },
+  },
+});
 
 describe("KgRepo durable single-flight lock", () => {
   const runSends: RunSend[] = [];
@@ -63,7 +75,7 @@ describe("KgRepo durable single-flight lock", () => {
 
   let envs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([kgRepo, fakeKgRefresh, privateCaller]);
+    envs = await startVariants([kgRepo, fakeKgRefresh, privateCaller, longRunningSourceSwitch]);
   }, 60_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -82,6 +94,85 @@ describe("KgRepo durable single-flight lock", () => {
   async function trigger(baseUrl: string, key: string): Promise<KgRepoTriggerResult> {
     return callObject<KgRepoTriggerResult>(baseUrl, "KgRepo", key, "trigger", {});
   }
+
+  async function startLongRunningSwitch(env: RestateEnvironment, key: string): Promise<{ switchId: string; running: Promise<unknown> }> {
+    const running = callObject(env.baseUrl(), "LongRunningSourceSwitch", key, "run", {}).catch(() => undefined);
+    const row = await eventually(
+      async () => (await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'LongRunningSourceSwitch' AND target_service_key = '${key}' AND target_handler_name = 'run'`))[0],
+      (found) => found !== undefined,
+      { label: "the live switch invocation", timeoutMs: 30_000, intervalMs: 50 },
+    );
+    return { switchId: String(row.id), running };
+  }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a source switch reserves the refresh lock; a refresh is refused and a dry run is queued until it releases (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const key = newKey();
+      const before = runSends.length;
+      const { switchId, running } = await startLongRunningSwitch(env, key);
+
+      expect(await callPrivate(env.baseUrl(), key, "claimSourceSwitch", { switchId })).toEqual({ claimed: true });
+      // Another switch cannot take it; the same switch reuses it after a suspension.
+      expect(await callPrivate(env.baseUrl(), key, "claimSourceSwitch", { switchId: "another-switch" })).toEqual({ claimed: false, switchId });
+      expect(await callPrivate(env.baseUrl(), key, "claimSourceSwitch", { switchId })).toEqual({ claimed: true });
+
+      expect(await trigger(env.baseUrl(), key)).toEqual({ status: "refresh-in-progress", triggerId: "kg-graph-source-switch" });
+      expect(await callObject(env.baseUrl(), "KgRepo", key, "enqueueDryRun", {
+        key: `${key}#1`, ref: "held", report: { repo: key, prNumber: 1, sha: "sha-held" },
+      })).toEqual({ queued: true });
+      expect(runSends.length - before).toBe(0);
+
+      expect(await callPrivate(env.baseUrl(), key, "releaseSourceSwitch", { switchId })).toEqual({ released: true });
+      await eventually(() => runSends.slice(before).filter((s) => s.parameter.kgSourceRef === "held").length, (n) => n === 1, {
+        label: "the queued dry run after the switch", timeoutMs: 30_000, intervalMs: 50,
+      });
+      await killInvocation(env.adminAPIBaseUrl(), switchId);
+      await running;
+    },
+    60_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "an older live switch still excludes refresh admission; killing it releases the lock and drains queued work (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const key = newKey();
+      const before = runSends.length;
+      const { switchId, running } = await startLongRunningSwitch(env, key);
+      expect(await callPrivate(env.baseUrl(), key, "claimSourceSwitch", { switchId })).toEqual({ claimed: true });
+      await eventually(
+        async () => trigger(env.baseUrl(), key),
+        (result) => "status" in result && result.status === "refresh-in-progress" && result.triggerId === "kg-graph-source-switch",
+        { label: "the source-switch reservation", timeoutMs: 30_000, intervalMs: 50 },
+      );
+
+      // Backdate the marker past the old 30-minute cutoff. A live invocation, not elapsed time,
+      // must own the reservation: the switch can suspend for longer than any test budget.
+      await setObjectState(env.adminAPIBaseUrl(), "KgRepo", key, "sourceSwitch", {
+        switchId,
+        invocationId: switchId,
+        startedAt: Date.now() - PAST_OLD_SWITCH_EXPIRY_MS,
+      });
+      expect(await trigger(env.baseUrl(), key)).toEqual({ status: "refresh-in-progress", triggerId: "kg-graph-source-switch" });
+      expect(await callObject(env.baseUrl(), "KgRepo", key, "enqueueDryRun", {
+        key: `${key}#1`, ref: "queued-through-switch", report: { repo: key, prNumber: 1, sha: "sha-queued" },
+      })).toEqual({ queued: true });
+      expect(runSends.length - before).toBe(0);
+
+      await killInvocation(env.adminAPIBaseUrl(), switchId);
+      await running;
+      await eventually(
+        () => runSends.slice(before).filter((send) => send.parameter.kgSourceRef === "queued-through-switch").length,
+        (count) => count === 1,
+        { label: "the queued dry run after the switch ended", timeoutMs: 30_000, intervalMs: 50 },
+      );
+      const next = await trigger(env.baseUrl(), key);
+      expect(next).not.toEqual({ status: "refresh-in-progress", triggerId: "kg-graph-source-switch" });
+    },
+    60_000,
+  );
 
   it.each(VARIANTS.map(([label]) => label))(
     "R1/R2: trigger mints once and sends once; a second trigger while in flight returns the same id with no second send (%s)",

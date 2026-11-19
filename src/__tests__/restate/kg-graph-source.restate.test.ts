@@ -5,6 +5,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   orchestratorTools,
+  KgGraphSourceSwitch,
   setKgGraphSourceToolDeps,
   setKgRefreshToolDeps,
   type KgGraphSourceToolDeps,
@@ -13,7 +14,7 @@ import {
 import { createKgRepo } from "../../restate/kg-repo.js";
 import {
   setObjectStates, VARIANTS, callService, journaledRunResult, journalEntries, journalText,
-  queryInvocations, startVariants, stopAll,
+  queryInvocations, startVariants, stopAll, gate, callObject, type Gate,
 } from "./harness.js";
 import type { RestateEnvironment } from "./harness.js";
 import { KG_GRAPH_SOURCE_SETTING_KEY, setKgGraphSource, setStardogValues, type KgGraphSource } from "../../kg-graph-source.js";
@@ -38,6 +39,9 @@ interface Fixture {
   saves: string[];
   logs: string[];
   sidecarPresent: boolean;
+  countTriplesGate?: Gate;
+  active: number;
+  maxActive: number;
 }
 
 let fixture: Fixture;
@@ -47,6 +51,7 @@ function kgGraphSourceDeps(overrides: Partial<KgGraphSourceToolDeps> = {}): KgGr
     countTriples: async () => {
       const outcome = fixture.tries[fixture.calls] ?? fixture.tries[fixture.tries.length - 1];
       fixture.calls += 1;
+      await fixture.countTriplesGate?.wait();
       if (outcome === "fail") throw new Error("Stardog Run count query answered HTTP 503");
       return 42;
     },
@@ -56,8 +61,14 @@ function kgGraphSourceDeps(overrides: Partial<KgGraphSourceToolDeps> = {}): KgGr
       setKgGraphSource(source);
     },
     restartSidecar: async () => {
+      fixture.active += 1;
+      fixture.maxActive = Math.max(fixture.maxActive, fixture.active);
       fixture.restarts += 1;
-      if (!fixture.sidecarPresent) throw new Error("sidecar did not start");
+      try {
+        if (!fixture.sidecarPresent) throw new Error("sidecar did not start");
+      } finally {
+        fixture.active -= 1;
+      }
     },
     sidecarGraphPresent: () => fixture.sidecarPresent,
     effectiveSource: () => fixture.source,
@@ -87,7 +98,7 @@ function bindRefreshDeps(): void {
 }
 
 function newFixture(overrides: Partial<Fixture> = {}): Fixture {
-  return { source: "sidecar", tries: ["pass"], calls: 0, restarts: 0, saves: [], logs: [], sidecarPresent: true, ...overrides };
+  return { source: "sidecar", tries: ["pass"], calls: 0, restarts: 0, saves: [], logs: [], sidecarPresent: true, active: 0, maxActive: 0, ...overrides };
 }
 
 function resetStoredValues(source: KgGraphSource = "sidecar"): void {
@@ -98,6 +109,10 @@ function resetStoredValues(source: KgGraphSource = "sidecar"): void {
 
 async function switchSource(env: RestateEnvironment, source: "sidecar" | "stardog_run", headers?: Record<string, string>): Promise<ToolResult> {
   return callService<ToolResult>(env.baseUrl(), "orchestratorTools", "set_kg_graph_source", { caller: ADMIN, args: { source } }, headers);
+}
+
+async function triggerRefresh(env: RestateEnvironment): Promise<unknown> {
+  return callObject(env.baseUrl(), "KgRepo", REPO_KEY, "trigger", {});
 }
 
 function resultBody(result: ToolResult): Record<string, unknown> {
@@ -114,7 +129,7 @@ describe("set_kg_graph_source (Restate)", () => {
     process.env.RUNNER_TOKEN_SECRET = "kg-graph-source-restate-test-key";
     bindRefreshDeps();
     bindFixture();
-    environments = await startVariants([orchestratorTools, createKgRepo({ workflowName: "KgRefresh" })]);
+    environments = await startVariants([orchestratorTools, KgGraphSourceSwitch, createKgRepo({ workflowName: "KgRefresh" })]);
   }, 60_000);
 
   beforeEach(() => {
@@ -124,7 +139,7 @@ describe("set_kg_graph_source (Restate)", () => {
 
   afterEach(async () => {
     for (const env of environments.values()) {
-      await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", REPO_KEY, { inFlight: null, held: null }).catch(() => undefined);
+      await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", REPO_KEY, { inFlight: null, held: null, sourceSwitch: null }).catch(() => undefined);
     }
     bindRefreshDeps();
     bindFixture();
@@ -295,7 +310,7 @@ describe("set_kg_graph_source (Restate)", () => {
     const result = await switchSource(env, "stardog_run");
     expect(resultBody(result)).toEqual({ switched: true, source: "stardog_run", triples: 42 });
 
-    const rows = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'set_kg_graph_source' ORDER BY created_at DESC LIMIT 1");
+    const rows = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'KgGraphSourceSwitch' AND target_handler_name = 'switch' ORDER BY created_at DESC LIMIT 1");
     expect(rows).toHaveLength(1);
     const entries = await journalEntries(env.adminAPIBaseUrl(), String(rows[0]!.id));
     const text = journalText(entries);
@@ -312,4 +327,43 @@ describe("set_kg_graph_source (Restate)", () => {
   it("the production test budget covers a Stardog wake", () => {
     expect(STARDOG_TEST_MAX_RETRY_DURATION_MS).toBe(6 * 60_000);
   });
+
+  it.each(VARIANTS.map(([label]) => label))("a refresh asked while the Stardog test is pending is refused and the switch still saves once (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const pending = gate("stardog test");
+    fixture = newFixture({ countTriplesGate: pending });
+    const switching = switchSource(env, "stardog_run");
+    await pending.reached();
+
+    // The switch claimed the lock before its test. A refresh arriving now is refused, not left
+    // to race the save/restart; the claim is a reservation, not a refresh-in-progress marker.
+    expect(await triggerRefresh(env)).toMatchObject({ status: "refresh-in-progress" });
+    expect(fixture.calls).toBe(1);
+    expect(fixture.saves).toEqual([]);
+    expect(fixture.restarts).toBe(0);
+
+    pending.release();
+    expect(resultBody(await switching)).toEqual({ switched: true, source: "stardog_run", triples: 42 });
+    expect(fixture.saves).toEqual(["stardog_run"]);
+    expect(fixture.restarts).toBe(1);
+  }, 60_000);
+
+  it.each(VARIANTS.map(([label]) => label))("two overlapping switches serialize, and one restart never overlaps another (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const pending = gate("first test");
+    fixture = newFixture({ countTriplesGate: pending });
+    const first = switchSource(env, "stardog_run");
+    await pending.reached();
+    const second = switchSource(env, "stardog_run");
+
+    // The exclusive object queues the second switch behind the first rather than entering its
+    // test concurrently. After the first's gate opens, both complete and each effect runs once.
+    pending.release();
+    const [one, two] = await Promise.all([first, second]);
+    expect(resultBody(one)).toEqual({ switched: true, source: "stardog_run", triples: 42 });
+    expect(resultBody(two)).toEqual({ switched: true, source: "stardog_run", triples: 42 });
+    expect(fixture.calls).toBe(2);
+    expect(fixture.saves).toEqual(["stardog_run", "stardog_run"]);
+    expect(fixture.maxActive).toBe(1);
+  }, 60_000);
 });
