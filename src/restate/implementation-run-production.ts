@@ -86,6 +86,7 @@ export const IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY = "baseBranchFie
 /** The global runner mode at dispatch, recorded on the job row. Absent: the mode at launch time. */
 export const IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY = "runnerMode";
 /** The poll's classification survives providers that omit hierarchy on findByKey. */
+export const IMPLEMENTATION_CONTEXT_ISSUE_MODELS_KEY = "hasIssueModels";
 export const IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY = "groupingParent";
 
 const GHA_BACKEND = "github-actions";
@@ -272,7 +273,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   /** Pure eligibility for a new launch, with the setup check that explains a refusal; never evidence that an earlier launch is absent. */
-  function containerIneligibility(run: ImplementationRunInput, mapping: RepoMapping): { reason: string; check: SetupCheckId } | null {
+  function containerIneligibility(run: ImplementationRunInput, mapping: RepoMapping, hasIssueModels: boolean): { reason: string; check: SetupCheckId } | null {
     if (containerBackend(run)) {
       if (mapping.provider === "bedrock") {
         return { reason: `provider=bedrock is not supported on ${run.backend}`, check: "runner.project-backend" };
@@ -280,7 +281,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       if (run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
         return { reason: "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set", check: "runner.fly-sessions" };
       }
-      if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(run.teamKey, run.dispatchId)) {
+      if (!config.anthropicApiKey && !config.claudeOAuthToken && !hasIssueModels && !isManagedProject(run.teamKey, run.dispatchId)) {
         return { reason: "neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set", check: "model.credentials-adopted" };
       }
     }
@@ -310,7 +311,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       maxTurns: issue.maxTurns ?? storedMapping.maxTurns,
       maxIterations: issue.maxIterations ?? storedMapping.maxIterations,
     };
-    const ineligible = containerIneligibility(run, mapping);
+    const ineligible = containerIneligibility(run, mapping, issue.issueModels !== undefined);
     if (ineligible) throw new Error(ineligible.reason);
 
     const managedRuntime = getModelAuthRuntime(config);
@@ -690,7 +691,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
     // exists, config changes cannot prove absence: keep reconciliation (and backend read failures)
     // intact, including on a retry of a committed-but-not-journaled reservation.
     if (!readAdmission(run.dispatchId) && !getJobByDispatchId(run.dispatchId)) {
-      const ineligible = containerIneligibility(run, mapping);
+      const ineligible = containerIneligibility(run, mapping, run.launchContext[IMPLEMENTATION_CONTEXT_ISSUE_MODELS_KEY] === "true");
       if (ineligible) {
         const pointer = pointAtSetupChecks({ ids: [ineligible.check], project: run.teamKey, cause: "launch-refused" });
         console.log(`[implementation-run] skipped dispatch=${run.dispatchId} issue=${run.issueIdentifier}: ${ineligible.reason}${pointer}`);

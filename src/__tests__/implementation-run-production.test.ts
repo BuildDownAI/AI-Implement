@@ -410,6 +410,21 @@ describe("production deps", () => {
       expect(releaseAdmission).not.toHaveBeenCalled();
     });
 
+    it.each(["fly-machines", "local-docker"] as const)("%s: reports an issue-model refusal without legacy credentials", async backend => {
+      const run = { ...INPUT, backend, launchContext: { hasIssueModels: "true" } };
+      const { d } = compose({ config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null } });
+      provider.findByKey.mockResolvedValue({ ...issue, issueModels: { implementation: "requested" } });
+      vi.mocked(readAdmission).mockReturnValueOnce(null);
+      vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+      vi.mocked(prepareManagedDispatch).mockResolvedValue({
+        kind: "refuse", category: "configuration-error", code: "issue_models_require_configured_project",
+      });
+      expect(await d.reserve(run)).toBe(true);
+      expect(await d.launch(run)).toEqual({ outcome: "rejected" });
+      expect(provider.markImplementationFailed).toHaveBeenCalledWith(issue.id, run.teamKey, "refused");
+      expect(mintLaunchTokens).not.toHaveBeenCalled();
+    });
+
     it.each(BACKENDS)("%s: preserves managed, API and OAuth eligibility", async (backend) => {
       for (const auth of ["managed", "api", "oauth"] as const) {
         vi.clearAllMocks();

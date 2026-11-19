@@ -130,10 +130,10 @@ describe("FilesystemProvider", () => {
 
   it("puts new tasks directly in the implementation bucket when planning is disabled", async () => {
     const dir = testDir("fs-provider");
-    await writeTask(dir, "AII-2.md", "---\ntitle: No planning\n---\n\nImplement directly.");
+    await writeTask(dir, "AII-2.md", "---\ntitle: No planning\n---\n\nImplement directly.\n\n```yaml\n# ai-implement.yml\nmodels: { implementation: specialist }\n```");
     const snap = await provider({ AII: mapping({ directory: dir, planningEnabled: false }) }).fetchAIImplementSnapshot();
     expect(snap.needsPlanning).toEqual([]);
-    expect(snap.readyForImplementation.map((issue) => issue.identifier)).toEqual(["AII-2"]);
+    expect(snap.readyForImplementation).toMatchObject([{ identifier: "AII-2", description: "Implement directly.", issueModels: { implementation: "specialist" } }]);
   });
 
   it("fails closed on malformed documents, corrupt state, and duplicate identifiers in one scope", async () => {

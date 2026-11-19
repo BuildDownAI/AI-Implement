@@ -237,14 +237,16 @@ sees it, even when the block is broken YAML. Config is orchestrator metadata, no
 implementation spec — removing it prevents the agent from trying to create or manage the
 configuration file as part of the work. An unmatched block is never touched.
 
-### Fail-open ladder
+### Grouping defaults and model selection errors
 
 Grouping errors resolve to `"feature"` mode.
 
 | Condition | Outcome |
 |-----------|---------|
 | No marked block found in description | `feature` mode (no warning) |
-| Marked block present, YAML invalid | `feature` mode + `[issue-config]` warning |
+| Marked block declares `models` and contains invalid YAML anywhere | Managed dispatch refuses the selection (`issue_models_invalid`) |
+| Valid YAML with a malformed `models` mapping | Managed dispatch refuses the selection (`issue_models_invalid`) |
+| Marked block without `models`, YAML invalid | `feature` mode + `[issue-config]` warning |
 | Marked block present, no `feature_branch` key | `feature` mode (no warning) |
 | `feature_branch` is not a mapping | `feature` mode + `[issue-config]` warning |
 | `feature_branch.mode` is an unrecognized string | `feature` mode + `[issue-config]` warning |

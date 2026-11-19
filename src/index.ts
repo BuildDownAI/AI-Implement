@@ -170,7 +170,7 @@ import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
-import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
+import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, IMPLEMENTATION_CONTEXT_ISSUE_MODELS_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
@@ -1576,6 +1576,7 @@ export async function submitImplementationRun(
     [IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY]: ctx.runnerMode,
     [IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY]: String(isGroupingParentDispatch(issue)),
   };
+  if (issue.issueModels !== undefined) launchContext[IMPLEMENTATION_CONTEXT_ISSUE_MODELS_KEY] = "true";
   if (ctx.baseBranchFieldValue) {
     launchContext[IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY] = ctx.baseBranchFieldValue;
   }
@@ -1978,7 +1979,7 @@ export async function dispatchFlyMachine(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && issue.issueModels === undefined && !isManagedProject(issue.scopeKey)) {
     const level = shadow ? "warn" : "error";
     console[level](`[poll] ${shadow ? "Shadow Fly dispatch skipped" : "Cannot dispatch"} ${issue.identifier} via Fly Machines: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
@@ -2022,7 +2023,7 @@ export async function dispatchLocalDocker(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && issue.issueModels === undefined && !isManagedProject(issue.scopeKey)) {
     console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
   }

@@ -419,7 +419,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
     return { outcome: "rejected", executionMode: execPath };
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && issue.issueModels === undefined && !isManagedProject(issue.scopeKey)) {
     console.error(
       `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set${refused("model.credentials-adopted")}`,
     );
