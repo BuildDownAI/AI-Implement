@@ -838,15 +838,16 @@ it("renders all exhausted account profiles from terminal error evidence", () => 
   expect(renderFailureRecord({ category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message, evidence: { truncated: false, llmErrorMessage: message } })).toContain("A, B, C");
 });
 
-it("explains a Fly machine removed before start, including when no PR exists", () => {
-  expect(classifyCompletion(jobOf("failed", "implementation", "fly_machine_never_started"))).toMatchObject({
+// Planning's close writes these conclusions too, so its fallback comment carries the same diagnosis.
+it.each(["implementation", "planning"] as const)("explains a Fly machine removed before start, including when no PR exists (%s)", (phase) => {
+  expect(classifyCompletion(jobOf("failed", phase, "fly_machine_never_started"))).toMatchObject({
     detail: "Fly removed the machine before it started.",
     remediation: "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly).",
   });
 });
 
-it("explains a GitHub Actions run whose token step failed, naming both secrets, GitHub Free's limit and the setup check", () => {
-  const classification = classifyCompletion(jobOf("failed", "implementation", "app_token_step_failed"));
+it.each(["implementation", "planning"] as const)("explains a GitHub Actions run whose token step failed, naming both secrets, GitHub Free's limit and the setup check (%s)", (phase) => {
+  const classification = classifyCompletion(jobOf("failed", phase, "app_token_step_failed"));
   expect(classification?.detail).toContain("GitHub App token");
   for (const fact of ["AI_IMPLEMENT_APP_ID", "AI_IMPLEMENT_PRIVATE_KEY", "GitHub Free", "github.target-secrets", "/admin#setup"]) {
     expect(classification?.remediation).toContain(fact);

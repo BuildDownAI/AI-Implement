@@ -1,4 +1,4 @@
-import { APP_TOKEN_STEP_FAILED_REMEDIATION, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
+import { APP_TOKEN_STEP_FAILED, APP_TOKEN_STEP_FAILED_REMEDIATION, FLY_MACHINE_NEVER_STARTED, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -467,6 +467,9 @@ describe("production deps", () => {
       await d.finishJob("d-1", { kind: scenario === "deadline" ? "deadline" : "run_ended" });
       const conclusion = scenario === "deadline" ? "deadline_exceeded" : "ended_without_callback";
       expect(updateJobStatus).toHaveBeenCalledWith(7, scenario === "deadline" ? "timed_out" : "failed", conclusion);
+      // Only a found cause re-closes the row, so the outcome step's own comment can name it.
+      expect(vi.mocked(updateJobStatus).mock.calls.map((call) => call[2])).toEqual(
+        scenario === "never-started" ? [conclusion, FLY_MACHINE_NEVER_STARTED] : [conclusion]);
       expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", conclusion, SUBJECT);
       if (scenario === "deadline") expect(getMachine).not.toHaveBeenCalled();
       else expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1", 10_000);
@@ -485,14 +488,24 @@ describe("production deps", () => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
-      // Planning closes and parks first, before any network read, so the conclusion stays the same.
+      // Planning closes and parks first, before any network read, and then the row takes the cause the read found.
       expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback", SUBJECT);
+      expect(vi.mocked(updateJobStatus).mock.calls.map((call) => call[2])).toEqual(
+        failed ? ["ended_without_callback", APP_TOKEN_STEP_FAILED] : ["ended_without_callback"]);
       expect(getFailedRunStepJob).toHaveBeenCalledWith("gh-token", expect.any(String), expect.any(String), 55, APP_TOKEN_STEP);
       const reason = vi.mocked(provider.markPlanningFailed).mock.calls[0][2];
       expect(reason.includes(APP_TOKEN_STEP_FAILED_REMEDIATION)).toBe(failed);
       expect(reason.startsWith("GitHub Actions could not create the run's GitHub App token")).toBe(failed);
       expect(send.mock.calls).toEqual(failed ? [[{ id: "github.target-secrets", project: "ENG", cause: "token-step" }]] : []);
       if (failed) expect(warn).toHaveBeenCalledWith(expect.stringContaining("github.target-secrets"));
+    });
+
+    // A row this step re-closed with the cause it found is still its own, so a retry finishes the comment it owes.
+    it.each([FLY_MACHINE_NEVER_STARTED, APP_TOKEN_STEP_FAILED])("retries the handling of a row it closed as %s", async (conclusion) => {
+      vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, status: "failed", conclusion, executionMode: "github-actions", runId: 55 } as never);
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      expect(provider.markPlanningFailed).toHaveBeenCalledOnce();
     });
 
     it("does nothing for a row the callback already closed", async () => {

@@ -1,3 +1,6 @@
+/** The conclusion of a Fly run whose machine Fly removed before it started. */
+export const FLY_MACHINE_NEVER_STARTED = "fly_machine_never_started";
+
 export const FLY_MACHINE_NEVER_STARTED_REMEDIATION = "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly).";
 
 /** The conclusion of a GitHub Actions run that ended unreported because its GitHub App token step failed. */
@@ -488,7 +491,7 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
     );
   }
   const exit = job.conclusion?.startsWith("exit_") ? job.conclusion.slice(5) : null;
-  const neverStarted = job.conclusion === "fly_machine_never_started";
+  const neverStarted = job.conclusion === FLY_MACHINE_NEVER_STARTED;
   const tokenStep = job.conclusion === APP_TOKEN_STEP_FAILED;
   const detail =
     neverStarted ? "Fly removed the machine before it started." :

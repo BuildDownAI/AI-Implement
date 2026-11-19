@@ -19,7 +19,7 @@ import { planningSessionName, type launchPlanningRun, type launchPlanningSession
 import { listMachines, getMachine, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { parkIssue } from "../dispatch-breaker.js";
-import { APP_TOKEN_STEP_FAILED_REMEDIATION, buildRunUrl, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
+import { APP_TOKEN_STEP_FAILED, APP_TOKEN_STEP_FAILED_REMEDIATION, buildRunUrl, FLY_MACHINE_NEVER_STARTED, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
 import type { RestateService } from "./endpoint.js";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
 import {
@@ -40,6 +40,8 @@ export const PLANNING_CONTEXT_FIELD_VALUE_KEY = "planningFieldValue";
 
 const GHA_BACKEND = "github-actions";
 const TERMINAL_JOB_STATUSES: ReadonlySet<string> = new Set(["completed", "review_failed", "failed", "timed_out", "dispatch-failed"]);
+/** The conclusions `finishJob` writes: its own close, then the cause a backend read found. */
+const FINISH_JOB_CONCLUSIONS: ReadonlySet<string> = new Set(["deadline_exceeded", "ended_without_callback", FLY_MACHINE_NEVER_STARTED, APP_TOKEN_STEP_FAILED]);
 
 export interface PlanningRunProductionInput {
   /** The full config: `preparePlanningLaunch` reads from it. */
@@ -237,7 +239,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     const conclusion = outcome.kind === "deadline" ? "deadline_exceeded" : "ended_without_callback";
     // A terminal row closed by the planning callback needs no handling. A row carrying this function's own marker
     // means an earlier attempt closed it and then threw before the handling finished, so the retry runs it again.
-    const closedByThisStep = job.conclusion === "deadline_exceeded" || job.conclusion === "ended_without_callback";
+    const closedByThisStep = job.conclusion !== null && FINISH_JOB_CONCLUSIONS.has(job.conclusion);
     if (TERMINAL_JOB_STATUSES.has(job.status) && !closedByThisStep) return;
     // Local writes first (they cannot fail on the network): close the row, then park. From here no poll dispatches
     // planning for the issue on any tracker, even if every tracker write below fails. Both are idempotent.
@@ -272,6 +274,8 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
         console.warn(`[planning-run] dispatch=${dispatchId} issue=${job.issueIdentifier} run=${job.runId} failed at its "${APP_TOKEN_STEP}" step${pointer}`);
       }
     }
+    // The row carries the cause too, so the outcome step's own comment names it if the tracker refuses the one below.
+    if (neverStarted || tokenStepFailed) updateJobStatus(job.id, status, neverStarted ? FLY_MACHINE_NEVER_STARTED : APP_TOKEN_STEP_FAILED);
     const runUrl = buildRunUrl(job);
     const reason =
       `${cause}${runUrl ? ` (run: ${runUrl})` : ""}. The issue is parked and will not be retried by itself. ` +

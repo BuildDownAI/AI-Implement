@@ -6,7 +6,7 @@
  * with `ownerCall`; this file holds the decision, never a copy of either. The composer (AII-1557)
  * supplies the real deps; the table of outcomes is in `docs/implementation-lifecycle.md`.
  */
-import { APP_TOKEN_STEP_FAILED } from "../completion-classification.js";
+import { APP_TOKEN_STEP_FAILED, FLY_MACHINE_NEVER_STARTED } from "../completion-classification.js";
 import type { ImplementationOutcome } from "../implementation-finalize.js";
 import type { Job, JobStatus } from "../log.js";
 import type { ImplementationFinishOutcome, ImplementationFinishResult } from "./implementation-run-workflow.js";
@@ -95,7 +95,7 @@ export async function finishImplementationJob(
   const tokenStepFailed = unreported && !neverStarted && await deps.tokenStepFailed?.(job);
   if (!facts.reported || neverStarted || tokenStepFailed) {
     // The backend ended and no callback came: the failure fix-up.
-    const conclusion = neverStarted ? "fly_machine_never_started" : tokenStepFailed ? APP_TOKEN_STEP_FAILED : "ended_without_callback";
+    const conclusion = neverStarted ? FLY_MACHINE_NEVER_STARTED : tokenStepFailed ? APP_TOKEN_STEP_FAILED : "ended_without_callback";
     deps.closeRow(job, "failed", conclusion, closeOpts);
     await deps.finalize({ kind: "failed", conclusion }, job);
     return {};
