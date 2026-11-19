@@ -109,7 +109,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           const [owner, repo] = gap.repository.split("/") as [string, string];
           await firePrBudgetPark({ getInstallationToken: token, postComment: postPrComment,
             listPrComments: (t, o, r, n) => listPrComments(t, o, r, n, { strict: true }),
-            postTrackerComment: async (m, id, body) => { await (await input.resolveProvider(m)).postComment(id, body); } }, mapping, run.issueId, owner, repo, gap.prNumber, gap.prDispatchBudget!);
+            postTrackerComment: async (m, id, body) => { await (await input.resolveProvider(m)).postComment(id, body); } }, mapping, run.issueId, { project: run.teamKey, identifier: run.issueIdentifier }, owner, repo, gap.prNumber, gap.prDispatchBudget!);
         }
       }
       if (result.ok) {

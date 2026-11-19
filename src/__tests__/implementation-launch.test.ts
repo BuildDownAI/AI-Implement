@@ -151,7 +151,7 @@ describe("launchImplementationRun", () => {
     vi.mocked(postWorkflowDispatch).mockResolvedValue({ success: false, outcome: "rejected", status, error: "no" } as never);
     vi.mocked(recordDispatchFailure).mockReturnValueOnce({ tripped: true, failures: 3 });
     await launchImplementationRun(args);
-    expect(recordDispatchFailure).toHaveBeenCalledWith(issue.id, "implementation", conclusion, issue.scopeKey);
+    expect(recordDispatchFailure).toHaveBeenCalledWith(issue.id, "implementation", conclusion, { project: issue.scopeKey, identifier: issue.identifier });
     expect(fireBreakerTrip).toHaveBeenCalledWith(config, provider, issue.id, issue.identifier, "implementation", 3, conclusion);
   });
 

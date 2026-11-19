@@ -57,10 +57,60 @@ export function initDispatchBreakerTable(): void {
   if (!cols.some((c) => c.name === "project")) {
     getDb().exec("ALTER TABLE dispatch_breaker ADD COLUMN project TEXT");
   }
+  // dispatch_log rows are pruned, so a parked issue is found by the identifier its breaker row keeps.
+  if (!cols.some((c) => c.name === "issue_identifier")) {
+    getDb().exec("ALTER TABLE dispatch_breaker ADD COLUMN issue_identifier TEXT");
+  }
+}
+
+/** What a breaker writer knows about the issue beyond its id. A null field keeps the value the row already holds. */
+export interface BreakerSubject {
+  /** The mapping key the issue belongs to. */
+  project: string | null;
+  /** The tracker's identifier for the issue, such as `AII-123`. */
+  identifier: string | null;
+}
+
+/** One issue+phase's breaker, as readers outside this module see it. */
+export interface BreakerState {
+  issueId: string;
+  phase: string;
+  failures: number;
+  lastConclusion: string | null;
+  lastFailureAt: number | null;
+  parkedAt: number | null;
+  project: string | null;
+  identifier: string | null;
+}
+
+type BreakerRow = {
+  issue_id: string;
+  phase: string;
+  consecutive_failures: number;
+  last_conclusion: string | null;
+  last_failure_at: number | null;
+  parked_at: number | null;
+  project: string | null;
+  issue_identifier: string | null;
+};
+
+const BREAKER_COLUMNS = "issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at, project, issue_identifier";
+
+function toBreakerState(r: BreakerRow): BreakerState {
+  return {
+    issueId: r.issue_id,
+    phase: r.phase,
+    failures: r.consecutive_failures,
+    lastConclusion: r.last_conclusion,
+    lastFailureAt: r.last_failure_at,
+    parkedAt: r.parked_at,
+    project: r.project,
+    identifier: r.issue_identifier,
+  };
 }
 
 /**
- * Records a consecutive dispatch failure for an issue+phase, and the project (mapping key) it failed for when known.
+ * Records a consecutive dispatch failure for an issue+phase, and what the caller knows of the issue.
  * Returns { tripped, failures } where tripped is true exactly once —
  * on the transition into parked state (count first reaches the threshold
  * and parked_at was null). Subsequent calls return tripped=false.
@@ -69,7 +119,7 @@ export function recordDispatchFailure(
   issueId: string,
   phase: string,
   conclusion: string,
-  project: string | null,
+  subject: BreakerSubject | null,
 ): { tripped: boolean; failures: number } {
   const db = getDb();
   const row = db
@@ -85,15 +135,16 @@ export function recordDispatchFailure(
   const now = Date.now();
 
   db.prepare(`
-    INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at, project)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at, project, issue_identifier)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (issue_id, phase) DO UPDATE SET
       consecutive_failures = excluded.consecutive_failures,
       last_conclusion      = excluded.last_conclusion,
       last_failure_at      = excluded.last_failure_at,
       parked_at            = COALESCE(dispatch_breaker.parked_at, excluded.parked_at),
-      project              = COALESCE(excluded.project, dispatch_breaker.project)
-  `).run(issueId, phase, failures, conclusion, now, tripped ? now : null, project);
+      project              = COALESCE(excluded.project, dispatch_breaker.project),
+      issue_identifier     = COALESCE(excluded.issue_identifier, dispatch_breaker.issue_identifier)
+  `).run(issueId, phase, failures, conclusion, now, tripped ? now : null, subject?.project ?? null, subject?.identifier ?? null);
 
   return { tripped, failures };
 }
@@ -104,6 +155,18 @@ export function breakerProject(issueId: string, phase: string): string | null {
     .prepare("SELECT project FROM dispatch_breaker WHERE issue_id = ? AND phase = ?")
     .get(issueId, phase) as { project: string | null } | undefined;
   return row?.project ?? null;
+}
+
+/**
+ * Every phase's breaker for one issue, found by the identifier its writers recorded.
+ * `issueIds` also reaches rows whose writers recorded none: rows from before the column, and PR-budget parks for a PR with no tracker issue.
+ */
+export function breakersForIssue(identifier: string, issueIds: readonly string[] = []): BreakerState[] {
+  const byId = issueIds.length === 0 ? "" : ` OR issue_id IN (${issueIds.map(() => "?").join(", ")})`;
+  const rows = getDb()
+    .prepare(`SELECT ${BREAKER_COLUMNS} FROM dispatch_breaker WHERE issue_identifier = ?${byId} ORDER BY phase`)
+    .all(identifier, ...issueIds) as BreakerRow[];
+  return rows.map(toBreakerState);
 }
 
 /**
@@ -128,7 +191,7 @@ export function recordDispatchSuccess(issueId: string, phase: string): void {
  * (mirrors the COALESCE idiom in `recordDispatchFailure`).
  * Returns true when this call parked it, false when it was already parked.
  */
-export function parkIssue(issueId: string, phase: string, conclusion: string): boolean {
+export function parkIssue(issueId: string, phase: string, conclusion: string, subject: BreakerSubject | null): boolean {
   const db = getDb();
   const row = db
     .prepare("SELECT parked_at FROM dispatch_breaker WHERE issue_id = ? AND phase = ?")
@@ -138,12 +201,14 @@ export function parkIssue(issueId: string, phase: string, conclusion: string): b
   const now = Date.now();
 
   db.prepare(`
-    INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at)
-    VALUES (?, ?, 0, ?, NULL, ?)
+    INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at, project, issue_identifier)
+    VALUES (?, ?, 0, ?, NULL, ?, ?, ?)
     ON CONFLICT (issue_id, phase) DO UPDATE SET
-      last_conclusion = CASE WHEN dispatch_breaker.parked_at IS NULL THEN excluded.last_conclusion ELSE dispatch_breaker.last_conclusion END,
-      parked_at        = COALESCE(dispatch_breaker.parked_at, excluded.parked_at)
-  `).run(issueId, phase, conclusion, now);
+      last_conclusion  = CASE WHEN dispatch_breaker.parked_at IS NULL THEN excluded.last_conclusion ELSE dispatch_breaker.last_conclusion END,
+      parked_at        = COALESCE(dispatch_breaker.parked_at, excluded.parked_at),
+      project          = COALESCE(excluded.project, dispatch_breaker.project),
+      issue_identifier = COALESCE(excluded.issue_identifier, dispatch_breaker.issue_identifier)
+  `).run(issueId, phase, conclusion, now, subject?.project ?? null, subject?.identifier ?? null);
 
   return !alreadyParked;
 }
@@ -244,33 +309,9 @@ export function unpark(issueId: string, phase?: string): boolean {
 }
 
 /** Returns all currently-parked issues, newest-parked first. */
-export function listParked(): Array<{
-  issueId: string;
-  phase: string;
-  failures: number;
-  lastConclusion: string | null;
-  parkedAt: number;
-}> {
+export function listParked(): Array<BreakerState & { parkedAt: number }> {
   const rows = getDb()
-    .prepare(
-      `SELECT issue_id, phase, consecutive_failures, last_conclusion, parked_at
-       FROM dispatch_breaker
-       WHERE parked_at IS NOT NULL
-       ORDER BY parked_at DESC`,
-    )
-    .all() as Array<{
-      issue_id: string;
-      phase: string;
-      consecutive_failures: number;
-      last_conclusion: string | null;
-      parked_at: number;
-    }>;
-
-  return rows.map((r) => ({
-    issueId: r.issue_id,
-    phase: r.phase,
-    failures: r.consecutive_failures,
-    lastConclusion: r.last_conclusion,
-    parkedAt: r.parked_at,
-  }));
+    .prepare(`SELECT ${BREAKER_COLUMNS} FROM dispatch_breaker WHERE parked_at IS NOT NULL ORDER BY parked_at DESC`)
+    .all() as Array<BreakerRow & { parked_at: number }>;
+  return rows.map((r) => ({ ...toBreakerState(r), parkedAt: r.parked_at }));
 }

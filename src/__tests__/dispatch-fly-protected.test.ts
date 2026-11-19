@@ -278,15 +278,15 @@ describe("opted-in Fly implementation", () => {
       vi.mocked(provider.markImplementationFailed).mockRejectedValueOnce(new Error("tracker down"));
       await dispatchFly();
     }
-    expect(dedup.getDb().prepare("SELECT parked_at IS NOT NULL AS parked, project FROM dispatch_breaker WHERE issue_id = ?").get(issue.id))
-      .toEqual({ parked: 1, project: issue.scopeKey });
+    expect(dedup.getDb().prepare("SELECT parked_at IS NOT NULL AS parked, project, issue_identifier FROM dispatch_breaker WHERE issue_id = ?").get(issue.id))
+      .toEqual({ parked: 1, project: issue.scopeKey, issue_identifier: issue.identifier });
   });
 
   it("a failure after the launch counts dispatch_error for the issue's project", async () => {
     vi.mocked(provider.markImplementing).mockRejectedValueOnce(new Error("tracker down"));
     await dispatchFly().catch(() => {});
-    expect(dedup.getDb().prepare("SELECT last_conclusion, project FROM dispatch_breaker WHERE issue_id = ?").get(issue.id))
-      .toEqual({ last_conclusion: "dispatch_error", project: issue.scopeKey });
+    expect(dedup.getDb().prepare("SELECT last_conclusion, project, issue_identifier FROM dispatch_breaker WHERE issue_id = ?").get(issue.id))
+      .toEqual({ last_conclusion: "dispatch_error", project: issue.scopeKey, issue_identifier: issue.identifier });
   });
 
   it("a Fly 4xx releases the admission and revokes the grant", async () => {

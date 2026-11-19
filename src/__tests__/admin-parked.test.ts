@@ -184,6 +184,15 @@ describe("GET /api/parked", () => {
     expect(rows[0].repo).toBeNull();
   });
 
+  it("names an issue by the identifier its breaker recorded when no dispatch_log or dispatched row is left", async () => {
+    const token = await login();
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-pruned", "implementation", "MANAGED_REFUSED", { project: "SAN", identifier: "SAN-9" });
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueId: string; issueIdentifier: unknown; issueTitle: unknown; repo: unknown }>;
+    expect(rows).toEqual([expect.objectContaining({ issueId: "issue-pruned", issueIdentifier: "SAN-9", issueTitle: null, repo: null })]);
+  });
+
   it("falls back to a dispatch_log row from another phase", async () => {
     const token = await login();
     log.appendLog({ issueId: "issue-fb", issueIdentifier: "AII-737", issueTitle: "Mint token", repo: "org/repo", phase: "planning" });

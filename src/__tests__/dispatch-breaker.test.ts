@@ -85,17 +85,87 @@ describe("the project a breaker row failed for", () => {
     expect(breaker.breakerProject("issue-1", "implementation")).toBeNull();
     breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(breaker.breakerProject("issue-1", "implementation")).toBeNull();
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure", "ENG");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", { project: "ENG", identifier: null });
     breaker.recordDispatchFailure("issue-1", "implementation", "failure", null);
     expect(breaker.breakerProject("issue-1", "implementation")).toBe("ENG");
-    breaker.recordDispatchFailure("issue-1", "implementation", "failure", "OPS");
+    breaker.recordDispatchFailure("issue-1", "implementation", "failure", { project: "OPS", identifier: null });
     expect(breaker.breakerProject("issue-1", "implementation")).toBe("OPS");
   });
 
   it("is kept per phase", () => {
-    breaker.recordDispatchFailure("issue-1", "planning", "failure", "ENG");
+    breaker.recordDispatchFailure("issue-1", "planning", "failure", { project: "ENG", identifier: null });
     expect(breaker.breakerProject("issue-1", "planning")).toBe("ENG");
     expect(breaker.breakerProject("issue-1", "implementation")).toBeNull();
+  });
+
+  it("is written by a park, and a park that names none keeps it", () => {
+    breaker.parkIssue("issue-1", "planning", "tracker_setup_refused", { project: "ENG", identifier: null });
+    expect(breaker.breakerProject("issue-1", "planning")).toBe("ENG");
+    breaker.parkIssue("issue-1", "planning", "tracker_setup_refused", null);
+    expect(breaker.breakerProject("issue-1", "planning")).toBe("ENG");
+  });
+});
+
+// dispatch_log rows are pruned and a managed refusal writes none, so the breaker keeps the identifier itself (AII-1546).
+describe("finding an issue's breakers by its identifier", () => {
+  it("reaches every phase a failure or a park recorded the identifier on, and no other issue's", () => {
+    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: "SAN-7" });
+    breaker.parkIssue("issue-7", "planning", "plan_status_write_failed", { project: "SAN", identifier: "SAN-7" });
+    breaker.recordDispatchFailure("issue-8", "implementation", "failure", { project: "SAN", identifier: "SAN-8" });
+    expect(breaker.breakersForIssue("SAN-7")).toEqual([
+      { issueId: "issue-7", phase: "implementation", failures: 1, lastConclusion: "workflow_dispatch_not_found", lastFailureAt: expect.any(Number), parkedAt: null, project: "SAN", identifier: "SAN-7" },
+      { issueId: "issue-7", phase: "planning", failures: 0, lastConclusion: "plan_status_write_failed", lastFailureAt: null, parkedAt: expect.any(Number), project: "SAN", identifier: "SAN-7" },
+    ]);
+  });
+
+  it("keeps the identifier through a failure, a park and a success that name none", () => {
+    breaker.recordDispatchFailure("issue-7", "implementation", "failure", { project: null, identifier: "SAN-7" });
+    breaker.recordDispatchFailure("issue-7", "implementation", "failure", null);
+    breaker.parkIssue("issue-7", "implementation", "failure", null);
+    breaker.recordDispatchSuccess("issue-7", "implementation");
+    expect(breaker.breakersForIssue("SAN-7").map((b) => b.identifier)).toEqual(["SAN-7"]);
+  });
+
+  // An issue moved to another team keeps its id and takes a new identifier.
+  it("takes the newest identifier a failure or a park names", () => {
+    breaker.recordDispatchFailure("issue-7", "implementation", "failure", { project: "SAN", identifier: "SAN-7" });
+    breaker.recordDispatchFailure("issue-7", "implementation", "failure", { project: "OPS", identifier: "OPS-3" });
+    breaker.parkIssue("issue-7", "planning", "failure", { project: "SAN", identifier: "SAN-7" });
+    breaker.parkIssue("issue-7", "planning", "failure", { project: "OPS", identifier: "OPS-3" });
+    expect(breaker.breakersForIssue("SAN-7")).toEqual([]);
+    expect(breaker.breakersForIssue("OPS-3").map((b) => [b.phase, b.project])).toEqual([["implementation", "OPS"], ["planning", "OPS"]]);
+  });
+
+  it("reaches a row that recorded no identifier only through the issue ids it is given", () => {
+    breaker.parkIssue("acme/app#7", "gap-analysis", "pr_budget", null);
+    expect(breaker.breakersForIssue("SAN-7")).toEqual([]);
+    expect(breaker.breakersForIssue("SAN-7", ["acme/app#7"])).toEqual([expect.objectContaining({ issueId: "acme/app#7", identifier: null })]);
+  });
+
+  it("lists each parked row with its identifier and project", () => {
+    breaker.parkIssue("issue-7", "planning", "tracker_setup_refused", { project: "SAN", identifier: "SAN-7" });
+    expect(breaker.listParked()).toEqual([expect.objectContaining({ issueId: "issue-7", phase: "planning", project: "SAN", identifier: "SAN-7", parkedAt: expect.any(Number) })]);
+  });
+});
+
+describe("a breaker table from before the identifier column", () => {
+  it("gains the column at boot, its rows read with no identifier and stay parked, and the next write that names one fills it", async () => {
+    ({ dedup, breaker } = (await testDb({ tables: "none", modules: { dedup: () => import("../dedup.js"), breaker: () => import("../dispatch-breaker.js") } })).modules);
+    // The table as the orchestrator before this change created it.
+    dedup.getDb().exec(`CREATE TABLE dispatch_breaker (issue_id TEXT NOT NULL, phase TEXT NOT NULL, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      last_conclusion TEXT, last_failure_at INTEGER, parked_at INTEGER, pr_budget_notified_at INTEGER, trip_notified_at INTEGER, project TEXT,
+      PRIMARY KEY (issue_id, phase))`);
+    dedup.getDb().prepare("INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at, project) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run("issue-7", "implementation", 3, "workflow_dispatch_not_found", 1000, 2000, "SAN");
+    breaker.initDispatchBreakerTable();
+    breaker.initDispatchBreakerTable();
+
+    expect(breaker.isParked("issue-7", "implementation")).toBe(true);
+    expect(breaker.listParked()).toEqual([{ issueId: "issue-7", phase: "implementation", failures: 3, lastConclusion: "workflow_dispatch_not_found", lastFailureAt: 1000, parkedAt: 2000, project: "SAN", identifier: null }]);
+    expect(breaker.breakersForIssue("SAN-7", ["issue-7"])).toHaveLength(1);
+
+    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", { project: null, identifier: "SAN-7" });
+    expect(breaker.breakersForIssue("SAN-7")).toEqual([expect.objectContaining({ failures: 4, parkedAt: 2000, project: "SAN", identifier: "SAN-7" })]);
   });
 });
 
@@ -323,7 +393,7 @@ describe("shouldCountFailure (BAC-27134)", () => {
 
 describe("parkIssue", () => {
   it("returns true on the first call, sets parked_at and last_conclusion, and leaves consecutive_failures at 0 for a fresh row", () => {
-    const result = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    const result = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget", null);
     expect(result).toBe(true);
     expect(breaker.isParked("issue-1", "gap-analysis")).toBe(true);
 
@@ -340,12 +410,12 @@ describe("parkIssue", () => {
   it("returns false on a second call and leaves the original parked_at unchanged", () => {
     const nowSpy = vi.spyOn(Date, "now");
     nowSpy.mockReturnValue(1_000_000);
-    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget", null);
     const first = breaker.listParked()[0].parkedAt;
     expect(first).toBe(1_000_000);
 
     nowSpy.mockReturnValue(2_000_000);
-    const second = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget_again");
+    const second = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget_again", null);
     expect(second).toBe(false);
 
     const parked = breaker.listParked();
@@ -358,7 +428,7 @@ describe("parkIssue", () => {
     breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
     breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
 
-    const result = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    const result = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget", null);
     expect(result).toBe(true);
 
     const parked = breaker.listParked();
@@ -370,7 +440,7 @@ describe("parkIssue", () => {
   it("a subsequent recordDispatchFailure call is unaffected by parkIssue's failure count", () => {
     breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
     breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
-    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget", null);
 
     const r = breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure", null);
     expect(r.failures).toBe(3);
@@ -441,14 +511,14 @@ describe("breakerPhaseFor", () => {
 describe("claimPrBudgetNotice", () => {
   it("claims once per park, regardless of who parked first", () => {
     for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("i1", "gap-analysis", "failure", null);
-    expect(breaker.parkIssue("i1", "gap-analysis", "pr_budget")).toBe(false);
+    expect(breaker.parkIssue("i1", "gap-analysis", "pr_budget", null)).toBe(false);
     expect(breaker.claimPrBudgetNotice("i1", "gap-analysis")).toBe(breaker.listParked()[0]!.parkedAt);
     expect(breaker.claimPrBudgetNotice("i1", "gap-analysis")).toBeNull();
   });
 
   it("keeps the breaker's last_conclusion when the budget path parks an already-parked row", () => {
     for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("i2", "gap-analysis", "crash", null);
-    breaker.parkIssue("i2", "gap-analysis", "pr_budget");
+    breaker.parkIssue("i2", "gap-analysis", "pr_budget", null);
     expect(breaker.listParked()[0]!.lastConclusion).toBe("crash");
   });
 
@@ -456,11 +526,11 @@ describe("claimPrBudgetNotice", () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(1_000);
-      breaker.parkIssue("i3", "gap-analysis", "pr_budget");
+      breaker.parkIssue("i3", "gap-analysis", "pr_budget", null);
       expect(breaker.claimPrBudgetNotice("i3", "gap-analysis")).toBe(1_000);
       breaker.unpark("i3");
       vi.setSystemTime(2_000);
-      breaker.parkIssue("i3", "gap-analysis", "pr_budget");
+      breaker.parkIssue("i3", "gap-analysis", "pr_budget", null);
       expect(breaker.claimPrBudgetNotice("i3", "gap-analysis")).toBe(2_000);
     } finally {
       vi.useRealTimers();
@@ -470,7 +540,7 @@ describe("claimPrBudgetNotice", () => {
   it("does not claim a row that is not parked, and a release lets the next call claim", () => {
     breaker.recordDispatchFailure("i4", "gap-analysis", "failure", null);
     expect(breaker.claimPrBudgetNotice("i4", "gap-analysis")).toBeNull();
-    breaker.parkIssue("i5", "gap-analysis", "pr_budget");
+    breaker.parkIssue("i5", "gap-analysis", "pr_budget", null);
     expect(breaker.claimPrBudgetNotice("i5", "gap-analysis")).not.toBeNull();
     breaker.releasePrBudgetNotice("i5", "gap-analysis");
     expect(breaker.claimPrBudgetNotice("i5", "gap-analysis")).not.toBeNull();
@@ -486,13 +556,13 @@ describe("prBudgetMarker", () => {
 
 describe("prBudgetTrackerCommentOwed", () => {
   it("is owed after a stuck park even when a later failure overwrites last_conclusion", () => {
-    breaker.parkIssue("t1", "gap-analysis", "stuck_giveup");
+    breaker.parkIssue("t1", "gap-analysis", "stuck_giveup", null);
     breaker.recordDispatchFailure("t1", "gap-analysis", "failed", null);
     expect(breaker.prBudgetTrackerCommentOwed("t1", "gap-analysis")).toBe(true);
   });
 
   it("is not owed once the trip comment was posted, and is owed again after unpark", () => {
-    breaker.parkIssue("t2", "gap-analysis", "failure");
+    breaker.parkIssue("t2", "gap-analysis", "failure", null);
     breaker.markTripNotified("t2", "gap-analysis");
     expect(breaker.prBudgetTrackerCommentOwed("t2", "gap-analysis")).toBe(false);
     breaker.unpark("t2");

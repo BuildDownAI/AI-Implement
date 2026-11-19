@@ -10,7 +10,7 @@ import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { gitHubAppErrorChecks, pointAtSetupChecks } from "./setup-checks/recheck.js";
 import { canDispatch } from "./dispatch-gate.js";
-import { isParked, claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
+import { isParked, claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice, type BreakerSubject } from "./dispatch-breaker.js";
 import {
   checkAdmission,
   acquire as acquireAdmission,
@@ -260,12 +260,13 @@ export async function firePrBudgetPark(
   opts: Pick<DrainCommentGapfillsInput, "getInstallationToken" | "listPrComments" | "postComment" | "postTrackerComment">,
   mapping: RepoMapping,
   issueId: string,
+  subject: BreakerSubject,
   owner: string,
   repo: string,
   prNumber: number,
   budget: number,
 ): Promise<void> {
-  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget");
+  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget", subject);
   const parkedAt = claimPrBudgetNotice(issueId, "gap-analysis");
   if (parkedAt == null) return;
 
@@ -458,7 +459,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         recordCommentGapfillRefusal(item.id, admission.reason, dispatchId);
         await notifyCommentGapfillSkipped(opts, item.id);
         if (admission.reason === "budget_exhausted" || (!gateDecision.ok && gateDecision.reason === "pr_budget")) {
-          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+          await firePrBudgetPark(opts, mapping, prLog.issueId, { project: scopeKey, identifier: prLog.issueIdentifier }, item.owner, item.repo, item.prNumber, prBudget);
         }
         continue;
       }
@@ -470,7 +471,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         recordCommentGapfillRefusal(item.id, reason, dispatchId);
         await notifyCommentGapfillSkipped(opts, item.id);
         if (reason === "budget_exhausted") {
-          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+          await firePrBudgetPark(opts, mapping, prLog.issueId, { project: scopeKey, identifier: prLog.issueIdentifier }, item.owner, item.repo, item.prNumber, prBudget);
         }
         console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${gateDecision.reason}`);
         continue;

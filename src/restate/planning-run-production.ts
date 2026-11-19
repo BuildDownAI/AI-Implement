@@ -242,7 +242,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     // Local writes first (they cannot fail on the network): close the row, then park. From here no poll dispatches
     // planning for the issue on any tracker, even if every tracker write below fails. Both are idempotent.
     if (!TERMINAL_JOB_STATUSES.has(job.status)) updateJobStatus(job.id, status, conclusion);
-    if (job.issueId) parkIssue(job.issueId, "planning", conclusion);
+    if (job.issueId) parkIssue(job.issueId, "planning", conclusion, { project: job.teamKey, identifier: job.issueIdentifier });
     // A comment already recorded by an earlier attempt means the tracker write is done.
     if (job.failureCommentedAt) return;
     const mapping = job.teamKey ? getMapping(job.teamKey) : undefined;

@@ -327,7 +327,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
           await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision))
             .catch((err) => console.error(`[implementation-run] refusal comment failed issue=${issue.identifier}:`, err));
           // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-          const breaker = recordDispatchFailure(issue.id, "implementation", decision.code, run.teamKey);
+          const breaker = recordDispatchFailure(issue.id, "implementation", decision.code, { project: run.teamKey, identifier: issue.identifier });
           if (breaker.tripped) {
             await input.fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breaker.failures, decision.code);
           }

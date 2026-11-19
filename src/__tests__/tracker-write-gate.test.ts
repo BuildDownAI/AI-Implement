@@ -55,8 +55,8 @@ it.each(["planning", "implementation"] as const)("parks %s and comments once acr
   const check = () => checkTrackerWrites({ ...opts, provider: { ensureLifecycleLabels } });
   expect(await check()).toBe("skip");
   expect(await check()).toBe("skip");
-  expect(opts.park).toHaveBeenCalledWith(issue.id, phase, "tracker_setup_refused");
-  expect(breaker.listParked()).toEqual([expect.objectContaining({ issueId: issue.id, phase, lastConclusion: "tracker_setup_refused" })]);
+  expect(opts.park).toHaveBeenCalledWith(issue.id, phase, "tracker_setup_refused", { project: "AII", identifier: issue.identifier });
+  expect(breaker.listParked()).toEqual([expect.objectContaining({ issueId: issue.id, phase, lastConclusion: "tracker_setup_refused", project: "AII", identifier: issue.identifier })]);
   expect(opts.comment).toHaveBeenCalledExactlyOnceWith(issue.id, COMMENT);
   expect(opts.comment.mock.calls[0][1].match(/Linear refused/g)).toHaveLength(1);
   expect(opts.log).toHaveBeenNthCalledWith(1, `[poll] ${issue.identifier} tracker_setup_refused: ${refusal.message}${LOG_POINTER}`);

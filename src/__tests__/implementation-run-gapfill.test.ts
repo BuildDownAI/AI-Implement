@@ -148,7 +148,9 @@ it.each(["parked", "budget_exhausted", "occupied", "at_capacity"])("reserve refu
   vi.mocked(acquire).mockReturnValue({ ok: false, reason } as never);
   expect(await d.reserve(run)).toEqual({ ok: false, reason });
   expect(recordCommentGapfillRefusal).toHaveBeenCalledWith(1, reason, run.dispatchId);
-  if (reason === "budget_exhausted") expect(firePrBudgetPark).toHaveBeenCalled();
+  if (reason === "budget_exhausted") {
+    expect(firePrBudgetPark).toHaveBeenCalledWith(expect.anything(), expect.anything(), "issue", { project: "ENG", identifier: "ENG-1" }, "Org", "repo", 42, 5);
+  }
 });
 it.each(["probe", "token", "managed"])("prep %s failure fails the queue and settles rejected", async source => {
   if (source === "probe") vi.mocked(prepareGhaGapfillLaunch).mockRejectedValueOnce(new Error("probe"));

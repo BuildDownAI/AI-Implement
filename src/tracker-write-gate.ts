@@ -1,3 +1,4 @@
+import type { parkIssue } from "./dispatch-breaker.js";
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import { pointAtSetupChecks, trackerSetupChecksSentence } from "./setup-checks/recheck.js";
 
@@ -8,7 +9,7 @@ export async function checkTrackerWrites({ provider, issue, phase, park, comment
   provider: Pick<TicketingProvider, "ensureLifecycleLabels">;
   issue: Pick<TicketIssue, "id" | "identifier" | "scopeKey">;
   phase: "planning" | "implementation";
-  park: (issueId: string, phase: string, conclusion: string) => boolean;
+  park: typeof parkIssue;
   comment: (issueId: string, body: string) => Promise<unknown>;
   log: (message: string) => void;
 }): Promise<"dispatch" | "skip"> {
@@ -25,7 +26,7 @@ export async function checkTrackerWrites({ provider, issue, phase, park, comment
     log(`[poll] ${issue.identifier} tracker setup deferred: ${result.message}`);
     return "skip";
   }
-  const newlyParked = park(issue.id, phase, "tracker_setup_refused");
+  const newlyParked = park(issue.id, phase, "tracker_setup_refused", { project: issue.scopeKey, identifier: issue.identifier });
   // Only Linear prepares lifecycle labels, so its label check is the one that explains a refusal.
   const pointer = pointAtSetupChecks({ ids: [LIFECYCLE_LABELS_CHECK], project: issue.scopeKey, cause: "tracker-write" });
   log(`[poll] ${issue.identifier} tracker_setup_refused: ${result.message.replace(/\.$/, "")}${pointer}`);

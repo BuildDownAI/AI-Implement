@@ -397,7 +397,7 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     seedMapping();
     queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
       prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1" });
-    breaker.parkIssue("issue-42", "gap-analysis", "pr_budget");
+    breaker.parkIssue("issue-42", "gap-analysis", "pr_budget", null);
     const feedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
     const store = new storeModule.SqliteReviewFixAttemptStore();
     expect(await store.admit(admissionRequest({ feedback }))).toEqual({ status: "deferred", reason: "paused" });

@@ -703,7 +703,7 @@ describe("reportTerminalJob — fix runs", () => {
       if (status === "review_failed" && bucket === "gap-analysis") {
         expect(recordDispatchFailure).not.toHaveBeenCalled();
       } else {
-        expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", bucket, "x", "ENG");
+        expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", bucket, "x", { project: "ENG", identifier: "ENG-1" });
       }
     }
   });
@@ -719,7 +719,7 @@ describe("reportTerminalJob — fix runs", () => {
       await reportTerminalJob(config, makeRegistry(makeProvider()), makeJob({ phase: "gap-analysis", status: "failed", conclusion: "failure" } as Partial<Job>));
     }
     expect(recordDispatchFailure).toHaveBeenCalledTimes(3);
-    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "failure", "ENG");
+    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "failure", { project: "ENG", identifier: "ENG-1" });
   });
 
   it("posts no second comment and no completion notice for stuck_review_fix", async () => {
@@ -729,7 +729,7 @@ describe("reportTerminalJob — fix runs", () => {
       makeRegistry(provider),
       makeJob({ phase: "gap-analysis", status: "timed_out", conclusion: "stuck_review_fix" } as Partial<Job>),
     );
-    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "stuck_review_fix", "ENG");
+    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "stuck_review_fix", { project: "ENG", identifier: "ENG-1" });
     expect(provider.postComment).not.toHaveBeenCalled();
     expect(notifyCompletion).not.toHaveBeenCalled();
   });

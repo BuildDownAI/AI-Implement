@@ -372,7 +372,7 @@ describe("handleRunnerResult — planning", () => {
     expect(row?.failure?.message).toContain("Unpark at /admin#runners");
     expect(failSpy).toHaveBeenCalledWith("i", "ENG", row?.failure?.message);
     expect(row?.failureCommentedAt).toBeTruthy();
-    expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
+    expect(dispatchBreaker.breakersForIssue("ENG-1")).toEqual([expect.objectContaining({ issueId: "i", phase: "planning", parkedAt: expect.any(Number), project: "ENG" })]);
   });
 
   it("still parks the issue and answers 200 when the failure write is refused too", async () => {

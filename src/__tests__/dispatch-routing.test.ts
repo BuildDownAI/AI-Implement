@@ -1721,7 +1721,8 @@ describe("poll implementation submission — ImplementationRun for every project
         (await import("../dedup.js")).markDispatched("gone-1", "AII", "AII-9", "Gone");
         vi.mocked(provider.fetchLifecycleStates).mockResolvedValue(new Map());
       });
-      expect((await import("../dispatch-breaker.js")).breakerProject("gone-1", "implementation")).toBe("AII");
+      // The dedup row is gone by then, so the identifier comes from the issue's dispatch row.
+      expect((await import("../dispatch-breaker.js")).breakersForIssue("AII-9")).toEqual([expect.objectContaining({ issueId: "gone-1", phase: "implementation", project: "AII" })]);
     });
 
     it("a provider that fails to build", async () => {

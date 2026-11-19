@@ -453,7 +453,9 @@ describe("production deps", () => {
   });
 
   describe("finishJob", () => {
-    const row = { id: 7, issueId: "i-1", teamKey: "ENG", dispatchId: "d-1", status: "dispatched", conclusion: null };
+    const row = { id: 7, issueId: "i-1", issueIdentifier: "ENG-1", teamKey: "ENG", dispatchId: "d-1", status: "dispatched", conclusion: null };
+    // The park names the row's issue, so the breaker finds it once its dispatch rows are pruned.
+    const SUBJECT = { project: "ENG", identifier: "ENG-1" };
 
     it.each(["never-started", "started", "timeout", "read-error", "deadline"])("keeps planning semantics for %s", async scenario => {
       vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, executionMode: "fly-machines", machineId: "m-1" } as never);
@@ -465,7 +467,7 @@ describe("production deps", () => {
       await d.finishJob("d-1", { kind: scenario === "deadline" ? "deadline" : "run_ended" });
       const conclusion = scenario === "deadline" ? "deadline_exceeded" : "ended_without_callback";
       expect(updateJobStatus).toHaveBeenCalledWith(7, scenario === "deadline" ? "timed_out" : "failed", conclusion);
-      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", conclusion);
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", conclusion, SUBJECT);
       if (scenario === "deadline") expect(getMachine).not.toHaveBeenCalled();
       else expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1", 10_000);
       const cause = scenario === "never-started" ? "Fly removed the machine before it started" :
@@ -477,14 +479,14 @@ describe("production deps", () => {
     });
 
     it.each([true, false])("names a failed GitHub App token step on a GitHub Actions run (failed=%s)", async (failed) => {
-      vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, executionMode: "github-actions", runId: 55, issueIdentifier: "ENG-1" } as never);
+      vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, executionMode: "github-actions", runId: 55 } as never);
       if (failed) vi.mocked(getFailedRunStepJob).mockResolvedValueOnce({ jobName: "plan", htmlUrl: null });
       const send = await recordRechecks();
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
       // Planning closes and parks first, before any network read, so the conclusion stays the same.
-      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback", SUBJECT);
       expect(getFailedRunStepJob).toHaveBeenCalledWith("gh-token", expect.any(String), expect.any(String), 55, APP_TOKEN_STEP);
       const reason = vi.mocked(provider.markPlanningFailed).mock.calls[0][2];
       expect(reason.includes(APP_TOKEN_STEP_FAILED_REMEDIATION)).toBe(failed);
@@ -513,7 +515,7 @@ describe("production deps", () => {
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
       expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "ended_without_callback");
-      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback", SUBJECT);
       expect(provider.markPlanningFailed).toHaveBeenCalledWith("i-1", "ENG", expect.stringContaining("Unpark"));
       expect(markJobFailureCommented).toHaveBeenCalledWith(7);
       expect(remediateFailedJob).not.toHaveBeenCalled();
@@ -546,7 +548,7 @@ describe("production deps", () => {
       const { d } = compose();
       await d.finishJob("d-1", { kind: "deadline" });
       expect(updateJobStatus).toHaveBeenCalledWith(7, "timed_out", "deadline_exceeded");
-      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "deadline_exceeded");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "deadline_exceeded", SUBJECT);
     });
 
     it("does not throw when the tracker write fails, and leaves the failure comment unrecorded", async () => {

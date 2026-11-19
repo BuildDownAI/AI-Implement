@@ -278,7 +278,7 @@ export async function launchImplementationRun(args: LaunchImplementationRunArgs)
     }
     // No dedup row was written at this point (markDispatched is called only on success).
     const conclusion = dispatchFailureConclusion(result.status);
-    const _brImpl = recordDispatchFailure(issue.id, "implementation", conclusion, issue.scopeKey);
+    const _brImpl = recordDispatchFailure(issue.id, "implementation", conclusion, { project: issue.scopeKey, identifier: issue.identifier });
     if (_brImpl.tripped) {
       await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", _brImpl.failures, conclusion);
     }

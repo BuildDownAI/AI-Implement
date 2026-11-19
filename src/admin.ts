@@ -1267,7 +1267,7 @@ export function handleAdminRequest(
             failures: r.failures,
             lastConclusion: r.lastConclusion,
             parkedAt: r.parkedAt,
-            issueIdentifier: enrichment.issueIdentifier,
+            issueIdentifier: r.identifier ?? enrichment.issueIdentifier,
             issueTitle: enrichment.issueTitle,
             repo: enrichment.repo,
           };

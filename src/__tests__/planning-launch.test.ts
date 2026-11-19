@@ -256,8 +256,8 @@ describe("launchPlanningRun", () => {
   it("counts a 404 for the issue's project as workflow_dispatch_not_found, and parks with that conclusion", async () => {
     vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: false, status: 404, error: "Not Found", outcome: "rejected" });
     for (let i = 0; i < 3; i++) await launchModule.launchPlanningRun(args());
-    expect(dedup.getDb().prepare("SELECT last_conclusion, project FROM dispatch_breaker WHERE issue_id = ? AND phase = 'planning'").get(issue.id))
-      .toEqual({ last_conclusion: "workflow_dispatch_not_found", project: issue.scopeKey });
+    expect(dedup.getDb().prepare("SELECT last_conclusion, project, issue_identifier FROM dispatch_breaker WHERE issue_id = ? AND phase = 'planning'").get(issue.id))
+      .toEqual({ last_conclusion: "workflow_dispatch_not_found", project: issue.scopeKey, issue_identifier: issue.identifier });
     expect(fireBreakerTrip).toHaveBeenCalledWith(config, provider, issue.id, issue.identifier, "planning", 3, "workflow_dispatch_not_found");
   });
 

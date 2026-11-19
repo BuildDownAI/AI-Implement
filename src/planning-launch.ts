@@ -106,7 +106,7 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
         await provider.markPlanningFailed(issue.id, issue.scopeKey, refusalText(decision))
           .catch((err) => console.error(`[poll] Refusal comment failed for ${issue.identifier}:`, err));
         // Neither caller counts a throw from here, so count it or the next poll re-comments every 60 s.
-        const breakerRefuse = recordDispatchFailure(issue.id, "planning", decision.code, issue.scopeKey);
+        const breakerRefuse = recordDispatchFailure(issue.id, "planning", decision.code, { project: issue.scopeKey, identifier: issue.identifier });
         if (breakerRefuse.tripped && fireBreakerTrip) {
           await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", breakerRefuse.failures, decision.code);
         }
@@ -319,7 +319,7 @@ export async function launchPlanningRun(args: LaunchPlanningRunArgs): Promise<Pl
     }
     // Planning never writes a dedup row (intentional), but we still count the failure.
     const conclusion = dispatchFailureConclusion(result.status);
-    const _brPlan = recordDispatchFailure(issue.id, "planning", conclusion, issue.scopeKey);
+    const _brPlan = recordDispatchFailure(issue.id, "planning", conclusion, { project: issue.scopeKey, identifier: issue.identifier });
     if (_brPlan.tripped) {
       await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", _brPlan.failures, conclusion);
     }

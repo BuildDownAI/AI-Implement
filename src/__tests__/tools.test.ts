@@ -1101,7 +1101,7 @@ describe("get_issue_dispatch_status on the real tables", () => {
 
   it("a 404 breaker reads as a configuration problem naming the checks failing for its project, beside the project's rows needing attention", async () => {
     dispatchRow({ status: "dispatch-failed" });
-    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", "SAN");
+    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: null });
     const data = await status("SAN-7", STORED);
     expect(data.breakers).toEqual([{
       phase: "implementation", failures: 1, lastConclusion: "workflow_dispatch_not_found", lastFailureAt: expect.any(Number),
@@ -1115,7 +1115,7 @@ describe("get_issue_dispatch_status on the real tables", () => {
 
   it("with no stored run, names every check that can cause a 404 and no project rows", async () => {
     dispatchRow();
-    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", "SAN");
+    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: null });
     const data = await status("SAN-7", null);
     expect(data.breakers[0].setupChecks).toEqual(["github.installation", "github.workflow-default-branch", "github.workflow-mapping-branch"]);
     expect(data.projectSetupChecks).toBeNull();
@@ -1124,7 +1124,7 @@ describe("get_issue_dispatch_status on the real tables", () => {
   it("a parked breaker with a conclusion no setup fault explains names no check, and the project comes from the dispatch rows", async () => {
     dispatchRow();
     breaker.recordDispatchFailure("issue-7", "planning", "dispatch_error", null);
-    breaker.parkIssue("issue-7", "planning", "dispatch_error");
+    breaker.parkIssue("issue-7", "planning", "dispatch_error", null);
     const data = await status("SAN-7", STORED);
     expect(data.breakers).toEqual([expect.objectContaining({ phase: "planning", parked: true, parkedAt: expect.any(Number), project: null, configurationProblem: false, setupChecks: [] })]);
     expect(data.projectSetupChecks.project).toBe("SAN");
@@ -1132,13 +1132,23 @@ describe("get_issue_dispatch_status on the real tables", () => {
 
   it("finds the breaker of an issue known only by its dedup row, and takes the project from the breaker", async () => {
     dedup.markDispatched("issue-7", "SAN", "SAN-7", "Fix it");
-    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", "SAN");
+    breaker.recordDispatchFailure("issue-7", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: null });
     const data = await status("SAN-7", STORED);
     expect(data.breakers).toEqual([expect.objectContaining({ project: "SAN", setupChecks: ["github.installation"] })]);
     expect(data.projectSetupChecks.project).toBe("SAN");
   });
 
+  // A managed refusal writes no dispatch row, and a refused dispatch's rows are pruned in time, so the breaker names the issue itself.
+  it("finds a parked issue's breaker by its identifier when no dispatch or dedup row names the issue", async () => {
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-7", "implementation", "MANAGED_REFUSED", { project: "SAN", identifier: "SAN-7" });
+    const data = await status("SAN-7", STORED);
+    expect(data.recentDispatches).toEqual([]);
+    expect(data.breakers).toEqual([expect.objectContaining({ phase: "implementation", failures: 3, parked: true, project: "SAN" })]);
+    expect(data.projectSetupChecks.project).toBe("SAN");
+  });
+
   it("shows no breaker and no project rows for an issue it has no record of", async () => {
+    breaker.recordDispatchFailure("issue-8", "implementation", "workflow_dispatch_not_found", { project: "SAN", identifier: "SAN-8" });
     const data = await status("NONE-1", STORED);
     expect(data.breakers).toEqual([]);
     expect(data.projectSetupChecks).toBeNull();

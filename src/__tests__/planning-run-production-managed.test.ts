@@ -139,7 +139,7 @@ describe("PlanningRun launch for an opted-in project (AII-1391)", () => {
     expect(getInstallationToken).not.toHaveBeenCalled();
     expect(postWorkflowDispatch).not.toHaveBeenCalled();
     // The refusal was counted and the trip went through `input.fireBreakerTrip`.
-    expect(recordDispatchFailure).toHaveBeenCalledWith("i-1", "planning", "runner_incompatible", "ENG");
+    expect(recordDispatchFailure).toHaveBeenCalledWith("i-1", "planning", "runner_incompatible", { project: "ENG", identifier: "ENG-1" });
     expect(fireBreakerTrip).toHaveBeenCalledTimes(1);
     expect(releaseByDispatchId).not.toHaveBeenCalled();
   });

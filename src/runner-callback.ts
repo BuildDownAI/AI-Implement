@@ -1513,7 +1513,7 @@ async function handleRunnerResultInternal(
           evidence: { truncated: false },
         });
       }
-      parkIssue(claims.issueId, "planning", "plan_status_write_failed");
+      parkIssue(claims.issueId, "planning", "plan_status_write_failed", { project: mappingTeamKey, identifier: failedJob?.issueIdentifier ?? null });
       try {
         const commented = await provider.markPlanningFailed(claims.issueId, mappingTeamKey, planStatusFailure);
         if (failedJob && commented) markJobFailureCommented(failedJob.id);

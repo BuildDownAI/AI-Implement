@@ -52,13 +52,13 @@ describe("review-fix budget refusal", () => {
   it.each(["budget_exhausted", "paused", "occupied", "at_capacity"] as const)("handles %s", async (reason) => {
     getMappings.mockReturnValue({ k: mapping });
     isManagedProject.mockReturnValue(false);
-    queueLookup.mockReturnValue({ issue_id: "tracker-123" });
+    queueLookup.mockReturnValue({ issue_id: "tracker-123", issue_identifier: "ENG-123" });
     const onBudgetExhausted = vi.fn();
     const outcome = { status: "deferred", reason } as const;
     const store = { admit: vi.fn(async () => outcome) };
     expect(await admitReviewFix(request, config, store, undefined, onBudgetExhausted)).toEqual(outcome);
     if (reason === "budget_exhausted") {
-      expect(onBudgetExhausted).toHaveBeenCalledExactlyOnceWith(mapping, "tracker-123", "acme/app", 7, 4);
+      expect(onBudgetExhausted).toHaveBeenCalledExactlyOnceWith(mapping, "tracker-123", { project: "k", identifier: "ENG-123" }, "acme/app", 7, 4);
       expect(queueLookup).toHaveBeenCalledWith(42, "acme/app", 7);
     } else expect(onBudgetExhausted).not.toHaveBeenCalled();
   });
@@ -70,17 +70,17 @@ describe("review-fix budget refusal", () => {
     const onBudgetExhausted = vi.fn();
     const store = { admit: vi.fn(async () => ({ status: "deferred", reason: "budget_exhausted" } as const)) };
     await admitReviewFix(request, config, store, undefined, onBudgetExhausted);
-    expect(onBudgetExhausted).toHaveBeenCalledExactlyOnceWith(mapping, null, "acme/app", 7, 4);
+    expect(onBudgetExhausted).toHaveBeenCalledExactlyOnceWith(mapping, null, { project: "k", identifier: null }, "acme/app", 7, 4);
   });
   it("uses the project budget override", async () => {
     const customMapping = { ...mapping, prDispatchBudget: 2 };
     getMappings.mockReturnValue({ k: customMapping });
     isManagedProject.mockReturnValue(false);
-    queueLookup.mockReturnValue({ issue_id: "tracker-123" });
+    queueLookup.mockReturnValue({ issue_id: "tracker-123", issue_identifier: "ENG-123" });
     const onBudgetExhausted = vi.fn();
     const store = { admit: vi.fn(async () => ({ status: "deferred", reason: "budget_exhausted" } as const)) };
     await admitReviewFix(request, config, store, undefined, onBudgetExhausted);
-    expect(onBudgetExhausted).toHaveBeenCalledExactlyOnceWith(customMapping, "tracker-123", "acme/app", 7, 2);
+    expect(onBudgetExhausted).toHaveBeenCalledExactlyOnceWith(customMapping, "tracker-123", { project: "k", identifier: "ENG-123" }, "acme/app", 7, 2);
   });
 
 });

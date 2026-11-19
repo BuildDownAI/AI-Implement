@@ -609,7 +609,7 @@ describe("production deps", () => {
       vi.spyOn(console, "error").mockImplementation(() => {});
       provider.markImplementationFailed.mockRejectedValueOnce(new Error("tracker down"));
       expect(await compose().d.launch(INPUT)).toEqual({ outcome: "rejected" });
-      expect(recordDispatchFailure).toHaveBeenCalledWith("i-1", "implementation", "x", "ENG");
+      expect(recordDispatchFailure).toHaveBeenCalledWith("i-1", "implementation", "x", { project: "ENG", identifier: "ENG-1" });
     });
 
     it("overrides an empty scopeKey from findByKey (Jira) with the run's mapping key", async () => {

@@ -38,7 +38,7 @@ import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-p
 import { breakerSetupChecks, surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
-import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
+import { getIssueEnrichment, getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
 import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSnapshots, trackerReadChecks, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -58,7 +58,7 @@ import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
 import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
-import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor, breakerProject, claimPrBudgetNotice, prBudgetMarker, releasePrBudgetNotice, prBudgetTrackerCommentOwed, markTripNotified } from "./dispatch-breaker.js";
+import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor, breakerProject, claimPrBudgetNotice, prBudgetMarker, releasePrBudgetNotice, prBudgetTrackerCommentOwed, markTripNotified, type BreakerSubject } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
@@ -574,7 +574,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
       providerFor: (m) => registry.forMapping(m),
       clear: (id) => { deleteDispatched(id); },
       recordNotFound: async (id) => {
-        const br = recordDispatchFailure(id, "implementation", "reconcile_not found", getLatestTeamKeyForIssue(id));
+        // The dedup row is already cleared, so the issue's newest dispatch row is the one place left that names it.
+        const br = recordDispatchFailure(id, "implementation", "reconcile_not found",
+          { project: getLatestTeamKeyForIssue(id), identifier: getIssueEnrichment(id, "implementation").issueIdentifier });
         if (br.tripped) {
           await fireBreakerTrip(config, null, id, null, "implementation", br.failures, "reconcile_not found");
         }
@@ -1158,11 +1160,12 @@ async function firePrBudgetPark(
   registry: ProviderRegistry,
   mapping: RepoMapping,
   issueId: string,
+  subject: BreakerSubject,
   repo: string,
   prNumber: number,
   budget: number,
 ): Promise<void> {
-  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget");
+  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget", subject);
   const parkedAt = claimPrBudgetNotice(issueId, "gap-analysis");
   if (parkedAt == null) return;
 
@@ -1207,7 +1210,7 @@ async function firePrBudgetPark(
 /** Preserve the proven park/notice mechanism for PRs with no tracker identity. */
 export async function parkRestatePrBudget(
   config: AppConfig, registry: ProviderRegistry, mapping: RepoMapping,
-  trackerIssueId: string | null, repo: string, prNumber: number, budget: number,
+  trackerIssueId: string | null, subject: BreakerSubject, repo: string, prNumber: number, budget: number,
 ): Promise<void> {
   // Only tracker delivery is suppressed. No provider needs to be configured for
   // an issueless PR; the stable PR identity still owns its park and notice claim.
@@ -1218,7 +1221,7 @@ export async function parkRestatePrBudget(
     },
   });
   await firePrBudgetPark(config, noticeRegistry, mapping, trackerIssueId || `${repo}#${prNumber}`,
-    repo, prNumber, budget);
+    subject, repo, prNumber, budget);
 }
 
 // ---------- Dispatch: GitHub Actions ----------
@@ -1323,7 +1326,7 @@ export async function dispatchGitHubActions(
       if (decision.kind === "refuse") {
         await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision));
         // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code, issue.scopeKey);
+        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code, { project: issue.scopeKey, identifier: issue.identifier });
         if (breakerRefuse.tripped) {
           await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breakerRefuse.failures, decision.code);
         }
@@ -1791,7 +1794,7 @@ export async function dispatchSession(
           : provider.markPlanningFailed(issue.id, issue.scopeKey, text))
           .catch((err) => console.error(`[poll] Refusal comment failed for ${issue.identifier}:`, err));
         // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code, issue.scopeKey);
+        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code, { project: issue.scopeKey, identifier: issue.identifier });
         if (breakerRefuse.tripped) {
           await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, breakerRefuse.failures, decision.code);
         }
@@ -1905,7 +1908,7 @@ export async function dispatchSession(
     if (opts.doMarkDispatched) {
       deleteDispatched(issue.id);
     }
-    const _brSession = recordDispatchFailure(issue.id, opts.phase, "dispatch_error", issue.scopeKey);
+    const _brSession = recordDispatchFailure(issue.id, opts.phase, "dispatch_error", { project: issue.scopeKey, identifier: issue.identifier });
     if (_brSession.tripped) {
       await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, _brSession.failures, "dispatch_error");
     }
@@ -3066,7 +3069,7 @@ export async function reportTerminalJob(
           // a flaky provider parks the issue (BAC-27134). Jobs with no classified failure at
           // all (pre-BAC-27112, or a synthetic dispatch-error conclusion) count as before.
           if (!job.failure || shouldCountFailure(job.failure)) {
-            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion, job.teamKey ?? null);
+            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion, { project: job.teamKey, identifier: job.issueIdentifier });
             if (br.tripped && !isStuck) {
               pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
             }
@@ -3529,7 +3532,7 @@ async function processLegacyReviewFixQueue(config: AppConfig, registry: Provider
       });
       if (!gateDecision.ok) {
         if (gateDecision.reason === "pr_budget") {
-          await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+          await firePrBudgetPark(config, registry, mapping, fix.issueId, { project: scopeKey, identifier: fix.issueIdentifier }, fix.repo, fix.prNumber, prBudget);
         }
         console.log(`[review-fix] Deferring review fix #${fix.id} for PR #${fix.prNumber}: ${gateDecision.reason}`);
         continue;
@@ -3648,7 +3651,7 @@ async function processLegacyReviewFixQueue(config: AppConfig, registry: Provider
         });
         if (!admission.ok) {
           if (admission.reason === "budget_exhausted") {
-            await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+            await firePrBudgetPark(config, registry, mapping, fix.issueId, { project: scopeKey, identifier: fix.issueIdentifier }, fix.repo, fix.prNumber, prBudget);
           }
           console.log(`[review-fix] Deferring local review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
           continue;
@@ -3765,7 +3768,7 @@ async function processLegacyReviewFixQueue(config: AppConfig, registry: Provider
       });
       if (!admission.ok) {
         if (admission.reason === "budget_exhausted") {
-          await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+          await firePrBudgetPark(config, registry, mapping, fix.issueId, { project: scopeKey, identifier: fix.issueIdentifier }, fix.repo, fix.prNumber, prBudget);
         }
         console.log(`[review-fix] Deferring review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
         continue;
@@ -5350,7 +5353,7 @@ async function main(): Promise<void> {
   // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
   const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config),
-    (mapping, issueId, repo, prNumber, budget) => parkRestatePrBudget(config, registry, mapping, issueId, repo, prNumber, budget));
+    (mapping, issueId, subject, repo, prNumber, budget) => parkRestatePrBudget(config, registry, mapping, issueId, subject, repo, prNumber, budget));
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;
