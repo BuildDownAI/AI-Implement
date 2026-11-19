@@ -444,6 +444,7 @@ describe("buildSessionMachineConfig", () => {
   it("sets metadata for filtering", () => {
     const result = buildSessionMachineConfig(baseInput);
     expect(result.config.metadata).toEqual({
+      implementation_sandbox: "agent-default:unprotected",
       purpose: "session",
       issue_id: "uuid-123",
       issue_identifier: "ENG-42",
@@ -1286,6 +1287,29 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
     return undefined;
   };
 
+  it("carries the Fly policy only in credentials and requires isolated one-shot sessions", () => {
+    const executionPolicy = { version: 1 as const, implementationSandbox: "ephemeral-full-access" as const,
+      backend: "fly" as const, dispatchId: "disp-1", projectKey: "proj", ephemeralRunnerAsserted: true as const };
+    const input = protectedInput({ flyProcessLevelSecrets: true, implementationSandbox: { sandbox: "runner-isolated" },
+      protectedModelBootstrap: { sealed, projectKey: "proj", modelAuthUrl: MODEL_AUTH_URL, secret: goodSecret,
+        runConfig: { ...runConfig, credentials: { version: 1, executionPolicy } } } });
+    const built = buildSessionMachineConfig(input);
+    expect(decodeTrustedRunConfig(built.config.env!.AI_IMPLEMENT_RUN_CONFIG).credentials?.executionPolicy).toEqual(executionPolicy);
+    expect(built.config.metadata?.implementation_sandbox).toBe("runner-isolated");
+    expect(buildSessionMachineConfig({ ...input, implementationSandbox: undefined }).config.env).toEqual(built.config.env);
+    expect(Object.keys(built.config.env!).filter(key => /POLICY|SANDBOX/.test(key))).toEqual([]);
+    expect(() => buildSessionMachineConfig({ ...input, purpose: "durable-runner" })).toThrow(/session/);
+    expect(() => buildSessionMachineConfig({ ...input, flyProcessLevelSecrets: false })).toThrow(/process-level secrets/);
+  });
+
+  it.each(["unprotected", "process-secrets-off"] as const)("default %s preserves the envelope and environment", reason => {
+    const original = buildSessionMachineConfig(protectedInput());
+    const explicit = buildSessionMachineConfig(protectedInput({ implementationSandbox: { sandbox: "agent-default", reason } }));
+    expect(explicit.config.env).toEqual(original.config.env);
+    expect(explicit.config.metadata?.implementation_sandbox).toBe(`agent-default:${reason}`);
+    expect(decodeTrustedRunConfig(explicit.config.env!.AI_IMPLEMENT_RUN_CONFIG).credentials?.executionPolicy).toBeUndefined();
+  });
+
   it("carries the sealed envelope and safe dispatch fields only", () => {
     const result = buildSessionMachineConfig(protectedInput());
     const env = result.config.env!;
@@ -1505,7 +1529,9 @@ describe("buildSessionMachineConfig — legacy config and protection key hiding 
   const names = ["ENG_DB", "OPS_X", "GLOBAL"];
   const fixture = JSON.parse(
     readFileSync(new URL("./fixtures/fly-legacy-config.json", import.meta.url), "utf8"),
-  ) as { a: unknown; b: unknown };
+  ) as { a: { config: { metadata: Record<string, string> } }; b: { config: { metadata: Record<string, string> } } };
+  fixture.a.config.metadata.implementation_sandbox = "agent-default:unprotected";
+  fixture.b.config.metadata.implementation_sandbox = "agent-default:unprotected";
 
   it("is byte-identical to the pre-change config for a listing without the key", () => {
     const common = { ...base, teamKey: "eng", teamSecretNames: names, allTeamKeys: ["eng", "ops"] };

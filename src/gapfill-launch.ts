@@ -1,3 +1,4 @@
+import type { ImplementationSandbox } from "./implementation-launch.js";
 import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
 import type { RunCredentialsV1 } from "./run-config.js";
 import type { RepoMapping } from "./config.js";
@@ -11,6 +12,7 @@ import { resolveSessionImage } from "./repo-image.js";
 import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
 
 export interface DispatchFlyGapfillInput {
+  implementationSandbox?: ImplementationSandbox;
   runName?: string;
   dispatchId?: string;
   reviewOnly?: RunConfigV1["reviewOnly"];
@@ -107,6 +109,15 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
     ...managedRunConfigFields(protectedLaunch),
   };
 
+  const implementationSandbox = input.implementationSandbox ?? { sandbox: "agent-default", reason: "unprotected" };
+  if (implementationSandbox.sandbox === "runner-isolated") {
+    if (!protectedLaunch) throw new Error("implementation sandbox requires a protected launch");
+    gapFillRunConfig.credentials = { version: 1, executionPolicy: {
+      version: 1, implementationSandbox: "ephemeral-full-access", backend: "fly",
+      dispatchId: protectedLaunch.dispatchId, projectKey: protectedLaunch.projectKey, ephemeralRunnerAsserted: true,
+    } };
+  }
+
   let protectedModelBootstrap: Awaited<ReturnType<typeof buildProtectedFlyBootstrap>> | undefined;
   if (protectedLaunch) {
     const bootstrap = protectedLaunch.takeBootstrap();
@@ -122,6 +133,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
   }
 
   const machineConfig = buildSessionMachineConfig({
+    implementationSandbox,
     machineName: input.runName,
     dispatchId: input.dispatchId ?? protectedLaunch?.dispatchId,
     image: resolvedImage,
@@ -172,6 +184,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
   }
   input.onBeforeLaunch(guestSize(machineConfig), machineNonce, resolvedImage);
   const machine = await createMachine(flyToken, flyApp, machineConfig);
+  console.log(`[comment-gapfill] Dispatched ${input.issueIdentifier} (machine: ${machine.id}, implementation_sandbox: ${machineConfig.config.metadata?.implementation_sandbox})`);
   return { machine: { id: machine.id, name: machine.name }, resolvedImage };
 }
 

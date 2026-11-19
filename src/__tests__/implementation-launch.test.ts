@@ -3,6 +3,7 @@ import { makeAppConfig, makeIssue, makeMapping, makeProvider } from "./helpers/b
 import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { decodeTrustedRunConfig } from "../run-config.js";
 import {
+  decideImplementationSandbox,
   prepareImplementationLaunch,
   launchImplementationRun,
   launchImplementationFlySession,
@@ -16,6 +17,7 @@ import { settleLaunch } from "../managed-dispatch-auth.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
 import { createMachine, buildSessionMachineConfig } from "../fly-machines.js";
+import { buildProtectedFlyBootstrap } from "../fly-protection-key.js";
 import { startLocalRunnerContainer } from "../local-docker.js";
 
 vi.mock("../github.js", async (importOriginal) => {
@@ -34,6 +36,7 @@ vi.mock("../fly-machines.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../fly-machines.js")>();
   return { ...actual, createMachine: vi.fn(), buildSessionMachineConfig: vi.fn((input: unknown) => ({ config: {}, input })), listAppSecrets: vi.fn(async () => []) };
 });
+vi.mock("../fly-protection-key.js", () => ({ buildProtectedFlyBootstrap: vi.fn() }));
 vi.mock("../local-docker.js", () => ({ startLocalRunnerContainer: vi.fn(), validateProtectedLocalInput: vi.fn() }));
 vi.mock("../repo-image.js", () => ({ resolveSessionImage: vi.fn(async () => ({ image: "default-img", source: "default" })) }));
 vi.mock("../config.js", async (importOriginal) => {
@@ -181,6 +184,70 @@ describe("implementation session launches", () => {
     vi.mocked(getScopedInstallationToken).mockResolvedValue({ token: TARGET_TOKEN } as never);
   });
 
+  it("fly: preserves the previous environment and run config for omitted and explicit agent-default", async () => {
+    const actual = await vi.importActual<typeof import("../fly-machines.js")>("../fly-machines.js");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const machines = [];
+      for (const implementationSandbox of [undefined, { sandbox: "agent-default", reason: "unprotected" }, { sandbox: "agent-default", reason: "process-secrets-off" }] as const) {
+        vi.mocked(buildSessionMachineConfig).mockImplementationOnce(actual.buildSessionMachineConfig);
+        vi.mocked(createMachine).mockResolvedValueOnce({ id: "m-default", name: "default" } as never);
+        await launchImplementationFlySession({ ...args, shadow: false, implementationSandbox });
+        const machine = vi.mocked(createMachine).mock.calls.at(-1)![2];
+        expect(machine.config.metadata?.implementation_sandbox).toBe(`agent-default:${implementationSandbox?.reason ?? "unprotected"}`);
+        expect(log).toHaveBeenLastCalledWith(expect.stringContaining(`implementation_sandbox: agent-default:${implementationSandbox?.reason ?? "unprotected"}`));
+        machines.push(machine);
+      }
+      const env = machines[0]!.config.env!;
+      // Fixed session, nonce and callback tokens above make this a stable legacy-output fixture.
+      expect({ ...env, AI_IMPLEMENT_RUN_CONFIG: decodeTrustedRunConfig(env.AI_IMPLEMENT_RUN_CONFIG!) }).toEqual({
+        "AI_IMPLEMENT_RUN_CONFIG": {
+          "issue": {
+            "description": "desc",
+            "id": "issue-impl-1",
+            "identifier": "AII-1551",
+            "title": "Move launch",
+          },
+          "retryPolicy": {
+            "backoffInitialMs": 30000,
+            "backoffJitter": 0.2,
+            "backoffMaxMs": 300000,
+            "pushRetries": 2,
+            "requestRetries": 2,
+            "reviewMaxTurns": 30,
+            "stageRetries": 1,
+          },
+          "runnerCallbackUrl": "https://orch.example.test",
+          "runnerPhase": "implementation",
+          "v": 1,
+        },
+        "ANTHROPIC_API_KEY": "anthropic-key",
+        "GITHUB_DEFAULT_BRANCH": "main",
+        "GITHUB_OWNER": "eudoxus",
+        "GITHUB_REPO": "AI-Implement",
+        "GITHUB_TOKEN": "gh-target-token-secret",
+        "ISSUE_DESCRIPTION": "desc",
+        "ISSUE_ID": "issue-impl-1",
+        "ISSUE_IDENTIFIER": "AII-1551",
+        "ISSUE_TITLE": "Move launch",
+        "MACHINE_NONCE": "machine-nonce-secret",
+        "ORCHESTRATOR_URL": "https://orch.example.test",
+        "RUNNER_CALLBACK_URL": "https://orch.example.test",
+        "RUNNER_PHASE": "implementation",
+        "RUN_PROGRESS_TOKEN": "run-progress-token-secret",
+        "RUN_PUBLICATION_TOKEN": "run-publication-token-secret",
+        "RUN_TOKEN": "run-token-secret",
+        "SESSION_TOKEN": "session-token-secret",
+      });
+      for (const machine of machines.slice(1)) {
+        expect(machine.config.env).toEqual(env);
+        expect(machine).toEqual({ ...machines[0], config: { ...machines[0]!.config, metadata: { ...machines[0]!.config.metadata, implementation_sandbox: machine.config.metadata?.implementation_sandbox } } });
+      }
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("fly: marks the launch attempted right before createMachine and returns no token", async () => {
     vi.mocked(createMachine).mockImplementation(async () => {
       expect(markLaunchAttempted).toHaveBeenCalledTimes(1);
@@ -240,6 +307,24 @@ describe("implementation session launches", () => {
     expect(markLaunchAttempted).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["claude", "codex"] as const)("fly: protects the full-access policy for %s", async agent => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.mocked(buildSessionMachineConfig).mockImplementationOnce(() => ({ config: { metadata: { implementation_sandbox: "runner-isolated" } } }) as never);
+    const snapshot = makeSnapshot();
+    const managed = { kind: "launch", snapshot: { ...snapshot, stages: { ...snapshot.stages,
+      implementation: { ...snapshot.stages.implementation, agent, provider: agent === "claude" ? "anthropic" : "openai" } },
+      profiles: { ...snapshot.profiles, implementation: { ...snapshot.profiles.implementation, agent, provider: agent === "claude" ? "anthropic" : "openai", authMode: agent === "claude" ? "anthropic-api-key" : "openai-api-key" } } }, dispatchId: "d", projectKey: "AII",
+      takeBootstrap: () => ({ bearer: "private" }) } as never;
+    vi.mocked(buildProtectedFlyBootstrap).mockImplementationOnce(async input => ({ runConfig: input.runConfig }) as never);
+    vi.mocked(createMachine).mockResolvedValueOnce({ id: "m", name: "m" } as never);
+    await launchImplementationFlySession({ ...args, shadow: false, implementationSandbox: { sandbox: "runner-isolated" }, input: { ...input, managedAuth: managed } });
+    expect(log).toHaveBeenLastCalledWith(expect.stringContaining("implementation_sandbox: runner-isolated"));
+    log.mockRestore();
+    const bootstrap = vi.mocked(buildProtectedFlyBootstrap).mock.calls.at(-1)![0];
+    expect(bootstrap.runConfig.credentials?.executionPolicy).toEqual({ version: 1, implementationSandbox: "ephemeral-full-access", backend: "fly", dispatchId: "d", projectKey: "AII", ephemeralRunnerAsserted: true });
+    expect(vi.mocked(buildSessionMachineConfig).mock.calls.at(-1)![0].implementationSandbox).toEqual({ sandbox: "runner-isolated" });
+  });
+
   it("fly: a managed launch with no bootstrap is refused before the launch", async () => {
     const managed = { kind: "launch", snapshot: makeSnapshot(), dispatchId: "d", takeBootstrap: () => null } as never;
     await expect(launchImplementationFlySession({ ...args, shadow: false, input: { ...input, managedAuth: managed } }))
@@ -273,5 +358,16 @@ describe("implementation session launches", () => {
       .rejects.toThrow("managed dispatch refused: bootstrap unavailable");
     expect(markLaunchAttempted).not.toHaveBeenCalled();
     expect(startLocalRunnerContainer).not.toHaveBeenCalled();
+  });
+});
+
+describe("implementation sandbox decision", () => {
+  it.each([
+    [true, true, { sandbox: "runner-isolated" }],
+    [true, false, { sandbox: "agent-default", reason: "process-secrets-off" }],
+    [false, true, { sandbox: "agent-default", reason: "unprotected" }],
+    [false, false, { sandbox: "agent-default", reason: "unprotected" }],
+  ] as const)("protected=%s secrets=%s", (protectedLaunch, processLevelSecrets, expected) => {
+    expect(decideImplementationSandbox({ protectedLaunch, processLevelSecrets })).toEqual(expected);
   });
 });
