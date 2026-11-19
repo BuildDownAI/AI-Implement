@@ -26,6 +26,19 @@ not fail boot; it fails the feature that needs it, late and quietly (a 4xx insid
 
 Plus whatever the runner's own GitHub Actions workflows need on each project repo (those are declared in the workflow files, not here). The table is declared once, as `GITHUB_APP_PERMISSIONS` in `src/github-app-permissions.ts`: the set of `permissions: {…}` scopes requested in `src/`, the `permission-*` inputs the synced `claude-implement.yml` and `claude-plan.yml` pass to `create-github-app-token`, and the grants the per-run installation token relies on (it carries the App's full permission set scoped to one repository). `src/__tests__/github-app-permissions.test.ts` fails when a token request in `src/` or a synced workflow names a permission the declaration lacks, or a level above it, and when the table above stops matching it. So a change that mints a token for a new permission adds it to the declaration and this table, and grants it on the App before the feature is switched on. The `github.permissions` setup check compares each project owner's installation with the declaration, failing on a missing required permission and warning on a missing optional one.
 
+**A missing publication permission degrades the run; it does not kill it.** The minting layer
+(`getScopedInstallationToken`) intersects every requested permission set with what the
+installation grants, so the token carries only the granted set and the orchestrator log gets one
+warning per owner and permission. Any missing permission, Contents and Pull requests included, is
+dropped with a warning and the token carries the rest. The mint fails with a `GitHubApiError`
+(403) naming the owner and the requested permissions only when the installation grants none of
+them. Without Contents: write, a push then fails in GitHub. Per permission:
+
+- **Checks: read** missing: the run continues, and post-push review reports `CHECKS_PERMISSION_DENIED` ("Grant Checks: read to the GitHub App").
+- **Workflows** missing: the token carries the other permissions, and GitHub refuses a push that touches `.github/workflows/`.
+- A level lower than requested (read where write was asked) is lowered the same way.
+- The cache key is the raw request, so a token minted before a grant is reused until it goes stale (up to ~55 minutes).
+
 **Granting or widening a permission is two steps by an org owner, not a per-repository
 setting.** GitHub App permissions live on the App; each installation then has to accept the
 change:
@@ -277,7 +290,7 @@ Secrets set through the admin UI Secrets panel are stored as classic Fly app sec
 
 Names are read from the Fly Machines API (`GET /v1/apps/{app}/secrets`), the same store Fly uses when starting a machine. The reply is an object that holds the list (`{ "secrets": [{ name, digest, created_at, updated_at }] }`), not a bare list; `listAppSecrets` reads `.secrets` and rejects any other shape. Admin set and delete operations use that API too. Admin writes deliberately ignore secrets versions and leave version pinning off; protected-run bootstrap still manages its own version.
 
-Before merging this change, compare `fly secrets list -a <sessions app>` with the historical GraphQL list on **each sessions app**. REST-only global names become visible to launch and pass to every machine in process-level mode. On `ai-implement-testing-sessions` on 2026-11-13, the only REST-only name was the protection key, which ordinary launch skips. The global admin list hides that key and rejects attempts to overwrite or delete it.
+Before you upgrade a deployment that reads Fly secrets through GraphQL, follow [Fly secrets migration](fly-secrets-migration.md).
 
 If Fly removes a machine before it starts, inspect `fly machine status <id> -a <sessions app>`. A missing requested secret produces a `launch` event followed by `destroy` from source `flyd`, with no `start` event. Check the requested names against `fly secrets list -a <sessions app>`. Remove a stale name with `fly secrets unset <name> -a <sessions app>` (or the corresponding admin delete route), then retry the run. Deleting an absent name succeeds; an unknown app can still return HTTP 404. Secret values stay on the admin API and never pass through a Restate journal.
 

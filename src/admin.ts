@@ -4314,25 +4314,26 @@ function accountWriteView(p: AccountProfileProjection, deps: AdminDeps): Record<
 async function handleCreateModelAccount(req: http.IncomingMessage, res: http.ServerResponse, deps: AdminDeps): Promise<void> {
   const body = await readJsonObject(req, res);
   if (!body) return;
+  const result = createModelAccountAction(body, deps);
+  json(res, result.status, result.body);
+}
+
+export function createModelAccountAction(body: Record<string, unknown>, deps: AdminDeps): { status: number; body: Record<string, unknown> } {
   const extra = unsupportedKeys(body, ACCOUNT_WRITE_FIELDS);
   if (extra.length > 0) {
-    json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}. Account writes carry metadata and a protected credentialRef, never credential values` });
-    return;
+    return { status: 400, body: { error: `unsupported field(s): ${extra.join(", ")}. Account writes carry metadata and a protected credentialRef, never credential values` } };
   }
   const profileId = body.profileId;
   if (typeof profileId !== "string") {
-    json(res, 400, { error: "profileId is required" });
-    return;
+    return { status: 400, body: { error: "profileId is required" } };
   }
   if (getAccountProfile(profileId)) {
-    json(res, 409, { error: "account profile already exists; PATCH it to append a revision" });
-    return;
+    return { status: 409, body: { error: "account profile already exists; PATCH it to append a revision" } };
   }
   if (body.status !== undefined && body.status !== "active") {
-    json(res, 400, { error: "a new account profile must be created active" });
-    return;
+    return { status: 400, body: { error: "a new account profile must be created active" } };
   }
-  saveAccountWrite(res, deps, profileId, 1, body, 201);
+  return saveAccountWriteAction(deps, profileId, 1, body, 201);
 }
 
 async function handlePatchModelAccount(req: http.IncomingMessage, res: http.ServerResponse, profileId: string, deps: AdminDeps): Promise<void> {
@@ -4383,6 +4384,13 @@ function saveAccountWrite(
   fields: Record<string, unknown>,
   okStatus: number,
 ): void {
+  const result = saveAccountWriteAction(deps, profileId, revision, fields, okStatus);
+  json(res, result.status, result.body);
+}
+
+function saveAccountWriteAction(
+  deps: AdminDeps, profileId: string, revision: number, fields: Record<string, unknown>, okStatus: number,
+): { status: number; body: Record<string, unknown> } {
   try {
     const saved = saveAccountProfileRevision({
       profileId,
@@ -4394,10 +4402,10 @@ function saveAccountWrite(
       status: fields.status as never,
       metadata: fields.credentialRef === undefined ? {} : { credentialRef: fields.credentialRef as string },
     });
-    json(res, okStatus, accountWriteView(saved, deps));
+    return { status: okStatus, body: accountWriteView(saved, deps) };
   } catch (err) {
     // The store throws fixed messages and writes everything in one transaction, so a failure leaves no revision behind.
-    json(res, 400, { error: err instanceof Error ? err.message : "invalid account profile" });
+    return { status: 400, body: { error: err instanceof Error ? err.message : "invalid account profile" } };
   }
 }
 
@@ -4569,38 +4577,40 @@ async function handlePutProjectAgentConfig(
 ): Promise<void> {
   const body = await readJsonObject(req, res);
   if (!body) return;
-  await withProjectConfigLock(projectKey, () => putProjectAgentConfigLocked(res, projectKey, deps, actor, body));
+  const result = await putProjectAgentConfigAction(projectKey, deps, actor, body);
+  json(res, result.status, result.body);
+}
+
+export function putProjectAgentConfigAction(
+  projectKey: string, deps: AdminDeps, actor: string | null, body: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  return withProjectConfigLock(projectKey, () => putProjectAgentConfigLocked(projectKey, deps, actor, body));
 }
 
 async function putProjectAgentConfigLocked(
-  res: http.ServerResponse,
   projectKey: string,
   deps: AdminDeps,
   actor: string | null,
   body: Record<string, unknown>,
-): Promise<void> {
+): Promise<{ status: number; body: Record<string, unknown> }> {
   const mapping = getOwnMapping(projectKey);
   if (!mapping) {
-    json(res, 404, { error: "mapping not found" });
-    return;
+    return { status: 404, body: { error: "mapping not found" } };
   }
   const extra = unsupportedKeys(body, ["stages"]);
   if (extra.length > 0) {
-    json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}` });
-    return;
+    return { status: 400, body: { error: `unsupported field(s): ${extra.join(", ")}` } };
   }
   const previous = getProjectStageConfig(projectKey);
   if (body.stages !== undefined) {
     const bad = validateStagesBody(body.stages);
     if (bad) {
-      json(res, 400, { error: bad });
-      return;
+      return { status: 400, body: { error: bad } };
     }
   }
   const enabled = previous?.config.mode === "configured";
   if (enabled && !deps.agentConfig) {
-    json(res, 501, { error: "agent configuration readiness inspection is not configured", code: "readiness_unavailable" });
-    return;
+    return { status: 501, body: { error: "agent configuration readiness inspection is not configured", code: "readiness_unavailable" } };
   }
   const stages = body.stages === undefined ? previous?.config.stages : overlayStages(previous?.config.stages, body.stages as Record<string, Record<string, unknown>>);
   const candidate: StageAgentConfigurationV1 = {
@@ -4615,13 +4625,11 @@ async function putProjectAgentConfigLocked(
     try {
       resolveCandidateProjectStageConfig(projectKey, candidate);
     } catch (err) {
-      json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
-      return;
+      return { status: 400, body: { error: err instanceof Error ? err.message : "invalid stage configuration" } };
     }
     const refusal = await readinessRefusal(projectKey, mapping, candidate, deps);
     if (refusal) {
-      json(res, refusal.status, refusal.body);
-      return;
+      return { status: refusal.status, body: refusal.body };
     }
   }
   let stored;
@@ -4629,13 +4637,11 @@ async function putProjectAgentConfigLocked(
     stored = setProjectStageConfig(projectKey, candidate, actor, inputs); // re-validates resolution inside its own transaction
   } catch (err) {
     if (err instanceof StaleStageInputsError) {
-      json(res, 409, { error: "stage configuration inputs changed while readiness was inspected; retry", code: "stale_inputs" });
-      return;
+      return { status: 409, body: { error: "stage configuration inputs changed while readiness was inspected; retry", code: "stale_inputs" } };
     }
-    json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
-    return;
+    return { status: 400, body: { error: err instanceof Error ? err.message : "invalid stage configuration" } };
   }
-  json(res, 200, { projectKey, ...storedConfigView(stored) });
+  return { status: 200, body: { projectKey, ...storedConfigView(stored) } };
 }
 
 /**

@@ -978,13 +978,7 @@ function readEnvelopeExecutionPolicy(env: NodeJS.ProcessEnv): unknown {
   }
 }
 
-/**
- * Operator-approved ephemeral full access (AII-1437). Enabled only when the workflow-projected launch variable, the
- * validated envelope policy and the trusted model-auth context all agree on a GHA dispatch. Only the absence of both the
- * variable and the envelope policy keeps the default sandbox; any other combination that fails a check (including a
- * blank variable beside an envelope policy) rejects the run before execution, never degrades silently.
- * `GITHUB_ACTIONS`, repository config, a diagnostic stage string and unrelated ambient flags are never consulted.
- */
+/** Binds the validated policy to the opened grant context; GHA additionally requires its workflow projection. */
 function resolveImplementationFullAccess(
   env: NodeJS.ProcessEnv,
   expected: ExpectedBootstrapContext | undefined,
@@ -995,11 +989,13 @@ function resolveImplementationFullAccess(
   // operator explicitly requested with a blank projection is a broken handoff and must not run under the old sandbox.
   if (!projected && policy === undefined) return false;
   if (
-    !expected || expected.backend !== "gha" || !isRec(policy) ||
+    !expected || !isRec(policy) ||
     policy.version !== 1 || policy.implementationSandbox !== "ephemeral-full-access" ||
-    policy.backend !== "gha" || policy.ephemeralRunnerAsserted !== true ||
+    policy.backend !== expected.backend || policy.ephemeralRunnerAsserted !== true ||
     policy.dispatchId !== expected.dispatchId || policy.projectKey !== expected.projectKey ||
-    projected !== `v1:ephemeral-full-access:gha:${expected.dispatchId}:${expected.projectKey}`
+    (policy.backend === "fly"
+      ? env[EXECUTION_POLICY_ENV] !== undefined
+      : policy.backend !== "gha" || projected !== `v1:ephemeral-full-access:gha:${expected.dispatchId}:${expected.projectKey}`)
   ) {
     throw new ConfiguredRunError("execution_policy_invalid");
   }

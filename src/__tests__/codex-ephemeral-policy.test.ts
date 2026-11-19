@@ -11,13 +11,25 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfiguredRunError, prepareConfiguredRun } from "../run-autonomous.js";
-import { NOW, SENTINEL_BEARER, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { NOW, SENTINEL_BEARER, makeSnapshot, makeGrant, envelopeEnv } from "./helpers/fixtures/configured-run.js";
 import { S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback } from "./helpers/fixtures/codex-composition.js";
-import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
+import { sealModelAuthBootstrap } from "../model-auth-seal.js";
+import { type ResolvedAgentSnapshotV1 } from "../run-config.js";
+import { MODEL_AUTH_ENV, MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
 import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, GHA_POLICY, ghaGrant, ghaRunStepEnv } from "./helpers/fixtures/gha-handoff.js";
 import type { InvokeParams } from "../pipeline/types.js";
 import { makeExecutor } from "./helpers/builders.js";
 import { testDir } from "./helpers/test-dir.js";
+
+const FLY_POLICY = { ...GHA_POLICY, backend: "fly" as const };
+function flyEnv(snapshot: ResolvedAgentSnapshotV1, policy: unknown = FLY_POLICY) {
+  const grant = sealModelAuthBootstrap({ grant: makeGrant(snapshot), protectionKey: { ref: MODEL_AUTH_ENV.protectionKey, key: Buffer.alloc(32, 1) } });
+  const env = envelopeEnv(snapshot, undefined);
+  env[MODEL_AUTH_ENV.protectionKey] = Buffer.alloc(32, 1).toString("base64url");
+  // Raw envelope allows tests to exercise runner rejection of invalid bindings.
+  env.AI_IMPLEMENT_RUN_CONFIG = Buffer.from(JSON.stringify({ v: 1, issue: { id: "i", identifier: "A-1", title: "t", description: "d" }, credentials: { version: 1, modelAuthGrant: grant, executionPolicy: policy } })).toString("base64");
+  return env;
+}
 
 const FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const CANARIES = {
@@ -296,9 +308,9 @@ describe("Codex-selected planning and review with the policy present", () => {
     return snapshot;
   };
 
-  async function composeCodex(shared: boolean, scripts: Array<{ stdout: string[]; exitCode: number; hang?: boolean }>, authMode: "openai-api-key" | "codex-subscription" = "openai-api-key", policy: unknown = GHA_POLICY, appServerChild?: (log: Child[]) => typeof spawn) {
+  async function composeCodex(shared: boolean, scripts: Array<{ stdout: string[]; exitCode: number; hang?: boolean }>, authMode: "openai-api-key" | "codex-subscription" = "openai-api-key", policy: unknown = GHA_POLICY, appServerChild?: (log: Child[]) => typeof spawn, fly = false) {
     const snapshot = codexSnapshot(shared, authMode);
-    const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, policy, callback: false });
+    const handoff = fly ? { bootStatus: 0, runEnv: flyEnv(snapshot, policy) } : ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, policy, callback: false });
     expect(handoff.bootStatus).toBe(0);
     for (const [k, v] of Object.entries(handoff.runEnv)) vi.stubEnv(k, v);
     const profiles = Object.fromEntries(Object.values(snapshot.profiles).map((p) => [p.id, authMode]));
@@ -356,6 +368,24 @@ describe("Codex-selected planning and review with the policy present", () => {
       return executor.invoke({ prompt: "p", model: "ignored", stage: String(agentStage), agentStage, ...extra });
     };
     return { invoke, log, checkouts, routes, finish: () => run!.finish("completed"), driverInputs, expireReviewOnce: () => (expireReviewOnce = true) };
+  }
+
+  for (const shared of [false, true]) {
+    it(`Fly isolates stage policy and preserves implementation resume (shared=${shared})`, async () => {
+      const { invoke, log } = await composeCodex(shared, [planningSpawn, planningSpawn, { stdout: expired, exitCode: 1 }, { stdout: ok, exitCode: 0 }], "codex-subscription", FLY_POLICY, undefined, true);
+      await invoke("planning");
+      await invoke("review");
+      await invoke("implementation");
+      expect(log).toHaveLength(4);
+      for (const child of log.slice(0, 2)) {
+        expect(child.args[0]).toBe("app-server");
+        expect(child.args).toContain('sandbox_mode="read-only"');
+        expect(child.args).not.toContain(FLAG);
+      }
+      expect(log[2].args).toContain(FLAG);
+      expect(log[3].args.slice(0, 2)).toEqual(["exec", "resume"]);
+      expect(log[3].args).toContain(FLAG);
+    });
   }
 
   const BYPASS_TOKENS = [FLAG, "danger-full-access", "--dangerously"];
@@ -518,5 +548,25 @@ describe("Codex-selected planning and review with the policy present", () => {
         for (const t of BYPASS_TOKENS) expect(c.args.join(" ")).not.toContain(t);
       }
     });
+  });
+});
+
+
+describe("Fly runner policy validation", () => {
+  it.each(["", "   ", "v1:ephemeral-full-access:fly:disp-1:proj"])("rejects any launch variable (%j) before checkout or spawn", async (value) => {
+    const snapshot = makeSnapshot();
+    const transport = vi.fn();
+    const spawnImpl = vi.fn();
+    await expect(prepareConfiguredRun({ env: { ...flyEnv(snapshot), AI_IMPLEMENT_EXECUTION_POLICY: value }, snapshot, workspaceDir: workspace, options: { now: () => NOW, modelAuthTransport: { post: transport }, codexOptions: { spawnImpl } } })).rejects.toMatchObject({ reason: "execution_policy_invalid" });
+    expect(transport).not.toHaveBeenCalled();
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+  it.each(["projectKey", "dispatchId"])("rejects mismatched %s before checkout or spawn", async (field) => {
+    const snapshot = makeSnapshot();
+    const transport = vi.fn();
+    const spawnImpl = vi.fn();
+    await expect(prepareConfiguredRun({ env: flyEnv(snapshot, { ...FLY_POLICY, [field]: "other" }), snapshot, workspaceDir: workspace, options: { now: () => NOW, modelAuthTransport: { post: transport }, codexOptions: { spawnImpl } } })).rejects.toMatchObject({ reason: field === "projectKey" ? "execution_policy_invalid" : "bootstrap_invalid" });
+    expect(transport).not.toHaveBeenCalled();
+    expect(spawnImpl).not.toHaveBeenCalled();
   });
 });

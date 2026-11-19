@@ -267,12 +267,16 @@ export interface TicketingProvider {
   clearWorkingState(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
   /** Move the issue out of pickup so a human decides what happens next, and post no comment (the
    *  caller comments). Unlike `clearWorkingState`, the ticket must not look ready for pickup
-   *  (Jira: Planning Failed / Implementation Failed; Linear: the `AI-Needs-Human` label;
+   *  (Jira: Planning Failed / Implementation Failed; Linear: clears active labels; caller persists the park record;
    *  filesystem: a failed task). Returns whether the write was applied; false when refused
    *  because the issue is already terminal (Jira: Merged; Linear: completed or canceled;
    *  filesystem: a terminal task). Not the dispatch-breaker park (`src/dispatch-breaker.ts`),
    *  which holds re-dispatch per phase. */
   parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
+  /** The issue's pull request closed without a merge. Moves the issue to the tracker's
+   * cancelled state and posts one comment. Returns false, with no write, when the issue
+   * is already terminal. */
+  markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean>;
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */
   markMerged(issueId: string, scopeKey: string): Promise<void>;

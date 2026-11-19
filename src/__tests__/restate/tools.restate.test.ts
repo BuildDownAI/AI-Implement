@@ -33,6 +33,23 @@ import { createSetupChecks } from "../../restate/setup-checks.js";
 import type { SetupCheckRun } from "../../setup-checks/index.js";
 import { VARIANTS, journalEntries, journalText, callObject, callService, gate, queryInvocations, startVariants, stopAll } from "./harness.js";
 
+// Supply valid inputs so registry-wide grant checks reach authorization even for
+// strict schemas, which reject unrelated shared fixture fields at ingress.
+function adminToolArgs(name: string, fallback: Record<string, unknown>): Record<string, unknown> {
+  switch (name) {
+    case "get_fly_setup": return {};
+    case "unpark_issue": return { identifier: "CON-146" };
+    case "set_project_agent_mode": return { teamKey: "BDS", mode: "legacy" };
+    case "start_deploy": return { branch: "testing", requestedBy: "test" };
+    case "add_model_account": return {
+      profileId: "grant-test", identity: "operator", agent: "claude",
+      provider: "openrouter", authMode: "openrouter-api-key",
+    };
+    case "set_project_stage": return { teamKey: "BDS", stage: "implementation" };
+    default: return fallback;
+  }
+}
+
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
 // try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
 // an isError result instead of letting Restate retry a hung handler forever.
@@ -384,7 +401,7 @@ describe("orchestratorTools (Restate)", () => {
     // start_deploy is the one admin tool the deploy grant reaches (its own cases are below).
     for (const { name } of admins.filter((handler) => handler.name !== "start_deploy")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
-        caller: serviceCaller({ grants: ["deploy"] }), args: name === "get_fly_setup" ? {} : name === "set_project_agent_mode" ? { teamKey: "BDS", mode: "legacy" } : args,
+        caller: serviceCaller({ grants: ["deploy"] }), args: adminToolArgs(name, args),
       });
       expect(result.isError, name).toBe(true);
       expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -408,7 +425,7 @@ describe("orchestratorTools (Restate)", () => {
     // Only the project mode tool is reachable with the projects grant.
     for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
-        caller: serviceCaller({ grants: ["projects"] }), args: name === "get_fly_setup" ? {} : name === "start_deploy" ? { branch: "testing", requestedBy: "test" } : args,
+        caller: serviceCaller({ grants: ["projects"] }), args: adminToolArgs(name, args),
       });
       expect(result.isError, name).toBe(true);
       expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);

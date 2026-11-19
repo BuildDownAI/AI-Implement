@@ -159,6 +159,7 @@ async function fetchImage(
 }
 
 const DEFAULT_RUNNER_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
+const NEXT_RUNNER_IMAGE = "ghcr.io/builddownai/ai-implement-runner:next";
 
 /**
  * State of the deprecated SESSION_IMAGE env var relative to its replacement:
@@ -177,6 +178,11 @@ export interface DefaultRunnerImageResult {
    * dispatches (see {@link selectRunnerImageInput}).
    */
   explicit: boolean;
+  /**
+   * True when no image variable is set and the image was derived from the
+   * `testing` source-branch stamp (`AI_IMPLEMENT_SOURCE_BRANCH`), i.e. `:next`.
+   */
+  channelDefault: boolean;
   sessionImageStatus: SessionImageStatus;
 }
 
@@ -188,7 +194,10 @@ export interface DefaultRunnerImageResult {
  * distinguishes "rename it" (active) from "it's ignored" (shadowed).
  */
 export function resolveDefaultRunnerImage(
-  env: Pick<NodeJS.ProcessEnv, "AI_IMPLEMENT_RUNNER_IMAGE" | "SESSION_IMAGE">,
+  env: Pick<
+    NodeJS.ProcessEnv,
+    "AI_IMPLEMENT_RUNNER_IMAGE" | "SESSION_IMAGE" | "AI_IMPLEMENT_SOURCE_BRANCH"
+  >,
 ): DefaultRunnerImageResult {
   const hasNew = Boolean(env.AI_IMPLEMENT_RUNNER_IMAGE);
   const hasLegacy = Boolean(env.SESSION_IMAGE);
@@ -197,9 +206,15 @@ export function resolveDefaultRunnerImage(
     : hasNew
       ? "shadowed"
       : "active";
+  const explicit = hasNew || hasLegacy;
+  const channelDefault = !explicit && env.AI_IMPLEMENT_SOURCE_BRANCH?.trim() === "testing";
   return {
-    image: env.AI_IMPLEMENT_RUNNER_IMAGE || env.SESSION_IMAGE || DEFAULT_RUNNER_IMAGE,
-    explicit: hasNew || hasLegacy,
+    image:
+      env.AI_IMPLEMENT_RUNNER_IMAGE ||
+      env.SESSION_IMAGE ||
+      (channelDefault ? NEXT_RUNNER_IMAGE : DEFAULT_RUNNER_IMAGE),
+    explicit,
+    channelDefault,
     sessionImageStatus,
   };
 }
@@ -211,7 +226,8 @@ export function resolveDefaultRunnerImage(
  * We only forward when the image represents an *explicit* choice:
  *   - a per-repo `.ai-implement/image.yml` override (source === "override"), or
  *   - an explicit orchestrator-wide default (AI_IMPLEMENT_RUNNER_IMAGE or the
- *     legacy SESSION_IMAGE), surfaced as `runnerImageExplicit`.
+ *     legacy SESSION_IMAGE), or the `:next` default a testing orchestrator
+ *     derives from its source-branch stamp, surfaced as `runnerImageExplicit`.
  *
  * When neither is true the resolved image is just the built-in fallback, so we
  * return `undefined` and let the target workflow keep its own resolution

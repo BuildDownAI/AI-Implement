@@ -1,3 +1,6 @@
+import { sealModelAuthBootstrap } from "../model-auth-seal.js";
+import { MODEL_AUTH_ENV } from "../model-auth-contract.js";
+import { makeGrant } from "./helpers/fixtures/configured-run.js";
 import { accountCombinations } from "./helpers/account-combinations.js";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
@@ -1148,5 +1151,26 @@ describe("review-only envelope", () => {
     for (const reviewOnly of [true, {}, { reviewers: "integration-review" }]) {
       expect(() => decodeRunConfig(Buffer.from(JSON.stringify({ ...full, reviewOnly })).toString("base64"))).toThrow(/reviewOnly/);
     }
+  });
+});
+
+
+describe("Fly execution policy binding", () => {
+  const policy = { version: 1, implementationSandbox: "ephemeral-full-access", dispatchId: "disp-1", projectKey: "proj", backend: "fly", ephemeralRunnerAsserted: true };
+  const grant = sealModelAuthBootstrap({ grant: makeGrant(makeSnapshot()), protectionKey: { ref: MODEL_AUTH_ENV.protectionKey, key: Buffer.alloc(32, 1) } });
+  const credentials = { version: 1, executionPolicy: policy, modelAuthGrant: grant };
+  const context = { version: 1, dispatchId: "disp-1", projectKey: "proj", backend: "gha", modelAuthUrl: "https://orch.example.com" };
+  it("accepts a matching sealed grant", () => {
+    expect(validateRunCredentials(credentials).executionPolicy).toEqual(policy);
+  });
+  it.each([
+    { ...credentials, modelAuthGrant: undefined },
+    { ...credentials, modelAuthGrant: makeGrant(makeSnapshot()) },
+    { ...credentials, executionPolicy: { ...policy, dispatchId: "other" } },
+    { ...credentials, modelAuthContext: context },
+    { version: 1, executionPolicy: policy, modelAuthContext: context },
+    { ...credentials, executionPolicy: { ...policy, backend: "gha" } },
+  ])("rejects an unbound or cross-backend policy", (raw) => {
+    expect(() => validateRunCredentials(raw)).toThrow(/^run_config.credentials.executionPolicy /);
   });
 });

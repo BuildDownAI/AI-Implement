@@ -444,6 +444,104 @@ describe("listInstallationRepositoryNames", () => {
   });
 });
 
+describe("getScopedInstallationToken permission intersection", () => {
+  const PUBLICATION = { contents: "write", pull_requests: "write", workflows: "write", checks: "read" };
+  // An org installation granting `granted` (omit for a reply with no permissions field), and mints answering in order.
+  // GitHub's schema requires the field, so the reply without it covers the guard, not a reply GitHub is documented to send.
+  const routes = (granted: Record<string, string> | undefined, ...minted: Reply[]) => fakeFetch({
+    [orgInstallation("my-org")]: installation(1, { permissions: granted }),
+    [mint(1)]: minted.length > 0 ? minted : [token("t")],
+  }).install();
+  const mintCalls = (api: ReturnType<typeof routes>) => api.calls.filter((call) => `${call.method} ${call.path}` === mint(1));
+  const installationCalls = (api: ReturnType<typeof routes>) => api.calls.filter((call) => call.path.endsWith("/installation"));
+  const mintBody = (api: ReturnType<typeof routes>, n = 0) => JSON.parse(mintCalls(api)[n].body);
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  const scoped = (perms: Record<string, string> = PUBLICATION, extra: Record<string, unknown> = {}) =>
+    getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: perms, ...extra });
+
+  it("leaves the body unchanged and does not warn when everything is granted", async () => {
+    const api = routes({ ...PUBLICATION, metadata: "read" });
+    await scoped();
+    expect(mintBody(api)).toEqual({ permissions: PUBLICATION });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("drops a permission the installation lacks, warns once naming it and the owner, and still mints", async () => {
+    const api = routes({ contents: "write", pull_requests: "write", workflows: "write" });
+    const result = await scoped();
+    expect(result.token).toBe("t");
+    expect(mintBody(api).permissions).toEqual({ contents: "write", pull_requests: "write", workflows: "write" });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain("checks");
+    expect(warn.mock.calls[0][0]).toContain("my-org");
+  });
+
+  it("lowers write to read where only read is granted, leaving the others unchanged", async () => {
+    const api = routes({ ...PUBLICATION, workflows: "read" });
+    await scoped();
+    expect(mintBody(api).permissions).toEqual({ ...PUBLICATION, workflows: "read" });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain("workflows");
+  });
+
+  it("keeps a read request when the installation grants write", async () => {
+    const api = routes({ contents: "write" });
+    await scoped({ contents: "read" });
+    expect(mintBody(api).permissions).toEqual({ contents: "read" });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("passes through a level the rank does not know", async () => {
+    const api = routes({ contents: "write" });
+    await scoped({ contents: "superuser" });
+    expect(mintBody(api).permissions).toEqual({ contents: "superuser" });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns once for the same owner and permission across mints, and again after clearTokenCache", async () => {
+    routes({ contents: "write" }, token("t1"), token("t2"), token("t3"));
+    await scoped({ contents: "write", checks: "read" });
+    await scoped({ contents: "write", checks: "read" }, { forceRefresh: true });
+    expect(warn).toHaveBeenCalledTimes(1);
+    clearTokenCache();
+    await scoped({ contents: "write", checks: "read" });
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws the same GitHubApiError when the installation lookup fails", async () => {
+    fakeFetch({ [orgInstallation("my-org")]: notFound, [userInstallation("my-org")]: notFound }).install();
+    await expect(scoped()).rejects.toMatchObject({ status: 404, path: "/users/my-org/installation" });
+  });
+
+  it("passes the request through when the installation response has no permissions field", async () => {
+    const api = routes(undefined);
+    await scoped();
+    expect(mintBody(api)).toEqual({ permissions: PUBLICATION });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("makes no installation request on a cache hit", async () => {
+    const api = routes({ contents: "write" });
+    await scoped({ contents: "write", checks: "read" });
+    expect(installationCalls(api)).toHaveLength(1);
+    expect(mintCalls(api)).toHaveLength(1);
+    await scoped({ contents: "write", checks: "read" });
+    expect(installationCalls(api)).toHaveLength(1);
+    expect(mintCalls(api)).toHaveLength(1);
+  });
+
+  it("throws without a mint request when nothing requested is granted", async () => {
+    const api = routes({ metadata: "read" });
+    await expect(scoped({ checks: "read" })).rejects.toThrow(/my-org.*checks/);
+    expect(mintCalls(api)).toHaveLength(0);
+  });
+});
+
 describe("getScopedInstallationToken", () => {
   // One installation lookup and one mint for my-org's installation 1, each answering the same reply every time.
   const myOrg = (minted: Reply) => fakeFetch({ [orgInstallation("my-org")]: installation(1), [mint(1)]: minted }).install();
@@ -493,7 +591,11 @@ describe("getScopedInstallationToken", () => {
   });
 
   it("sends both permissions and repositories in the request body", async () => {
-    const api = myOrg(token("ghs_both"));
+    // The installation grants what is asked, so the mint passes both through unchanged.
+    const api = fakeFetch({
+      [orgInstallation("my-org")]: installation(1, { permissions: { contents: "write", issues: "write", metadata: "read" } }),
+      [mint(1)]: token("ghs_both"),
+    }).install();
 
     await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
       permissions: { contents: "read", issues: "write" },

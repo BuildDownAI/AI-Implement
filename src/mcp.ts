@@ -120,11 +120,14 @@ const RESTATE_TOOL_NAMES = new Set([
   "pause_project",
   "start_deploy",
   "add_project",
+  "add_model_account",
+  "set_project_stage",
   "set_project_agent_mode",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
   "list_dispatch_reservations",
   "release_dispatch_reservation",
+  "unpark_issue",
 ]);
 
 // The subset of RESTATE_TOOL_NAMES that mutates state. Not a role declaration — that lives on
@@ -143,10 +146,13 @@ export const RESTATE_WRITE_TOOL_NAMES = new Set([
   "pause_project",
   "start_deploy",
   "add_project",
+  "add_model_account",
+  "set_project_stage",
   "set_project_agent_mode",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
   "release_dispatch_reservation",
+  "unpark_issue",
 ]);
 
 // admin is a strict superset of user (docs/access-model.md § Roles): an entry's role satisfies

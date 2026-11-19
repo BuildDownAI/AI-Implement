@@ -96,7 +96,14 @@ the same way and launches no run; see the [paired-image rule](workflow-envelope.
 Restate launch preparation sets the envelope's `reviewOnly` payload to
 `integration-review` plus the project's effective gating reviewers, deduplicated by
 id. An unset project selection uses the normal defaults; an empty selection still
-runs `integration-review`. Open ledger findings are not appended as fix instructions.
+runs `integration-review`. The payload's optional `expectedHeadSha` is recovered
+from the queue row's exact generated instruction, including retry rows and rows
+queued before this field existed; it is never replaced with the live PR head.
+Malformed synthetic instructions fail launch preparation. If the PR head has moved,
+the runner reports a skip with both heads before reading the diff or invoking a
+reviewer. It posts no verdict, and the callback files no child or retry while still
+finalizing the dispatch. Envelopes from older orchestrators that omit the field
+continue reviewing the current head. Open ledger findings are not appended as fix instructions.
 
 An incomplete roll-up review with a nonempty list of failed reviewers, all classified
 `transient` (for example `PROVIDER_OVERLOADED`), queues one retry for the same head.
@@ -123,7 +130,7 @@ remediation. Each terminal result is given a follow-up notice: it names the file
 child, says
 when no child is needed, or names failed reviewers for an incomplete review
 (with a fallback when review failed before a reviewer ran). At the two-child
-limit, including on incomplete reviews, it says a person must decide further fixes. A notice can still be lost: when the verdict comment update fails after the child is reserved, the callback is acknowledged and the notice is not retried (AII-2011).
+limit, including on incomplete reviews, it says a person must decide further fixes. When the verdict comment update fails, the callback keeps the saved notice pending and answers 503, so the runner's bounded result-delivery retries post it without filing another child (see `docs/feature-branch-grouping.md` § 6).
 Ordinary comment gap-fills are unchanged.
 
 ## Failed rounds

@@ -30,13 +30,17 @@ describe("parseExecutionPolicy", () => {
   it("accepts the exact versioned shape", () => {
     expect(parseExecutionPolicy(policy)).toEqual({ ok: true, value: policy });
   });
+  it("accepts Fly with the same v1 shape", () => {
+    const fly = { ...policy, backend: "fly" };
+    expect(parseExecutionPolicy(fly)).toEqual({ ok: true, value: fly });
+  });
   it.each([
     ["missing", undefined],
     ["boolean", true],
     ["unknown field", { ...policy, extra: 1 }],
     ["wrong version", { ...policy, version: 2 }],
     ["other sandbox", { ...policy, implementationSandbox: "danger-full-access" }],
-    ["non-gha backend", { ...policy, backend: "fly" }],
+    ["unsupported backend", { ...policy, backend: "local" }],
     ["false assertion", { ...policy, ephemeralRunnerAsserted: false }],
     ["string assertion", { ...policy, ephemeralRunnerAsserted: "true" }],
     ["empty dispatch", { ...policy, dispatchId: "" }],

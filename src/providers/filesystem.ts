@@ -148,7 +148,8 @@ export class FilesystemProvider implements TicketingProvider {
     const records: IssueStatusRecord[] = [];
     for (const { issue, state, location } of tasks.values()) {
       const status = state?.status ?? (mapping.planningEnabled ? "ready" : "plan-approved");
-      const updatedAt = state ? Date.parse(state.updatedAt) : null;
+      const parsedUpdatedAt = state ? Date.parse(state.updatedAt) : NaN;
+      const updatedAt = Number.isFinite(parsedUpdatedAt) ? parsedUpdatedAt : null;
       if (status === "cancelled") continue;
       if (location !== "active" && (updatedAt === null || !(updatedAt >= cutoff))) continue;
       const normalized = status === "completed" ? "merged"
@@ -309,6 +310,16 @@ export class FilesystemProvider implements TicketingProvider {
     return this.updateTask(issueId, scopeKey, (state) => {
       if (isCallbackTerminal(state.status)) return null;
       return { ...state, status: "failed", failurePhase: phase };
+    }, { activeOnly: true });
+  }
+
+  async markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (state.status === "completed" || state.status === "cancelled") return null;
+      return appendComment(
+        { ...state, status: "cancelled" },
+        `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the task status to its pickup value.`,
+      );
     }, { activeOnly: true });
   }
 

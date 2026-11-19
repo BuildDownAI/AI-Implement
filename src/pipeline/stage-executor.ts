@@ -175,7 +175,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
   // shell and unified exec disabled). Planning's host tools are repo_read/repo_search/comments_write (confined to
   // ai-output/comments); review's are repo_read/repo_search only. Implementation keeps the `codex exec` path with
   // its own sandbox. Cached per profile and kind, so no stage reuses another's transport or policy.
-  const getCodex = (profileId: string, stage: StageName): LLMExecutor => {
+  const getCodex = (profileId: string, stage: StageName, implementationFullAccess: true | undefined): LLMExecutor => {
     const kind = stage === "planning" || stage === "review" ? stage : "exec";
     const key = `${kind}:${profileId}`;
     let ex = codexByProfile.get(key);
@@ -201,7 +201,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
             : {
                 protocolDriver: undefined,
                 trustedSkillsDir: undefined,
-                ...(options.implementationFullAccess === true ? { implementationFullAccess: true as const } : {}),
+                ...(implementationFullAccess === true ? { implementationFullAccess: true as const } : {}),
               }),
           auth,
           profileId,
@@ -219,6 +219,18 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
       const account = effectiveAccounts.get(stage);
       const selection = { ...snapshot.stages[stage], ...account, model: effectiveModels.get(stage) ?? account?.model ?? snapshot.stages[stage].model };
       const profile = account ? { ...snapshot.profiles[stage], ...account, id: account.accountProfileId, revision: account.profileRevision } : snapshot.profiles[stage];
+      let implementationFullAccess: true | undefined;
+      if (stage === "implementation") {
+        const agent = selection.agent;
+        switch (agent) {
+          case "codex": implementationFullAccess = options.implementationFullAccess; break;
+          case "claude": break; // Claude has no inner OS sandbox to change.
+          default: {
+            const exhaustive: never = agent;
+            throw new AgentStageError(`Unsupported implementation agent: ${exhaustive}`);
+          }
+        }
+      }
       const invocationId = `${stage}-${randomUUID()}`;
       // Validate the static projection before any auth acquisition or spawn: a rejected model, id or limit
       // fails closed with a fixed message and never reaches a child or a result.
@@ -269,7 +281,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
           invocation.catch(() => {});
           result = await Promise.race([invocation, recovery]);
         } else {
-          result = await getCodex(profileId, stage).invoke(call);
+          result = await getCodex(profileId, stage, implementationFullAccess).invoke(call);
         }
         switchOnFailure(stage, result.failure);
         const attribution = attribute(result.failure ? "error" : "success", result.telemetry);

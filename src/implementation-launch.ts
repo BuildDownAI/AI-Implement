@@ -47,6 +47,17 @@ import { getMappings } from "./config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { buildImplRunConfig, encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
 
+export type ImplementationSandbox =
+  | { sandbox: "runner-isolated" }
+  | { sandbox: "agent-default"; reason: "unprotected" | "process-secrets-off" };
+
+/** Decided inside the existing launch step; never returned to the Restate journal. */
+export function decideImplementationSandbox(input: { protectedLaunch: boolean; processLevelSecrets: boolean }): ImplementationSandbox {
+  if (!input.protectedLaunch) return { sandbox: "agent-default", reason: "unprotected" };
+  if (!input.processLevelSecrets) return { sandbox: "agent-default", reason: "process-secrets-off" };
+  return { sandbox: "runner-isolated" };
+}
+
 type ManagedLaunchDecision = Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
 
 async function getTargetRepoToken(
@@ -314,6 +325,7 @@ export interface LaunchImplementationSessionArgs {
 }
 
 export interface FlyImplementationSessionArgs extends LaunchImplementationSessionArgs {
+  implementationSandbox?: ImplementationSandbox;
   /** The shadow Fly run of "both" mode: tags the log line and posts no status comment. */
   shadow: boolean;
 }
@@ -376,6 +388,15 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
     ...managedRunConfigFields(protectedLaunch),
   });
 
+  const implementationSandbox = args.implementationSandbox ?? { sandbox: "agent-default", reason: "unprotected" };
+  if (implementationSandbox.sandbox === "runner-isolated") {
+    if (!protectedLaunch) throw new Error("implementation sandbox requires a protected launch");
+    implRunConfig.credentials = { version: 1, executionPolicy: {
+      version: 1, implementationSandbox: "ephemeral-full-access", backend: "fly",
+      dispatchId: protectedLaunch.dispatchId, projectKey: protectedLaunch.projectKey, ephemeralRunnerAsserted: true,
+    } };
+  }
+
   let protectedModelBootstrap: Awaited<ReturnType<typeof buildProtectedFlyBootstrap>> | undefined;
   if (protectedLaunch) {
     const bootstrap = protectedLaunch.takeBootstrap();
@@ -391,6 +412,7 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
   }
 
   const machineConfig = buildSessionMachineConfig({
+    implementationSandbox,
     image: resolvedImage,
     issueId: issue.id,
     issueIdentifier: issue.identifier,
@@ -437,7 +459,7 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
   const machine = await createMachine(flyToken, flyApp, machineConfig);
 
   const tag = shadow ? "shadow fly-machines" : "fly-machines";
-  console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${tag}, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
+  console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${tag}, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}], implementation_sandbox: ${machineConfig.config.metadata?.implementation_sandbox})`);
 
   const machineLogsUrl = `https://fly.io/apps/${flyApp}/machines/${machine.id}`;
   return {

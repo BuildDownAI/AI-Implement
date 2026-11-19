@@ -1,14 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
 import { JiraProvider, adfToPlainText, createJiraProviderFromConfig } from "../../providers/jira.js";
 import { JiraApiError, JiraClient, type JiraIssue } from "../../providers/jira-client.js";
-import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
 import { validateTicketingConfig } from "../../providers/ticketing-config.js";
 import { validateIssueBaseBranch } from "../../base-branch.js";
 import type { RepoMapping } from "../../config.js";
 import { makeIssue, makeMapping } from "../helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type ReplyInit, type Routes } from "../helpers/fake-fetch.js";
-import { runChildIssueContract } from "./contract.js";
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
 
 // The client reaches Jira through the OAuth gateway for cloud id "c", so every request path starts here.
 const API = "/ex/jira/c/rest/api/3";
@@ -2172,7 +2172,7 @@ describe("JiraProvider.listIssueStatuses", () => {
     const fake = fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/ }) }).install();
     await provider().listIssueStatuses(mapping());
     expect(searchBodies(fake)[0]).toEqual({
-      jql: '(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -7d)',
+      jql: `(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`,
       fields: ["summary", "updated", "customfield_10100", "customfield_10101"],
       maxResults: 100,
     });
@@ -2246,5 +2246,38 @@ describe("JiraProvider.listIssueStatuses", () => {
     fakeFetch({}).install();
     await expect(provider().listIssueStatuses(makeMapping())).rejects.toBeInstanceOf(TrackerUnavailableError);
     await expect(provider().listIssueStatuses({ ...mapping(), teamKey: undefined })).rejects.toBeInstanceOf(TrackerUnavailableError);
+  });
+});
+
+runPrClosedUnmergedContract("JiraProvider", async (terminal) => {
+  clearFieldCache();
+  const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY,
+    [STATUS_READ]: { json: { id: "10001", key: "P-1", fields: { customfield_10100: { value: terminal ? "Merged" : "PR Ready" } } } },
+    [STATUS_WRITE]: { status: 204 }, [COMMENT]: { status: 201, json: { id: "comment" } },
+  }).install();
+  return { provider: makeProvider({ cacheScope: "close", mappings: { "acme/x": jiraMapping() } }), issueId: "10001", scopeKey: "acme/x",
+    restartSentence: "To run it again, set the AI-Implement status to its pickup value.",
+    verify: async (terminal, comment) => {
+      expect(fake.calls.map((c) => c.method)).toEqual(terminal ? ["GET", "GET"] : ["GET", "GET", "PUT", "POST"]);
+      if (!terminal) {
+        expect(JSON.parse(fake.calls[2].body).fields.customfield_10100).toEqual({ value: "Implementation Failed" });
+        expect(adfToPlainText(JSON.parse(fake.calls[3].body).body)).toBe(comment);
+      }
+    } };
+});
+describe("JiraProvider unmerged close guards", () => {
+  it("refuses native terminal issues", async () => {
+    clearFieldCache();
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: { json: { id: "10001", key: "P-1", fields: { status: { statusCategory: { key: "done" } } } } } }).install();
+    const p = makeProvider({ cacheScope: "close-native", mappings: { "acme/x": jiraMapping() } });
+    expect(await p.markPrClosedUnmerged("10001", "acme/x", "url")).toBe(false);
+    expect(fake.calls.map((c) => c.method)).toEqual(["GET", "GET"]);
+  });
+  it("does not write when the terminal-state read fails", async () => {
+    clearFieldCache();
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: { status: 403, json: {} } }).install();
+    const p = makeProvider({ cacheScope: "close-error", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.markPrClosedUnmerged("10001", "acme/x", "url")).rejects.toThrow();
+    expect(fake.calls.map((c) => c.method)).toEqual(["GET", "GET"]);
   });
 });

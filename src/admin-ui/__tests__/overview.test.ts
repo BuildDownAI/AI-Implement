@@ -112,9 +112,24 @@ describe("overview page", () => {
     expect(overviewScript).toContain("PROVIDER_UNAVAILABLE");
   });
 
-  it("includes stuck_giveup in the attention KPI filter", () => {
-    expect(overviewScript).toContain("stuck_giveup");
-    expect(overviewScript).toContain("e.conclusion === 'stuck_giveup'");
+  it("counts recent hard-stopped jobs as attention and excludes ordinary or old timeouts", async () => {
+    const recent = new Date(Date.now() - 3600000).toISOString();
+    const old = new Date(Date.now() - 48 * 3600000).toISOString();
+    const { win, doc } = mountOverview({
+      log: [
+        { id: 1, status: "timed_out", conclusion: "stuck_giveup", dispatchedAt: recent },
+        { id: 2, status: "failed", dispatchedAt: recent },
+        { id: 3, status: "review_failed", dispatchedAt: recent },
+        { id: 4, status: "timed_out", conclusion: "machine_timeout", dispatchedAt: recent },
+        { id: 5, status: "timed_out", conclusion: "run_not_found", dispatchedAt: recent },
+        { id: 6, status: "timed_out", conclusion: "stuck_giveup", dispatchedAt: old },
+        { id: 7, status: "completed", conclusion: "stuck_giveup", dispatchedAt: recent },
+      ],
+    });
+    await win.loadOverview();
+    expect(doc.getElementById("kpi-failed-value")?.textContent).toBe("3");
+    const rows = doc.querySelectorAll("#overview-failures-body [data-job-id]");
+    expect(Array.from(rows, (row) => row.getAttribute("data-job-id"))).toEqual(["1", "2", "3"]);
   });
 
   it("treats stuck_review_fix like stuck_giveup in the attention and failure filters", () => {

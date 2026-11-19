@@ -1,5 +1,5 @@
 import { getDb } from "./dedup.js";
-import { ROLLUP_REVIEW_COMMENTER } from "./comment-gapfill-queue.js";
+import { ROLLUP_REVIEW_COMMENTER, rollupReviewExpectedHead } from "./comment-gapfill-queue.js";
 import { resolveReviewerSelection } from "./config.js";
 import { createImplementationRunIngressClient, type ImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { restateCanServe } from "./restate/status.js";
@@ -18,6 +18,7 @@ import {
 } from "./dispatch-admission.js";
 import { MAX_COMMENT_GAPFILL_REFUSALS, getCommentGapfillItem, recordCommentGapfillRefusal, claimPendingCommentGapfills, markCommentGapfillSubmitted, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, type Job } from "./log.js";
+import { findLinkByPr } from "./pr-links.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
 import { trackerAccounting as defaultTrackerAccounting, type TrackerAccounting } from "./job-accounting.js";
@@ -358,7 +359,18 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
-      let prLog = getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
+      let prLog: Pick<Job, "issueId" | "issueIdentifier" | "teamKey"> | null =
+        getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
+      if (!prLog) {
+        // Link identity survives job pruning; all mapping and admission checks below
+        // still apply, including the live GitHub terminal-state check above.
+        const link = findLinkByPr(fullRepo, item.prNumber);
+        if (link) prLog = {
+          issueId: link.issue.trackerIssueId,
+          issueIdentifier: link.issue.identifier,
+          teamKey: link.issue.mappingKey,
+        };
+      }
       if (!prLog) {
         if (!pr) {
           await opts.postComment(
@@ -514,10 +526,11 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 }
 
 /** Advisory roll-up review selection; project authority is retained for trusted resolution only. */
-export function rollupReviewMode(commenter: string, mapping: RepoMapping) {
+export function rollupReviewMode(commenter: string, mapping: RepoMapping, instruction?: string) {
   if (commenter !== ROLLUP_REVIEW_COMMENTER) return undefined;
   const reviewers = new Map(resolveReviewerSelection(mapping)
     .filter(r => r.gates).map(r => [r.id, r]));
   reviewers.set("integration-review", { id: "integration-review", gates: true });
-  return { reviewers: [...reviewers.values()] };
+  return { reviewers: [...reviewers.values()],
+    ...(instruction !== undefined ? { expectedHeadSha: rollupReviewExpectedHead(instruction) } : {}) };
 }

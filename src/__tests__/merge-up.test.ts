@@ -1,3 +1,5 @@
+import { initDispatchBreakerTable, isParked } from "../dispatch-breaker.js";
+import { findLinkByPr, deleteLinksForMapping } from "../pr-links.js";
 import { getDb } from "../dedup.js";
 import { describe, it, expect, vi, beforeEach, onTestFinished } from "vitest";
 import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, isRollUpHandled, markRollUpHandled, clearRollUpHandledMarkersByIdentifier, runMergeUps } from "../merge-up.js";
@@ -57,9 +59,12 @@ const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
 });
 
 beforeEach(() => {
+  initDispatchBreakerTable();
+  getDb().exec("DELETE FROM dispatch_breaker");
   vi.clearAllMocks();
   reviewHeads.clear();
   resetRollUpHandledMarkers();
+  deleteLinksForMapping("OOL");
   getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run("roll-up-review:%");
   resetClosedVetoLogGuard();
   vi.mocked(findOpenPullRequest).mockResolvedValue(null);
@@ -119,6 +124,23 @@ describe("runMergeUps", () => {
     // PR title/body carry no issue identifier.
     const arg = vi.mocked(createPullRequest).mock.calls[0][3];
     expect(`${arg.title} ${arg.body}`).not.toMatch(/OOL-\d+/i);
+  });
+
+  it("stores the roll-up link before a subsequent GitHub failure", async () => {
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    vi.mocked(getBranchSha).mockRejectedValueOnce(new Error("GitHub unavailable"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+      expect(findLinkByPr("jodwyer/alpacaWheel", 7)).toMatchObject({
+        role: "roll-up", source: "result", outcome: "open",
+        headRef: "ai-implement/feature/ool-107", baseRef: "testing",
+        issue: { trackerKind: "linear", mappingKey: "OOL",
+          trackerIssueId: "issue-uuid-1", identifier: "OOL-107" },
+      });
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it("recovers a missing creation head on the next open poll", async () => {
@@ -514,7 +536,9 @@ describe("roll-up review child cleanup", () => {
       labels: { nodes: [] }, project: null, comments: { nodes: [] }, relations: { nodes: [] },
     };
     Object.assign(provider, { listIssuesPage: vi.fn(async () => ({ issues: [child], pageInfo: { hasNextPage: false, endCursor: null } })) });
+    Object.defineProperty(provider, "id", { value: "linear" });
     const comment = vi.spyOn(provider, "postComment").mockImplementation(async (_id, body) => {
+      expect(isParked("child", "implementation")).toBe(true);
       child.comments.nodes.push({ body, user: null, createdAt: "now" });
     });
     vi.mocked(getPullRequestState).mockResolvedValue({ merged, state: "closed", headRef: null, headSha: null });
@@ -530,6 +554,45 @@ describe("roll-up review child cleanup", () => {
     provider.setLifecycle("child", "completed");
     await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
     expect(comment).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the park when commenting fails and completes bookkeeping on retry", async () => {
+    const { reconcileRollupReviewChildren } = await import("../merge-up.js");
+    const { FakeProvider } = await import("./providers/fake.js");
+    const { makeIssue } = await import("./helpers/builders.js");
+    const provider = new FakeProvider({ initialIssues: [makeIssue({ id: "child", identifier: "OOL-108" })] });
+    Object.defineProperty(provider, "id", { value: "linear" });
+    const child: import("../providers/types.js").TrackerIssueRecord = {
+      id: "child", identifier: "OOL-108", title: `[roll-up-review] jodwyer/alpacaWheel#7 ${"a".repeat(40)} Fix blockers`,
+      description: "body", parent: { identifier: "OOL-106" }, state: { name: "Ready", type: "unstarted" },
+      labels: { nodes: [] }, project: null, comments: { nodes: [] }, relations: { nodes: [] },
+    };
+    Object.assign(provider, { listIssuesPage: vi.fn(async () => ({ issues: [child], pageInfo: { hasNextPage: false, endCursor: null } })) });
+    const park = vi.spyOn(provider, "parkForHuman");
+    const comment = vi.spyOn(provider, "postComment").mockImplementationOnce(async () => {
+      expect(isParked("child", "implementation")).toBe(true);
+      throw new Error("comment unavailable");
+    }).mockResolvedValue(undefined);
+    vi.mocked(getPullRequestState).mockResolvedValue({ merged: false, state: "closed", headRef: null, headSha: null });
+    const reconcile = () => reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
+    const bookkeeping = () => getDb().prepare("SELECT value FROM settings WHERE key = ?")
+      .get("roll-up-review:parked:linear:OOL:child");
+
+    await expect(reconcile()).rejects.toThrow("comment unavailable");
+    expect(isParked("child", "implementation")).toBe(true);
+    expect(getDb().prepare("SELECT phase, last_conclusion, project, issue_identifier FROM dispatch_breaker WHERE issue_id = ?").get("child"))
+      .toEqual({ phase: "implementation", last_conclusion: "rollup_review_closed", project: "OOL", issue_identifier: "OOL-108" });
+    expect(bookkeeping()).toBeUndefined();
+
+    await reconcile();
+    expect(isParked("child", "implementation")).toBe(true);
+    expect(bookkeeping()).toBeDefined();
+    expect(comment).toHaveBeenCalledTimes(2);
+    expect(park).toHaveBeenCalledTimes(2);
+    // The settings marker, rather than a cached tracker comment, prevents duplicate work.
+    await reconcile();
+    expect(comment).toHaveBeenCalledTimes(2);
+    expect(park).toHaveBeenCalledTimes(2);
   });
 
   it.each([true, false])("parks an active child beyond Linear's 250-result limit (merged=%s)", async merged => {

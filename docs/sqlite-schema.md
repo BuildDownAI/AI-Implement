@@ -190,6 +190,14 @@ Running the change before `ensureAccountingTriggers()` is not enough for this ta
 5. Read the deploy paths in [deployment.md](deployment.md#deploy-paths). Remember that a
    rollback keeps the schema change (section 3).
 
+### Pull request cancellation decisions
+
+On first access, `src/pr-links.ts` adds nullable `pull_request_link.cancel_checked_at INTEGER` after checking `PRAGMA table_info`, before importing surviving job rows.
+Existing rows keep NULL. Closed-unmerged links with NULL are reconsidered without
+another GitHub read; final decisions receive an epoch-millisecond timestamp.
+In-flight runs and provider errors leave NULL for retry. Link metadata refreshes
+preserve the marker, and rollback leaves the nullable column in place.
+
 ## Gap-fill dispatch uncertainty
 
 `src/comment-gapfill-queue.ts` owns `comment_gapfill_launch`, keyed by

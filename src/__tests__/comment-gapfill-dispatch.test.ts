@@ -544,6 +544,36 @@ async function checkNoSubmit(opts: DrainInput, id: number, status: string): Prom
 }
 
 describe("ImplementationRun gap-fill ingress", () => {
+  it.each(["admitted", "paused", "in-flight", "wrong-mapping", "closed"] as const)(
+    "recovers a pruned PR from its durable link while preserving %s safeguards", async (scenario) => {
+      const { linkPullRequest } = await import("../pr-links.js");
+      const { getDb } = await import("../dedup.js");
+      const jobId = seedOrigin();
+      linkPullRequest({ repository: "acme/billing", number: 42,
+        url: "https://github.com/acme/billing/pull/42", role: "implementation", source: "result",
+        issue: { trackerKind: "linear", mappingKey: scenario === "wrong-mapping" ? "OTHER" : "AII",
+          trackerIssueId: "issue-1", identifier: "AII-1554", title: "Caller switch", url: null } });
+      getDb().prepare("DELETE FROM dispatch_log WHERE id = ?").run(jobId);
+      expect(log.getLatestDispatchForPr("acme", "billing", 42)).toBeNull();
+      if (scenario === "in-flight") log.appendLog(makeAppendLogEntry({
+        issueId: "issue-1", teamKey: "AII", repo: "acme/billing", status: "running",
+      }));
+      if (scenario === "closed") prLookup(42, { json: { merged: false, state: "closed" } });
+      const opts = optsFor(makeMapping({ owner: "acme", repo: "billing", paused: scenario === "paused" }));
+      const id = seedItem();
+      await drain.drainCommentGapfillQueue(opts);
+      if (scenario === "admitted") {
+        expect(submit).toHaveBeenCalledExactlyOnceWith(expect.any(String), expect.objectContaining({
+          teamKey: "AII", issueId: "issue-1", issueIdentifier: "AII-1554",
+        }));
+      } else {
+        expect(submit).not.toHaveBeenCalled();
+        expect(queue.getCommentGapfillItem(id)?.status).toBe(
+          scenario === "in-flight" ? "pending" : scenario === "wrong-mapping" ? "failed" : "skipped");
+      }
+      expect(opts.postComment).not.toHaveBeenCalled();
+    },
+  );
   for (const lifecycle of [null, "legacy", "restate"] as const) {
     it.each([
       ["default", "github-actions", "github-actions"],
@@ -923,3 +953,30 @@ it("open in-flight PR preserves the entire row and reads once", async () => {
   expect(queue.getCommentGapfillItem(id)).toEqual(before);
   expect(http.calls).toHaveLength(1);
 });
+
+ it("retains head A from an attempt-1 queue row in the review envelope when the live PR is at B", async () => {
+  const { buildRunConfig, encodeRunConfig, decodeRunConfig } = await import("../run-config.js");
+  seedOrigin();
+  expect(queue.enqueueRollupReview({ owner: "acme", repo: "billing", prNumber: 42, headSha: "a".repeat(40), attempt: 1 })).toBe(true);
+  prLookup(42, { json: { merged: false, state: "open", head: { ref: "ai-implement/feature/aii-1554", sha: "b".repeat(40) } } });
+  await drain.drainCommentGapfillQueue(optsFor());
+  const row = queue.getCommentGapfillItem(submit.mock.calls[0]![1].gapFill!.queueItemId)!;
+  const reviewOnly = drain.rollupReviewMode(row.commenter, makeMapping(), row.instruction);
+  const envelope = buildRunConfig({ issue: { id: "i", identifier: "AII-1554", title: "Roll-up", description: "" },
+    mapping: makeMapping(), runnerPhase: "gap-analysis", prNumber: "42", retryPolicy: null, reviewOnly });
+  expect(decodeRunConfig(encodeRunConfig(envelope)).reviewOnly?.expectedHeadSha).toBe("a".repeat(40));
+ });
+
+ it.each([undefined, "a".repeat(40), "AB".repeat(32), 123, "g".repeat(40), "a".repeat(39), "a".repeat(65)])(
+  "validates review-only expected head %s through envelope decoding", async (expectedHeadSha) => {
+    const { buildRunConfig, encodeRunConfig, decodeRunConfig } = await import("../run-config.js");
+    const envelope = buildRunConfig({ issue: { id: "i", identifier: "AII-1", title: "Roll-up", description: "" },
+      mapping: makeMapping(), runnerPhase: "gap-analysis", prNumber: "42", retryPolicy: null,
+      reviewOnly: { reviewers: [{ id: "integration-review", gates: true }] } });
+    const raw = JSON.parse(Buffer.from(encodeRunConfig(envelope), "base64").toString());
+    if (expectedHeadSha !== undefined) raw.reviewOnly.expectedHeadSha = expectedHeadSha;
+    const decode = () => decodeRunConfig(Buffer.from(JSON.stringify(raw)).toString("base64"));
+    if (expectedHeadSha === undefined || (typeof expectedHeadSha === "string" && /^[a-f0-9]{40,64}$/i.test(expectedHeadSha))) {
+      expect(decode().reviewOnly?.expectedHeadSha).toBe(expectedHeadSha);
+    } else expect(decode).toThrow("invalid run_config.reviewOnly");
+  });

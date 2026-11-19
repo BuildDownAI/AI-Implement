@@ -61,7 +61,7 @@ testing                                  (repo base branch)
 | `Plan-Complete` | Planning finished and approved → the issue is ready for implementation. | Orchestrator via the **runner callback** (`runner-callback.ts` → `markPlanComplete`) |
 | `AI-Working` | Implementation in flight. Counts against capacity; the issue is skipped while present. | Orchestrator on implementation dispatch |
 | `Ready for Review` | An implementation PR is open. The issue is skipped (waiting on the human to merge). | Orchestrator when the PR is detected |
-| `AI-Needs-Human` | The stuck watchdog gave up on the issue (`parkForHuman`). The issue is skipped until a human removes this label. It keeps `AI-Implement`, so it stays in the grouping tree and, while not terminal, holds its parent's roll-up. | Orchestrator on give-up |
+| Park record | The stuck watchdog gave up on the issue (`parkForHuman`). The issue is skipped until an operator unparks it at `/admin#runners`. It keeps `AI-Implement`, so it stays in the grouping tree and, while not terminal, holds its parent's roll-up. | Orchestrator on give-up |
 
 When a PR merges, the orchestrator moves the issue to **Done** via `markMerged` — driven by
 a poll detector (guaranteed, runs every tick) and optionally accelerated by a webhook delivery
@@ -78,7 +78,7 @@ classifies each one (`src/providers/linear.ts`, `fetchAIImplementSnapshot`):
 
 | Condition | Class | Action |
 |-----------|-------|--------|
-| `AI-Needs-Human` present (checked before the capacity count) | parked | skipped, not counted for capacity |
+| Park record present (checked before the capacity count) | parked | skipped, not counted for capacity |
 | `AI-Working` or `AI-Planning` present | in-progress | counted for capacity, skipped |
 | `Ready for Review` present | in review | skipped |
 | blocked by an open "blocks" relation | blocked | skipped |
@@ -110,6 +110,8 @@ in flight (`Skipping <key>: feature-node parent waiting on in-flight AI-Implemen
 children`). Only once **all** its labelled children reach a terminal state does its own
 work dispatch — onto its own feature branch. "Terminal" means completed or cancelled, and for Linear also Duplicate
 (state type `duplicate`), so these closed children do not block the parent forever.
+
+A child whose implementation PR closes without a merge is cancelled by the orchestrator once it has no other open PR and no run in flight (subject to the [grouping-parent exemptions](pull-request-links.md#cancellation-after-an-unmerged-close)). The cancelled child is terminal, so the parent's closing run can then start without that child's work.
 
 On both Linear and Jira, unlabelled children must also be terminal (Done or Cancelled, and also Duplicate for Linear) before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
 
@@ -289,7 +291,20 @@ two, including completed or cancelled children. Each terminal result is given a
 follow-up notice naming the filed child or stating that no child was filed. Incomplete notices name the failed reviewers (or explain
 that no failed reviewer was identified for a failure before review). Once the
 two-child limit is reached, every notice, including an incomplete review, says a
-person must decide further fixes. A notice can still be lost: when the verdict comment update fails after the child is reserved, the callback is acknowledged and the notice is not retried (AII-2011). Existing settings rows
+person must decide further fixes. Callbacks sharing a notice identity serialize
+preparation through delivery, including child creation, so overlapping deliveries
+preserve the child identifier and edit the verdict only once. Before reading or
+updating the verdict comment, the callback saves the exact notice
+text, reviewed head, and verdict comment ID in SQLite settings. A failed comment
+read, missing verdict, or failed edit leaves that notice pending and returns 503
+without consuming the callback credential or completing the job. The runner's
+existing bounded result-delivery retries replay the saved notice without filing
+another child or regenerating its wording. A delivery receipt prevents later
+callbacks for the same complete head/verdict from posting it again; a comment
+read also detects an edit that succeeded remotely before its response was lost.
+Pending records survive restarts, but there is no independent scheduled drain:
+after the sender exhausts its retry budget, recovery needs another authenticated
+callback delivery while its credential is valid. Existing settings rows
 reserve creation attempts atomically, including ambiguous tracker failures (which
 require a person to check the tracker); no new table is used. Tracker enumeration
 must finish successfully before filing, so an unreadable page cannot reset the cap.
@@ -334,15 +349,26 @@ For an automated roll-up review (commenter `ai-implement-rollup-review`, `ROLLUP
 > With the callback disabled, planning stalls at `AI-Planning` and the cascade can't advance
 > on its own.
 
+The merge poll checks stored open pull request links, so dispatch-log pruning does not
+prevent reconciliation. Merged implementation links queue completion; unmerged closes
+record a tombstone. Both persist the terminal outcome on the link. Roll-up links only
+record the outcome here because `merge-up` owns their reconciliation. Unreadable PRs and
+repositories without a mapping remain open for retry.
+
 ### A parent's own PR closed without merging (AII-1294)
 
 A feature-node parent never blocks its own roll-up. When the PR from the parent's own run
-(any dispatch row for that PR with `grouping_parent` set, even if a newer gap-fill row says
-otherwise) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
-parent, then writes the tombstone. It skips this while a run for the issue is in flight
+(identified for finalization by `isCurrentGroupingParent`: durable
+`pull_request_link.grouping_parent` ownership and the current PR of the issue's newest job,
+using `job_dispatched_at`/`job_id` ordering with `job_current` selecting a job's replacement PR) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
+parent, then writes the tombstone. Ownership survives dispatch-history pruning and
+a later gap-fill report does not clear it (`recordLinkJob` never clears the flag).
+Cancellation exempts every link with `groupingParent` set, current or superseded;
+only finalization requires current-PR identity. The poll skips finalization while a run for the issue is in flight
 (nothing is written; the next poll re-checks) and when the closed PR is not the issue's latest
 PR (tombstone only). If `markMerged` throws or no mapping resolves, no tombstone is written
-and the next poll retries. The poll does not check children; the roll-up gates above do that
+and the link stays open for the next poll to retry. Existing queue rows only repair the
+link outcome without repeating finalization. The poll does not check children; the roll-up gates above do that
 live, so a Done parent with a non-terminal designated child still gets no roll-up. A closed
 parent PR does not veto the tree; to stop a tree, cancel the parent issue.
 
