@@ -29,16 +29,26 @@ const SIDECAR_PORT = 8765;
 const SIDECAR_URL = `http://127.0.0.1:${SIDECAR_PORT}/mcp`;
 
 /**
- * Uses a nonempty KG_NAMESPACE first, otherwise reads the served graph: the runtime
- * overlay when one has been staged, else the baked image — the same selection
- * kg-refresh.ts's status() uses to read servedStamp. Used to build the spine IRI
- * for the sidecar liveness probe's kg_neighbors call (AII-648). Best-effort: a
- * missing or malformed sources.yml resolves to null rather than throwing.
+ * For a remote store, the served namespace is the stored `kg_namespace` row — the same value
+ * `stardogChildEnv` gives the child. For a local graph it uses a nonempty KG_NAMESPACE first,
+ * otherwise reads the served graph: the runtime overlay when one has been staged, else the
+ * baked image — the same selection kg-refresh.ts's status() uses to read servedStamp. Used to
+ * build the spine IRI for the sidecar liveness probe's kg_neighbors call (AII-648).
+ * Best-effort: a missing or malformed value resolves to null rather than throwing.
  */
 export async function getServedNamespace(
   kgDir: string = KG_DIR,
   runtimeDataDir: string = RUNTIME_DATA_DIR,
 ): Promise<string | null> {
+  // A base-only image has no local graph, and the sidecar child takes its namespace from the
+  // stored row. Reading the environment first would disagree with what the child serves.
+  if (isRemoteKgStore(process.env, kgDir)) {
+    try {
+      return getStardogValues().namespace || null;
+    } catch {
+      return null;
+    }
+  }
   if (process.env.KG_NAMESPACE) return process.env.KG_NAMESPACE;
 
   const servedDir = existsSync(join(runtimeDataDir, "sources.yml")) ? runtimeDataDir : kgDir;
@@ -112,6 +122,7 @@ export class KgSidecar {
   private readonly _spawn: (cmd: string, args: string[], opts: object) => ChildProcess;
   private _child: ChildProcess | null = null;
   private _stopPromise: Promise<void> | null = null;
+  private _restartChain: Promise<void> = Promise.resolve();
 
   constructor(opts?: KgSidecarOptions, _deps?: KgSidecarDeps) {
     this._kgDir = opts?.kgDir ?? KG_DIR;
@@ -196,10 +207,18 @@ export class KgSidecar {
     return this._stopPromise;
   }
 
-  /** Stops then starts the sidecar; used by the graph-refresh trigger (AII-426). */
-  async restart(): Promise<void> {
-    await this.stop();
-    await this.start();
+  /**
+   * Stops then starts the sidecar; used by the graph-refresh trigger (AII-426) and the graph-source
+   * switch. Calls are chained: a second call waits for the one running, then restarts once more, so
+   * two children are never alive at once. A rejected restart does not poison the chain.
+   */
+  restart(): Promise<void> {
+    const run = this._restartChain.then(async () => {
+      await this.stop();
+      await this.start();
+    });
+    this._restartChain = run.catch(() => undefined);
+    return run;
   }
 
   private _findEntryPoint(): EntryPoint | null {

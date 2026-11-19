@@ -140,6 +140,22 @@ there is nothing to undo. A tested switch to `stardog_run` and a switch back to
 `sidecar` both clear a recorded Stardog error, and `GET /` reports
 `sidecar.lastError: null`.
 
+**The switch holds the KG refresh lock for its whole test, save and restart.** It
+uses the `KgRepo` object's `inFlight` marker, so a switch and a refresh cannot
+overlap: a switch started while a refresh (or a decision hold) owns the lock
+answers `refresh-in-flight` immediately without testing, saving or restarting; a
+second switch while one runs answers `switch-in-flight`; and `trigger` refuses a
+new refresh while a switch owns the lock. The lock is released on success, a
+failed test, a failed restart, and a cancelled invocation, so the next refresh is
+then admitted. With no refresh rail configured (`kgRefreshToolDeps` is null) the
+switch uses one fixed `KgRepo` key so two switches still cannot overlap.
+
+When the effective source is a remote store (`isRemoteKgStore()`), the served
+namespace is the stored `kg_namespace` row — the same value `stardogChildEnv`
+gives the sidecar child — even when `KG_NAMESPACE` disagrees or is unset and the
+image has no `sources.yml`. A local sidecar graph keeps the `KG_NAMESPACE`, then
+`sources.yml`, order.
+
 Values are set without a refresh rail: `GET`/`POST /api/settings` carry the
 non-secret fields (`kg_stardog_*`, `stardogTokenSet`, the effective `kgGraphSource`
 and `kgCustomerRepo`), never the token, and `POST /api/kg/stardog` stores the token

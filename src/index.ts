@@ -170,6 +170,7 @@ import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { createKgRepo } from "./restate/kg-repo.js";
 import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
@@ -5495,6 +5496,9 @@ async function main(): Promise<void> {
   setKgGraphSourceToolDeps(createKgGraphSourceToolDeps({ sidecar, memoryProviderId: config.memoryProviderId }));
   kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
+  // set_kg_graph_source holds the KG refresh lock even without a source repo. Register the
+  // object for the switch's fixed key when the refresh composition did not already add it.
+  const kgSwitchLockServices = kgComposition === null ? [createKgRepo({ workflowName: "KgRefresh" })] : [];
   // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every project on every backend.
   const planningRunServices = createProductionPlanningRunServices({
     config,
@@ -5557,7 +5561,7 @@ async function main(): Promise<void> {
     onOutcome: createSelfDeployOutcomeHandler(config),
   })];
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...kgSwitchLockServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
       // Boot settles as serving only once this hook returns, and the first poll waits for that.

@@ -69,8 +69,8 @@ describe("createKgGraphSourceToolDeps restart step (AII-1974)", () => {
   /** The tool's Restate context with each step run immediately. The fake tool's log captures lines. */
   function toolContext() {
     return {
-      request: () => ({ target: { handler: "set_kg_graph_source" } }),
-      objectClient: () => ({ status: async () => null }),
+      request: () => ({ id: "inv-test", target: { handler: "set_kg_graph_source" } }),
+      objectClient: () => ({ acquireSwitch: async () => ({ acquired: true }), releaseSwitch: async () => {} }),
       run: async (name: unknown, action?: unknown) => {
         // This fake handles both ctx.run(action) and ctx.run(name, action).
         const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);

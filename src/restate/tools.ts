@@ -61,7 +61,7 @@ import { RUN_PROFILE_OBJECTS, isRunProfileBackend, type RunProfileBackend } from
 import { RunnerBackend } from "./runner-backend.js";
 import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
-import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
+import { KG_GRAPH_SOURCE_SWITCH_REPO_KEY, type KgRefreshDefinition, type KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getFlySessionsConfig, getRunnerBackendSource, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
@@ -1920,7 +1920,7 @@ export const STARDOG_TEST_MAX_RETRY_DURATION_MS = 6 * 60_000;
 export const STARDOG_TEST_PAUSE_MS = 15_000;
 
 export const SET_KG_GRAPH_SOURCE_DESCRIPTION =
-  "Switch which graph answers the kg_* tools (admin role). `stardog_run` first sends one real COUNT query with the stored Stardog values, retrying for up to 6 minutes so a sleeping endpoint can wake; only when it passes are the source saved and the sidecar restarted. A failed test changes nothing and returns { switched: false, error }. `sidecar` saves and restarts with no test. There is nothing to undo.";
+  "Switch which graph answers the kg_* tools (admin role). The switch holds the KG refresh lock for its whole test, save and restart: a refresh or another switch already holding it answers refresh-in-flight or switch-in-flight without waiting. `stardog_run` first sends one real COUNT query with the stored Stardog values, retrying for up to 6 minutes so a sleeping endpoint can wake; only when it passes are the source saved and the sidecar restarted. A failed test changes nothing and returns { switched: false, error }. `sidecar` saves and restarts with no test. There is nothing to undo.";
 
 /**
  * The source answering `kg_*` right now: `isRemoteKgStore()`, so a base-only image with an
@@ -1955,56 +1955,64 @@ export const setKgGraphSourceTool = tool(
     // Journaled so a replay logs the state the first attempt saw, not the saved row.
     const from = await ctx.run("read-source", () => effectiveKgGraphSource(deps), { maxRetryAttempts: 1 });
     const log = deps.log ?? ((f: KgGraphSource, t: KgGraphSource, ok: boolean) => console.log(`[kg] graph source ${f} -> ${t}: ${ok ? "ok" : "failed"}`));
-    const fail = (error: string, message?: string): ToolResponse => {
-      log(from, to, false);
+    // Journaled so the release call's replay cannot log one failure twice.
+    const failLogged = async (error: string, message?: string): Promise<ToolResponse> => {
+      await ctx.run("log-source", () => log(from, to, false), { maxRetryAttempts: 1 });
       return kgGraphSourceError(error, message);
     };
 
-    // Refuse while the exclusive refresh lock is held. The status read is shared, so it
-    // still answers while a run or a decision hold owns the object.
+    // The switch holds the same lock as a refresh for its whole test, save and restart. Without a
+    // refresh rail there is no source-repo key, so one fixed key still serializes switches.
     const toolDeps = kgRefreshToolDeps;
-    if (toolDeps) {
-      const status = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
-      if (status != null) return fail("refresh-in-flight");
-    }
+    const switchInvocationId = ctx.request().id;
+    const repo = ctx.objectClient(KgRepo, toolDeps?.kgSourceRepo ?? KG_GRAPH_SOURCE_SWITCH_REPO_KEY);
+    const admission = await repo.acquireSwitch({ switchId: switchInvocationId });
+    if (!("acquired" in admission)) return failLogged(admission.status);
 
-    if (to === "sidecar" && !deps.sidecarGraphPresent()) return fail("no-sidecar-graph");
-
-    let triples: number | undefined;
-    if (to === "stardog_run") {
-      const values = getStardogValues();
-      if (!values.db || !values.namespace || !values.tokenSet) return fail("stardog-values-missing");
-      try {
-        // One journaled step: Restate repeats it within the budget, and the pause between
-        // tries is bounded by maxRetryInterval (15 s in production, not the SDK's 10 s cap).
-        triples = await ctx.run("stardog-test", () => deps.countTriples(), {
-          maxRetryDuration: deps.testMaxRetryDurationMs ?? STARDOG_TEST_MAX_RETRY_DURATION_MS,
-          initialRetryInterval: deps.testPauseMs,
-          maxRetryInterval: deps.testPauseMs,
-          retryIntervalFactor: 1,
-        });
-      } catch (err) {
-        // Exhausted retries arrive as a TerminalError; a suspended invocation unwinds instead.
-        if (!(err instanceof restate.TerminalError)) throw err;
-        return fail(err.message);
-      }
-    }
-
-    await ctx.run("save", () => deps.saveGraphSource(to), { maxRetryAttempts: 1 });
     try {
-      await ctx.run("restart", () => deps.restartSidecar(), { maxRetryAttempts: 1 });
-    } catch (err) {
-      // A suspended invocation unwinds so Restate can resume it; any other failure means the
-      // restart step could not prove a serving sidecar. The save already ran, so say so.
-      if (restate.internal.isSuspendedError(err)) throw err;
-      return fail(
-        "sidecar-restart-failed",
-        "the source row was already saved, but the sidecar did not come up; retry the switch or restart the orchestrator",
-      );
+      if (to === "sidecar" && !deps.sidecarGraphPresent()) return await failLogged("no-sidecar-graph");
+
+      let triples: number | undefined;
+      if (to === "stardog_run") {
+        const values = getStardogValues();
+        if (!values.db || !values.namespace || !values.tokenSet) return await failLogged("stardog-values-missing");
+        try {
+          // One journaled step: Restate repeats it within the budget, and the pause between
+          // tries is bounded by maxRetryInterval (15 s in production, not the SDK's 10 s cap).
+          triples = await ctx.run("stardog-test", () => deps.countTriples(), {
+            maxRetryDuration: deps.testMaxRetryDurationMs ?? STARDOG_TEST_MAX_RETRY_DURATION_MS,
+            initialRetryInterval: deps.testPauseMs,
+            maxRetryInterval: deps.testPauseMs,
+            retryIntervalFactor: 1,
+          });
+        } catch (err) {
+          // Exhausted retries arrive as a TerminalError; a suspended invocation unwinds instead.
+          if (!(err instanceof restate.TerminalError)) throw err;
+          return await failLogged(err.message);
+        }
+      }
+
+      await ctx.run("save", () => deps.saveGraphSource(to), { maxRetryAttempts: 1 });
+      try {
+        await ctx.run("restart", () => deps.restartSidecar(), { maxRetryAttempts: 1 });
+      } catch (err) {
+        // A suspended invocation unwinds so Restate can resume it; any other failure means the
+        // restart step could not prove a serving sidecar. The save already ran, so say so.
+        if (restate.internal.isSuspendedError(err)) throw err;
+        return await failLogged(
+          "sidecar-restart-failed",
+          "the source row was already saved, but the sidecar did not come up; retry the switch or restart the orchestrator",
+        );
+      }
+      // Journaled so a replay after the release call logs the outcome once, not once per attempt.
+      await ctx.run("log-source", () => log(from, to, true), { maxRetryAttempts: 1 });
+      const result = triples === undefined ? { switched: true, source: to } : { switched: true, source: to, triples };
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } finally {
+      // The `watchSwitch` send is the backstop for a kill or a cancel that never reaches this
+      // finally; this path is the fast one on success and on every ordinary failure.
+      await repo.releaseSwitch({ switchId: switchInvocationId });
     }
-    log(from, to, true);
-    const result = triples === undefined ? { switched: true, source: to } : { switched: true, source: to, triples };
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
   },
 );
 

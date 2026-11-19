@@ -6,8 +6,9 @@ import * as restate from "@restatedev/restate-sdk";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
-import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
-import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callService, cancelInvocation, eventually, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll } from "./harness.js";
+import { createKgRepo, type KgRepoEnqueueResult, type KgRepoSwitchAdmission, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
+import type { KgRepoDefinition } from "../../restate/kg-refresh-types.js";
+import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callService, cancelInvocation, eventually, gate, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll, type Gate } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 const MARKER_AGE_WAIT_MS = 1_500;
@@ -34,9 +35,36 @@ const privateCaller = restate.service({
       }),
   },
 });
-async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "hold" | "recordDryRunOutcome" | "recordAdminDryRun", body: unknown): Promise<unknown> {
+async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "hold" | "recordDryRunOutcome" | "recordAdminDryRun" | "acquireSwitch" | "releaseSwitch", body: unknown): Promise<unknown> {
   return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler, body });
 }
+
+async function acquireSwitch(baseUrl: string, slug: string, switchId: string): Promise<unknown> {
+  return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler: "acquireSwitch", body: { switchId } });
+}
+
+async function releaseSwitch(baseUrl: string, slug: string, switchId: string): Promise<unknown> {
+  return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler: "releaseSwitch", body: { switchId } });
+}
+
+// A real, gated switch owner: its handler takes the lock with its own invocation id and then
+// stays live until the test releases the gate. `watchSwitch` can therefore attach to a real
+// invocation instead of racing an immediate "not found" release.
+const switchOwnerGates = new Map<string, Gate>();
+const switchOwnerAdmissions = new Map<string, KgRepoSwitchAdmission>();
+const switchOwner = restate.object({
+  name: "KgRepoSwitchOwner",
+  handlers: {
+    hold: async (ctx: restate.ObjectContext, input: { slug: string; hold: boolean }): Promise<KgRepoSwitchAdmission> => {
+      const admission = await ctx.objectClient<KgRepoDefinition>({ name: "KgRepo" }, input.slug).acquireSwitch({ switchId: ctx.request().id });
+      switchOwnerAdmissions.set(ctx.key, admission);
+      if (input.hold && "acquired" in admission) {
+        await ctx.run("hold", () => switchOwnerGates.get(ctx.key)!.wait());
+      }
+      return admission;
+    },
+  },
+});
 
 describe("KgRepo durable single-flight lock", () => {
   const runSends: RunSend[] = [];
@@ -63,7 +91,7 @@ describe("KgRepo durable single-flight lock", () => {
 
   let envs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([kgRepo, fakeKgRefresh, privateCaller]);
+    envs = await startVariants([kgRepo, fakeKgRefresh, privateCaller, switchOwner]);
   }, 60_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -178,6 +206,72 @@ describe("KgRepo durable single-flight lock", () => {
     30_000,
   );
 
+  it.each(VARIANTS.map(([label]) => label))(
+    "S1: a switch acquires the lock, refuses trigger and a second switch, and release lets a refresh in (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+
+      const owner = await startSwitchOwner(env, slug, "S1 switch owner");
+
+      // The same live invocation is admitted again, but a different invocation is refused.
+      expect(await acquireSwitch(env.baseUrl(), slug, owner.invocationId)).toEqual({ acquired: true });
+      expect(await probeSwitch(env, slug)).toEqual({ status: "switch-in-flight" });
+      expect(await trigger(env.baseUrl(), slug)).toMatchObject({ status: "refresh-in-progress" });
+      expect(runSends.length).toBe(before);
+
+      // A release naming another switch leaves it held; a stale refresh release cannot clear it.
+      await releaseSwitch(env.baseUrl(), slug, "not-the-owner");
+      await release(env.baseUrl(), slug, `switch:${owner.invocationId}`);
+      expect(await trigger(env.baseUrl(), slug)).toMatchObject({ status: "refresh-in-progress" });
+      await endSwitchOwner(owner, env, slug);
+      const next = await trigger(env.baseUrl(), slug);
+      expect(next).not.toHaveProperty("status");
+      expect(next).toEqual({ triggerId: expect.any(String) });
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
+    },
+    60_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "S2: a switch is refused while a refresh owns the lock (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const first = await trigger(env.baseUrl(), slug);
+      const triggerId = (first as { triggerId: string }).triggerId;
+      expect(await probeSwitch(env, slug)).toEqual({ status: "refresh-in-flight" });
+      expect((await repoStatus(env.baseUrl(), slug))?.triggerId).toBe(triggerId);
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "S3: a stale switch release cannot clear a newer switch or refresh owner (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+
+      const first = await startSwitchOwner(env, slug, "S3 first switch owner");
+      await endSwitchOwner(first, env, slug);
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
+
+      const second = await startSwitchOwner(env, slug, "S3 second switch owner");
+      // The first owner's watcher release has run; replaying it now must not free the second.
+      await releaseSwitch(env.baseUrl(), slug, first.invocationId);
+      expect(await probeSwitch(env, slug)).toEqual({ status: "switch-in-flight" });
+      expect(await trigger(env.baseUrl(), slug)).toMatchObject({ status: "refresh-in-progress" });
+
+      await endSwitchOwner(second, env, slug);
+      const refresh = await trigger(env.baseUrl(), slug);
+      const triggerId = (refresh as { triggerId: string }).triggerId;
+      await releaseSwitch(env.baseUrl(), slug, first.invocationId);
+      await releaseSwitch(env.baseUrl(), slug, second.invocationId);
+      expect((await repoStatus(env.baseUrl(), slug))?.triggerId).toBe(triggerId);
+    },
+    60_000,
+  );
+
   // ---- AII-730: the PR-check dry-run queue ----
 
   const reportFor = (prNumber: number, sha = `sha-${prNumber}`) => ({ repo: "org/kg-source", prNumber, sha });
@@ -194,6 +288,49 @@ describe("KgRepo durable single-flight lock", () => {
 
   async function repoStatus(baseUrl: string, slug: string) {
     return callObject<{ triggerId: string; startedAt: number; invocationId?: string; pending: string[] } | null>(baseUrl, "KgRepo", slug, "status", {});
+  }
+
+  async function startSwitchOwner(
+    env: RestateEnvironment,
+    slug: string,
+    label: string,
+    hold = true,
+  ): Promise<{ key: string; invocationId: string; watchId: string; gate: Gate; result: Promise<KgRepoSwitchAdmission> }> {
+    const key = `switch-owner-${randomUUID()}`;
+    const ownerGate = gate(label);
+    switchOwnerGates.set(key, ownerGate);
+    const knownWatches = new Set((await switchWatchRows(env, slug)).map((row) => String(row.id)));
+    const result = callObject<KgRepoSwitchAdmission>(env.baseUrl(), "KgRepoSwitchOwner", key, "hold", { slug, hold });
+    const invocationId = await eventually(
+      async () => (await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepoSwitchOwner' AND target_service_key = '${key}' AND target_handler_name = 'hold'`))[0]?.id,
+      (id) => id !== undefined,
+      { label: `switch owner ${label}` },
+    );
+    await eventually(() => switchOwnerAdmissions.get(key), Boolean, { label: `switch owner ${label} to acquire` });
+    const watchId = await eventually(
+      async () => (await switchWatchRows(env, slug)).find((row) => !knownWatches.has(String(row.id))),
+      (row) => row !== undefined,
+      { label: `switch watcher for ${label}` },
+    );
+    return { key, invocationId: String(invocationId), watchId: String(watchId!.id), gate: ownerGate, result };
+  }
+
+  async function probeSwitch(env: RestateEnvironment, slug: string): Promise<KgRepoSwitchAdmission> {
+    return callObject<KgRepoSwitchAdmission>(env.baseUrl(), "KgRepoSwitchOwner", `switch-probe-${randomUUID()}`, "hold", { slug, hold: false });
+  }
+
+  const switchWatchRows = (env: RestateEnvironment, slug: string) =>
+    queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'watchSwitch'`);
+
+  /** Waits for the `releaseSwitch` a `watchSwitch` sent: a barrier on `KgRepo` does not order a send made by another invocation. */
+  async function awaitSwitchReleaseFromWatcher(env: RestateEnvironment, slug: string, watchId: string): Promise<void> {
+    await awaitSentInvocations(env.adminAPIBaseUrl(), env.baseUrl(), { service: "KgRepo", key: slug, handler: "releaseSwitch" }, `invoked_by_id = '${watchId}'`);
+  }
+
+  async function endSwitchOwner(owner: Awaited<ReturnType<typeof startSwitchOwner>>, env: RestateEnvironment, slug: string): Promise<void> {
+    owner.gate.release();
+    expect(await owner.result).toEqual({ acquired: true });
+    await awaitSwitchReleaseFromWatcher(env, slug, owner.watchId);
   }
 
   it.each(VARIANTS.map(([label]) => label))(
