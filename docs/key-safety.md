@@ -14,11 +14,10 @@ request and response bodies are journaled.
 
 The Stardog Run token is the one non-model-account reference that
 `model_protected_secrets` accepts, at `kg-store:stardog-run-token`. `POST /api/kg/stardog`
-writes it. Two consumers read it: the KG sidecar child environment, and the orchestrator's
-Stardog client (`src/stardog-client.ts`), which uses it to sign in for count queries. The
-admin page shows `tokenSet`, never the value, and the reference has no `KeyBinding`
-destination. The constant lives in `src/kg-secret-refs.ts`; [kg-sidecar.md](kg-sidecar.md)
-covers the stored values and how the token reaches the sidecar.
+writes it. Only the KG sidecar child environment reads the token, as
+`KG_STARDOG_RUN_TOKEN`. The admin page shows `tokenSet`, never the value, and the reference
+has no `KeyBinding` destination. The constant lives in `src/kg-secret-refs.ts`;
+[kg-sidecar.md](kg-sidecar.md) covers the stored values and how the token reaches the sidecar.
 
 ## Storage and handlers
 
