@@ -92,9 +92,9 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
   // throws, and the caller releases the reservation it holds.
   const managedRuntime = getModelAuthRuntime(config);
   let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
-  if (isManagedProject(issue.scopeKey, dispatchId)) {
+  if (issue.issueModels !== undefined || isManagedProject(issue.scopeKey, dispatchId)) {
     const decision = await prepareManagedDispatch(
-      { dispatchId, projectKey: issue.scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.planningWorkflowFile },
+      { dispatchId, projectKey: issue.scopeKey, issueModels: issue.issueModels, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.planningWorkflowFile },
       managedRuntime,
     );
     console.log(`[poll] Managed planning dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
@@ -419,7 +419,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
     return { outcome: "rejected", executionMode: execPath };
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && issue.issueModels === undefined && !isManagedProject(issue.scopeKey)) {
     console.error(
       `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set${refused("model.credentials-adopted")}`,
     );

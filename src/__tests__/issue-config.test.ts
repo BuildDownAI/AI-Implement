@@ -96,3 +96,24 @@ describe("parseIssueConfig — warn ladder", () => {
     expect(warn).toHaveBeenCalledOnce();
   });
 });
+
+describe("per-issue stage models", () => {
+  it("reads several stage selections alongside grouping and strips the config", () => {
+    const parsed = parseIssueConfig("Spec.\n\n" + block("models:", "  implementation: large", "  review: small",
+      "feature_branch:", "  mode: multi-issue"));
+    expect(parsed).toEqual({ description: "Spec.", config: {
+      featureBranch: { mode: "multi-issue" }, issueModels: { implementation: "large", review: "small" },
+    } });
+  });
+
+  it("refuses a models-bearing block when another key contains invalid YAML", () => {
+    expect(parseIssueConfig(block("models: { review: specialist }", "feature_branch: [unclosed")).config.issueModels).toBeNull();
+    expect(parseIssueConfig(block("models: { review: specialist }", "feature_branch: wrong-shape")).config.issueModels)
+      .toEqual({ review: "specialist" });
+  });
+
+  it.each(["{}", "[]", "{ deploy: large }", "{ review: 1 }", "{ review: '' }", "[unclosed"])(
+    "marks invalid explicit models for dispatch refusal (%s)", value => {
+      expect(parseIssueConfig(block("models: " + value)).config.issueModels).toBeNull();
+    });
+});

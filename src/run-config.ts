@@ -325,7 +325,7 @@ export function validateResolvedAgentSnapshot(value: unknown): ResolvedAgentSnap
     snapshotKeys(src, STAGE_SELECTION_FIELDS, srp);
     const fieldSources = {} as Record<StageSelectionField, FieldSource>;
     for (const field of STAGE_SELECTION_FIELDS) {
-      fieldSources[field] = snapshotEnum(src[field], FIELD_SOURCES, `${srp}.${field}`);
+      fieldSources[field] = snapshotEnum(src[field], field === "model" ? [...FIELD_SOURCES, "issue"] as const : FIELD_SOURCES, `${srp}.${field}`);
     }
     const pp = `.profiles.${stage}`;
     const prof = snapshotObject(profilesIn[stage], pp);
