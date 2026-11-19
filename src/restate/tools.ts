@@ -1896,9 +1896,14 @@ function effectiveKgGraphSource(deps: KgGraphSourceToolDeps): KgGraphSource {
   return (deps.effectiveSource ?? (() => (isRemoteKgStore() ? "stardog_run" : "sidecar")))();
 }
 
-function kgGraphSourceError(error: string): ToolResponse {
+function kgGraphSourceError(error: string, message?: string): ToolResponse {
   // Not an `isError`: the shape is the contract, and a caller must read `switched` either way.
-  return { content: [{ type: "text", text: JSON.stringify({ switched: false, error }) }] };
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify(message === undefined ? { switched: false, error } : { switched: false, error, message }),
+    }],
+  };
 }
 
 export const setKgGraphSourceTool = tool(
@@ -1916,9 +1921,9 @@ export const setKgGraphSourceTool = tool(
     // Journaled so a replay logs the state the first attempt saw, not the saved row.
     const from = await ctx.run("read-source", () => effectiveKgGraphSource(deps), { maxRetryAttempts: 1 });
     const log = deps.log ?? ((f: KgGraphSource, t: KgGraphSource, ok: boolean) => console.log(`[kg] graph source ${f} -> ${t}: ${ok ? "ok" : "failed"}`));
-    const fail = (error: string): ToolResponse => {
+    const fail = (error: string, message?: string): ToolResponse => {
       log(from, to, false);
-      return kgGraphSourceError(error);
+      return kgGraphSourceError(error, message);
     };
 
     // Refuse while the exclusive refresh lock is held. The status read is shared, so it
@@ -1952,7 +1957,17 @@ export const setKgGraphSourceTool = tool(
     }
 
     await ctx.run("save", () => deps.saveGraphSource(to), { maxRetryAttempts: 1 });
-    await ctx.run("restart", () => deps.restartSidecar(), { maxRetryAttempts: 1 });
+    try {
+      await ctx.run("restart", () => deps.restartSidecar(), { maxRetryAttempts: 1 });
+    } catch (err) {
+      // A suspended invocation unwinds so Restate can resume it; any other failure means the
+      // restart step could not prove a serving sidecar. The save already ran, so say so.
+      if (restate.internal.isSuspendedError(err)) throw err;
+      return fail(
+        "sidecar-restart-failed",
+        "the source row was already saved, but the sidecar did not come up; retry the switch or restart the orchestrator",
+      );
+    }
     log(from, to, true);
     const result = triples === undefined ? { switched: true, source: to } : { switched: true, source: to, triples };
     return { content: [{ type: "text", text: JSON.stringify(result) }] };

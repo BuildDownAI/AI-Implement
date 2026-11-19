@@ -2777,6 +2777,27 @@ describe("set_kg_graph_source (AII-1974)", () => {
     expect(runCalls).toEqual([]);
   });
 
+  it("a restart that cannot prove a serving sidecar returns sidecar-restart-failed", async () => {
+    const runCalls: RunCall[] = [];
+    const logs: string[] = [];
+    setKgGraphSourceToolDeps({
+      countTriples: async () => 7,
+      saveGraphSource: () => {},
+      restartSidecar: async () => { throw new Error("sidecar restart left KG_SIDECAR_URL unset"); },
+      sidecarGraphPresent: () => true,
+      testPauseMs: 0,
+      log: (from, to, ok) => { logs.push(`[kg] graph source ${from} -> ${to}: ${ok ? "ok" : "failed"}`); },
+    });
+    const ctx = { ...fakeContext("set_kg_graph_source", runCalls), objectClient: () => ({ status: async () => null }) } as unknown as restate.Context;
+    const result = await setKgGraphSourceTool(ctx, { caller: admin, args: { source: "stardog_run" } });
+    expect(parse(result)).toMatchObject({ switched: false, error: "sidecar-restart-failed" });
+    expect(parse(result).message).toContain("source row was already saved");
+    expect(result.isError).not.toBe(true);
+    // The save ran before the restart failed; only the restart step's logged result is absent.
+    expect(runCalls.map((c) => c.name)).toEqual(["read-source", "stardog-test", "save"]);
+    expect(logs).toEqual(["[kg] graph source sidecar -> stardog_run: failed"]);
+  });
+
   it("a refused Stardog test changes nothing and returns switched:false", async () => {
     const runCalls: RunCall[] = [];
     const { ctx, restarts } = stage({

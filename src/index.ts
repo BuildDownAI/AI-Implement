@@ -4229,15 +4229,25 @@ export function createKgGraphSourceToolDeps(opts: {
     saveGraphSource: (source: KgGraphSource) => setKgGraphSource(source),
     restartSidecar: async () => {
       await opts.sidecar.restart();
+      // KgSidecar.restart() resolves even when the sidecar never became ready, leaving the
+      // URL unset. A switch that reports success there would leave every kg_* call down.
+      const sidecarUrl = process.env.KG_SIDECAR_URL || null;
+      if (sidecarUrl === null) throw new Error("sidecar restart left KG_SIDECAR_URL unset");
       const current = getKgMemoryProvider();
       const provider = current instanceof SidecarMemoryProvider
         ? current
-        : resolveMemoryProvider(process.env.KG_SIDECAR_URL || null, opts.memoryProviderId);
-      if (provider === null) return;
+        : resolveMemoryProvider(sidecarUrl, opts.memoryProviderId);
+      if (provider === null) throw new Error("sidecar restart installed no memory provider");
       if (provider !== current) setKgMemoryProvider(provider);
       if (provider instanceof SidecarMemoryProvider) {
+        // The restart runs only after the Stardog test passed, so an error cached against the
+        // store that test just reached is stale. Clear it before the probe reads it (no query).
+        // A switch back to the local graph clears it in probe() instead.
+        if (isRemoteKgStore()) provider.clearStoreError();
         // list-only for a remote store: the restart must not bill another store query.
-        await probeWithTimeout(provider, undefined, isRemoteKgStore() ? "list-only" : "full");
+        const health = await probeWithTimeout(provider, undefined, isRemoteKgStore() ? "list-only" : "full");
+        if (!health.reachable) throw new Error("sidecar restart probe found the sidecar unreachable");
+        if (!health.toolsListed) throw new Error("sidecar restart probe listed no kg_* tools");
       }
     },
     sidecarGraphPresent: () => !existsSync(join(opts.kgDir ?? KG_DIR, ".base-only")),

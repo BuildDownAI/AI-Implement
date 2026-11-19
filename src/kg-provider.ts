@@ -214,6 +214,15 @@ export class SidecarMemoryProvider implements MemoryProvider {
   // A list-only recovery proves transport health, not store health.
   private storeError: string | null = null;
 
+  /**
+   * Drops a cached remote-store error (AII-1974). Called after a tested switch to
+   * Stardog: the old error describes the store the test just proved reachable, so a
+   * following list-only probe must not carry it onto `GET /`. Sends no Stardog query.
+   */
+  clearStoreError(): void {
+    this.storeError = null;
+  }
+
   constructor(
     private readonly kgSidecarUrl: string,
     private readonly resolveServedNamespace: () => Promise<string | null> = getServedNamespace,

@@ -102,7 +102,8 @@ environment above seeds them on first boot. `kg_graph_source` defaults to
 `sidecar`; the non-secret rows are
 `kg_stardog_db`, `kg_stardog_run_endpoint`, `kg_stardog_run_console`, and
 `kg_stardog_run_platform`. The import platform defaults to
-`https://app.stardog.run`, distinct from the console host. Namespace and graph
+`https://app.stardog.run`, distinct from the console host; an empty
+`kg_stardog_run_console` uses `https://console.stardog.run`. Namespace and graph
 name use the shared `kg_namespace` and `kg_graph_name` rows. Names accept letters,
 digits, underscores and hyphens, beginning with a letter or digit; namespaces and
 endpoint/console/platform values must be absolute HTTP(S) URLs without userinfo.
@@ -127,8 +128,12 @@ The switch is a Restate handler, so a client that gives up at its own timeout mu
 repeat the call with the same `Idempotency-Key`; the repeat attaches to the first
 invocation instead of testing again. Restarting starts a sidecar that did not start
 at boot and installs a probed provider, so `/mcp` lists the `kg_*` tools again
-without an orchestrator restart. Switching back to `sidecar` clears the recorded
-Stardog error, and `GET /` reports `sidecar.lastError: null`.
+without an orchestrator restart. A switch whose restart cannot prove a serving
+sidecar answers `{ switched: false, error: "sidecar-restart-failed", message }`
+and logs `failed`; the row was saved before the restart, so `message` says so and
+there is nothing to undo. A tested switch to `stardog_run` and a switch back to
+`sidecar` both clear a recorded Stardog error, and `GET /` reports
+`sidecar.lastError: null`.
 
 Values are set without a refresh rail: `GET`/`POST /api/settings` carry the
 non-secret fields (`kg_stardog_*`, `stardogTokenSet`, the effective `kgGraphSource`

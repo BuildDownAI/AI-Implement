@@ -3161,12 +3161,15 @@ async function handlePostStardogToken(req: http.IncomingMessage, res: http.Serve
     json(res, 400, { error: "Invalid request body" });
     return;
   }
-  if (typeof body.token !== "string" || body.token.length === 0) {
+  // A pasted token often carries a trailing newline; store the trimmed value so the
+  // console exchange is not sent a bearer with whitespace in it.
+  const token = typeof body.token === "string" ? body.token.trim() : "";
+  if (token.length === 0) {
     json(res, 400, { error: "token must be a nonempty string" });
     return;
   }
   try {
-    setStardogValues({ token: body.token });
+    setStardogValues({ token });
   } catch (err) {
     // setStardogValues never puts the supplied value in its error.
     json(res, 400, { error: err instanceof Error ? err.message : "Invalid Stardog token" });

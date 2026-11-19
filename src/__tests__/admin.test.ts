@@ -188,6 +188,7 @@ const loaders = {
   dispatchBreaker: () => import("../dispatch-breaker.js"),
   dispatchAdmission: () => import("../dispatch-admission.js"),
   orchestratorSettings: () => import("../orchestrator-settings.js"),
+  kgGraphSource: () => import("../kg-graph-source.js"),
   filesystemProvider: () => import("../providers/filesystem.js"),
   deployHold: () => import("../deploy-hold.js"),
   deployPolicy: () => import("../deploy-policy.js"),
@@ -2666,10 +2667,19 @@ describe("admin settings", () => {
       expect(JSON.stringify(settings)).not.toContain(TOKEN);
     });
 
+    it("POST /api/kg/stardog trims a trailing newline before storing the token", async () => {
+      const token = await login("secret");
+      const res = await postStardog(token, { token: `${TOKEN}\n` });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ tokenSet: true });
+      expect(res.body).not.toContain(TOKEN);
+      expect(modules.kgGraphSource.getStardogRunToken()).toBe(TOKEN);
+    });
+
     it("POST /api/kg/stardog answers 400 for an empty token and does not clear a stored one", async () => {
       const token = await login("secret");
       await postStardog(token, { token: TOKEN });
-      for (const body of [{ token: "" }, {}, { token: 5 }]) {
+      for (const body of [{ token: "" }, { token: " \n\t " }, {}, { token: 5 }]) {
         const res = await postStardog(token, body);
         expect(res.statusCode).toBe(400);
         expect(res.body).not.toContain(TOKEN);
