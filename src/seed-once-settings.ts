@@ -7,7 +7,13 @@
  * which many tests mock in part; neither of those modules loads the other.
  */
 
-import { KG_GRAPH_SOURCE_SETTING_KEY, KG_NAMESPACE_SETTING_KEY, setStardogValues, STARDOG_RUN_TOKEN_REF } from "./kg-graph-source.js";
+import {
+  KG_GRAPH_SOURCE_SETTING_KEY,
+  KG_NAMESPACE_SETTING_KEY,
+  KG_STARDOG_RUN_TOKEN_HANDLED_SETTING_KEY,
+  setStardogValues,
+  STARDOG_RUN_TOKEN_REF,
+} from "./kg-graph-source.js";
 import { getDb } from "./dedup.js";
 import {
   KG_BASE_REPO_KEY,
@@ -70,16 +76,23 @@ export const SEED_ONCE_SETTINGS: readonly SeedOnceSetting[] = [
   },
 ];
 
-/** Writes each `SEED_ONCE_SETTINGS` row from `env` where none exists yet. Call once at boot, after `initSettingsTable()`. */
+/**
+ * Writes each `SEED_ONCE_SETTINGS` row from `env` where none exists yet. Call once at boot, after
+ * `initSettingsTable()`. A KG save or clear writes the row even when the saved value is empty, so the
+ * row's presence records that the value is handled and a later boot never restores the environment value.
+ * The token has no setting row, so a successful store or clear writes its non-secret marker instead; a
+ * failed store writes neither, leaving the next boot free to retry.
+ */
 export function seedSettingsFromEnv(env: Readonly<Record<string, string | undefined>> = process.env): void {
   const db = getDb();
   if (env.KG_STARDOG_RUN_TOKEN &&
+      !db.prepare("SELECT 1 FROM settings WHERE key = ?").get(KG_STARDOG_RUN_TOKEN_HANDLED_SETTING_KEY) &&
       !db.prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(STARDOG_RUN_TOKEN_REF)) {
     try {
       setStardogValues({ token: env.KG_STARDOG_RUN_TOKEN });
     } catch {
-      // Keep boot available and leave the row absent so the next boot can retry.
-      // Never log the token or exception text from the secret-storage boundary.
+      // Keep boot available and leave the secret row and its handled marker absent, so the
+      // next boot retries. Never log the token or exception text from the secret-storage boundary.
       console.warn("[settings] KG_STARDOG_RUN_TOKEN could not be stored; check RUNNER_TOKEN_SECRET and retry at next boot");
     }
   }

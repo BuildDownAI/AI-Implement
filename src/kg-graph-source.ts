@@ -5,6 +5,7 @@ import { createModelProtectedSecrets } from "./model-protected-secrets.js";
 export const KG_GRAPH_SOURCE_SETTING_KEY = "kg_graph_source";
 export const KG_NAMESPACE_SETTING_KEY = "kg_namespace";
 export const KG_GRAPH_NAME_SETTING_KEY = "kg_graph_name";
+export const KG_STARDOG_RUN_TOKEN_HANDLED_SETTING_KEY = "kg_stardog_run_token_handled";
 export const STARDOG_RUN_TOKEN_REF = "kg-store:stardog-run-token";
 export const DEFAULT_STARDOG_RUN_PLATFORM = "https://app.stardog.run";
 export type KgGraphSource = "sidecar" | "stardog_run";
@@ -37,8 +38,7 @@ function read(key: string): string {
   return row?.value ?? "";
 }
 function write(key: string, value: string): void {
-  if (value === "") getDb().prepare("DELETE FROM settings WHERE key = ?").run(key);
-  else getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+  getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
 }
 
 export function getKgGraphSource(): KgGraphSource {
@@ -100,6 +100,8 @@ export function setStardogValues(values: StardogValuesUpdate): void {
       const store = createModelProtectedSecrets();
       const result = values.token === "" ? store.delete(STARDOG_RUN_TOKEN_REF) : store.write(STARDOG_RUN_TOKEN_REF, values.token);
       if (!result.ok) throw new Error(`Stardog token storage failed: ${result.code}`);
+      // Also written inside this transaction: a failed store leaves no marker, so boot retries.
+      write(KG_STARDOG_RUN_TOKEN_HANDLED_SETTING_KEY, "1");
     }
     for (const field of Object.keys(keys) as Array<keyof typeof keys>) {
       const value = values[field];
