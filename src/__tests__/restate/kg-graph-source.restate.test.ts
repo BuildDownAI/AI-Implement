@@ -187,6 +187,36 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.restarts).toBe(1);
   });
 
+  it("a switch suspended on a failing Stardog test keeps the lock until it ends (alwaysReplay)", async () => {
+    const env = environments.get("alwaysReplay")!;
+    const retry = gate("the Stardog test's second attempt");
+    setKgGraphSourceToolDeps(kgGraphSourceDeps({
+      countTriples: async () => {
+        fixture.calls += 1;
+        // The first attempt fails, so the engine suspends the invocation and retries the test.
+        if (fixture.calls === 1) throw new Error("Stardog Run count query answered HTTP 503");
+        return retry.wait().then(() => 42);
+      },
+    }));
+
+    const first = switchSource(env, "stardog_run", { "idempotency-key": "switch-suspended-first" });
+    await retry.reached();
+    // The first switch is between attempts; the lock must still be its own, not released by the unwind.
+    const second = await switchSource(env, "stardog_run", { "idempotency-key": "switch-suspended-second" });
+    expect(second.isError).not.toBe(true);
+    expect(resultBody(second)).toEqual({ switched: false, error: "switch-in-flight" });
+    expect(fixture.saves).toEqual([]);
+    expect(fixture.restarts).toBe(0);
+
+    retry.release();
+    expect(resultBody(await first)).toEqual({ switched: true, source: "stardog_run", triples: 42 });
+    expect(fixture.calls).toBe(2);
+    expect(fixture.saves).toEqual(["stardog_run"]);
+    expect(fixture.restarts).toBe(1);
+    // The switch's own end frees the lock; a new refresh is admitted without waiting for `watchSwitch`.
+    expectRefreshAdmitted(await triggerRefresh(env));
+  }, 60_000);
+
   it.each(VARIANTS.map(([label]) => label))("a fake that never passes returns switched:false and runs no effect (%s)", async (label) => {
     const env = environments.get(label)!;
     fixture = newFixture({ tries: ["fail"] });

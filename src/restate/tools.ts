@@ -1969,6 +1969,7 @@ export const setKgGraphSourceTool = tool(
     const admission = await repo.acquireSwitch({ switchId: switchInvocationId });
     if (!("acquired" in admission)) return failLogged(admission.status);
 
+    let suspended = false;
     try {
       if (to === "sidecar" && !deps.sidecarGraphPresent()) return await failLogged("no-sidecar-graph");
 
@@ -2008,10 +2009,14 @@ export const setKgGraphSourceTool = tool(
       await ctx.run("log-source", () => log(from, to, true), { maxRetryAttempts: 1 });
       const result = triples === undefined ? { switched: true, source: to } : { switched: true, source: to, triples };
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (err) {
+      if (restate.internal.isSuspendedError(err)) suspended = true;
+      throw err;
     } finally {
-      // The `watchSwitch` send is the backstop for a kill or a cancel that never reaches this
-      // finally; this path is the fast one on success and on every ordinary failure.
-      await repo.releaseSwitch({ switchId: switchInvocationId });
+      // A suspension is a replay, not an end: the lock stays held, and the invocation releases
+      // it when it resumes and ends. The `watchSwitch` send is the backstop for a kill or a
+      // cancel that never reaches this finally; this path is the fast one otherwise.
+      if (!suspended) await repo.releaseSwitch({ switchId: switchInvocationId });
     }
   },
 );
