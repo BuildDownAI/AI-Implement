@@ -27,7 +27,8 @@ import * as auth from "../../github-app-auth.js";
 import * as runnerTokens from "../../runner-tokens.js";
 import * as managedAuth from "../../managed-dispatch-auth.js";
 import * as admission from "../../dispatch-admission.js";
-import { enqueueCommentGapfill, getCommentGapfillItem } from "../../comment-gapfill-queue.js";
+import * as github from "../../github.js";
+import { enqueueCommentGapfill, enqueueConflictResolution, getCommentGapfillItem } from "../../comment-gapfill-queue.js";
 import { getJobByDispatchId } from "../../log.js";
 import { makeMapping } from "../helpers/builders.js";
 import { makeJob } from "../helpers/builders.js";
@@ -397,6 +398,106 @@ describe("ImplementationRun durable workflow", () => {
     const text = (await Promise.all(rows.map(async row => journalText(await journalEntries(env.adminAPIBaseUrl(), String(row.id)))))).join("\n");
     for (const sentinel of [SECRET_TOKEN, nonce, bootstrap, "executionPolicy", "ephemeral-full-access"]) expect(text).not.toContain(sentinel);
   }, 60_000);
+
+  /** Shared harness for conflict-repair launch scenarios: real gap-fill dependencies, mocked backends. */
+  function gapfillProduction(backend: ImplementationRunInput["backend"]) {
+    vi.spyOn(auth, "getInstallationToken").mockResolvedValue(SECRET_TOKEN);
+    vi.spyOn(auth, "getScopedInstallationToken").mockResolvedValue({ token: SECRET_TOKEN } as Awaited<ReturnType<typeof auth.getScopedInstallationToken>>);
+    vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(false);
+    vi.spyOn(gapfillDrain, "resolveManagedDecision").mockResolvedValue({ kind: "legacy" });
+    vi.spyOn(gapfillDrain, "gapfillAccounting").mockResolvedValue({ trackerKind: "linear", issueUrl: "https://tracker.test/ENG-1" });
+    if (backend === "github-actions") {
+      vi.spyOn(gapfillLaunch, "prepareGhaGapfillLaunch").mockResolvedValue({ contract: "envelope", runnerImage: undefined, inputs: {} });
+    }
+    return createImplementationGapfillDependencies({ config: {
+      githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "https://callback.test", runnerTokenSecret: "secret",
+      anthropicApiKey: "synthetic-key", flySessionsToken: SECRET_TOKEN, flySessionsApp: "sessions", sessionImage: "runner:test", localRunnerImage: "runner:test",
+    } } as ImplementationRunProductionInput, () => makeMapping({ owner: "Org", repo: "repo" }));
+  }
+
+  it.each(labels)("a Fly conflict repair forwards the PR base branch to the launch (%s)", async (label) => {
+    onTestFinished(() => { vi.restoreAllMocks(); });
+    const nonce = "CONFLICT-NONCE";
+    vi.spyOn(runnerTokens, "mintLaunchTokens").mockReturnValue({ runToken: SECRET_TOKEN, runProgressToken: SECRET_TOKEN, runPublicationToken: SECRET_TOKEN });
+    const fly = vi.spyOn(gapfillLaunch, "dispatchFlyGapfill").mockImplementation(async args => {
+      args.onBeforeLaunch({} as never, nonce, "runner:test");
+      return { machine: { id: "fly-gapfill", nonce }, resolvedImage: "runner:test" } as unknown as Awaited<ReturnType<typeof gapfillLaunch.dispatchFlyGapfill>>;
+    });
+    const pr = vi.spyOn(github, "getPullRequestState").mockResolvedValue({ merged: false, state: "open", headRef: "ai-implement/aii-1", headSha: "a".repeat(40), baseRef: "ai-implement/feature/aii-1881" });
+    const production = gapfillProduction("fly-machines");
+    const queueItemId = enqueueConflictResolution({ owner: "Org", repo: "repo", prNumber: 42, featureBranch: "ai-implement/feature/aii-1881" });
+    const w = begin(slow, label, { status: "ended", row: makeJob({ status: "completed" }),
+      reserveImpl: async input => production.reserve(input),
+      releaseImpl: (id, reason) => { admission.releaseByDispatchId(id, reason); },
+      launchImpl: production.launch,
+    }, { backend: "fly-machines", gapFill: { queueItemId, installationId: "123", repository: "Org/repo", prNumber: 42, prDispatchBudget: 5, humanRequested: true } });
+
+    expect(await w.done).toMatchObject({ reason: "finalized" });
+    expect(pr).toHaveBeenCalledExactlyOnceWith(SECRET_TOKEN, "Org", "repo", 42);
+    expect(fly).toHaveBeenCalledTimes(1);
+    expect(fly.mock.calls[0][0]).toMatchObject({ baseBranch: "ai-implement/feature/aii-1881" });
+    expect(getCommentGapfillItem(queueItemId)?.status).toBe("dispatched");
+  }, 60_000);
+
+  it.each(labels)("a normal comment gap-fill does not read the PR or carry a base branch (%s)", async (label) => {
+    onTestFinished(() => { vi.restoreAllMocks(); });
+    const nonce = "NORMAL-NONCE";
+    vi.spyOn(runnerTokens, "mintLaunchTokens").mockReturnValue({ runToken: SECRET_TOKEN, runProgressToken: SECRET_TOKEN, runPublicationToken: SECRET_TOKEN });
+    const fly = vi.spyOn(gapfillLaunch, "dispatchFlyGapfill").mockImplementation(async args => {
+      args.onBeforeLaunch({} as never, nonce, "runner:test");
+      return { machine: { id: "fly-gapfill", nonce }, resolvedImage: "runner:test" } as unknown as Awaited<ReturnType<typeof gapfillLaunch.dispatchFlyGapfill>>;
+    });
+    const pr = vi.spyOn(github, "getPullRequestState");
+    const production = gapfillProduction("fly-machines");
+    const queueItemId = enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 910000 + counter, commenter: "human", instruction: "Fix the review findings" });
+    const w = begin(slow, label, { status: "ended", row: makeJob({ status: "completed" }),
+      reserveImpl: async input => production.reserve(input),
+      releaseImpl: (id, reason) => { admission.releaseByDispatchId(id, reason); },
+      launchImpl: production.launch,
+    }, { backend: "fly-machines", gapFill: { queueItemId, installationId: "123", repository: "Org/repo", prNumber: 42, prDispatchBudget: 5, humanRequested: true } });
+
+    expect(await w.done).toMatchObject({ reason: "finalized" });
+    expect(pr).not.toHaveBeenCalled();
+    expect(fly).toHaveBeenCalledTimes(1);
+    expect(fly.mock.calls[0][0]).not.toHaveProperty("baseBranch");
+  }, 60_000);
+
+  it.each(labels)("a github-actions conflict repair does not read the PR (%s)", async (label) => {
+    onTestFinished(() => { vi.restoreAllMocks(); });
+    vi.spyOn(runnerTokens, "mintLaunchTokens").mockReturnValue({ runToken: SECRET_TOKEN, runProgressToken: SECRET_TOKEN, runPublicationToken: SECRET_TOKEN });
+    const gha = vi.spyOn(gapfillLaunch, "dispatchGhaGapfill").mockResolvedValue({ success: true, status: 200, runId: 4242 });
+    const pr = vi.spyOn(github, "getPullRequestState");
+    const production = gapfillProduction("github-actions");
+    const queueItemId = enqueueConflictResolution({ owner: "Org", repo: "repo", prNumber: 42, featureBranch: "ai-implement/feature/aii-1881" });
+    const w = begin(slow, label, { status: "ended", row: makeJob({ status: "completed" }),
+      reserveImpl: async input => production.reserve(input),
+      releaseImpl: (id, reason) => { admission.releaseByDispatchId(id, reason); },
+      launchImpl: production.launch,
+    }, { backend: "github-actions", gapFill: { queueItemId, installationId: "123", repository: "Org/repo", prNumber: 42, prDispatchBudget: 5, humanRequested: true } });
+
+    expect(await w.done).toMatchObject({ reason: "finalized" });
+    expect(pr).not.toHaveBeenCalled();
+    expect(gha).toHaveBeenCalledTimes(1);
+  }, 60_000);
+
+  it.each(labels.flatMap(label => ([null, "no-base"] as const).map(kind => ({ label, kind }))))(
+    "a conflict repair rejects when the PR read yields $kind ($label)", async ({ label, kind }) => {
+      onTestFinished(() => { vi.restoreAllMocks(); });
+      const fly = vi.spyOn(gapfillLaunch, "dispatchFlyGapfill");
+      const pr = vi.spyOn(github, "getPullRequestState").mockResolvedValue(kind === null ? null : { merged: false, state: "open", headRef: "h", headSha: "a".repeat(40), baseRef: "" });
+      const production = gapfillProduction("fly-machines");
+      const queueItemId = enqueueConflictResolution({ owner: "Org", repo: "repo", prNumber: 42, featureBranch: "ai-implement/feature/aii-1881" });
+      const w = begin(slow, label, { status: "ended", row: makeJob({ status: "completed" }),
+        reserveImpl: async input => production.reserve(input),
+        releaseImpl: (id, reason) => { admission.releaseByDispatchId(id, reason); },
+        launchImpl: production.launch,
+      }, { backend: "fly-machines", gapFill: { queueItemId, installationId: "123", repository: "Org/repo", prNumber: 42, prDispatchBudget: 5, humanRequested: true } });
+
+      expect(await w.done).toMatchObject({ reason: "launch_rejected" });
+      expect(pr).toHaveBeenCalledTimes(1);
+      expect(fly).not.toHaveBeenCalled();
+      expect(getCommentGapfillItem(queueItemId)?.status).toBe("failed");
+    }, 60_000);
 
   it.each(labels)("accepts an empty HTTP report body (%s)", async (label) => {
     const w = begin(slow, label);

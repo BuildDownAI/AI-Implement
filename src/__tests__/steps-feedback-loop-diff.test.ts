@@ -347,3 +347,73 @@ describe("getDiff setup-failure index isolation", () => {
     expect(Buffer.compare(before, after)).toBe(0);
   });
 });
+
+describe("getDiff from the run start commit", () => {
+  let repo: string;
+  let start: string;
+
+  beforeEach(() => {
+    repo = testDir("diff-base");
+    git(repo, ["init", "-q"]);
+    git(repo, ["config", "user.email", "t@t.com"]);
+    git(repo, ["config", "user.name", "t"]);
+    writeFileSync(join(repo, "code.ts"), "export const a = 1;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "seed"]);
+    start = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] }).stdout.toString().trim();
+  });
+
+  it("matches the HEAD diff byte-for-byte when HEAD has not moved", () => {
+    writeFileSync(join(repo, "code.ts"), "export const a = 2;\n");
+    writeFileSync(join(repo, "new.ts"), "export const n = 1;\n");
+    expect(getDiff(repo, start)).toBe(getDiff(repo));
+  });
+
+  it("falls back to HEAD for an empty base", () => {
+    writeFileSync(join(repo, "code.ts"), "export const a = 3;\n");
+    expect(getDiff(repo, "")).toBe(getDiff(repo));
+    expect(getDiff(repo, "   ")).toBe(getDiff(repo));
+  });
+
+  it("includes a plain commit made after the base plus uncommitted and untracked work", () => {
+    writeFileSync(join(repo, "committed.ts"), "export const c = 1;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "agent commit"]);
+    writeFileSync(join(repo, "code.ts"), "export const a = 4;\n");
+    writeFileSync(join(repo, "untracked.ts"), "export const u = 1;\n");
+
+    const diff = getDiff(repo, start);
+    expect(diff).toContain("committed.ts");
+    expect(diff).toContain("export const c = 1");
+    expect(diff).toContain("code.ts");
+    expect(diff).toContain("export const a = 4");
+    expect(diff).toContain("untracked.ts");
+    // HEAD alone would only show the uncommitted work.
+    expect(getDiff(repo)).not.toContain("committed.ts");
+  });
+
+  it("includes the conflict resolution from a two-parent merge commit", () => {
+    git(repo, ["checkout", "-q", "-b", "sibling"]);
+    writeFileSync(join(repo, "code.ts"), "export const a = 1;\nexport const sibling = true;\n");
+    git(repo, ["commit", "-qam", "sibling change"]);
+    git(repo, ["checkout", "-q", "-"]);
+    writeFileSync(join(repo, "code.ts"), "export const a = 1;\nexport const ours = true;\n");
+    git(repo, ["commit", "-qam", "our change"]);
+    spawnSync("git", ["merge", "--no-ff", "--no-commit", "sibling"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+    writeFileSync(join(repo, "code.ts"), "export const a = 1;\nexport const sibling = true;\nexport const ours = true;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "merge sibling"]);
+    const parents = spawnSync("git", ["rev-list", "--parents", "-n", "1", "HEAD"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] }).stdout.toString().trim().split(/\s+/);
+    expect(parents).toHaveLength(3);
+
+    writeFileSync(join(repo, "code.ts"), "export const a = 1;\nexport const sibling = true;\nexport const ours = true;\nexport const afterMerge = true;\n");
+    writeFileSync(join(repo, "untracked.ts"), "export const untracked = true;\n");
+
+    const diff = getDiff(repo, start);
+    expect(diff).toContain("export const sibling = true");
+    expect(diff).toContain("export const ours = true");
+    expect(diff).toContain("export const afterMerge = true");
+    expect(diff).toContain("untracked.ts");
+    expect(diff).toContain("export const untracked = true");
+  });
+});

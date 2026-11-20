@@ -34,7 +34,7 @@ const input = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u",
 
 beforeEach(() => {
   vi.mocked(getMappings).mockReturnValue({});
-  vi.mocked(getPullRequestState).mockResolvedValue({ state: "open", merged: false, headRef: "ai-implement/aii-5-x", headSha: "b" });
+  vi.mocked(getPullRequestState).mockResolvedValue({ state: "open", merged: false, headRef: "ai-implement/aii-5-x", headSha: "b", baseRef: "main" });
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
   vi.mocked(getCommitTime).mockResolvedValue(1000);
   vi.mocked(listOpenReviewFindings).mockReturnValue([]);

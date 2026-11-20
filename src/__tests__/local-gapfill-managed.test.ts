@@ -138,3 +138,11 @@ it("retains review-only in the local envelope", async () => {
   const { decodeRunConfig } = await import("../run-config.js");
   expect(decodeRunConfig(startMock.start.mock.calls[0][0].extraEnv.AI_IMPLEMENT_RUN_CONFIG).reviewOnly).toEqual(reviewOnly);
 });
+
+it("carries a supplied baseBranch and omits it when not given", async () => {
+  const { decodeRunConfig } = await import("../run-config.js");
+  await dispatchLocalGapfill(input({ anthropicApiKey: "k", baseBranch: "ai-implement/feature/eng-7" }));
+  expect(decodeRunConfig(startMock.start.mock.calls.at(-1)![0].extraEnv.AI_IMPLEMENT_RUN_CONFIG).baseBranch).toBe("ai-implement/feature/eng-7");
+  await dispatchLocalGapfill(input({ anthropicApiKey: "k" }));
+  expect(decodeRunConfig(startMock.start.mock.calls.at(-1)![0].extraEnv.AI_IMPLEMENT_RUN_CONFIG)).not.toHaveProperty("baseBranch");
+});

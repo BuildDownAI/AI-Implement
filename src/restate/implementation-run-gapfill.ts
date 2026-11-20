@@ -13,7 +13,7 @@ import { notifyCommentGapfillSkipped, firePrBudgetPark, rollupReviewMode, buildC
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, updateJobStatus, suppressStaleNotifications, setJobMachineId } from "../log.js";
 import { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
-import { postPrComment, listPrComments, defaultFetchSignal, dispatchWorkflow } from "../github.js";
+import { postPrComment, listPrComments, defaultFetchSignal, dispatchWorkflow, getPullRequestState } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill, dispatchFlyGapfill } from "../gapfill-launch.js";
@@ -216,6 +216,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       let reviewOnly: import("../run-config.js").RunConfigV1["reviewOnly"];
       let ghToken: string;
       let mapping: RepoMapping;
+      let baseBranch: string | undefined;
       const issue: { issueId: string; issueIdentifier: string; issueTitle?: string } = { issueId: run.issueId, issueIdentifier: run.issueIdentifier };
       try {
         const target = initialTarget(run);
@@ -279,6 +280,15 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         tokens = config.runnerCallbackBaseUrl && config.runnerTokenSecret ? mintLaunchTokens({ issueId: run.issueId, mappingTeamKey: run.teamKey, phase: "gap-analysis", dispatchId: run.dispatchId,
           repository: gap.repository, ttlSeconds: implementationTtlSeconds(mapping.maxJobMinutes), secret: config.runnerTokenSecret }) : undefined;
         ghToken = run.backend === "github-actions" ? await token(mapping.owner) : await getTargetRepoToken(config, mapping.owner, mapping.repo);
+        // Conflict repair merges the PR's base branch, which the clone step only
+        // fetches when the envelope carries it. Read it here, in the existing
+        // preparation attempt: a missing base fails this try and rejects the launch.
+        if (run.backend !== "github-actions" && item.commenter === CONFLICT_COMMENTER) {
+          const pr = await getPullRequestState(ghToken, item.owner, item.repo, gap.prNumber);
+          const baseRef = pr?.baseRef?.trim();
+          if (!baseRef) throw new Error(`conflict repair: cannot read base branch for PR #${gap.prNumber}`);
+          baseBranch = baseRef;
+        }
         if (run.backend === "github-actions") prepared = await prepareGhaGapfillLaunch({ mapping, issue, item, ghToken, decision, reviewOnly,
           runnerCallbackBaseUrl: config.runnerCallbackBaseUrl, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? "",
           runToken: tokens?.runToken ?? "", runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
@@ -320,7 +330,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
             runName: `gap-fill-${run.dispatchId}`, dispatchId: run.dispatchId,
             runnerCallbackUrl: config.runnerCallbackBaseUrl ?? "", runToken: tokens?.runToken ?? "",
             runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
-            commentInstruction };
+            commentInstruction, ...(baseBranch ? { baseBranch } : {}) };
           if (run.backend === "fly-machines") {
             const result = await dispatchFlyGapfill({ implementationSandbox: decideImplementationSandbox({ protectedLaunch: decision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }), ...common, issue, owner: mapping.owner, repo: mapping.repo,
               issueIdentifier: run.issueIdentifier, scopeKey: run.teamKey, allTeamKeys: Object.keys(getMappings()),
