@@ -2,8 +2,9 @@
  * `SetupChecks` — a Virtual Object, one key (`orchestrator`), that runs the setup-check list inside the orchestrator
  * and keeps the last run (AII-1538). `run` (exclusive) runs every check in one `ctx.run` step and stores the result, so
  * a second run queues behind the first. `runProject` (exclusive) runs one project's checks and replaces only that project's rows
- * in the stored run, or runs every check when an orchestrator-wide check its rows depend on fails (AII-1543). `runOrchestratorWide` (exclusive) runs every check
- * whose rows no one project owns and replaces only those rows (AII-1544). `get` (shared) answers the stored run, or null before the first.
+ * in the stored run (AII-1543). `runOrchestratorWide` (exclusive) runs every check whose rows no one project owns and replaces only those rows (AII-1544).
+ * Every check runs instead when nothing is stored, or when a partial run finds a check every project's rows wait on changed (AII-1543, AII-1544).
+ * `get` (shared) answers the stored run, or null before the first.
  * The admin route starts `run` without waiting for it, and reads the run's progress in this process meanwhile (AII-1541).
  * The poll's change detector sends whichever of the three a saved change needs (AII-1544). `recheck` (exclusive) re-runs one check a runtime
  * failure names, with the checks its rows wait on, and replaces their rows, at most once an hour for the same rows (AII-1544).
@@ -17,7 +18,7 @@ import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
 import { whenDeployHoldClears } from "../deploy-hold.js";
-import { cacheSetupCheckRun, claimSetupCheckRun, createBootSetupChecks, createSetupCheckContext, endSetupCheckProgress, getCachedSetupCheckRun, mergeSetupCheckRun, projectRunNeedsFullRun, recheckHeld, recheckScope, recheckWaitedOn, runOrchestratorWideSetupChecks, runProjectSetupChecks, runSetupChecks, runSetupChecksBeforeRestate, runSetupChecksInScope, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckContext, type SetupCheckScope, type SetupCheckRun } from "../setup-checks/index.js";
+import { cacheSetupCheckRun, claimSetupCheckRun, createBootSetupChecks, createSetupCheckContext, endSetupCheckProgress, getCachedSetupCheckRun, mergeSetupCheckRun, partialRunNeedsFullRun, recheckHeld, recheckScope, recheckWaitedOn, runOrchestratorWideSetupChecks, runProjectSetupChecks, runSetupChecks, runSetupChecksBeforeRestate, runSetupChecksInScope, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckContext, type SetupCheckScope, type SetupCheckRun } from "../setup-checks/index.js";
 import { recheckKey, rememberRecheck, type SetupCheckRecheck } from "../setup-checks/recheck.js";
 import type { SetupCheckRunKind } from "../setup-checks/change-detector.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -26,7 +27,7 @@ import { getRestateStatus, restateCanServe, restateCanStartWork } from "./status
 export interface SetupChecksDeps {
   /** Runs every check and answers the run. Called inside `run`'s one `ctx.run` step. */
   runChecks(): Promise<SetupCheckRun>;
-  /** Runs every check without showing its progress, for a project run that found an orchestrator-wide check failing. Called inside `runProject`. */
+  /** Runs every check without showing its progress, for a partial run the stored run cannot take. Called inside every handler that stores a partial run. */
   runChecksQuietly(): Promise<SetupCheckRun>;
   /** Runs one saved project's checks alone, or answers null when no project has that key. Called inside `runProject`'s one `ctx.run` step. */
   runProjectChecks(project: string): Promise<SetupCheckRun | null>;
@@ -62,12 +63,12 @@ const WAITED_RUN_TIMEOUT_MS = 60_000;
 
 export function createSetupChecks(deps: SetupChecksDeps) {
   /**
-   * Merges a partial run into the stored run and keeps the result, in this process and in the object. With nothing stored, a partial run
-   * would stand for every check, so every check runs instead, in a step of its own, and that run is kept whole.
+   * Merges a partial run into the stored run and keeps the result, in this process and in the object. A partial run the stored run
+   * cannot take (`partialRunNeedsFullRun`) is answered by every check instead, run in a step of its own and kept whole.
    */
   async function storeMerged(ctx: ObjectContext, run: SetupCheckRun): Promise<SetupCheckRun> {
     const stored = (await ctx.get<SetupCheckRun>(LAST_RUN)) ?? null;
-    const merged = stored === null && run.scope !== undefined
+    const merged = partialRunNeedsFullRun(run, stored)
       ? await ctx.run("run checks", () => deps.runChecksQuietly())
       : mergeSetupCheckRun(stored, run, await ctx.run("mapped projects", () => deps.mappedProjects()));
     cacheSetupCheckRun(merged);
@@ -92,8 +93,7 @@ export function createSetupChecks(deps: SetupChecksDeps) {
       runProject: restate.handlers.object.exclusive(async (ctx: ObjectContext, { project }: { project: string }): Promise<SetupCheckRun | null> => {
         const run = await ctx.run("run project checks", () => deps.runProjectChecks(project));
         if (run === null) return null;
-        // The full run leaves the progress record alone, which a start may hold for a run queued behind this one.
-        if (projectRunNeedsFullRun(run, (await ctx.get<SetupCheckRun>(LAST_RUN)) ?? null)) return storeMerged(ctx, await ctx.run("run checks", () => deps.runChecksQuietly()));
+        // A full run it is answered by leaves the progress record alone, which a start may hold for a run queued behind this one.
         return storeMerged(ctx, run);
       }),
       // Exclusive like the others, so it never merges into a run another handler is about to replace.

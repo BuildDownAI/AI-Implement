@@ -219,6 +219,8 @@ export async function runSetupChecks(
 
 /** The orchestrator-wide checks every project's rows depend on, run beside them. */
 const PROJECT_RUN_DEPENDENCIES: readonly SetupCheckId[] = ["tracker.provider", "github.app-identity", "github.clock"];
+/** The orchestrator-wide checks per-project rows wait on (`waitsOn`), so a change to one reaches every project that shares it. */
+const SHARED_DEPENDENCIES: readonly SetupCheckId[] = ["env.github-app", "tracker.provider", "github.app-identity", "tracker.linear.credentials", "tracker.jira.credentials"];
 /** The checks no project passes before its first workflow sync, which a run before the save leaves out. */
 export const BEFORE_FIRST_SYNC: readonly SetupCheckId[] = ["github.workflow-default-branch", "github.workflow-mapping-branch"];
 /** The credentials check of each ticketing system that has one. */
@@ -367,13 +369,15 @@ export function createBootSetupChecks(deps: {
 }
 
 /**
- * Whether a project run found an orchestrator-wide check its rows depend on failing or unread, where the stored run does not show it so.
- * Such a fault reaches every project that shares the check, whose stored rows a project run cannot correct, so the run is answered by
- * a full run instead; once a full run has stored the fault on every project, later project runs merge as they are.
+ * Whether a partial run is answered by a full run instead: nothing is stored, so it would stand for every check, or it found a check
+ * every project's rows wait on in a state the stored run does not show, failing or recovered. Such a change reaches every project that
+ * shares the check, whose stored rows a partial run cannot correct; once a full run has stored it, later partial runs merge as they are.
  */
-export function projectRunNeedsFullRun(run: SetupCheckRun, stored: SetupCheckRun | null): boolean {
-  return run.results.some((row) => row.project === undefined && (row.state === "fail" || row.state === "cannot-verify")
-    && !stored?.results.some((kept) => kept.id === row.id && kept.project === undefined && kept.state === row.state));
+export function partialRunNeedsFullRun(run: SetupCheckRun, stored: SetupCheckRun | null): boolean {
+  if (run.scope === undefined) return false;
+  if (stored === null) return true;
+  return run.results.some((row) => row.project === undefined && SHARED_DEPENDENCIES.includes(row.id)
+    && !stored.results.some((kept) => kept.id === row.id && kept.project === undefined && kept.state === row.state));
 }
 
 function inScope(row: SetupCheckResult, scope: SetupCheckScope): boolean {
