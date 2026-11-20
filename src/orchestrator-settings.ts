@@ -12,19 +12,23 @@ const FLY_SESSIONS_REGION_KEY = "fly_sessions_region";
 const RETRY_POLICY_KEY = "retry_policy";
 const KG_REFRESH_REPORT_ISSUE_KEY = "kg_refresh_report_issue";
 export const KG_BASE_REPO_KEY = "kg_base_repo";
+export const KG_CODE_REPO_KEY = "kg_code_repo";
+export const KG_GRAPH_LABEL_KEY = "kg_graph_label";
 export const LINEAR_PICKUP_LABEL_KEY = "linear_pickup_label";
 export const RUNNER_IMAGE_ALLOWED_PREFIXES_KEY = "runner_image_allowed_prefixes";
 
 /** Default Linear pickup label when no `linear_pickup_label` row exists (AII-694). */
 export const DEFAULT_LINEAR_PICKUP_LABEL = "AI-Implement";
 
-type SettingKey = "flySessionsApp" | "flySessionsRegion" | "kgRefreshReportIssue" | "kgBaseRepo" | "linearPickupLabel" | "runnerImageAllowedPrefixes";
+type SettingKey = "flySessionsApp" | "flySessionsRegion" | "kgRefreshReportIssue" | "kgBaseRepo" | "kgCodeRepo" | "kgGraphLabel" | "linearPickupLabel" | "runnerImageAllowedPrefixes";
 
 const SETTING_KEYS: Record<SettingKey, string> = {
   flySessionsApp: FLY_SESSIONS_APP_KEY,
   flySessionsRegion: FLY_SESSIONS_REGION_KEY,
   kgRefreshReportIssue: KG_REFRESH_REPORT_ISSUE_KEY,
   kgBaseRepo: KG_BASE_REPO_KEY,
+  kgCodeRepo: KG_CODE_REPO_KEY,
+  kgGraphLabel: KG_GRAPH_LABEL_KEY,
   linearPickupLabel: LINEAR_PICKUP_LABEL_KEY,
   runnerImageAllowedPrefixes: RUNNER_IMAGE_ALLOWED_PREFIXES_KEY,
 };
@@ -36,6 +40,10 @@ export interface OrchestratorSettings {
   kgRefreshReportIssue: string | null;
   /** owner/repo of the base template repo the KG PR-triggered dry-run check watches (AII-633). Seeded once from KG_BASE_REPO. */
   kgBaseRepo: string | null;
+  /** owner/name of the KG code repo shown with the graph details (AII-1991). No environment seed. */
+  kgCodeRepo: string | null;
+  /** Human-readable label for the graph (AII-1991). No environment seed. */
+  kgGraphLabel: string | null;
   /** Linear label the provider polls for pickup (AII-694). Seeded once from LINEAR_PICKUP_LABEL. */
   linearPickupLabel: string | null;
   /** Comma-separated extra trusted runner-image prefixes (AII-1321). Seeded once from RUNNER_IMAGE_ALLOWED_PREFIXES. */
@@ -54,6 +62,8 @@ export function getOrchestratorSettings(): OrchestratorSettings {
       flySessionsRegion: get(FLY_SESSIONS_REGION_KEY),
       kgRefreshReportIssue: get(KG_REFRESH_REPORT_ISSUE_KEY),
       kgBaseRepo: get(KG_BASE_REPO_KEY),
+      kgCodeRepo: get(KG_CODE_REPO_KEY),
+      kgGraphLabel: get(KG_GRAPH_LABEL_KEY),
       linearPickupLabel: get(LINEAR_PICKUP_LABEL_KEY),
       runnerImageAllowedPrefixes: get(RUNNER_IMAGE_ALLOWED_PREFIXES_KEY),
     };
@@ -63,6 +73,8 @@ export function getOrchestratorSettings(): OrchestratorSettings {
       flySessionsRegion: null,
       kgRefreshReportIssue: null,
       kgBaseRepo: null,
+      kgCodeRepo: null,
+      kgGraphLabel: null,
       linearPickupLabel: null,
       runnerImageAllowedPrefixes: null,
     };

@@ -32,6 +32,8 @@ describe("getOrchestratorSettings", () => {
       flySessionsRegion: null,
       kgRefreshReportIssue: null,
       kgBaseRepo: null,
+      kgCodeRepo: null,
+      kgGraphLabel: null,
       linearPickupLabel: null,
       runnerImageAllowedPrefixes: null,
     });
@@ -44,6 +46,8 @@ describe("getOrchestratorSettings", () => {
       flySessionsRegion: null,
       kgRefreshReportIssue: null,
       kgBaseRepo: null,
+      kgCodeRepo: null,
+      kgGraphLabel: null,
       linearPickupLabel: null,
       runnerImageAllowedPrefixes: null,
     });
@@ -76,6 +80,13 @@ describe("setOrchestratorSetting", () => {
   it("stores and retrieves kgBaseRepo", () => {
     settings.setOrchestratorSetting("kgBaseRepo", "BuildDownAI/bd-knowledge-graph-base");
     expect(settings.getOrchestratorSettings().kgBaseRepo).toBe("BuildDownAI/bd-knowledge-graph-base");
+  });
+
+  it("stores and retrieves the graph detail rows", () => {
+    settings.setOrchestratorSetting("kgCodeRepo", "BuildDownAI/bd-knowledge-graph");
+    settings.setOrchestratorSetting("kgGraphLabel", "Builddown KG");
+    expect(settings.getOrchestratorSettings().kgCodeRepo).toBe("BuildDownAI/bd-knowledge-graph");
+    expect(settings.getOrchestratorSettings().kgGraphLabel).toBe("Builddown KG");
   });
 });
 

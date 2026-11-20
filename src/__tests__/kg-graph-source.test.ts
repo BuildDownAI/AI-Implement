@@ -73,7 +73,7 @@ describe("KG graph source", () => {
     kg.setStardogValues({ token: "stored-token" });
     vi.stubEnv("RUNNER_TOKEN_SECRET", "rotated-key");
     expect(kg.getStardogValues().tokenSet).toBe(false);
-    expect(kg.stardogChildEnv().KG_STARDOG_RUN_TOKEN).toBe("");
+    expect(kg.stardogChildEnv()).not.toHaveProperty("KG_STARDOG_RUN_TOKEN");
     vi.stubEnv("RUNNER_TOKEN_SECRET", undefined);
     expect(kg.getStardogValues().tokenSet).toBe(false);
     vi.stubEnv("RUNNER_TOKEN_SECRET", "kg-test-encryption-key");

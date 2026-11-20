@@ -772,6 +772,98 @@ describe("kg current run card (AII-1260)", () => {
   });
 });
 
+describe("kg graph details card (AII-1991)", () => {
+  const settings = {
+    kgGraphSource: "sidecar",
+    kg_stardog_db: "",
+    kg_stardog_run_endpoint: "",
+    kg_stardog_run_console: "",
+    kg_stardog_run_platform: "https://app.stardog.run",
+    kg_namespace: "https://kg.builddown.dev/",
+    kg_graph_name: "builddown-kg",
+    kg_code_repo: "BuildDownAI/bd-knowledge-graph",
+    kg_graph_label: "Builddown KG",
+    stardogTokenSet: false,
+    kgCustomerRepo: false,
+  };
+
+  function mount(opts: { settings?: Record<string, unknown>; save?: { status: number; body: unknown } } = {}) {
+    const calls: { url: string; body: unknown }[] = [];
+    const api = async (url: string, init?: { method?: string; body?: string }) => {
+      calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (url === "/api/settings") {
+        if (init?.method === "POST") {
+          const r = opts.save ?? { status: 200, body: {} };
+          return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
+        }
+        return { ok: true, status: 200, json: async () => ({ ...settings, ...opts.settings }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const { win, doc } = mountAdminPage({ html: kgPipelinesHtml, script: kgPipelinesScript, route: "kg-pipelines", api });
+    const el = (id: string) => doc.getElementById(id) as HTMLInputElement;
+    return { win, el, calls };
+  }
+
+  it("declares the card and its four fields with the specified placeholders", () => {
+    for (const id of ["kg-graph-details-card", "kg-namespace", "kg-graph-name", "kg-code-repo", "kg-graph-label", "btn-kg-graph-details-save"]) {
+      expect(kgPipelinesHtml).toContain(`id="${id}"`);
+    }
+    expect(kgPipelinesHtml).toContain('placeholder="https://kg.builddown.dev/"');
+    expect(kgPipelinesHtml).toContain('placeholder="builddown-kg"');
+    expect(kgPipelinesHtml).toContain("The sidecar reads these values when it starts. Select the graph source again, or restart the orchestrator, to apply a change.");
+    expect(kgPipelinesHtml).toContain("Graph details");
+  });
+
+  it("loads the four fields from GET /api/settings", async () => {
+    const { win, el, calls } = mount();
+    await win.loadKgGraphSettings();
+    expect(calls[0].url).toBe("/api/settings");
+    expect(el("kg-namespace").value).toBe("https://kg.builddown.dev/");
+    expect(el("kg-graph-name").value).toBe("builddown-kg");
+    expect(el("kg-code-repo").value).toBe("BuildDownAI/bd-knowledge-graph");
+    expect(el("kg-graph-label").value).toBe("Builddown KG");
+    expect(el("btn-kg-graph-details-save").disabled).toBe(false);
+  });
+
+  it("posts one body with all four values and reloads", async () => {
+    const { win, el, calls } = mount();
+    await win.loadKgGraphSettings();
+    el("kg-namespace").value = "https://new.example/";
+    el("kg-graph-name").value = "new-kg";
+    el("kg-code-repo").value = "Org/new-repo";
+    el("kg-graph-label").value = "New label";
+    await win.saveKgGraphDetails();
+    const save = calls.find((c) => c.url === "/api/settings" && c.body);
+    expect(save?.body).toEqual({
+      kg_namespace: "https://new.example/",
+      kg_graph_name: "new-kg",
+      kg_code_repo: "Org/new-repo",
+      kg_graph_label: "New label",
+    });
+    expect(el("kg-graph-details-save-status").textContent).toBe("Saved.");
+  });
+
+  it("keeps an edited value through a poll and shows a 400's error", async () => {
+    const { win, el } = mount({ save: { status: 400, body: { error: "Invalid KG graph name" } } });
+    await win.loadKgGraphSettings();
+    el("kg-graph-name").value = "half-typed";
+    await win.loadKgGraphSettings();
+    expect(el("kg-graph-name").value).toBe("half-typed");
+    await win.saveKgGraphDetails();
+    expect(el("kg-graph-details-error").textContent).toContain("Invalid KG graph name");
+    expect(el("kg-graph-details-error").hidden).toBe(false);
+  });
+
+  it("renders a hostile label as input value text, never as markup", async () => {
+    const { win, el } = mount({ settings: { kg_graph_label: "<img src=x onerror=alert(1)>" } });
+    await win.loadKgGraphSettings();
+    const input = el("kg-graph-label");
+    expect(input.value).toBe("<img src=x onerror=alert(1)>");
+    expect(input.querySelector("img")).toBeNull();
+  });
+});
+
 describe("kg schedule control (AII-1434)", () => {
   const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const wrap = (v: unknown) => ({ content: [{ type: "text", text: JSON.stringify(v) }] });
