@@ -414,23 +414,39 @@ describe("a fault every project on a dependency shares", () => {
     expect(results.find((row) => row.id === "tracker.provider" && row.state === "fail")?.project).toBeUndefined();
   });
 
-  it("makes a project run answer with a full run, while a fault of the project's own does not", () => {
-    const run = (results: SetupCheckResult[]) => ({ checkedAt: 1, results });
-    const shared = (state: SetupCheckResult["state"]) => ({ id: "tracker.provider" as const, title: "", group: "tracker" as const, tier: "core" as const, onAdminPath: false, state, detail: "" });
-    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), null)).toBe(true);
-    expect(checks.projectRunNeedsFullRun(run([shared("cannot-verify")]), null)).toBe(true);
-    expect(checks.projectRunNeedsFullRun(run([shared("pass"), shared("warn"), shared("not-applicable")]), null)).toBe(false);
-    expect(checks.projectRunNeedsFullRun(run([{ ...shared("fail"), id: "tracker.linear.team-access", project: "ENG" }]), null)).toBe(false);
+  const stored = (results: SetupCheckResult[]): SetupCheckRun => ({ checkedAt: 1, results });
+  const partial = (results: SetupCheckResult[]): SetupCheckRun => ({ checkedAt: 2, results, scope: { checks: results.map((row) => row.id) } });
+  const shared = (state: SetupCheckResult["state"], id: SetupCheckResult["id"] = "tracker.provider"): SetupCheckResult => ({ id, title: "", group: "tracker", tier: "core", onAdminPath: false, state, detail: "" });
+
+  it("answers a partial run with a full run when nothing is stored, and never answers a full run with another", () => {
+    expect(checks.partialRunNeedsFullRun(partial([shared("pass")]), null)).toBe(true);
+    expect(checks.partialRunNeedsFullRun(partial([]), null)).toBe(true);
+    expect(checks.partialRunNeedsFullRun(stored([shared("fail")]), null)).toBe(false);
+    expect(checks.partialRunNeedsFullRun(stored([shared("fail")]), stored([shared("pass")]))).toBe(false);
   });
 
-  // Once a full run has stored the fault on every project, another full run would only repeat its reads against the failing system.
-  it("lets a project run merge as it is once the stored run already shows the shared fault, and escalates for one it does not", () => {
-    const run = (results: SetupCheckResult[]) => ({ checkedAt: 1, results });
-    const shared = (state: SetupCheckResult["state"]) => ({ id: "tracker.provider" as const, title: "", group: "tracker" as const, tier: "core" as const, onAdminPath: false, state, detail: "" });
-    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), run([shared("fail")]))).toBe(false);
-    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), run([shared("pass")]))).toBe(true);
-    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), run([shared("cannot-verify")]))).toBe(true);
-    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), run([{ ...shared("fail"), project: "ENG" }]))).toBe(true);
+  it.each(["env.github-app", "tracker.provider", "github.app-identity", "tracker.linear.credentials", "tracker.jira.credentials"] as const)(
+    "answers a partial run that finds %s failing or recovered with a full run",
+    (id) => {
+      expect(checks.partialRunNeedsFullRun(partial([shared("fail", id)]), stored([shared("pass", id)]))).toBe(true);
+      expect(checks.partialRunNeedsFullRun(partial([shared("cannot-verify", id)]), stored([shared("fail", id)]))).toBe(true);
+      expect(checks.partialRunNeedsFullRun(partial([shared("pass", id)]), stored([shared("fail", id)]))).toBe(true);
+    },
+  );
+
+  // Once a full run has stored the change on every project, another full run would only repeat its reads.
+  it("lets a partial run merge as it is when the stored run already shows each shared check's state", () => {
+    expect(checks.partialRunNeedsFullRun(partial([shared("fail")]), stored([shared("fail")]))).toBe(false);
+    expect(checks.partialRunNeedsFullRun(partial([shared("pass")]), stored([shared("pass")]))).toBe(false);
+    // The stored state must be the shared check's own, not a project's row of it.
+    expect(checks.partialRunNeedsFullRun(partial([shared("fail")]), stored([{ ...shared("fail"), project: "ENG" }]))).toBe(true);
+  });
+
+  it("lets a partial run merge as it is when only a project's own row or a check no project waits on changed", () => {
+    expect(checks.partialRunNeedsFullRun(partial([{ ...shared("fail"), id: "tracker.linear.team-access", project: "ENG" }]), stored([{ ...shared("pass"), id: "tracker.linear.team-access", project: "ENG" }]))).toBe(false);
+    for (const id of ["restate", "github.clock", "callback.config"] as const) {
+      expect(checks.partialRunNeedsFullRun(partial([shared("fail", id)]), stored([shared("pass", id)]))).toBe(false);
+    }
   });
 });
 
