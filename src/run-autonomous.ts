@@ -1361,7 +1361,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       workspaceDir,
       planningContext,
       implementationPrompt,
-      reviewRubric: commentInstructionReviewRubric(commentInstruction),
+      reviewRubric: commentInstructionReviewRubric(commentInstruction, {
+        conflictRepair: Boolean(prNumber && baseBranch),
+      }),
       prNumber,
       githubOwner,
       githubRepo,

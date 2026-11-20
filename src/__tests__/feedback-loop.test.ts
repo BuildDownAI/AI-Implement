@@ -229,10 +229,15 @@ describe("splitPlanningContext with real assemblePlanningContext output", () => 
 });
 
 describe("feedbackLoopStep — planning context routing", () => {
-  it("puts the merge-commit scope rule in the trusted rubric outside the instruction guard", () => {
-    const rubric = commentInstructionReviewRubric("Fix the documentation only")!;
-    const rule = "When this run created a merge commit, the changes brought in from the merged branch are not this run's work; review the conflict resolution and this PR's own changes.";
+  it("adds the merge-commit scope rule only for a conflict repair", () => {
+    const plain = commentInstructionReviewRubric("Fix the documentation only")!;
+    expect(plain).not.toContain("net change against the feature branch");
+    expect(plain).not.toContain("When this run created a merge commit");
+
+    const rubric = commentInstructionReviewRubric("Fix the documentation only", { conflictRepair: true })!;
+    const rule = "the review diff is the net change against the feature branch";
     expect(rubric).toContain(rule);
+    expect(rubric).toContain("Changes brought in from the merged branch are not this run's work");
     const guarded = wrapWithPlanningGuard("Fix the documentation only");
     expect(rubric.indexOf(rule)).toBeGreaterThan(rubric.indexOf(guarded) + guarded.length);
   });

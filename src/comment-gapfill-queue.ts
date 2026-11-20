@@ -186,7 +186,9 @@ export function conflictResolutionInstruction(featureBranch: string): string {
     `First run \`git rev-parse --verify origin/${featureBranch}\` on this PR branch; if that ref is missing, stop and report it —`,
     `the clone has no origin credential, so a fetch cannot work. Otherwise run \`git merge origin/${featureBranch}\`, resolve every conflict`,
     `by keeping BOTH sides' intent (the sibling changes already on \`${featureBranch}\` AND this PR's changes),`,
-    `re-run the repo's tests, and finish the merge with \`git commit --no-edit\`. Do not push — the pipeline pushes the merge commit.`,
+    `re-run the repo's tests, then finish with \`if git rev-parse -q --verify MERGE_HEAD >/dev/null; then git commit --no-edit; fi\` —`,
+    `that command commits only when the merge stopped on a conflict (git left \`MERGE_HEAD\`); a clean merge already committed itself,`,
+    `so it needs no further commit, and the guard exits 0 either way. Do not push — the pipeline pushes the merge commit.`,
     `Do not force-push, do not revert sibling work.`,
   ].join(" ");
 }
