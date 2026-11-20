@@ -358,6 +358,34 @@ ${finding.feedback || "(none)"}`;
   }).join("\n\n");
 }
 
+function readHumanPrComments(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): string | undefined {
+  try {
+    const result = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+    if (result.exitCode !== 0) return undefined;
+    const parsed = JSON.parse(result.stdout) as unknown;
+    if (!Array.isArray(parsed)) return undefined;
+    const comments = parsed.flat();
+    const trustedAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+    const kept: Array<{ login: string; createdAt: string; body: string }> = [];
+    for (const comment of comments) {
+      if (!comment || typeof comment !== "object") continue;
+      const item = comment as { user?: unknown; author_association?: unknown; created_at?: unknown; body?: unknown };
+      const user = item.user && typeof item.user === "object"
+        ? item.user as { login?: unknown; type?: unknown }
+        : undefined;
+      if (user?.type !== "User") continue;
+      if (typeof item.author_association !== "string" || !trustedAssociations.has(item.author_association)) continue;
+      if (typeof user.login !== "string" || typeof item.created_at !== "string" || typeof item.body !== "string") continue;
+      kept.push({ login: user.login, createdAt: item.created_at, body: item.body.slice(0, 2_000) });
+    }
+    if (kept.length === 0) return undefined;
+    kept.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return JSON.stringify(kept.slice(-10));
+  } catch {
+    return undefined;
+  }
+}
+
 function requiredReviewFindingsBlock(findings: ReviewLedgerFinding[]): string {
   if (findings.length === 0) return "";
   return `\n\nRequired external review findings:\n${formatReviewLedgerForPrompt(findings)}`;
@@ -1685,6 +1713,7 @@ async function runSelectedInternalReviewers(params: {
   iteration: number;
   diff: string;
   previousFindings: string;
+  humanComments?: string;
   model: string;
   sleep: (ms: number) => Promise<void>;
 }): Promise<SelectedReviewerPassResult> {
@@ -1755,6 +1784,7 @@ async function runSelectedInternalReviewers(params: {
         prNumber: params.prNumber,
         diff: params.diff,
         previousFindings: params.previousFindings,
+        humanComments: params.humanComments,
       });
       prompt += isTimeBudget
         ? `\n\nYou have a time budget of ${reviewBudgetLabel.replace(/^timeout /, "")} for this review. Finish within the time budget and reserve time for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`
@@ -2188,6 +2218,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         issues: finding.issues.filter(issue =>
           issue.title !== CI_CHECK_FAILING_TITLE && issue.title !== CI_CHECK_UNVERIFIED_TITLE),
       })));
+      const humanComments = readHumanPrComments(ghSpawn, prNumber);
       const advisoryConfigReviewers = configAdvisoryReviewers(configReviewerResolution.branchDefinitions, selectedInternalReviewers);
       const activeInternalReviewers: SelectedReviewer[] = [
         ...selectedInternalReviewers,
@@ -2206,6 +2237,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         iteration,
         diff: diffRes.stdout,
         previousFindings,
+        humanComments,
         model,
         sleep,
       });

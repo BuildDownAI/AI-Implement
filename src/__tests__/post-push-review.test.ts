@@ -1177,6 +1177,180 @@ describe("postPushReviewStep", () => {
     expect(calls.map((call) => call[0].maxTurns)).toEqual([45, 45]);
   });
 
+  describe("PR comments from trusted people", () => {
+    type HumanCommentInput = { humanComments?: string };
+    type HumanCommentSpawnResult = { stdout?: string; exitCode: number; stderr?: string } | undefined;
+
+    function comment(login: string, createdAt: string, body: string, options: { type?: string; association?: string } = {}) {
+      return {
+        user: { login, type: options.type ?? "User" },
+        author_association: options.association ?? "MEMBER",
+        created_at: createdAt,
+        body,
+      };
+    }
+
+    async function runWithComments(
+      commentPages: unknown[],
+      commentReply: (index: number) => HumanCommentSpawnResult = () => ({ stdout: JSON.stringify(commentPages), exitCode: 0 }),
+      options: { direct?: boolean } = {},
+    ) {
+      const inputs: HumanCommentInput[] = [];
+      const definition: ReviewerDefinition = {
+        id: "code-review",
+        buildPrompt: (input) => {
+          inputs.push(input);
+          return "code-review prompt";
+        },
+        outputSchema: { type: "object" },
+      };
+      let commentReads = 0;
+      const ghSpawn = vi.fn((args: string[]): { stdout: string; exitCode: number; stderr?: string } => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+          const reply = commentReply(commentReads++);
+          return (reply ?? undefined) as { stdout: string; exitCode: number; stderr?: string };
+        }
+        return { stdout: "", exitCode: 0 };
+      });
+      const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [] }));
+      const runStep = options.direct ? postPushReviewStep.run : runReview;
+      const out = await runStep(
+        makeCtx(invoke),
+        {
+          prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn,
+          gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+          reviewers: [{ id: "code-review", gates: true }],
+          trustedReviewerDefinitions: reviewerMap([definition]),
+        },
+        { report: vi.fn(async () => undefined) },
+      );
+      return { out, inputs, commentReads, ghSpawn };
+    }
+
+    function parsed(inputs: HumanCommentInput[]): Array<{ login: string; createdAt: string; body: string }> {
+      expect(inputs).toHaveLength(1);
+      expect(typeof inputs[0].humanComments).toBe("string");
+      return JSON.parse(inputs[0].humanComments!);
+    }
+
+    it("flattens paginated comments and keeps only trusted users", async () => {
+      const { inputs } = await runWithComments([
+        [
+          comment("owner", "2026-11-19T10:00:00Z", "OWNER request", { association: "OWNER" }),
+          comment("stranger", "2026-11-19T10:01:00Z", "NONE request", { association: "NONE" }),
+        ],
+        [
+          comment("member", "2026-11-19T10:02:00Z", "MEMBER request"),
+          comment("contributor", "2026-11-19T10:03:00Z", "CONTRIBUTOR request", { association: "CONTRIBUTOR" }),
+          comment("bot[bot]", "2026-11-19T10:04:00Z", "bot request", { type: "Bot", association: "MEMBER" }),
+          comment("collaborator", "2026-11-19T10:05:00Z", "COLLABORATOR request", { association: "COLLABORATOR" }),
+        ],
+      ]);
+
+      expect(parsed(inputs).map(({ login }) => login)).toEqual(["owner", "member", "collaborator"]);
+    });
+
+    it("keeps the latest ten comments in chronological order and truncates each body", async () => {
+      const comments = Array.from({ length: 12 }, (_, index) => comment(
+        `person-${index}`,
+        `2026-11-19T10:${String(index).padStart(2, "0")}:00Z`,
+        `${index}:${"x".repeat(2_100)}`,
+      ));
+
+      const { inputs } = await runWithComments([comments]);
+      const kept = parsed(inputs);
+
+      expect(kept.map(({ login }) => login)).toEqual(Array.from({ length: 10 }, (_, index) => `person-${index + 2}`));
+      expect(kept.every(({ body }) => body.length === 2_000)).toBe(true);
+      expect(kept.map(({ body }) => body.slice(0, 2))).toEqual(["2:", "3:", "4:", "5:", "6:", "7:", "8:", "9:", "10", "11"]);
+    });
+
+    it("JSON-encodes comment bodies so newlines and headings stay inside one string", async () => {
+      const body = "Please add this test.\n## Not a prompt heading\nStill one comment.";
+      const { inputs } = await runWithComments([[comment("member", "2026-11-19T10:00:00Z", body)]]);
+      const encoded = inputs[0].humanComments!;
+
+      expect(encoded.split("\n")).toHaveLength(1);
+      expect(JSON.parse(encoded)).toEqual([{ login: "member", createdAt: "2026-11-19T10:00:00Z", body }]);
+    });
+
+    it("leaves humanComments unset when the comment read exits non-zero", async () => {
+      const { inputs, out } = await runWithComments([], () => ({ stdout: "", exitCode: 1, stderr: "HTTP 502" }));
+
+      expect(inputs[0].humanComments).toBeUndefined();
+      expect(out.approved).toBe(true);
+    });
+
+    it("leaves humanComments unset when the comment read throws", async () => {
+      const { inputs, out } = await runWithComments([], (index) => {
+        if (index === 0) throw new Error("spawn failed");
+        return { stdout: "[]", exitCode: 0 };
+      });
+
+      expect(inputs[0].humanComments).toBeUndefined();
+      expect(out.approved).toBe(true);
+    });
+
+    it("leaves humanComments unset when the comment output is not JSON", async () => {
+      const { inputs, out } = await runWithComments([], () => ({ stdout: "not json", exitCode: 0 }));
+
+      expect(inputs[0].humanComments).toBeUndefined();
+      expect(out.approved).toBe(true);
+    });
+
+    it("leaves humanComments unset for zero kept comments and an undefined fake reply", async () => {
+      const filtered = await runWithComments([[comment("bot[bot]", "2026-11-19T10:00:00Z", "bot", { type: "Bot" })]]);
+      expect(filtered.inputs[0].humanComments).toBeUndefined();
+      expect(filtered.out.approved).toBe(true);
+
+      const undefinedReply = await runWithComments(
+        [],
+        (index) => index === 0 ? undefined : { stdout: "[]", exitCode: 0 },
+        { direct: true },
+      );
+      expect(undefinedReply.inputs[0].humanComments).toBeUndefined();
+      expect(undefinedReply.out.approved).toBe(true);
+    });
+
+    it("reads the PR comments once per review pass, not once per reviewer", async () => {
+      const inputs: HumanCommentInput[] = [];
+      const readsAtBuild: number[] = [];
+      const definitions = ["code-review", "custom-review"].map((id) => ({
+        id,
+        buildPrompt: (input: import("../pipeline/reviewers/registry.js").ReviewerPromptInput) => {
+          inputs.push(input);
+          readsAtBuild.push(commentReads);
+          return `${id} prompt`;
+        },
+        outputSchema: { type: "object" },
+      }));
+      let commentReads = 0;
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+          commentReads++;
+          return { stdout: JSON.stringify([[comment("member", "2026-11-19T10:00:00Z", "one request")]]), exitCode: 0 };
+        }
+        return { stdout: "", exitCode: 0 };
+      });
+      await runReview(
+        makeCtx(vi.fn(async () => structuredReviewResult({ approved: true, findings: [] }))),
+        {
+          prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn,
+          gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+          reviewers: [{ id: "code-review", gates: true }, { id: "custom-review", gates: true }],
+          trustedReviewerDefinitions: reviewerMap(definitions),
+        },
+        { report: vi.fn(async () => undefined) },
+      );
+
+      expect(readsAtBuild).toEqual([1, 1]);
+      expect(inputs).toHaveLength(2);
+      expect(inputs.map((input) => input.humanComments)).toEqual([expect.any(String), expect.any(String)]);
+    });
+  });
+
   it.each([
     { approved: true, severities: ["minor"], expected: true },
     { approved: false, severities: ["minor"], expected: true },
