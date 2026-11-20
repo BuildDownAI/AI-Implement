@@ -8,7 +8,7 @@
 //
 // Pause points: `wait` (the durable sleep that races the `report` promise) and `confirm` (the first status read after
 // `report`, held by a gate). The tick seams are huge, so no tick adds a `read-N` entry while a capture is read.
-// Both runner backends AII and CON use are captured: GitHub Actions and Fly Machines. They share the same workflow
+// Both runner backends that AII and CON use are captured: GitHub Actions and Fly Machines. They share the same workflow
 // commands today, but separate snapshots make a later backend-specific journal change fail here.
 //
 // Regenerate only with UPDATE_JOURNAL_SNAPSHOTS=1; a missing snapshot fails. Run with `npm run test:restate`.
