@@ -217,6 +217,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       let ghToken: string;
       let mapping: RepoMapping;
       let baseBranch: string | undefined;
+      let issueDescription: string | undefined;
       const issue: { issueId: string; issueIdentifier: string; issueTitle?: string } = { issueId: run.issueId, issueIdentifier: run.issueIdentifier };
       try {
         const target = initialTarget(run);
@@ -289,7 +290,16 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           if (!baseRef) throw new Error(`conflict repair: cannot read base branch for PR #${gap.prNumber}`);
           baseBranch = baseRef;
         }
-        if (run.backend === "github-actions") prepared = await prepareGhaGapfillLaunch({ mapping, issue, item, ghToken, decision, reviewOnly,
+        // The gap-fill review needs the current tracker body, not the title. Read it in
+        // this journaled launch step. A tracker failure must not reject the launch.
+        try {
+          const found = await (await input.resolveProvider(mapping)).findByKey(run.issueIdentifier, run.teamKey);
+          const description = found?.description;
+          if (description && description.trim() !== "") issueDescription = description;
+        } catch {
+          // Fall back to the title, as before this read existed.
+        }
+        if (run.backend === "github-actions") prepared = await prepareGhaGapfillLaunch({ mapping, issue, issueDescription, item, ghToken, decision, reviewOnly,
           runnerCallbackBaseUrl: config.runnerCallbackBaseUrl, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? "",
           runToken: tokens?.runToken ?? "", runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
           commentInstruction, resolveRunnerImage: (m, t) => input.resolveRunnerImage(config, m, t), checkContract: resolveWorkflowCapabilities });
@@ -332,7 +342,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
             runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
             commentInstruction, ...(baseBranch ? { baseBranch } : {}) };
           if (run.backend === "fly-machines") {
-            const result = await dispatchFlyGapfill({ implementationSandbox: decideImplementationSandbox({ protectedLaunch: decision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }), ...common, issue, owner: mapping.owner, repo: mapping.repo,
+            const result = await dispatchFlyGapfill({ implementationSandbox: decideImplementationSandbox({ protectedLaunch: decision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }), ...common, issue, issueDescription, owner: mapping.owner, repo: mapping.repo,
               issueIdentifier: run.issueIdentifier, scopeKey: run.teamKey, allTeamKeys: Object.keys(getMappings()),
               flySessionsToken: config.flySessionsToken!, flySessionsApp: flyApp!,
               flySessionsRegion: config.flySessionsRegion, flyOrchestratorApp: config.flyOrchestratorApp,
@@ -345,7 +355,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
             const modelAuthUrl = config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? "";
             const result = await dispatchLocalGapfill({ ...common,
               issue: { id: issue.issueId, identifier: issue.issueIdentifier, title: issue.issueTitle ?? issue.issueId,
-                description: issue.issueTitle ?? issue.issueId },
+                description: issueDescription ?? issue.issueTitle ?? issue.issueId },
               image: localImage, orchestratorUrl: modelAuthUrl,
               anthropicApiKey: decision.kind === "launch" ? undefined : config.anthropicApiKey,
               claudeOAuthToken: decision.kind === "launch" ? undefined : config.claudeOAuthToken,
