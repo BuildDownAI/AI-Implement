@@ -535,6 +535,20 @@ auto-merge), the cascade self-heals without operator intervention:
    orchestrator logs and fires a standard notification, then leaves the PR for a human to
    resolve. No labels are changed.
 
+The repair merges `origin/<feature>` into the PR branch and finishes with
+`if git rev-parse -q --verify MERGE_HEAD >/dev/null; then git commit --no-edit; fi`: git
+leaves `MERGE_HEAD` only when the merge stopped on a conflict, and a clean merge already
+committed itself, so the guard exits 0 either way.
+
+For the review, a conflict repair (a run carrying both `prNumber` and `baseBranch`) bases
+the diff on the feature branch — `git diff origin/<baseBranch>` against the working tree,
+with the usual disposable index and `REVIEW_DIFF_EXCLUDES`. That is the PR's net change:
+the PR's own work plus the resolution, without the sibling payload merged in from the
+feature branch. The runner picks this base only after verifying `origin/<baseBranch>` with
+`git rev-parse --verify`; if the clone did not fetch that ref (for example the GHA
+single-branch clone, or a base branch absent from the run config), it falls back to the
+run-start commit and the diff includes the merged sibling changes again.
+
 ### Dispatch guard (declared-file overlap)
 
 Before dispatching a same-feature-node sibling (another leaf or child issue targeting the

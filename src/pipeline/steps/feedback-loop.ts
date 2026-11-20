@@ -166,6 +166,29 @@ export function getDiff(workspaceDir: string, base?: string): string {
 }
 
 /**
+ * Base commit the reviewer's diff starts from. A conflict repair (`prNumber` and
+ * `baseBranch` both set — the clone fetched `origin/<baseBranch>`) reviews the
+ * PR's net change after the merge, so the diff runs against the feature branch
+ * and leaves out sibling work merged in from it. Every other run keeps the
+ * run-start base (AII-1938), including a conflict repair whose clone did not
+ * fetch the remote ref.
+ */
+export function reviewDiffBase(
+  workspaceDir: string,
+  runStartHead: string,
+  baseBranch?: string,
+  prNumber?: string,
+): string {
+  if (!prNumber || !baseBranch) return runStartHead;
+  const remoteRef = `origin/${baseBranch}`;
+  const result = spawnSync("git", ["rev-parse", "--verify", remoteRef], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 ? remoteRef : runStartHead;
+}
+
+/**
  * `git status --porcelain` snapshot, used by `isRunDirty` to detect uncommitted
  * changes (BAC-27134). Returns "" on a spawn failure — the same fail-safe
  * getDiff uses — since misreading a dirty tree as clean (the exhausted-and-throw
@@ -451,7 +474,11 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             },
             reporter,
           ),
-        getDiff: () => getDiff(workspaceDir, runStartHead),
+        getDiff: () =>
+          getDiff(
+            workspaceDir,
+            reviewDiffBase(workspaceDir, runStartHead, context.data.baseBranch, context.data.prNumber),
+          ),
         isRunDirty: () => isRunDirty(workspaceDir, runStartHead),
         writeCycleSummary: (input) => {
           writeCycleSummary(workspaceDir, input);
