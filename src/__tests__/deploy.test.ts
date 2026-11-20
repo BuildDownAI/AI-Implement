@@ -137,7 +137,9 @@ describe("Dockerfile KG source repo wiring", () => {
     expect(dockerfile).not.toContain("ARG KG_SOURCE_REPO=");
     expect(dockerfile).toContain("ENV KG_SOURCE_REPO=$KG_SOURCE_REPO");
     expect(dockerfile).toContain('[ "$kg_owner" = "$KG_SOURCE_REPO" ]');
-    expect(dockerfile).toContain("KG_SOURCE_REPO not set — building without a knowledge graph");
+    expect(dockerfile).toContain('FROM kg-artifact-${KG_ARTIFACT_KIND:-base} AS kg-artifact');
+    expect(dockerfile).toContain('ARG KG_ARTIFACT_KIND=${KG_SOURCE_REPO:+customer}');
+    expect(dockerfile).toContain('touch /app/kg/.base-only');
   });
 });
 

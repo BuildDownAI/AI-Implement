@@ -541,7 +541,7 @@ describe("roll-up review child cleanup", () => {
       expect(isParked("child", "implementation")).toBe(true);
       child.comments.nodes.push({ body, user: null, createdAt: "now" });
     });
-    vi.mocked(getPullRequestState).mockResolvedValue({ merged, state: "closed", headRef: null, headSha: null });
+    vi.mocked(getPullRequestState).mockResolvedValue({ merged, state: "closed", headRef: null, headSha: null, baseRef: null });
     markRollUpHandled("jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
     // No roll-up candidates: the parent can be excluded because this child is active.
     await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
@@ -573,7 +573,7 @@ describe("roll-up review child cleanup", () => {
       expect(isParked("child", "implementation")).toBe(true);
       throw new Error("comment unavailable");
     }).mockResolvedValue(undefined);
-    vi.mocked(getPullRequestState).mockResolvedValue({ merged: false, state: "closed", headRef: null, headSha: null });
+    vi.mocked(getPullRequestState).mockResolvedValue({ merged: false, state: "closed", headRef: null, headSha: null, baseRef: null });
     const reconcile = () => reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
     const bookkeeping = () => getDb().prepare("SELECT value FROM settings WHERE key = ?")
       .get("roll-up-review:parked:linear:OOL:child");
@@ -614,7 +614,7 @@ describe("roll-up review child cleanup", () => {
       new Map(ids.slice(0, 250).map(id => [id, id === "child-250" ? "active" : "completed"] as const)));
     const park = vi.spyOn(provider, "parkForHuman").mockResolvedValue(true);
     const comment = vi.spyOn(provider, "postComment").mockResolvedValue(undefined);
-    vi.mocked(getPullRequestState).mockResolvedValue({ merged, state: "closed", headRef: null, headSha: null });
+    vi.mocked(getPullRequestState).mockResolvedValue({ merged, state: "closed", headRef: null, headSha: null, baseRef: null });
 
     await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
 

@@ -2,7 +2,7 @@
  * Encrypted storage for API-key and Bedrock credentials (AII-1411), over `model_protected_secrets` (dedup.ts).
  *
  * AES-256-GCM under a key HKDF-derived from `RUNNER_TOKEN_SECRET` (model-session-keys.ts). The AAD binds the
- * ciphertext to the exact `model-account:` reference, so a row copied to another reference fails authentication.
+ * ciphertext to the exact secret reference, so a row copied to another reference fails authentication.
  * Rotating `RUNNER_TOKEN_SECRET` orphans every row: the operator re-imports.
  *
  * The resolver is synchronous (ProtectedSecretResolver) and returns null for every failure; it never throws and
@@ -12,6 +12,7 @@
 import crypto from "node:crypto";
 import type Database from "better-sqlite3";
 import { getDb } from "./dedup.js";
+import { STARDOG_RUN_TOKEN_REF } from "./kg-secret-refs.js";
 import { parseModelAuthCheckoutResponse } from "./model-auth-contract.js";
 import { MODEL_ACCOUNT_REF_PATTERN, type ProtectedSecretResolver, type ProtectedSecretValue } from "./model-credentials.js";
 import { deriveModelProtectedSecretKey } from "./model-session-keys.js";
@@ -59,7 +60,7 @@ function aad(ref: string): Buffer {
 }
 
 function validRef(ref: unknown): ref is string {
-  return typeof ref === "string" && MODEL_ACCOUNT_REF_PATTERN.test(ref);
+  return typeof ref === "string" && (MODEL_ACCOUNT_REF_PATTERN.test(ref) || ref === STARDOG_RUN_TOKEN_REF);
 }
 
 /** Same validator the reader applies, so a stored value is always one the reader accepts. */

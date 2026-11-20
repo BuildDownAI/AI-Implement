@@ -1,5 +1,6 @@
 /** Checks of the orchestrator's own environment and settings: the `orchestrator` group. */
 
+import { getStardogValues } from "../kg-graph-source.js";
 import { dirname } from "node:path";
 import { isRemoteKgStore } from "../kg-sidecar.js";
 import { allowlistFromEnv, hasAdminAddress } from "../access-entries.js";
@@ -134,11 +135,13 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         state: "not-applicable",
         detail: "The knowledge graph is served from the local sidecar store",
       }];
-      const missing = ["KG_STARDOG_RUN_TOKEN", "KG_STARDOG_DB", "KG_NAMESPACE"].filter((name) => !env[name]);
+      const values = getStardogValues();
+      const required = { KG_STARDOG_RUN_TOKEN: values.tokenSet, KG_STARDOG_DB: values.db, KG_NAMESPACE: values.namespace };
+      const missing = Object.entries(required).filter(([, value]) => !value).map(([name]) => name);
       if (missing.length > 0) return [{
         state: "fail",
         detail: `Missing: ${missing.join(", ")}`,
-        fix: "Set the listed variables in the orchestrator environment and restart.",
+        fix: "Save the listed Stardog values on /admin#kg-pipelines.",
       }];
       return [{ state: "pass", detail: "The Stardog store values are set" }];
     },

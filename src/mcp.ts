@@ -3,7 +3,7 @@ import { getDeployStartedAt } from "./deploy-hold.js";
 import { verifyMcpToken, resolveClientPath, getRefreshExpiry } from "./mcp-oauth.js";
 import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
-import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
+import { type MemoryProvider, KG_TOOL_CAPABILITY, getKgMemoryProvider } from "./kg-provider.js";
 import type { Caller } from "./mcp-identity.js";
 import { discoverTools, callTool } from "./restate/tools-client.js";
 import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
@@ -112,6 +112,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "kg_repo_history",
   "trigger_kg_refresh",
   "decide_kg_refresh",
+  "set_kg_graph_source",
   "set_runner_mode",
   "set_fly_machine_profile",
   "set_runner_backend",
@@ -139,6 +140,7 @@ const RESTATE_TOOL_NAMES = new Set([
 export const RESTATE_WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "decide_kg_refresh",
+  "set_kg_graph_source",
   "set_runner_mode",
   "set_fly_machine_profile",
   "set_runner_backend",
@@ -168,10 +170,10 @@ const roleAllows = (have: AccessRole | null, need: AccessRole): boolean =>
 export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  // `provider` is still read by tools/list's kg_* courtesy filter (AII-641); the diagnostic
-  // string is kept in the signature so the boot wiring (src/index.ts) and the tests keep
-  // their positions. AII-715 restructures the door and drops it.
-  provider: MemoryProvider | null,
+  // The boot-time provider is no longer read: tools/list's kg_* courtesy filter uses the
+  // live one (getKgMemoryProvider), because set_kg_graph_source can install a provider
+  // after boot (AII-1974). Kept in the signature so the boot wiring and tests keep positions.
+  _provider: MemoryProvider | null,
   baseUrl: string | null,
   _providerDiagnostic?: string | null,
 ): Promise<void> {
@@ -280,11 +282,14 @@ export async function handleMcpRequest(
     // call (tools/call still refuses it inside the handler if called from a stale list). A
     // Restate-backed tool degrades the same way when the admin API itself is unreachable:
     // discoverTools() returns an empty list, so the discovered set drops out until it recovers.
+    // Reads the live provider rather than the boot copy: a set_kg_graph_source switch can
+    // start the sidecar and install a provider after boot, with no orchestrator restart.
     const kgToolVisible = (name: string): boolean => {
       const capKey = KG_TOOL_CAPABILITY[name];
       if (capKey === undefined && !name.startsWith("kg_")) return true;
-      if (!provider) return false;
-      return capKey === undefined || provider.capabilities[capKey] === true;
+      const current = getKgMemoryProvider();
+      if (!current) return false;
+      return capKey === undefined || current.capabilities[capKey] === true;
     };
     const discovered = await discoverTools();
     const restateTools = discovered

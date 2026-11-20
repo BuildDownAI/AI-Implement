@@ -13,7 +13,9 @@ export const authJs = `
 
   async function api(path, opts) {
     opts = opts || {};
-    const headers = { 'Content-Type': 'application/json' };
+    // Callers may add headers (for example Idempotency-Key on a tool retry); keep them
+    // while the session's own content type and bearer take precedence.
+    const headers = Object.assign({}, opts.headers, { 'Content-Type': 'application/json' });
     if (token) headers['Authorization'] = 'Bearer ' + token;
     // credentials:'include' so the httpOnly session cookie rides along with every API call.
     const res = await fetch(API + path, Object.assign({}, opts, { headers, credentials: 'include' }));

@@ -193,3 +193,26 @@ describe("no leakage", () => {
     expect(src.match(/process\.env/g)).toHaveLength(1);
   });
 });
+
+
+describe("KG token reference", () => {
+  const kgRef = "kg-store:stardog-run-token";
+  it("accepts only the fixed KG reference", () => {
+    const s = make();
+    expect(s.write(kgRef, "t".repeat(1200))).toEqual({ ok: true });
+    expect(s.resolve(kgRef)).toBe("t".repeat(1200));
+    for (const ref of ["kg-store:other", `${kgRef}-other`, `${kgRef}\n`]) {
+      expect(s.write(ref, OPENAI)).toEqual({ ok: false, code: "invalid_ref" });
+      expect(s.open(ref)).toEqual({ ok: false, code: "invalid_ref" });
+    }
+  });
+  it("cannot open model-account ciphertext copied to the KG reference", () => {
+    const s = make();
+    s.write(REF, OPENAI);
+    const r = rows()[0]!;
+    dedup.getDb().prepare("INSERT INTO model_protected_secrets VALUES (?,?,?,?,?,?)")
+      .run(kgRef, r.ciphertext, r.nonce, r.auth_tag, r.encryption_key_id, 1);
+    expect(s.open(kgRef)).toEqual({ ok: false, code: "decrypt_failed" });
+    expect(s.resolve(REF)).toBe(OPENAI);
+  });
+});

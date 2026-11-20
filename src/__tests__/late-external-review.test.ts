@@ -44,7 +44,7 @@ const input: LateExternalReviewInput & { headSha: string } = {
 };
 const deps = createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
 /** What getPullRequestState reads back for the PR: never merged here, so "closed" means closed unmerged. */
-const prState = (state: "open" | "closed", headSha: string) => ({ merged: false, state, headRef: "ai-implement/feature", headSha });
+const prState = (state: "open" | "closed", headSha: string) => ({ merged: false, state, headRef: "ai-implement/feature", headSha, baseRef: "main" });
 let findingId = 0;
 /** An open review-contract finding on owner/repo#12 as the review ledger stores it. */
 const finding = (severity: ReviewLedgerSeverity, lastSeenAt = 0): StoredReviewFinding => ({

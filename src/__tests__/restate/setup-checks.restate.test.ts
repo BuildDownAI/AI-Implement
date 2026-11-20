@@ -116,7 +116,8 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
   });
 
   it("merges one project's run into the stored run, keeps every other row, and journals the project's run", async () => {
-    nextRun = async () => ({ startedAt: 4000, checkedAt: 4001, results: [row({ id: "restate", group: "orchestrator" }), row({ project: "ENG", state: "fail" }), row({ project: "OPS", state: "fail" })] });
+    // A full run always holds github.app-identity's row, here in the state the project run finds it.
+    nextRun = async () => ({ startedAt: 4000, checkedAt: 4001, results: [row({ id: "restate", group: "orchestrator" }), row({ id: "github.app-identity", group: "github" }), row({ project: "ENG", state: "fail" }), row({ project: "OPS", state: "fail" })] });
     await call<SetupCheckRun>("merge", "run");
     const projectRun: SetupCheckRun = {
       startedAt: 4100,
@@ -148,7 +149,7 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
     const full: SetupCheckRun = { startedAt: 4600, checkedAt: 4601, results: [row({ id: "tracker.provider", state: "fail" }), row({ project: "ENG", state: "cannot-verify" }), row({ project: "OPS", state: "cannot-verify" })] };
     let quiet = 0;
     nextQuietRun = async () => { quiet++; return full; };
-    nextProjectRun = async () => ({ checkedAt: 4550, results: [row({ id: "tracker.provider", state: "fail" }), row({ project: "ENG", state: "cannot-verify" })] });
+    nextProjectRun = async () => ({ checkedAt: 4550, results: [row({ id: "tracker.provider", state: "fail" }), row({ project: "ENG", state: "cannot-verify" })], scope: { checks: ["tracker.linear.team-access"], projects: ["ENG"] } });
     expect(claimSetupCheckRun(() => 4599)).toBeNull();
     try {
       expect(await runProject("shared", "ENG")).toEqual(full);
@@ -165,10 +166,6 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
     // The stored run already shows the fault on every project, so another project's run finding it merges as it is.
     nextProjectRun = async () => ({ checkedAt: 4650, results: [row({ id: "tracker.provider", state: "fail" }), row({ project: "OPS", state: "cannot-verify" })], scope: { checks: ["tracker.linear.team-access"], projects: ["OPS"] } });
     expect((await runProject("shared", "OPS"))!.results).toContainEqual(row({ project: "OPS", state: "cannot-verify", checkedAt: 4650 }));
-    expect(quiet).toBe(1);
-
-    nextProjectRun = async () => ({ checkedAt: 4700, results: [row({ id: "tracker.provider" }), row({ project: "ENG" })], scope: { checks: ["tracker.linear.team-access"], projects: ["ENG"] } });
-    await runProject("shared", "ENG");
     expect(quiet).toBe(1);
   });
 
@@ -209,6 +206,57 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
     expect(getCachedSetupCheckRun()).toEqual(expected);
     const rows = await invocations("wide", "runOrchestratorWide");
     expect(journaledRunResult(await journalEntries(env().adminAPIBaseUrl(), String(rows[0].id)), "run orchestrator-wide checks")).toEqual(wide);
+  });
+
+  // Every project's rows wait on github.app-identity, so its change reaches projects a partial run did not read, whose stored rows only a full run can correct.
+  describe("a shared check every project's rows wait on", () => {
+    const appIdentity = (state: Row["state"]) => row({ id: "github.app-identity", group: "github", state });
+    const waiting = (project: string) => row({ project, state: "cannot-verify", waitsOn: "github.app-identity" });
+    const recheck = (key: string) => callObject<SetupCheckRun | null>(env().baseUrl(), "SetupChecks", key, "recheck", { id: "github.app-identity" });
+
+    it.each([
+      ["an orchestrator-wide run", "shared-fails-wide", (key: string) => call<SetupCheckRun>(key, "runOrchestratorWide")],
+      ["a recheck of it", "shared-fails-recheck", recheck],
+    ] as const)("answers %s that finds it failing with a full run, stored whole", async (_case, key, start) => {
+      nextRun = async () => ({ checkedAt: 7300, results: [appIdentity("pass"), row({ project: "ENG" }), row({ project: "OPS" })] });
+      await call<SetupCheckRun>(key, "run");
+      const failing: SetupCheckRun = { checkedAt: 7350, results: [appIdentity("fail")], scope: { checks: ["github.app-identity"] } };
+      nextWideRun = async () => failing;
+      nextScope = async () => failing;
+      const full: SetupCheckRun = { checkedAt: 7401, results: [appIdentity("fail"), waiting("ENG"), waiting("OPS")] };
+      let quiet = 0;
+      nextQuietRun = async () => { quiet++; return full; };
+
+      expect(await start(key)).toEqual(full);
+      expect(quiet).toBe(1);
+      expect(await call(key, "get")).toEqual(full);
+    });
+
+    it("answers a project run that finds it passing again with a full run, so no project's rows wait on a fault that has cleared", async () => {
+      nextRun = async () => ({ checkedAt: 7450, results: [appIdentity("fail"), waiting("ENG"), waiting("OPS")] });
+      await call<SetupCheckRun>("shared-recovers", "run");
+      nextProjectRun = async () => ({ checkedAt: 7460, results: [appIdentity("pass"), row({ project: "ENG" })], scope: { checks: ["github.app-identity", "tracker.linear.team-access"], projects: ["ENG"] } });
+      const full: SetupCheckRun = { checkedAt: 7471, results: [appIdentity("pass"), row({ project: "ENG" }), row({ project: "OPS" })] };
+      let quiet = 0;
+      nextQuietRun = async () => { quiet++; return full; };
+
+      expect(await runProject("shared-recovers", "ENG")).toEqual(full);
+      expect(quiet).toBe(1);
+    });
+
+    // A check no project's rows wait on reaches no project's rows, so its change merges as it is.
+    it("merges an orchestrator-wide run whose only change is to a check no project waits on", async () => {
+      nextRun = async () => ({ checkedAt: 7480, results: [appIdentity("pass"), row({ id: "restate", group: "orchestrator" }), row({ project: "ENG" })] });
+      await call<SetupCheckRun>("unshared-change", "run");
+      nextWideRun = async () => ({ checkedAt: 7490, results: [appIdentity("pass"), row({ id: "restate", group: "orchestrator", state: "fail" })], scope: { checks: ["github.app-identity", "restate"] } });
+      let quiet = 0;
+      nextQuietRun = async () => { quiet++; return runAt(0); };
+
+      const merged = await call<SetupCheckRun>("unshared-change", "runOrchestratorWide");
+      expect(quiet).toBe(0);
+      expect(merged.results).toContainEqual(row({ id: "restate", group: "orchestrator", state: "fail", checkedAt: 7490 }));
+      expect(merged.results).toContainEqual(row({ project: "ENG" }));
+    });
   });
 
   // The project list is read in a step, so a retried merge drops the same projects the first attempt saw.
@@ -292,7 +340,8 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
     });
 
     it("re-runs each check the rechecked rows wait on, so none waits on an older row", async () => {
-      nextRun = async () => ({ checkedAt: 8300, results: [row({ project: "ENG" })] });
+      // github.app-identity already fails in the stored run, so its recheck merges rather than escalating to a full run.
+      nextRun = async () => ({ checkedAt: 8300, results: [row({ project: "ENG" }), row({ id: "github.app-identity", group: "github", state: "fail" })] });
       await call<SetupCheckRun>("recheck-waits", "run");
       const waiting = row({ project: "ENG", state: "cannot-verify", waitsOn: "github.app-identity" });
       const asked = answering({

@@ -82,10 +82,9 @@ The container runs as the unprivileged `node` user.
 
 ## Serving from a remote store
 
-Set `KG_BACKEND=stardog_run` in the orchestrator environment to serve the graph
-from Stardog. The sidecar code comes from the public base KG repo; no customer
-KG repo is needed. These values are environment-only for now;
-[AII-1880](https://linear.app/eudoxus/issue/AII-1880) moves them to the admin KG page.
+The KG page (`/admin#kg-pipelines`) is the home of the graph source and the
+Stardog values. The sidecar code comes from the public base KG repo; no customer
+KG repo is needed.
 
 | Variable | Purpose |
 | -- | -- |
@@ -93,9 +92,85 @@ KG repo is needed. These values are environment-only for now;
 | `KG_STARDOG_RUN_TOKEN` | Access token, passed to the sidecar without logging it. |
 | `KG_STARDOG_DB` | Database name. |
 | `KG_STARDOG_RUN_ENDPOINT` | SPARQL endpoint URL. |
-| `KG_STARDOG_DATASET` | Dataset sent as `default-graph-uri`. Necessary for a graph installed as a Knowledge Graph: the database default graph is empty, and queries without this parameter see no data. |
+| `KG_STARDOG_DATASET` | Fallback dataset sent as `default-graph-uri`, used only when no graph name is stored. A stored graph name derives the dataset. |
 | `KG_STARDOG_RUN_CONSOLE` | Endpoint console URL. |
 | `KG_NAMESPACE` | Graph IRI namespace; a nonempty value takes precedence over `sources.yml`, including for the boot probe. |
+
+`src/kg-graph-source.ts` holds the stored values the sidecar reads at start. The
+environment above seeds them at first boot only. From then on, change the graph
+source and the database, endpoint, console, import-host and token values on the
+KG page; `KG_NAMESPACE` and the graph name remain settings rows with no field
+there yet. `kg_graph_source` defaults to
+`sidecar`; the non-secret rows are
+`kg_stardog_db`, `kg_stardog_run_endpoint`, `kg_stardog_run_console`, and
+`kg_stardog_run_platform`. The import platform defaults to
+`https://app.stardog.run`, distinct from the console host; an empty
+`kg_stardog_run_console` uses `https://console.stardog.run`. There is no import-host
+environment variable; the row default is enough. Namespace and graph name use the
+shared `kg_namespace` and `kg_graph_name` rows; this page deliberately adds no
+fields for them. `KG_NAMESPACE` seeds `kg_namespace` at first boot and has no
+admin-UI field yet. Names accept letters,
+digits, underscores and hyphens, beginning with a letter or digit; namespaces and
+endpoint/console/platform values must be absolute HTTP(S) URLs without userinfo.
+Empty fields clear their rows, and partial updates preserve omitted fields.
+
+With the `/app/kg/.base-only` marker there is no local graph, so the remote store
+is the effective source whatever the row says. `isRemoteKgStore()` is the one test
+of that: true with the marker, else when the row is `stardog_run`.
+
+### Switching the source
+
+`set_kg_graph_source` (admin, `src/restate/tools.ts`) is the only writer of
+`kg_graph_source`. For `stardog_run` it first sends one real COUNT query with the
+stored values (`src/stardog-client.ts`: the console `POST /api/token` exchange,
+then the edge's `/edge/token`), retrying for up to 6 minutes because a sleeping
+endpoint takes 2–5 minutes to wake. Only a passing test saves the row and restarts
+the sidecar. A failing test changes nothing. `sidecar` saves and restarts with no
+test, and is refused with `no-sidecar-graph` on a base-only image. There is
+nothing to undo: switching back is another call.
+
+The switch is a Restate handler, so a client that gives up at its own timeout must
+repeat the call with the same `Idempotency-Key`; the repeat attaches to the first
+invocation instead of testing again. Restarting starts a sidecar that did not start
+at boot and installs a probed provider, so `/mcp` lists the `kg_*` tools again
+without an orchestrator restart. A switch whose restart cannot prove a serving
+sidecar answers `{ switched: false, error: "sidecar-restart-failed", message }`
+and logs `failed`; the row was saved before the restart, so `message` says so and
+there is nothing to undo. A tested switch to `stardog_run` and a switch back to
+`sidecar` both clear a recorded Stardog error, and `GET /` reports
+`sidecar.lastError: null`.
+
+**The switch holds the KG refresh lock for its whole test, save and restart.** It
+uses the `KgRepo` object's `inFlight` marker, so a switch and a refresh cannot
+overlap: a switch started while a refresh (or a decision hold) owns the lock
+answers `refresh-in-flight` immediately without testing, saving or restarting; a
+second switch while one runs answers `switch-in-flight`; and `trigger` refuses a
+new refresh while a switch owns the lock. The lock is released on success, a
+failed test, a failed restart, and a cancelled invocation, so the next refresh is
+then admitted. With no refresh rail configured (`kgRefreshToolDeps` is null) the
+switch uses one fixed `KgRepo` key so two switches still cannot overlap.
+
+When the effective source is a remote store (`isRemoteKgStore()`), the served
+namespace is the stored `kg_namespace` row — the same value `stardogChildEnv`
+gives the sidecar child — even when `KG_NAMESPACE` disagrees or is unset and the
+image has no `sources.yml`. A local sidecar graph keeps the `KG_NAMESPACE`, then
+`sources.yml`, order.
+
+Values are set without a refresh rail: `GET`/`POST /api/settings` carry the
+non-secret fields (`kg_stardog_*`, `stardogTokenSet`, the effective `kgGraphSource`
+and `kgCustomerRepo`), never the token, and `POST /api/kg/stardog` stores the token
+alone (an empty token is a 400).
+
+The token is encrypted in `model_protected_secrets` at
+`kg-store:stardog-run-token`, with reference-bound authentication. The public
+getter exposes only `tokenSet`; missing or rotated `RUNNER_TOKEN_SECRET` makes
+it false. Token updates fail explicitly when encryption or storage fails, and
+roll back accompanying field changes. An empty token clears it. The child-env
+builder exposes the decrypted token and must never be logged or returned to a
+client. The dataset comes from the graph name: a stored name produces
+`tag:stardog:kit:alias:<name>` with hyphens replaced by underscores; only when no
+graph name is set does `KG_STARDOG_DATASET` apply. There is no dataset settings
+row, and the KG page sends no dataset field.
 
 | `KG_BACKEND` in the orchestrator environment | Staged overlay with `parts/` | Child `KG_BACKEND` | Overlay variables | `KG_EMBEDDINGS_DEGRADED` |
 | -- | -- | -- | -- | -- |

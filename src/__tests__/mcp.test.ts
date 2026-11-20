@@ -455,6 +455,8 @@ async function callMcp(
     triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> };
     clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> };
   },
+  /** Set false to leave the live provider as the caller installed it (the after-boot case). */
+  installProvider = true,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   // AII-713: the write tools are Restate handlers that call the admin actions and the
   // kg-refresh handle directly, not closures threaded through handleMcpRequest. The write-tier
@@ -491,6 +493,8 @@ async function callMcp(
         }
       : { ok: false, reason: "invalid", clientId: null },
   );
+  // tools/list reads the live provider (AII-1974), set once at boot in production; mirror that here.
+  if (installProvider) setKgMemoryProvider(provider);
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
   handleMcpRequest(
@@ -749,6 +753,28 @@ describe("handleMcpRequest", () => {
       const namesWith = JSON.parse(withProvider.body).result.tools.map((t: { name: string }) => t.name);
       expect(namesWith).toContain("kg_hybrid_search");
       expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+
+    it("a provider installed after boot makes kg_* visible with no restart (AII-1974)", async () => {
+      const before = await callMcp({ authorization: "Bearer tok" }, true, null, BASE_URL, "POST", '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}');
+      expect(JSON.parse(before.body).result.tools.some((t: { name: string }) => t.name.startsWith("kg_"))).toBe(false);
+
+      // A set_kg_graph_source restart installs a provider through the same setter. The kg_*
+      // handler itself reads that getter (src/restate/tools.ts), so a call reaches it too.
+      const provider = {
+        id: "sidecar",
+        capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: true },
+        listTools: async () => [],
+        callKgTool: async () => ({ ok: true as const, result: { hits: [] } }),
+      };
+      setKgMemoryProvider(provider);
+      try {
+        const after = await callMcp({ authorization: "Bearer tok" }, true, null, BASE_URL, "POST", '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
+          null, undefined, undefined, undefined, undefined, false);
+        expect(JSON.parse(after.body).result.tools.map((t: { name: string }) => t.name)).toEqual(expect.arrayContaining(["kg_hybrid_search", "kg_neighbors"]));
+      } finally {
+        setKgMemoryProvider(null);
+      }
     });
 
     it("preserves the JSON-RPC id in the tools/list response", async () => {
