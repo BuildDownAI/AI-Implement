@@ -4,6 +4,64 @@ import { authJs } from "../auth.js";
 import { helpersJs } from "../helpers.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mountAuth(): any {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><body>
+      <div id="login-page" class="hidden"></div>
+      <div id="admin-page"></div>
+      <div id="sso-buttons"></div>
+      <div id="sso-label" class="hidden"></div>
+      <div id="login-divider" class="hidden"></div>
+      <div id="access-code-notice" class="hidden"></div>
+      <div id="no-admin-notice" class="hidden"></div>
+      <div id="access-code-box" class="hidden"></div>
+      <div id="auth-error" class="hidden"></div>
+      <input id="access-code" />
+      <div id="login-error" class="hidden"></div>
+    </body>`,
+    { runScripts: "dangerously", url: "http://localhost" }
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const win = dom.window as any;
+  win.fetch = async () => ({ ok: false, status: 401, json: async () => ({}) });
+  const script = dom.window.document.createElement("script");
+  script.textContent = authJs;
+  dom.window.document.head.appendChild(script);
+  return win;
+}
+
+describe("api", () => {
+  it("keeps the caller's headers when it adds authentication", async () => {
+    const win = mountAuth();
+    let seen: Record<string, string> | undefined;
+    win.startRouting = () => {};
+    win.fetch = async (path: string, init: { headers: Record<string, string> }) => {
+      if (String(path).endsWith("/api/auth")) {
+        return { ok: true, status: 200, json: async () => ({ token: "test-token" }) };
+      }
+      if (String(path).endsWith("/api/session-identity")) {
+        return { ok: true, status: 200, json: async () => ({ role: "admin", email: "admin@example.com" }) };
+      }
+      seen = init.headers;
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    win.document.getElementById("access-code").value = "secret";
+    await win.login();
+
+    await win.api("/api/tools/set_kg_graph_source", {
+      method: "POST",
+      headers: { "Idempotency-Key": "kg-switch-test" },
+      body: "{}",
+    });
+
+    expect(seen).toMatchObject({
+      "Content-Type": "application/json",
+      "Idempotency-Key": "kg-switch-test",
+    });
+  });
+});
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mountRenderLogin(includeNoAdminEl: boolean, noAdmin: boolean, providers: { id: string; label: string }[] = []): { win: any; dom: JSDOM } {
   const noAdminEl = includeNoAdminEl ? '<div id="no-admin-notice" class="hidden"></div>' : '';
   const dom = new JSDOM(

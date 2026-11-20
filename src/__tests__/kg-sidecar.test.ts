@@ -655,6 +655,72 @@ describe("restart()", () => {
       await sidecar.stop();
     }
   });
+
+  it("two concurrent restarts spawn children one at a time, and only one child is live at the end", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const spawns: Array<{ pid?: number; liveAtSpawn: number }> = [];
+    let live = 0;
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      {
+        httpGet: async () => true,
+        spawn: (cmd, args, opts) => {
+          const child = testSpawn(cmd, args, opts);
+          live += 1;
+          spawns.push({ pid: child.pid, liveAtSpawn: live });
+          child.once("close", () => { live -= 1; });
+          return child;
+        },
+      },
+    );
+    await sidecar.start();
+
+    try {
+      const firstPid = spawns[0]?.pid;
+      const [first, second] = [sidecar.restart(), sidecar.restart()];
+      await Promise.all([first, second]);
+
+      // Each restart ran, in order, and the second one's spawn happened only after the first child closed.
+      expect(spawns).toHaveLength(3);
+      expect(spawns.map((s) => s.liveAtSpawn)).toEqual([1, 1, 1]);
+      expect(spawns[1]?.pid).not.toBe(firstPid);
+      expect(spawns[2]?.pid).not.toBe(spawns[1]?.pid);
+      expect(live).toBe(1);
+      expect(() => process.kill(spawns[1]!.pid!, 0)).toThrow();
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("a rejected restart does not poison the chain", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    let calls = 0;
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      {
+        httpGet: async () => true,
+        spawn: (cmd, args, opts) => {
+          calls += 1;
+          if (calls === 2) throw new Error("spawn failed");
+          return testSpawn(cmd, args, opts);
+        },
+      },
+    );
+    await sidecar.start();
+    try {
+      await expect(sidecar.restart()).rejects.toThrow("spawn failed");
+      await expect(sidecar.restart()).resolves.toBeUndefined();
+      expect(calls).toBe(3);
+    } finally {
+      await sidecar.stop();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -781,7 +847,10 @@ describe("remote store selection", () => {
       expect(childEnv?.KG_PARTS_DIR).toBe(!remote && parts ? join(runtimeDir, "parts") : undefined);
       expect(childEnv?.KG_EMBEDDINGS_DEGRADED).toBeUndefined();
       expect(process.env.KG_EMBEDDINGS_DEGRADED).toBe(remote ? undefined : "1");
-      expect(childEnv).toMatchObject(values);
+      if (remote) expect(childEnv).toMatchObject(values);
+      else for (const key of Object.keys(values).filter((key) => key.startsWith("KG_STARDOG_"))) {
+        expect(childEnv?.[key]).toBeUndefined();
+      }
       const lines = logs.mock.calls.map((args) => args.join(" "));
       expect(lines.filter((line) => line === "[kg] serving remote store stardog_run")).toHaveLength(remote ? 1 : 0);
       for (const value of Object.values(values)) expect(lines.join("\n")).not.toContain(value);
@@ -804,4 +873,93 @@ it("falls back to sources.yml for an empty KG_NAMESPACE", async () => {
   const kgDir = makeKgDir();
   writeFileSync(join(kgDir, "sources.yml"), "namespace: https://baked.example/\n");
   expect(await getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://baked.example/");
+});
+
+describe("stored graph configuration", () => {
+  async function storedFixture() {
+    const { testDb } = await import("./helpers/test-db.js");
+    vi.stubEnv("RUNNER_TOKEN_SECRET", "sidecar-test-key");
+    return testDb({ modules: {
+      kg: () => import("../kg-graph-source.js"),
+      sidecar: () => import("../kg-sidecar.js"),
+    } });
+  }
+
+  it.each([false, true])("uses stored credentials, including marker-selected remote mode (%s)", async (baseOnly) => {
+    const { modules: { kg, sidecar: module } } = await storedFixture();
+    const kgDir = makeKgDir();
+    if (baseOnly) {
+      touch(join(kgDir, ".base-only"));
+      writeFileSync(join(kgDir, ".base-commit"), "a".repeat(40));
+    } else kg.setKgGraphSource("stardog_run");
+    kg.setStardogValues({ db: "stored-db", namespace: "https://stored.example/", token: "stored-token-sentinel" });
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+    expect(module.isRemoteKgStore({}, kgDir)).toBe(true);
+    let env: NodeJS.ProcessEnv | undefined;
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    const sidecar = new module.KgSidecar({ kgDir }, {
+      httpGet: async () => true,
+      spawn: (cmd, args, opts) => {
+        env = (opts as { env: NodeJS.ProcessEnv }).env;
+        return testSpawn(cmd, args, opts);
+      },
+    });
+    try {
+      await sidecar.start();
+      expect(env).toMatchObject({ KG_BACKEND: "stardog_run", KG_STARDOG_DB: "stored-db",
+        KG_NAMESPACE: "https://stored.example/", KG_STARDOG_RUN_TOKEN: "stored-token-sentinel" });
+      expect(JSON.stringify(logs.mock.calls)).not.toContain("stored-token-sentinel");
+      if (baseOnly) expect(JSON.stringify(logs.mock.calls)).toContain("a".repeat(40));
+      kg.setKgGraphSource("sidecar");
+      if (!baseOnly) {
+        vi.stubEnv("KG_BACKEND", "stardog_run");
+        vi.stubEnv("KG_STARDOG_UNKNOWN", "stale");
+        await sidecar.restart();
+        expect(env?.KG_BACKEND).toBeUndefined();
+        expect(Object.keys(env!).filter((key) => key.startsWith("KG_STARDOG_"))).toEqual([]);
+      }
+    } finally { await sidecar.stop(); }
+  });
+
+  it.each(["db", "namespace", "token", "unreadable"] as const)("base-only skips spawn and probing without %s", async (missing) => {
+    const { modules: { kg, sidecar: module } } = await storedFixture();
+    kg.setStardogValues({
+      db: missing === "db" ? "" : "db",
+      namespace: missing === "namespace" ? "" : "https://kg.example/",
+      token: missing === "token" ? "" : "token",
+    });
+    if (missing === "unreadable") vi.stubEnv("RUNNER_TOKEN_SECRET", "rotated");
+    const kgDir = makeKgDir();
+    touch(join(kgDir, ".base-only"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+    const spawn = vi.fn(testSpawn);
+    const httpGet = vi.fn(async () => true);
+    await new module.KgSidecar({ kgDir }, { spawn, httpGet }).start();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(httpGet).not.toHaveBeenCalled();
+    expect(process.env.KG_SIDECAR_URL).toBeUndefined();
+  });
+
+  it("getServedNamespace reads the stored namespace for a remote store, ignoring KG_NAMESPACE and sources.yml", async () => {
+    const { modules: { kg, sidecar: module } } = await storedFixture();
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "namespace: https://baked.example/\n");
+    kg.setKgGraphSource("stardog_run");
+    kg.setStardogValues({ db: "stored-db", namespace: "https://stored.example/", token: "stored-token" });
+    vi.stubEnv("KG_NAMESPACE", "https://environment.example/");
+    expect(await module.getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://stored.example/");
+
+    vi.stubEnv("KG_NAMESPACE", "");
+    expect(await module.getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://stored.example/");
+  });
+
+  it("getServedNamespace reads the stored namespace on a base-only image with no sources.yml and no KG_NAMESPACE", async () => {
+    const { modules: { kg, sidecar: module } } = await storedFixture();
+    const kgDir = makeKgDir();
+    touch(join(kgDir, ".base-only"));
+    kg.setStardogValues({ db: "stored-db", namespace: "https://stored.example/", token: "stored-token" });
+    vi.stubEnv("KG_NAMESPACE", undefined);
+    expect(module.isRemoteKgStore({}, kgDir)).toBe(true);
+    expect(await module.getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://stored.example/");
+  });
 });

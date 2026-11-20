@@ -18,6 +18,7 @@ function contextSources(dockerfile: string): string[] {
     if (args.some((arg) => arg.startsWith("--from="))) continue;
     // Every argument but the last is a source; flags such as --chown come first.
     for (const source of args.filter((arg) => !arg.startsWith("--")).slice(0, -1)) {
+      if (/^https?:\/\//.test(source)) continue;
       sources.push(source.replace(/^\.\//, "").split("/")[0]!);
     }
   }

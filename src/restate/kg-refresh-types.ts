@@ -9,6 +9,9 @@ import type { createKgRepo } from "./kg-repo.js";
 export type KgRefreshDefinition = ReturnType<typeof createKgRefreshWorkflow>;
 export type KgRepoDefinition = ReturnType<typeof createKgRepo>;
 
+/** The one fixed object key a switch uses when no KG source repo (and so no refresh rail) is configured. */
+export const KG_GRAPH_SOURCE_SWITCH_REPO_KEY = "kg-graph-source-switch";
+
 /** The kg-refresh pipeline's step ids in order (`pipelines/kg-refresh.yml`); `status().runnerStep` reads one pair of step promises per id. */
 export const KG_REFRESH_RUNNER_STEPS = [
   "clone",

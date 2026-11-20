@@ -118,7 +118,7 @@ import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider, getKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { parseHealthPort, withRequestErrorBoundary } from "./http-server.js";
 import { initMcpOAuthTables, routeMcpOAuth } from "./mcp-oauth.js";
@@ -170,11 +170,17 @@ import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { createKgRepo } from "./restate/kg-repo.js";
 import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, IMPLEMENTATION_CONTEXT_ISSUE_MODELS_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
-import { setKgRefreshToolDeps } from "./restate/tools.js";
+import { setKgRefreshToolDeps, setKgGraphSourceToolDeps, STARDOG_TEST_PAUSE_MS, type KgGraphSourceToolDeps } from "./restate/tools.js";
+import { createStardogClient } from "./stardog-client.js";
+import { isRemoteKgStore, KG_DIR } from "./kg-sidecar.js";
+import { setKgGraphSource, type KgGraphSource } from "./kg-graph-source.js";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
 import { checkKgSidecarHealth, probeKgSidecarAfterBoot } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
@@ -4232,6 +4238,56 @@ export function makeKgRefreshAdminDeps(
   };
 }
 
+/**
+ * The `set_kg_graph_source` dependencies (AII-1974), extracted from `main()` so the switch's
+ * restart step is testable without booting the orchestrator. Bound even when no KG source
+ * repo is configured: a base-only image switches between its absent sidecar graph and Stardog.
+ *
+ * The restart step starts a sidecar that did not start at boot (for example a base-only image
+ * whose Stardog values arrived later), then installs a probed provider so `/mcp`'s `tools/list`
+ * advertises `kg_*` with no orchestrator restart. It keeps a provider that already exists.
+ */
+export function createKgGraphSourceToolDeps(opts: {
+  /** Only `restart()` is used; a fake in tests can be a bare object. */
+  sidecar: Pick<KgSidecar, "restart">;
+  memoryProviderId?: string | null;
+  /** Defaults to `KG_DIR`; a test points it at a temp directory. */
+  kgDir?: string;
+  /** Test seam for the production global `fetch`. */
+  fetchImpl?: typeof fetch;
+}): KgGraphSourceToolDeps {
+  const stardogClient = createStardogClient(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {});
+  return {
+    countTriples: () => stardogClient.countTriples(),
+    saveGraphSource: (source: KgGraphSource) => setKgGraphSource(source),
+    restartSidecar: async () => {
+      await opts.sidecar.restart();
+      // KgSidecar.restart() resolves even when the sidecar never became ready, leaving the
+      // URL unset. A switch that reports success there would leave every kg_* call down.
+      const sidecarUrl = process.env.KG_SIDECAR_URL || null;
+      if (sidecarUrl === null) throw new Error("sidecar restart left KG_SIDECAR_URL unset");
+      const current = getKgMemoryProvider();
+      const provider = current instanceof SidecarMemoryProvider
+        ? current
+        : resolveMemoryProvider(sidecarUrl, opts.memoryProviderId);
+      if (provider === null) throw new Error("sidecar restart installed no memory provider");
+      if (provider !== current) setKgMemoryProvider(provider);
+      if (provider instanceof SidecarMemoryProvider) {
+        // The restart runs only after the Stardog test passed, so an error cached against the
+        // store that test just reached is stale. Clear it before the probe reads it (no query).
+        // A switch back to the local graph clears it in probe() instead.
+        if (isRemoteKgStore()) provider.clearStoreError();
+        // list-only for a remote store: the restart must not bill another store query.
+        const health = await probeWithTimeout(provider, undefined, isRemoteKgStore() ? "list-only" : "full");
+        if (!health.reachable) throw new Error("sidecar restart probe found the sidecar unreachable");
+        if (!health.toolsListed) throw new Error("sidecar restart probe listed no kg_* tools");
+      }
+    },
+    sidecarGraphPresent: () => !existsSync(join(opts.kgDir ?? KG_DIR, ".base-only")),
+    testPauseMs: STARDOG_TEST_PAUSE_MS,
+  };
+}
+
 // The settings key the deleted legacy state machine persisted its stage under.
 const LEGACY_KG_STAGE_SETTINGS_KEY = "kg_refresh_stage";
 
@@ -5436,8 +5492,14 @@ async function main(): Promise<void> {
     })
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
+  // set_kg_graph_source (AII-1974): bound even without KG_SOURCE_REPO, because a base-only
+  // image switches between its absent sidecar graph and Stardog.
+  setKgGraphSourceToolDeps(createKgGraphSourceToolDeps({ sidecar, memoryProviderId: config.memoryProviderId }));
   kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
+  // set_kg_graph_source holds the KG refresh lock even without a source repo. Register the
+  // object for the switch's fixed key when the refresh composition did not already add it.
+  const kgSwitchLockServices = kgComposition === null ? [createKgRepo({ workflowName: "KgRefresh" })] : [];
   // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every project on every backend.
   const planningRunServices = createProductionPlanningRunServices({
     config,
@@ -5500,7 +5562,7 @@ async function main(): Promise<void> {
     onOutcome: createSelfDeployOutcomeHandler(config),
   })];
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...kgSwitchLockServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
       // Boot settles as serving only once this hook returns, and the first poll waits for that.
