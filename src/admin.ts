@@ -86,7 +86,7 @@ import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { SelfDeployClient } from "./restate/self-deploy.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
-import { getStardogValues, setStardogValues } from "./kg-graph-source.js";
+import { getStardogValues, setStardogValues, validateStardogValues } from "./kg-graph-source.js";
 import { isRemoteKgStore } from "./kg-sidecar.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
@@ -3036,6 +3036,10 @@ function handleGetSettings(
     kg_stardog_run_endpoint: stardog.runEndpoint,
     kg_stardog_run_console: stardog.runConsole,
     kg_stardog_run_platform: stardog.runPlatform,
+    kg_namespace: stardog.namespace,
+    kg_graph_name: stardog.graphName,
+    kg_code_repo: dbSettings.kgCodeRepo,
+    kg_graph_label: dbSettings.kgGraphLabel,
     stardogTokenSet: stardog.tokenSet,
     kgCustomerRepo: Boolean(process.env.KG_SOURCE_REPO),
     linearPickupLabel: {
@@ -3069,6 +3073,10 @@ async function handlePostSettings(
     kg_stardog_run_endpoint?: string | null;
     kg_stardog_run_console?: string | null;
     kg_stardog_run_platform?: string | null;
+    kg_namespace?: string | null;
+    kg_graph_name?: string | null;
+    kg_code_repo?: string | null;
+    kg_graph_label?: string | null;
     kgGraphSource?: unknown;
     linearPickupLabel?: string | null;
     runnerImageAllowedPrefixes?: string | null;
@@ -3084,6 +3092,72 @@ async function handlePostSettings(
   } catch {
     json(res, 400, { error: "Invalid request body" });
     return;
+  }
+
+  // Graph details and the Stardog rows are validated before any write in this handler, so a
+  // request that mixes valid and invalid values answers 400 and stores nothing.
+  const stardogPatch: Parameters<typeof setStardogValues>[0] = {};
+  const stardogFields = {
+    kg_stardog_db: "db",
+    kg_stardog_run_endpoint: "runEndpoint",
+    kg_stardog_run_console: "runConsole",
+    kg_stardog_run_platform: "runPlatform",
+    kg_namespace: "namespace",
+    kg_graph_name: "graphName",
+  } as const;
+  for (const field of Object.keys(stardogFields) as Array<keyof typeof stardogFields>) {
+    const raw = body[field];
+    if (raw === undefined) continue;
+    if (raw !== null && typeof raw !== "string") {
+      json(res, 400, { error: `${field} must be a string or null` });
+      return;
+    }
+    stardogPatch[stardogFields[field]] = raw ?? "";
+  }
+  if (Object.keys(stardogPatch).length > 0) {
+    try {
+      validateStardogValues(stardogPatch);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : "Invalid Stardog values" });
+      return;
+    }
+  }
+
+  let kgCodeRepo: string | null | undefined;
+  if ("kg_code_repo" in body) {
+    const raw = body.kg_code_repo;
+    if (raw !== null && typeof raw !== "string") {
+      json(res, 400, { error: "kg_code_repo must be a string or null" });
+      return;
+    }
+    const trimmed = typeof raw === "string" ? raw.trim() : "";
+    if (trimmed && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,100}$/.test(trimmed)) {
+      json(res, 400, { error: "kg_code_repo must be an owner/name GitHub repository" });
+      return;
+    }
+    kgCodeRepo = trimmed || null;
+  }
+
+  let kgGraphLabel: string | null | undefined;
+  if ("kg_graph_label" in body) {
+    const raw = body.kg_graph_label;
+    if (raw !== null && typeof raw !== "string") {
+      json(res, 400, { error: "kg_graph_label must be a string or null" });
+      return;
+    }
+    const value = typeof raw === "string" ? raw : "";
+    // Validate the raw value: trimming must not hide a control character or shorten an
+    // over-length label into an accepted one.
+    if (value.length > 200) {
+      json(res, 400, { error: "kg_graph_label must be 200 characters or fewer" });
+      return;
+    }
+    if (/[\x00-\x1f\x7f]/.test(value)) {
+      json(res, 400, { error: "kg_graph_label must not contain control characters" });
+      return;
+    }
+    const trimmed = value.trim();
+    kgGraphLabel = trimmed || null;
   }
 
   let runnerImagePrefixes: string | null | undefined;
@@ -3184,32 +3258,14 @@ async function handlePostSettings(
     setOrchestratorSetting("kgBaseRepo", val);
   }
 
-  // The non-secret Stardog values. `kgGraphSource` is deliberately ignored: only
-  // set_kg_graph_source writes that row, after it has tested Stardog. An empty value
-  // clears its row; an omitted one preserves it.
-  const stardogPatch: Parameters<typeof setStardogValues>[0] = {};
-  const stardogFields = {
-    kg_stardog_db: "db",
-    kg_stardog_run_endpoint: "runEndpoint",
-    kg_stardog_run_console: "runConsole",
-    kg_stardog_run_platform: "runPlatform",
-  } as const;
-  for (const field of Object.keys(stardogFields) as Array<keyof typeof stardogFields>) {
-    const raw = body[field];
-    if (raw === undefined) continue;
-    if (raw !== null && typeof raw !== "string") {
-      json(res, 400, { error: `${field} must be a string or null` });
-      return;
-    }
-    stardogPatch[stardogFields[field]] = raw ?? "";
-  }
+  if (kgCodeRepo !== undefined) setOrchestratorSetting("kgCodeRepo", kgCodeRepo);
+  if (kgGraphLabel !== undefined) setOrchestratorSetting("kgGraphLabel", kgGraphLabel);
+
+  // The non-secret Stardog values, already validated above. `kgGraphSource` is deliberately
+  // ignored: only set_kg_graph_source writes that row, after it has tested Stardog. An empty
+  // value clears its row; an omitted one preserves it.
   if (Object.keys(stardogPatch).length > 0) {
-    try {
-      setStardogValues(stardogPatch);
-    } catch (err) {
-      json(res, 400, { error: err instanceof Error ? err.message : "Invalid Stardog values" });
-      return;
-    }
+    setStardogValues(stardogPatch);
   }
 
   const dbSettings = getOrchestratorSettings();
@@ -3229,6 +3285,10 @@ async function handlePostSettings(
     kg_stardog_run_endpoint: stardog.runEndpoint,
     kg_stardog_run_console: stardog.runConsole,
     kg_stardog_run_platform: stardog.runPlatform,
+    kg_namespace: stardog.namespace,
+    kg_graph_name: stardog.graphName,
+    kg_code_repo: dbSettings.kgCodeRepo,
+    kg_graph_label: dbSettings.kgGraphLabel,
     stardogTokenSet: stardog.tokenSet,
     kgCustomerRepo: Boolean(process.env.KG_SOURCE_REPO),
     linearPickupLabel: {

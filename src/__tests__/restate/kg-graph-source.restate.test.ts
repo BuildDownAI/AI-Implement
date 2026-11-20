@@ -455,6 +455,20 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.restarts).toBe(0);
   });
 
+  it.each(VARIANTS.map(([label]) => label))("refuses stardog_run when only the namespace is missing (%s)", async (label) => {
+    const env = environments.get(label)!;
+    setStardogValues({ namespace: "" });
+    const result = await switchSource(env, "stardog_run");
+    expect(result.isError).not.toBe(true);
+    expect(resultBody(result)).toEqual({ switched: false, error: "stardog-values-missing" });
+    expect(fixture.calls).toBe(0);
+    expect(fixture.restarts).toBe(0);
+
+    // The namespace is the only value the fixture had to add back: db and token were already stored.
+    setStardogValues({ namespace: "https://kg.example/" });
+    expect(resultBody(await switchSource(env, "stardog_run"))).toEqual({ switched: true, source: "stardog_run", triples: 42 });
+  });
+
   it.each(VARIANTS.map(([label]) => label))("a non-admin caller is refused and nothing runs (%s)", async (label) => {
     const env = environments.get(label)!;
     const result = await callService<ToolResult>(env.baseUrl(), "orchestratorTools", "set_kg_graph_source", {

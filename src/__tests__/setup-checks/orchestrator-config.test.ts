@@ -129,7 +129,8 @@ describe("kg.remote-store", () => {
       KG_BACKEND: "stardog_run", KG_STARDOG_DB: "ambient", KG_NAMESPACE: "https://ambient/", KG_STARDOG_RUN_TOKEN: "ambient-token",
     } }), [check]);
     expect(result.results).toMatchObject([{ tier: "feature", state: "fail",
-      detail: "Missing: KG_STARDOG_RUN_TOKEN, KG_STARDOG_DB, KG_NAMESPACE" }]);
+      detail: "Missing: KG_STARDOG_RUN_TOKEN, KG_STARDOG_DB, KG_NAMESPACE",
+      fix: "Save the Stardog values and the Graph details on /admin#kg-pipelines." }]);
     expect(countFailingCore(result)).toBe(0);
   });
 });
