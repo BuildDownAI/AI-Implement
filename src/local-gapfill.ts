@@ -21,6 +21,8 @@ export interface DispatchLocalGapfillInput {
   mapping: RepoMapping;
   issue: LocalGapfillIssue;
   prNumber: number;
+  /** PR base branch to fetch at clone time (conflict-repair runs only). */
+  baseBranch?: string;
   githubToken: string;
   image: string;
   orchestratorUrl: string;
@@ -70,6 +72,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     issue: input.issue,
     runnerPhase: "gap-analysis",
     prNumber: String(input.prNumber),
+    ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
     commentInstruction: input.commentInstruction || undefined,
     runnerCallbackUrl: input.runnerCallbackUrl || undefined,
     retryPolicy: input.retryPolicy,

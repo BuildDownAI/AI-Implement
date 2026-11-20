@@ -38,6 +38,12 @@ it("preserves defaults and returns only safe machine identity", async () => {
   expect(decodeRunConfig(config.config.env.AI_IMPLEMENT_RUN_CONFIG)).not.toHaveProperty("reviewFix");
   expect(result).toEqual({ machine: { id: "m", name: "session-aii-1" }, resolvedImage: "runner:latest" });
 });
+it("carries a supplied baseBranch and omits it when not given", async () => {
+  await dispatchFlyGapfill(input({ baseBranch: "ai-implement/feature/eng-7" }));
+  expect(decodeRunConfig(mocks.create.mock.calls.at(-1)![2].config.env.AI_IMPLEMENT_RUN_CONFIG).baseBranch).toBe("ai-implement/feature/eng-7");
+  await dispatchFlyGapfill(input());
+  expect(decodeRunConfig(mocks.create.mock.calls.at(-1)![2].config.env.AI_IMPLEMENT_RUN_CONFIG)).not.toHaveProperty("baseBranch");
+});
 it("preserves the previous environment and run config for omitted and explicit agent-default", async () => {
   const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
   try {

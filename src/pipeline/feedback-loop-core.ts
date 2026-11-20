@@ -73,6 +73,7 @@ export function commentInstructionReviewRubric(instruction: string | null | unde
 ${wrapWithPlanningGuard(task)}
 
 For this run, these scope rules take precedence over grading the original issue or every numbered acceptance-bar claim:
+- When this run created a merge commit, the changes brought in from the merged branch are not this run's work; review the conflict resolution and this PR's own changes.
 - Block on faults in the work requested by the comment instruction, and on faults the diff itself adds: regressions, broken tests, or unsafe changes.
 - Requirements of the original issue or acceptance-bar claims that the instruction did not ask for are advisory. Report them in feedback only; do not put them in blocking_issues or withhold approval for them.
 - Requested work remains in scope even when it also appears in the issue description or acceptance bar. For a review-fix task, all open findings carried by the instruction remain in scope and unresolved findings require blocking_issues.

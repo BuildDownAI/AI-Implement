@@ -58,7 +58,7 @@ describe("Restate budget park composition", () => {
       vi.spyOn(probe, "resolveWorkflowCapabilities").mockResolvedValue({
         contract: "envelope", supportsAttemptCorrelation: true, supportsRunPublicationToken: true,
       });
-      vi.spyOn(github, "getPullRequestState").mockResolvedValue({ state: "open", merged: false, headRef: "fix", headSha: "a".repeat(40) });
+      vi.spyOn(github, "getPullRequestState").mockResolvedValue({ state: "open", merged: false, headRef: "fix", headSha: "a".repeat(40), baseRef: "main" });
       const comments: Awaited<ReturnType<typeof github.listPrComments>> = [];
       vi.spyOn(github, "listPrComments").mockImplementation(async () => comments);
       const postPr = vi.spyOn(github, "postPrComment").mockImplementation(async (_t, _o, _r, _n, body) => { comments.push({ id: comments.length + 1, body }); });

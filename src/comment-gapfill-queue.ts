@@ -183,9 +183,11 @@ export function hasPendingConflictResolution(owner: string, repo: string, prNumb
 export function conflictResolutionInstruction(featureBranch: string): string {
   return [
     `This PR conflicts with its grouping branch \`${featureBranch}\` (sibling changes merged first).`,
-    `Run \`git fetch origin && git merge origin/${featureBranch}\` on this PR branch, resolve every conflict`,
+    `First run \`git rev-parse --verify origin/${featureBranch}\` on this PR branch; if that ref is missing, stop and report it —`,
+    `the clone has no origin credential, so a fetch cannot work. Otherwise run \`git merge origin/${featureBranch}\`, resolve every conflict`,
     `by keeping BOTH sides' intent (the sibling changes already on \`${featureBranch}\` AND this PR's changes),`,
-    `re-run the repo's tests, and push the merge commit to this branch. Do not force-push, do not revert sibling work.`,
+    `re-run the repo's tests, and finish the merge with \`git commit --no-edit\`. Do not push — the pipeline pushes the merge commit.`,
+    `Do not force-push, do not revert sibling work.`,
   ].join(" ");
 }
 

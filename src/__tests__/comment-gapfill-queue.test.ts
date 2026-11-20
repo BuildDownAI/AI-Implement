@@ -239,6 +239,20 @@ describe("conflict resolution helpers", () => {
     expect(rows[0].commenter).toBe(queue.CONFLICT_COMMENTER);
     expect(rows[0].instruction).toContain("ai-implement/feature/aii-200");
   });
+
+  it("conflictResolutionInstruction merges the fetched ref and commits without fetching or pushing", () => {
+    const instruction = queue.conflictResolutionInstruction("ai-implement/feature/aii-200");
+    expect(instruction).toContain("git rev-parse --verify origin/ai-implement/feature/aii-200");
+    expect(instruction).toContain("git merge origin/ai-implement/feature/aii-200");
+    expect(instruction).toContain("git commit --no-edit");
+    expect(instruction).toContain("stop and report");
+    expect(instruction).toContain("BOTH sides' intent");
+    expect(instruction).toContain("tests");
+    expect(instruction).toContain("Do not push");
+    expect(instruction).not.toContain("git fetch");
+    expect(instruction).not.toMatch(/push the merge commit/i);
+    expect(instruction).not.toMatch(/force-push\s+the|git push --force/);
+  });
 });
 
 describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
