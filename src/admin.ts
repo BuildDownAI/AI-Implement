@@ -24,6 +24,7 @@ import {
   upsertMapping,
   updateMappingCap,
   setMappingPaused,
+  setMappingExecutionMode,
   deleteMapping,
 } from "./config.js";
 import { isReviewProcessId, type ReviewProcessId } from "./review-process.js";
@@ -2247,6 +2248,42 @@ export function pauseProjectAction(
     return { status: 404, body: { error: "Team not found" } };
   }
   return { status: 200, body: { updated, paused } };
+}
+
+export type SetProjectExecutionModeResult =
+  | { ok: true; teamKey: string; executionMode: ExecutionMode }
+  | { ok: false; code: "mapping-not-found" }
+  | { ok: false; code: "fly-not-eligible"; reason: string };
+
+/**
+ * Switches one project's execution mode without touching any other mapping column.
+ * The Fly check is made against the proposed mapping, not the stored one, and always
+ * with the "fly" runner mode: under "default" the eligibility check otherwise returns
+ * early and would let a Fly-ineligible project store a mode dispatch then skips.
+ */
+export function setProjectExecutionModeAction(
+  config: AdminConfig,
+  teamKey: string,
+  mode: ExecutionMode,
+): SetProjectExecutionModeResult {
+  const mapping = getOwnMapping(teamKey);
+  if (!mapping) {
+    return { ok: false, code: "mapping-not-found" };
+  }
+  if (mode === "fly-machines") {
+    const eligibility = checkForcedPathEligibility(
+      "fly",
+      { ...mapping, executionMode: mode },
+      Boolean(config.flySessionsApp),
+    );
+    if (!eligibility.eligible) {
+      return { ok: false, code: "fly-not-eligible", reason: eligibility.reason };
+    }
+  }
+  if (!setMappingExecutionMode(teamKey, mode)) {
+    return { ok: false, code: "mapping-not-found" };
+  }
+  return { ok: true, teamKey, executionMode: mode };
 }
 
 async function handlePatchMapping(
