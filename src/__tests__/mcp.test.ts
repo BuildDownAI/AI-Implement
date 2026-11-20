@@ -47,6 +47,7 @@ import {
   pauseProjectTool,
   importEnvironmentCredentialTool,
   addProjectTool,
+  setProjectExecutionModeTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
   listDispatchReservationsTool,
@@ -59,6 +60,7 @@ import {
   upsertMappingAction,
   triggerWorkflowSyncAction,
   clearDedupEntryAction,
+  setProjectExecutionModeAction,
 } from "../admin.js";
 
 // The five non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
@@ -75,6 +77,7 @@ vi.mock("../admin.js", () => ({
   upsertMappingAction: vi.fn(),
   triggerWorkflowSyncAction: vi.fn(),
   clearDedupEntryAction: vi.fn(),
+  setProjectExecutionModeAction: vi.fn(),
 }));
 
 /**
@@ -125,6 +128,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   pause_project: pauseProjectTool,
   import_environment_credential: importEnvironmentCredentialTool,
   add_project: addProjectTool,
+  set_project_execution_mode: setProjectExecutionModeTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
   clear_dispatch_dedup: clearDispatchDedupTool,
   list_dispatch_reservations: listDispatchReservationsTool,
@@ -142,6 +146,7 @@ const WRITE_TOOL_NAMES = new Set([
   "add_project",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
+  "set_project_execution_mode",
   "release_dispatch_reservation",
 ]);
 const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]);
@@ -1973,6 +1978,37 @@ describe("handleMcpRequest", () => {
   });
 
   describe("tools/call — write tier (set_runner_mode, pause_project, add_project, trigger_workflow_sync, clear_dispatch_dedup)", () => {
+    it("set_project_execution_mode: as admin, forwards the team key and mode with an idempotency key", async () => {
+      mockRole("admin");
+      vi.mocked(setProjectExecutionModeAction).mockReturnValue({ ok: true, teamKey: "AII", executionMode: "github-actions" });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0", id: 59, method: "tools/call",
+          params: { name: "set_project_execution_mode", arguments: { teamKey: "AII", mode: "github-actions" }, _meta: { idempotencyKey: "switch-1" } },
+        }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ teamKey: "AII", executionMode: "github-actions" });
+      expect(setProjectExecutionModeAction).toHaveBeenCalledWith(expect.any(Object), "AII", "github-actions");
+      expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
+        "set_project_execution_mode", { teamKey: "AII", mode: "github-actions" },
+        expect.objectContaining({ role: "admin" }), { idempotencyKey: "user@example.com:switch-1" },
+      );
+      expect(logSpy).toHaveBeenCalledWith(
+        "[mcp] write tool=set_project_execution_mode actor=user@example.com role=admin result=ok kind=human teamKey=AII mode=github-actions",
+      );
+    });
+
     it("set_runner_mode: as admin, calls setRunnerMode with the parsed args and returns its result", async () => {
       mockRole("admin");
       const setRunnerModeMock = vi.fn(() => ({ status: 200, body: { mode: "gha", source: "db" } }));

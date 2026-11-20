@@ -33,6 +33,8 @@ import {
   addProjectTool,
   setProjectAgentModeTool,
   SetProjectAgentModeArgsSchema,
+  setProjectExecutionModeTool,
+  SetProjectExecutionModeArgsSchema,
   addModelAccountTool,
   setProjectStageTool,
   AddModelAccountArgsSchema,
@@ -67,6 +69,7 @@ import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../resta
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
   setProjectAgentModeAction,
+  setProjectExecutionModeAction,
   setRunnerModeAction,
   pauseProjectAction,
   upsertMappingAction,
@@ -105,6 +108,7 @@ vi.mock("../admin.js", () => ({
   createModelAccountAction: vi.fn(),
   putProjectAgentConfigAction: vi.fn(),
   setProjectAgentModeAction: vi.fn(),
+  setProjectExecutionModeAction: vi.fn(),
   setRunnerModeAction: vi.fn(),
   pauseProjectAction: vi.fn(),
   upsertMappingAction: vi.fn(),
@@ -1912,6 +1916,72 @@ describe("migrated write handlers (AII-713)", () => {
     });
   });
 
+  describe("set_project_execution_mode", () => {
+    it("journals the action once with the config, team key and mode", async () => {
+      vi.mocked(setProjectExecutionModeAction).mockReturnValue({ ok: true, teamKey: "AII", executionMode: "github-actions" });
+      const calls: RunCall[] = [];
+      const result = await setProjectExecutionModeTool(fakeContext("set_project_execution_mode", calls), {
+        caller: admin, args: { teamKey: "AII", mode: "github-actions" },
+      });
+      expect(setProjectExecutionModeAction).toHaveBeenCalledWith(expect.any(Object), "AII", "github-actions");
+      expect(result).toEqual({ content: [{ type: "text", text: '{"teamKey":"AII","executionMode":"github-actions"}' }] });
+      expect(calls).toEqual([{ name: "set-project-execution-mode", options: { maxRetryAttempts: 1 },
+        result: { ok: true, teamKey: "AII", executionMode: "github-actions" } }]);
+    });
+
+    it("returns the bare mapping-not-found refusal", async () => {
+      vi.mocked(setProjectExecutionModeAction).mockReturnValue({ ok: false, code: "mapping-not-found" });
+      expect(await setProjectExecutionModeTool(fakeContext("set_project_execution_mode"), {
+        caller: admin, args: { teamKey: "NOPE", mode: "fly-machines" },
+      })).toEqual({ isError: true, content: [{ type: "text", text: "mapping-not-found" }] });
+    });
+
+    it("returns fly-not-eligible with the eligibility reason", async () => {
+      vi.mocked(setProjectExecutionModeAction).mockReturnValue({
+        ok: false, code: "fly-not-eligible", reason: "no Fly sessions app configured (FLY_SESSIONS_APP)",
+      });
+      expect(await setProjectExecutionModeTool(fakeContext("set_project_execution_mode"), {
+        caller: admin, args: { teamKey: "AII", mode: "fly-machines" },
+      })).toEqual({ isError: true, content: [{ type: "text", text: "fly-not-eligible: no Fly sessions app configured (FLY_SESSIONS_APP)" }] });
+    });
+
+    it("audits the team key and mode", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      vi.mocked(setProjectExecutionModeAction).mockReturnValue({ ok: true, teamKey: "AII", executionMode: "fly-machines" });
+      await setProjectExecutionModeTool(fakeContext("set_project_execution_mode"), {
+        caller: { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, args: { teamKey: "AII", mode: "fly-machines" },
+      });
+      expect(logSpy).toHaveBeenCalledWith(
+        "[mcp] write tool=set_project_execution_mode actor=admin@example.com role=admin result=ok kind=human teamKey=AII mode=fly-machines",
+      );
+      logSpy.mockRestore();
+    });
+
+    it("refuses a caller without the admin role or projects grant before the action runs", async () => {
+      vi.mocked(setProjectExecutionModeAction).mockClear();
+      expect(await setProjectExecutionModeTool(fakeContext("set_project_execution_mode"), {
+        caller: HUMAN_USER, args: { teamKey: "AII", mode: "github-actions" },
+      })).toEqual({ isError: true, content: [{ type: "text", text: "forbidden: set_project_execution_mode requires the admin role" }] });
+      expect(setProjectExecutionModeAction).not.toHaveBeenCalled();
+    });
+
+    it("accepts a projects-granted service caller", async () => {
+      vi.mocked(setProjectExecutionModeAction).mockReturnValue({ ok: true, teamKey: "AII", executionMode: "github-actions" });
+      const result = await setProjectExecutionModeTool(fakeContext("set_project_execution_mode"), {
+        caller: serviceCaller({ grants: ["projects"] }), args: { teamKey: "AII", mode: "github-actions" },
+      });
+      expect(result.isError).toBeUndefined();
+    });
+
+    it.each(["action", "attemptId", "pipeline", "backend", "patch", "schedule", "paused", "issueId", "dispatchId"])("rejects unknown argument %s", (key) => {
+      expect(SetProjectExecutionModeArgsSchema.safeParse({ teamKey: "AII", mode: "fly-machines", [key]: "x" }).success).toBe(false);
+    });
+
+    it("rejects a mode outside the two execution modes", () => {
+      expect(SetProjectExecutionModeArgsSchema.safeParse({ teamKey: "AII", mode: "local-docker" }).success).toBe(false);
+    });
+  });
+
   describe("add_project", () => {
     it("has no separate pre-validation — a partial args object reaches upsertMappingAction through ctx.run, whose own 400 comes back verbatim", async () => {
       (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 400, body: { error: "teamKey, owner, and repo are required" } });
@@ -2758,10 +2828,10 @@ describe("model administration acceptance through shared actions", () => {
     const declarations = readFileSync("src/restate/tools.ts", "utf8");
     const writes = [...declarations.matchAll(/= tool\(\s*\{([\s\S]*?)\n  async \(/g)]
       .filter(([, options]) => options.includes('role: "admin"') && !options.includes('operation: "read"')).length;
-    expect(writes).toBe(19);
-    expect(RESTATE_WRITE_TOOL_NAMES.size).toBe(18);
-    expect(docs).toContain("nineteen declared write handlers");
-    expect(docs).toContain("eighteen are in `RESTATE_WRITE_TOOL_NAMES`");
+    expect(writes).toBe(20);
+    expect(RESTATE_WRITE_TOOL_NAMES.size).toBe(19);
+    expect(docs).toContain("twenty declared write handlers");
+    expect(docs).toContain("nineteen are in `RESTATE_WRITE_TOOL_NAMES`");
   });
 });
 

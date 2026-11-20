@@ -1,6 +1,6 @@
 import { getReviewerScorecard } from "../../report-card.js";
 import { createModelProtectedSecrets } from "../../model-protected-secrets.js";
-import { makeStageAgentDefaults, makeStageAgentProfile } from "../helpers/builders.js";
+import { makeStageAgentDefaults, makeStageAgentProfile, makeMapping } from "../helpers/builders.js";
 import { getOrchestratorDefaults, saveAccountProfileRevision, setOrchestratorDefaults, setProjectConfigured } from "../../agent-config-store.js";
 import { createSession } from "../../admin-session.js";
 import { handleAdminRequest } from "../../admin.js";
@@ -26,8 +26,10 @@ import { serviceCaller, systemCaller, type Caller } from "../../mcp-identity.js"
 import * as dedup from "../../dedup.js";
 import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import { initLogTable } from "../../log.js";
-import { initMappingsTable, getMappings } from "../../config.js";
-import { initSettingsTable } from "../../runner-mode.js";
+import { initMappingsTable, getMappings, upsertMapping } from "../../config.js";
+import { initSettingsTable, setRunnerMode } from "../../runner-mode.js";
+import { getFlySessionsConfig, refreshRunnerBackendCache, resetRunnerBackendCache } from "../../orchestrator-settings.js";
+import { EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EPHEMERAL_FULL_ACCESS_ASSERTION } from "../../model-auth-contract.js";
 import { setKgMemoryProvider, type KgToolResult, type MemoryProvider } from "../../kg-provider.js";
 import { createSetupChecks } from "../../restate/setup-checks.js";
 import type { SetupCheckRun } from "../../setup-checks/index.js";
@@ -40,6 +42,7 @@ function adminToolArgs(name: string, fallback: Record<string, unknown>): Record<
     case "get_fly_setup": return {};
     case "unpark_issue": return { identifier: "CON-146" };
     case "set_project_agent_mode": return { teamKey: "BDS", mode: "legacy" };
+    case "set_project_execution_mode": return { teamKey: "BDS", mode: "github-actions" };
     case "start_deploy": return { branch: "testing", requestedBy: "test" };
     case "add_model_account": return {
       profileId: "grant-test", identity: "operator", agent: "claude",
@@ -423,8 +426,8 @@ describe("orchestratorTools (Restate)", () => {
     const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
       backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
       paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
-    // Only the project mode tool is reachable with the projects grant.
-    for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode")) {
+    // Only the project tools are reachable with the projects grant.
+    for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode" && handler.name !== "set_project_execution_mode")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
         caller: serviceCaller({ grants: ["projects"] }), args: adminToolArgs(name, args),
       });
@@ -481,6 +484,104 @@ describe("orchestratorTools (Restate)", () => {
     } finally {
       setProjectConfigured("BDS", false);
       setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("set_project_execution_mode switches a project both ways and changes only execution_mode (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const db = dedup.getDb();
+    const teamKey = "EXECMODE";
+    const seeded = makeMapping({
+      owner: "BuildDownAI", repo: "skills", workflowFile: "claude.yml", defaultBranch: "testing",
+      maxInProgressAiIssues: 7, executionMode: "fly-machines", sessionMode: "hybrid",
+      machineCpuKind: "performance", machineCpus: 4, machineMemoryMb: 8192,
+      planningEnabled: true, planningWorkflowFile: "plan.yml", autoApprovePlans: false, autoMerge: true,
+      extraEnv: { SUPER_SECRET: "leak-me", OTHER: "kept" }, provider: "anthropic",
+      paused: true, maxTurns: 12, maxIterations: 3, maxJobMinutes: 45, branchPrefix: "pr",
+      skillsRepo: "BuildDownAI/skills", dependencyTokenScope: "installation", memoryProviderId: "sidecar",
+      reviewers: [{ id: "gap-analysis", gates: true }], prDispatchBudget: 2,
+      reviewFixLifecycle: "restate", trustedReviewAuthors: ["trusted"], reviewProcess: "ai-implement",
+    });
+    const row = () => db.prepare("SELECT * FROM mappings WHERE team_key = ?").get(teamKey) as Record<string, unknown>;
+    const unknownRow = () => db.prepare("SELECT * FROM mappings WHERE team_key = ?").get("NOPE") as Record<string, unknown> | undefined;
+    const switchMode = (mode: string, caller: Caller = systemCaller()) =>
+      callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_execution_mode", { caller, args: { teamKey, mode } });
+    try {
+      upsertMapping(teamKey, seeded);
+      setRunnerMode("default");
+      resetRunnerBackendCache();
+      await refreshRunnerBackendCache({ readFlyMachines: async () => ({ app: "sessions-app", region: "iad" }) });
+      for (const mode of ["github-actions", "fly-machines", "github-actions"] as const) {
+        const before = row();
+        const result = await switchMode(mode);
+        expect(result.isError).toBeFalsy();
+        expect(JSON.parse(result.content[0].text)).toEqual({ teamKey, executionMode: mode });
+        expect(row()).toEqual({ ...before, execution_mode: mode });
+      }
+
+      const beforeRefusals = row();
+      const unknownKey = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_execution_mode", {
+        caller: systemCaller(), args: { teamKey: "NOPE", mode: "fly-machines" },
+      });
+      expect(unknownKey).toEqual({ isError: true, content: [{ type: "text", text: "mapping-not-found" }] });
+      expect(row()).toEqual(beforeRefusals);
+      expect(unknownRow()).toBeUndefined();
+
+      const user = await switchMode("fly-machines", { kind: "human", email: "user@example.com", role: "user", grants: [] });
+      expect(user).toEqual({ isError: true, content: [{ type: "text", text: "forbidden: set_project_execution_mode requires the admin role" }] });
+      expect(row()).toEqual(beforeRefusals);
+
+      for (const mode of ["fly-machines", "github-actions"] as const) {
+        const result = await switchMode(mode, serviceCaller({ grants: ["projects"] }));
+        expect(result.isError).toBeFalsy();
+        expect(JSON.parse(result.content[0].text)).toEqual({ teamKey, executionMode: mode });
+        expect(row()).toEqual({ ...beforeRefusals, execution_mode: mode });
+      }
+    } finally {
+      db.prepare("DELETE FROM mappings WHERE team_key = ?").run(teamKey);
+      resetRunnerBackendCache();
+      setRunnerMode("default");
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("set_project_execution_mode refuses Fly under the global default mode when eligibility fails, and changes nothing (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const db = dedup.getDb();
+    const teamKey = "EXECMODE2";
+    const seeded = makeMapping({
+      owner: "BuildDownAI", repo: "skills", workflowFile: "claude.yml", defaultBranch: "testing",
+      executionMode: "github-actions", autoMerge: true, extraEnv: { SUPER_SECRET: "leak-me" }, provider: "anthropic",
+    });
+    const row = () => db.prepare("SELECT * FROM mappings WHERE team_key = ?").get(teamKey) as Record<string, unknown>;
+    const switchMode = (mode: string) => callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_execution_mode", {
+      caller: systemCaller(), args: { teamKey, mode },
+    });
+    try {
+      setRunnerMode("default");
+      upsertMapping(teamKey, seeded);
+      resetRunnerBackendCache();
+      const beforeNoApp = row();
+      const noApp = await switchMode("fly-machines");
+      expect(noApp).toEqual({ isError: true, content: [{ type: "text", text: "fly-not-eligible: no Fly sessions app configured (FLY_SESSIONS_APP)" }] });
+      expect(row()).toEqual(beforeNoApp);
+
+      upsertMapping(teamKey, { ...seeded, provider: "bedrock", awsRegion: "us-east-1" });
+      await refreshRunnerBackendCache({ readFlyMachines: async () => ({ app: "sessions-app", region: "iad" }) });
+      expect(getFlySessionsConfig().app).toBe("sessions-app");
+      const beforeBedrock = row();
+      const bedrock = await switchMode("fly-machines");
+      expect(bedrock).toEqual({ isError: true, content: [{ type: "text", text: "fly-not-eligible: provider=bedrock is GHA-only (no role-assumption on Fly)" }] });
+      expect(row()).toEqual(beforeBedrock);
+
+      upsertMapping(teamKey, { ...seeded, extraEnv: { [EPHEMERAL_FULL_ACCESS_EXTRA_ENV]: EPHEMERAL_FULL_ACCESS_ASSERTION } });
+      const beforeFullAccess = row();
+      const fullAccess = await switchMode("fly-machines");
+      expect(fullAccess).toEqual({ isError: true, content: [{ type: "text", text: "fly-not-eligible: ephemeral full-access opt-in requires GitHub Actions execution" }] });
+      expect(row()).toEqual(beforeFullAccess);
+    } finally {
+      db.prepare("DELETE FROM mappings WHERE team_key = ?").run(teamKey);
+      resetRunnerBackendCache();
+      setRunnerMode("default");
     }
   });
 
