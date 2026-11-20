@@ -50,7 +50,7 @@ import { createProductionImplementationRunServices, createImplementationFindExis
 import { acquire, read } from "../dispatch-admission.js";
 import { acquireDispatch } from "../dispatch-gate.js";
 import { getCommentGapfillRefusal, recordCommentGapfillRefusal, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
-import { firePrBudgetPark, resolveManagedDecision, buildCommentGapfillInstruction } from "../comment-gapfill-drain.js";
+import { firePrBudgetPark, resolveManagedDecision, buildCommentGapfillInstruction, gapfillAccounting } from "../comment-gapfill-drain.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill } from "../gapfill-launch.js";
 import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, updateJobPrUrl, attachJobRunIdIfMissing, suppressStaleNotifications } from "../log.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
@@ -97,7 +97,7 @@ beforeEach(() => {
   vi.mocked(getLatestDispatchForPr).mockReturnValue(null);
   vi.mocked(getLatestDispatchForIssueIdentifier).mockReturnValue(null);
   input = { config: { githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "callback", runnerTokenSecret: "secret" }, getMapping: () => mapping,
-    resolveProvider: vi.fn(async () => ({})), resolveRunnerImage: vi.fn(), postDispatch: vi.fn(), finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn() } as unknown as ImplementationRunProductionInput;
+    resolveProvider: vi.fn(async () => ({ findByKey: vi.fn(async () => null) })), resolveRunnerImage: vi.fn(), postDispatch: vi.fn(), finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn() } as unknown as ImplementationRunProductionInput;
   createProductionImplementationRunServices(input);
   d = captured.deps as ImplementationRunDependencies;
 });
@@ -362,6 +362,41 @@ it.each(["PR", "issue identifier"])("gap-fill preserves the title recovered by %
   expect(getLatestDispatchForPr).toHaveBeenCalledExactlyOnceWith("Org", "repo", 42);
   if (source === "issue identifier") expect(getLatestDispatchForIssueIdentifier).toHaveBeenCalledExactlyOnceWith("Org", "repo", "ENG-1");
 });
+it.each(["github-actions", "fly-machines", "local-docker"] as const)("gap-fill launch carries the tracker issue body on %s", async backend => {
+  configureContainer();
+  const title = "Recovered title";
+  const body = `Current tracker body for ${backend}`;
+  vi.mocked(getLatestDispatchForPr).mockReturnValueOnce(makeJob({ issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: title }));
+  const findByKey = vi.fn(async () => ({ id: run.issueId, identifier: run.issueIdentifier, title, description: body, scopeKey: run.teamKey, nativeStatus: "open" }));
+  input.resolveProvider = vi.fn(async () => ({ findByKey })) as never;
+  createProductionImplementationRunServices(input);
+  d = captured.deps as ImplementationRunDependencies;
+  expect(await d.launch({ ...run, backend })).toEqual({ outcome: "accepted", jobId: backend === "github-actions" ? "88" : "machine" });
+  expect(input.resolveProvider).toHaveBeenCalledExactlyOnceWith(mapping);
+  expect(findByKey).toHaveBeenCalledExactlyOnceWith(run.issueIdentifier, run.teamKey);
+  const helper = backend === "github-actions" ? prepareGhaGapfillLaunch : backend === "fly-machines" ? dispatchFlyGapfill : dispatchLocalGapfill;
+  if (backend === "local-docker") {
+    expect(helper).toHaveBeenCalledWith(expect.objectContaining({ issue: expect.objectContaining({ title, description: body }) }));
+  } else {
+    expect(helper).toHaveBeenCalledWith(expect.objectContaining({ issueDescription: body, issue: expect.objectContaining({ issueTitle: title }) }));
+  }
+});
+it.each(["null", "empty description", "throw", "provider failure"] as const)("gap-fill falls back to the recovered title when the issue read is %s", async reason => {
+  const title = "Recovered title";
+  vi.mocked(getLatestDispatchForPr).mockReturnValueOnce(makeJob({ issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: title }));
+  const findByKey = vi.fn(async () => reason === "null" ? null : { id: run.issueId, identifier: run.issueIdentifier, title, description: reason === "empty description" ? "" : "body", scopeKey: run.teamKey, nativeStatus: "open" });
+  if (reason === "throw") findByKey.mockRejectedValueOnce(new Error("tracker unavailable"));
+  input.resolveProvider = (reason === "provider failure" ? vi.fn(async () => { throw new Error("tracker unavailable"); }) : vi.fn(async () => ({ findByKey }))) as never;
+  createProductionImplementationRunServices(input);
+  d = captured.deps as ImplementationRunDependencies;
+  expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({
+    issueDescription: undefined,
+    issue: expect.objectContaining({ issueTitle: title }),
+  }));
+  if (reason === "provider failure") expect(findByKey).not.toHaveBeenCalled();
+  else expect(findByKey).toHaveBeenCalledExactlyOnceWith(run.issueIdentifier, run.teamKey);
+});
 it("missing title retains the shared launch helper's issue-id fallback", async () => {
   await d.launch(run);
   expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({ issue: { issueId: run.issueId, issueIdentifier: run.issueIdentifier } }));
@@ -467,12 +502,63 @@ it.each(["github-actions", "fly-machines"] as const)("quietly skips roll-up revi
 
 it.each(["github-actions", "fly-machines", "local-docker"] as const)("launches paired roll-up review on %s", async backend => {
   configureContainer();
+  const body = `Roll-up tracker body for ${backend}`;
+  input.resolveProvider = vi.fn(async () => ({ findByKey: vi.fn(async () => ({ id: run.issueId, identifier: run.issueIdentifier, title: "Recovered title", description: body, scopeKey: run.teamKey, nativeStatus: "open" })) })) as never;
+  createProductionImplementationRunServices(input);
+  d = captured.deps as ImplementationRunDependencies;
   const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
   vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: "ai-implement-rollup-review", instruction: `Review the feature-branch roll-up at head ${"a".repeat(40)}. Post an advisory verdict in the PR conversation.` });
   expect(await d.launch({ ...run, backend })).toEqual({ outcome: "accepted", jobId: backend === "github-actions" ? "88" : "machine" });
   const helper = backend === "github-actions" ? prepareGhaGapfillLaunch : backend === "fly-machines" ? dispatchFlyGapfill : dispatchLocalGapfill;
-  expect(helper).toHaveBeenCalledWith(expect.objectContaining({ reviewOnly: { expectedHeadSha: "a".repeat(40), reviewers: expect.arrayContaining([{ id: "integration-review", gates: true }]) } }));
+  expect(helper).toHaveBeenCalledWith(expect.objectContaining({
+    reviewOnly: { expectedHeadSha: "a".repeat(40), reviewers: expect.arrayContaining([{ id: "integration-review", gates: true }]) },
+    ...(backend === "local-docker" ? { issue: expect.objectContaining({ description: body }) } : { issueDescription: body }),
+  }));
   expect(resolveSessionImage).toHaveBeenCalledTimes(backend === "local-docker" ? 0 : 1);
+});
+
+it("conflict repair carries the tracker body but still rejects when the base branch is unreadable", async () => {
+  configureContainer();
+  const body = "Conflict repair tracker body";
+  input.resolveProvider = vi.fn(async () => ({ findByKey: vi.fn(async () => ({ id: run.issueId, identifier: run.issueIdentifier, title: "Title", description: body, scopeKey: run.teamKey, nativeStatus: "open" })) })) as never;
+  createProductionImplementationRunServices(input);
+  d = captured.deps as ImplementationRunDependencies;
+  const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: "conflict", instruction: "merge" });
+  vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ state: "open", merged: false, base: { ref: "main" } }) } as Response);
+  expect(await d.launch({ ...run, backend: "fly-machines" })).toEqual({ outcome: "accepted", jobId: "machine" });
+  expect(dispatchFlyGapfill).toHaveBeenCalledWith(expect.objectContaining({ issueDescription: body, baseBranch: "main" }));
+
+  vi.clearAllMocks();
+  intents.clear();
+  vi.mocked(resolveManagedDecision).mockResolvedValue({ kind: "legacy" });
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: "conflict", instruction: "merge" });
+  vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ state: "open", merged: false, base: { ref: null } }) } as Response);
+  expect(await d.launch({ ...run, backend: "fly-machines" })).toEqual({ outcome: "rejected" });
+  expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "failed");
+  expect(dispatchFlyGapfill).not.toHaveBeenCalled();
+});
+
+it("tracker body stays out of logs, launch intent, accounting and dependency results", async () => {
+  const body = "TRACKER-BODY-SENTINEL";
+  input.resolveProvider = vi.fn(async () => ({ findByKey: vi.fn(async () => ({ id: run.issueId, identifier: run.issueIdentifier, title: "Title", description: body, scopeKey: run.teamKey, nativeStatus: "open" })) })) as never;
+  createProductionImplementationRunServices(input);
+  d = captured.deps as ImplementationRunDependencies;
+  const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    const result = await d.launch(run);
+    expect(result).toEqual({ outcome: "accepted", jobId: "88" });
+    expect(JSON.stringify(result)).not.toContain(body);
+    expect(JSON.stringify(intents.get(run.dispatchId))).not.toContain(body);
+    expect(JSON.stringify(vi.mocked(appendLogIfAbsent).mock.calls)).not.toContain(body);
+    expect(JSON.stringify(vi.mocked(gapfillAccounting).mock.calls)).not.toContain(body);
+    expect(log.mock.calls.map(args => args.join(" ")).join("\n")).not.toContain(body);
+    expect(error.mock.calls.map(args => args.join(" ")).join("\n")).not.toContain(body);
+  } finally {
+    log.mockRestore();
+    error.mockRestore();
+  }
 });
 
 it.each((["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend => (["default", "override"] as const).map(source => ({ backend, source }))))("ordinary gap-fill bypasses review capability: $backend / $source", async ({ backend, source }) => {
@@ -647,7 +733,7 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
     return { contract: "envelope", runnerImage: undefined, inputs: { token: "TOKEN-SENTINEL" } };
   });
   const input = { config: { githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "callback", runnerTokenSecret: "secret" }, getMapping: () => mapping,
-    resolveProvider: vi.fn(async () => ({})), resolveRunnerImage: vi.fn(), postDispatch: vi.fn(), finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn() } as unknown as ImplementationRunProductionInput;
+    resolveProvider: vi.fn(async () => ({ findByKey: vi.fn(async () => null) })), resolveRunnerImage: vi.fn(), postDispatch: vi.fn(), finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn() } as unknown as ImplementationRunProductionInput;
   createProductionImplementationRunServices(input);
   await expect((captured.deps as ImplementationRunDependencies).launch(recoveryRun)).rejects.toThrow("crash before insert");
   expect(getJobByDispatchId("dispatch")).toBeNull();

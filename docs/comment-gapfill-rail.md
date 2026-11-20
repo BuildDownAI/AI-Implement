@@ -62,6 +62,8 @@ Restate unavailability or an unavailable submission leaves the item pending and 
 
 GitHub Actions gap-fill recovery uses the persisted `comment_gapfill_launch` intent’s frozen owner/repo and workflow target. `readStatus` and `stop` also use that original owner/repo even when the current mapping disappears or points to a different repository. Monitoring and crash recovery therefore keep authority over the original launch.
 
+On every backend, the run’s issue description is the tracker’s current issue body, read by the orchestrator with `findByKey(run.issueIdentifier, run.teamKey)` during the journaled launch step. If the issue is missing, its description is empty, or the read throws, the run keeps the previous fallback: the recovered dispatch title, then the issue ID. The body is passed only as the launch input; it is not written to the gap-fill launch intent or job/accounting rows, and it is never logged.
+
 ## Open review findings
 
 At workflow launch, the run's instruction is the comment's text followed by the PR's open review findings (`buildCommentGapfillInstruction`, `src/comment-gapfill-drain.ts`, reading `listOpenReviewFindings`). A human's inline review comment is recorded in the ledger and starts no run on its own ([review-fix-rail.md](review-fix-rail.md#a-human-inline-comment-is-recorded-not-enqueued)), and the agent cannot read the PR, so this block is how `/ai-implement` addresses those comments. A bare `/ai-implement` gets the block alone; with no open findings the instruction is the comment text unchanged.

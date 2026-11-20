@@ -19,6 +19,8 @@ export interface DispatchFlyGapfillInput {
   reviewFix?: RunConfigV1["reviewFix"];
   mapping: RepoMapping;
   issue: { issueId: string; issueIdentifier?: string | null; issueTitle?: string | null };
+  /** Current tracker issue body. Omitted or blank keeps the title/issue-id description. */
+  issueDescription?: string;
   owner: string;
   repo: string;
   prNumber: number;
@@ -50,6 +52,10 @@ export interface DispatchFlyGapfillInput {
 export interface DispatchFlyGapfillResult {
   machine: Pick<Awaited<ReturnType<typeof createMachine>>, "id" | "name">;
   resolvedImage: string;
+}
+
+function gapfillIssueDescription(issueDescription: string | undefined, issueTitle: string | null | undefined, issueId: string): string {
+  return issueDescription !== undefined && issueDescription.trim() !== "" ? issueDescription : issueTitle ?? issueId;
 }
 
 /** The proven Fly gap-fill launch; admission, settlement and persistence belong to the caller. */
@@ -90,6 +96,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
 
   const sessionToken = generateSessionToken();
   const machineNonce = generateMachineNonce();
+  const issueDescription = gapfillIssueDescription(input.issueDescription, prLog.issueTitle, prLog.issueId);
 
   const gapFillRunConfig: RunConfigV1 = {
     ...buildRunConfig({
@@ -98,7 +105,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
         id: prLog.issueId,
         identifier: prLog.issueIdentifier ?? prLog.issueId,
         title: prLog.issueTitle ?? prLog.issueId,
-        description: prLog.issueTitle ?? prLog.issueId,
+        description: issueDescription,
       },
       mapping,
       runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -143,7 +150,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
     issueId: prLog.issueId,
     issueIdentifier: prLog.issueIdentifier ?? prLog.issueId,
     issueTitle: prLog.issueTitle ?? prLog.issueId,
-    issueDescription: prLog.issueTitle ?? prLog.issueId,
+    issueDescription,
     owner: input.owner,
     repo: input.repo,
     defaultBranch: mapping.defaultBranch,
@@ -204,6 +211,8 @@ export interface GhaGapfillDependencies {
 export interface PrepareGhaGapfillLaunchArgs extends Omit<GhaGapfillDependencies, "dispatch"> {
   mapping: RepoMapping;
   issue: { issueId: string; issueIdentifier?: string | null; issueTitle?: string | null };
+  /** Current tracker issue body. Omitted or blank keeps the title/issue-id description. */
+  issueDescription?: string;
   reviewOnly?: RunConfigV1["reviewOnly"];
   item: { owner: string; repo: string; prNumber: number };
   ghToken: string;
@@ -232,11 +241,12 @@ function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapa
 export async function prepareGhaGapfillLaunch(args: PrepareGhaGapfillLaunchArgs): Promise<GhaGapfillLaunch> {
   const { mapping, issue: prLog, item, ghToken, decision: ghaDecision,
     runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, commentInstruction } = args;
+  const issueDescription = gapfillIssueDescription(args.issueDescription, prLog.issueTitle, prLog.issueId);
   const gapFillIssue = {
     id: prLog.issueId,
     identifier: prLog.issueIdentifier ?? prLog.issueId,
     title: prLog.issueTitle ?? prLog.issueId,
-    description: prLog.issueTitle ?? prLog.issueId,
+    description: issueDescription,
   };
   const runnerImage = await args.resolveRunnerImage(mapping, ghToken);
   const capabilities = normalizeContractProbeResult(await args.checkContract({
@@ -284,7 +294,7 @@ export async function prepareGhaGapfillLaunch(args: PrepareGhaGapfillLaunchArgs)
         issue_id: prLog.issueId,
         issue_identifier: prLog.issueIdentifier ?? prLog.issueId,
         issue_title: prLog.issueTitle ?? prLog.issueId,
-        issue_description: prLog.issueTitle ?? prLog.issueId,
+        issue_description: issueDescription,
         pr_number: String(item.prNumber),
         runner_phase: "gap-analysis" as const,
         ...providerDispatchFields(mapping),
