@@ -474,6 +474,14 @@ export function setMappingPaused(teamKey: string, paused: boolean): boolean {
   return result.changes > 0;
 }
 
+/** Change only a mapping's execution mode; every other column (Extra Env included) is left as stored. */
+export function setMappingExecutionMode(teamKey: string, mode: ExecutionMode): boolean {
+  const result = getDb()
+    .prepare("UPDATE mappings SET execution_mode = ? WHERE team_key = ?")
+    .run(mode, teamKey);
+  return result.changes > 0;
+}
+
 function parseTicketingConfig(provider: string, raw: string): TicketingMappingConfig {
   // Throws on malformed JSON or schema mismatch — getMappings() catches and
   // drops the corrupted row rather than degrading to a mismatched config

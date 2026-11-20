@@ -68,6 +68,7 @@ import {
   createModelAccountAction,
   putProjectAgentConfigAction,
   setProjectAgentModeAction,
+  setProjectExecutionModeAction,
   setRunnerModeAction,
   pauseProjectAction,
   upsertMappingAction,
@@ -1729,6 +1730,32 @@ export const setProjectAgentModeTool = tool(
   },
 );
 
+export const SetProjectExecutionModeArgsSchema = z.object({
+  teamKey: z.string(),
+  mode: z.enum(["fly-machines", "github-actions"]),
+}).strict();
+
+export const setProjectExecutionModeTool = tool(
+  {
+    description: "Change only a project's execution mode to fly-machines or github-actions. Refusals: mapping-not-found; fly-not-eligible with the eligibility reason. Runs already in flight keep their backend; the next dispatch uses the new mode.",
+    input: SetProjectExecutionModeArgsSchema,
+    grant: "projects",
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `teamKey=${input.args.teamKey} mode=${input.args.mode}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("set-project-execution-mode", () =>
+      setProjectExecutionModeAction(mcpAdminConfig(), input.args.teamKey, input.args.mode),
+    { maxRetryAttempts: 1 });
+    if (!result.ok) {
+      return toolError(result.code === "fly-not-eligible" ? `fly-not-eligible: ${result.reason}` : result.code);
+    }
+    return { content: [{ type: "text", text: JSON.stringify({ teamKey: result.teamKey, executionMode: result.executionMode }) }] };
+  },
+);
+
 export const addProjectTool = tool(
   {
     description: ADD_PROJECT_DESCRIPTION,
@@ -1927,6 +1954,7 @@ export const orchestratorTools = restate.service({
     add_model_account: addModelAccountTool,
     set_project_stage: setProjectStageTool,
     set_project_agent_mode: setProjectAgentModeTool,
+    set_project_execution_mode: setProjectExecutionModeTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
     list_dispatch_reservations: listDispatchReservationsTool,

@@ -1664,6 +1664,46 @@ describe("poll implementation submission — ImplementationRun for every project
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/^\[poll\] Skipping AII-1555: .*runner\.project-backend/));
   });
 
+  it("the next dispatch follows a stored execution-mode change in both directions, leaving an active job's backend alone", async () => {
+    fakeFetch({ ...POLL_CYCLE_ROUTES,
+      "POST /SetupChecks/orchestrator/runProject/send": { json: null },
+      "POST /SetupChecks/orchestrator/runOrchestratorWide/send": { json: null },
+    }).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    const mode = await import("../runner-mode.js");
+    const log = await import("../log.js");
+    mode.setRunnerMode("default");
+    store.upsertMapping("AII", jiraMapping("AII", { executionMode: "github-actions" }));
+    const provider = jiraProvider();
+    vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+      needsPlanning: [], readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [],
+    });
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
+    const registry = () => makeRegistry({ provider, mappings: store.getMappings() });
+    const inFlight = log.appendLog(makeAppendLogEntry({
+      issueId: "in-flight-mode-switch", issueIdentifier: "AII-1", teamKey: "AII", executionMode: "fly-machines",
+      status: "running", machineNonce: "nonce-mode-switch", machineId: "machine-mode-switch",
+    }));
+    const before = log.getJobById(inFlight);
+    expect(before).toMatchObject({ executionMode: "fly-machines", machineId: "machine-mode-switch", status: "running" });
+
+    await indexModule.poll(config, registry());
+    expect(implementationIngress.submit.mock.calls[0]![1].backend).toBe("github-actions");
+    expect(log.getJobById(inFlight)).toEqual(before);
+
+    store.setMappingExecutionMode("AII", "fly-machines");
+    await indexModule.poll(config, registry());
+    expect(implementationIngress.submit.mock.calls[1]![1].backend).toBe("fly-machines");
+    expect(log.getJobById(inFlight)).toEqual(before);
+
+    store.setMappingExecutionMode("AII", "github-actions");
+    await indexModule.poll(config, registry());
+    expect(implementationIngress.submit.mock.calls[2]![1].backend).toBe("github-actions");
+
+    expect(log.getJobById(inFlight)).toEqual(before);
+  });
+
   describe("a failed poll read names the setup checks that explain it and asks for them to run again", () => {
     let send: Awaited<ReturnType<typeof recordRechecks>>;
     let errorLines: () => string[];
