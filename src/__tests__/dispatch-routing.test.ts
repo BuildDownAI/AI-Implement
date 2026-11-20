@@ -1797,7 +1797,7 @@ describe("poll implementation submission — ImplementationRun for every project
     vi.spyOn(github, "getPullRequestState").mockImplementation(async () => {
       if (outcome === "lookup-error") throw new Error("GitHub unavailable");
       if (outcome === "lookup-null") return null;
-      return { merged: false, state: "closed", headRef: null, headSha: null };
+      return { merged: false, state: "closed", headRef: null, headSha: null, baseRef: null };
     });
     planningIngress.submit.mockClear();
 

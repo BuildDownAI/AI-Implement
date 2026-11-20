@@ -22,6 +22,8 @@ export interface DispatchFlyGapfillInput {
   owner: string;
   repo: string;
   prNumber: number;
+  /** PR base branch to fetch at clone time (conflict-repair runs only). */
+  baseBranch?: string;
   issueIdentifier: string;
   githubToken: string;
   scopeKey: string;
@@ -101,6 +103,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
       mapping,
       runnerCallbackUrl: runnerCallbackUrl || undefined,
       prNumber: String(input.prNumber),
+      ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
       commentInstruction,
       retryPolicy: getRetryPolicy(),
       reviewOnly: input.reviewOnly,

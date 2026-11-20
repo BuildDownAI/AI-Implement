@@ -508,14 +508,19 @@ describe("getPullRequestState", () => {
   // The branch an implementation run opens for ENG-7, named as production names it.
   const branch = buildIssueBranchName("ENG-7", "Test");
   const head = { ref: branch, sha: "sha-7" };
+  const base = { ref: "ai-implement/feature/eng-7" };
 
   it("returns merged=true for a merged PR", async () => {
-    fakeFetch({ [PULL]: { json: { merged: true, state: "closed", head } } }).install();
-    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: true, state: "closed", headRef: branch, headSha: "sha-7" });
+    fakeFetch({ [PULL]: { json: { merged: true, state: "closed", head, base } } }).install();
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: true, state: "closed", headRef: branch, headSha: "sha-7", baseRef: "ai-implement/feature/eng-7" });
   });
   it("returns merged=false for a closed-unmerged PR", async () => {
-    fakeFetch({ [PULL]: { json: { merged: false, state: "closed", head } } }).install();
-    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "closed", headRef: branch, headSha: "sha-7" });
+    fakeFetch({ [PULL]: { json: { merged: false, state: "closed", head, base } } }).install();
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "closed", headRef: branch, headSha: "sha-7", baseRef: "ai-implement/feature/eng-7" });
+  });
+  it("returns baseRef=null when the response has no base ref", async () => {
+    fakeFetch({ [PULL]: { json: { merged: false, state: "open", head } } }).install();
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "open", headRef: branch, headSha: "sha-7", baseRef: null });
   });
   it("returns null on a non-OK response", async () => {
     fakeFetch({ [PULL]: githubError(404, "Not Found") }).install();

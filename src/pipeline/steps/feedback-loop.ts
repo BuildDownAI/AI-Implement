@@ -73,7 +73,7 @@ const REVIEW_DIFF_EXCLUDES = [
   ":(exclude,glob)**/yarn.lock",
 ];
 
-export function getDiff(workspaceDir: string): string {
+export function getDiff(workspaceDir: string, base?: string): string {
   // Resolve the real index via git rev-parse --git-path index, which handles
   // worktrees correctly (each worktree has its own index, not the one in the
   // shared .git dir).
@@ -141,7 +141,7 @@ export function getDiff(workspaceDir: string): string {
 
     const result = spawnSync(
       "git",
-      ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
+      ["diff", base && base.trim() ? base.trim() : "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
       {
         cwd: workspaceDir,
         stdio: ["ignore", "pipe", "pipe"],
@@ -451,7 +451,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             },
             reporter,
           ),
-        getDiff: () => getDiff(workspaceDir),
+        getDiff: () => getDiff(workspaceDir, runStartHead),
         isRunDirty: () => isRunDirty(workspaceDir, runStartHead),
         writeCycleSummary: (input) => {
           writeCycleSummary(workspaceDir, input);
