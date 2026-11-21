@@ -35,7 +35,7 @@ describe("validateRefSegments", () => {
     ["a segment ending in '.lock'", "branch.lock"],
     ["a non-final segment ending in '.lock'", "branch.lock/tail"],
   ])("rejects %s", (_label, value) => {
-    expect(() => validateRefSegments(value, "field")).toThrow(/must not end with/);
+    expect(() => validateRefSegments(value, "field")).toThrow(/must not have a part that ends with/);
   });
 
   it("names the caller's field in every message", () => {

@@ -28,7 +28,7 @@ import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDispositio
 import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { mintPreparedReviewFixToken } from "../runner-tokens.js";
-import { getRunnerMode, resolvePlanningExecutionPath } from "../runner-mode.js";
+import { getRunnerMode, resolveExecutionBackend } from "../runner-mode.js";
 import { inspectAgentReadiness } from "../agent-run-preparation.js";
 import { resolveWorkflowCapabilities, type WorkflowCapabilities } from "../workflow-probe.js";
 import type { ProviderRegistry } from "../providers/registry.js";
@@ -113,8 +113,8 @@ async function decideAdmission(
   if (mapping.ticketingProvider === "filesystem" && getRunnerMode().mode !== "local") {
     return { verdict: "defer", reason: `Filesystem project ${key} requires local runner mode`, skip: true };
   }
-  // Shadow launches its authoritative attempt on GHA, as resolvePlanningExecutionPath does.
-  const path = resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode);
+  // Shadow launches its authoritative attempt on GHA, as resolveExecutionBackend does.
+  const path = resolveExecutionBackend(getRunnerMode().mode, mapping.executionMode);
   const managed = isManagedProject(key);
   if (path !== "github-actions") {
     if (Object.keys(mapping.extraEnv ?? {}).some(isEphemeralPolicyEnvName)) {
@@ -367,7 +367,7 @@ export function createProductionReviewFixWorker(
       // Mapping selection now includes containers; protected GHA preparation still
       // requires the authoritative GHA path at launch time, including shadow.
       if (!selectedEntry(plan.scope)
-        || resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode) !== "github-actions") {
+        || resolveExecutionBackend(getRunnerMode().mode, mapping.executionMode) !== "github-actions") {
         throw new Error("review-fix managed mapping unavailable");
       }
       if (capabilities.supportsStageAgentConfig !== true) throw new Error("review-fix managed workflow unavailable");

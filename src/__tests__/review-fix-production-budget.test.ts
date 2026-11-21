@@ -21,7 +21,7 @@ vi.mock("../config.js", async (importOriginal) => ({
 }));
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),
-  resolvePlanningExecutionPath: () => "github-actions",
+  resolveExecutionBackend: () => "github-actions",
 }));
 vi.mock("../review-fix-queue.js", () => ({
   acceptReviewFixWebhookEvent: vi.fn(),

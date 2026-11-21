@@ -10,10 +10,10 @@ import { appCredentialsProblem } from "../github-app-auth.js";
 import { SEED_ONCE_SETTINGS } from "../seed-once-settings.js";
 import { MAX_POLL_INTERVAL_MS, parsePollIntervalMs } from "../poll-cycle.js";
 import { parseBreakerThreshold } from "../dispatch-breaker.js";
-import { checkForcedPathEligibility, FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveFlyProcessLevelSecrets, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
+import { checkForcedPathEligibility, FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveFlyProcessLevelSecrets, resolveExecutionBackend, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
 import { missingRunnerCallbackConfig } from "../runner-callback.js";
 import { ORCHESTRATOR_HEALTH_TIMEOUT_MS } from "../health-body.js";
-import { waitOn, type SetupCheck, type SetupCheckContext } from "./contract.js";
+import { defineCheck, waitOnCheck, type SetupCheck, type SetupCheckContext } from "./contract.js";
 
 /** A URL's host name, or null when it does not parse, so the fetch reports the malformed address. */
 function hostnameOf(url: string): string | null {
@@ -39,7 +39,7 @@ export function isAdminPathConfigured({ env, effectiveAllowlist, allowlistReadAv
 }
 
 export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
-  {
+  defineCheck({
     id: "model.credentials-adopted",
     title: "Model credential adoption",
     group: "orchestrator",
@@ -47,6 +47,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env", "orchestratorDefaults", "projectStageConfig", "mappings"],
     run: ({ env, orchestratorDefaults, projectStageConfig, mappings }) => {
       const hasEnv = Boolean(env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN);
       const configured = orchestratorDefaults()?.config.mode === "configured";
@@ -69,8 +70,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         ? "Defaults and all mapped projects are configured; environment credential is unused"
         : "Defaults and all mapped projects are configured" }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "env.github-app",
     title: "GitHub App credentials",
     group: "orchestrator",
@@ -78,13 +79,14 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: true,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       const problem = appCredentialsProblem(env);
       if (problem) return [{ state: "fail", detail: problem, fix: "Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY. The private key is the PEM file from the GitHub App's settings page." }];
       return [{ state: "pass", detail: "Both set, and the key parses" }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "env.admin-access-code",
     title: "Admin access code",
     group: "orchestrator",
@@ -92,6 +94,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: true,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       if (!env.ADMIN_ACCESS_CODE) return [{ state: "not-applicable", detail: "ADMIN_ACCESS_CODE not set" }];
       if (effectiveAccessCode(env.ADMIN_ACCESS_CODE) === null) {
@@ -103,8 +106,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       }
       return [{ state: "pass", detail: "Set, and not the placeholder" }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "env.runner-mode",
     title: "Runner mode variable",
     group: "orchestrator",
@@ -112,6 +115,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       if (!env.RUNNER_MODE) return [{ state: "pass", detail: "RUNNER_MODE not set, so the stored runner mode applies" }];
       if (isRunnerMode(env.RUNNER_MODE)) return [{ state: "pass", detail: `RUNNER_MODE=${env.RUNNER_MODE}` }];
@@ -121,8 +125,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: `Set RUNNER_MODE to one of ${VALID_RUNNER_MODES.join(", ")}, or unset it.`,
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "kg.remote-store",
     title: "KG remote store values",
     group: "orchestrator",
@@ -130,6 +134,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       if (!isRemoteKgStore(env)) return [{
         state: "not-applicable",
@@ -145,8 +150,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       }];
       return [{ state: "pass", detail: "The Stardog store values are set" }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "env.poll-interval",
     title: "Poll interval",
     group: "orchestrator",
@@ -154,6 +159,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       const raw = env.POLL_INTERVAL_MS;
       const ms = parsePollIntervalMs(raw);
@@ -166,8 +172,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Set POLL_INTERVAL_MS to a whole number of milliseconds, such as 60000, or unset it.",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "env.breaker-threshold",
     title: "Dispatch breaker threshold",
     group: "orchestrator",
@@ -175,6 +181,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       const raw = env.DISPATCH_BREAKER_THRESHOLD;
       const value = parseBreakerThreshold(raw);
@@ -188,8 +195,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Unset DISPATCH_BREAKER_THRESHOLD (default 3) or set a positive number.",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "settings.seeded",
     title: "Seed-once variables",
     group: "orchestrator",
@@ -197,6 +204,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env", "readSetting"],
+    settingsRows: SEED_ONCE_SETTINGS.map((setting) => setting.key),
     run: ({ env, readSetting }) => {
       const findings: string[] = [];
       for (const setting of SEED_ONCE_SETTINGS) {
@@ -214,8 +223,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Change each setting on its admin page, then remove the variable from the environment.",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "settings.env-override",
     title: "Variables that override saved settings",
     group: "orchestrator",
@@ -223,6 +232,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env", "readSetting"],
+    settingsRows: [RUNNER_MODE_SETTING_KEY, FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY],
     run: ({ env, readSetting }) => {
       const findings: string[] = [];
       const mode = resolveRunnerMode(env.RUNNER_MODE, null);
@@ -238,8 +249,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       if (findings.length === 0) return [{ state: "pass", detail: "No variable overrides a saved runner setting" }];
       return [{ state: "warn", detail: findings.join(" "), fix: "Unset the variable and restart, so the saved setting applies." }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "settings.allowlist-env",
     title: "Allowlist variables",
     group: "orchestrator",
@@ -247,6 +258,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env", "storedAccessEntries"],
     run: ({ env, storedAccessEntries }) => {
       if (allowlistFromEnv(env).length === 0) {
         return [{ state: "pass", detail: "Neither OAUTH_ALLOWED_DOMAINS nor OAUTH_ALLOWED_EMAILS admits anyone" }];
@@ -260,8 +272,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Remove OAUTH_ALLOWED_DOMAINS and OAUTH_ALLOWED_EMAILS from the environment.",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "volume.database",
     title: "Database location",
     group: "orchestrator",
@@ -269,6 +281,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: true,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env", "databasePath", "onSeparateFilesystem"],
     run: ({ env, databasePath, onSeparateFilesystem }) => {
       const db = databasePath();
       if (db.fellBack) {
@@ -288,8 +301,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Mount a volume over the database directory in fly.toml, under [[mounts]] with destination = \"/data\".",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "restate",
     title: "Restate engine",
     group: "orchestrator",
@@ -297,14 +310,15 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: true,
     perProject: false,
     verifiable: true,
+    contextReaders: ["restateStatus"],
     run: ({ restateStatus }) => {
       const { sidecar, registration } = restateStatus();
       const detail = `The sidecar is ${sidecar.state} and the endpoint registration is ${registration.state}`;
       if (sidecar.state === "ready" && registration.state === "registered") return [{ state: "pass", detail }];
       return [{ state: "fail", detail, fix: "Read the [restate] lines in the orchestrator log, which name the cause. The orchestrator does not dispatch until Restate serves." }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "callback.config",
     title: "Runner callback",
     group: "orchestrator",
@@ -312,6 +326,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       const callback = resolveRunnerCallbackBaseUrl(env);
       const missing = missingRunnerCallbackConfig({
@@ -328,8 +343,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       const derived = callback.source === "local-default" ? ", derived for RUNNER_MODE=local" : "";
       return [{ state: "pass", detail: `Runs report to ${callback.url}${derived}` }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "callback.reachable",
     title: "Runner callback reachable",
     group: "orchestrator",
@@ -337,9 +352,11 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env", "runnerMode", "orchestratorHealthAt", "orchestratorInstanceId"],
+    waitsOnChecks: ["callback.config"],
     run: async ({ env, runnerMode, orchestratorHealthAt, orchestratorInstanceId }) => {
       const { url } = resolveRunnerCallbackBaseUrl(env);
-      if (!url) return [{ state: "cannot-verify", detail: "No callback address is set, so there is none to reach", ...waitOn("callback.config") }];
+      if (!url) return [{ state: "cannot-verify", detail: "No callback address is set, so there is none to reach", ...waitOnCheck("callback.config") }];
       // A local runner reaches the orchestrator through host.docker.internal, which resolves inside its container only.
       if (runnerMode().mode === "local") return [{ state: "not-applicable", detail: "The runner mode is local, so runs reach the orchestrator from containers on this host" }];
       if (hostnameOf(url) === "host.docker.internal") return [{ state: "not-applicable", detail: `${url} resolves only inside a local runner's container` }];
@@ -363,8 +380,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Check RUNNER_CALLBACK_BASE_URL for a typo, then that its DNS name, and any proxy or tunnel in front of it, lead to this orchestrator.",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "runner.fly-sessions",
     title: "Fly sessions",
     group: "orchestrator",
@@ -372,10 +389,11 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["runnerMode", "mappings", "flySessions", "runnerBackendSource"],
     run: ({ runnerMode, mappings, flySessions, runnerBackendSource }) => {
       const mode = runnerMode().mode;
       const onFly = Object.entries(mappings())
-        .filter(([, mapping]) => resolvePlanningExecutionPath(mode, mapping.executionMode) === "fly-machines")
+        .filter(([, mapping]) => resolveExecutionBackend(mode, mapping.executionMode) === "fly-machines")
         .map(([key]) => key);
       if (onFly.length === 0) return [{ state: "not-applicable", detail: "No project runs on Fly Machines" }];
       if (runnerBackendSource() === "not-loaded") return [{
@@ -394,8 +412,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Set FLY_SESSIONS_TOKEN, and save the sessions app on /admin#settings.",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "runner.project-backend",
     title: "Projects on their runner backend",
     group: "orchestrator",
@@ -403,6 +421,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: ["runnerMode", "mappings"],
     run: ({ runnerMode, mappings }) => {
       const projects = Object.entries(mappings());
       if (projects.length === 0) return [{ state: "not-applicable", detail: "No project is saved" }];
@@ -410,7 +429,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       // Dispatch's own two refusals: the skip it names this check for, and a container backend refusing Bedrock at launch.
       // The sessions app is passed as set, since runner.fly-sessions judges it.
       const refused = projects.filter(([, mapping]) => checkForcedPathEligibility(mode, mapping, true).check === "runner.project-backend"
-        || (mapping.provider === "bedrock" && resolvePlanningExecutionPath(mode, mapping.executionMode) !== "github-actions")).map(([key]) => key);
+        || (mapping.provider === "bedrock" && resolveExecutionBackend(mode, mapping.executionMode) !== "github-actions")).map(([key]) => key);
       if (refused.length === 0) return [{ state: "pass", detail: "Every project runs on a backend that accepts its settings" }];
       // A forced runner mode sends every project to one backend, so its fix is the runner mode rather than each project.
       const fix = mode === "default"
@@ -418,8 +437,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         : "Set the runner mode back to default at /admin#runners, or set it to gha.";
       return [{ state: "fail", detail: `These projects use Bedrock or the ephemeral full-access opt-in, which run only on GitHub Actions, but their runs go to Fly Machines or local Docker, which refuse them: ${refused.join(", ")}`, fix }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "admin.path",
     title: "Admin sign-in",
     group: "orchestrator",
@@ -427,6 +446,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: true,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       const providers = resolveProviders(env).providers.map((p) => p.id);
       const codeSet = effectiveAccessCode(env.ADMIN_ACCESS_CODE) !== null;
@@ -440,8 +460,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       const paths = [...(providers.length > 0 ? [`SSO (${providers.join(", ")})`] : []), ...(codeSet ? ["the access code"] : [])];
       return [{ state: "pass", detail: `Admins sign in with ${paths.join(" and ")}` }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "admin.providers",
     title: "Sign-in providers",
     group: "orchestrator",
@@ -449,6 +469,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: true,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       const { dropped } = resolveProviders(env);
       if (dropped.length === 0) return [{ state: "pass", detail: "No sign-in provider is partly configured" }];
@@ -458,8 +479,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Correct each variable named, or unset that provider's variables.",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "admin.redirect-url",
     title: "Sign-in return address",
     group: "orchestrator",
@@ -467,6 +488,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: true,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env"],
     run: ({ env }) => {
       if (resolveProviders(env).providers.length === 0) return [{ state: "not-applicable", detail: "No sign-in provider is configured" }];
       if (env.OAUTH_REDIRECT_BASE_URL) return [{ state: "pass", detail: `Sign-in returns to ${env.OAUTH_REDIRECT_BASE_URL}` }];
@@ -476,8 +498,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Set OAUTH_REDIRECT_BASE_URL to the orchestrator's public address.",
       }];
     },
-  },
-  {
+  }),
+  defineCheck({
     id: "admin.allowlist",
     title: "Admin in the sign-in allowlist",
     group: "orchestrator",
@@ -485,6 +507,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: true,
     perProject: false,
     verifiable: true,
+    contextReaders: ["env", "effectiveAllowlist"],
     run: ({ env, effectiveAllowlist }) => {
       const providers = resolveProviders(env).providers.map((p) => p.id);
       if (providers.length === 0) return [{ state: "not-applicable", detail: "No sign-in provider is configured" }];
@@ -510,5 +533,5 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Add an admin address to OAUTH_ALLOWED_EMAILS. A domain admits its addresses as user only.",
       }];
     },
-  },
+  }),
 ];

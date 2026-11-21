@@ -4,7 +4,7 @@ import { bindKey, clearKeyBinding } from "./restate/key-binding.js";
 import { initKeyBindingsTable } from "./key-bindings.js";
 import { checkTrackerWrites } from "./tracker-write-gate.js";
 import { buildHealthBody } from "./health-body.js";
-import { BEFORE_FIRST_SYNC, createSetupCheckContext, getCachedSetupCheckRun, getSetupCheckProgress, runProjectSetupChecks, setupChecksHealthField } from "./setup-checks/index.js";
+import { BEFORE_FIRST_SYNC, getCachedSetupCheckRun, getSetupCheckProgress, runProjectSetupChecks, setupChecksHealthField } from "./setup-checks/index.js";
 import { gitHubAppErrorChecks, pointAtSetupChecks, readOnSetupPage, setSetupCheckRecheckSender } from "./setup-checks/recheck.js";
 import { createSetupCheckChangeDetector, readSavedSetup } from "./setup-checks/change-detector.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
@@ -65,7 +65,7 @@ import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
-import { createProductionBootSetupChecks, createSetupChecksHydration, createSetupChecksIngressClient } from "./restate/setup-checks.js";
+import { createProductionBootSetupChecks, createSetupChecksHydration, createSetupChecksIngressClient, productionSetupCheckContext } from "./restate/setup-checks.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
@@ -98,7 +98,7 @@ import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } fr
 import { getMachine, listMachines, updateMachine, generateSessionToken, generateMachineNonce, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { reconcileRestateMachine, reconcileRestateLocalContainers, isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
-import { getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
+import { getRunnerMode, initSettingsTable, resolveExecutionBackend, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility, type ExecutionBackend } from "./runner-mode.js";
 import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
 import { initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
@@ -469,7 +469,7 @@ const setupChecksClient = createSetupChecksIngressClient();
 const hydrateSetupChecks = createSetupChecksHydration(() => setupChecksClient.read());
 /** The setup checks' change detector. Each cycle compares with the one before, so its memory lives as long as the process. */
 const setupCheckChangeDetector = createSetupCheckChangeDetector({
-  readSavedSetup: () => readSavedSetup(createSetupCheckContext({ restateStatus: getRestateStatus })),
+  readSavedSetup: () => readSavedSetup(productionSetupCheckContext()),
   send: (run) => setupChecksClient.send(run),
   log: (line) => { console.log(line); },
 });
@@ -847,7 +847,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
           }
 
           const { mode: runnerMode } = getRunnerMode();
-          const execPath = resolveExecutionPath(runnerMode, mapping.executionMode);
+          const backend = resolveExecutionBackend(runnerMode, mapping.executionMode);
 
           // AII-306: a forced global mode can point at a backend this mapping
           // cannot run on (bedrock is GHA-only; Fly needs a sessions app).
@@ -912,7 +912,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
           const implFieldValue = implValidated.branch;
 
           await submitImplementationRun(config, issue, mapping, {
-            execPath, runnerMode, baseBranch, baseBranchFieldValue: implFieldValue,
+            backend, runnerMode, baseBranch, baseBranchFieldValue: implFieldValue,
           });
         }
       } catch (err) {
@@ -1436,14 +1436,14 @@ export async function dispatchGitHubActions(
 
 /**
  * Dispatch the planning workflow for an issue that needs planning.
- * Routes via resolveExecutionPath: GHA (primary, also handles shadow to avoid
+ * Routes via resolveExecutionBackend: GHA (primary, also handles shadow to avoid
  * double-posting Linear comments), Fly Machines, or local Docker. Uses
  * AI-Planning label as the in-progress marker and intentionally does NOT call
  * markDispatched() so the dedup table stays clear for the subsequent
  * implementation dispatch.
  */
 export type PlanningDispatchContext = {
-  execPath: ReturnType<typeof resolvePlanningExecutionPath>;
+  backend: ExecutionBackend;
   runnerMode: string;
   /** Validated "AI-Implement Base Branch" field value, the resolved feature-branch
    *  chain target (when the field is unset and the chain's branch already exists),
@@ -1486,9 +1486,7 @@ export async function preparePlanningDispatch(
   }
 
   const { mode: runnerMode } = getRunnerMode();
-  // Shadow collapses to GHA-only: planning posts user-visible Linear comments,
-  // so a shadow second backend would double-post.
-  const execPath = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
+  const backend = resolveExecutionBackend(runnerMode, mapping.executionMode);
 
   // AII-306: same forced-mode eligibility guard as implementation dispatch.
   const planningEligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
@@ -1548,7 +1546,7 @@ export async function preparePlanningDispatch(
     resolvedPlanningBranch = mapping.defaultBranch;
   }
 
-  return { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue: planningValidated.branch };
+  return { backend, runnerMode, resolvedPlanningBranch, planningFieldValue: planningValidated.branch };
 }
 
 // Submit only safe launch context; credentials are resolved by the workflow at launch.
@@ -1557,7 +1555,7 @@ export async function submitImplementationRun(
   issue: DispatchableIssue,
   mapping: RepoMapping,
   ctx: {
-    execPath: ReturnType<typeof resolveExecutionPath>;
+    backend: ExecutionBackend;
     runnerMode: string;
     baseBranch: string;
     baseBranchFieldValue: string | null;
@@ -1568,7 +1566,7 @@ export async function submitImplementationRun(
     return;
   }
   const dispatchId = crypto.randomUUID();
-  const backend = ctx.execPath === "fly-machines" || ctx.execPath === "local-docker" ? ctx.execPath : "github-actions";
+  const { backend } = ctx;
   // Advisory only: the workflow's reserve step owns admission and deduplication.
   const decision = canDispatch({
     issueId: issue.id,
@@ -1612,14 +1610,13 @@ export async function dispatchPlanning(
   mapping: RepoMapping,
   ctx: PlanningDispatchContext,
 ): Promise<void> {
-  const { execPath, resolvedPlanningBranch, planningFieldValue } = ctx;
+  const { backend, resolvedPlanningBranch, planningFieldValue } = ctx;
 
   if (!restateCanServe()) {
     console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
     return;
   }
   const dispatchId = crypto.randomUUID();
-  const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
   // Non-binding pre-check only: the workflow takes the reservation in its first step, so a crash here leaves no row.
   const decision = canDispatch({
     issueId: issue.id,
@@ -4431,7 +4428,7 @@ export function startServer(
         sidecarHealthFields,
         restateStatus: getRestateStatus,
         deployHealth,
-        setupChecks: () => setupChecksHealthField(getCachedSetupCheckRun(), createSetupCheckContext({ restateStatus: getRestateStatus })),
+        setupChecks: () => setupChecksHealthField(getCachedSetupCheckRun(), productionSetupCheckContext()),
       }).then((body) => {
         const json = JSON.stringify(body);
         res.writeHead(body.status === "unavailable" ? 503 : 200, { "Content-Type": "application/json" });
@@ -5019,7 +5016,7 @@ export function startServer(
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
       }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, bindKey, clearKeyBinding, readSetupChecks: () => setupChecksClient.read(), startSetupChecks: () => setupChecksClient.start(), setupCheckProgress: getSetupCheckProgress,
-        runCandidateChecks: (key, mapping) => runProjectSetupChecks(createSetupCheckContext({ restateStatus: getRestateStatus, mappings: () => ({ [key]: mapping }) }), key, BEFORE_FIRST_SYNC),
+        runCandidateChecks: (key, mapping) => runProjectSetupChecks(productionSetupCheckContext({ key, mapping }), key, BEFORE_FIRST_SYNC),
         runProjectSetupChecks: (project) => setupChecksClient.runProject(project),
         retention: {
           getRestateDays: getRestateRetentionDays,
@@ -5630,7 +5627,7 @@ async function main(): Promise<void> {
   });
 
   let server: ReturnType<typeof startServer>;
-  const bootSetupChecks = createProductionBootSetupChecks(() => server, setupChecksClient);
+  const bootSetupChecks = createProductionBootSetupChecks(setupChecksClient);
   await runMainBoot({
     registerSignal: (signal, handler) => { process.on(signal, handler); },
     startServer: () => { server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic); },

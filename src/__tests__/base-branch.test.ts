@@ -88,15 +88,15 @@ describe("normalizeBaseBranch", () => {
   });
 
   it("rejects a leading hyphen (--upload-pack=x)", () => {
-    expect(() => normalizeBaseBranch("--upload-pack=x")).toThrow(/must each start with a letter or digit/);
+    expect(() => normalizeBaseBranch("--upload-pack=x")).toThrow(/each part must start with a letter or digit/);
   });
 
   it("rejects a segment starting with '-'", () => {
-    expect(() => normalizeBaseBranch("feat/-bad")).toThrow(/must each start with a letter or digit/);
+    expect(() => normalizeBaseBranch("feat/-bad")).toThrow(/each part must start with a letter or digit/);
   });
 
   it("rejects a segment with a special character like '='", () => {
-    expect(() => normalizeBaseBranch("feat/bad=name")).toThrow(/must each start with a letter or digit/);
+    expect(() => normalizeBaseBranch("feat/bad=name")).toThrow(/each part must start with a letter or digit/);
   });
 });
 
@@ -244,7 +244,7 @@ describe("validateIssueBaseBranch", () => {
     const [id, scopeKey, reason] = markFailed.mock.calls[0];
     expect(id).toBe("issue-1");
     expect(scopeKey).toBe("BAC");
-    expect(reason).toMatch(/must each start with a letter or digit/);
+    expect(reason).toMatch(/each part must start with a letter or digit/);
   });
 
   it("refusal #1: invalid value — calls markFailed with implementation verb when markFailed is markImplementationFailed", async () => {

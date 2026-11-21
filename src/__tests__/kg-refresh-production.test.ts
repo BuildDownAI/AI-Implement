@@ -762,9 +762,16 @@ describe("createKgFindRunByTitle", () => {
 
   const RUNS = "GET /repos/acme/kg/actions/workflows/claude-implement.yml/runs" as const;
 
-  it("throws on an HTTP error instead of answering no run", async () => {
-    fakeFetch({ [RUNS]: { status: 500, text: "boom" } }).install();
-    await expect(lookup().find("KG-REFRESH · d-1")).rejects.toThrow(/HTTP 500/);
+  // Any other failure leaves an earlier dispatch possible, and a rate limit answers 403 or 429.
+  it.each([403, 429, 500])("throws on HTTP %i instead of answering no run", async (status) => {
+    fakeFetch({ [RUNS]: { status, text: "boom" } }).install();
+    await expect(lookup().find("KG-REFRESH · d-1")).rejects.toThrow(`HTTP ${status}`);
+  });
+
+  // The KG repository has no such workflow, or none this token can see, so it has no run of it, and the dispatch's own refusal ends the refresh.
+  it("answers no run when GitHub answers 404 for the workflow", async () => {
+    fakeFetch({ [RUNS]: { status: 404, json: { message: "Not Found" } } }).install();
+    expect(await lookup().find("KG-REFRESH · d-1")).toBeNull();
   });
 
   it("answers null for a 200 with no matching title, and the run id for a match", async () => {

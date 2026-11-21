@@ -55,9 +55,6 @@ export const setupScript = `
   // How many running checks a card names before counting the rest.
   var RUNNING_NAMED = 3;
 
-  // The states listed open in each table, worst first; the rest fold away.
-  var ACTIONABLE = window.SETUP_ACTIONABLE;
-
   // What each card covers, under its name. Only this page says it, so it lives here rather than coming from the route.
   var GROUP_CONTEXT = {
     'orchestrator': "This orchestrator's environment, saved settings, sign-in, database and Restate engine, and the address runs report to",
@@ -87,7 +84,8 @@ export const setupScript = `
   }
 
   function countBy(rows) {
-    var counts = { 'fail': 0, 'cannot-verify': 0, 'warn': 0, 'pass': 0, 'not-applicable': 0 };
+    var counts = {};
+    window.SETUP_STATE_ORDER.forEach(function (s) { counts[s] = 0; });
     rows.forEach(function (row) { counts[row.state] = (counts[row.state] || 0) + 1; });
     return counts;
   }
@@ -135,14 +133,6 @@ export const setupScript = `
     unit.textContent = run.startedAt ? 'took ' + window.fmtDuration(run.checkedAt - run.startedAt) : '';
   }
 
-  /** Worst state first, then in the route's group order; the run's own order breaks ties. */
-  function openRows(rows) {
-    var groups = Object.keys(state.data.groups);
-    return rows.filter(function (row) { return ACTIONABLE.indexOf(row.state) !== -1; }).sort(function (a, b) {
-      return ACTIONABLE.indexOf(a.state) - ACTIONABLE.indexOf(b.state) || groups.indexOf(a.group) - groups.indexOf(b.group);
-    });
-  }
-
   // The checks still running, in one line so a run in progress does not lengthen the page.
   // The first few are named, in the list's own order, and the rest counted.
   function runningLine(running) {
@@ -153,24 +143,20 @@ export const setupScript = `
       + names + (rest > 0 ? ', and ' + rest + ' more' : '') + '</span>';
   }
 
-  function foldLabel(counts) {
-    var parts = [];
-    if (counts['pass']) parts.push(counts['pass'] + ' passing');
-    if (counts['not-applicable']) parts.push(counts['not-applicable'] + ' not applicable');
-    return parts.join(', ');
-  }
-
   // One card's checks: the open rows, the line of running checks, then a fold over the rest.
   // Folded rows stay in the same table as the open rows, so their columns line up.
   // With nothing open, the running line and the fold sit above the table, so opening the fold adds the table below and the fold stays put.
   function checksBody(key, rows, running, folds) {
-    var open = openRows(rows);
-    var folded = rows.filter(function (row) { return ACTIONABLE.indexOf(row.state) === -1; });
+    // Within a state, rows follow the route's group order.
+    var groups = Object.keys(state.data.groups);
+    var split = window.splitSetupRows(rows, function (a, b) { return groups.indexOf(a.group) - groups.indexOf(b.group); });
+    var open = split.open;
+    var folded = split.folded;
     var unfold = folded.length > 0 && !!unfolded[key];
     if (folded.length) folds.push(key);
     var fold = folded.length
       ? '<button type="button" class="btn btn-ghost btn-sm text-accent setup-fold">'
-        + '<span style="display:inline-block;transform:rotate(' + (unfold ? 90 : 0) + 'deg)">›</span> ' + window.esc(foldLabel(countBy(rows))) + '</button>'
+        + '<span style="display:inline-block;transform:rotate(' + (unfold ? 90 : 0) + 'deg)">›</span> ' + window.esc(split.foldLabel) + '</button>'
       : '';
     var foldedRows = folded.map(function (row) { return window.setupCheckRow(row, !unfold); }).join('');
     var runningNow = runningLine(running);
@@ -179,7 +165,7 @@ export const setupScript = `
         + (fold ? '<div class="setup-fold-row" style="padding:10px 14px">' + fold + '</div>' : '')
         + (unfold ? window.setupCheckTable(foldedRows) : '');
     }
-    return window.setupCheckTable(window.groupWaitingRows(open).map(function (row) { return window.setupCheckRow(row, false); }).join('')
+    return window.setupCheckTable(open.map(function (row) { return window.setupCheckRow(row, false); }).join('')
       + (runningNow ? '<tr class="setup-running-row"><td colspan="4">' + runningNow + '</td></tr>' : '')
       + (fold ? '<tr class="setup-fold-row"><td colspan="4">' + fold + '</td></tr>' + foldedRows : ''));
   }

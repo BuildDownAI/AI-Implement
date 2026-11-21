@@ -158,6 +158,8 @@ const gh = {
   listGate: undefined as Gate | undefined,
   /** The first run-list read after the gate throws once, as a crash of the step would. */
   failNextList: false,
+  /** The status every run-list read answers instead of the runs: 404 for a workflow file the repository lacks. */
+  listStatus: undefined as number | undefined,
   async status(runId: number): Promise<{ status: string; conclusion: string | null; html_url: string } | null> {
     this.statusReads.push(runId);
     const g = this.statusGate;
@@ -166,7 +168,7 @@ const gh = {
     return run ? { status: run.status, conclusion: null, html_url: `https://github.test/run/${runId}` } : null;
   },
   reset() {
-    this.runs = []; this.cancelCalls = []; this.statusReads = []; this.statusGate = undefined; this.listGate = undefined; this.failNextList = false; this.nextRunId = 5_000;
+    this.runs = []; this.cancelCalls = []; this.statusReads = []; this.statusGate = undefined; this.listGate = undefined; this.failNextList = false; this.listStatus = undefined; this.nextRunId = 5_000;
   },
 };
 
@@ -226,6 +228,8 @@ const NONCE = "nonce-must-not-leak";
 /** Per-scenario launch behaviour. */
 const launches: string[] = [];
 let launchAckLost = false;
+/** The launch's dispatch is refused, as GitHub refuses one for a workflow file the repository lacks. */
+let launchRefused = false;
 /** Parks the launch call of `launchPlanningRun` before it creates the run. */
 let launchGate: Gate | undefined;
 /** Parks the `reserve` step after it took the reservation. */
@@ -273,6 +277,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         gh.failNextList = false;
         throw new Error("injected crash: the dispatch step died after the reservation");
       }
+      if (gh.listStatus !== undefined) return new Response(JSON.stringify({ message: "Not Found" }), { status: gh.listStatus });
       return new Response(JSON.stringify({
         workflow_runs: gh.runs.map((r) => ({ id: r.id, display_title: r.title, created_at: r.createdAt })),
       }), { status: 200, headers: { "content-type": "application/json" } });
@@ -313,6 +318,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       launchPlanningRun: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }; dispatchId: string; admissionGeneration: number }) => {
         launches.push(args.issue.identifier);
         if (launchGate) await launchGate.wait();
+        // The real function writes no row for a refused dispatch, and answers `rejected`.
+        if (launchRefused) return { outcome: "rejected" };
         // As `buildPlanningLaunch` does: the token carries the issue's scopeKey as its mapping key.
         mintedTokens.set(args.dispatchId, mintRunToken({
           issueId: args.issue.id, mappingTeamKey: args.issue.scopeKey, phase: "planning", dispatchId: args.dispatchId,
@@ -387,6 +394,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     sim.notices = [];
     sim.failAfterEffect = new Set();
     launchAckLost = false;
+    launchRefused = false;
     launchGate = undefined;
     reserveGate = undefined;
     sim.remediateCalls = 0;
@@ -454,6 +462,17 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   function expectNoDispatchRounds(issueId: string): void {
     for (let i = 0; i < 5; i++) expect(pollDispatches(issueId)).toEqual({ planning: 0, implementation: 0 });
   }
+
+  // A workflow file the repository lacks answers 404 to the run list as to the dispatch, so the lookup lets the launch run,
+  // and the launch's refusal (with its breaker count and Setup check pointer) ends the run.
+  it.each(labels)("a 404 from the run list reaches the launch, whose refusal ends the run launch_rejected (%s)", async (label) => {
+    gh.listStatus = 404;
+    launchRefused = true;
+    const w = await dispatch(label, "PLT-404");
+    await untilReleased(w.dispatchId);
+    expect(launches).toEqual(["PLT-404"]);
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "launch_rejected" });
+  });
 
   it.each(labels)("a callback-closed run releases the reservation and leaves the closed row alone (%s)", async (label) => {
     gh.statusGate = gate("first status read");
@@ -867,8 +886,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       reviewFixLifecycle: "restate",
     } as never;
     const provider = { id: "jira" } as never;
-    const planningCtx = (execPath: PlanningRunInput["backend"]) =>
-      ({ execPath, runnerMode: "default", resolvedPlanningBranch: "main", planningFieldValue: null }) as never;
+    const planningCtx = (backend: PlanningRunInput["backend"]) =>
+      ({ backend, runnerMode: "default", resolvedPlanningBranch: "main", planningFieldValue: null }) as never;
 
     beforeEach(() => setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } }));
     afterEach(() => resetRestateStatus());

@@ -43,12 +43,12 @@ export function describeReferenceRepoCause(cause: ReferenceRepoResultCause | und
 }
 
 /** Returns null for both absent and empty, so the column stores one "unset" value. */
-export function normalizeReferenceRepos(raw: unknown): ReferenceRepo[] | null {
+export function normalizeReferenceRepos(raw: unknown, subject = "referenceRepos"): ReferenceRepo[] | null {
   if (raw == null) return null;
-  if (!Array.isArray(raw)) throw new Error("referenceRepos must be an array of entries");
+  if (!Array.isArray(raw)) throw new Error(`${subject} must be a list of entries.`);
   if (raw.length === 0) return null;
   if (raw.length > MAX_ENTRIES) {
-    throw new Error(`too many entries (${raw.length}); maximum is ${MAX_ENTRIES}`);
+    throw new Error(`${subject} may hold at most ${MAX_ENTRIES} entries, not ${raw.length}.`);
   }
 
   const entries: ReferenceRepo[] = [];
@@ -56,27 +56,27 @@ export function normalizeReferenceRepos(raw: unknown): ReferenceRepo[] | null {
 
   for (const item of raw) {
     if (item == null || typeof item !== "object" || Array.isArray(item)) {
-      throw new Error("each entry must be an object with repo and path");
+      throw new Error(`Each entry in ${subject} needs a repository and a path.`);
     }
     const { repo, path: rawPath, ref } = item as Record<string, unknown>;
     if (typeof repo !== "string" || repo.trim() === "") {
-      throw new Error("each entry needs a repo");
+      throw new Error(`Each entry in ${subject} needs a repository.`);
     }
     if (typeof rawPath !== "string") {
-      throw new Error("each entry needs a path");
+      throw new Error(`Each entry in ${subject} needs a path.`);
     }
     if (ref != null && (typeof ref !== "string" || ref.trim() === "")) {
-      throw new Error("ref must be a non-empty string when present");
+      throw new Error(`An entry's ref in ${subject} must not be blank.`);
     }
 
-    const normalizedPath = normalizePath(rawPath);
+    const normalizedPath = normalizePath(rawPath, subject);
     if (seenPaths.has(normalizedPath)) {
-      throw new Error(`two entries share the path "${normalizedPath}"; each entry needs its own directory`);
+      throw new Error(`Two entries in ${subject} share the path "${normalizedPath}". Each entry needs its own directory.`);
     }
     seenPaths.add(normalizedPath);
 
     entries.push({
-      repo: normalizeGitHubRepo(repo, "referenceRepos"),
+      repo: normalizeGitHubRepo(repo, subject),
       path: normalizedPath,
       ...(ref != null ? { ref: (ref as string).trim() } : {}),
     });
@@ -116,7 +116,7 @@ export function normalizeGitHubRepo(raw: string, field: string): string {
   }
   // A token here would survive into the clone's remote.origin.url, in a directory that persists for the whole run and that the agent is pointed at.
   if (hasUserinfo) {
-    throw new Error(`${field} must not embed a username or token in the URL; the runner supplies its own credential at clone time`);
+    throw new Error(`${field} must not carry a username or token in its URL. The runner supplies its own credential when it clones.`);
   }
   return v;
 }
@@ -136,26 +136,26 @@ export function githubRepoParts(url: string): { owner: string; repo: string } | 
 }
 
 /** Checks the normalized form as well as the raw one: a path can look contained and normalize outward. */
-function normalizePath(raw: string): string {
+function normalizePath(raw: string, subject: string): string {
   const v = raw.trim();
-  if (v === "") throw new Error("each entry needs a non-empty path");
+  if (v === "") throw new Error(`Each entry in ${subject} needs a path.`);
   if (v.length > MAX_PATH_LENGTH) {
-    throw new Error(`path too long (${v.length} chars): "${v.slice(0, 30)}..."; maximum is ${MAX_PATH_LENGTH}`);
+    throw new Error(`The path "${v.slice(0, 30)}..." in ${subject} is ${v.length} characters, more than the ${MAX_PATH_LENGTH} allowed.`);
   }
   if (path.posix.isAbsolute(v) || /^[A-Za-z]:/.test(v)) {
-    throw new Error(`path "${v}" must be relative to the workspace`);
+    throw new Error(`The path "${v}" in ${subject} must be relative to the workspace.`);
   }
   // Not a traversal vector here — backslash is a literal filename character on the runner.
   if (v.includes("\\")) {
-    throw new Error(`path "${v}" must use forward slashes`);
+    throw new Error(`The path "${v}" in ${subject} must use forward slashes.`);
   }
 
   const normalized = path.posix.normalize(v).replace(/\/+$/, "");
   if (normalized === "." || normalized === "" || normalized.split("/").includes("..")) {
-    throw new Error(`path "${v}" must stay inside the workspace and name a directory`);
+    throw new Error(`The path "${v}" in ${subject} must stay inside the workspace and name a directory.`);
   }
   if (normalized.split("/")[0] === ".git") {
-    throw new Error(`path "${v}" must not write into the repository's own .git directory`);
+    throw new Error(`The path "${v}" in ${subject} must not write into the repository's own .git directory.`);
   }
   return normalized;
 }

@@ -4,11 +4,11 @@ import { isParked, breakerPhaseFor } from "./dispatch-breaker.js";
 import {
   acquire as acquireAdmission,
   release as releaseAdmission,
-  type DispatchAdmissionBackend,
   type DispatchAdmissionDeferReason,
   type DispatchAdmissionReleaseReason,
   type LifecycleOwner,
 } from "./dispatch-admission.js";
+import type { ExecutionBackend } from "./runner-mode.js";
 
 export type DispatchKind = "planning" | "implementation" | "gap-fill";
 
@@ -86,7 +86,7 @@ export interface AcquireDispatchInput {
   kind: AcquireDispatchKind;
   teamKey: string;
   maxInProgressAiIssues: number;
-  backend: DispatchAdmissionBackend;
+  backend: ExecutionBackend;
   /** Overrides park only, never capacity/occupancy. */
   humanRequested?: boolean;
   /** Who owns the reservation's release. Defaults to Legacy. */
