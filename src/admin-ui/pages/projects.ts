@@ -89,7 +89,7 @@ export const projectsHtml = `
         <div style="display:grid;gap:12px">
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
             <div class="field">
-              <label class="field-label" data-field="ticketingProvider">Ticketing System</label>
+              <label class="field-label" data-setting="ticketingProvider">Ticketing System</label>
               <select class="select" id="md-ticketing-provider" onchange="onTicketingProviderChange()">
                 <option value="linear">Linear</option>
                 <option value="jira">Jira</option>
@@ -98,18 +98,18 @@ export const projectsHtml = `
               <div class="field-hint">Filesystem tickets are Markdown files on this machine. They run real GitHub PRs through local Docker and require RUNNER_MODE=local.</div>
             </div>
             <div class="field">
-              <label class="field-label" data-field="teamKey">Project Mapping Key</label>
+              <label class="field-label" data-setting="teamKey">Project Mapping Key</label>
               <input class="input mono" id="md-team-key" placeholder="MY_TEAM">
               <div class="field-hint">Identifies this project independently of its ticket directory. Cannot be changed after creation.</div>
             </div>
           </div>
-          <div id="md-jira-fields" data-field="ticketingConfig" class="hidden" style="display:grid;gap:12px">
+          <div id="md-jira-fields" data-setting="ticketingConfig" class="hidden" style="display:grid;gap:12px">
             <div class="field">
               <label class="field-label">Mapping ID</label>
               <input class="input mono" id="md-jira-mapping-id" placeholder="acme/billing">
             </div>
             <div class="field">
-              <label class="field-label" data-field="ticketingConfig.jql">JQL</label>
+              <label class="field-label" data-setting="ticketingConfig.jql">JQL</label>
               <textarea class="textarea" id="md-jira-jql" rows="3" placeholder="project = TEST"></textarea>
               <div style="display:flex;gap:8px;align-items:center;margin-top:2px">
                 <button type="button" class="btn btn-sm" onclick="validateJqlButton()">Validate</button>
@@ -118,44 +118,44 @@ export const projectsHtml = `
               <div class="field-hint">The orchestrator wraps this with its own status filter at query time. Don't include status filters here.</div>
             </div>
             <div class="field">
-              <label class="field-label" data-field="ticketingConfig.statusFieldOverride">Status Field</label>
+              <label class="field-label" data-setting="ticketingConfig.statusFieldOverride">Status Field</label>
               <select class="select" id="md-jira-status-field">
                 <option value="">(auto-discover by name "AI-Implement Status")</option>
               </select>
               <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Status&rdquo;. Otherwise pick the field that holds the workflow status (Ready, Planning, Implementing, etc.).</div>
             </div>
             <div class="field">
-              <label class="field-label" data-field="ticketingConfig.repoFieldOverride">Repo Field</label>
+              <label class="field-label" data-setting="ticketingConfig.repoFieldOverride">Repo Field</label>
               <select class="select" id="md-jira-repo-field" onchange="onRepoFieldChange()">
                 <option value="">(auto-discover by name "AI-Implement Repo")</option>
               </select>
               <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.</div>
             </div>
             <div class="field">
-              <label class="field-label" data-field="ticketingConfig.profilesFieldOverride">Profiles Field</label>
+              <label class="field-label" data-setting="ticketingConfig.profilesFieldOverride">Profiles Field</label>
               <select class="select" id="md-jira-profiles-field">
                 <option value="">(auto-discover by name "AI-Implement Profiles")</option>
               </select>
               <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.</div>
             </div>
             <div class="field">
-              <label class="field-label" data-field="ticketingConfig.baseBranchFieldOverride">Base Branch Field</label>
+              <label class="field-label" data-setting="ticketingConfig.baseBranchFieldOverride">Base Branch Field</label>
               <select class="select" id="md-jira-base-branch-field">
                 <option value="">(auto-discover by name "AI-Implement Base Branch")</option>
               </select>
               <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Base Branch&rdquo;. Otherwise pick the text field that holds the branch an issue&#x27;s PR should target instead of the repo&#x27;s default branch.</div>
             </div>
             <div class="field">
-              <label class="field-label" data-field="ticketingConfig.repoFieldValue">Repo Field Value</label>
+              <label class="field-label" data-setting="ticketingConfig.repoFieldValue">Repo Field Value</label>
               <select class="select" id="md-jira-repo-value">
                 <option value="">Select a Repo Field first</option>
               </select>
               <input class="input mono hidden" id="md-jira-repo-value-text" type="text" placeholder="owner/repo">
             </div>
           </div>
-          <div id="md-filesystem-fields" data-field="ticketingConfig" class="hidden" style="display:grid;gap:12px">
+          <div id="md-filesystem-fields" data-setting="ticketingConfig" class="hidden" style="display:grid;gap:12px">
             <div class="field">
-              <label class="field-label" data-field="ticketingConfig.directory">Ticket Directory</label>
+              <label class="field-label" data-setting="ticketingConfig.directory">Ticket Directory</label>
               <input class="input mono" id="md-filesystem-directory" placeholder="/private/tmp/filesystem-local-tickets">
               <div class="field-hint">Absolute host path containing Markdown tickets. The orchestrator writes local state there, while implementation still opens real GitHub PRs for review iteration.</div>
             </div>
@@ -174,27 +174,27 @@ export const projectsHtml = `
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">The GitHub repository this mapping dispatches against, and how its branches are named.</p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div class="field">
-            <label class="field-label" data-field="owner">GitHub Owner</label>
+            <label class="field-label" data-setting="owner">GitHub Owner</label>
             <input class="input mono" id="md-owner" placeholder="acme-corp">
             <div class="field-hint">Org or user that owns the repo.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="repo">Repository Name</label>
+            <label class="field-label" data-setting="repo">Repository Name</label>
             <input class="input mono" id="md-repo" placeholder="backend">
             <div class="field-hint">Repository name only, no owner prefix.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="defaultBranch">Default Branch</label>
+            <label class="field-label" data-setting="defaultBranch">Default Branch</label>
             <input class="input mono" id="md-branch" placeholder="development">
             <div class="field-hint">Base for runner clones and implementation PRs.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="workflowFile">Workflow File</label>
+            <label class="field-label" data-setting="workflowFile">Workflow File</label>
             <input class="input mono" id="md-wf" value="claude-implement.yml">
             <div class="field-hint">Synced into the target repo under .github/workflows/.</div>
           </div>
           <div class="field" style="grid-column:1 / -1">
-            <label class="field-label" data-field="branchPrefix">Branch Prefix</label>
+            <label class="field-label" data-setting="branchPrefix">Branch Prefix</label>
             <input class="input mono" id="md-branch-prefix" placeholder="pr">
             <div class="field-hint">Blank = none.</div>
             <details class="explain">
@@ -210,12 +210,12 @@ export const projectsHtml = `
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">What a run can reach beyond the target repository.</p>
         <div style="display:grid;gap:12px">
           <div class="field">
-            <label class="field-label" data-field="skillsRepo">Skills Repo</label>
+            <label class="field-label" data-setting="skillsRepo">Skills Repo</label>
             <input class="input mono" id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="referenceRepos">Reference Repositories</label>
+            <label class="field-label" data-setting="referenceRepos">Reference Repositories</label>
             <div style="display:flex;gap:8px;align-items:flex-end">
               <input class="input mono" id="md-refrepo-repo" style="flex:2;min-width:0" placeholder="repository">
               <input class="input mono" id="md-refrepo-path" style="flex:2;min-width:0" placeholder="workspace path">
@@ -232,7 +232,7 @@ export const projectsHtml = `
             </details>
           </div>
           <div class="field">
-            <label class="field-label" data-field="dependencyTokenScope">Dependency Token Scope</label>
+            <label class="field-label" data-setting="dependencyTokenScope">Dependency Token Scope</label>
             <select class="select" id="md-dep-token-scope">
               <option value="">Off (default)</option>
               <option value="installation">All repos the App can access (read-only)</option>
@@ -259,14 +259,14 @@ export const projectsHtml = `
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
             <div class="field">
-              <label class="field-label" data-field="executionMode">Execution Mode</label>
+              <label class="field-label" data-setting="executionMode">Execution Mode</label>
               <select class="select" id="md-exec-mode" onchange="onExecModeChange()">
                 <option value="github-actions">github-actions</option>
                 <option value="fly-machines">fly-machines</option>
               </select>
             </div>
             <div class="field">
-              <label class="field-label" data-field="sessionMode">Session Mode</label>
+              <label class="field-label" data-setting="sessionMode">Session Mode</label>
               <select class="select" id="md-session-mode">
                 <option value="autonomous">autonomous</option>
                 <option value="interactive">interactive</option>
@@ -276,15 +276,15 @@ export const projectsHtml = `
           </div>
           <div id="md-fly-fields" class="hidden" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
             <div class="field">
-              <label class="field-label" data-field="machineCpus">CPUs</label>
+              <label class="field-label" data-setting="machineCpus">CPUs</label>
               <input class="input" id="md-cpus" type="number" min="1" value="2">
             </div>
             <div class="field">
-              <label class="field-label" data-field="machineMemoryMb">Memory (MB)</label>
+              <label class="field-label" data-setting="machineMemoryMb">Memory (MB)</label>
               <input class="input" id="md-mem" type="number" min="256" step="256" value="4096">
             </div>
             <div class="field">
-              <label class="field-label" for="md-cpu-kind" data-field="machineCpuKind">CPU type</label>
+              <label class="field-label" for="md-cpu-kind" data-setting="machineCpuKind">CPU type</label>
               <select class="select" id="md-cpu-kind">
                 <option value="shared">shared</option>
                 <option value="performance">performance</option>
@@ -293,7 +293,7 @@ export const projectsHtml = `
             </div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="reviewProcess">Review process</label>
+            <label class="field-label" data-setting="reviewProcess">Review process</label>
             <select class="select" id="md-review-process">
               <option value="ai-implement">AI-Implement</option>
               <option value="claude-code-review">Claude Code Review</option>
@@ -303,12 +303,12 @@ export const projectsHtml = `
             <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Applies to every project; Restate coordinates AI-Implement fix attempts on every backend.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="trustedReviewAuthors">Trusted Review Authors</label>
+            <label class="field-label" data-setting="trustedReviewAuthors">Trusted Review Authors</label>
             <textarea class="textarea" id="md-trusted-review-authors" rows="3" placeholder="topia-ai-implement-bot[bot]"></textarea>
             <div class="field-hint">Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="extraEnv">Extra Env</label>
+            <label class="field-label" data-setting="extraEnv">Extra Env</label>
             <textarea class="textarea" id="md-env" rows="4" placeholder="LOG_LEVEL=debug&#10;FEATURE_FLAG=on"></textarea>
             <div class="field-hint">One KEY=VALUE per line. Unlike secrets, these reach the model process and are visible to the agent.</div>
           </div>
@@ -319,27 +319,27 @@ export const projectsHtml = `
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">How much work this project may have running, and how long each run may take. Every cap applies to re-dispatches as well as initial runs.</p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div class="field">
-            <label class="field-label" data-field="maxInProgressAiIssues">Max parallel AI issues</label>
+            <label class="field-label" data-setting="maxInProgressAiIssues">Max parallel AI issues</label>
             <input class="input" id="md-max-ai" type="number" min="1" value="3">
             <div class="field-hint">Issues in flight at once for this project. Required.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="maxTurns">Max Turns</label>
+            <label class="field-label" data-setting="maxTurns">Max Turns</label>
             <input class="input" id="md-max-turns" type="number" min="1" step="1" placeholder="50">
             <div class="field-hint">Claude turns per implement pass. Blank = 50.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="maxIterations">Max Iterations</label>
+            <label class="field-label" data-setting="maxIterations">Max Iterations</label>
             <input class="input" id="md-max-iter" type="number" min="1" step="1" placeholder="3">
             <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="prDispatchBudget">PR Dispatch Budget</label>
+            <label class="field-label" data-setting="prDispatchBudget">PR Dispatch Budget</label>
             <input class="input" id="md-pr-budget" type="number" min="1" step="1" placeholder="4">
             <div class="field-hint">Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.</div>
           </div>
           <div class="field" style="grid-column:1 / -1">
-            <label class="field-label" data-field="reviewers">Reviewers</label>
+            <label class="field-label" data-setting="reviewers">Reviewers</label>
             <div id="md-reviewer-list"></div>
             <div style="display:flex;gap:8px;align-items:flex-end;margin-top:8px">
               <input class="input mono" id="md-reviewer-id" placeholder="reviewer id" style="flex:1;min-width:0">
@@ -348,7 +348,7 @@ export const projectsHtml = `
             <div class="field-hint">Blank = gap-analysis and code-review both run and gate. Reviewer Max turns blank = inherit the reviewer default or global limit.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="maxJobMinutes">Job Timeout (min)</label>
+            <label class="field-label" data-setting="maxJobMinutes">Job Timeout (min)</label>
             <input class="input" id="md-max-job-min" type="number" min="1" step="1" placeholder="90">
             <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
           </div>
@@ -359,12 +359,12 @@ export const projectsHtml = `
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Files a run is refused permission to push. AI-Implement already blocks a built-in list; these two settings extend it and carve holes in it.</p>
         <div style="display:grid;gap:12px">
           <div class="field">
-            <label class="field-label" data-field="sensitiveAddPatterns">Additional protected files</label>
+            <label class="field-label" data-setting="sensitiveAddPatterns">Additional protected files</label>
             <textarea class="textarea" id="md-sensitive-add" rows="3" placeholder="infra/**&#10;*.pem&#10;deploy/production.yml"></textarea>
             <div class="field-hint">One file pattern per line, on top of the built-in list. <span class="mono">*</span> matches within one path segment, <span class="mono">**</span> matches across segments. Blank = none.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="sensitiveAllowPatterns">Exceptions to those rules</label>
+            <label class="field-label" data-setting="sensitiveAllowPatterns">Exceptions to those rules</label>
             <textarea class="textarea" id="md-sensitive-allow" rows="3" placeholder="infra/README.md&#10;deploy/example.yml"></textarea>
             <div class="field-hint">One file pattern per line. Same syntax as above.</div>
           </div>
@@ -383,7 +383,7 @@ export const projectsHtml = `
         <div style="display:grid;gap:18px">
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
             <div class="field">
-              <label class="field-label" data-field="provider">AI Provider</label>
+              <label class="field-label" data-setting="provider">AI Provider</label>
               <select class="select" id="md-provider" onchange="onProviderChange()">
                 <option value="anthropic">anthropic</option>
                 <option value="bedrock">bedrock</option>
@@ -391,18 +391,18 @@ export const projectsHtml = `
               <div class="field-hint">Bedrock requires the GitHub Actions execution mode.</div>
             </div>
             <div id="md-aws-region-wrap" class="field hidden">
-              <label class="field-label" data-field="awsRegion">AWS Region</label>
+              <label class="field-label" data-setting="awsRegion">AWS Region</label>
               <input class="input mono" id="md-aws-region" placeholder="us-west-2">
               <div class="field-hint">Where your Bedrock inference profile is deployed.</div>
             </div>
           </div>
           <div>
             <div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:10px">Planning</div>
-            <label class="checkbox-row" data-field="planningEnabled"><input id="md-planning" type="checkbox" onchange="onPlanningChange()"> Enabled &mdash; Claude posts a plan to the ticket before implementing</label>
-            <label class="checkbox-row" data-field="autoApprovePlans"><input id="md-auto-approve" type="checkbox" checked> Auto-approve plans</label>
-            <label class="checkbox-row" data-field="autoMerge"><input id="md-auto-merge" type="checkbox"> Auto-merge child PRs into their grouping branch</label>
+            <label class="checkbox-row" data-setting="planningEnabled"><input id="md-planning" type="checkbox" onchange="onPlanningChange()"> Enabled &mdash; Claude posts a plan to the ticket before implementing</label>
+            <label class="checkbox-row" data-setting="autoApprovePlans"><input id="md-auto-approve" type="checkbox" checked> Auto-approve plans</label>
+            <label class="checkbox-row" data-setting="autoMerge"><input id="md-auto-merge" type="checkbox"> Auto-merge child PRs into their grouping branch</label>
             <div id="md-planning-wf-wrap" class="field hidden" style="max-width:260px;margin-top:10px">
-              <label class="field-label" data-field="planningWorkflowFile">Planning Workflow File</label>
+              <label class="field-label" data-setting="planningWorkflowFile">Planning Workflow File</label>
               <input class="input mono" id="md-planning-wf" value="claude-plan.yml">
             </div>
           </div>
@@ -1327,8 +1327,8 @@ export const projectsScript = `
   // The tab holding the setting a refusal names, read from the markup: its own element, else its root's for a ticketing system's nested key.
   function mappingFieldTab(field) {
     if (typeof field !== 'string') return undefined;
-    const marked = Array.from(document.querySelectorAll('#mapping-dialog [data-field]'));
-    const el = marked.find((m) => m.dataset.field === field) || marked.find((m) => m.dataset.field === field.split('.')[0]);
+    const marked = Array.from(document.querySelectorAll('#mapping-dialog [data-setting]'));
+    const el = marked.find((m) => m.dataset.setting === field) || marked.find((m) => m.dataset.setting === field.split('.')[0]);
     const panel = el ? el.closest('[data-md-panel]') : null;
     return panel ? panel.dataset.mdPanel : undefined;
   }

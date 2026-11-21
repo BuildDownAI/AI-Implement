@@ -18,7 +18,7 @@ export const stepperHtml = `
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Ticketing System</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Choose where this mapping&rsquo;s issues come from. Each ticketing system has different config requirements on the next step.</p>
         <div class="field" style="max-width:240px">
-          <label class="field-label" data-field="ticketingProvider">Ticketing System</label>
+          <label class="field-label" data-setting="ticketingProvider">Ticketing System</label>
           <select class="input" id="np-ticketing-provider" onchange="onStepperTicketingProviderChange()">
             <option value="linear">Linear</option>
             <option value="jira">Jira</option>
@@ -34,15 +34,15 @@ export const stepperHtml = `
 
         <div id="np-linear-config" hidden>
           <div class="field">
-            <label class="field-label" data-field="teamKey">Project Mapping Key</label>
+            <label class="field-label" data-setting="teamKey">Project Mapping Key</label>
             <input class="input mono" id="np-teamKey" placeholder="MY_TEAM" autocomplete="off" oninput="updateStepperNextButton()">
             <div class="field-hint">Your Linear team&rsquo;s uppercase key, such as ENG or BACKEND.</div>
           </div>
         </div>
 
-        <div id="np-jira-config" data-field="ticketingConfig" hidden>
+        <div id="np-jira-config" data-setting="ticketingConfig" hidden>
           <div class="field">
-            <label class="field-label" data-field="ticketingConfig.jql">JQL</label>
+            <label class="field-label" data-setting="ticketingConfig.jql">JQL</label>
             <textarea class="input mono" id="np-jira-jql" rows="3" placeholder="project = TEST" oninput="updateStepperNextButton()"></textarea>
             <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
               <button type="button" class="btn btn-sm" onclick="stepperValidateJql()">Validate</button>
@@ -51,35 +51,35 @@ export const stepperHtml = `
             <div class="field-hint">The orchestrator wraps this with status filters at query time. Don&rsquo;t include status filters here.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="ticketingConfig.statusFieldOverride">Status Field</label>
+            <label class="field-label" data-setting="ticketingConfig.statusFieldOverride">Status Field</label>
             <select class="input" id="np-jira-status-field">
               <option value="">(auto-discover by name "AI-Implement Status")</option>
             </select>
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Status&rdquo;. Otherwise pick the field that holds the workflow status (Ready, Planning, Implementing, etc.).</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="ticketingConfig.repoFieldOverride">Repo Field</label>
+            <label class="field-label" data-setting="ticketingConfig.repoFieldOverride">Repo Field</label>
             <select class="input" id="np-jira-repo-field" onchange="onStepperRepoFieldChange()">
               <option value="">(auto-discover by name "AI-Implement Repo")</option>
             </select>
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="ticketingConfig.profilesFieldOverride">Profiles Field</label>
+            <label class="field-label" data-setting="ticketingConfig.profilesFieldOverride">Profiles Field</label>
             <select class="input" id="np-jira-profiles-field">
               <option value="">(auto-discover by name "AI-Implement Profiles")</option>
             </select>
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="ticketingConfig.baseBranchFieldOverride">Base Branch Field</label>
+            <label class="field-label" data-setting="ticketingConfig.baseBranchFieldOverride">Base Branch Field</label>
             <select class="input" id="np-jira-base-branch-field">
               <option value="">(auto-discover by name "AI-Implement Base Branch")</option>
             </select>
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Base Branch&rdquo;. Otherwise pick the text field that holds the branch an issue's PR should target instead of the repo's default branch.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="ticketingConfig.repoFieldValue">Repo Field Value</label>
+            <label class="field-label" data-setting="ticketingConfig.repoFieldValue">Repo Field Value</label>
             <select class="input" id="np-jira-repo-value" onchange="updateStepperNextButton()">
               <option value="">Select a Repo Field first</option>
             </select>
@@ -88,9 +88,9 @@ export const stepperHtml = `
           </div>
         </div>
 
-        <div id="np-filesystem-config" data-field="ticketingConfig" hidden>
+        <div id="np-filesystem-config" data-setting="ticketingConfig" hidden>
           <div class="field">
-            <label class="field-label" data-field="ticketingConfig.directory">Ticket Directory</label>
+            <label class="field-label" data-setting="ticketingConfig.directory">Ticket Directory</label>
             <input class="input mono" id="np-filesystem-directory" placeholder="/private/tmp/filesystem-local-tickets" autocomplete="off" oninput="updateStepperNextButton()">
             <div class="field-hint">Absolute host path containing Markdown tickets. The orchestrator writes local state there, while implementation still opens real GitHub PRs for review iteration.</div>
           </div>
@@ -109,22 +109,22 @@ export const stepperHtml = `
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Connect to the GitHub repository this mapping dispatches against.</p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div class="field">
-            <label class="field-label" data-field="owner">GitHub Owner</label>
+            <label class="field-label" data-setting="owner">GitHub Owner</label>
             <input class="input mono" id="np-owner" placeholder="acme-corp" autocomplete="off" oninput="updateStepperNextButton()">
             <div class="field-hint">Org or user that owns the repo.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="repo">Repository Name</label>
+            <label class="field-label" data-setting="repo">Repository Name</label>
             <input class="input mono" id="np-repo" placeholder="backend" autocomplete="off" oninput="updateStepperNextButton()">
             <div class="field-hint">Repository name only (no owner prefix).</div>
           </div>
           <div class="field" style="grid-column:1 / -1">
-            <label class="field-label" data-field="defaultBranch">Default Branch</label>
+            <label class="field-label" data-setting="defaultBranch">Default Branch</label>
             <input class="input mono" id="np-defaultBranch" placeholder="development" autocomplete="off" oninput="updateStepperNextButton()">
             <div class="field-hint">Branch used for workflow dispatches, runner clones, and implementation PR bases.</div>
           </div>
           <div class="field" style="grid-column:1 / -1">
-            <label class="field-label" data-field="branchPrefix">Branch Prefix <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="branchPrefix">Branch Prefix <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input mono" id="np-branch-prefix" placeholder="pr" autocomplete="off">
             <div class="field-hint">Blank = none.</div>
             <details class="explain">
@@ -137,12 +137,12 @@ export const stepperHtml = `
         <div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin:22px 0 10px">Guardrails</div>
         <div style="display:grid;gap:12px">
           <div class="field">
-            <label class="field-label" data-field="sensitiveAddPatterns">Additional protected files <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="sensitiveAddPatterns">Additional protected files <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <textarea class="input mono" id="np-sensitive-add" rows="3" placeholder="infra/**&#10;*.pem&#10;deploy/production.yml" autocomplete="off"></textarea>
             <div class="field-hint">One file pattern per line, on top of the built-in sensitive-files list. <span class="mono">*</span> matches within one path segment, <span class="mono">**</span> matches across segments. Blank = none.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="sensitiveAllowPatterns">Exceptions to those rules <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="sensitiveAllowPatterns">Exceptions to those rules <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <textarea class="input mono" id="np-sensitive-allow" rows="3" placeholder="infra/README.md&#10;deploy/example.yml" autocomplete="off"></textarea>
             <div class="field-hint">One file pattern per line. Same syntax as above.</div>
           </div>
@@ -161,12 +161,12 @@ export const stepperHtml = `
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">What a run can reach beyond the target repository.</p>
         <div style="display:grid;gap:12px">
           <div class="field">
-            <label class="field-label" data-field="skillsRepo">Skills Repo <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="skillsRepo">Skills Repo <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="referenceRepos">Reference Repositories <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="referenceRepos">Reference Repositories <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <div style="display:flex;gap:8px;align-items:flex-end">
               <input class="input mono" id="np-refrepo-repo" style="flex:2;min-width:0" placeholder="repository" autocomplete="off">
               <input class="input mono" id="np-refrepo-path" style="flex:2;min-width:0" placeholder="workspace path" autocomplete="off">
@@ -183,7 +183,7 @@ export const stepperHtml = `
             </details>
           </div>
           <div class="field">
-            <label class="field-label" data-field="dependencyTokenScope">Dependency Token Scope <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="dependencyTokenScope">Dependency Token Scope <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <select class="input" id="np-dep-token-scope">
               <option value="">Off (default)</option>
               <option value="installation">All repos the App can access (read-only)</option>
@@ -208,7 +208,7 @@ export const stepperHtml = `
             <div class="alert-desc">With <span class="mono">RUNNER_MODE=local</span>, this project runs in the local Docker runner and still opens real GitHub PRs for review iteration. No Fly credentials are needed for this path.</div>
           </div>
         </div>
-        <div id="np-hosted-runner-options" data-field="executionMode" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
+        <div id="np-hosted-runner-options" data-setting="executionMode" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
           <div class="runner-card active" data-runner="github-actions" onclick="selectExecutionMode('github-actions')">
             <div style="font-size:13px;font-weight:600;margin-bottom:4px">GitHub Actions</div>
             <div style="font-size:12px;color:var(--fg-secondary)">Run Claude via GitHub-hosted or self-hosted runners. Zero infrastructure overhead.</div>
@@ -221,15 +221,15 @@ export const stepperHtml = `
         <div id="np-fly-fields" hidden style="margin-bottom:18px">
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
             <div class="field">
-              <label class="field-label" data-field="machineCpus">CPUs</label>
+              <label class="field-label" data-setting="machineCpus">CPUs</label>
               <input class="input" id="np-cpus" type="number" min="1" value="2">
             </div>
             <div class="field">
-              <label class="field-label" data-field="machineMemoryMb">Memory (MB)</label>
+              <label class="field-label" data-setting="machineMemoryMb">Memory (MB)</label>
               <input class="input" id="np-mem" type="number" min="256" step="256" value="4096">
             </div>
             <div class="field">
-              <label class="field-label" for="np-cpu-kind" data-field="machineCpuKind">CPU type</label>
+              <label class="field-label" for="np-cpu-kind" data-setting="machineCpuKind">CPU type</label>
               <select class="select" id="np-cpu-kind">
                 <option value="shared">shared</option>
                 <option value="performance">performance</option>
@@ -239,7 +239,7 @@ export const stepperHtml = `
           </div>
         </div>
         <div class="field">
-          <label class="field-label" data-field="sessionMode">Session Mode</label>
+          <label class="field-label" data-setting="sessionMode">Session Mode</label>
           <select class="input" id="np-sessionMode">
             <option value="autonomous">autonomous &mdash; fully automated, no human input</option>
             <option value="interactive">interactive &mdash; Claude pauses for feedback</option>
@@ -251,7 +251,7 @@ export const stepperHtml = `
       <div data-step="5" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Provider</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Select the AI provider and configure planning behaviour.</p>
-        <div data-field="provider" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
+        <div data-setting="provider" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
           <div class="runner-card active" data-provider="anthropic" onclick="selectProvider('anthropic')">
             <div style="font-size:13px;font-weight:600;margin-bottom:4px">Anthropic API</div>
             <div style="font-size:12px;color:var(--fg-secondary)">Use the Anthropic API directly. Set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in Secrets.</div>
@@ -270,22 +270,22 @@ export const stepperHtml = `
         </div>
         <div id="np-bedrock-region-wrap" hidden style="margin-bottom:18px">
           <div class="field">
-            <label class="field-label" data-field="awsRegion">AWS Region</label>
+            <label class="field-label" data-setting="awsRegion">AWS Region</label>
             <input class="input mono" id="np-awsRegion" placeholder="us-west-2">
             <div class="field-hint">The AWS region where your Bedrock inference profile is deployed.</div>
           </div>
         </div>
         <div style="margin-top:4px">
           <div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:10px">Planning</div>
-          <label data-field="planningEnabled" style="display:flex;align-items:center;gap:8px;font-size:12.5px;margin-bottom:8px;cursor:pointer">
+          <label data-setting="planningEnabled" style="display:flex;align-items:center;gap:8px;font-size:12.5px;margin-bottom:8px;cursor:pointer">
             <input type="checkbox" id="np-planning" checked style="width:auto">
             Enable planning — Claude analyses the codebase and posts a structured plan to Linear before implementing.
           </label>
-          <label data-field="autoApprovePlans" style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer">
+          <label data-setting="autoApprovePlans" style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer">
             <input type="checkbox" id="np-autoApprove" checked style="width:auto">
             Auto-approve plans — skip the manual approval step and proceed to implementation automatically.
           </label>
-          <label data-field="autoMerge" style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer">
+          <label data-setting="autoMerge" style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer">
             <input type="checkbox" id="np-autoMerge" style="width:auto">
             Auto-merge child PRs — automatically merge child PRs into their grouping branch once checks pass.
           </label>
@@ -304,27 +304,27 @@ export const stepperHtml = `
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div class="field">
-            <label class="field-label" data-field="maxInProgressAiIssues">Max parallel AI issues</label>
+            <label class="field-label" data-setting="maxInProgressAiIssues">Max parallel AI issues</label>
             <input class="input" type="number" id="np-maxAi" min="1" value="3">
             <div class="field-hint">Issues in flight at once for this project. Must be a positive integer.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="maxTurns">Max Turns <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="maxTurns">Max Turns <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input" type="number" id="np-maxTurns" min="1" step="1" placeholder="50">
             <div class="field-hint">Claude turns per implement pass. Blank = 50.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="maxIterations">Max Iterations <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="maxIterations">Max Iterations <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input" type="number" id="np-maxIterations" min="1" step="1" placeholder="3">
             <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="prDispatchBudget">PR Dispatch Budget <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="prDispatchBudget">PR Dispatch Budget <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input" type="number" id="np-prDispatchBudget" min="1" step="1" placeholder="4">
             <div class="field-hint">Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="reviewProcess">Review process</label>
+            <label class="field-label" data-setting="reviewProcess">Review process</label>
             <select class="select" id="np-review-process">
               <option value="ai-implement">AI-Implement</option>
               <option value="claude-code-review">Claude Code Review</option>
@@ -334,12 +334,12 @@ export const stepperHtml = `
             <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Codex Code Review reads the hosted Codex verdict for the PR head. Restate coordinates AI-Implement fix attempts on every backend.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="trustedReviewAuthors">Trusted Review Authors <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="trustedReviewAuthors">Trusted Review Authors <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <textarea class="textarea" id="np-trusted-review-authors" rows="3" placeholder="topia-ai-implement-bot[bot]"></textarea>
             <div class="field-hint">Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-field="maxJobMinutes">Job Timeout (min) <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <label class="field-label" data-setting="maxJobMinutes">Job Timeout (min) <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input" type="number" id="np-maxJobMinutes" min="1" step="1" placeholder="90">
             <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
           </div>
@@ -1059,8 +1059,8 @@ export const stepperScript = `
   function fieldStep(field) {
     if (typeof field !== 'string') return undefined;
     const key = field === 'teamKey' && data.ticketingProvider !== 'linear' ? 'repo' : field;
-    const marked = Array.from(document.querySelectorAll('#np-stepper-wrap [data-field]'));
-    const el = marked.find((m) => m.dataset.field === key) || marked.find((m) => m.dataset.field === key.split('.')[0]);
+    const marked = Array.from(document.querySelectorAll('#np-stepper-wrap [data-setting]'));
+    const el = marked.find((m) => m.dataset.setting === key) || marked.find((m) => m.dataset.setting === key.split('.')[0]);
     const stepEl = el ? el.closest('[data-step]') : null;
     return stepEl ? Number(stepEl.dataset.step) : undefined;
   }

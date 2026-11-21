@@ -707,8 +707,8 @@ describe("projects page agents tab", () => {
     ...overrides,
   });
 
-  function mountAgents(opts: { defaults?: Mapping; stored?: Mapping; accounts?: Mapping[]; put?: { status: number; body: Mapping } } = {}) {
-    const m = mountProjects(makeMapping({ executionMode: "fly-machines" }));
+  function mountAgents(opts: { defaults?: Mapping; stored?: Mapping; accounts?: Mapping[]; put?: { status: number; body: Mapping }; refusedSave?: { status: number; body: unknown } } = {}) {
+    const m = mountProjects(makeMapping({ executionMode: "fly-machines" }), { save: opts.refusedSave });
     const calls: { url: string; method: string; body: unknown }[] = [];
     const base = m.win.api;
     m.win.api = async (url: string, init?: { method?: string; body?: string }) => {
@@ -741,6 +741,18 @@ describe("projects page agents tab", () => {
     doc.querySelector<HTMLInputElement & HTMLSelectElement>(`[data-ag-${kind}][data-stage="${stage}"][data-field="${f}"]`)!;
   const preview = (doc: Document, stage: string, f: string) => doc.querySelector(`[data-ag-preview="${stage}.${f}"]`)!.textContent;
   const puts = (m: ReturnType<typeof mountAgents>) => m.calls.filter((c) => c.method === "PUT");
+
+  // A stage control's own field can share a setting's name, as provider does, and must never decide where that setting's refusal goes.
+  it("opens AI Provider's tab for its refusal with the stage controls rendered ahead of it", async () => {
+    const m = mountAgents({ refusedSave: { status: 400, body: { error: "The setting was refused.", field: "provider" } } });
+    await open(m);
+    const panel = (name: string) => m.doc.querySelector(`[data-md-panel="${name}"]`)!;
+    panel("ticketing").before(panel("agents"));
+    expect(field(m.doc, "value", "planning", "provider")).not.toBeNull();
+    m.win.switchMappingTab("source");
+    await m.win.saveMappingDialog();
+    expect((m.doc.querySelector("#md-tabs [data-md-tab].active") as HTMLElement).dataset.mdTab).toBe("provider");
+  });
 
   it.each(["legacy", "configured"])("saves and reloads the open-model checkbox in %s mode", async (mode) => {
     const stored: Mapping = { mode, stages: {} };
