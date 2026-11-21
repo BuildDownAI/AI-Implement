@@ -211,7 +211,7 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
   // Every project's rows wait on github.app-identity, so its change reaches projects a partial run did not read, whose stored rows only a full run can correct.
   describe("a shared check every project's rows wait on", () => {
     const appIdentity = (state: Row["state"]) => row({ id: "github.app-identity", group: "github", state });
-    const waiting = (project: string) => row({ project, state: "cannot-verify", waitsOn: "github.app-identity" });
+    const waiting = (project: string) => row({ project, state: "cannot-verify", waitsOnCheck: "github.app-identity" });
     const recheck = (key: string) => callObject<SetupCheckRun | null>(env().baseUrl(), "SetupChecks", key, "recheck", { id: "github.app-identity" });
 
     it.each([
@@ -289,6 +289,26 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
     expect(await call(key, "get")).toEqual(full);
   });
 
+  // A stored run from a check list declared otherwise has no rows for a check it lacked, and copies the old declaration into the rest.
+  it.each([
+    ["an orchestrator-wide run", "relisted-wide", (key: string) => call<SetupCheckRun>(key, "runOrchestratorWide")],
+    ["a project run", "relisted-project", (key: string) => runProject(key, "ENG")],
+    ["a recheck", "relisted-recheck", (key: string) => callObject<SetupCheckRun | null>(env().baseUrl(), "SetupChecks", key, "recheck", { id: "restate" })],
+  ] as const)("answers %s with a full run, stored whole, when the stored run came from a check list declared otherwise", async (_case, key, start) => {
+    nextRun = async () => ({ checkedAt: 7660, results: [row({ id: "restate", group: "orchestrator" }), row({ project: "ENG" })], checkListFingerprint: "before" });
+    await call<SetupCheckRun>(key, "run");
+    const partial = (results: Row[], scope: SetupCheckScope): SetupCheckRun => ({ checkedAt: 7670, results, scope, checkListFingerprint: "after" });
+    nextWideRun = async () => partial([row({ id: "restate", group: "orchestrator" })], { checks: ["restate"] });
+    nextProjectRun = async () => partial([row({ project: "ENG" })], { checks: ["tracker.linear.team-access"], projects: ["ENG"] });
+    nextScope = async () => partial([row({ id: "restate", group: "orchestrator" })], { checks: ["restate"] });
+    const full: SetupCheckRun = { checkedAt: 7681, results: [row({ id: "restate", group: "orchestrator" }), row({ project: "ENG" }), row({ project: "OPS" })], checkListFingerprint: "after" };
+    let quiet = 0;
+    nextQuietRun = async () => { quiet++; return full; };
+    expect(await start(key)).toEqual(full);
+    expect(quiet).toBe(1);
+    expect(await call(key, "get")).toEqual(full);
+  });
+
   // The project run's own escalation is already a full run, which nothing stored needs no second one for.
   it("runs every check once for a project run that finds a shared fault when nothing is stored", async () => {
     const full: SetupCheckRun = { checkedAt: 7801, results: [row({ id: "tracker.provider", state: "fail" }), row({ project: "ENG", state: "cannot-verify" })] };
@@ -343,7 +363,7 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
       // github.app-identity already fails in the stored run, so its recheck merges rather than escalating to a full run.
       nextRun = async () => ({ checkedAt: 8300, results: [row({ project: "ENG" }), row({ id: "github.app-identity", group: "github", state: "fail" })] });
       await call<SetupCheckRun>("recheck-waits", "run");
-      const waiting = row({ project: "ENG", state: "cannot-verify", waitsOn: "github.app-identity" });
+      const waiting = row({ project: "ENG", state: "cannot-verify", waitsOnCheck: "github.app-identity" });
       const asked = answering({
         "tracker.linear.team-access": { checkedAt: 8301, results: [waiting], scope: { checks: ["tracker.linear.team-access"], projects: ["ENG"] } },
         "github.app-identity": { checkedAt: 8302, results: [row({ id: "github.app-identity", group: "github", state: "fail" })], scope: { checks: ["github.app-identity"] } },
@@ -361,7 +381,7 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
         asked.push([scope.checks[0], scope.projects?.[0]]);
         return scope.checks[0] === "github.app-identity"
           ? { checkedAt: 8352, results: [row({ id: "github.app-identity", group: "github", state: "fail" })], scope }
-          : { checkedAt: 8351, results: [row({ project: scope.projects![0], state: "cannot-verify", waitsOn: "github.app-identity" })], scope };
+          : { checkedAt: 8351, results: [row({ project: scope.projects![0], state: "cannot-verify", waitsOnCheck: "github.app-identity" })], scope };
       };
       await recheck("recheck-shared", { id: "tracker.linear.team-access", project: "ENG" });
       await recheck("recheck-shared", { id: "tracker.linear.team-access", project: "OPS" });

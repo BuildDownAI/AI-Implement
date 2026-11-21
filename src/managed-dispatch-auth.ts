@@ -18,7 +18,7 @@ import {
   prepareAgentRun,
   releaseRejectedLaunch,
 } from "./agent-run-preparation.js";
-import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
+import type { ExecutionBackend } from "./runner-mode.js";
 import { parseExecutionPolicy, parseModelAuthContext, type ModelAuthGrantBootstrapV1, type SafeGrantMetadata } from "./model-auth-contract.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
 import { copyAccountFallbacks, type AccountFallbacks, copyModelFallbacks, type ResolvedAgentSnapshotV1, type RunCredentialsV1 } from "./run-config.js";
@@ -28,7 +28,7 @@ export interface ManagedDispatchRequest {
   dispatchId: string;
   /** Mapping key (`issue.scopeKey`). */
   projectKey: string;
-  backend: DispatchAdmissionBackend;
+  backend: ExecutionBackend;
   /** Repository used for the workflow-capability probe and credential scoping. */
   owner: string;
   repo: string;
@@ -41,7 +41,7 @@ export type ManagedDispatchDecision =
       readonly kind: "launch";
       readonly dispatchId: string;
       readonly projectKey: string;
-      readonly backend: DispatchAdmissionBackend;
+      readonly backend: ExecutionBackend;
       readonly snapshot: ResolvedAgentSnapshotV1;
       readonly accountFallbacks?: AccountFallbacks;
       readonly fallbackModels: Partial<Record<StageName, string>>;
@@ -154,7 +154,7 @@ export function settleLaunch(
 
 /** Mirrors `isDefinitiveFlyRejectionError` and `isDefinitiveLocalDockerLaunchFailure` in `src/index.ts`. */
 export function classifyLaunchError(
-  backend: DispatchAdmissionBackend,
+  backend: ExecutionBackend,
   launchAttempted: boolean,
   err: unknown,
 ): "rejected" | "unknown" {

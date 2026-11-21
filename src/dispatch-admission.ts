@@ -4,13 +4,12 @@ import type Database from "better-sqlite3";
 import { getDb } from "./dedup.js";
 import type { DispatchKind } from "./dispatch-gate.js";
 import { getJobByDispatchId, type Job } from "./log.js";
+import type { ExecutionBackend } from "./runner-mode.js";
 
 /** Matches `dispatch-gate.ts`'s PR_BUDGET_WINDOW_MS — kept local since that module
  *  does not export its constant, and this table's budget entries are a distinct
  *  ledger from `dispatch_log`'s. */
 const PR_BUDGET_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-export type DispatchAdmissionBackend = "github-actions" | "fly-machines" | "local-docker";
 
 /** Which system's write this reservation belongs to. A row's owner never changes in
  *  place — a slot is released and re-admitted under a new owner, not reassigned. */
@@ -54,7 +53,7 @@ export interface DispatchAdmissionRequest {
   readonly mappingKey: string;
   readonly scope: DispatchAdmissionScope;
   readonly kind: DispatchAdmissionKind;
-  readonly backend: DispatchAdmissionBackend;
+  readonly backend: ExecutionBackend;
   readonly lifecycleOwner: LifecycleOwner;
   /** Team capacity for `mappingKey` (the old `canDispatch`'s `maxInProgressAiIssues`). */
   readonly cap: number;
@@ -81,7 +80,7 @@ export interface DispatchAdmissionRecord {
   readonly mappingKey: string;
   readonly scope: DispatchAdmissionScope;
   readonly kind: DispatchAdmissionKind;
-  readonly backend: DispatchAdmissionBackend;
+  readonly backend: ExecutionBackend;
   readonly lifecycleOwner: LifecycleOwner;
   /** Opaque token distinguishing this reservation from any other that has ever held
    *  the same `dispatchId`. `release` must be given the generation it read (from
@@ -163,7 +162,7 @@ function toRecord(row: Row): DispatchAdmissionRecord {
     mappingKey: row.mapping_key,
     scope: decodeScope(row),
     kind: row.phase as DispatchAdmissionKind,
-    backend: row.backend as DispatchAdmissionBackend,
+    backend: row.backend as ExecutionBackend,
     lifecycleOwner: decodeOwner(row.lifecycle_owner),
     generation: row.generation,
     createdAt: row.created_at,
@@ -441,7 +440,7 @@ export interface HeldReservation {
   readonly issueId: string;
   readonly issueIdentifier: string | null;
   readonly phase: DispatchAdmissionKind;
-  readonly backend: DispatchAdmissionBackend;
+  readonly backend: ExecutionBackend;
   readonly lifecycleOwner: string;
   readonly ageMs: number;
   readonly jobStatus: string | null;
@@ -465,7 +464,7 @@ export function listHeldReservations(now: number = Date.now()): HeldReservation[
       issueId: row.issue_id,
       issueIdentifier: job?.issueIdentifier ?? null,
       phase: row.phase as DispatchAdmissionKind,
-      backend: row.backend as DispatchAdmissionBackend,
+      backend: row.backend as ExecutionBackend,
       lifecycleOwner: row.lifecycle_owner,
       ageMs: Math.max(0, now - row.created_at),
       jobStatus: job?.status ?? null,
@@ -559,7 +558,7 @@ export const DEFAULT_ADMISSION_SWEEP_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
 export interface StaleAdmissionCandidate {
   readonly dispatchId: string;
   readonly mappingKey: string;
-  readonly backend: DispatchAdmissionBackend;
+  readonly backend: ExecutionBackend;
   readonly lifecycleOwner: LifecycleOwner;
   readonly generation?: number;
   readonly ageMs: number;
@@ -601,7 +600,7 @@ export async function sweepStaleAdmissions(
     const candidate: StaleAdmissionCandidate = {
       dispatchId: row.dispatch_id,
       mappingKey: row.mapping_key,
-      backend: row.backend as DispatchAdmissionBackend,
+      backend: row.backend as ExecutionBackend,
       lifecycleOwner: decodeOwner(row.lifecycle_owner),
       generation: row.generation,
       ageMs: Date.now() - row.created_at,
@@ -685,7 +684,7 @@ export async function reconcileTerminalCallbackAdmissions(
     const candidate: StaleAdmissionCandidate = {
       dispatchId: row.dispatch_id,
       mappingKey: row.mapping_key,
-      backend: row.backend as DispatchAdmissionBackend,
+      backend: row.backend as ExecutionBackend,
       lifecycleOwner: decodeOwner(row.lifecycle_owner),
       generation: row.generation,
       ageMs: Date.now() - row.created_at,

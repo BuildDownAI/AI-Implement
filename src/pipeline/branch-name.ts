@@ -21,14 +21,14 @@ function slugify(value: string | undefined, fallback: string): string {
  *   alphanumeric, no "..", no "//", <= 64 chars.
  * Throws on an invalid (non-blank) value so callers can surface a clear error.
  */
-export function normalizeBranchPrefix(raw: string | null | undefined): string | null {
+export function normalizeBranchPrefix(raw: string | null | undefined, subject = "branchPrefix"): string | null {
   if (raw == null) return null;
   let value = raw.trim().replace(/^\/+|\/+$/g, "");
   if (value === "") return null;
   if (value.length > MAX_BRANCH_PREFIX_LENGTH) {
-    throw new Error(`branchPrefix must be ${MAX_BRANCH_PREFIX_LENGTH} characters or fewer`);
+    throw new Error(`${subject} must be ${MAX_BRANCH_PREFIX_LENGTH} characters or fewer.`);
   }
-  validateRefSegments(value, "branchPrefix");
+  validateRefSegments(value, subject);
   return value;
 }
 

@@ -3,7 +3,7 @@ import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { FilesystemSetupFacts, JiraSetupFacts } from "../../providers/types.js";
 import type { SetupCheck, SetupCheckContext, SetupCheckId, SetupCheckResult, SetupCheckRun, SetupCheckScope } from "../../setup-checks/index.js";
-import { waitOn } from "../../setup-checks/contract.js";
+import { waitOnCheck } from "../../setup-checks/contract.js";
 import { makeAccessEntry, makeAppPrivateKey, makeMapping, makeProvider } from "../helpers/builders.js";
 import { makeGitHubSetupFacts, makeLinearSetupFacts, makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
@@ -28,6 +28,7 @@ function fakeCheck(overrides: Partial<SetupCheck> = {}): SetupCheck {
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: [],
     run: () => [{ state: "pass" }],
     ...overrides,
   };
@@ -242,12 +243,12 @@ describe("SETUP_CHECKS", () => {
   });
 
   // A surface groups a project's rows by the check they wait on, so a fix that names a check without saying so would be shown alone.
-  it("gives every row whose fix waits on another check that check as its waitsOn, and only those rows", async () => {
+  it("gives every row whose fix waits on another check that check as its waitsOnCheck, and only those rows", async () => {
     let waiting = 0;
     for (const ctx of Object.values(CONTEXTS)) {
       for (const row of await resultsFor(ctx)) {
         const named = row.fix?.match(/^More information is needed\. Address the (.+) check first\.$/)?.[1];
-        expect(row.waitsOn, `${row.id}: ${row.fix}`).toBe(named);
+        expect(row.waitsOnCheck, `${row.id}: ${row.fix}`).toBe(named);
         if (named) waiting++;
       }
     }
@@ -255,18 +256,59 @@ describe("SETUP_CHECKS", () => {
   });
 
   it("words a waiting row's fix from the check it waits on", () => {
-    expect(waitOn("tracker.provider")).toEqual({ fix: "More information is needed. Address the tracker.provider check first.", waitsOn: "tracker.provider" });
+    expect(waitOnCheck("tracker.provider")).toEqual({ fix: "More information is needed. Address the tracker.provider check first.", waitsOnCheck: "tracker.provider" });
+  });
+});
+
+describe("fingerprintCheckList", () => {
+  const redeclared = (change: Partial<SetupCheck>) =>
+    checks.fingerprintCheckList(checks.SETUP_CHECKS.map((check, i) => (i === 0 ? { ...check, ...change } : check)));
+
+  it("changes when a check is added, removed or declared differently", () => {
+    const list = checks.SETUP_CHECKS;
+    const before = checks.fingerprintCheckList(list);
+    expect(checks.fingerprintCheckList([...list, fakeCheck({ id: "admin.path" })])).not.toBe(before);
+    expect(checks.fingerprintCheckList(list.slice(1))).not.toBe(before);
+    expect(redeclared({ title: "Renamed" })).not.toBe(before);
+    expect(redeclared({ tier: list[0].tier === "core" ? "feature" : "core" })).not.toBe(before);
+    expect(redeclared({ contextReaders: [...list[0].contextReaders, "mappings"] })).not.toBe(before);
+  });
+
+  // Keyed by every field a check declares, so a field added to SetupCheck does not compile until it has a case here.
+  const declaredDifferently: { [K in Exclude<keyof SetupCheck, "run">]-?: (check: SetupCheck) => SetupCheck[K] } = {
+    id: (check) => (check.id === "admin.path" ? "restate" : "admin.path"),
+    title: () => "Renamed",
+    group: (check) => (check.group === "github" ? "tracker" : "github"),
+    tier: (check) => (check.tier === "core" ? "feature" : "core"),
+    onAdminPath: (check) => !check.onAdminPath,
+    perProject: (check) => !check.perProject,
+    verifiable: (check) => !check.verifiable,
+    contextReaders: (check) => [...check.contextReaders, "mappings"],
+    githubReaders: (check) => [...(check.githubReaders ?? []), "app"],
+    waitsOnChecks: (check) => [...(check.waitsOnChecks ?? []), "restate"],
+    settingsRows: (check) => [...(check.settingsRows ?? []), "a_setting"],
+  };
+
+  it.each(Object.keys(declaredDifferently) as Array<keyof typeof declaredDifferently>)("changes when a check declares its %s differently", (field) => {
+    const first = checks.SETUP_CHECKS[0];
+    expect(redeclared({ [field]: declaredDifferently[field](first) })).not.toBe(checks.fingerprintCheckList(checks.SETUP_CHECKS));
+  });
+
+  it("stays the same when only how a check judges changes", () => {
+    expect(checks.fingerprintCheckList(checks.SETUP_CHECKS.map((check) => ({ ...check, run: () => [] })))).toBe(checks.fingerprintCheckList(checks.SETUP_CHECKS));
   });
 });
 
 describe("runSetupChecks", () => {
-  it("adds each check's identity to its outcomes and stamps the run with when it began and finished", async () => {
+  // The fingerprint is the registered check list's, whichever checks the run ran, so a partial run compares with the full run stored before it.
+  it("adds each check's identity to its outcomes and stamps the run with when it began and finished, and with the check list's fingerprint", async () => {
     const ticks = [1000, 1234];
     const check = fakeCheck({ id: "admin.path", title: "Admin sign-in", tier: "mode", onAdminPath: true, run: () => [{ state: "warn", detail: "d", fix: "f" }] });
     expect(await checks.runSetupChecks(makeSetupCheckContext(), [check], () => ticks.shift()!)).toEqual({
       startedAt: 1000,
       checkedAt: 1234,
       results: [{ id: "admin.path", title: "Admin sign-in", group: "orchestrator", tier: "mode", onAdminPath: true, state: "warn", detail: "d", fix: "f" }],
+      checkListFingerprint: checks.fingerprintCheckList(checks.SETUP_CHECKS),
     });
   });
 
@@ -344,12 +386,13 @@ describe("a run for one project", () => {
     await expect(checks.runProjectSetupChecks(linearProject("OPS"), "ENG")).rejects.toThrow("A run for ENG needs a context holding that project alone");
   });
 
-  it("runs every per-project check and the rows they depend on, and no other orchestrator-wide check", async () => {
+  // The orchestrator-wide checks come from what the per-project checks declare they wait on, and the host clock beside the App's identity.
+  it("runs every per-project check, the orchestrator-wide checks they wait on and the clock, and no other orchestrator-wide check", async () => {
     const ids = idsOf(await checks.runProjectSetupChecks(linearProject(), "ENG"));
-    for (const id of ["tracker.provider", "tracker.linear.credentials", "github.app-identity", "github.clock", "tracker.linear.team-access", "github.installation", "github.target-secrets"]) {
+    for (const id of ["env.github-app", "tracker.provider", "tracker.linear.credentials", "github.app-identity", "github.clock", "tracker.linear.team-access", "github.installation", "github.target-secrets"]) {
       expect(ids).toContain(id);
     }
-    for (const id of ["tracker.jira.credentials", "restate", "env.github-app", "admin.path", "github.webhook-signature", "github.kg-grants", "model.credentials-adopted"]) {
+    for (const id of ["tracker.jira.credentials", "restate", "admin.path", "github.webhook-signature", "github.kg-grants", "model.credentials-adopted"]) {
       expect(ids).not.toContain(id);
     }
   });
@@ -398,6 +441,58 @@ describe("a run for one project", () => {
   });
 });
 
+describe("what each check's rows can wait on", () => {
+  const APP_ENV = { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: makeAppPrivateKey(), GITHUB_WEBHOOK_SECRET: "a-webhook-secret", KG_SOURCE_REPO: "acme/kg" };
+  const NOW = Date.parse("2026-11-19T20:00:00Z");
+  const app = (slug: string | null) => ({ status: slug ? 200 : 401, slug, events: slug ? [] : null, errorBody: "", githubTime: NOW, localTime: NOW });
+  const installation = { id: 1, repository_selection: "all" as const, permissions: {} };
+  // A project whose every GitHub check reads GitHub, so none answers not-applicable before its read.
+  const reading = makeMapping({ owner: "acme", repo: "app", referenceRepos: [{ repo: "https://github.com/acme/reference", path: "reference" }], skillsRepo: "https://github.com/acme/skills" });
+  const JIRA = { kind: "jira" as const, jql: "project = OPS", repoFieldValue: "acme/ops", ...NO_FIELD_OVERRIDES };
+  const every = () => ({
+    ENG: makeMapping(),
+    ABC: makeMapping(),
+    OPS: makeMapping({ ticketingProvider: "jira", ticketingConfig: JIRA }),
+    LOCAL: makeMapping({ ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tickets" } }),
+  });
+
+  // Contexts beside the shared ones that reach each fault a row can wait on: the GitHub App's, and the ticketing systems' before their projects are read.
+  async function waitingContexts(): Promise<SetupCheckContext[]> {
+    const { GitHubApiError } = await import("../../github-errors.js");
+    const refused = () => Promise.reject(new GitHubApiError({ status: 403 }));
+    const github = (facts: Parameters<typeof makeGitHubSetupFacts>[0], env: Record<string, string> = APP_ENV) => makeSetupCheckContext({
+      env,
+      mappings: () => ({ ENG: reading }),
+      githubSetupFacts: () => makeGitHubSetupFacts({ kgSourceRepo: () => "acme/kg", ...facts }),
+    });
+    const tracker = (facts: (id: string) => Promise<unknown>) => makeSetupCheckContext({
+      mappings: every,
+      trackerSetupFacts: facts as SetupCheckContext["trackerSetupFacts"],
+    });
+    return [
+      ...Object.values(CONTEXTS),
+      github({}, { GITHUB_WEBHOOK_SECRET: "a-webhook-secret", KG_SOURCE_REPO: "acme/kg" }),
+      github({ app: async () => app(null), deliveries: refused }),
+      github({ app: async () => app("ai-implement"), installation: async () => null, installationRepositories: async () => null }),
+      github({ app: async () => app("ai-implement"), installation: async () => installation, installationRepositories: async () => null, repositories: refused }),
+      tracker(() => Promise.reject(new Error("The provider cannot be built"))),
+      tracker(async (id) => (id === "linear" ? makeLinearSetupFacts({ teams: { ENG: ["started", "completed"] } }) : id === "jira" ? { kind: "jira", credentials: "refused", status: 401, error: "refused" } : null)),
+    ];
+  }
+
+  // Each check declares the checks its rows can wait on, so what reaches its rows is read from the check, never a list kept beside it.
+  it("is every check a row it answers waits on, and nothing else", async () => {
+    const answered = new Map<string, Set<string>>();
+    for (const ctx of await waitingContexts()) {
+      for (const row of await resultsFor(ctx)) {
+        if (row.waitsOnCheck) answered.set(row.id, (answered.get(row.id) ?? new Set()).add(row.waitsOnCheck));
+      }
+    }
+    const declared = Object.fromEntries(checks.SETUP_CHECKS.filter((check) => (check.waitsOnChecks ?? []).length > 0).map((check) => [check.id, [...check.waitsOnChecks!].sort()]));
+    expect(Object.fromEntries([...answered].map(([id, waited]) => [id, [...waited].sort()]))).toEqual(declared);
+  });
+});
+
 describe("a fault every project on a dependency shares", () => {
   const JIRA_CONFIG = { kind: "jira" as const, jql: "project = OPS", repoFieldValue: "acme/ops", ...NO_FIELD_OVERRIDES };
   const broken = makeSetupCheckContext({
@@ -417,6 +512,13 @@ describe("a fault every project on a dependency shares", () => {
   const stored = (results: SetupCheckResult[]): SetupCheckRun => ({ checkedAt: 1, results });
   const partial = (results: SetupCheckResult[]): SetupCheckRun => ({ checkedAt: 2, results, scope: { checks: results.map((row) => row.id) } });
   const shared = (state: SetupCheckResult["state"], id: SetupCheckResult["id"] = "tracker.provider"): SetupCheckResult => ({ id, title: "", group: "tracker", tier: "core", onAdminPath: false, state, detail: "" });
+
+  it("answers a partial run with a full run when the stored run came from a check list declared otherwise, an older orchestrator's included", () => {
+    const listed = (run: SetupCheckRun, checkListFingerprint: string): SetupCheckRun => ({ ...run, checkListFingerprint });
+    expect(checks.partialRunNeedsFullRun(listed(partial([shared("pass")]), "after"), listed(stored([shared("pass")]), "before"))).toBe(true);
+    expect(checks.partialRunNeedsFullRun(listed(partial([shared("pass")]), "after"), stored([shared("pass")]))).toBe(true);
+    expect(checks.partialRunNeedsFullRun(listed(partial([shared("pass")]), "same"), listed(stored([shared("pass")]), "same"))).toBe(false);
+  });
 
   it("answers a partial run with a full run when nothing is stored, and never answers a full run with another", () => {
     expect(checks.partialRunNeedsFullRun(partial([shared("pass")]), null)).toBe(true);
@@ -577,9 +679,11 @@ describe("an orchestrator-wide run", () => {
 });
 
 describe("the run before Restate serves", () => {
-  it("runs the orchestrator's own checks, less the two that read what only Restate fills", async () => {
+  // restate and runner.fly-sessions read what only Restate fills; callback.reachable reads through the public address, which a deploy's proxy may not route here yet.
+  it("runs the orchestrator's own checks, less those that call a reader it cannot read yet", async () => {
     const run = await checks.runSetupChecksBeforeRestate(makeSetupCheckContext());
-    const own = checks.SETUP_CHECKS.filter((check) => check.group === "orchestrator").map((check) => check.id).filter((id) => id !== "restate" && id !== "runner.fly-sessions");
+    const later = ["restate", "runner.fly-sessions", "callback.reachable"];
+    const own = checks.SETUP_CHECKS.filter((check) => check.group === "orchestrator").map((check) => check.id).filter((id) => !later.includes(id));
     expect(new Set(run.results.map((row) => row.id))).toEqual(new Set(own));
   });
 });
@@ -632,12 +736,12 @@ describe("boot's setup-check runs", () => {
     expect(lines).toEqual([expect.stringContaining("env.github-app fail")]);
   });
 
-  // The stored run holds every row; the first log covered the orchestrator's own checks but the two that need Restate.
+  // The stored run holds every row; the first log covered the orchestrator's own checks but those that call a reader it cannot.
   it("logs only the stored rows the first log could not, once Restate serves", async () => {
-    const stored = runOf(row("env.github-app"), row("restate"), row("runner.fly-sessions"), row("tracker.linear.credentials"), { ...row("tracker.linear.team-access"), project: "ENG" });
+    const stored = runOf(row("env.github-app"), row("restate"), row("runner.fly-sessions"), row("callback.reachable"), row("tracker.linear.credentials"), { ...row("tracker.linear.team-access"), project: "ENG" });
     const { runs, lines } = boot({ storeOrchestratorWide: async () => stored });
     await runs.afterServing();
-    expect(lines.map((line) => line.split(" ")[1])).toEqual(["restate", "runner.fly-sessions", "tracker.linear.credentials"]);
+    expect(lines.map((line) => line.split(" ")[1])).toEqual(["restate", "runner.fly-sessions", "callback.reachable", "tracker.linear.credentials"]);
   });
 
   it("logs nothing once Restate serves when the run could not be stored, which the ingress already logged", async () => {
@@ -683,9 +787,15 @@ describe("a recheck", () => {
     expect(checks.recheckHeld(run, { checks: ["tracker.linear.team-access"], projects: ["ENG"] }, lastRecheckAt, HOUR)).toBe(held);
   });
 
+  // A recheck for every project's rows of a check runs while any of them could read differently now.
+  it("is not held while one stored row in scope passes, though another fails within the hour", () => {
+    const mixed: SetupCheckRun = { checkedAt: 0, results: [...stored("fail", 1, "ENG").results, ...stored("pass", 1, "OPS").results] };
+    expect(checks.recheckHeld(mixed, { checks: ["tracker.linear.team-access"] }, undefined, HOUR)).toBe(false);
+  });
+
   describe("of the checks a rechecked run's rows wait on", () => {
-    const waiting = (id: SetupCheckId, waitsOn?: SetupCheckId): SetupCheckResult =>
-      ({ id, title: "", group: "tracker", tier: "core", onAdminPath: false, state: "cannot-verify", ...(waitsOn ? { waitsOn } : {}) });
+    const waiting = (id: SetupCheckId, waitsOnCheck?: SetupCheckId): SetupCheckResult =>
+      ({ id, title: "", group: "tracker", tier: "core", onAdminPath: false, state: "cannot-verify", ...(waitsOnCheck ? { waitsOnCheck } : {}) });
     const runOf = (...results: SetupCheckResult[]): SetupCheckRun => ({ checkedAt: 0, results });
     // Answers each check's canned run with no hold, so only the chain's own guard can end it. Throws rather than loop without end.
     function rerunning(answers: Partial<Record<SetupCheckId, SetupCheckRun | null>>) {
@@ -706,24 +816,24 @@ describe("a recheck", () => {
         "tracker.linear.credentials": runOf(waiting("tracker.linear.credentials", "tracker.provider")),
         "tracker.provider": null,
       });
-      await checks.recheckWaitedOn(pickupLabel, runOf(waiting("tracker.linear.pickup-label", "tracker.linear.team-access")), rerun);
+      await checks.recheckChecksWaitedOn(pickupLabel, runOf(waiting("tracker.linear.pickup-label", "tracker.linear.team-access")), rerun);
       expect(asked).toEqual([["tracker.linear.team-access", "ENG"], ["tracker.linear.credentials", undefined], ["tracker.provider", undefined]]);
     });
 
-    // A flapping read, or a waitsOn added later, could lead the chain back to a check it already ran.
+    // A flapping read, or a waitsOnCheck added later, could lead the chain back to a check it already ran.
     it("runs each scope once, so a chain that leads back to one it ran ends", async () => {
       const { asked, rerun } = rerunning({
         "tracker.linear.team-access": runOf(waiting("tracker.linear.team-access", "tracker.linear.pickup-label"), waiting("tracker.linear.team-access", "tracker.linear.credentials")),
         "tracker.linear.credentials": runOf(waiting("tracker.linear.credentials", "tracker.linear.team-access")),
       });
       const run = runOf(waiting("tracker.linear.pickup-label", "tracker.linear.team-access"), waiting("tracker.linear.pickup-label", "tracker.linear.team-access"));
-      await checks.recheckWaitedOn(pickupLabel, run, rerun);
+      await checks.recheckChecksWaitedOn(pickupLabel, run, rerun);
       expect(asked).toEqual([["tracker.linear.team-access", "ENG"], ["tracker.linear.credentials", undefined]]);
     });
 
     it("runs nothing when no row waits on another check", async () => {
       const { asked, rerun } = rerunning({});
-      await checks.recheckWaitedOn(pickupLabel, runOf(waiting("tracker.linear.pickup-label")), rerun);
+      await checks.recheckChecksWaitedOn(pickupLabel, runOf(waiting("tracker.linear.pickup-label")), rerun);
       expect(asked).toEqual([]);
     });
   });

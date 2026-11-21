@@ -867,8 +867,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       reviewFixLifecycle: "restate",
     } as never;
     const provider = { id: "jira" } as never;
-    const planningCtx = (execPath: PlanningRunInput["backend"]) =>
-      ({ execPath, runnerMode: "default", resolvedPlanningBranch: "main", planningFieldValue: null }) as never;
+    const planningCtx = (backend: PlanningRunInput["backend"]) =>
+      ({ backend, runnerMode: "default", resolvedPlanningBranch: "main", planningFieldValue: null }) as never;
 
     beforeEach(() => setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } }));
     afterEach(() => resetRestateStatus());

@@ -4,7 +4,7 @@ import type { ModelAuthClient, ModelInvocation } from "../../../model-auth-clien
 import { toSafeGrantMetadata, type ModelAuthBackend, type ModelAuthGrantBootstrapV1 } from "../../../model-auth-contract.js";
 import { encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../../../run-config.js";
 import type { AccountAuthMode } from "../../../agent-config.js";
-import type { DispatchAdmissionBackend } from "../../../dispatch-admission.js";
+import type { ExecutionBackend } from "../../../runner-mode.js";
 import type { ManagedDispatchDecision } from "../../../managed-dispatch-auth.js";
 
 export const SENTINEL_BEARER = "SENTINELbearer0123456789abcdefghijklmnop";
@@ -62,7 +62,7 @@ export function makeGrant(snapshot: ResolvedAgentSnapshotV1, over: Partial<Model
 }
 
 /** The grant backend each dispatch backend mints for, as `GRANT_BACKENDS` in `agent-run-preparation.ts` maps them. */
-const GRANT_BACKEND: Record<DispatchAdmissionBackend, ModelAuthBackend> = {
+const GRANT_BACKEND: Record<ExecutionBackend, ModelAuthBackend> = {
   "github-actions": "gha",
   "fly-machines": "fly",
   "local-docker": "local",
@@ -82,7 +82,7 @@ export type LaunchDecision = Extract<ManagedDispatchDecision, { kind: "launch" }
  *  then `undefined`, as the prepared run's does. */
 export function makeLaunchDecision(
   snapshot: ResolvedAgentSnapshotV1,
-  backend: DispatchAdmissionBackend,
+  backend: ExecutionBackend,
   over: Partial<ModelAuthGrantBootstrapV1> = {},
 ): { decision: LaunchDecision; bootstrap: ModelAuthGrantBootstrapV1 } {
   const bootstrap = makeGrant(snapshot, { backend: GRANT_BACKEND[backend], expiresAt: Date.now() + GRANT_TTL_MS, ...over });
