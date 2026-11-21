@@ -44,6 +44,24 @@ it("carries a supplied baseBranch and omits it when not given", async () => {
   await dispatchFlyGapfill(input());
   expect(decodeRunConfig(mocks.create.mock.calls.at(-1)![2].config.env.AI_IMPLEMENT_RUN_CONFIG)).not.toHaveProperty("baseBranch");
 });
+it("carries a supplied issue description on Fly and falls back when it is blank", async () => {
+  const body = "Current tracker body with acceptance criteria";
+  const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  try {
+    await dispatchFlyGapfill(input({ issueDescription: body }));
+    const machine = mocks.create.mock.calls.at(-1)![2];
+    expect(decodeRunConfig(machine.config.env.AI_IMPLEMENT_RUN_CONFIG).issue.description).toBe(body);
+    expect(machine.config.env.ISSUE_DESCRIPTION).toBe(body);
+    expect(log.mock.calls.map(([line]) => String(line)).join("\n")).not.toContain(body);
+
+    await dispatchFlyGapfill(input({ issueDescription: "   " }));
+    const fallback = mocks.create.mock.calls.at(-1)![2];
+    expect(decodeRunConfig(fallback.config.env.AI_IMPLEMENT_RUN_CONFIG).issue.description).toBe("title");
+    expect(fallback.config.env.ISSUE_DESCRIPTION).toBe("title");
+  } finally {
+    log.mockRestore();
+  }
+});
 it("preserves the previous environment and run config for omitted and explicit agent-default", async () => {
   const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
   try {
@@ -198,6 +216,28 @@ it("carries advisory mode in Fly and GHA envelopes and rejects legacy GHA", asyn
   const launch = await prepareGhaGapfillLaunch(args);
   expect(decodeRunConfig(launch.inputs.run_config!).reviewOnly).toEqual(reviewOnly);
   await expect(prepareGhaGapfillLaunch({ ...args, checkContract: async () => "legacy" as const })).rejects.toThrow(/review-only requires/);
+});
+it("carries a supplied issue description in GHA envelope and legacy inputs", async () => {
+  const { prepareGhaGapfillLaunch } = await import("../gapfill-launch.js");
+  const body = "Current tracker body with acceptance criteria";
+  const args = {
+    mapping: makeMapping(), issue: { issueId: "i", issueIdentifier: "AII-1", issueTitle: "title" },
+    item: { owner: "acme", repo: "billing", prNumber: 7 },
+    ghToken: "gh", decision: { kind: "legacy" as const }, runnerCallbackBaseUrl: null,
+    runnerCallbackUrl: "", runToken: "", runProgressToken: "", issueDescription: body,
+    resolveRunnerImage: async () => undefined, checkContract: async () => "envelope" as const,
+  };
+  const envelope = await prepareGhaGapfillLaunch(args);
+  expect(decodeRunConfig(envelope.inputs.run_config!).issue.description).toBe(body);
+
+  const legacy = await prepareGhaGapfillLaunch({ ...args, checkContract: async () => "legacy" as const });
+  expect(legacy.inputs.issue_description).toBe(body);
+  expect(legacy.inputs.issue_title).toBe("title");
+
+  const omitted = await prepareGhaGapfillLaunch({ ...args, issueDescription: undefined });
+  expect(decodeRunConfig(omitted.inputs.run_config!).issue.description).toBe("title");
+  const omittedLegacy = await prepareGhaGapfillLaunch({ ...args, issueDescription: undefined, checkContract: async () => "legacy" as const });
+  expect(omittedLegacy.inputs.issue_description).toBe("title");
 });
 
 

@@ -244,7 +244,10 @@ describe("conflict resolution helpers", () => {
     const instruction = queue.conflictResolutionInstruction("ai-implement/feature/aii-200");
     expect(instruction).toContain("git rev-parse --verify origin/ai-implement/feature/aii-200");
     expect(instruction).toContain("git merge origin/ai-implement/feature/aii-200");
-    expect(instruction).toContain("git commit --no-edit");
+    expect(instruction).toContain(
+      "if git rev-parse -q --verify MERGE_HEAD >/dev/null; then git commit --no-edit; fi",
+    );
+    expect(instruction).toContain("a clean merge already committed itself");
     expect(instruction).toContain("stop and report");
     expect(instruction).toContain("BOTH sides' intent");
     expect(instruction).toContain("tests");

@@ -3,7 +3,7 @@ import { readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { getDiff } from "../pipeline/steps/feedback-loop.js";
+import { getDiff, reviewDiffBase } from "../pipeline/steps/feedback-loop.js";
 import { testDir, testTempRoot } from "./helpers/test-dir.js";
 
 function git(cwd: string, args: string[]): void {
@@ -415,5 +415,82 @@ describe("getDiff from the run start commit", () => {
     expect(diff).toContain("export const afterMerge = true");
     expect(diff).toContain("untracked.ts");
     expect(diff).toContain("export const untracked = true");
+  });
+});
+
+describe("reviewDiffBase — conflict repair net-change base", () => {
+  let repo: string;
+  let start: string;
+
+  function gitOut(cwd: string, args: string[]): string {
+    const r = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);
+    return r.stdout.toString().trim();
+  }
+
+  beforeEach(() => {
+    repo = testDir("diff-review-base");
+    git(repo, ["init", "-q", "-b", "ai-implement/aii-2"]);
+    git(repo, ["config", "user.email", "t@t.com"]);
+    git(repo, ["config", "user.name", "t"]);
+    writeFileSync(join(repo, "code.ts"), "export const a = 1;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "start"]);
+    start = gitOut(repo, ["rev-parse", "HEAD"]);
+
+    // A bare origin so origin/<feature> can be fetched like the clone step does.
+    const origin = testDir("diff-review-base-origin");
+    git(origin, ["init", "-q", "--bare"]);
+    git(repo, ["remote", "add", "origin", origin]);
+
+    git(repo, ["checkout", "-q", "-b", "ai-implement/feature/aii-2"]);
+    writeFileSync(join(repo, "sibling-only.ts"), "export const siblingOnly = true;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "sibling work"]);
+    git(repo, ["push", "-q", "origin", `refs/heads/ai-implement/feature/aii-2:refs/heads/ai-implement/feature/aii-2`]);
+    git(repo, ["checkout", "-q", "ai-implement/aii-2"]);
+  });
+
+  it("without a base branch, keeps the AII-1938 run-start output", () => {
+    expect(reviewDiffBase(repo, start)).toBe(start);
+    expect(reviewDiffBase(repo, start, undefined, "2")).toBe(start);
+    expect(getDiff(repo, reviewDiffBase(repo, start))).toBe(getDiff(repo, start));
+  });
+
+  it("without a PR number, keeps the run-start output even with a base branch", () => {
+    expect(reviewDiffBase(repo, start, "ai-implement/feature/aii-2")).toBe(start);
+  });
+
+  it("falls back to runStartHead when origin/<baseBranch> is missing", () => {
+    expect(reviewDiffBase(repo, start, "ai-implement/feature/missing", "2")).toBe(start);
+  });
+
+  it("uses the verified remote ref, so the diff is the PR's net change", () => {
+    git(repo, ["fetch", "-q", "origin", "+refs/heads/ai-implement/feature/aii-2:refs/remotes/origin/ai-implement/feature/aii-2"]);
+    expect(reviewDiffBase(repo, start, "ai-implement/feature/aii-2", "2")).toBe(
+      "origin/ai-implement/feature/aii-2",
+    );
+
+    // PR-owned change before the feature branch existed, plus a conflict resolution.
+    writeFileSync(join(repo, "pr-own.ts"), "export const prOwn = true;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "pr own change"]);
+    spawnSync("git", ["merge", "--no-ff", "--no-commit", "origin/ai-implement/feature/aii-2"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    writeFileSync(join(repo, "code.ts"), "export const a = 1;\nexport const resolved = true;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "merge feature"]);
+
+    const startDiff = getDiff(repo, start);
+    expect(startDiff).toContain("sibling-only.ts");
+    expect(startDiff).toContain("export const resolved = true");
+
+    const netDiff = getDiff(repo, reviewDiffBase(repo, start, "ai-implement/feature/aii-2", "2"));
+    expect(netDiff).toContain("pr-own.ts");
+    expect(netDiff).toContain("export const prOwn = true");
+    expect(netDiff).toContain("export const resolved = true");
+    expect(netDiff).not.toContain("sibling-only.ts");
   });
 });
