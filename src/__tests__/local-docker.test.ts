@@ -300,6 +300,40 @@ describe("serve mode (AII-2048)", () => {
     }
     expect(buildDockerRunArgs(protectedInput, "/tmp/x.env")).not.toContain("-p");
   });
+
+  it("combines serve with the protected model-auth transport", () => {
+    const bootstrap = {
+      version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1", projectKey: "AII",
+      backend: "local", expiresAt: 1, bearer: "B".repeat(43),
+      bindings: [{ stage: "implementation", profileId: "cdx", profileRevision: 1, authMode: "codex-subscription" }],
+    } as unknown as NonNullable<LocalRunnerInput["protectedModelAuth"]>["bootstrap"];
+    const input: StartLocalContainerInput = {
+      ...baseInput,
+      anthropicApiKey: undefined,
+      containerName: "ai-implement-serve-protected",
+      serve,
+      protectedModelAuth: {
+        bootstrap, projectKey: "AII",
+        runConfig: { v: 1, issue: { id: "i", identifier: "ENG-42", title: "t", description: "d" } } as RunConfigV1,
+        modelAuthUrl: "http://host.docker.internal:8080",
+      },
+    };
+    const env = buildLocalRunnerEnv(input);
+    // The three serve variables, and the protected model-auth values, all reach the env.
+    expect(env.AI_IMPLEMENT_RUNNER_SERVE).toBe("1");
+    expect(env.AI_IMPLEMENT_RUNNER_ID).toBe("dispatch-42");
+    expect(env.RESTATE_IDENTITY_KEY).toBe("publickeyv1_abc");
+    const { secretEnv } = splitLocalRunnerEnv(env, { protectedModelAuth: true });
+    expect(secretEnv.AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID).toBe("d1");
+    expect(secretEnv.AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY).toBe("AII");
+    expect(secretEnv.AI_IMPLEMENT_MODEL_AUTH_BACKEND).toBe("local");
+    expect(secretEnv.AI_IMPLEMENT_MODEL_AUTH_URL).toBe("http://host.docker.internal:8080");
+    expect(decodeTrustedRunConfig(secretEnv.AI_IMPLEMENT_RUN_CONFIG!).credentials?.modelAuthGrant).toMatchObject({ bearer: "B".repeat(43) });
+    // The args carry the loopback ephemeral publication, and no secret value.
+    const args = buildDockerRunArgs(input, "/tmp/x.env");
+    expect(args[args.indexOf("-p") + 1]).toBe("127.0.0.1::9080");
+    expect(args.join("\n")).not.toContain("B".repeat(43));
+  });
 });
 
 describe("pre-change env and argv for the four launch paths", () => {

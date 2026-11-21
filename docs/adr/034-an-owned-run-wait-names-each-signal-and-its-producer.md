@@ -76,3 +76,25 @@ The kg-refresh table carries one per-step row: `step:<id>:running` and `step:<id
 ## Amendment (2026-10-12): the decision row
 
 The kg-refresh table carries a `decision` row: workflow promise `decide`, resolved one time by the shared `decide` handler of `KgRefresh` ([AII-1256](https://linear.app/eudoxus/issue/AII-1256/kgrefresh-a-decision-gate-wait-for-decide-or-24-hours-release-the)). The producer is the MCP tool `decide_kg_refresh` (`src/restate/tools.ts`), which the admin page reaches through `POST /api/tools/decide_kg_refresh` and agents through `/mcp`; the Restate UI playground is added as a producer by [AII-1261](https://linear.app/eudoxus/issue/AII-1261/admin-only-restate-ui-through-the-orchestrator-root-path-allowlist). The tool takes no trigger id: it decides only the run `KgRepo.status()` reports in flight, so a past run cannot be decided. The contract test is "contract: KgRefresh.decide" in `src/__tests__/kg-refresh-decide-contract.test.ts` (the handler) and the real-Restate scenario in `src/__tests__/restate/kg-refresh-workflow.restate.test.ts` (the tool resolving the real handler of a run held at the gate). The signal ends the gate wait; `cancel` still ends it too.
+
+## Amendment (2026-11-21): the call arm
+
+The wait has one more arm, and it is not a signal. `OwnedRunWaitOptions.callArm` is
+`RestatePromise<unknown>`: the caller's own open call to the run's service handler, created one
+time and passed as the same promise to every `awaitOwnedRun` call, never a factory. This is the
+arm for [AII-2036](https://linear.app/eudoxus/issue/AII-2036/implementationrun-calls-the-local-runner-through-restate-and-a-failed),
+where the workflow calls `Runner_<runId>.run`; [AII-2065](https://linear.app/eudoxus/issue/AII-2065/let-awaitownedrun-race-one-runner-call-that-the-caller-holds-callarm)
+adds the arm only, so no run behaves differently yet. A factory would start a new invocation on
+each tick, and a runner starts one pipeline per invocation id.
+
+The producer is the caller, named at the call site, not a route: the caller makes the call itself
+and holds its promise, so rule 3's "name the module" and rule 4's "a test from the producer" are
+met by the caller's own race test. The called handler is a service handler like any other: the
+engine journals the call, so a replay reuses it instead of invoking the handler again.
+
+When the call ends, `awaitOwnedRun` returns `{ kind: "call_ended" }` for a result, or
+`{ kind: "call_failed", message }` for a terminal failure, without throwing. A resolved result
+signal still wins over the call arm, exactly as it wins over the tick at a deadline: the helper
+peeks `resultSignal` when the call arm wins. `callArm` changes none of the other arms, the
+deadline logic (`decideAtDeadline`), the `readStatus` path, or `cancelArm`; a workflow
+cancellation still unwinds the handler rather than becoming a `call_failed` event.
