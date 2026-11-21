@@ -269,6 +269,12 @@ on_err() {
 # phase -> entry file.
 select_runner_entry() {
   local phase="$1"
+  # Restate service mode (AII-2048): one launch option selects the runner's service entry
+  # regardless of phase. Unset or any value other than "1" keeps the phase mapping below.
+  if [ "${AI_IMPLEMENT_RUNNER_SERVE:-}" = "1" ]; then
+    echo "runner-service.js"
+    return 0
+  fi
   case "$phase" in
     planning) echo "run-planning.js" ;;
     local-planning) echo "run-local-planning.js" ;;
@@ -287,6 +293,7 @@ _remap_is_reserved() {
     GITHUB_*|ISSUE_*|AI_IMPLEMENT_*) return 0 ;;
     ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE) return 0 ;;
     RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME) return 0 ;;
+    RESTATE_IDENTITY_KEY) return 0 ;;
   esac
   # Legacy KG runs must not restore model routing variables after credential cleanup.
   if [ "${CONFIGURED:-0}" != "1" ] && [ "${RUNNER_PHASE:-}" = "kg-refresh" ]; then

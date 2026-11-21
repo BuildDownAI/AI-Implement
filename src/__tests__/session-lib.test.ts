@@ -179,6 +179,24 @@ echo "FINAL=$RUNNER_PHASE:$RUNNER_PHASE_SOURCE"; echo "ALIAS=\${SAN_RUNNER_PHASE
       expect(result.stdout.trim()).toBe(entry);
     }
   });
+
+  it("select_runner_entry returns the serve entry only for AI_IMPLEMENT_RUNNER_SERVE=1", () => {
+    const cases: Array<[string, string]> = [
+      ["planning", "run-planning.js"],
+      ["local-planning", "run-local-planning.js"],
+      ["full", "run-local-full-loop.js"],
+      ["kg-refresh", "pipeline/kg-refresh-run.js"],
+      ["implementation", "run-autonomous.js"],
+    ];
+    for (const [phase, entry] of cases) {
+      const served = runBash(`unset AI_IMPLEMENT_RUNNER_SERVE; source session/lib.sh; AI_IMPLEMENT_RUNNER_SERVE=1; select_runner_entry "${phase}"`);
+      expect(served.stdout.trim()).toBe("runner-service.js");
+      for (const value of ["", "0", "true", "yes"]) {
+        const result = runBash(`unset AI_IMPLEMENT_RUNNER_SERVE; source session/lib.sh; AI_IMPLEMENT_RUNNER_SERVE='${value}'; select_runner_entry "${phase}"`);
+        expect(result.stdout.trim()).toBe(entry);
+      }
+    }
+  });
 });
 
 describe.skipIf(isWindows)("verify_workspace_writable", () => {
@@ -513,6 +531,20 @@ describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", ()
       const legacy = run(script(false), env);
       expect(legacy.stdout).toContain("NO=--require=/sentinel/preload.cjs");
       expect(legacy.stdout).toContain("NP=/sentinel/modules");
+    });
+
+    it("reserves RESTATE_IDENTITY_KEY in configured and legacy modes", () => {
+      for (const configured of [false, true]) {
+        const result = run(
+          `${configured ? "CONFIGURED=1\n" : ""}_remap_is_reserved RESTATE_IDENTITY_KEY; echo "RC=$?"\n` +
+            "remap_team_secrets\necho \"F=$AI_IMPLEMENT_FORWARDED_SECRETS\"\necho \"K=${RESTATE_IDENTITY_KEY:-UNSET}\"",
+          { AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_", SAN_RESTATE_IDENTITY_KEY: "SENTINEL-conflict", SAN_DB_URL: "safe-value" },
+        );
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toContain("RC=0");
+        expect(result.stdout).toContain("K=UNSET");
+        expect(result.stdout).not.toContain("SENTINEL-conflict");
+      }
     });
   });
 
