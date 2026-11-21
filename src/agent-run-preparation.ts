@@ -48,7 +48,7 @@ import {
   type StageName,
 } from "./agent-config.js";
 import { isProjectConfigured, resolveCandidateProjectStageConfig, resolveProjectStageConfig } from "./agent-config-store.js";
-import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
+import type { ExecutionBackend } from "./runner-mode.js";
 import {
   MODEL_AUTH_AUDIENCE,
   MAX_MODEL_AUTH_BINDINGS,
@@ -99,7 +99,7 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const WORKFLOW_FILE_PATTERN = /^[A-Za-z0-9_.-]+\.ya?ml$/i;
 
-const GRANT_BACKENDS: Record<DispatchAdmissionBackend, ModelAuthBackend> = {
+const GRANT_BACKENDS: Record<ExecutionBackend, ModelAuthBackend> = {
   "github-actions": "gha",
   "fly-machines": "fly",
   "local-docker": "local",
@@ -112,7 +112,7 @@ export interface AgentReadinessDeps {
   /** Default-branch contents of each path, `null` when absent. A throw means unreadable. */
   readDefaultBranchWorkflows(repository: string, paths: readonly string[]): Promise<Record<string, string | null>>;
   /** Runner-image capability for backends that do not read a workflow. Absent means unknown (fail closed). */
-  checkRunnerCapability?(backend: DispatchAdmissionBackend): Promise<boolean>;
+  checkRunnerCapability?(backend: ExecutionBackend): Promise<boolean>;
   credentials: ModelCredentialDeps;
 }
 
@@ -127,7 +127,7 @@ export interface AgentRunRequest {
   /** Stable identity of this attempt. A replacement attempt must use a new one. */
   dispatchId: string;
   projectKey: string;
-  backend: DispatchAdmissionBackend;
+  backend: ExecutionBackend;
   /** `owner/repo` whose trusted default branch carries the workflow (GitHub Actions). */
   workflowRepository: string;
   workflowFile: string;
@@ -418,7 +418,7 @@ function profileList(snapshot: ResolvedAgentSnapshotV1): PreparedProfile[] {
 }
 
 /** Bedrock credentials are only forwarded by GitHub Actions; every other combination is validated by the snapshot. */
-function backendSupported(snapshot: ResolvedAgentSnapshotV1, backend: DispatchAdmissionBackend): boolean {
+function backendSupported(snapshot: ResolvedAgentSnapshotV1, backend: ExecutionBackend): boolean {
   return backend === "github-actions" || !profileList(snapshot).some((p) => p.authMode === "bedrock");
 }
 

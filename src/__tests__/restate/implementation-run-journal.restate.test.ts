@@ -8,6 +8,8 @@
 //
 // Pause points: `wait` (the durable sleep that races the `report` promise) and `confirm` (the first status read after
 // `report`, held by a gate). The tick seams are huge, so no tick adds a `read-N` entry while a capture is read.
+// Both runner backends that AII and CON use are captured: GitHub Actions and Fly Machines. They share the same workflow
+// commands today, but separate snapshots make a later backend-specific journal change fail here.
 //
 // Regenerate only with UPDATE_JOURNAL_SNAPSHOTS=1; a missing snapshot fails. Run with `npm run test:restate`.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -39,8 +41,8 @@ const RULE = [
 ].join("\n");
 
 /** Compares one capture with its snapshot; returns the failure message, or null when it matches (or was regenerated). */
-function checkSnapshot(point: string, actual: JournalCommand[]): string | null {
-  const file = join(SNAPSHOT_DIR, `implementation-run.${point}.json`);
+function checkSnapshot(prefix: string, point: string, actual: JournalCommand[]): string | null {
+  const file = join(SNAPSHOT_DIR, `${prefix}.${point}.json`);
   const text = `${JSON.stringify(actual, null, 2)}\n`;
   if (process.env.UPDATE_JOURNAL_SNAPSHOTS === "1") {
     mkdirSync(SNAPSHOT_DIR, { recursive: true });
@@ -57,75 +59,81 @@ function checkSnapshot(point: string, actual: JournalCommand[]): string | null {
   return null;
 }
 
-describe("ImplementationRun journal at its pause points", () => {
-  let envs: Map<string, RestateEnvironment>;
-  let status: OwnedRunStatus = "started";
-  const readGate = gate("confirm read");
-  let holdReads = false;
+const CASES = [
+  { backend: "github-actions", prefix: "implementation-run", dispatchId: "implementation-journal-snapshot" },
+  { backend: "fly-machines", prefix: "implementation-run-fly", dispatchId: "implementation-journal-snapshot-fly" },
+] as const satisfies ReadonlyArray<{ backend: ImplementationRunInput["backend"]; prefix: string; dispatchId: string }>;
 
-  const deps: ImplementationRunDependencies = {
-    ...SEAMS,
-    reserve: async () => true,
-    findExistingRun: async () => null,
-    launch: async () => ({ outcome: "accepted", jobId: "job-journal" }),
-    readStatus: async () => {
-      if (holdReads) await readGate.wait();
-      return status;
-    },
-    stop: async () => true,
-    cleanup: async () => undefined,
-    onOutcome: async () => undefined,
-    finishJob: async () => ({}),
-    release: async () => undefined,
-  };
+for (const { backend, prefix, dispatchId } of CASES) {
+  describe(`ImplementationRun journal at its pause points (${backend})`, () => {
+    let envs: Map<string, RestateEnvironment>;
+    let status: OwnedRunStatus = "started";
+    const readGate = gate("confirm read");
+    let holdReads = false;
 
-  beforeAll(async () => {
-    envs = await startVariants([createImplementationRunWorkflow(deps)]);
-  }, 180_000);
-
-  afterAll(async () => {
-    holdReads = false;
-    readGate.release();
-    await stopAll(envs);
-  });
-
-  it("matches the committed journal at the wait and the confirm pause points", async () => {
-    const env = envs.get("disableRetries");
-    if (!env) throw new Error("missing Restate variant disableRetries");
-    const dispatchId = "implementation-journal-snapshot";
-    const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "issue-journal", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "github-actions" };
-    const done = callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "run", input);
-    done.catch(() => undefined);
-    const read = () => callWorkflow<ImplementationRunStatusResult>(env.baseUrl(), "ImplementationRun", dispatchId, "status");
-
-    const commands = async (): Promise<JournalCommand[]> => {
-      const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${dispatchId}' AND target_handler_name = 'run'`);
-      if (rows.length !== 1) return [];
-      return (await journalEntries(env.adminAPIBaseUrl(), String(rows[0].id)))
-        .filter((e) => String(e.entry_type).startsWith("Command: "))
-        .map((e) => ({ type: String(e.entry_type).slice("Command: ".length), name: String(e.name ?? "") }));
+    const deps: ImplementationRunDependencies = {
+      ...SEAMS,
+      reserve: async () => true,
+      findExistingRun: async () => null,
+      launch: async () => ({ outcome: "accepted", jobId: `job-${prefix}` }),
+      readStatus: async () => {
+        if (holdReads) await readGate.wait();
+        return status;
+      },
+      stop: async () => true,
+      cleanup: async () => undefined,
+      onOutcome: async () => undefined,
+      finishJob: async () => ({}),
+      release: async () => undefined,
     };
 
-    try {
-      // Wait pause: the first status read returned `started`, and the workflow sleeps on a tick that never fires.
-      await waitForStep(read, "wait");
-      const atWait = await eventually(commands, (c) => c.at(-1)?.type === "Sleep", { label: "the sleep of the wait pause" });
+    beforeAll(async () => {
+      envs = await startVariants([createImplementationRunWorkflow(deps)]);
+    }, 180_000);
 
-      // Confirm pause: `report` wakes the wait, and the first status read of the confirm window is held.
-      holdReads = true;
-      await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report");
-      await waitForStep(read, "confirm");
-      await readGate.reached();
-      const atConfirm = await eventually(commands, (c) => c.at(-1)?.name.startsWith("read-") === true && c.length > atWait.length, { label: "the confirm read" });
-      expect(atConfirm.slice(0, atWait.length), "the confirm journal extends the wait journal").toEqual(atWait);
-      // Both points are checked before either failure is thrown, so a change before the wait fails both.
-      const failures = [checkSnapshot("wait", atWait), checkSnapshot("confirm", atConfirm)].filter((m): m is string => m !== null);
-      if (failures.length > 0) throw new Error(failures.join("\n\n"));
-    } finally {
+    afterAll(async () => {
       holdReads = false;
-      status = "ended";
       readGate.release();
-    }
-    await done;
-  }, 60_000);
-});
+      await stopAll(envs);
+    });
+
+    it("matches the committed journal at the wait and the confirm pause points", async () => {
+      const env = envs.get("disableRetries");
+      if (!env) throw new Error("missing Restate variant disableRetries");
+      const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "issue-journal", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend };
+      const done = callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "run", input);
+      done.catch(() => undefined);
+      const read = () => callWorkflow<ImplementationRunStatusResult>(env.baseUrl(), "ImplementationRun", dispatchId, "status");
+
+      const commands = async (): Promise<JournalCommand[]> => {
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${dispatchId}' AND target_handler_name = 'run'`);
+        if (rows.length !== 1) return [];
+        return (await journalEntries(env.adminAPIBaseUrl(), String(rows[0].id)))
+          .filter((e) => String(e.entry_type).startsWith("Command: "))
+          .map((e) => ({ type: String(e.entry_type).slice("Command: ".length), name: String(e.name ?? "") }));
+      };
+
+      try {
+        // Wait pause: the first status read returned `started`, and the workflow sleeps on a tick that never fires.
+        await waitForStep(read, "wait");
+        const atWait = await eventually(commands, (c) => c.at(-1)?.type === "Sleep", { label: "the sleep of the wait pause" });
+
+        // Confirm pause: `report` wakes the wait, and the first status read of the confirm window is held.
+        holdReads = true;
+        await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report");
+        await waitForStep(read, "confirm");
+        await readGate.reached();
+        const atConfirm = await eventually(commands, (c) => c.at(-1)?.name.startsWith("read-") === true && c.length > atWait.length, { label: "the confirm read" });
+        expect(atConfirm.slice(0, atWait.length), "the confirm journal extends the wait journal").toEqual(atWait);
+        // Both points are checked before either failure is thrown, so a change before the wait fails both.
+        const failures = [checkSnapshot(prefix, "wait", atWait), checkSnapshot(prefix, "confirm", atConfirm)].filter((m): m is string => m !== null);
+        if (failures.length > 0) throw new Error(failures.join("\n\n"));
+      } finally {
+        holdReads = false;
+        status = "ended";
+        readGate.release();
+      }
+      await done;
+    }, 60_000);
+  });
+}

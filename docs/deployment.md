@@ -61,6 +61,14 @@ and self-deploy's new commits to the poll. A scan test pins the declaration to t
 `handleGitHubWebhook` (`src/webhook.ts`) routes, and the `github.webhook-events` setup check
 compares the App's own subscriptions with it.
 
+### The host clock
+
+The orchestrator authenticates as the App with a JSON Web Token it signs with `GITHUB_APP_PRIVATE_KEY`, and GitHub checks the token's times against its own clock. `createAppJwt` (`src/github-app-auth.ts`) backdates `iat` and shortens `exp` by `CLOCK_SKEW_TOLERANCE_S`, 300 seconds under GitHub's ten-minute cap, so a host clock up to five minutes from GitHub's still mints tokens. Past that margin every mint fails with a 401. The fix is resyncing the host clock with NTP, not a wider margin, since `exp` cannot pass GitHub's cap. The `github.clock` setup check compares the host clock with the `Date` of GitHub's answer to `GET /app`, and fails beyond the margin.
+
+### The App's secrets in target repositories
+
+On GitHub Actions a run mints its own installation token: the synced `claude-implement.yml` and `claude-plan.yml` run `actions/create-github-app-token` in their "Generate GitHub App token" step with the `AI_IMPLEMENT_APP_ID` and `AI_IMPLEMENT_PRIVATE_KEY` Actions secrets, set on the repository or its organization. The App has no permission that reads Actions secrets, so the `github.target-secrets` setup check can never pass: for each project on GitHub Actions it reports *cannot verify*, naming both secrets to check by hand. A run whose token step fails names the check when it closes (the setup checks' runtime-failure table in `docs/setup-checks.md`).
+
 ## Deploy paths
 
 Deployments with `KG_SOURCE_REPO` ship the orchestrator **and** the knowledge graph as one image: a data refresh is a code deploy, and a code deploy re-materializes the graph from the KG repository's default branch. Shared published images omit the knowledge graph. [kg-architecture.md](kg-architecture.md#the-monolith) covers what that couples.

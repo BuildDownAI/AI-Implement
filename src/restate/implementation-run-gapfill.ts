@@ -13,7 +13,7 @@ import { notifyCommentGapfillSkipped, firePrBudgetPark, rollupReviewMode, buildC
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, updateJobStatus, suppressStaleNotifications, setJobMachineId } from "../log.js";
 import { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
-import { postPrComment, listPrComments, defaultFetchSignal, dispatchWorkflow, getPullRequestState } from "../github.js";
+import { postPrComment, listPrComments, dispatchWorkflow, getPullRequestState, listWorkflowDispatchRuns } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill, dispatchFlyGapfill } from "../gapfill-launch.js";
@@ -159,14 +159,10 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         await recordLaunch(run, undefined, row, undefined, id);
         return id;
       }
-      const res = await fetch(`https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs?event=workflow_dispatch&per_page=20`, {
-        headers: { Authorization: `Bearer ${await token(mapping.owner)}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal(),
-      });
-      if (!res.ok) throw new Error(`findExistingRun: workflow runs lookup answered HTTP ${res.status}`);
-      const data = await res.json() as { workflow_runs: Array<{ id: number; display_title?: string; created_at?: string }> };
+      const runs = await listWorkflowDispatchRuns(await token(mapping.owner), mapping.owner, mapping.repo, mapping.workflowFile);
       const claimed = getClaimedRunIds();
       const floor = Math.floor(dispatchedAt / 1000) * 1000;
-      const matches = data.workflow_runs.filter(r => r.display_title === `${IMPLEMENTATION_RUN_TITLE_PREFIX}${run.issueIdentifier}` && r.created_at !== undefined && Date.parse(r.created_at) >= floor && !claimed.has(r.id));
+      const matches = runs.filter(r => r.display_title === `${IMPLEMENTATION_RUN_TITLE_PREFIX}${run.issueIdentifier}` && r.created_at !== undefined && Date.parse(r.created_at) >= floor && !claimed.has(r.id));
       if (matches.length > 1) throw new Error("findExistingRun: multiple unclaimed gap-fill runs match");
       if (!matches.length) return null;
       if (!staged) {

@@ -30,6 +30,7 @@ function check(overrides: Partial<SetupCheck> = {}): SetupCheck {
     onAdminPath: false,
     perProject: false,
     verifiable: true,
+    contextReaders: [],
     run: () => [{ state: "pass" }],
     ...overrides,
   };
@@ -208,7 +209,7 @@ describe("the Fly sessions cache", () => {
 });
 
 describe("output of rows waiting on another check", () => {
-  const waiting = { state: "cannot-verify" as const, detail: "The linear setup facts could not be read", fix: "More information is needed. Address the tracker.provider check first.", waitsOn: "tracker.provider" as const };
+  const waiting = { state: "cannot-verify" as const, detail: "The linear setup facts could not be read", fix: "More information is needed. Address the tracker.provider check first.", waitsOnCheck: "tracker.provider" as const };
   const CHECKS: SetupCheck[] = [
     check({ id: "tracker.linear.team-access", group: "tracker", run: () => [{ ...waiting, project: "ENG" }, { ...waiting, project: "OPS" }] }),
     check({ id: "tracker.linear.pickup-label", group: "tracker", run: () => [{ ...waiting, project: "ENG" }, { ...waiting, project: "OPS" }] }),
@@ -292,6 +293,7 @@ describe("output", () => {
         { id: "runner.fly-sessions", title: "Second", group: "orchestrator", tier: "mode", onAdminPath: false, state: "warn", project: "ENG", detail: "A detail", fix: "A fix." },
         { id: "env.admin-access-code", title: "Third", group: "tracker", tier: "core", onAdminPath: false, state: "fail", fix: "Do it." },
       ],
+      checkListFingerprint: expect.any(String),
     });
   });
 });

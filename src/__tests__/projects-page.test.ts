@@ -230,13 +230,13 @@ describe("mapping dialog — guardrails", () => {
     "%s carries a non-empty label and a non-empty placeholder",
     (id) => {
       const block = fieldBlockFor(projectsHtml, id);
-      expect(block).toMatch(/<label class="field-label">\s*\S[^<]*<\/label>/);
+      expect(block).toMatch(/<label class="field-label"[^>]*>\s*\S[^<]*<\/label>/);
       expect(block).toMatch(new RegExp(`id="${id}"[^>]*placeholder="[^"]+"`));
     },
   );
 
   it("labels the two fields differently", () => {
-    const labelIn = (id: string) => fieldBlockFor(projectsHtml, id).match(/<label class="field-label">([^<]+)</)?.[1];
+    const labelIn = (id: string) => fieldBlockFor(projectsHtml, id).match(/<label class="field-label"[^>]*>([^<]+)</)?.[1];
     expect(labelIn("md-sensitive-add")).not.toBe(labelIn("md-sensitive-allow"));
   });
 

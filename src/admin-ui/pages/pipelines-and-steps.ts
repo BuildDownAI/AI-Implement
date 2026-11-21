@@ -46,9 +46,13 @@ export const pipelinesAndStepsScript = `(function () {
     const subtitle = document.getElementById('ps-subtitle');
     let data;
     try {
-      data = await window.api('/api/pipelines-steps');
+      const res = await window.api('/api/pipelines-steps');
+      let body = null;
+      try { body = await res.json(); } catch (_) {}
+      if (!res.ok || !body) throw new Error((body && body.error) || 'Pipelines and steps could not be loaded (HTTP ' + res.status + ').');
+      data = body;
     } catch (err) {
-      if (errorEl) { errorEl.textContent = String(err); errorEl.hidden = false; }
+      if (errorEl) { errorEl.textContent = err instanceof Error ? err.message : String(err); errorEl.hidden = false; }
       if (pipelinesBody) pipelinesBody.innerHTML = '';
       if (stepsBody) stepsBody.innerHTML = '';
       if (subtitle) subtitle.textContent = '—';

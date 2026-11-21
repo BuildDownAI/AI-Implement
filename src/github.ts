@@ -900,6 +900,30 @@ export async function ensureBranchExists(
   });
 }
 
+/** A run of a workflow, as the runs list answers it; the fields the run lookups match on. */
+export interface WorkflowDispatchRun {
+  id: number;
+  created_at?: string;
+  display_title?: string;
+  html_url?: string;
+}
+
+/**
+ * The workflow's runs started by `workflow_dispatch`, newest first, as a lookup before a dispatch reads them.
+ * A 404 answers no runs: GitHub has no such workflow on the default branch, or no repository this token can see,
+ * and a dispatch with the same token is refused alike. Any other failure throws, since reading it as no runs could
+ * dispatch a second run (a rate limit answers 403 or 429).
+ */
+export async function listWorkflowDispatchRuns(token: string, owner: string, repo: string, workflowFile: string): Promise<WorkflowDispatchRun[]> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/runs?event=workflow_dispatch&per_page=20`,
+    { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal() },
+  );
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`workflow runs lookup answered HTTP ${res.status}`);
+  return ((await res.json()) as { workflow_runs: WorkflowDispatchRun[] }).workflow_runs;
+}
+
 /**
  * Finds the workflow run ID that was triggered by a dispatch.
  *

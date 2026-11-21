@@ -463,6 +463,12 @@ it("a crash before dispatch leaves no durable intent and retry dispatches", asyn
   expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
 });
+// GitHub has no such workflow, or none this token can see, so it has no run of it: the relaunch's own 404 is reached.
+it("lookup answers null when GitHub answers 404 for the workflow", async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+  expect(await d.findExistingRun(run, 1000)).toBeNull();
+  expect(appendLogIfAbsent).not.toHaveBeenCalled();
+});
 it.each(["http", "unreadable"])("lookup remains fail-closed on %s failure", async kind => {
   vi.mocked(fetch).mockResolvedValueOnce(kind === "http" ? { ok: false, status: 503 } as Response : { ok: true, json: async () => { throw new Error("unreadable"); } } as unknown as Response);
   await expect(d.findExistingRun(run, 1000)).rejects.toThrow();

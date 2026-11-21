@@ -309,6 +309,14 @@ async function login(accessCode: string): Promise<string> {
   return JSON.parse(res.body).token as string;
 }
 
+/** A save's refusal: a 400 whose `field` is the setting's body key, and whose `error` names it by the label the admin UI shows. */
+function expectRefusal(res: { statusCode: number; body: string }, field: AdminModule.MappingRefusalField): void {
+  expect(res.statusCode).toBe(400);
+  const refusal = JSON.parse(res.body) as { error: string; field: string };
+  expect(refusal.field).toBe(field);
+  expect(refusal.error).toContain(admin.MAPPING_FIELD_LABELS[field]);
+}
+
 const RETIRED_GRANT_FIELD = ["allowed", "Project", "Keys"].join("");
 
 describe("admin auth", () => {
@@ -552,7 +560,7 @@ describe("admin mappings", () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "BAD", owner: "org", repo: "bad", maxInProgressAiIssues: 0 }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("maxInProgressAiIssues");
+    expectRefusal(res, "maxInProgressAiIssues");
   });
 
   it("rejects mapping creation without required fields", async () => {
@@ -571,7 +579,7 @@ describe("admin mappings", () => {
       token,
     );
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("defaultBranch");
+    expectRefusal(res, "defaultBranch");
   });
 
   it("preserves an existing mapping defaultBranch when an upsert omits it", async () => {
@@ -746,7 +754,7 @@ describe("admin mappings", () => {
     { machineCpuKind: "unknown", machineCpus: 2, machineMemoryMb: 4096, field: "machineCpuKind" },
     { machineCpuKind: null, machineCpus: 2, machineMemoryMb: 4096, field: "machineCpuKind" },
     { machineCpus: 3, machineMemoryMb: 8192, field: "machineCpus" },
-  ])("rejects invalid kind/sizing without changing storage: %j", async ({ field, ...size }) => {
+  ] as const)("rejects invalid kind/sizing without changing storage: %j", async ({ field, ...size }) => {
     config.upsertMapping("PERF", makeMapping({ machineCpuKind: "performance" }));
     const before = config.getMappings().PERF;
     const token = await login("secret");
@@ -754,7 +762,7 @@ describe("admin mappings", () => {
       teamKey: "PERF", owner: "org", repo: "app", ...size,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain(field);
+    expectRefusal(res, field);
     expect(config.getMappings().PERF).toEqual(before);
   });
 
@@ -762,28 +770,28 @@ describe("admin mappings", () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "BAD", owner: "org", repo: "bad", executionMode: "invalid" }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("executionMode");
+    expectRefusal(res, "executionMode");
   });
 
   it("rejects invalid sessionMode", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "BAD", owner: "org", repo: "bad", sessionMode: "invalid" }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("sessionMode");
+    expectRefusal(res, "sessionMode");
   });
 
   it("rejects invalid machineCpus", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "BAD", owner: "org", repo: "bad", machineCpus: 0 }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("machineCpus");
+    expectRefusal(res, "machineCpus");
   });
 
   it("rejects machineMemoryMb below 256", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "BAD", owner: "org", repo: "bad", machineMemoryMb: 128 }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("machineMemoryMb");
+    expectRefusal(res, "machineMemoryMb");
   });
 
   it("creates a mapping with extraEnv and returns it", async () => {
@@ -855,7 +863,7 @@ describe("admin mappings", () => {
       planningEnabled: true, planningWorkflowFile: "",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("planningWorkflowFile");
+    expectRefusal(res, "planningWorkflowFile");
   });
 
   it("accepts bare workflow file names for workflowFile and planningWorkflowFile", async () => {
@@ -881,7 +889,7 @@ describe("admin mappings", () => {
       teamKey: "WFBAD", owner: "org", repo: "wfbad-repo", workflowFile: badName,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("workflowFile");
+    expectRefusal(res, "workflowFile");
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).WFBAD).toBeUndefined();
@@ -897,7 +905,7 @@ describe("admin mappings", () => {
       teamKey: "PWFBAD", owner: "org", repo: "pwfbad-repo", planningWorkflowFile: badName,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("planningWorkflowFile");
+    expectRefusal(res, "planningWorkflowFile");
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).PWFBAD).toBeUndefined();
@@ -910,8 +918,8 @@ describe("admin mappings", () => {
       workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-implement.yml",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("workflowFile");
-    expect(JSON.parse(res.body).error).toContain("planningWorkflowFile");
+    expectRefusal(res, "planningWorkflowFile");
+    expect(JSON.parse(res.body).error).toContain(admin.MAPPING_FIELD_LABELS.workflowFile);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).WFDUP).toBeUndefined();
@@ -923,7 +931,7 @@ describe("admin mappings", () => {
       teamKey: "BAD", owner: "org", repo: "bad", extraEnv: ["KEY=val"],
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/extraEnv must be a plain object/);
+    expectRefusal(res, "extraEnv");
   });
 
   describe("ephemeral full-access opt-in (AII-1437)", () => {
@@ -999,7 +1007,7 @@ describe("admin mappings", () => {
       teamKey: "BAD", owner: "org", repo: "bad", provider: "bedrock",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/awsRegion.*bedrock/);
+    expectRefusal(res, "awsRegion");
   });
 
   it("rejects provider=bedrock with blank awsRegion string with 400", async () => {
@@ -1008,7 +1016,7 @@ describe("admin mappings", () => {
       teamKey: "BAD", owner: "org", repo: "bad", provider: "bedrock", awsRegion: "   ",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/awsRegion.*bedrock/);
+    expectRefusal(res, "awsRegion");
   });
 
   it("rejects an unknown provider value with 400", async () => {
@@ -1017,7 +1025,7 @@ describe("admin mappings", () => {
       teamKey: "BAD", owner: "org", repo: "bad", provider: "openai",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("provider");
+    expectRefusal(res, "provider");
   });
 
   it("rejects provider=bedrock with executionMode=fly-machines with 400", async () => {
@@ -1028,7 +1036,8 @@ describe("admin mappings", () => {
       executionMode: "fly-machines",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/bedrock.*fly-machines/);
+    expectRefusal(res, "provider");
+    expect(JSON.parse(res.body).error).toContain(admin.MAPPING_FIELD_LABELS.executionMode);
   });
 
   it("creates a mapping with maxTurns/maxIterations/maxJobMinutes and round-trips them", async () => {
@@ -1068,7 +1077,7 @@ describe("admin mappings", () => {
       teamKey: "BAD", owner: "org", repo: "bad", maxTurns: 0,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/maxTurns/);
+    expectRefusal(res, "maxTurns");
   });
 
   it("rejects maxIterations:-1 with 400 mentioning maxIterations", async () => {
@@ -1077,7 +1086,7 @@ describe("admin mappings", () => {
       teamKey: "BAD", owner: "org", repo: "bad", maxIterations: -1,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/maxIterations/);
+    expectRefusal(res, "maxIterations");
   });
 
   it("accepts null maxTurns explicitly and stores null", async () => {
@@ -1130,7 +1139,7 @@ describe("admin mappings", () => {
       teamKey: "BAD", owner: "org", repo: "bad", prDispatchBudget: 0,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/prDispatchBudget/);
+    expectRefusal(res, "prDispatchBudget");
   });
 
   it("rejects prDispatchBudget:-1 with 400 mentioning prDispatchBudget", async () => {
@@ -1139,7 +1148,7 @@ describe("admin mappings", () => {
       teamKey: "BAD", owner: "org", repo: "bad", prDispatchBudget: -1,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/prDispatchBudget/);
+    expectRefusal(res, "prDispatchBudget");
   });
 
   it("upsertMapping accepts a Jira ticketingProvider with valid config", async () => {
@@ -1231,15 +1240,18 @@ describe("admin mappings", () => {
     }
   });
 
-  it("upsertMapping rejects Jira ticketingProvider with linear ticketingConfig", async () => {
+  // A config of the wrong shape comes from an API caller, never a form, so its refusal says what is wrong with the data as sent.
+  it.each([
+    ["names the kind that does not match", { ticketingProvider: "jira", ticketingConfig: { kind: "linear" } }, ["ticketingConfig.kind", "linear", "jira"]],
+    ["says a config that is not an object is not one", { ticketingProvider: "jira", ticketingConfig: "jql" }, ["must be an object", "string"]],
+    ["says a missing config is required", { ticketingProvider: "jira" }, ["required", "jira"]],
+  ])("upsertMapping's refusal of a ticketingConfig shape %s", async (_case, ticketing, named) => {
     const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "BAD", owner: "org", repo: "bad",
-      ticketingProvider: "jira",
-      ticketingConfig: { kind: "linear" },
-    }, token);
+    const res = await request("/api/mappings", "POST", "secret", { teamKey: "BAD", owner: "org", repo: "bad", ...ticketing }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toMatch(/kind/);
+    const refusal = JSON.parse(res.body) as { error: string; field: string };
+    expect(refusal.field).toBe("ticketingConfig");
+    for (const fact of named) expect(refusal.error).toContain(fact);
   });
 
   it("persists a valid branchPrefix and returns it", async () => {
@@ -1278,7 +1290,7 @@ describe("admin mappings", () => {
       teamKey: "PFXBAD", owner: "org", repo: "app", branchPrefix: "has space",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("branchPrefix");
+    expectRefusal(res, "branchPrefix");
   });
 
   it("expands skillsRepo shorthand to GitHub HTTPS URL at storage time", async () => {
@@ -1308,7 +1320,7 @@ describe("admin mappings", () => {
       teamKey: "SR3", owner: "org", repo: "app", skillsRepo: "git@github.com:acme/skills.git",
     }, token);
     expect(create.statusCode).toBe(400);
-    expect(JSON.parse(create.body).error).toMatch(/skillsRepo/i);
+    expectRefusal(create, "skillsRepo");
   });
 
   it("treats a blank skillsRepo as null", async () => {
@@ -1326,7 +1338,7 @@ describe("admin mappings", () => {
       teamKey: "SRBAD", owner: "org", repo: "app", skillsRepo: "not a valid repo",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("skillsRepo");
+    expectRefusal(res, "skillsRepo");
   });
 
   it("rejects a non-string skillsRepo", async () => {
@@ -1335,7 +1347,7 @@ describe("admin mappings", () => {
       teamKey: "SRBAD2", owner: "org", repo: "app", skillsRepo: 123,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("skillsRepo");
+    expectRefusal(res, "skillsRepo");
   });
 
   it("rejects a non-github HTTPS skillsRepo URL (the runner's token must never leave github.com)", async () => {
@@ -1344,7 +1356,7 @@ describe("admin mappings", () => {
       teamKey: "SR5", owner: "org", repo: "app", skillsRepo: "https://gitlab.com/acme/skills",
     }, token);
     expect(create.statusCode).toBe(400);
-    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+    expectRefusal(create, "skillsRepo");
   });
 
   it("rejects a lookalike-host skillsRepo URL (github.com prefix on another domain)", async () => {
@@ -1353,7 +1365,7 @@ describe("admin mappings", () => {
       teamKey: "SR6", owner: "org", repo: "app", skillsRepo: "https://github.com.evil.example/acme/skills",
     }, token);
     expect(create.statusCode).toBe(400);
-    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+    expectRefusal(create, "skillsRepo");
   });
 
   it("rejects a www.github.com skillsRepo URL (git remotes live on the apex host)", async () => {
@@ -1362,7 +1374,7 @@ describe("admin mappings", () => {
       teamKey: "SR7", owner: "org", repo: "app", skillsRepo: "https://www.github.com/acme/skills",
     }, token);
     expect(create.statusCode).toBe(400);
-    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+    expectRefusal(create, "skillsRepo");
   });
 
   it("accepts a github.com skillsRepo URL regardless of host case", async () => {
@@ -1383,7 +1395,7 @@ describe("admin mappings", () => {
       teamKey: "SR9", owner: "org", repo: "app", skillsRepo: "https://user:tok@github.com/acme/skills",
     }, token);
     expect(create.statusCode).toBe(400);
-    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+    expectRefusal(create, "skillsRepo");
   });
 
   it("persists referenceRepos and expands shorthand at storage time", async () => {
@@ -1454,7 +1466,7 @@ describe("admin mappings", () => {
       teamKey, owner: "org", repo: "app", referenceRepos: value,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("referenceRepos");
+    expectRefusal(res, "referenceRepos");
   });
 
   it("rejects more than ten referenceRepos entries", async () => {
@@ -1464,7 +1476,7 @@ describe("admin mappings", () => {
       referenceRepos: Array.from({ length: 11 }, (_, i) => ({ repo: "acme/docs", path: `p${i}` })),
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("referenceRepos");
+    expectRefusal(res, "referenceRepos");
   });
 
   it("clears skillsRepo when an existing mapping is updated to null", async () => {
@@ -1613,7 +1625,7 @@ describe("admin mappings", () => {
       sensitiveAddPatterns: 123,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("string");
+    expectRefusal(res, "sensitiveAddPatterns");
   });
 
   it("accepts wildcard-heavy globs that still contain a literal path component (202)", async () => {
@@ -1690,7 +1702,7 @@ describe("admin mappings", () => {
         dependencyTokenScope: invalid,
       }, token);
       expect(res.statusCode).toBe(400);
-      expect(JSON.parse(res.body).error).toContain("dependencyTokenScope");
+      expectRefusal(res, "dependencyTokenScope");
     }
   });
 
@@ -1805,7 +1817,7 @@ describe("admin mappings", () => {
       reviewers: { id: "gap-analysis", gates: true },
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("reviewers");
+    expectRefusal(res, "reviewers");
   });
 
   it("rejects a reviewers entry missing id or gates with 400 naming the entry", async () => {
@@ -1815,14 +1827,14 @@ describe("admin mappings", () => {
       reviewers: [{ gates: true }],
     }, token);
     expect(missingId.statusCode).toBe(400);
-    expect(JSON.parse(missingId.body).error).toContain("reviewers[0]");
+    expect(JSON.parse(missingId.body).error).toContain("Reviewer 1");
 
     const missingGates = await request("/api/mappings", "POST", "secret", {
       teamKey: "REVBAD3", owner: "org", repo: "app",
       reviewers: [{ id: "gap-analysis" }],
     }, token);
     expect(missingGates.statusCode).toBe(400);
-    expect(JSON.parse(missingGates.body).error).toContain("reviewers[0]");
+    expect(JSON.parse(missingGates.body).error).toContain('Reviewer "gap-analysis"');
   });
 
   it("rejects a non-string id with 400", async () => {
@@ -1857,7 +1869,7 @@ describe("admin mappings", () => {
         reviewers: [{ id: "gap-analysis", gates: true, maxTurns: badMaxTurns }],
       }, token);
       expect(res.statusCode).toBe(400);
-      expect(JSON.parse(res.body).error).toContain("maxTurns");
+      expect(JSON.parse(res.body).error).toContain("Max turns");
     }
   });
 
@@ -1973,7 +1985,7 @@ describe("admin mappings", () => {
       teamKey: "RP3", owner: "org", repo: "app", reviewProcess: "github",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"');
+    expectRefusal(res, "reviewProcess");
   });
 
   it("resets trustedReviewAuthors to the null default via an explicit null", async () => {
@@ -1998,7 +2010,7 @@ describe("admin mappings", () => {
       trustedReviewAuthors: "codex-reviewer[bot]",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: must be an array of strings or null");
+    expect(JSON.parse(res.body).error).toBe("Trusted Review Authors must be a list of GitHub logins.");
   });
 
   it("rejects an empty-string entry (post-trim) with the exact error prefix", async () => {
@@ -2008,7 +2020,7 @@ describe("admin mappings", () => {
       trustedReviewAuthors: ["   "],
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: [0] must not be empty");
+    expect(JSON.parse(res.body).error).toBe("Trusted Review Authors must not hold a blank login.");
   });
 
   it("rejects an entry that fails the login regex with the exact error prefix", async () => {
@@ -2019,7 +2031,7 @@ describe("admin mappings", () => {
         trustedReviewAuthors: [bad],
       }, token);
       expect(res.statusCode).toBe(400);
-      expect(JSON.parse(res.body).error).toBe(`trustedReviewAuthors invalid: [0] "${bad}" is not a valid GitHub login`);
+      expect(JSON.parse(res.body).error).toBe(`"${bad}" in Trusted Review Authors is not a GitHub login.`);
     }
   });
 
@@ -2031,7 +2043,7 @@ describe("admin mappings", () => {
       trustedReviewAuthors: many,
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: too many entries (21); maximum is 20");
+    expect(JSON.parse(res.body).error).toBe("Trusted Review Authors may hold at most 20 logins, not 21.");
   });
 
   it("rejects a duplicate entry, including a duplicate created by lowercasing, with the exact error prefix", async () => {
@@ -2041,7 +2053,7 @@ describe("admin mappings", () => {
       trustedReviewAuthors: ["Foo", "foo"],
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe('trustedReviewAuthors invalid: duplicate entry "foo"');
+    expect(JSON.parse(res.body).error).toBe('Trusted Review Authors lists "foo" twice.');
   });
 });
 
@@ -5982,8 +5994,8 @@ describe("per-page grants", () => {
         [{ provider: "bedrock", awsRegion: "us-east-1", executionMode: "fly-machines" }, "provider"],
         [{ ticketingProvider: "elsewhere" }, "ticketingProvider"],
         [{ ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/tickets" } }, "ticketingProvider"],
-        [{ ticketingProvider: "jira", ticketingConfig: { ...JIRA, jql: "" } }, "ticketingConfig"],
-        [{ ticketingProvider: "jira", ticketingConfig: { ...JIRA, statusFieldOverride: "customfield 1" } }, "ticketingConfig"],
+        [{ ticketingProvider: "jira", ticketingConfig: { ...JIRA, jql: "" } }, "ticketingConfig.jql"],
+        [{ ticketingProvider: "jira", ticketingConfig: { ...JIRA, statusFieldOverride: "customfield 1" } }, "ticketingConfig.statusFieldOverride"],
         [{ maxTurns: 0 }, "maxTurns"],
         [{ maxIterations: 1.5 }, "maxIterations"],
         [{ maxJobMinutes: -1 }, "maxJobMinutes"],
@@ -5998,10 +6010,9 @@ describe("per-page grants", () => {
         [{ reviewers: "everyone" }, "reviewers"],
         [{ trustedReviewAuthors: 7 }, "trustedReviewAuthors"],
         [{ reviewProcess: "elsewhere" }, "reviewProcess"],
-      ] as [Record<string, unknown>, keyof AdminModule.UpsertMappingBody][])("names %j's refusal as %s", async (overrides, field) => {
+      ] as [Record<string, unknown>, AdminModule.MappingRefusalField][])("names %j's refusal as %s", async (overrides, field) => {
         const res = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, { ...BODY, ...overrides });
-        expect(res.statusCode).toBe(400);
-        expect(JSON.parse(res.body)).toMatchObject({ field, error: expect.any(String) });
+        expectRefusal(res, field);
       });
 
       it("names a Filesystem project's malformed key as teamKey, under the local runner mode Filesystem needs", async () => {
@@ -6010,7 +6021,7 @@ describe("per-page grants", () => {
           const body = { ...BODY, teamKey: "bad key", ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/tickets" } };
           const res = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, body);
           expect(res.statusCode).toBe(400);
-          expect(JSON.parse(res.body)).toMatchObject({ field: "teamKey", error: expect.stringContaining("Filesystem project key") });
+          expectRefusal(res, "teamKey");
         } finally {
           vi.unstubAllEnvs();
         }

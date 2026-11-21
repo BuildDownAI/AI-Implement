@@ -4,7 +4,7 @@ import type { RepoMapping } from "./config.js";
 import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
 import { StaleStageInputsError } from "./agent-config-store.js";
 import { parseWorkflowMd } from "./workflow-md.js";
-import { resolveExecutionPath, resolvePlanningExecutionPath, type RunnerMode } from "./runner-mode.js";
+import { resolveExecutionPath, resolveExecutionBackend, type RunnerMode } from "./runner-mode.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 
 export interface AdoptionDeps {
@@ -67,7 +67,7 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
     const expectedAdoptionInputs = adoptionInputsFingerprint(mapping, runnerMode);
     const path = resolveExecutionPath(runnerMode, mapping.executionMode);
     const backends = path === "both" ? ["github-actions", "fly-machines"] as const : [path];
-    const planningBackend = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
+    const planningBackend = resolveExecutionBackend(runnerMode, mapping.executionMode);
     const candidate: StageAgentConfigurationV1 = { version: 1, mode: "configured", stages: {} };
     let revision: string | null = null;
     try {
@@ -113,7 +113,7 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
     if (result.outcome) continue;
     const checks = backends.map(backend => ({ backend, workflowFile: mapping.workflowFile }));
     if (mapping.planningEnabled) {
-      checks.push({ backend: resolvePlanningExecutionPath(runnerMode, mapping.executionMode), workflowFile: mapping.planningWorkflowFile });
+      checks.push({ backend: resolveExecutionBackend(runnerMode, mapping.executionMode), workflowFile: mapping.planningWorkflowFile });
     }
     try {
       for (const check of checks) {

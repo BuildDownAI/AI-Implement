@@ -10,6 +10,7 @@ import { overviewScript } from "../pages/overview.js";
 import { reaperScript } from "../pages/reaper.js";
 import { setupScript } from "../pages/setup.js";
 import { stepperScript } from "../stepper.js";
+import { NEEDS_ATTENTION, type SetupCheckState } from "../../setup-checks/contract.js";
 
 /** Runs helpers.ts in a page of its own, as the admin page runs it ahead of every other script. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -455,7 +456,7 @@ describe("setupCheckItem", () => {
 // The Setup page's cards and the stepper's Review show a project's rows waiting on one check as one row.
 describe("groupWaitingRows", () => {
   const group = (...rows: Record<string, unknown>[]) => mountHelpers().groupWaitingRows(rows);
-  const waiting = (id: string, extra: Record<string, unknown> = {}) => ({ id, title: id, state: "cannot-verify", detail: "d", fix: "f", waitsOn: "tracker.provider", project: "ENG", ...extra });
+  const waiting = (id: string, extra: Record<string, unknown> = {}) => ({ id, title: id, state: "cannot-verify", detail: "d", fix: "f", waitsOnCheck: "tracker.provider", project: "ENG", ...extra });
 
   it("shows two or more rows waiting on one check as one row, in the first one's place, naming every check", () => {
     const shown = group({ id: "github.installation", state: "fail" }, waiting("a"), { id: "github.permissions", state: "warn" }, waiting("b"), waiting("c"));
@@ -470,7 +471,7 @@ describe("groupWaitingRows", () => {
   });
 
   it("joins only one project's rows waiting on the same check", () => {
-    const shown = group(waiting("a"), waiting("b", { project: "OPS" }), waiting("c", { waitsOn: "github.app-identity" }), waiting("d", { waitsOn: "github.app-identity" }));
+    const shown = group(waiting("a"), waiting("b", { project: "OPS" }), waiting("c", { waitsOnCheck: "github.app-identity" }), waiting("d", { waitsOnCheck: "github.app-identity" }));
     expect(shown.map((row: { id: string }) => row.id)).toEqual(["a", "b", "c, d"]);
   });
 
@@ -481,16 +482,63 @@ describe("groupWaitingRows", () => {
   });
 });
 
+// The Setup page's cards and the stepper's Review list a set of rows the same way.
+describe("splitSetupRows", () => {
+  const split = (rows: Record<string, unknown>[], tieBreak?: (a: any, b: any) => number) => mountHelpers().splitSetupRows(rows, tieBreak);
+  const ids = (rows: { id: string }[]) => rows.map((row) => row.id);
+
+  it("opens the rows needing attention worst first, and folds the rest worst first, each keeping the rows' own order within a state", () => {
+    const { open, folded } = split([
+      { id: "na", state: "not-applicable" }, { id: "w1", state: "warn" }, { id: "p1", state: "pass" },
+      { id: "f", state: "fail" }, { id: "cv", state: "cannot-verify" }, { id: "w2", state: "warn" }, { id: "p2", state: "pass" },
+    ]);
+    expect(ids(open)).toEqual(["f", "cv", "w1", "w2"]);
+    expect(ids(folded)).toEqual(["p1", "p2", "na"]);
+  });
+
+  it("breaks ties within a state by the tie-break given, before the rows' own order", () => {
+    const rank = { b: 0, a: 1 } as Record<string, number>;
+    const { open } = split([{ id: "1", group: "a", state: "warn" }, { id: "2", group: "b", state: "warn" }, { id: "3", group: "a", state: "fail" }], (x, y) => rank[x.group] - rank[y.group]);
+    expect(ids(open)).toEqual(["3", "2", "1"]);
+  });
+
+  it("joins one project's open rows waiting on one check, and never a folded row", () => {
+    const wait = (id: string, state: string) => ({ id, state, waitsOnCheck: "tracker.provider", project: "ENG" });
+    const { open, folded } = split([wait("a", "cannot-verify"), wait("b", "cannot-verify"), wait("c", "pass"), wait("d", "pass")]);
+    expect(ids(open)).toEqual(["a, b"]);
+    expect(ids(folded)).toEqual(["c", "d"]);
+  });
+
+  it.each([
+    [["pass", "pass", "not-applicable"], "2 passing, 1 not applicable"],
+    [["pass"], "1 passing"],
+    [["not-applicable", "not-applicable"], "2 not applicable"],
+    [["fail"], ""],
+  ])("labels the fold of %j as %j", (states, label) => {
+    expect(split(states.map((state, i) => ({ id: String(i), state }))).foldLabel).toBe(label);
+  });
+});
+
 // Every setup surface orders and folds rows by the one list here, so a new state or a new order changes them together.
 describe("the setup states' order", () => {
   it("is published worst first, the first three needing attention", () => {
     const win = mountHelpers();
     expect(win.SETUP_STATE_ORDER).toEqual(["fail", "cannot-verify", "warn", "pass", "not-applicable"]);
-    expect(win.SETUP_ACTIONABLE).toEqual(["fail", "cannot-verify", "warn"]);
+    expect(win.SETUP_NEEDS_ATTENTION).toEqual(["fail", "cannot-verify", "warn"]);
   });
 
-  it.each([["setup", setupScript], ["stepper", stepperScript]])("%s defines no order of its own", (_name, script) => {
-    expect(script).not.toMatch(/\[\s*'fail',\s*'cannot-verify'/);
+  // The admin UI cannot import the server's lists, so it keeps copies, and a test, which reads both sides, holds them to the server's.
+  // The record names every state the server's type has, so a state added there fails the type check until it is listed here.
+  it("holds the server's states, and the same ones needing attention", () => {
+    const win = mountHelpers();
+    const states: Record<SetupCheckState, true> = { "fail": true, "cannot-verify": true, "warn": true, "pass": true, "not-applicable": true };
+    expect([...win.SETUP_STATE_ORDER].sort()).toEqual(Object.keys(states).sort());
+    expect(win.SETUP_NEEDS_ATTENTION).toEqual(NEEDS_ATTENTION);
+  });
+
+  // A list of every state, in any order or shape, names both ends of the order in one statement.
+  it.each([["setup", setupScript], ["stepper", stepperScript]])("%s defines no list of the states of its own", (_name, script) => {
+    expect(script).not.toMatch(/'fail'[^;]*'not-applicable'/);
   });
 });
 

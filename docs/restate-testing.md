@@ -320,12 +320,12 @@ A workflow that pauses for a long time (an `ImplementationRun` waits for its run
 
 * It drives the workflow with fakes to each pause point (`wait`, the durable sleep that races the `report` promise, and `confirm`, the first status read after a `report`, held by a `gate`). The tick seams are set to hours, so no tick adds an entry while the journal is read.
 * It reads the journal with `journalEntries` and keeps only the commands (`entry_type` "Command: ..." and `name`), in order. Completion notifications are dropped, because their position depends on timing. No ids, payloads or times are stored.
-* It compares each list with a committed file in `src/__tests__/restate/journal-snapshots/` (`implementation-run.wait.json`, `implementation-run.confirm.json`). It checks both points before it fails, so a change before the wait fails both. A missing snapshot fails.
+* It compares each list with a committed file in `src/__tests__/restate/journal-snapshots/`: GitHub Actions uses `implementation-run.wait.json` and `implementation-run.confirm.json`; Fly Machines uses `implementation-run-fly.wait.json` and `implementation-run-fly.confirm.json`. The two pairs are equal today because the workflow is the same for both backends; the separate Fly pair makes a later backend-specific journal change fail the test. It checks both points before it fails, so a change before the wait fails both. A missing snapshot fails.
 * The failure message states the rule: do not change journaled actions before a pause point; put new work after the last pause point or in a new handler; if the change is unavoidable, drain paused invocations before the deploy and regenerate the snapshots.
 
 **Regenerate** only on purpose: `UPDATE_JOURNAL_SNAPSHOTS=1 npm run test:restate -- implementation-run-journal`. The variable is in the ambient-env allowlist (`src/__tests__/setup/ambient-env.ts`). Commit the new files with the change that needed them, and say in the PR how paused invocations were drained.
 
-**Add one for another workflow** when it pauses across deploys for longer than a deploy takes (for example `PlanningRun`, which is built the same way): copy the example, name the snapshots `<workflow>.<point>.json`, and capture each point where the workflow suspends.
+**Add one for another workflow** when it pauses across deploys for longer than a deploy takes (for example `PlanningRun`, which is built the same way): copy the example, name the snapshots `<prefix>.<point>.json` where the prefix is the workflow name, and capture each point where the workflow suspends. A workflow with one snapshot set for each backend adds a backend suffix to the prefix (for example, `implementation-run-fly`).
 
 ## Testing a journal projection (two tiers)
 

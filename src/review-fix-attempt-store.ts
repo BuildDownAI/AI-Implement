@@ -43,7 +43,7 @@
  */
 import { normalizeExecutionIdentity } from "./review-fix-contract.js";
 import { createHash } from "node:crypto";
-import { getRunnerMode, resolvePlanningExecutionPath } from "./runner-mode.js";
+import { getRunnerMode, resolveExecutionBackend } from "./runner-mode.js";
 import { getDb } from "./dedup.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { isParked } from "./dispatch-breaker.js";
@@ -235,7 +235,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         return { status: "deferred", reason: "paused" };
       }
       const { teamKey, mapping } = mappingEntry;
-      const executionBackend = resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode);
+      const executionBackend = resolveExecutionBackend(getRunnerMode().mode, mapping.executionMode);
 
       const now = Date.now();
       const issueId = `${request.scope.repository}#${request.scope.prNumber}`;

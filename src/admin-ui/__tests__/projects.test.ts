@@ -7,7 +7,8 @@ import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 type Mapping = Record<string, unknown>;
 
-function mountProjects(mapping: RepoMapping = makeMapping()) {
+/** `refused` answers the save, or the load, with a refusal instead of success. */
+function mountProjects(mapping: RepoMapping = makeMapping(), refused: { save?: { status: number; body: unknown }; load?: { status: number; body: unknown } } = {}) {
   const posts: unknown[] = [];
   const mounted = mountAdminPage({
     html: projectsHtml,
@@ -16,9 +17,11 @@ function mountProjects(mapping: RepoMapping = makeMapping()) {
     api: async (url, init) => {
       if (url === "/api/mappings" && init?.method === "POST") {
         posts.push(JSON.parse(init.body || "{}"));
+        if (refused.save) return { ok: false, status: refused.save.status, json: async () => refused.save!.body };
         return { ok: true, status: 200, json: async () => ({ syncJobId: null }) };
       }
       if (url === "/api/mappings") {
+        if (refused.load) return { ok: false, status: refused.load.status, json: async () => refused.load!.body };
         return { ok: true, status: 200, json: async () => ({ AII: mapping }) };
       }
       if (url === "/api/admin/config-status") {
@@ -46,6 +49,46 @@ async function save(win: { saveMappingDialog: () => Promise<void> }): Promise<vo
 function reviewerRows(doc: Document): HTMLElement[] {
   return Array.from(doc.querySelectorAll<HTMLElement>("#md-reviewer-list > div"));
 }
+
+describe("the Edit dialog's save refused by the server", () => {
+  const activeTab = (doc: Document) => (doc.querySelector("#md-tabs [data-md-tab].active") as HTMLElement).dataset.mdTab;
+  const shownError = (doc: Document) => doc.getElementById("md-error")!.textContent;
+
+  // The tab comes from where the markup puts the setting, a nested ticketing key by its own label.
+  it.each([
+    ["maxTurns", "capacity"],
+    ["sensitiveAddPatterns", "guardrails"],
+    ["ticketingConfig.jql", "ticketing"],
+    ["machineCpuKind", "execution"],
+  ])("opens the tab holding %s, %s, and shows the server's sentence as it is", async (field, tab) => {
+    const error = "The setting was refused.";
+    const { win, doc } = mountProjects(makeMapping(), { save: { status: 400, body: { error, field } } });
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    win.switchMappingTab("source");
+    await save(win);
+    expect([activeTab(doc), shownError(doc)]).toEqual([tab, error]);
+  });
+
+  it("stays on the open tab for a refusal that names no setting", async () => {
+    const { win, doc } = mountProjects(makeMapping(), { save: { status: 400, body: { error: "Invalid request body" } } });
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    win.switchMappingTab("source");
+    await save(win);
+    expect([activeTab(doc), shownError(doc)]).toEqual(["source", "Invalid request body"]);
+  });
+});
+
+describe("the Projects table's load refused", () => {
+  it("shows the refusal instead of rendering its body as projects", async () => {
+    const { win, doc } = mountProjects(makeMapping(), { load: { status: 503, body: { error: "Access control is unavailable" } } });
+    await win.loadMappings();
+    expect(doc.querySelectorAll("#mappings-body tr")).toHaveLength(0);
+    const empty = doc.getElementById("mappings-empty")!;
+    expect([empty.classList.contains("hidden"), empty.textContent]).toEqual([false, "Access control is unavailable"]);
+  });
+});
 
 describe("projects table containment", () => {
   it("uses a shared horizontal scroll container for the table and its Edit action", async () => {
@@ -664,8 +707,8 @@ describe("projects page agents tab", () => {
     ...overrides,
   });
 
-  function mountAgents(opts: { defaults?: Mapping; stored?: Mapping; accounts?: Mapping[]; put?: { status: number; body: Mapping } } = {}) {
-    const m = mountProjects(makeMapping({ executionMode: "fly-machines" }));
+  function mountAgents(opts: { defaults?: Mapping; stored?: Mapping; accounts?: Mapping[]; put?: { status: number; body: Mapping }; refusedSave?: { status: number; body: unknown } } = {}) {
+    const m = mountProjects(makeMapping({ executionMode: "fly-machines" }), { save: opts.refusedSave });
     const calls: { url: string; method: string; body: unknown }[] = [];
     const base = m.win.api;
     m.win.api = async (url: string, init?: { method?: string; body?: string }) => {
@@ -698,6 +741,18 @@ describe("projects page agents tab", () => {
     doc.querySelector<HTMLInputElement & HTMLSelectElement>(`[data-ag-${kind}][data-stage="${stage}"][data-field="${f}"]`)!;
   const preview = (doc: Document, stage: string, f: string) => doc.querySelector(`[data-ag-preview="${stage}.${f}"]`)!.textContent;
   const puts = (m: ReturnType<typeof mountAgents>) => m.calls.filter((c) => c.method === "PUT");
+
+  // A stage control's own field can share a setting's name, as provider does, and must never decide where that setting's refusal goes.
+  it("opens AI Provider's tab for its refusal with the stage controls rendered ahead of it", async () => {
+    const m = mountAgents({ refusedSave: { status: 400, body: { error: "The setting was refused.", field: "provider" } } });
+    await open(m);
+    const panel = (name: string) => m.doc.querySelector(`[data-md-panel="${name}"]`)!;
+    panel("ticketing").before(panel("agents"));
+    expect(field(m.doc, "value", "planning", "provider")).not.toBeNull();
+    m.win.switchMappingTab("source");
+    await m.win.saveMappingDialog();
+    expect((m.doc.querySelector("#md-tabs [data-md-tab].active") as HTMLElement).dataset.mdTab).toBe("provider");
+  });
 
   it.each(["legacy", "configured"])("saves and reloads the open-model checkbox in %s mode", async (mode) => {
     const stored: Mapping = { mode, stages: {} };

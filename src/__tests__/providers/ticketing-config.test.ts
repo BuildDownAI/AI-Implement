@@ -1,9 +1,20 @@
 import { describe, it, expect, vi } from "vitest";
-import { validateTicketingConfig, DEFAULT_TICKETING_CONFIG } from "../../providers/ticketing-config.js";
+import { validateTicketingConfig, DEFAULT_TICKETING_CONFIG, TicketingConfigError } from "../../providers/ticketing-config.js";
 import { resolveCustomFieldIds } from "../../providers/jira-fields.js";
 import type { JiraMappingConfig } from "../../providers/ticketing-config.js";
 
 const jiraBase = { kind: "jira", jql: "project = ENG", repoFieldValue: "owner/repo" };
+
+/** The refusal validateTicketingConfig throws for these arguments. */
+function refusal(...args: Parameters<typeof validateTicketingConfig>): TicketingConfigError {
+  try {
+    validateTicketingConfig(...args);
+  } catch (err) {
+    if (err instanceof TicketingConfigError) return err;
+    throw err;
+  }
+  throw new Error("expected a refusal");
+}
 
 describe("validateTicketingConfig", () => {
   it("accepts and normalizes an absolute filesystem directory", () => {
@@ -12,7 +23,9 @@ describe("validateTicketingConfig", () => {
   });
 
   it.each([undefined, "", "tickets", "~/tickets", "/tmp/\0tickets"])("rejects invalid filesystem directory %s", (directory) => {
-    expect(() => validateTicketingConfig("filesystem", { kind: "filesystem", directory })).toThrow(/absolute directory/);
+    const err = refusal("filesystem", { kind: "filesystem", directory });
+    expect(err.key).toBe("directory");
+    expect(err.message).toContain("ticketingConfig.directory");
   });
 
   it("returns the linear default for a null config on the linear provider", () => {
@@ -23,9 +36,19 @@ describe("validateTicketingConfig", () => {
     expect(() => validateTicketingConfig("jira", { kind: "linear" })).toThrow(/must match ticketingProvider/);
   });
 
-  it("requires a non-empty jql and repoFieldValue for jira", () => {
-    expect(() => validateTicketingConfig("jira", { kind: "jira", repoFieldValue: "owner/repo" })).toThrow(/jql/);
-    expect(() => validateTicketingConfig("jira", { kind: "jira", jql: "project = ENG" })).toThrow(/repoFieldValue/);
+  it("requires a non-empty jql and repoFieldValue for jira, naming each by its path in the stored data", () => {
+    const noJql = refusal("jira", { kind: "jira", repoFieldValue: "owner/repo" });
+    const noRepo = refusal("jira", { kind: "jira", jql: "project = ENG" });
+    expect([noJql.key, noRepo.key]).toEqual(["jql", "repoFieldValue"]);
+    expect(noJql.message).toContain("ticketingConfig.jql");
+    expect(noRepo.message).toContain("ticketingConfig.repoFieldValue");
+  });
+
+  // The save names each setting by its label, while the stored data's own callers keep its paths.
+  it("names a key by the subject its caller gives", () => {
+    const subject = (key: string) => `the ${key} setting`;
+    expect(refusal("jira", { kind: "jira", repoFieldValue: "owner/repo" }, subject).message).toContain("the jql setting");
+    expect(refusal("filesystem", { kind: "filesystem", directory: "relative" }, subject).message).toContain("the directory setting");
   });
 
   it("keeps a valid field override, trimmed", () => {
