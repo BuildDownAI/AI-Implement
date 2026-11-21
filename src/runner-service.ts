@@ -20,6 +20,8 @@ import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import type { ServiceDefinition } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
+import { setInvocationListener } from "./pipeline/job-accounting.js";
+import type { InvocationRecordV1 } from "./pipeline/types.js";
 import { runAutonomous, type RunAutonomousResult } from "./run-autonomous.js";
 
 /** The run id is the dispatch id, set by the launch (AII-2048). */
@@ -48,6 +50,7 @@ export const runnerRunInputSchema = z.object({ workflowKey: z.string().min(1) })
 export type RunnerRunInput = z.infer<typeof runnerRunInputSchema>;
 
 export type RunnerEvent =
+  | { kind: "invocation"; record: InvocationRecordV1 }
   | { kind: "result"; result: RunAutonomousResult }
   | { kind: "failed"; message: string };
 
@@ -110,6 +113,7 @@ export function sanitizeRunnerFailure(err: unknown, env: NodeJS.ProcessEnv = pro
 export class RunnerFlight {
   private readonly events: RunnerEvent[] = [];
   private readonly waiters = new Map<number, Array<{ resolve: (event: RunnerEvent) => void; reject: (err: Error) => void }>>();
+  private readonly detachInvocationListener: () => void;
   private started = false;
   private terminal = false;
   private cancelled: Error | undefined;
@@ -117,7 +121,12 @@ export class RunnerFlight {
   constructor(
     private readonly run: () => Promise<RunAutonomousResult>,
     private readonly env: NodeJS.ProcessEnv = process.env,
-  ) {}
+  ) {
+    // Installed for this flight, not for the process: `runAutonomous()` resets the
+    // accounting list when it starts, and `resetJobAccounting()` must leave the
+    // listener attached so calls made after the reset still reach the journal.
+    this.detachInvocationListener = setInvocationListener((record) => this.push({ kind: "invocation", record }));
+  }
 
   /** Starts the pipeline on the first call; every later call, including a retry, is a no-op. */
   start(): void {
@@ -131,6 +140,8 @@ export class RunnerFlight {
       this.push({ kind: "result", result: await this.run() });
     } catch (err) {
       this.push({ kind: "failed", message: sanitizeRunnerFailure(err, this.env) });
+    } finally {
+      this.detachInvocationListener();
     }
   }
 
@@ -212,6 +223,15 @@ export function createRunnerService(deps: RunnerServiceDeps): ServiceDefinition<
       ]);
       if (event.kind === "result") return event.result;
       if (event.kind === "failed") throw new restate.TerminalError(event.message);
+      if (event.kind === "invocation") {
+        ctx.genericSend({
+          service: "ImplementationRun",
+          method: "recordInvocation",
+          key: input.workflowKey,
+          parameter: event.record,
+          inputSerde: restate.serde.json,
+        });
+      }
     }
   }
 

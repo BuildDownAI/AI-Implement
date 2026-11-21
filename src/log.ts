@@ -185,6 +185,14 @@ function ensureAccountingTriggers(): void {
       UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
       UPDATE review_fix_attempts SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
     END`);
+  // A status upgrade is an UPDATE (insert stays the fast path for new rows), so it needs its own arm.
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_invocation_attribution_status_changed_at
+    AFTER UPDATE OF status ON model_invocation_attribution
+    WHEN OLD.status IS NOT NEW.status
+    BEGIN
+      UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+      UPDATE review_fix_attempts SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+    END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_job_report_insert_changed_at
     AFTER INSERT ON dispatch_job_report
     BEGIN
@@ -1273,8 +1281,9 @@ const INVOCATION_STATUS: Record<InvocationUsageRow["outcome"], string> = {
 
 /**
  * Persists one normalized invocation record (AII-954 `normalizeInvocation` output) for a dispatch.
- * Insert-or-ignore on `invocation_id`, so a repeated delivery never double-counts. Rows without an
- * invocation id cannot be deduplicated and are not stored. Returns whether a row was inserted.
+ * Repeated deliveries never double-count. A final timeout classification may upgrade an existing
+ * row's status in place, but its usage is never replaced. Rows without an invocation id cannot be
+ * deduplicated and are not stored. Returns whether a row was inserted or its status upgraded.
  */
 export function recordInvocationAttribution(
   dispatchId: string,
@@ -1304,10 +1313,14 @@ export function recordInvocationAttribution(
   };
   const info = getDb()
     .prepare(
-      `INSERT OR IGNORE INTO model_invocation_attribution
+      `INSERT INTO model_invocation_attribution
          (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode,
           config_revision_id, snapshot_id, status, started_at, completed_at, usage_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(invocation_id) DO UPDATE SET status = excluded.status
+       WHERE excluded.status = 'timed_out'
+         AND model_invocation_attribution.dispatch_id = excluded.dispatch_id
+         AND model_invocation_attribution.status <> 'timed_out'`,
     )
     .run(
       row.invocationId, dispatchId, row.stage, row.profileId, row.profileRevision, row.agent, row.provider,

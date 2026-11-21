@@ -3,6 +3,13 @@ import { createHash } from "node:crypto";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as AccountingModule from "../job-accounting.js";
+import {
+  collectedInvocations,
+  recordInvocation,
+  resetJobAccounting,
+  setInvocationListener,
+} from "../pipeline/job-accounting.js";
+import type { InvocationRecordV1 } from "../pipeline/types.js";
 import { testDb } from "./helpers/test-db.js";
 import { seedBoundary } from "./helpers/job-accounting-boundary.js";
 
@@ -254,6 +261,74 @@ describe("listJobAccounting", () => {
     reviewFixAttempt("f", OLD - 10);
     finishedJob("recent", NOW);
     expect(acc.listJobAccounting({ now: NOW }).oldestRetainedCompletedAt).toBe(OLD - 10);
+  });
+});
+
+describe("invocation listener", () => {
+  beforeEach(() => {
+    resetJobAccounting();
+    setInvocationListener(undefined);
+  });
+
+  function record(id: string): InvocationRecordV1 {
+    return {
+      attribution: {
+        version: 1,
+        invocationId: id,
+        snapshotId: "snapshot-1",
+        stage: "implementation",
+        agent: "claude",
+        provider: "anthropic",
+        model: "model",
+        profileId: "profile",
+        authMode: "anthropic-api-key",
+        limit: null,
+        outcome: "success",
+        usage: { availability: "complete", tokensIn: 10, tokensOut: 2, costUsd: 0.1, costStatus: "reported" },
+      },
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
+      attempts: 1,
+    };
+  }
+
+  it("sends nothing when no listener is installed", () => {
+    setInvocationListener(undefined);
+    expect(collectedInvocations()).toEqual([]);
+    recordInvocation(record("unobserved"));
+    const seen: string[] = [];
+    const detach = setInvocationListener((r) => seen.push(r.attribution.invocationId));
+    // The earlier record is in the retained list, but there was no listener to notify when it was made.
+    expect(collectedInvocations().map((r) => r.attribution.invocationId)).toEqual(["unobserved"]);
+    expect(seen).toEqual([]);
+    detach();
+  });
+
+  it("notifies once per call and keeps each record in the final list", () => {
+    const seen: string[] = [];
+    const detach = setInvocationListener((r) => seen.push(r.attribution.invocationId));
+    recordInvocation(record("one"));
+    recordInvocation(record("two"));
+    detach();
+    recordInvocation(record("three"));
+    expect(seen).toEqual(["one", "two"]);
+    expect(collectedInvocations().map((r) => r.attribution.invocationId)).toEqual(["one", "two", "three"]);
+  });
+
+  it("survives resetJobAccounting and detaches only its own listener", () => {
+    const seen: string[] = [];
+    const detachFirst = setInvocationListener((r) => seen.push(`first:${r.attribution.invocationId}`));
+    recordInvocation(record("before-reset"));
+    resetJobAccounting();
+    const detachSecond = setInvocationListener((r) => seen.push(r.attribution.invocationId));
+    recordInvocation(record("after-reset"));
+    // A stale detach from an older flight must not remove the current listener.
+    detachFirst();
+    recordInvocation(record("after-stale-detach"));
+    detachSecond();
+    recordInvocation(record("after-removal"));
+    expect(seen).toEqual(["first:before-reset", "after-reset", "after-stale-detach"]);
+    expect(collectedInvocations().map((r) => r.attribution.invocationId)).toEqual(["after-reset", "after-stale-detach", "after-removal"]);
   });
 });
 
