@@ -10,7 +10,15 @@ import { READ_ONLY_TOOL_PARAMS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
 import { normalizeRetryPolicy } from "../retry-backoff.js";
 import { writeCycleSummary } from "../cycle-summary.js";
-import { runFeedbackLoop, splitPlanningContext, type FeedbackLoopOutputs, type PassStat, type TerminationReason } from "../feedback-loop-core.js";
+import {
+  CONFLICT_REPAIR_NET_SECTION_HEADING,
+  CONFLICT_REPAIR_PR_SECTION_HEADING,
+  runFeedbackLoop,
+  splitPlanningContext,
+  type FeedbackLoopOutputs,
+  type PassStat,
+  type TerminationReason,
+} from "../feedback-loop-core.js";
 import { DEFAULT_MODEL } from "../default-model.js";
 import { hookOutputTail, runHookScript } from "./hooks.js";
 import { neutralizeFences } from "../../completion-classification.js";
@@ -166,12 +174,12 @@ export function getDiff(workspaceDir: string, base?: string): string {
 }
 
 /**
- * Base commit the reviewer's diff starts from. A conflict repair (`prNumber` and
- * `baseBranch` both set — the clone fetched `origin/<baseBranch>`) reviews the
- * PR's net change after the merge, so the diff runs against the feature branch
- * and leaves out sibling work merged in from it. Every other run keeps the
- * run-start base (AII-1938), including a conflict repair whose clone did not
- * fetch the remote ref.
+ * Base commit for the review diff's net-change section. A conflict repair
+ * (`prNumber` and `baseBranch` both set — the clone fetched
+ * `origin/<baseBranch>`) diffs against the feature branch so its net change
+ * leaves out sibling work merged in from it; `composeReviewDiff` prepends the
+ * PR's pre-merge change. Every other run keeps the run-start base (AII-1938),
+ * including a conflict repair whose clone did not fetch the remote ref.
  */
 export function reviewDiffBase(
   workspaceDir: string,
@@ -186,6 +194,64 @@ export function reviewDiffBase(
     stdio: ["ignore", "pipe", "ignore"],
   });
   return result.status === 0 ? remoteRef : runStartHead;
+}
+
+/**
+ * Review diff for a run. A conflict repair whose base is `origin/<baseBranch>`
+ * gets two sections: the PR's own change before the merge (from the single
+ * merge base to `runStartHead`), then the net change against the feature branch
+ * after the merge. The first section comes first because `capDiff` keeps the
+ * start. Every other shape, an empty first section, and any failure while
+ * reading the first section return today's diff unchanged.
+ */
+export function composeReviewDiff(
+  workspaceDir: string,
+  runStartHead: string,
+  baseBranch?: string,
+  prNumber?: string,
+): string {
+  const base = reviewDiffBase(workspaceDir, runStartHead, baseBranch, prNumber);
+  const netDiff = getDiff(workspaceDir, base);
+  if (!prNumber || !baseBranch || base !== `origin/${baseBranch}`) return netDiff;
+
+  const mergeBases = spawnSync("git", ["merge-base", "--all", runStartHead, base], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (mergeBases.status !== 0) {
+    console.warn(
+      `[composeReviewDiff] git merge-base --all failed (exit ${mergeBases.status ?? "null"}): ${mergeBases.stderr?.toString().trim() ?? ""}`,
+    );
+    return getDiff(workspaceDir, runStartHead);
+  }
+  const mergeBaseLines = mergeBases.stdout.toString().split("\n").map((line) => line.trim()).filter(Boolean);
+  if (mergeBaseLines.length !== 1) {
+    console.warn(
+      `[composeReviewDiff] git merge-base --all returned ${mergeBaseLines.length} merge bases; using the run-start diff`,
+    );
+    return getDiff(workspaceDir, runStartHead);
+  }
+
+  const firstDiff = spawnSync(
+    "git",
+    ["diff", mergeBaseLines[0], runStartHead, "--", ".", ...REVIEW_DIFF_EXCLUDES],
+    {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (firstDiff.status !== 0) {
+    console.warn(
+      `[composeReviewDiff] git diff ${mergeBaseLines[0]} ${runStartHead} failed (exit ${firstDiff.status ?? "null"}): ${firstDiff.stderr?.toString().trim() ?? ""}`,
+    );
+    return getDiff(workspaceDir, runStartHead);
+  }
+
+  const prDiff = firstDiff.stdout.toString();
+  if (!prDiff) return netDiff;
+  const prSection = `${CONFLICT_REPAIR_PR_SECTION_HEADING}\n${prDiff}`;
+  const sectionBreak = prDiff.endsWith("\n") ? "" : "\n";
+  return `${prSection}${sectionBreak}${CONFLICT_REPAIR_NET_SECTION_HEADING}\n${netDiff}`;
 }
 
 /**
@@ -475,9 +541,11 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             reporter,
           ),
         getDiff: () =>
-          getDiff(
+          composeReviewDiff(
             workspaceDir,
-            reviewDiffBase(workspaceDir, runStartHead, context.data.baseBranch, context.data.prNumber),
+            runStartHead,
+            context.data.baseBranch,
+            context.data.prNumber,
           ),
         isRunDirty: () => isRunDirty(workspaceDir, runStartHead),
         writeCycleSummary: (input) => {
