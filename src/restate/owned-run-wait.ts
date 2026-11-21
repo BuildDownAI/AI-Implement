@@ -1,5 +1,5 @@
 // The shared owned-run wait (AII-1039, ADR 034). A Restate workflow that started work outside
-// Restate calls awaitOwnedRun to wait for the first signal, status change, or deadline. The
+// Restate calls awaitOwnedRun to wait for the first signal, status change, deadline, or open call. The
 // helper only reports what happened — it never releases, cancels, or finalizes anything,
 // because each run kind does different work at the same event (kg-refresh cancels the run at a
 // timeout; review-fix keeps the slot until the backend confirms the stop).
@@ -74,15 +74,29 @@ export interface OwnedRunWaitOptions {
    * throws at the pending await. Other callers omit it.
    */
   cancelArm?: () => restate.RestatePromise<never>;
+  /**
+   * Optional open call the caller already made, for example `Runner_<runId>.run`. A value, never a
+   * factory: the caller creates the promise one time and passes the same one to every call, so the
+   * call starts exactly once per run. When it ends, the wait returns `call_ended` (a result) or
+   * `call_failed` (a terminal failure, with its message). A result signal that is already resolved
+   * wins over this arm, as it does over the tick.
+   */
+  callArm?: restate.RestatePromise<unknown>;
 }
 
 export type OwnedRunEvent =
   | { kind: "signal"; name: string; value: unknown }
   | { kind: "status"; status: "started" | "ended" }
   | { kind: "bootstrap_timeout" }
-  | { kind: "total_timeout" };
+  | { kind: "total_timeout" }
+  | { kind: "call_ended" }
+  | { kind: "call_failed"; message: string };
 
-type Arm = { kind: "signal"; name: string; value: unknown } | { kind: "tick" };
+type Arm =
+  | { kind: "signal"; name: string; value: unknown }
+  | { kind: "tick" }
+  | { kind: "call_ended" }
+  | { kind: "call_failed"; message: string };
 
 /**
  * Waits for the first event of an owned run and returns it.
@@ -110,6 +124,12 @@ export async function awaitOwnedRun(ctx: WorkflowContext, opts: OwnedRunWaitOpti
   const signalArms = armNames.map((name) =>
     ctx.promise<unknown>(name).get().map((value): Arm => ({ kind: "signal", name, value })),
   );
+  // Only the call arm is normalized: a workflow cancellation is raised by the race itself, not this
+  // mapper, so it still unwinds the handler. A terminal failure of the call becomes a reported event.
+  const callArm = opts.callArm?.map((_value, failure): Arm => {
+    if (!failure) return { kind: "call_ended" };
+    return { kind: "call_failed", message: failure.message };
+  });
 
   for (;;) {
     if (opts.readStatus) {
@@ -143,8 +163,19 @@ export async function awaitOwnedRun(ctx: WorkflowContext, opts: OwnedRunWaitOpti
 
     const tick = Math.max(1, Math.min(decision.nextDeadlineAt - now, opts.tickMs));
     const tickArm = ctx.sleep(tick).map((): Arm => ({ kind: "tick" }));
-    const winner = await restate.RestatePromise.race([...signalArms, tickArm, ...(opts.cancelArm ? [opts.cancelArm()] : [])]);
+    const winner = await restate.RestatePromise.race([
+      ...signalArms,
+      ...(callArm ? [callArm] : []),
+      tickArm,
+      ...(opts.cancelArm ? [opts.cancelArm()] : []),
+    ]);
     if (winner.kind === "signal") return winner;
+    if (winner.kind === "call_ended" || winner.kind === "call_failed") {
+      // Race order alone cannot give a resolved result signal priority, so peek it here.
+      const peeked = await ctx.promise<unknown>(opts.resultSignal).peek();
+      if (peeked !== undefined) return { kind: "signal", name: opts.resultSignal, value: peeked };
+      return winner;
+    }
     // "tick": loop again, re-reading status and the deadline.
   }
 }

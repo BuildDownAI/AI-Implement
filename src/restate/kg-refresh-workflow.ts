@@ -835,7 +835,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             startedSeen = true; // "progress"
             continue;
           }
-          if (event.status === "started") {
+          if (event.kind === "status" && event.status === "started") {
             startedSeen = true;
             skipNextRead = true;
             continue;

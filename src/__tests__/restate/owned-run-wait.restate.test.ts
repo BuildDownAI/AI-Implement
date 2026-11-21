@@ -16,6 +16,8 @@ type Shape = "kg-refresh" | "planning" | "review-fix";
 
 interface FixtureInput {
   shape: Shape;
+  /** Override the shape's signal list, as a caller that already has a report does. */
+  signals?: string[];
   tickMs: number;
   bootstrapMs?: number;
   totalMs: number;
@@ -25,6 +27,17 @@ interface FixtureInput {
   secondCall?: boolean;
   /** Park in a journaled step before the wait, so the wait starts after the deadline has passed. */
   holdBeforeWait?: boolean;
+  /** Race one call the fixture creates before the wait, as AII-2036 will hold `Runner_<runId>.run`. */
+  call?: CallInput;
+}
+
+interface CallInput {
+  /** Throw a TerminalError with this message instead of returning a result. */
+  failure?: string;
+  /** Park the called handler until the test releases it. */
+  hold?: boolean;
+  /** Await the caller-held promise before the wait, so the test can observe it settle. */
+  awaitSettledBeforeWait?: boolean;
 }
 
 interface FixtureResult {
@@ -51,6 +64,36 @@ const statusScripts = new Map<string, (read: number, call: number) => Promise<Ow
 const statusCalls = new Map<string, number>();
 // Gates a workflow parks on before it calls the helper, keyed by workflow key.
 const holdGates = new Map<string, Gate>();
+// Gates a called handler parks on, keyed by call tag (the caller's workflow key).
+const callGates = new Map<string, Gate>();
+// Journaled effects of the called handler, keyed by call tag. `ctx.run` executes one time per
+// invocation, so a replayed handler does not increment it again.
+const callInvocations = new Map<string, number>();
+// Set by the caller after it awaited the same call promise it passes to the wait. This is the
+// settlement barrier: the handler's own last step runs before the call promise settles.
+const callSettled = new Set<string>();
+
+interface CallFixtureInput {
+  tag: string;
+  failure?: string;
+  hold?: boolean;
+}
+
+// The handler a caller holds open: `Runner_<runId>.run` in AII-2036. It counts its journaled
+// effect so a test can prove the caller started it once, and can fail terminally on demand.
+const callFixture = restate.service({
+  name: "OwnedRunCallFixture",
+  handlers: {
+    run: async (ctx: restate.Context, input: CallFixtureInput): Promise<{ ok: true }> => {
+      await ctx.run("call-effect", async () => {
+        callInvocations.set(input.tag, (callInvocations.get(input.tag) ?? 0) + 1);
+        if (input.hold) await callGates.get(input.tag)?.wait();
+      });
+      if (input.failure) throw new restate.TerminalError(input.failure, { errorCode: 400 });
+      return { ok: true };
+    },
+  },
+});
 
 const fixture = restate.workflow({
   name: "OwnedRunWaitFixture",
@@ -78,6 +121,20 @@ const fixture = restate.workflow({
       ctx.set("step", "waiting");
 
       const key = ctx.key;
+      // Created once, before the wait loop, and passed as the same promise to every call.
+      const callArm = input.call
+        ? ctx.serviceClient<typeof callFixture>({ name: "OwnedRunCallFixture" }).run({ tag: key, ...input.call })
+        : undefined;
+      if (input.call?.awaitSettledBeforeWait && callArm) {
+        // Awaited in the caller, not merely the handler's last step: only this proves the promise
+        // the wait races has settled. A terminal failure is caught and re-raced below.
+        try {
+          await callArm;
+        } catch {
+          // The failure remains in the call's journal; `awaitOwnedRun` reports it as call_failed.
+        }
+        callSettled.add(key);
+      }
       let statusIndex = 0;
       // Which awaitOwnedRun call is reading, so a script can depend on it rather than on timing.
       let phase = 0;
@@ -103,7 +160,7 @@ const fixture = restate.workflow({
       for (let call = 0; call < (input.secondCall ? 2 : 1); call++) {
         phase = call;
         const event = await awaitOwnedRun(counting, {
-          signals: SIGNALS[input.shape],
+          signals: input.signals ?? SIGNALS[input.shape],
           resultSignal: "report",
           startedSignal: input.shape === "kg-refresh" ? "progress" : undefined,
           bootstrapDeadlineAt,
@@ -111,6 +168,7 @@ const fixture = restate.workflow({
           tickMs: input.tickMs,
           readStatus,
           startedSeen,
+          callArm,
         });
         events.push(event);
         if ((event.kind === "status" && event.status === "started") || (event.kind === "signal" && event.name === "progress")) {
@@ -186,7 +244,7 @@ describe("awaitOwnedRun (Restate)", () => {
   let counter = 0;
 
   beforeAll(async () => {
-    environments = await startVariants([fixture, cancelFixture]);
+    environments = await startVariants([fixture, cancelFixture, callFixture]);
   }, 60_000);
 
   afterAll(async () => {
@@ -210,6 +268,7 @@ describe("awaitOwnedRun (Restate)", () => {
     const baseUrl = envFor(label).baseUrl();
     const key = `wait-${label}-${counter++}`;
     if (input.holdBeforeWait) holdGates.set(key, gate("hold before wait"));
+    if (input.call?.hold) callGates.set(key, gate(`call ${key}`));
     if (script) statusScripts.set(key, script);
     const done = callWorkflow<FixtureResult>(baseUrl, "OwnedRunWaitFixture", key, "run", input);
     const read = () => callWorkflow<FixtureStatus>(baseUrl, "OwnedRunWaitFixture", key, "status");
@@ -482,5 +541,80 @@ describe("awaitOwnedRun (Restate)", () => {
       await run.send({ ok: true });
       expect(await run.done).toEqual({ kind: "signal", name: "report", value: { ok: true } });
     }, 30_000);
+  });
+
+  describe("callArm option", () => {
+    // Long relative to this group's work, so the deadline peek never masks the call arm.
+    const PLANNING = { shape: "planning", tickMs: 30, totalMs: 1_200_000 } as const;
+
+    /** Runs the fixture with one call, made once before the wait, and reports its invocation count. */
+    async function called(
+      label: string,
+      input: FixtureInput,
+      opts: { script?: (read: number, call: number) => Promise<OwnedRunStatus>; endsImmediately?: boolean } = {},
+    ) {
+      const run = await begin(label, input, opts.script, { endsImmediately: opts.endsImmediately });
+      const invocations = () => callInvocations.get(run.key) ?? 0;
+      return { ...run, invocations };
+    }
+
+    it.each(labels)("the call ends with a result: the wait returns call_ended (%s)", async (label) => {
+      const run = await called(label, { ...PLANNING, call: {} }, { endsImmediately: true });
+      expect((await run.done).events).toEqual([{ kind: "call_ended" }]);
+    });
+
+    it.each(labels)("the call ends with a terminal failure: call_failed with the message, not a throw (%s)", async (label) => {
+      const run = await called(label, { ...PLANNING, call: { failure: "runner stopped" } }, { endsImmediately: true });
+      expect((await run.done).events).toEqual([{ kind: "call_failed", message: "runner stopped" }]);
+    });
+
+    it.each(labels)("the same promise across several ticks and two waits calls the handler exactly once (%s)", async (label) => {
+      // Phase 0 ticks three times before the started status ends it; phase 1 (the second wait) ticks
+      // while the call is still open. The call is created once, before either wait.
+      const run = await called(label, { ...PLANNING, tickMs: 20, secondCall: true, call: { hold: true } }, {
+        script: async (read, phase) => (phase === 0 && read >= 3 ? "started" : "unknown"),
+      });
+      // Four reads for the first wait, then several ticks in the second wait, all with the call open.
+      await eventually(() => statusCalls.get(run.key) ?? 0, (reads) => reads >= 8, { label: "ticks in both waits" });
+      expect(run.invocations()).toBe(1);
+      // The call ends only when the gate opens, so the second wait races the same promise.
+      callGates.get(run.key)!.release();
+      const result = await run.done;
+      expect(result.events).toEqual([{ kind: "status", status: "started" }, { kind: "call_ended" }]);
+      expect(run.invocations()).toBe(1);
+    });
+
+    it.each(labels.flatMap((label) => [
+      [label, "result"],
+      [label, "terminal failure"],
+    ] as const))(
+      "a resolved result signal wins over a call at the same time (%s, %s)",
+      async (label, outcome) => {
+        // Park the workflow before the wait, so the call and the report can both settle first.
+        const run = await called(label, {
+          ...PLANNING,
+          holdBeforeWait: true,
+          // `report` is not a race arm here: only the call-completion peek can see it.
+          signals: [],
+          call: {
+            hold: true,
+            awaitSettledBeforeWait: true,
+            ...(outcome === "terminal failure" ? { failure: "runner stopped" } : {}),
+          },
+        });
+        const callGate = callGates.get(run.key)!;
+        await callGate.reached();
+        callGate.release();
+        // The caller awaits the same promise it passes to the wait. `callSettled` is set only after
+        // that await returns, then the workflow parks on its gate. Both steps precede the race.
+        await eventually(() => callSettled.has(run.key), Boolean, { label: "the caller-held call settled" });
+        await run.hold!.reached();
+        // The report resolves while the workflow is still gated, so both arms are ready at once.
+        await run.send("report", { ok: true });
+        run.hold!.release();
+        expect((await run.done).events).toEqual([{ kind: "signal", name: "report", value: { ok: true } }]);
+      },
+      30_000,
+    );
   });
 });
