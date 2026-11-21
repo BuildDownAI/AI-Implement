@@ -8,10 +8,6 @@ import { pushStep } from "../pipeline/steps/push.js";
 import { implementStep } from "../pipeline/steps/implement.js";
 import { reviewStep } from "../pipeline/steps/review.js";
 import { collectedPushedCommits } from "../pipeline/job-accounting.js";
-import {
-  CONFLICT_REPAIR_NET_SECTION_HEADING,
-  CONFLICT_REPAIR_PR_SECTION_HEADING,
-} from "../pipeline/feedback-loop-core.js";
 import { makeContext } from "./helpers/builders.js";
 import { testDir } from "./helpers/test-dir.js";
 
@@ -126,35 +122,6 @@ describe("conflict repair on a real workspace", () => {
     expect(git(dir, ["diff", "HEAD"])).toBe("");
   });
 
-  it("reviews the PR net change against the feature branch, without sibling-only files", async () => {
-    const { dir, start, baseBranch } = initGroupedRepo();
-    mockImplementRun.mockImplementation(async () => {
-      spawnSync("git", ["merge", "--no-ff", "--no-commit", `origin/${baseBranch}`], {
-        cwd: dir,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      writeFileSync(join(dir, "code.ts"), "export const a = 1;\nexport const sibling = true;\nexport const ours = true;\n");
-      git(dir, ["add", "-A"]);
-      git(dir, ["commit", "-qm", "merge feature"]);
-      return { filesChanged: [], tokensUsed: 0, exitCode: 0, subagentCount: 0, attempts: 1 } as never;
-    });
-    mockReviewRun.mockResolvedValue({ approved: true, issues: [], score: 100, progressDelta: 0, feedback: "ok", tokensUsed: 1, attempts: 1 });
-
-    await feedbackLoopStep.run(
-      makeContext({ prNumber: "42", baseBranch } as never),
-      { workspaceDir: dir, issueTitle: "T", issueDescription: "D", maxIterations: 1 },
-      { report: async () => undefined },
-    );
-
-    expect(parents(dir)).toHaveLength(3);
-    expect(git(dir, ["rev-parse", "HEAD"]).trim()).not.toBe(start);
-    const diff = mockReviewRun.mock.calls[0][1].diff as string;
-    expect(diff).toContain("export const prOwn = true");
-    expect(diff).toContain("export const ours = true");
-    expect(diff).toContain("export const sibling = true");
-    expect(diff).not.toContain("sibling-only.ts");
-  });
-
   it("shows a PR line that resolving with the feature side dropped", async () => {
     const { dir, start, baseBranch } = initGroupedRepo();
     // The PR's own change touches the same line the feature branch changes.
@@ -184,19 +151,10 @@ describe("conflict repair on a real workspace", () => {
     expect(parents(dir)).toHaveLength(3);
     expect(git(dir, ["rev-parse", "HEAD"]).trim()).not.toBe(start);
     const diff = mockReviewRun.mock.calls[0][1].diff as string;
-    const prSectionStart = diff.indexOf(CONFLICT_REPAIR_PR_SECTION_HEADING);
-    const netSectionStart = diff.indexOf(CONFLICT_REPAIR_NET_SECTION_HEADING);
-    expect(prSectionStart).toBe(0);
-    expect(netSectionStart).toBeGreaterThan(prSectionStart);
-
-    const prSection = diff.slice(prSectionStart, netSectionStart);
-    const netSection = diff.slice(netSectionStart);
-    expect(prSection).toContain("export const prLine = true");
-    expect(prSection).toContain("pr-own.ts");
-    expect(prSection).not.toContain("sibling-only.ts");
-    expect(prSection).not.toContain("export const sibling = true");
-    // The feature-side resolution is what hides the dropped line from the net change.
-    expect(netSection).not.toContain("export const prLine = true");
+    expect(diff).toContain("-export const prLine = true");
+    expect(diff).toContain("sibling-only.ts");
+    expect(diff).not.toContain("=== This PR's change before the merge ===");
+    expect(diff).not.toContain("=== Net change after the merge ===");
   });
 
   it("completes a clean merge that commits itself and leaves the guarded commit as a no-op", async () => {

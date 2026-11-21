@@ -540,28 +540,9 @@ The repair merges `origin/<feature>` into the PR branch and finishes with
 leaves `MERGE_HEAD` only when the merge stopped on a conflict, and a clean merge already
 committed itself, so the guard exits 0 either way.
 
-For the review, a conflict repair (a run carrying both `prNumber` and `baseBranch`) bases
-the diff on the feature branch — `git diff origin/<baseBranch>` against the working tree,
-with the usual disposable index and `REVIEW_DIFF_EXCLUDES`. The review diff has two
-sections, in this order:
-
-1. `=== This PR's change before the merge ===` — `git diff <merge base> <runStartHead>`
-   with the same `REVIEW_DIFF_EXCLUDES`, where `<merge base>` is the single commit
-   returned by `git merge-base --all <runStartHead> origin/<baseBranch>`. This is the
-   PR's own change before the merge, so a line the resolution dropped is still visible.
-2. `=== Net change after the merge ===` — the PR's net change against the feature branch:
-   the PR's own work plus the resolution, without the sibling payload merged in from the
-   feature branch.
-
-The PR section comes first so `capDiff` cannot cut it before the reviewer sees it. When
-the PR section is empty, the diff is the net change alone, byte for byte as before.
-The runner picks the feature-branch base only after verifying `origin/<baseBranch>` with
-`git rev-parse --verify`; if the clone did not fetch that ref (for example the GHA
-single-branch clone, or a base branch absent from the run config), the diff falls back to
-the run-start commit and includes the merged sibling changes again, with no heading.
-The same headingless run-start fallback applies with a warning when `git merge-base --all`
-fails or returns more than one commit, or when the first section cannot be read. A
-failure shows the reviewer more, not less.
+The review diff of a conflict repair starts at the run-start commit, so it holds the
+changes from the merged branch and the resolution. A PR line that the resolution dropped
+shows as a removed line.
 
 ### Dispatch guard (declared-file overlap)
 
