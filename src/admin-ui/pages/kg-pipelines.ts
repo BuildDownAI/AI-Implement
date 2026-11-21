@@ -150,7 +150,7 @@ export const kgPipelinesHtml = `
           <span class="kpi-trend text-secondary" id="kg-graph-details-save-status"></span>
         </div>
         <div id="kg-graph-details-error" class="error" hidden></div>
-        <div class="kpi-trend text-secondary">The sidecar reads these values when it starts. Select the graph source again, or restart the orchestrator, to apply a change.</div>
+        <div class="kpi-trend text-secondary">The sidecar reads Namespace and Graph name when it starts. Select the graph source again, or restart the orchestrator, to apply a change to them. A change to KG code repo or Graph label needs no restart.</div>
       </div>
     </div>
     ${dispatchLogHtml("kglog", { title: "Runs", emptyText: "No knowledge-graph refresh runs in the selected time range" })}

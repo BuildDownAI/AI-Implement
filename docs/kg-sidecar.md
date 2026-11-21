@@ -112,8 +112,9 @@ rows that have no environment seed: `kg_code_repo` (an `owner/name` GitHub
 repository) and `kg_graph_label` (free text, at most 200 characters). Namespace
 and graph name use the shared `kg_namespace` and `kg_graph_name` rows;
 `KG_NAMESPACE` seeds `kg_namespace` at first boot, and a stored graph name
-derives the Stardog dataset. The sidecar reads these values when it starts, so
-select the graph source again, or restart the orchestrator, to apply a change.
+derives the Stardog dataset. The sidecar reads Namespace and Graph name when it
+starts. Select the graph source again, or restart the orchestrator, to apply a
+change to them. A change to KG code repo or Graph label needs no restart.
 Names accept letters, digits, underscores and hyphens, beginning with a letter
 or digit; namespaces and endpoint/console/platform values must be absolute
 HTTP(S) URLs without userinfo. Empty fields clear their rows, and partial updates

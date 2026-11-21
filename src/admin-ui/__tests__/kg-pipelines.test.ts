@@ -811,7 +811,7 @@ describe("kg graph details card (AII-1991)", () => {
     }
     expect(kgPipelinesHtml).toContain('placeholder="https://kg.builddown.dev/"');
     expect(kgPipelinesHtml).toContain('placeholder="builddown-kg"');
-    expect(kgPipelinesHtml).toContain("The sidecar reads these values when it starts. Select the graph source again, or restart the orchestrator, to apply a change.");
+    expect(kgPipelinesHtml).toContain("The sidecar reads Namespace and Graph name when it starts. Select the graph source again, or restart the orchestrator, to apply a change to them. A change to KG code repo or Graph label needs no restart.");
     expect(kgPipelinesHtml).toContain("Graph details");
   });
 
