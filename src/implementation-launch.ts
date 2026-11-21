@@ -31,7 +31,7 @@ import { getInstallationToken, getScopedInstallationToken } from "./github-app-a
 import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
 import { createMachine, buildSessionMachineConfig, listAppSecrets, guestSize } from "./fly-machines.js";
 import type { MachineSize } from "./log.js";
-import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
+import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type LocalRunnerServeInput, type StartLocalContainerInput } from "./local-docker.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
 import {
   ghaLaunchOutcome,
@@ -324,6 +324,12 @@ export interface LaunchImplementationSessionArgs {
   isGroupingParentDispatch: (issue: TicketIssue) => boolean;
 }
 
+/** The local Docker implementation launch also accepts the opt-in Restate serve payload (AII-2048).
+ *  Nothing passes it in this issue; AII-2036 turns it on. */
+export interface LaunchLocalImplementationSessionArgs extends LaunchImplementationSessionArgs {
+  serve?: LocalRunnerServeInput;
+}
+
 export interface FlyImplementationSessionArgs extends LaunchImplementationSessionArgs {
   implementationSandbox?: ImplementationSandbox;
   /** The shadow Fly run of "both" mode: tags the log line and posts no status comment. */
@@ -473,7 +479,7 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
 }
 
 /** The local Docker implementation launch, moved out of `dispatchLocalDocker`. */
-export async function launchImplementationLocalSession(args: LaunchImplementationSessionArgs): Promise<ImplementationSessionResult> {
+export async function launchImplementationLocalSession(args: LaunchLocalImplementationSessionArgs): Promise<ImplementationSessionResult> {
   const { config, issue, mapping, baseBranch, input } = args;
   const { sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, managedAuth, markLaunchAttempted } = input;
   const localOrchestratorUrl =
@@ -512,6 +518,7 @@ export async function launchImplementationLocalSession(args: LaunchImplementatio
   const localRunnerInput: StartLocalContainerInput = {
     image: config.localRunnerImage,
     containerName: input.containerName,
+    ...(args.serve ? { serve: args.serve } : {}),
     onBeforeLaunch: () => markLaunchAttempted({ sessionImage: config.localRunnerImage, computeStartedAt: Date.now() }),
     issueId: issue.id,
     issueIdentifier: issue.identifier,

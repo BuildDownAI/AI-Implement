@@ -1,13 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { execFile as rawExecFile } from "node:child_process";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
+
 import {
   buildDockerEnvFileContent,
   buildDockerRunArgs,
   buildLocalRunnerEnv,
+  readPublishedPort,
   startLocalRunnerContainer,
   selectSweepableContainers,
   splitLocalRunnerEnv,
 } from "../local-docker.js";
-import type { LocalRunnerInput } from "../local-docker.js";
+import type { LocalRunnerInput, StartLocalContainerInput } from "../local-docker.js";
 import { encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, type RunConfigV1 } from "../run-config.js";
 import { testTempRoot } from "./helpers/test-dir.js";
 
@@ -238,6 +243,239 @@ describe("buildDockerRunArgs default name", () => {
   it("keeps the issue-key name when no containerName is given", () => {
     const args = buildDockerRunArgs(baseInput);
     expect(args[args.indexOf("--name") + 1]).toMatch(/^ai-implement-eng-42-[a-z0-9]+$/);
+  });
+});
+
+describe("serve mode (AII-2048)", () => {
+  const serve = { identityKey: "publickeyv1_abc", runnerId: "dispatch-42" };
+
+  it("adds the three authoritative env vars after extraEnv", () => {
+    const env = buildLocalRunnerEnv({
+      ...baseInput,
+      serve,
+      extraEnv: {
+        AI_IMPLEMENT_RUNNER_SERVE: "0",
+        AI_IMPLEMENT_RUNNER_ID: "mapping-id",
+        RESTATE_IDENTITY_KEY: "mapping-key",
+      },
+    });
+    expect(env.AI_IMPLEMENT_RUNNER_SERVE).toBe("1");
+    expect(env.AI_IMPLEMENT_RUNNER_ID).toBe("dispatch-42");
+    expect(env.RESTATE_IDENTITY_KEY).toBe("publickeyv1_abc");
+  });
+
+  it("adds exactly the loopback ephemeral publication to the args", () => {
+    const args = buildDockerRunArgs({ ...baseInput, containerName: "c", serve }, "/tmp/x.env");
+    expect(args).toContain("-p");
+    expect(args[args.indexOf("-p") + 1]).toBe("127.0.0.1::9080");
+    expect(args.filter((a) => a === "-p")).toHaveLength(1);
+    expect(args).not.toContain("::9080");
+  });
+
+  it("leaves env and args unchanged when serve is absent", () => {
+    expect(buildLocalRunnerEnv(baseInput)).toEqual(buildLocalRunnerEnv({ ...baseInput, serve: undefined }));
+    expect(buildDockerRunArgs({ ...baseInput, containerName: "c" }, "/tmp/x.env"))
+      .toEqual(buildDockerRunArgs({ ...baseInput, containerName: "c", serve: undefined }, "/tmp/x.env"));
+  });
+
+  it("adds no serve env or publication on the protected model-auth transport", () => {
+    const bootstrap = {
+      version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1", projectKey: "AII",
+      backend: "local", expiresAt: 1, bearer: "B".repeat(43),
+      bindings: [{ stage: "implementation", profileId: "cdx", profileRevision: 1, authMode: "codex-subscription" }],
+    } as unknown as NonNullable<LocalRunnerInput["protectedModelAuth"]>["bootstrap"];
+    const protectedInput: StartLocalContainerInput = {
+      ...baseInput,
+      anthropicApiKey: undefined,
+      containerName: "c",
+      protectedModelAuth: {
+        bootstrap, projectKey: "AII",
+        runConfig: { v: 1, issue: { id: "i", identifier: "ENG-42", title: "t", description: "d" } } as RunConfigV1,
+        modelAuthUrl: "http://host.docker.internal:8080",
+      },
+    };
+    const env = buildLocalRunnerEnv(protectedInput);
+    for (const key of ["AI_IMPLEMENT_RUNNER_SERVE", "AI_IMPLEMENT_RUNNER_ID", "RESTATE_IDENTITY_KEY"]) {
+      expect(env).not.toHaveProperty(key);
+    }
+    expect(buildDockerRunArgs(protectedInput, "/tmp/x.env")).not.toContain("-p");
+  });
+});
+
+describe("pre-change env and argv for the four launch paths", () => {
+  // Pinned from the code before AII-2048. Absent `serve`, every launch path must reproduce it.
+  const paths: Array<[string, StartLocalContainerInput, Record<string, string>, string[]]> = [
+    [
+      "implementation",
+      { ...baseInput, containerName: "ai-implement-impl", extraEnv: { AI_IMPLEMENT_RUN_CONFIG: "IMPL-CONFIG", AI_IMPLEMENT_MAX_TURNS: "40" } },
+      {
+        AI_IMPLEMENT_MODE: "local", ISSUE_ID: "issue-uuid", ISSUE_IDENTIFIER: "ENG-42", ISSUE_TITLE: "Add local mode",
+        ISSUE_DESCRIPTION: "Run implementation jobs locally", GITHUB_OWNER: "BuildDownAI", GITHUB_REPO: "AI-Implement",
+        GITHUB_DEFAULT_BRANCH: "main", GITHUB_TOKEN: "ghs_test_token", SESSION_TOKEN: "session-token", MACHINE_NONCE: "nonce-123",
+        RUNNER_PHASE: "implementation", ANTHROPIC_API_KEY: "sk-ant-test", ORCHESTRATOR_URL: "http://host.docker.internal:8080",
+        AI_IMPLEMENT_RUN_CONFIG: "IMPL-CONFIG", AI_IMPLEMENT_MAX_TURNS: "40",
+      },
+      [
+        "run", "-d", "--name", "ai-implement-impl", "--add-host", "host.docker.internal:host-gateway", "--env-file", "/tmp/runner.env",
+        "-e", "AI_IMPLEMENT_MODE=local", "-e", "ISSUE_ID=issue-uuid", "-e", "ISSUE_IDENTIFIER=ENG-42", "-e", "ISSUE_TITLE=Add local mode",
+        "-e", "ISSUE_DESCRIPTION=Run implementation jobs locally", "-e", "GITHUB_OWNER=BuildDownAI", "-e", "GITHUB_REPO=AI-Implement",
+        "-e", "GITHUB_DEFAULT_BRANCH=main", "-e", "MACHINE_NONCE=nonce-123", "-e", "RUNNER_PHASE=implementation",
+        "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8080", "-e", "AI_IMPLEMENT_RUN_CONFIG=IMPL-CONFIG",
+        "-e", "AI_IMPLEMENT_MAX_TURNS=40", "ai-implement-runner:local",
+      ],
+    ],
+    [
+      "planning",
+      { ...baseInput, containerName: "ai-implement-plan", phase: "planning", extraEnv: { AI_IMPLEMENT_RUN_CONFIG: "PLAN-CONFIG" } },
+      {
+        AI_IMPLEMENT_MODE: "local", ISSUE_ID: "issue-uuid", ISSUE_IDENTIFIER: "ENG-42", ISSUE_TITLE: "Add local mode",
+        ISSUE_DESCRIPTION: "Run implementation jobs locally", GITHUB_OWNER: "BuildDownAI", GITHUB_REPO: "AI-Implement",
+        GITHUB_DEFAULT_BRANCH: "main", GITHUB_TOKEN: "ghs_test_token", SESSION_TOKEN: "session-token", MACHINE_NONCE: "nonce-123",
+        RUNNER_PHASE: "planning", ANTHROPIC_API_KEY: "sk-ant-test", ORCHESTRATOR_URL: "http://host.docker.internal:8080",
+        AI_IMPLEMENT_RUN_CONFIG: "PLAN-CONFIG",
+      },
+      [
+        "run", "-d", "--name", "ai-implement-plan", "--add-host", "host.docker.internal:host-gateway", "--env-file", "/tmp/runner.env",
+        "-e", "AI_IMPLEMENT_MODE=local", "-e", "ISSUE_ID=issue-uuid", "-e", "ISSUE_IDENTIFIER=ENG-42", "-e", "ISSUE_TITLE=Add local mode",
+        "-e", "ISSUE_DESCRIPTION=Run implementation jobs locally", "-e", "GITHUB_OWNER=BuildDownAI", "-e", "GITHUB_REPO=AI-Implement",
+        "-e", "GITHUB_DEFAULT_BRANCH=main", "-e", "MACHINE_NONCE=nonce-123", "-e", "RUNNER_PHASE=planning",
+        "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8080", "-e", "AI_IMPLEMENT_RUN_CONFIG=PLAN-CONFIG",
+        "ai-implement-runner:local",
+      ],
+    ],
+    [
+      "review-fix",
+      { ...baseInput, containerName: "ai-implement-review", phase: "implementation", extraEnv: { AI_IMPLEMENT_RUN_CONFIG: "REVIEW-CONFIG" } },
+      {
+        AI_IMPLEMENT_MODE: "local", ISSUE_ID: "issue-uuid", ISSUE_IDENTIFIER: "ENG-42", ISSUE_TITLE: "Add local mode",
+        ISSUE_DESCRIPTION: "Run implementation jobs locally", GITHUB_OWNER: "BuildDownAI", GITHUB_REPO: "AI-Implement",
+        GITHUB_DEFAULT_BRANCH: "main", GITHUB_TOKEN: "ghs_test_token", SESSION_TOKEN: "session-token", MACHINE_NONCE: "nonce-123",
+        RUNNER_PHASE: "implementation", ANTHROPIC_API_KEY: "sk-ant-test", ORCHESTRATOR_URL: "http://host.docker.internal:8080",
+        AI_IMPLEMENT_RUN_CONFIG: "REVIEW-CONFIG",
+      },
+      [
+        "run", "-d", "--name", "ai-implement-review", "--add-host", "host.docker.internal:host-gateway", "--env-file", "/tmp/runner.env",
+        "-e", "AI_IMPLEMENT_MODE=local", "-e", "ISSUE_ID=issue-uuid", "-e", "ISSUE_IDENTIFIER=ENG-42", "-e", "ISSUE_TITLE=Add local mode",
+        "-e", "ISSUE_DESCRIPTION=Run implementation jobs locally", "-e", "GITHUB_OWNER=BuildDownAI", "-e", "GITHUB_REPO=AI-Implement",
+        "-e", "GITHUB_DEFAULT_BRANCH=main", "-e", "MACHINE_NONCE=nonce-123", "-e", "RUNNER_PHASE=implementation",
+        "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8080", "-e", "AI_IMPLEMENT_RUN_CONFIG=REVIEW-CONFIG",
+        "ai-implement-runner:local",
+      ],
+    ],
+    [
+      "kg-refresh",
+      { ...baseInput, containerName: "ai-implement-kg", phase: "kg-refresh", extraEnv: { AI_IMPLEMENT_RUN_CONFIG: "KG-CONFIG" } },
+      {
+        AI_IMPLEMENT_MODE: "local", ISSUE_ID: "issue-uuid", ISSUE_IDENTIFIER: "ENG-42", ISSUE_TITLE: "Add local mode",
+        ISSUE_DESCRIPTION: "Run implementation jobs locally", GITHUB_OWNER: "BuildDownAI", GITHUB_REPO: "AI-Implement",
+        GITHUB_DEFAULT_BRANCH: "main", GITHUB_TOKEN: "ghs_test_token", SESSION_TOKEN: "session-token", MACHINE_NONCE: "nonce-123",
+        RUNNER_PHASE: "kg-refresh", ANTHROPIC_API_KEY: "sk-ant-test", ORCHESTRATOR_URL: "http://host.docker.internal:8080",
+        AI_IMPLEMENT_RUN_CONFIG: "KG-CONFIG",
+      },
+      [
+        "run", "-d", "--name", "ai-implement-kg", "--add-host", "host.docker.internal:host-gateway", "--env-file", "/tmp/runner.env",
+        "-e", "AI_IMPLEMENT_MODE=local", "-e", "ISSUE_ID=issue-uuid", "-e", "ISSUE_IDENTIFIER=ENG-42", "-e", "ISSUE_TITLE=Add local mode",
+        "-e", "ISSUE_DESCRIPTION=Run implementation jobs locally", "-e", "GITHUB_OWNER=BuildDownAI", "-e", "GITHUB_REPO=AI-Implement",
+        "-e", "GITHUB_DEFAULT_BRANCH=main", "-e", "MACHINE_NONCE=nonce-123", "-e", "RUNNER_PHASE=kg-refresh",
+        "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8080", "-e", "AI_IMPLEMENT_RUN_CONFIG=KG-CONFIG",
+        "ai-implement-runner:local",
+      ],
+    ],
+  ];
+
+  it.each(paths)("%s keeps today's env and argv without serve", (_name, input, env, args) => {
+    expect(buildLocalRunnerEnv(input)).toEqual(env);
+    expect(buildDockerRunArgs(input, "/tmp/runner.env")).toEqual(args);
+  });
+
+  // The protected model-auth transport is the other launch shape; with serve absent it must
+  // reproduce its pre-change env, argv, and private env-file byte for byte. The encoded run
+  // config below is a literal captured before AII-2048, not regenerated by the implementation.
+  it("protected model auth keeps today's complete env, argv, and env-file without serve", () => {
+    const bootstrap = {
+      version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1", projectKey: "AII",
+      backend: "local", expiresAt: 1, bearer: "B".repeat(43),
+      bindings: [{ stage: "implementation", profileId: "cdx", profileRevision: 1, authMode: "codex-subscription" }],
+    } as unknown as NonNullable<LocalRunnerInput["protectedModelAuth"]>["bootstrap"];
+    const runConfig = { v: 1, issue: { id: "i", identifier: "ENG-42", title: "t", description: "d" } } as RunConfigV1;
+    const protectedInput: StartLocalContainerInput = {
+      ...baseInput,
+      anthropicApiKey: undefined,
+      containerName: "ai-implement-protected",
+      protectedModelAuth: {
+        bootstrap, projectKey: "AII", runConfig,
+        modelAuthUrl: "http://host.docker.internal:8080",
+      },
+    };
+    const env = {
+      AI_IMPLEMENT_MODE: "local", ISSUE_ID: "issue-uuid", ISSUE_IDENTIFIER: "ENG-42", ISSUE_TITLE: "Add local mode",
+      ISSUE_DESCRIPTION: "Run implementation jobs locally", GITHUB_OWNER: "BuildDownAI", GITHUB_REPO: "AI-Implement",
+      GITHUB_DEFAULT_BRANCH: "main", GITHUB_TOKEN: "ghs_test_token", SESSION_TOKEN: "session-token", MACHINE_NONCE: "nonce-123",
+      RUNNER_PHASE: "implementation", ORCHESTRATOR_URL: "http://host.docker.internal:8080",
+      AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID: "d1", AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: "AII",
+      AI_IMPLEMENT_MODEL_AUTH_BACKEND: "local", AI_IMPLEMENT_MODEL_AUTH_URL: "http://host.docker.internal:8080",
+      AI_IMPLEMENT_RUN_CONFIG: "eyJ2IjoxLCJpc3N1ZSI6eyJpZCI6ImkiLCJpZGVudGlmaWVyIjoiRU5HLTQyIiwidGl0bGUiOiJ0IiwiZGVzY3JpcHRpb24iOiJkIn0sImNyZWRlbnRpYWxzIjp7InZlcnNpb24iOjEsIm1vZGVsQXV0aEdyYW50Ijp7InZlcnNpb24iOjEsImF1ZGllbmNlIjoibW9kZWwtYXV0aCIsImdyYW50SWQiOiJnMSIsImRpc3BhdGNoSWQiOiJkMSIsInNuYXBzaG90SWQiOiJzMSIsInByb2plY3RLZXkiOiJBSUkiLCJiYWNrZW5kIjoibG9jYWwiLCJleHBpcmVzQXQiOjEsImJlYXJlciI6IkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkIiLCJiaW5kaW5ncyI6W3sic3RhZ2UiOiJpbXBsZW1lbnRhdGlvbiIsInByb2ZpbGVJZCI6ImNkeCIsInByb2ZpbGVSZXZpc2lvbiI6MSwiYXV0aE1vZGUiOiJjb2RleC1zdWJzY3JpcHRpb24ifV19fX0=",
+    };
+    const args = [
+      "run", "-d", "--name", "ai-implement-protected", "--add-host", "host.docker.internal:host-gateway", "--env-file", "/tmp/runner.env",
+      "-e", "AI_IMPLEMENT_MODE=local", "-e", "ISSUE_ID=issue-uuid", "-e", "ISSUE_IDENTIFIER=ENG-42", "-e", "ISSUE_TITLE=Add local mode",
+      "-e", "ISSUE_DESCRIPTION=Run implementation jobs locally", "-e", "GITHUB_OWNER=BuildDownAI", "-e", "GITHUB_REPO=AI-Implement",
+      "-e", "GITHUB_DEFAULT_BRANCH=main", "-e", "MACHINE_NONCE=nonce-123", "-e", "RUNNER_PHASE=implementation",
+      "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8080", "ai-implement-runner:local",
+    ];
+    const envFile = [
+      "GITHUB_TOKEN=ghs_test_token",
+      "SESSION_TOKEN=session-token",
+      "AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID=d1",
+      "AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY=AII",
+      "AI_IMPLEMENT_MODEL_AUTH_BACKEND=local",
+      "AI_IMPLEMENT_MODEL_AUTH_URL=http://host.docker.internal:8080",
+      `AI_IMPLEMENT_RUN_CONFIG=${env.AI_IMPLEMENT_RUN_CONFIG}`,
+    ].join("\n") + "\n";
+
+    expect(buildLocalRunnerEnv(protectedInput)).toEqual(env);
+    expect(buildDockerRunArgs(protectedInput, "/tmp/runner.env")).toEqual(args);
+    const { secretEnv } = splitLocalRunnerEnv(env, { protectedModelAuth: true });
+    expect(buildDockerEnvFileContent(secretEnv)).toBe(envFile);
+  });
+});
+
+describe("readPublishedPort", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function mockPort(stdout: string) {
+    vi.mocked(rawExecFile).mockImplementationOnce((_cmd: unknown, _args: unknown, cb: unknown) => {
+      (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, { stdout, stderr: "" });
+      return {} as ReturnType<typeof rawExecFile>;
+    });
+  }
+
+  it("runs docker port <container> 9080", async () => {
+    mockPort("127.0.0.1:49153\n");
+    await readPublishedPort("c-1", 9080);
+    expect(rawExecFile).toHaveBeenCalledWith("docker", ["port", "c-1", "9080"], expect.any(Function));
+  });
+
+  it("parses an IPv4 line", async () => {
+    mockPort("127.0.0.1:49153\n");
+    await expect(readPublishedPort("c-1", 9080)).resolves.toBe(49153);
+  });
+
+  it("parses an IPv6 line", async () => {
+    mockPort("[::1]:49154\n");
+    await expect(readPublishedPort("c-1", 9080)).resolves.toBe(49154);
+  });
+
+  it("parses multiline IPv4 and IPv6 output", async () => {
+    mockPort("127.0.0.1:49155\n[::1]:49155\n");
+    await expect(readPublishedPort("c-1", 9080)).resolves.toBe(49155);
+  });
+
+  it("returns null for empty output", async () => {
+    mockPort("");
+    await expect(readPublishedPort("c-1", 9080)).resolves.toBeNull();
   });
 });
 

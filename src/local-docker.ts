@@ -68,6 +68,18 @@ export interface StartLocalContainerInput extends LocalRunnerInput {
   containerName?: string;
   /** Called after preparation, immediately before the Docker command can launch a container. */
   onBeforeLaunch?: () => void;
+  /**
+   * Opt-in Restate service mode (AII-2048). Off unless a caller sets it; nothing does in this
+   * issue. The identity key is the server's public half, not a secret.
+   */
+  serve?: LocalRunnerServeInput;
+}
+
+export interface LocalRunnerServeInput {
+  /** The Restate request-identity public key the runner's SDK endpoint accepts. */
+  identityKey: string;
+  /** The dispatch id, sent to the runner as `AI_IMPLEMENT_RUNNER_ID`. */
+  runnerId: string;
 }
 
 export interface LocalContainerState {
@@ -105,7 +117,7 @@ export function validateProtectedLocalInput(input: LocalRunnerInput, p: NonNulla
   }
 }
 
-export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, string> {
+export function buildLocalRunnerEnv(input: LocalRunnerInput & { serve?: LocalRunnerServeInput }): Record<string, string> {
   const protectedAuth = input.protectedModelAuth;
   if (input.extraEnv && Object.keys(input.extraEnv).some(isEphemeralPolicyEnvName)) {
     // The ephemeral full-access opt-in is GHA-only (AII-1437).
@@ -135,6 +147,13 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
   if (input.runProgressToken) env.RUN_PROGRESS_TOKEN = input.runProgressToken;
   if (input.runPublicationToken) env.RUN_PUBLICATION_TOKEN = input.runPublicationToken;
   if (input.extraEnv) Object.assign(env, input.extraEnv);
+
+  if (input.serve) {
+    // Authoritative values go after extraEnv, like the protected model-auth values, so a mapping cannot replace them.
+    env.AI_IMPLEMENT_RUNNER_SERVE = "1";
+    env.AI_IMPLEMENT_RUNNER_ID = input.serve.runnerId;
+    env.RESTATE_IDENTITY_KEY = input.serve.identityKey;
+  }
 
   if (protectedAuth) {
     // Authoritative values go after extraEnv so a mapping cannot replace the grant, URL or run config.
@@ -205,6 +224,9 @@ export function buildDockerRunArgs(input: StartLocalContainerInput, envFilePath?
     "host.docker.internal:host-gateway",
   ];
 
+  // Loopback-only publication with a Docker-chosen host port, so concurrent launches never race.
+  if (input.serve) args.push("-p", "127.0.0.1::9080");
+
   if (envFilePath) {
     args.push("--env-file", envFilePath);
   }
@@ -236,6 +258,24 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
     throw new Error(`Failed to start local Docker runner: ${errorMessage(err)}`);
   } finally {
     await unlink(envFilePath).catch(() => undefined);
+  }
+}
+
+/** The host port Docker published for a container port, from `docker port`. `null` means Docker
+ *  answered with no mapping. The port is loopback-only where `serve` requested it. */
+export async function readPublishedPort(containerId: string, containerPort: number): Promise<number | null> {
+  try {
+    const { stdout } = await execFile("docker", ["port", containerId, String(containerPort)]);
+    for (const line of stdout.split("\n")) {
+      // IPv4 is `127.0.0.1:49153`; IPv6 is `[::1]:49153`. Docker prints one line per bound address.
+      const match = line.trim().match(/:(\d+)$/);
+      if (!match) continue;
+      const port = Number(match[1]);
+      if (Number.isInteger(port) && port > 0) return port;
+    }
+    return null;
+  } catch (err) {
+    throw new Error(`Failed to read published port for local Docker runner ${containerId}: ${errorMessage(err)}`);
   }
 }
 

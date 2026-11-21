@@ -95,6 +95,10 @@ type ContainerBackend = "fly-machines" | "local-docker";
 export interface ImplementationRunProductionInput {
   /** The full config: the launch functions read from it. */
   config: AppConfig;
+  /** The Restate request-identity public key (`restateSidecar.identityKey`), the same value
+   *  `startRestateEndpoint` receives. Stored only; AII-2036 reads it to launch a local runner in
+   *  serve mode. It is the public half, not a secret. */
+  restateIdentityKey?: string;
   /** Maps a team key to its mapping. Defaults to `getMappings()[teamKey]`. */
   getMapping?: (teamKey: string) => RepoMapping | undefined;
   /** The provider lookup (`ProviderRegistry.forMapping`). */
