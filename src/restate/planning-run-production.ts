@@ -11,7 +11,7 @@ import type { AppConfig, HeldReservation } from "../index.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
-import { APP_TOKEN_STEP, defaultFetchSignal, cancelWorkflowRun, getFailedRunStepJob, getWorkflowRunStatus } from "../github.js";
+import { APP_TOKEN_STEP, cancelWorkflowRun, getFailedRunStepJob, getWorkflowRunStatus, listWorkflowDispatchRuns } from "../github.js";
 import { pointAtSetupChecks } from "../setup-checks/recheck.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { findLogIdByDispatchId, getJobByDispatchId, markJobFailureCommented, recordGhaRunCompleted, updateJobRunId, updateJobStatus, type Job } from "../log.js";
@@ -79,7 +79,8 @@ function requireMapping(getMapping: (teamKey: string) => RepoMapping | undefined
 
 /** Looks a planning run up: a container backend by the row's id, else by the name derived from the dispatch id;
  *  GitHub Actions by its exact title and creation time. `null` means only "GitHub answered, and
- *  no run matches"; an HTTP error throws, so the workflow retries the lookup rather than launching a second run.
+ *  no run matches", a 404 included (`listWorkflowDispatchRuns`); any other HTTP error throws, so the workflow
+ *  retries the lookup rather than launching a second run.
  *  GitHub stamps `created_at` to the second, so the dispatch time is floored to the second before the compare. */
 export function createPlanningFindExistingRun(opts: {
   getMapping: (teamKey: string) => RepoMapping | undefined;
@@ -105,16 +106,8 @@ export function createPlanningFindExistingRun(opts: {
     const mapping = requireMapping(opts.getMapping, input.teamKey);
     const title = `${PLANNING_RUN_TITLE_PREFIX}${input.issueIdentifier}`;
     const floor = Math.floor(dispatchedAt / 1000) * 1000;
-    const res = await fetch(
-      `https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.planningWorkflowFile}/runs?event=workflow_dispatch&per_page=20`,
-      {
-        headers: { Authorization: `Bearer ${await opts.getToken(mapping.owner)}`, Accept: "application/vnd.github+json" },
-        signal: defaultFetchSignal(),
-      },
-    );
-    if (!res.ok) throw new Error(`findExistingRun: workflow runs lookup answered HTTP ${res.status}`);
-    const data = (await res.json()) as { workflow_runs: Array<{ id: number; created_at?: string; display_title?: string }> };
-    const match = data.workflow_runs.find(
+    const runs = await listWorkflowDispatchRuns(await opts.getToken(mapping.owner), mapping.owner, mapping.repo, mapping.planningWorkflowFile);
+    const match = runs.find(
       (r) => r.display_title === title && r.created_at !== undefined && Date.parse(r.created_at) >= floor,
     );
     return match ? String(match.id) : null;

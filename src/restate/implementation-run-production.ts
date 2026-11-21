@@ -22,7 +22,7 @@ import type { AppConfig } from "../index.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
 import { getFlyProcessLevelSecrets, getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
-import { APP_TOKEN_STEP, cancelWorkflowRun, defaultFetchSignal, getFailedRunStepJob, getPullRequestState, getWorkflowRunStatus } from "../github.js";
+import { APP_TOKEN_STEP, cancelWorkflowRun, getFailedRunStepJob, getPullRequestState, getWorkflowRunStatus, listWorkflowDispatchRuns } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import {
   appendLogIfAbsent,
@@ -161,7 +161,7 @@ export function implementationLocalContainerName(dispatchId: string): string {
   return `ai-implement-dispatch-${createHash("sha256").update(dispatchId).digest("hex")}`;
 }
 
-/** A null lookup requires a successful backend read; failures propagate. */
+/** A null lookup requires a successful backend read, or GitHub's 404 for the workflow (`listWorkflowDispatchRuns`); other failures propagate. */
 export function createImplementationFindExistingRun(opts: {
   getMapping: (teamKey: string) => RepoMapping | undefined;
   getToken: (owner: string) => Promise<string>;
@@ -183,17 +183,9 @@ export function createImplementationFindExistingRun(opts: {
     if (recorded?.runId) return String(recorded.runId);
     const mapping = requireMapping(opts.getMapping, input.teamKey);
     const title = `${IMPLEMENTATION_RUN_TITLE_PREFIX}${input.issueIdentifier}`;
-    const res = await fetch(
-      `https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs?event=workflow_dispatch&per_page=20`,
-      {
-        headers: { Authorization: `Bearer ${await opts.getToken(mapping.owner)}`, Accept: "application/vnd.github+json" },
-        signal: defaultFetchSignal(),
-      },
-    );
-    if (!res.ok) throw new Error(`findExistingRun: workflow runs lookup answered HTTP ${res.status}`);
-    const data = (await res.json()) as { workflow_runs: Array<{ id: number; created_at?: string; display_title?: string }> };
+    const runs = await listWorkflowDispatchRuns(await opts.getToken(mapping.owner), mapping.owner, mapping.repo, mapping.workflowFile);
     const claimed = getClaimedRunIds();
-    const match = data.workflow_runs.find(
+    const match = runs.find(
       (r) => r.display_title === title && r.created_at !== undefined && Date.parse(r.created_at) >= floor && !claimed.has(r.id),
     );
     return match ? String(match.id) : null;
