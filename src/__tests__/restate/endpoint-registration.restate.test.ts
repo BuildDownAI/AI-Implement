@@ -1,19 +1,25 @@
-// Restate scenario for the AII-721 drain check: `queryNonCompletedInvocations()`
-// (src/restate/endpoint.ts) against a real 1.7.10 admin API. Nothing under
-// src/restate/ or docs/restate-*.md queried invocations by deployment before this issue —
-// the exact route (`POST /query`), the header that selects JSON over Arrow IPC, and
-// whether persistent Virtual Object state leaks into the count were all unknowns the unit
-// tier (src/__tests__/restate-endpoint.test.ts) can only fake. This file is where those
-// unknowns get proven against the real server; the META0004/zero/nonzero/unknown decision
-// tree in register() itself stays a unit test.
+// Restate scenarios for registration helpers in src/restate/endpoint.ts against a real
+// 1.7.10 admin API. The first block covers the AII-721 drain check:
+// `queryNonCompletedInvocations()` — the exact route (`POST /query`), the header that
+// selects JSON over Arrow IPC, and whether persistent Virtual Object state leaks into the
+// count were all unknowns the unit tier (src/__tests__/restate-endpoint.test.ts) can only
+// fake; the META0004/zero/nonzero/unknown decision tree in register() itself stays a unit
+// test. The last block covers AII-2046's runner deployment registration and removal:
+// one-attempt success, META0003 unreachable, forced idempotent deletion, and other
+// refusals including non-JSON bodies.
 //
 // Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import { randomUUID } from "node:crypto";
+import * as http2 from "node:http2";
+import * as net from "node:net";
 import * as restate from "@restatedev/restate-sdk";
+import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
+import { queryNonCompletedInvocations, registerRunnerDeployment, removeDeployment } from "../../restate/endpoint.js";
 import { operatorObject } from "../../restate/operator-object.js";
+import { fakeFetch } from "../helpers/fake-fetch.js";
+import { startBinaryEnvironment } from "./binary-environment.js";
 import { VARIANTS, callObject, eventually, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 // An exclusive handler held on an awakeable leaves a second handler on the same key
@@ -197,4 +203,159 @@ describe("queryNonCompletedInvocations ignores a scheduled call that has not sta
       expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(1);
     },
   );
+});
+
+// A runner endpoint on its own port, outside the shared harness: `registerRunnerDeployment()`
+// and `removeDeployment()` register and remove a deployment the caller built, not the harness's
+// own endpoint. Restate holds HTTP/2 sessions open, so the test mirrors binary-environment.ts's
+// session cleanup rather than leaving teardown waiting on one.
+const runnerDeploymentProbe = restate.service({
+  name: "RunnerDeploymentProbe",
+  handlers: { ping: async (_ctx: restate.Context) => "pong" },
+});
+
+interface AdminDeployment {
+  id: string;
+  uri?: string;
+  services: Array<{ name: string }>;
+}
+
+async function adminDeployments(adminBaseUrl: string): Promise<AdminDeployment[]> {
+  const response = await fetch(`${adminBaseUrl}/deployments`);
+  if (!response.ok) throw new Error(`GET /deployments failed: HTTP ${response.status}`);
+  return ((await response.json()) as { deployments: AdminDeployment[] }).deployments;
+}
+
+async function unusedLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as net.AddressInfo;
+      server.close((error) => (error ? reject(error) : resolve(port)));
+    });
+  });
+}
+
+describe("runner deployment registration and removal against a real 1.7.10 admin API", () => {
+  let env: RestateEnvironment;
+  let runnerEndpoint: http2.Http2Server;
+  let runnerEndpointSessions: Set<http2.ServerHttp2Session>;
+  let runnerEndpointPort: number;
+  let deploymentId: string;
+
+  beforeAll(async () => {
+    env = await startBinaryEnvironment({ services: [drainProbe] });
+    runnerEndpoint = http2.createServer(createEndpointHandler({ services: [runnerDeploymentProbe] }));
+    runnerEndpointSessions = new Set();
+    runnerEndpoint.on("session", (session) => {
+      runnerEndpointSessions.add(session);
+      session.once("close", () => runnerEndpointSessions.delete(session));
+    });
+    await new Promise<void>((resolve, reject) => {
+      runnerEndpoint.once("error", reject);
+      runnerEndpoint.listen(0, "127.0.0.1", resolve);
+    });
+    runnerEndpointPort = (runnerEndpoint.address() as net.AddressInfo).port;
+  }, 60_000);
+
+  afterAll(async () => {
+    if (runnerEndpoint) {
+      await new Promise<void>((resolve) => {
+        runnerEndpoint.close(() => resolve());
+        for (const session of runnerEndpointSessions) session.destroy();
+      });
+    }
+    await env?.stop();
+  });
+
+  it("registers a listening runner endpoint in one attempt and exposes its service", async () => {
+    let posts = 0;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method === "POST" && new URL(request.url).pathname === "/deployments") posts++;
+      return fetch(input, init);
+    };
+    const uri = `http://127.0.0.1:${runnerEndpointPort}`;
+
+    const result = await registerRunnerDeployment(uri, { adminBaseUrl: env.adminAPIBaseUrl(), fetchImpl });
+
+    expect(result).toEqual({ ok: true, deploymentId: expect.stringMatching(/^dp_/) });
+    if (!result.ok) throw new Error("registration unexpectedly failed");
+    deploymentId = result.deploymentId;
+    expect(posts).toBe(1);
+
+    const deployment = (await adminDeployments(env.adminAPIBaseUrl())).find((entry) => entry.id === deploymentId);
+    expect(deployment?.uri?.replace(/\/+$/, "")).toBe(uri);
+    expect(deployment?.services.map((service) => service.name)).toContain(runnerDeploymentProbe.name);
+
+    const response = await fetch(`${env.adminAPIBaseUrl()}/services/${runnerDeploymentProbe.name}`);
+    expect(response.ok).toBe(true);
+    expect((await response.json()) as { deployment_id: string }).toMatchObject({ deployment_id: deploymentId });
+  });
+
+  it("classifies a port with no listener as unreachable after one attempt and registers nothing", async () => {
+    const before = (await adminDeployments(env.adminAPIBaseUrl())).map((entry) => entry.id).sort();
+    const port = await unusedLoopbackPort();
+    let posts = 0;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method === "POST" && new URL(request.url).pathname === "/deployments") posts++;
+      return fetch(input, init);
+    };
+
+    const result = await registerRunnerDeployment(`http://127.0.0.1:${port}`, {
+      adminBaseUrl: env.adminAPIBaseUrl(),
+      fetchImpl,
+    });
+
+    expect(result).toEqual({ ok: false, reason: "unreachable" });
+    expect(posts).toBe(1);
+    expect((await adminDeployments(env.adminAPIBaseUrl())).map((entry) => entry.id).sort()).toEqual(before);
+  });
+
+  it("forces removal and treats a second removal's 404 as success", async () => {
+    const calls: Array<{ method: string; url: string }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      calls.push({ method: request.method, url: request.url });
+      return fetch(input, init);
+    };
+
+    await removeDeployment(deploymentId, { adminBaseUrl: env.adminAPIBaseUrl(), fetchImpl });
+    expect(calls[0]).toEqual({
+      method: "DELETE",
+      url: `${env.adminAPIBaseUrl()}/deployments/${deploymentId}?force=true`,
+    });
+    expect((await adminDeployments(env.adminAPIBaseUrl())).some((entry) => entry.id === deploymentId)).toBe(false);
+
+    await expect(
+      removeDeployment(deploymentId, { adminBaseUrl: env.adminAPIBaseUrl(), fetchImpl }),
+    ).resolves.toBeUndefined();
+    expect(calls).toHaveLength(2);
+    expect(new URL(calls[1].url).searchParams.get("force")).toBe("true");
+  });
+
+  it("rejects other refusals with their status, including a non-JSON response", async () => {
+    const fake = fakeFetch({
+      "POST /deployments": [
+        { status: 500, json: { message: "internal error" } },
+        { status: 403, text: "denied" },
+      ],
+      "DELETE /deployments/dp_other": { status: 501, text: "not implemented" },
+    });
+    const deps = { adminBaseUrl: "http://admin.test", fetchImpl: fake.fetch };
+
+    await expect(registerRunnerDeployment("http://127.0.0.1:1", deps)).resolves.toEqual({
+      ok: false,
+      reason: "rejected",
+      status: 500,
+    });
+    await expect(registerRunnerDeployment("http://127.0.0.1:2", deps)).resolves.toEqual({
+      ok: false,
+      reason: "rejected",
+      status: 403,
+    });
+    await expect(removeDeployment("dp_other", deps)).rejects.toThrow("HTTP 501");
+  });
 });
