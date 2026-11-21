@@ -19,7 +19,16 @@ import os from "node:os";
 import path from "node:path";
 import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
+import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } from "@restatedev/restate-sdk";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { toRecordedUsage } from "../../agent-usage.js";
+import { getDb } from "../../dedup.js";
+import { listJobAccounting } from "../../job-accounting.js";
+import { initLogTable } from "../../log.js";
+import { recordInvocation } from "../../pipeline/job-accounting.js";
+import type { InvocationRecordV1 } from "../../pipeline/types.js";
+import { createImplementationRunWorkflow, type ImplementationRunDependencies } from "../../restate/implementation-run-workflow.js";
+import { initSettingsTable } from "../../runner-mode.js";
 import {
   RUNNER_IDENTITY_KEY_ENV,
   RUNNER_ID_ENV,
@@ -31,6 +40,7 @@ import type { RunAutonomousResult } from "../../run-autonomous.js";
 import {
   VARIANTS,
   callService,
+  callWorkflow,
   eventually,
   gate,
   journalEntries,
@@ -58,11 +68,14 @@ interface RunnerEndpoint {
   close(): Promise<void>;
 }
 
+type DeploymentService = ServiceDefinition<string, unknown> | VirtualObjectDefinition<string, unknown> | WorkflowDefinition<string, unknown>;
+
 interface FakeRunState {
   starts: number;
   gate: Gate<void>;
   result: RunAutonomousResult;
   failure?: string;
+  script?: () => void | Promise<void>;
 }
 
 function fakeState(result: RunAutonomousResult = { exitCode: 0 }, failure?: string): FakeRunState {
@@ -72,6 +85,7 @@ function fakeState(result: RunAutonomousResult = { exitCode: 0 }, failure?: stri
 function fakePipeline(state: FakeRunState): () => Promise<RunAutonomousResult> {
   return async () => {
     state.starts++;
+    await state.script?.();
     await state.gate.wait();
     if (state.failure) throw new Error(state.failure);
     return state.result;
@@ -122,10 +136,13 @@ async function registerDeployment(env: RestateEnvironment, uri: string, label: s
 }
 
 /** Registers one runner service at a fresh loopback port with the variant's request-identity key. */
-async function registerRunner(env: RestateEnvironment, service: restate.ServiceDefinition<string, unknown>): Promise<RunnerEndpoint> {
+async function registerRunner(env: RestateEnvironment, services: DeploymentService | DeploymentService[]): Promise<RunnerEndpoint> {
   const identityKey = env.identityKey();
   if (!identityKey) throw new Error("the variant was not started with requestIdentity");
-  const server = http2.createServer(createEndpointHandler({ services: [service], identityKeys: [identityKey] }));
+  const server = http2.createServer(createEndpointHandler({
+    services: Array.isArray(services) ? services : [services],
+    identityKeys: [identityKey],
+  }));
   const sessions = new Set<http2.ServerHttp2Session>();
   server.on("session", (session) => {
     sessions.add(session);
@@ -303,6 +320,8 @@ let envs: Map<string, RestateEnvironment>;
 const endpoints: RunnerEndpoint[] = [];
 
 beforeAll(async () => {
+  initLogTable();
+  initSettingsTable();
   envs = await startVariants([placeholder], {
     requestIdentity: true,
     invokerTimeouts: { inactivity: "2s", abort: "2s" },
@@ -316,6 +335,71 @@ afterAll(async () => {
 afterEach(async () => {
   await Promise.all(endpoints.splice(0).map((endpoint) => endpoint.close()));
 });
+
+/** A stored snapshot is required before `recordUsage` can write attribution rows. */
+function seedImplementationSnapshot(dispatchId: string): string {
+  const snapshotId = `snapshot-${dispatchId}`;
+  const selection = { agent: "claude", provider: "anthropic", model: "claude-model", accountProfileId: "implementation-profile", invocationTimeoutMs: 60_000 };
+  const profile = { id: "implementation-profile", identity: "account", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
+  getDb().prepare(`INSERT OR IGNORE INTO run_agent_config_snapshots
+    (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+    VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snapshotId, dispatchId,
+      JSON.stringify({ stages: { planning: selection, implementation: selection, review: selection }, profiles: { planning: profile, implementation: profile, review: profile } }),
+      JSON.stringify(Object.fromEntries(["planning", "implementation", "review"].map((stage) => [stage, Object.fromEntries(Object.keys(selection).map((field) => [field, "project"]))]))),
+      JSON.stringify({ orchestratorDefault: { configRevisionId: "r1", revision: 1 }, project: { configRevisionId: "r2", revision: 1 } }));
+  return snapshotId;
+}
+
+function invocationRecord(dispatchId: string, snapshotId: string, index: number, tokensIn = 10 + index, tokensOut = 2): InvocationRecordV1 {
+  return {
+    attribution: {
+      version: 1,
+      invocationId: `${dispatchId}-call-${index}`,
+      snapshotId,
+      stage: "implementation",
+      agent: "claude",
+      provider: "anthropic",
+      model: "claude-model",
+      profileId: "implementation-profile",
+      authMode: "anthropic-api-key",
+      limit: null,
+      outcome: "success",
+      usage: { availability: "complete", tokensIn, tokensOut, costUsd: 0.01, costStatus: "reported" },
+    },
+    cacheReadTokens: 3,
+    cacheCreationTokens: 4,
+    attempts: 1,
+  };
+}
+
+function storedInvocations(dispatchId: string): Array<{ invocation_id: string; usage_json: string }> {
+  return getDb().prepare("SELECT invocation_id, usage_json FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id")
+    .all(dispatchId) as Array<{ invocation_id: string; usage_json: string }>;
+}
+
+/** `listJobAccounting` serves only finished dispatch_log rows with a dispatch id in the production format. */
+function seedFinishedDispatch(dispatchId: string): void {
+  const now = Date.now();
+  getDb().prepare(`INSERT INTO dispatch_log (issue_id, issue_identifier, dispatched_at, status, dispatch_id, completed_at)
+    VALUES (?, ?, ?, 'timed_out', ?, ?)`).run(`issue-${dispatchId}`, `ENG-${dispatchId.slice(0, 8)}`, now - 1_000, dispatchId, now);
+}
+
+/** The real workflow handler under test, with every launch-side dependency parked or inert. */
+function implementationWorkflow(seams: Partial<ImplementationRunDependencies> = {}): ReturnType<typeof createImplementationRunWorkflow> {
+  const parked = (): Promise<never> => new Promise(() => {});
+  return createImplementationRunWorkflow({
+    reserve: parked,
+    findExistingRun: async () => null,
+    launch: parked,
+    readStatus: async () => "unknown",
+    stop: async () => true,
+    finishJob: () => undefined,
+    cleanup: () => undefined,
+    onOutcome: () => undefined,
+    release: () => undefined,
+    ...seams,
+  });
+}
 
 describe("Runner_<runId> Restate service (AII-2034)", () => {
   it.each(VARIANTS)("a signed call to Runner_<runId>.run returns the fake pipeline result (%s)", async (label) => {
@@ -522,6 +606,123 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
     expect(decoded).not.toContain(tokenSecret);
     expect((await journalEntryNames(env.adminAPIBaseUrl(), String(invocation.id))).filter((name) => /^ev-/.test(name))).toEqual(["ev-0"]);
   });
+
+  it.each(VARIANTS)("stopping the runner after two calls keeps both rows and never marks the list complete (%s)", async (label) => {
+    const env = envs.get(label)!;
+    // A UUID matches the accounting read model's dispatch-id format, so the stopped dispatch can be read back below.
+    const dispatchId = randomUUID();
+    const snapshotId = seedImplementationSnapshot(dispatchId);
+    seedFinishedDispatch(dispatchId);
+    const state = fakeState({ exitCode: 0 });
+    state.script = () => {
+      recordInvocation(invocationRecord(dispatchId, snapshotId, 1));
+      recordInvocation(invocationRecord(dispatchId, snapshotId, 2));
+    };
+    const endpoint = await registerRunner(env, [
+      createRunnerService({ runId: dispatchId, runAutonomous: fakePipeline(state) }),
+      implementationWorkflow(),
+    ]);
+    endpoints.push(endpoint);
+    const pending = callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(dispatchId), "run", { workflowKey: dispatchId });
+    const rows = await eventually(() => storedInvocations(dispatchId), (found) => found.length === 2, { label: "two invocation rows" });
+    expect(rows.map((row) => JSON.parse(row.usage_json))).toEqual([
+      expect.objectContaining({ tokensIn: 11, tokensOut: 2 }),
+      expect.objectContaining({ tokensIn: 12, tokensOut: 2 }),
+    ]);
+    await endpoint.close();
+    endpoints.splice(endpoints.indexOf(endpoint), 1);
+    await expect(pending).rejects.toBeInstanceOf(Error);
+    expect(storedInvocations(dispatchId)).toHaveLength(2);
+    const report = getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId) as
+      | { invocations_complete: number }
+      | undefined;
+    expect(report?.invocations_complete ?? 0).toBe(0);
+    const accounting = listJobAccounting({ includeUnsettled: true }).records.find((record) => record.dispatchId === dispatchId);
+    expect(accounting?.usage).toBe("partial");
+  }, 60_000);
+
+  it.each(VARIANTS)("a server restart after two calls stores all four rows once and starts the pipeline once (%s)", async (label) => {
+    const env = envs.get(label)!;
+    const dispatchId = `runner-restart-${label}-${randomUUID()}`;
+    const snapshotId = seedImplementationSnapshot(dispatchId);
+    const state = fakeState({ exitCode: 0 });
+    const afterRestart = gate("after restart");
+    state.script = async () => {
+      recordInvocation(invocationRecord(dispatchId, snapshotId, 1));
+      recordInvocation(invocationRecord(dispatchId, snapshotId, 2));
+      await afterRestart.wait();
+      recordInvocation(invocationRecord(dispatchId, snapshotId, 3));
+      recordInvocation(invocationRecord(dispatchId, snapshotId, 4));
+    };
+    const endpoint = await registerRunner(env, [
+      createRunnerService({ runId: dispatchId, runAutonomous: fakePipeline(state) }),
+      implementationWorkflow(),
+    ]);
+    endpoints.push(endpoint);
+    // Restarting the server closes the ingress socket; the durable journal and the rows are what this proves.
+    const pending = callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(dispatchId), "run", { workflowKey: dispatchId }).catch((error: Error) => error);
+    await eventually(() => storedInvocations(dispatchId), (found) => found.length === 2, { label: "the first two invocation rows" });
+    await env.startedRestateServer.restart();
+    afterRestart.release();
+    state.gate.release();
+    await pending;
+    const rows = await eventually(() => storedInvocations(dispatchId), (found) => found.length === 4, { label: "all four invocation rows" });
+    expect(rows.map((row) => ({ invocationId: row.invocation_id, usage: JSON.parse(row.usage_json) }))).toEqual(
+      [1, 2, 3, 4].map((index) => ({
+        invocationId: `${dispatchId}-call-${index}`,
+        usage: expect.objectContaining({ tokensIn: 10 + index, tokensOut: 2, cacheReadTokens: 3, cacheCreationTokens: 4 }),
+      })),
+    );
+    expect(state.starts).toBe(1);
+    expect(getDb().prepare("SELECT COUNT(*) AS count FROM model_invocation_attribution WHERE dispatch_id = ?").get(dispatchId))
+      .toEqual({ count: 4 });
+  }, 90_000);
+
+  it.each(VARIANTS)("a full run and its final report store each invocation once (%s)", async (label) => {
+    const env = envs.get(label)!;
+    const dispatchId = `runner-full-${label}-${randomUUID()}`;
+    const snapshotId = seedImplementationSnapshot(dispatchId);
+    const records = [invocationRecord(dispatchId, snapshotId, 1), invocationRecord(dispatchId, snapshotId, 2)];
+    const state = fakeState({ exitCode: 0 });
+    state.script = () => { for (const record of records) recordInvocation(record); };
+    const providerKey = `sk-${randomUUID().replaceAll("-", "")}`;
+    const endpoint = await registerRunner(env, [
+      createRunnerService({ runId: dispatchId, runAutonomous: fakePipeline(state), env: { MODEL_API_KEY: providerKey } }),
+      implementationWorkflow({
+        reserve: () => true,
+        launch: async () => ({ outcome: "accepted", jobId: `job-${dispatchId}` }),
+        readStatus: async () => "ended",
+      }),
+    ]);
+    endpoints.push(endpoint);
+    const input = {
+      dispatchId, teamKey: "ENG", issueId: `issue-${dispatchId}`, issueIdentifier: "ENG-1",
+      launchContext: {}, maxJobMinutes: 90, backend: "github-actions" as const,
+    };
+    expect(await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "run", input)).toEqual({ reason: "finalized" });
+    state.gate.release();
+    expect(await callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(dispatchId), "run", { workflowKey: dispatchId }))
+      .toEqual({ exitCode: 0 });
+    await eventually(() => storedInvocations(dispatchId), (found) => found.length === 2, { label: "two invocation rows" });
+    await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report", {
+      usage: toRecordedUsage({ invocations: records }),
+    });
+    expect(storedInvocations(dispatchId)).toHaveLength(2);
+    expect(getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId))
+      .toEqual({ invocations_complete: 1 });
+
+    // The one-way sends and the workflow's write contain accounting fields only: no provider key, prompt or output.
+    const invocations = await queryInvocations(
+      env.adminAPIBaseUrl(),
+      `(target_service_name = '${runnerServiceName(dispatchId)}' AND target_handler_name = 'run') OR (target_service_name = 'ImplementationRun' AND target_service_key = '${dispatchId}')`,
+    );
+    const text = (await Promise.all(invocations.map(async (row) => journalText(await journalEntries(env.adminAPIBaseUrl(), String(row.id)))))).join("\n");
+    expect(text).toContain(`${dispatchId}-call-1`);
+    expect(text).toContain('"tokensIn":11');
+    expect(text).not.toContain(providerKey);
+    expect(text).not.toContain("prompt");
+    expect(text).not.toContain("modelOutput");
+  }, 60_000);
 });
 
 describe("runner-service process entry (AII-2034)", () => {

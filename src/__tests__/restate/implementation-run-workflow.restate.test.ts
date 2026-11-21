@@ -547,6 +547,23 @@ describe("ImplementationRun durable workflow", () => {
     expect(w.sc.finishCalls).toEqual([{ kind: "run_ended" }]);
   }, 60_000);
 
+  it.each(labels)("recordInvocation stores each sent call once and never marks the list complete (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started" });
+    await waitForStep(w.read, "wait");
+    const record = seedUsage(w.dispatchId, 12, 1, [1]).records[0];
+    const send = () => callWorkflow(baseUrl(slow, label), "ImplementationRun", w.dispatchId, "recordInvocation", record);
+    await send();
+    await eventually(() => storedRows(w.dispatchId), (rows) => rows.length === 1, { label: "the first invocation row" });
+    await send();
+    expect(storedRows(w.dispatchId)).toHaveLength(1);
+    const report = getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?")
+      .get(w.dispatchId) as { invocations_complete: number } | undefined;
+    expect(report?.invocations_complete ?? 0).toBe(0);
+
+    w.sc.status = "ended";
+    await w.done;
+  }, 60_000);
+
   it.each(labels)("ended with no report finishes the job and releases one time each (%s)", async (label) => {
     const w = begin(slow, label);
     await waitForStep(w.read, "wait");
