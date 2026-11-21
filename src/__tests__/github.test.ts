@@ -1,5 +1,5 @@
 import { describe, it, expect, onTestFinished, vi } from "vitest";
-import { listAllOpenPullRequests, dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedRunStepJob, CONTAINER_INIT_STEP, APP_TOKEN_STEP, readPublicRepository, readRepositoryFacts } from "../github.js";
+import { listAllOpenPullRequests, dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedRunStepJob, CONTAINER_INIT_STEP, APP_TOKEN_STEP, readPublicRepository, readRepositoryFacts, listWorkflowDispatchRuns } from "../github.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { decodeRunConfig } from "../run-config.js";
@@ -1523,5 +1523,28 @@ describe("listAllOpenPullRequests", () => {
   it("accepts an epoch-zero creation date", async () => {
     fakeFetch({ [PULLS]: { json: [pull(1, false, "1970-01-01T00:00:00Z")] } }).install();
     expect((await listAllOpenPullRequests("t", "owner", "repo"))[0].createdAt).toBe(0);
+  });
+});
+
+describe("listWorkflowDispatchRuns", () => {
+  const RUNS = "GET /repos/owner/repo/actions/workflows/claude-plan.yml/runs" as const;
+
+  it("answers the workflow's runs started by workflow_dispatch, newest first", async () => {
+    const runs = [{ id: 2, display_title: "b", created_at: "2026-11-20T00:00:02Z" }, { id: 1, display_title: "a", created_at: "2026-11-20T00:00:01Z" }];
+    const fake = fakeFetch({ [RUNS]: { json: { workflow_runs: runs } } }).install();
+    expect(await listWorkflowDispatchRuns("t", "owner", "repo", "claude-plan.yml")).toEqual(runs);
+    expect(fake.calls[0].url.searchParams.get("event")).toBe("workflow_dispatch");
+  });
+
+  // A workflow GitHub does not have, or a repository this token cannot see: either way it has no run of it.
+  it("answers no runs for a 404", async () => {
+    fakeFetch({ [RUNS]: { status: 404, json: { message: "Not Found" } } }).install();
+    expect(await listWorkflowDispatchRuns("t", "owner", "repo", "claude-plan.yml")).toEqual([]);
+  });
+
+  // A rate limit answers 403 or 429, and any other failure leaves the runs unknown.
+  it.each([403, 429, 500, 502])("throws on HTTP %i", async (status) => {
+    fakeFetch({ [RUNS]: { status, text: "boom" } }).install();
+    await expect(listWorkflowDispatchRuns("t", "owner", "repo", "claude-plan.yml")).rejects.toThrow(`HTTP ${status}`);
   });
 });

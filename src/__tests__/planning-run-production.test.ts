@@ -111,9 +111,16 @@ describe("findExistingRun", () => {
     expect(await find(INPUT, DISPATCHED_AT)).toBeNull();
   });
 
-  it("throws on an HTTP error rather than answering null", async () => {
-    githubRuns([], 502);
-    await expect(find(INPUT, DISPATCHED_AT)).rejects.toThrow(/HTTP 502/);
+  // GitHub has no such workflow, or none this token can see, so it has no run of it: the launch's own 404 is reached.
+  it("answers null when GitHub answers 404 for the workflow", async () => {
+    githubRuns([], 404);
+    expect(await find(INPUT, DISPATCHED_AT)).toBeNull();
+  });
+
+  // Any other failure leaves an earlier dispatch possible, and a rate limit answers 403 or 429.
+  it.each([403, 429, 502])("throws on HTTP %i rather than answering null", async (status) => {
+    githubRuns([], status);
+    await expect(find(INPUT, DISPATCHED_AT)).rejects.toThrow(`HTTP ${status}`);
   });
 
   it.each(["fly-machines", "local-docker"] as const)("%s returns the machine id on the dispatch row, or null when the name lookup finds nothing", async (backend) => {
