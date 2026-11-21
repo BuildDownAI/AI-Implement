@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi, onTestFinished } from "vitest";
-import { resolveExecutionPath, resolvePlanningExecutionPath } from "../runner-mode.js";
+import { resolveExecutionPath, resolveExecutionBackend } from "../runner-mode.js";
 import type * as DedupModule from "../dedup.js";
 import type * as GateModule from "../dispatch-gate.js";
 import type { TicketingProvider } from "../providers/types.js";
@@ -199,54 +199,54 @@ describe("resolveExecutionPath", () => {
   });
 });
 
-describe("resolvePlanningExecutionPath", () => {
+describe("resolveExecutionBackend", () => {
   describe("shadow mode — collapses to GHA-only (no double-posting Linear comments)", () => {
     it("returns github-actions for shadow + github-actions mapping", () => {
-      expect(resolvePlanningExecutionPath("shadow", "github-actions")).toBe("github-actions");
+      expect(resolveExecutionBackend("shadow", "github-actions")).toBe("github-actions");
     });
 
     it("returns github-actions for shadow + fly-machines mapping", () => {
-      expect(resolvePlanningExecutionPath("shadow", "fly-machines")).toBe("github-actions");
+      expect(resolveExecutionBackend("shadow", "fly-machines")).toBe("github-actions");
     });
   });
 
   describe("gha override", () => {
     it("returns github-actions for gha + github-actions mapping", () => {
-      expect(resolvePlanningExecutionPath("gha", "github-actions")).toBe("github-actions");
+      expect(resolveExecutionBackend("gha", "github-actions")).toBe("github-actions");
     });
 
     it("returns github-actions for gha + fly-machines mapping (override)", () => {
-      expect(resolvePlanningExecutionPath("gha", "fly-machines")).toBe("github-actions");
+      expect(resolveExecutionBackend("gha", "fly-machines")).toBe("github-actions");
     });
   });
 
   describe("fly override", () => {
     it("returns fly-machines for fly + github-actions mapping (override)", () => {
-      expect(resolvePlanningExecutionPath("fly", "github-actions")).toBe("fly-machines");
+      expect(resolveExecutionBackend("fly", "github-actions")).toBe("fly-machines");
     });
 
     it("returns fly-machines for fly + fly-machines mapping", () => {
-      expect(resolvePlanningExecutionPath("fly", "fly-machines")).toBe("fly-machines");
+      expect(resolveExecutionBackend("fly", "fly-machines")).toBe("fly-machines");
     });
   });
 
   describe("local override", () => {
     it("returns local-docker for local + github-actions mapping", () => {
-      expect(resolvePlanningExecutionPath("local", "github-actions")).toBe("local-docker");
+      expect(resolveExecutionBackend("local", "github-actions")).toBe("local-docker");
     });
 
     it("returns local-docker for local + fly-machines mapping", () => {
-      expect(resolvePlanningExecutionPath("local", "fly-machines")).toBe("local-docker");
+      expect(resolveExecutionBackend("local", "fly-machines")).toBe("local-docker");
     });
   });
 
   describe("default mode — respects per-team executionMode", () => {
     it("returns github-actions when mapping is github-actions", () => {
-      expect(resolvePlanningExecutionPath("default", "github-actions")).toBe("github-actions");
+      expect(resolveExecutionBackend("default", "github-actions")).toBe("github-actions");
     });
 
     it("returns fly-machines when mapping is fly-machines", () => {
-      expect(resolvePlanningExecutionPath("default", "fly-machines")).toBe("fly-machines");
+      expect(resolveExecutionBackend("default", "fly-machines")).toBe("fly-machines");
     });
   });
 });
@@ -601,8 +601,8 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     flySessionsApp: "fly-app",
   });
 
-  const planningCtx = (execPath: "fly-machines" | "local-docker") => ({
-    execPath,
+  const planningCtx = (backend: "fly-machines" | "local-docker") => ({
+    backend,
     runnerMode: "default",
     resolvedPlanningBranch: mapping.defaultBranch,
     planningFieldValue: null,
@@ -974,14 +974,14 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
   const provider = makeProvider();
 
   const planningCtx = {
-    execPath: "github-actions" as const,
+    backend: "github-actions" as const,
     runnerMode: "default",
     resolvedPlanningBranch: mapping.defaultBranch,
     planningFieldValue: null,
   };
 
   const localPlanningCtx = {
-    execPath: "local-docker" as const,
+    backend: "local-docker" as const,
     runnerMode: "default",
     resolvedPlanningBranch: mapping.defaultBranch,
     planningFieldValue: null,
@@ -1161,6 +1161,17 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
       expect(send.mock.calls).toEqual([[{ id: "callback.config", cause: "planning-refused" }]]);
       expect(error).toHaveBeenCalledWith(expect.stringMatching(/^\[poll\] Refusing to dispatch planning for AII-934: .*callback\.config/));
     });
+  });
+
+  // The context's backend is the one dispatchPlanning submits, so a forced runner mode reaches planning only through it.
+  it.each([
+    ["local", "github-actions", "local-docker"],
+    ["shadow", "fly-machines", "github-actions"],
+  ] as const)("under runner mode %s, sends a %s project's planning to %s", async (runnerMode, executionMode, backend) => {
+    (await import("../runner-mode.js")).setRunnerMode(runnerMode);
+    const flatIssue = makeIssue({ identifier: "AII-935", scopeKey: "AII", nativeStatus: "Ready" });
+    const ctx = await indexModule.preparePlanningDispatch(config, provider, flatIssue, { ...mapping, executionMode });
+    expect(ctx?.backend).toBe(backend);
   });
 
   it("no chain and no field: resolves to the default branch, unchanged", async () => {
@@ -1429,8 +1440,8 @@ describe("dispatchPlanning — PlanningRun for every project", () => {
   const legacyMapping = jiraMapping("AII", { reviewFixLifecycle: "legacy", planningEnabled: true });
   const provider = jiraProvider();
   const config = makeAppConfig(CALLBACK_CONFIG);
-  const ctxFor = (execPath: "github-actions" | "fly-machines" | "local-docker") => ({
-    execPath, runnerMode: "default", resolvedPlanningBranch: "release/1.0", planningFieldValue: "release/1.0",
+  const ctxFor = (backend: "github-actions" | "fly-machines" | "local-docker") => ({
+    backend, runnerMode: "default", resolvedPlanningBranch: "release/1.0", planningFieldValue: "release/1.0",
   });
   const backends = ["github-actions", "fly-machines", "local-docker"] as const;
   const cases = backends.flatMap((backend) => [null, "legacy", "restate"].map((reviewFixLifecycle) => ({ backend, reviewFixLifecycle: reviewFixLifecycle as RepoMapping["reviewFixLifecycle"] })));
@@ -1535,9 +1546,9 @@ describe("dispatchPlanning — PlanningRun for every project", () => {
 
   it.each(["github-actions", "fly-machines"] as const)("shadow resolves %s to GitHub Actions", async (executionMode) => {
     const mapping = { ...legacyMapping, executionMode };
-    const execPath = resolvePlanningExecutionPath("shadow", executionMode);
-    expect(execPath).toBe("github-actions");
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, { ...ctxFor(execPath), runnerMode: "shadow" });
+    const backend = resolveExecutionBackend("shadow", executionMode);
+    expect(backend).toBe("github-actions");
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, { ...ctxFor(backend), runnerMode: "shadow" });
     expect(planningIngress.submit).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ backend: "github-actions" }));
     expect(activeRows()).toEqual([]);
   });
@@ -1547,7 +1558,7 @@ describe("dispatchPlanning — PlanningRun for every project", () => {
 describe("poll implementation submission — ImplementationRun for every project", () => {
   const issue = makeIssue({ identifier: "AII-1555", scopeKey: "AII" });
   const config = makeAppConfig({ ...CALLBACK_CONFIG, runnerTokenSecret: "TOKEN_SENTINEL" });
-  const ctx = { execPath: "github-actions" as const, runnerMode: "default", baseBranch: "feature/group", baseBranchFieldValue: null as string | null };
+  const ctx = { backend: "github-actions" as const, runnerMode: "default", baseBranch: "feature/group", baseBranchFieldValue: null as string | null };
   // What every poll cycle reads from Restate before its own work: the runner backend cache, and the stored setup-check run until one read answers.
   const POLL_CYCLE_ROUTES = { "POST /RunnerBackend/fly-machines/get": { json: {} }, "POST /SetupChecks/orchestrator/get": { json: null } } as const;
   let indexModule: typeof import("../index.js");
@@ -1566,27 +1577,27 @@ describe("poll implementation submission — ImplementationRun for every project
   });
   afterEach(() => status.resetRestateStatus());
 
-  it.each(["github-actions", "fly-machines", "local-docker"] as const)("freezes a grouping parent's classification for %s", async (execPath) => {
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("freezes a grouping parent's classification for %s", async (backend) => {
     const parent = { ...issue, featureBranchChain: [{ identifier: issue.identifier, mode: "feature" as const }] };
-    await indexModule.submitImplementationRun(config, parent, jiraMapping("AII"), { ...ctx, execPath });
+    await indexModule.submitImplementationRun(config, parent, jiraMapping("AII"), { ...ctx, backend });
     expect(implementationIngress.submit.mock.calls[0]![1].launchContext.groupingParent).toBe("true");
   });
 
   it.each([null, { implementation: "requested" }])("carries explicit model selection into reservation preflight", async issueModels => {
-    await indexModule.submitImplementationRun(config, { ...issue, issueModels }, jiraMapping("AII"), { ...ctx, execPath: "local-docker" });
+    await indexModule.submitImplementationRun(config, { ...issue, issueModels }, jiraMapping("AII"), { ...ctx, backend: "local-docker" });
     expect(implementationIngress.submit.mock.calls[0]![1].launchContext.hasIssueModels).toBe("true");
   });
 
-  it.each(["github-actions", "fly-machines", "local-docker", "both"] as const)("submits %s with a schema-valid credential-free input", async (execPath) => {
+  // Shadow reaches here already resolved to GitHub Actions (resolveExecutionBackend, above), since the field takes only a backend.
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("submits %s with a schema-valid credential-free input", async (backend) => {
     const { implementationRunInputSchema } = await import("../restate/implementation-run-workflow.js");
     const { normalizeGithubActionsJobTimeoutMinutes } = await import("../github-actions-watchdog.js");
     const mapping = jiraMapping("AII", { maxJobMinutes: 42 });
     const log = vi.spyOn(console, "log");
-    await indexModule.submitImplementationRun(config, issue, mapping, { ...ctx, execPath });
+    await indexModule.submitImplementationRun(config, issue, mapping, { ...ctx, backend });
     const [key, input] = implementationIngress.submit.mock.calls[0];
     expect(implementationRunInputSchema.parse(input)).toEqual(input);
     expect(key).toMatch(/^[0-9a-f-]{36}$/);
-    const backend = execPath === "both" ? "github-actions" : execPath;
     expect(input).toEqual({ dispatchId: key, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier,
       backend, maxJobMinutes: normalizeGithubActionsJobTimeoutMinutes(42),
       launchContext: { baseBranch: "feature/group", runnerMode: "default", groupingParent: "false" } });

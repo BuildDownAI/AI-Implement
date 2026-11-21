@@ -6,10 +6,9 @@
 
 import { createHash } from "node:crypto";
 import { getDb } from "../dedup.js";
-import { LINEAR_PICKUP_LABEL_KEY } from "../orchestrator-settings.js";
-import { FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, RUNNER_MODE_SETTING_KEY } from "../runner-mode.js";
-import { SEED_ONCE_SETTINGS } from "../seed-once-settings.js";
-import type { GitHubSetupFacts, SetupCheckContext } from "./contract.js";
+import { KG_BASE_REPO_KEY, LINEAR_PICKUP_LABEL_KEY } from "../orchestrator-settings.js";
+import type { GitHubSetupReader, SetupCheck, SetupCheckContext, SetupCheckReader } from "./contract.js";
+import { SETUP_CHECKS } from "./index.js";
 
 // The setup checks' time in this module. The recheck hold is in index.ts, the ingress bounds in src/restate/setup-checks.ts, the Setup page's polls in its own module.
 /** The least time between two runs of one kind, so a burst of saves is checked once it settles, and the last save is always checked. */
@@ -20,96 +19,148 @@ export type SetupCheckRunKind = { kind: "full" } | { kind: "orchestrator-wide" }
 
 /**
  * The setup that saves change, as the checks read it from this orchestrator's own state, split by which checks read each part,
- * so a change names the run it needs. Nothing the orchestrator writes for itself is in it, so two cycles with nothing saved between them match.
+ * so a change names the run it needs. Which part a source lands in comes from the checks' declarations, never from a hand-placed list.
+ * Nothing the orchestrator writes for itself is in it, so two cycles with nothing saved between them match.
  */
 export interface SavedSetup {
-  /** Each project's saved mapping, and its workflow sync's id and state, which that project's own checks read. */
-  perProject: Record<string, { mapping: string; sync: string }>;
-  /** What only the orchestrator-wide checks read. */
+  /** Each project's own saved sources: what that project's checks read of them, and what the orchestrator-wide checks read of them. */
+  perProject: Record<string, { projectChecks: string; orchestratorWideChecks: string }>;
+  /** The other sources that only orchestrator-wide checks read. */
   orchestratorWide: string;
-  /** What reaches checks of both kinds: the runner mode, and the pickup label each Linear project's checks judge. */
+  /** The other sources that a per-project check reads, so a change to them reaches every project. */
   allChecks: string;
 }
 
-/** The settings rows the checks read: each seed-once row, and the two runner rows a variable can override. */
-export const SAVED_SETUP_SETTINGS: readonly string[] = [...SEED_ONCE_SETTINGS.map((setting) => setting.key), RUNNER_MODE_SETTING_KEY, FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY];
-
-export function readSavedSetup(ctx: SetupCheckContext): SavedSetup {
-  const mappings = ctx.mappings();
-  const sync = ctx.githubSetupFacts().workflowSync;
-  const perProject = Object.fromEntries(Object.entries(mappings).map(([project, mapping]) => {
-    const job = sync(project);
-    // A sync queued again keeps its row's id, so a retry that fails differently shows only in the error the workflow check reads.
-    return [project, { mapping: JSON.stringify(mapping), sync: JSON.stringify(job && [job.id, job.status, job.error?.message ?? null]) }];
-  }));
-  const allowlist = ctx.effectiveAllowlist();
-  const fly = ctx.flySessions();
-  return {
-    perProject,
-    orchestratorWide: JSON.stringify({
-      settings: SAVED_SETUP_SETTINGS.map((key) => ctx.readSetting(key)),
-      defaults: ctx.orchestratorDefaults()?.configRevisionId ?? null,
-      stages: Object.keys(mappings).map((project) => ctx.projectStageConfig(project)?.configRevisionId ?? null),
-      // An address's bindings are written at its first sign-in, which no check judges.
-      allowlist: allowlist && { source: allowlist.source, entries: allowlist.entries.map(({ kind, value, role }) => [kind, value, role]) },
-      allowlistReadable: ctx.allowlistReadAvailable(),
-      fly: [ctx.runnerBackendSource(), fly.app, fly.region],
-    }),
-    allChecks: JSON.stringify([ctx.runnerMode().mode, ctx.readSetting(LINEAR_PICKUP_LABEL_KEY)]),
-  };
+/** The saved setup a reader's result is built from, though the result itself is not saved. Every check that calls the reader reads it too. */
+interface BuiltFrom {
+  contextReaders?: readonly SetupCheckReader[];
+  settingsRows?: readonly string[];
 }
 
-/** A context reader's place in the saved setup: read by readSavedSetup, or left out for the reason given. */
-type SavedSetupReader = "saved" | { leftOut: string };
+/**
+ * A reader's place in the saved setup: saved, as one value per project or one for the orchestrator, or by settings row for readSetting;
+ * or left out for the reason given, with the saved setup its result is built from when it has any.
+ */
+type SavedSetupReader =
+  | { saved: "per-project"; read: (ctx: SetupCheckContext, project: string) => unknown }
+  | { saved: "orchestrator"; read: (ctx: SetupCheckContext) => unknown }
+  | { saved: "by-settings-row" }
+  | { leftOut: string; builtFrom?: BuiltFrom };
+
+const GITHUB_READ: SavedSetupReader = { leftOut: "Read from GitHub, where no save here changes it." };
 
 /**
  * Every reader a check can call, and its place in the saved setup, so a reader added to the context does not compile until it is placed.
- * A reader is placed whole: which settings rows readSetting covers is SAVED_SETUP_SETTINGS and the pickup label.
+ * Which checks read each saved part is read from the checks' declarations.
  */
-export const SAVED_SETUP_READERS: { [K in Exclude<keyof SetupCheckContext, "githubSetupFacts">]: SavedSetupReader } & {
-  githubSetupFacts: Record<keyof GitHubSetupFacts, SavedSetupReader>;
-} = {
+export const SAVED_SETUP_READERS: { [K in SetupCheckReader]: SavedSetupReader } & { githubSetupFacts: Record<GitHubSetupReader, SavedSetupReader> } = {
   env: { leftOut: "A variable changes only with a restart, and boot runs the checks." },
-  readSetting: "saved",
-  orchestratorDefaults: "saved",
-  projectStageConfig: "saved",
-  runnerMode: "saved",
-  flySessions: "saved",
-  runnerBackendSource: "saved",
-  mappings: "saved",
+  readSetting: { saved: "by-settings-row" },
+  orchestratorDefaults: { saved: "orchestrator", read: (ctx) => ctx.orchestratorDefaults()?.configRevisionId ?? null },
+  projectStageConfig: { saved: "per-project", read: (ctx, project) => ctx.projectStageConfig(project)?.configRevisionId ?? null },
+  runnerMode: { saved: "orchestrator", read: (ctx) => ctx.runnerMode().mode },
+  flySessions: { saved: "orchestrator", read: (ctx) => { const fly = ctx.flySessions(); return [fly.app, fly.region]; } },
+  runnerBackendSource: { saved: "orchestrator", read: (ctx) => ctx.runnerBackendSource() },
+  mappings: { saved: "per-project", read: (ctx, project) => ctx.mappings()[project] },
   storedAccessEntries: { leftOut: "A check reads only whether the saved list holds entries, which effectiveAllowlist's source says." },
-  effectiveAllowlist: "saved",
-  allowlistReadAvailable: "saved",
+  effectiveAllowlist: {
+    saved: "orchestrator",
+    // An address's bindings are written at its first sign-in, which no check judges.
+    read: (ctx) => { const allowlist = ctx.effectiveAllowlist(); return allowlist && { source: allowlist.source, entries: allowlist.entries.map(({ kind, value, role }) => [kind, value, role]) }; },
+  },
+  allowlistReadAvailable: { leftOut: "No check reads it. Bootstrap mode on GET / does, live, outside the stored run." },
   restateStatus: { leftOut: "The process's own state, not a save." },
   databasePath: { leftOut: "Resolved once per process, from a variable." },
   onSeparateFilesystem: { leftOut: "The machine's mounts, not a save." },
-  trackerProvider: { leftOut: "Built from the variables and the mappings, which are placed already." },
-  trackerSetupFacts: { leftOut: "Read from the ticketing system, where no save here changes it." },
+  trackerProvider: { leftOut: "Built from the variables and the mappings.", builtFrom: { contextReaders: ["mappings"] } },
+  // The Linear provider judges the pickup label it reads itself.
+  trackerSetupFacts: { leftOut: "Read from the ticketing system, where no save here changes it.", builtFrom: { contextReaders: ["mappings"], settingsRows: [LINEAR_PICKUP_LABEL_KEY] } },
   orchestratorHealthAt: { leftOut: "A network read, which no save changes." },
   orchestratorInstanceId: { leftOut: "Fixed for the process's life." },
   githubSetupFacts: {
-    app: { leftOut: "Read from GitHub, where no save here changes it." },
-    installation: { leftOut: "Read from GitHub, where no save here changes it." },
-    installationRepositories: { leftOut: "Read from GitHub, where no save here changes it." },
-    repositories: { leftOut: "Read from GitHub, where no save here changes it." },
-    publicRepository: { leftOut: "Read from GitHub, where no save here changes it." },
-    deliveries: { leftOut: "Read from GitHub, where no save here changes it." },
+    app: GITHUB_READ,
+    installation: GITHUB_READ,
+    installationRepositories: GITHUB_READ,
+    repositories: { ...GITHUB_READ, builtFrom: { contextReaders: ["mappings"] } },
+    publicRepository: GITHUB_READ,
+    deliveries: GITHUB_READ,
     kgSourceRepo: { leftOut: "Set by KG_SOURCE_REPO, a variable." },
-    kgPreflight: { leftOut: "Read from GitHub, where no save here changes it." },
-    workflowSync: "saved",
+    kgPreflight: { ...GITHUB_READ, builtFrom: { settingsRows: [KG_BASE_REPO_KEY] } },
+    // A sync queued again keeps its row's id, so a retry that fails differently shows only in the error the workflow check reads.
+    workflowSync: { saved: "per-project", read: (ctx, project) => { const job = ctx.githubSetupFacts().workflowSync(project); return job && [job.id, job.status, job.error?.message ?? null]; } },
   },
 };
+
+/** Where a piece of the saved setup a check reads comes from: a reader whose value is saved, named as the checks name it, or a settings row. */
+type SavedSetupSource = { reader: string; place: Extract<SavedSetupReader, { read: unknown }> } | { settingsRow: string };
+
+/** Every saved setup source `check` reads: its readers that are saved, what its other readers are built from, and its settings rows. */
+function savedSetupSourcesOf(check: SetupCheck): SavedSetupSource[] {
+  const sources: SavedSetupSource[] = [];
+  const add = (reader: string, place: SavedSetupReader) => {
+    if ("read" in place) sources.push({ reader, place });
+    else if ("leftOut" in place) {
+      for (const source of place.builtFrom?.contextReaders ?? []) add(source, SAVED_SETUP_READERS[source]);
+      for (const row of place.builtFrom?.settingsRows ?? []) sources.push({ settingsRow: row });
+    }
+  };
+  for (const reader of check.contextReaders) add(reader, SAVED_SETUP_READERS[reader]);
+  for (const reader of check.githubReaders ?? []) add(`githubSetupFacts.${reader}`, SAVED_SETUP_READERS.githubSetupFacts[reader]);
+  for (const row of check.settingsRows ?? []) sources.push({ settingsRow: row });
+  return sources;
+}
+
+/** Each saved setup source once, keyed by name, with which kinds of check read it. */
+function readBy(): Map<string, { source: SavedSetupSource; perProject: boolean; orchestratorWide: boolean }> {
+  const read = new Map<string, { source: SavedSetupSource; perProject: boolean; orchestratorWide: boolean }>();
+  for (const check of SETUP_CHECKS) {
+    for (const source of savedSetupSourcesOf(check)) {
+      const key = "reader" in source ? source.reader : `settings row ${source.settingsRow}`;
+      const entry = read.get(key) ?? { source, perProject: false, orchestratorWide: false };
+      if (check.perProject) entry.perProject = true;
+      else entry.orchestratorWide = true;
+      read.set(key, entry);
+    }
+  }
+  return read;
+}
+
+const SAVED_SETUP_SOURCES = [...readBy()].sort(([a], [b]) => a.localeCompare(b));
+
+/** The settings rows the checks read, directly or through a reader. */
+export const SAVED_SETUP_SETTINGS: readonly string[] = SAVED_SETUP_SOURCES.flatMap(([, { source }]) => ("settingsRow" in source ? [source.settingsRow] : []));
+
+const PER_PROJECT = SAVED_SETUP_SOURCES.filter(([, { source }]) => "reader" in source && source.place.saved === "per-project");
+const ORCHESTRATOR = SAVED_SETUP_SOURCES.filter(([, { source }]) => !("reader" in source && source.place.saved === "per-project"));
+/** Whether an orchestrator-wide check reads a project's own sources, so a project added or deleted changes its rows. */
+const ORCHESTRATOR_WIDE_READS_PROJECTS = PER_PROJECT.some(([, { orchestratorWide }]) => orchestratorWide);
+
+export function readSavedSetup(ctx: SetupCheckContext): SavedSetup {
+  const value = (source: SavedSetupSource, project?: string): unknown => {
+    if ("settingsRow" in source) return ctx.readSetting(source.settingsRow);
+    return source.place.saved === "per-project" ? source.place.read(ctx, project!) : source.place.read(ctx);
+  };
+  const part = (sources: typeof SAVED_SETUP_SOURCES, project?: string) => JSON.stringify(sources.map(([key, { source }]) => [key, value(source, project)]));
+  return {
+    perProject: Object.fromEntries(Object.keys(ctx.mappings()).map((project) => [project, {
+      projectChecks: part(PER_PROJECT.filter(([, by]) => by.perProject), project),
+      orchestratorWideChecks: part(PER_PROJECT.filter(([, by]) => by.orchestratorWide), project),
+    }])),
+    orchestratorWide: part(ORCHESTRATOR.filter(([, by]) => !by.perProject)),
+    allChecks: part(ORCHESTRATOR.filter(([, by]) => by.perProject)),
+  };
+}
 
 /** The runs a change from one saved setup to the next needs. */
 export function runsForSavedChange(before: SavedSetup, after: SavedSetup): SetupCheckRunKind[] {
   if (after.allChecks !== before.allChecks) return [{ kind: "full" }];
   const runs: SetupCheckRunKind[] = [];
-  // tracker.provider, model.credentials-adopted, runner.fly-sessions and runner.project-backend name projects, so a project saved, added or deleted changes their rows too.
-  let orchestratorWide = after.orchestratorWide !== before.orchestratorWide || Object.keys(before.perProject).some((project) => !(project in after.perProject));
+  let orchestratorWide = after.orchestratorWide !== before.orchestratorWide
+    || (ORCHESTRATOR_WIDE_READS_PROJECTS && Object.keys(before.perProject).some((project) => !(project in after.perProject)));
   for (const [project, now] of Object.entries(after.perProject)) {
     const was = before.perProject[project];
-    if (was === undefined || was.mapping !== now.mapping) orchestratorWide = true;
-    if (was === undefined || was.mapping !== now.mapping || was.sync !== now.sync) runs.push({ kind: "project", project });
+    if (was === undefined ? ORCHESTRATOR_WIDE_READS_PROJECTS : was.orchestratorWideChecks !== now.orchestratorWideChecks) orchestratorWide = true;
+    if (was === undefined || was.projectChecks !== now.projectChecks) runs.push({ kind: "project", project });
   }
   if (orchestratorWide) runs.push({ kind: "orchestrator-wide" });
   return runs;
@@ -126,7 +177,10 @@ const runName = (run: SetupCheckRunKind): string =>
 export function fingerprintSavedSetup(saved: SavedSetup): SavedSetup {
   const fingerprint = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16);
   return {
-    perProject: Object.fromEntries(Object.entries(saved.perProject).map(([project, { mapping, sync }]) => [project, { mapping: fingerprint(mapping), sync: fingerprint(sync) }])),
+    perProject: Object.fromEntries(Object.entries(saved.perProject).map(([project, parts]) => [project, {
+      projectChecks: fingerprint(parts.projectChecks),
+      orchestratorWideChecks: fingerprint(parts.orchestratorWideChecks),
+    }])),
     orchestratorWide: fingerprint(saved.orchestratorWide),
     allChecks: fingerprint(saved.allChecks),
   };

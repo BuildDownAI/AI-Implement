@@ -20,7 +20,7 @@ import { MAX_COMMENT_GAPFILL_REFUSALS, getCommentGapfillItem, recordCommentGapfi
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, type Job } from "./log.js";
 import { findLinkByPr } from "./pr-links.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
-import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
+import { checkForcedPathEligibility, resolveExecutionBackend, type RunnerMode } from "./runner-mode.js";
 import { trackerAccounting as defaultTrackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { getPullRequestState, type DispatchResult } from "./github.js";
 import type { RunCredentialsV1 } from "./run-config.js";
@@ -445,7 +445,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
-      const execPath = resolveExecutionPath(opts.runnerMode, mapping.executionMode);
+      const backend = resolveExecutionBackend(opts.runnerMode, mapping.executionMode);
 
       // AII-1437: an ephemeral full-access opt-in cannot run off GHA; defer rather than throw at launch.
       const pathEligibility = checkForcedPathEligibility(opts.runnerMode, mapping, true);
@@ -461,7 +461,6 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       }
       const installationId = String(await opts.getInstallationId(item.owner));
       const dispatchId = crypto.randomUUID();
-      const backend = execPath === "both" ? "github-actions" : execPath;
       const admission = checkAdmission({ dispatchId, mappingKey: scopeKey,
         scope: { kind: "pr", issueId: prLog.issueId, installationId, repository: fullRepo, prNumber: item.prNumber },
         kind: "gap-fill", backend, lifecycleOwner: { kind: "restate", attemptId: dispatchId },

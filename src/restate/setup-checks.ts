@@ -11,14 +11,12 @@
  * The stored run and the journal hold each check's detail and fix, which by contract carry no secret value (ADR 047),
  * because Restate journals every handler's output.
  */
-import { once } from "node:events";
-import type { Server } from "node:http";
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import * as restateClients from "@restatedev/restate-sdk-clients";
-import { getMappings } from "../config.js";
+import { getMappings, type RepoMapping } from "../config.js";
 import { whenDeployHoldClears } from "../deploy-hold.js";
-import { cacheSetupCheckRun, claimSetupCheckRun, createBootSetupChecks, createSetupCheckContext, endSetupCheckProgress, getCachedSetupCheckRun, mergeSetupCheckRun, partialRunNeedsFullRun, recheckHeld, recheckScope, recheckWaitedOn, runOrchestratorWideSetupChecks, runProjectSetupChecks, runSetupChecks, runSetupChecksBeforeRestate, runSetupChecksInScope, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckContext, type SetupCheckScope, type SetupCheckRun } from "../setup-checks/index.js";
+import { cacheSetupCheckRun, claimSetupCheckRun, createBootSetupChecks, createSetupCheckContext, endSetupCheckProgress, getCachedSetupCheckRun, mergeSetupCheckRun, partialRunNeedsFullRun, recheckHeld, recheckScope, recheckChecksWaitedOn, runOrchestratorWideSetupChecks, runProjectSetupChecks, runSetupChecks, runSetupChecksBeforeRestate, runSetupChecksInScope, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckContext, type SetupCheckScope, type SetupCheckRun } from "../setup-checks/index.js";
 import { recheckKey, rememberRecheck, type SetupCheckRecheck } from "../setup-checks/recheck.js";
 import type { SetupCheckRunKind } from "../setup-checks/change-detector.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -62,18 +60,22 @@ const INGRESS_TIMEOUT_MS = 10_000;
 const WAITED_RUN_TIMEOUT_MS = 60_000;
 
 export function createSetupChecks(deps: SetupChecksDeps) {
+  /** Stores a run as the stored run, in the object and in this process's cache of it. */
+  function storeRun(ctx: ObjectContext, run: SetupCheckRun): SetupCheckRun {
+    cacheSetupCheckRun(run);
+    ctx.set<SetupCheckRun>(LAST_RUN, run);
+    return run;
+  }
+
   /**
-   * Merges a partial run into the stored run and keeps the result, in this process and in the object. A partial run the stored run
-   * cannot take (`partialRunNeedsFullRun`) is answered by every check instead, run in a step of its own and kept whole.
+   * Merges a partial run into the stored run and stores the result. A partial run the stored run
+   * cannot take (`partialRunNeedsFullRun`) is answered by every check instead, run in a step of its own and stored whole.
    */
   async function storeMerged(ctx: ObjectContext, run: SetupCheckRun): Promise<SetupCheckRun> {
     const stored = (await ctx.get<SetupCheckRun>(LAST_RUN)) ?? null;
-    const merged = partialRunNeedsFullRun(run, stored)
+    return storeRun(ctx, partialRunNeedsFullRun(run, stored)
       ? await ctx.run("run checks", () => deps.runChecksQuietly())
-      : mergeSetupCheckRun(stored, run, await ctx.run("mapped projects", () => deps.mappedProjects()));
-    cacheSetupCheckRun(merged);
-    ctx.set<SetupCheckRun>(LAST_RUN, merged);
-    return merged;
+      : mergeSetupCheckRun(stored, run, await ctx.run("mapped projects", () => deps.mappedProjects())));
   }
 
   return restate.object({
@@ -81,10 +83,7 @@ export function createSetupChecks(deps: SetupChecksDeps) {
     handlers: {
       run: restate.handlers.object.exclusive(async (ctx: ObjectContext): Promise<SetupCheckRun> => {
         try {
-          const run = await ctx.run("run checks", () => deps.runChecks());
-          cacheSetupCheckRun(run);
-          ctx.set<SetupCheckRun>(LAST_RUN, run);
-          return run;
+          return storeRun(ctx, await ctx.run("run checks", () => deps.runChecks()));
         } finally {
           endSetupCheckProgress();
         }
@@ -122,7 +121,7 @@ export function createSetupChecks(deps: SetupChecksDeps) {
         if (run === null) return null;
         stored = await storeMerged(ctx, cause === undefined ? run : { ...run, results: run.results.map((row) => ({ ...row, cause })) });
         // The checks its rows wait on are rechecked with it, so the stored run never shows a row waiting on an older one.
-        await recheckWaitedOn(scope, run, async (dependency, waited) => {
+        await recheckChecksWaitedOn(scope, run, async (dependency, waited) => {
           const answered = await rerun(dependency, `recheck ${waited}`);
           if (answered !== null) stored = await storeMerged(ctx, answered);
           return answered;
@@ -136,28 +135,30 @@ export function createSetupChecks(deps: SetupChecksDeps) {
   });
 }
 
-/** This process's setup-check context, as every production run reads it. */
-const processContext = (): SetupCheckContext => createSetupCheckContext({ restateStatus: getRestateStatus });
+/** This process's setup-check context, as every production run reads it, holding only the project given, so every read is that project's. */
+export function productionSetupCheckContext(project?: { key: string; mapping: RepoMapping }): SetupCheckContext {
+  return createSetupCheckContext({ restateStatus: getRestateStatus, ...(project && { mappings: () => ({ [project.key]: project.mapping }) }) });
+}
 
-/** This process's context narrowed to one saved project, so every read is that project's, or null when no mapping holds it. */
+/** This process's context holding one saved project, or null when no mapping holds it. */
 function savedProjectContext(project: string): SetupCheckContext | null {
   const mapping = getMappings()[project];
-  return mapping ? createSetupCheckContext({ restateStatus: getRestateStatus, mappings: () => ({ [project]: mapping }) }) : null;
+  return mapping ? productionSetupCheckContext({ key: project, mapping }) : null;
 }
 
 /** The object's dependencies in production: every run reads this process's configuration, narrowed to the one saved project a run names. */
 export const createProductionSetupChecksDependencies = (): SetupChecksDeps => ({
-  runChecks: () => runSetupChecksWithProgress(processContext()),
-  runChecksQuietly: () => runSetupChecks(processContext(), SETUP_CHECKS),
+  runChecks: () => runSetupChecksWithProgress(productionSetupCheckContext()),
+  runChecksQuietly: () => runSetupChecks(productionSetupCheckContext(), SETUP_CHECKS),
   runProjectChecks: async (project) => {
     const ctx = savedProjectContext(project);
     return ctx && runProjectSetupChecks(ctx, project);
   },
-  runOrchestratorWideChecks: () => runOrchestratorWideSetupChecks(processContext()),
+  runOrchestratorWideChecks: () => runOrchestratorWideSetupChecks(productionSetupCheckContext()),
   mappedProjects: () => Object.keys(getMappings()),
   runScope: async (scope) => {
     const project = scope.projects?.[0];
-    const ctx = project === undefined ? processContext() : savedProjectContext(project);
+    const ctx = project === undefined ? productionSetupCheckContext() : savedProjectContext(project);
     return ctx && runSetupChecksInScope(ctx, scope);
   },
 });
@@ -242,13 +243,9 @@ export function createSetupChecksIngressClient(deps: SetupChecksIngressDeps = {}
 }
 
 /** Boot's two runs in production, over this process's server and the object. Each answers once its work ends, and boot never waits for either. */
-export function createProductionBootSetupChecks(server: () => Server, client = createSetupChecksIngressClient()): ReturnType<typeof createBootSetupChecks> {
+export function createProductionBootSetupChecks(client = createSetupChecksIngressClient()): ReturnType<typeof createBootSetupChecks> {
   return createBootSetupChecks({
-    // callback.reachable reads this process's own GET /, so the run waits for the server to listen.
-    runBeforeRestate: async () => {
-      if (!server().listening) await once(server(), "listening");
-      return runSetupChecksBeforeRestate(processContext());
-    },
+    runBeforeRestate: () => runSetupChecksBeforeRestate(productionSetupCheckContext()),
     // A boot after a self-deploy runs while the deploy still holds new work back, so the run waits for the hold to clear.
     storeOrchestratorWide: async () => {
       await whenDeployHoldClears();

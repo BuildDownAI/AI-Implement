@@ -7,7 +7,8 @@ import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 type Mapping = Record<string, unknown>;
 
-function mountProjects(mapping: RepoMapping = makeMapping()) {
+/** `refused` answers the save with a refusal instead of success. */
+function mountProjects(mapping: RepoMapping = makeMapping(), refused: { save?: { status: number; body: unknown } } = {}) {
   const posts: unknown[] = [];
   const mounted = mountAdminPage({
     html: projectsHtml,
@@ -16,6 +17,7 @@ function mountProjects(mapping: RepoMapping = makeMapping()) {
     api: async (url, init) => {
       if (url === "/api/mappings" && init?.method === "POST") {
         posts.push(JSON.parse(init.body || "{}"));
+        if (refused.save) return { ok: false, status: refused.save.status, json: async () => refused.save!.body };
         return { ok: true, status: 200, json: async () => ({ syncJobId: null }) };
       }
       if (url === "/api/mappings") {
@@ -46,6 +48,36 @@ async function save(win: { saveMappingDialog: () => Promise<void> }): Promise<vo
 function reviewerRows(doc: Document): HTMLElement[] {
   return Array.from(doc.querySelectorAll<HTMLElement>("#md-reviewer-list > div"));
 }
+
+describe("the Edit dialog's save refused by the server", () => {
+  const activeTab = (doc: Document) => (doc.querySelector("#md-tabs [data-md-tab].active") as HTMLElement).dataset.mdTab;
+  const shownError = (doc: Document) => doc.getElementById("md-error")!.textContent;
+
+  // The tab comes from where the markup puts the setting, a nested ticketing key by its own label.
+  it.each([
+    ["maxTurns", "capacity"],
+    ["sensitiveAddPatterns", "guardrails"],
+    ["ticketingConfig.jql", "ticketing"],
+    ["machineCpuKind", "execution"],
+  ])("opens the tab holding %s, %s, and shows the server's sentence as it is", async (field, tab) => {
+    const error = "The setting was refused.";
+    const { win, doc } = mountProjects(makeMapping(), { save: { status: 400, body: { error, field } } });
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    win.switchMappingTab("source");
+    await save(win);
+    expect([activeTab(doc), shownError(doc)]).toEqual([tab, error]);
+  });
+
+  it("stays on the open tab for a refusal that names no setting", async () => {
+    const { win, doc } = mountProjects(makeMapping(), { save: { status: 400, body: { error: "Invalid request body" } } });
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    win.switchMappingTab("source");
+    await save(win);
+    expect([activeTab(doc), shownError(doc)]).toEqual(["source", "Invalid request body"]);
+  });
+});
 
 describe("projects table containment", () => {
   it("uses a shared horizontal scroll container for the table and its Edit action", async () => {

@@ -125,7 +125,7 @@ import { listRepoBranchesAndTags, getRepoDefaultBranch, fetchRepoTarball } from 
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport, restateRefForJob } from "./report-card.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
-import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
+import { TicketingConfigError, validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { FilesystemProvider } from "./providers/filesystem.js";
 import { filesystemRetryEligibility, retryFilesystemTicket } from "./filesystem-ticket-lifecycle.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
@@ -144,42 +144,43 @@ import picomatch from "picomatch";
 
 function normalizeSkillsRepo(raw: unknown): string | null {
   if (raw == null) return null;
-  if (typeof raw !== "string") throw new Error("skillsRepo must be a string");
+  if (typeof raw !== "string") throw new Error(`${label("skillsRepo")} must be text.`);
   const v = raw.trim();
   if (v === "") return null;
-  return normalizeGitHubRepo(v, "skillsRepo");
+  return normalizeGitHubRepo(v, label("skillsRepo"));
 }
 
-function normalizeSensitiveGlobs(raw: unknown): string[] | null {
+function normalizeSensitiveGlobs(raw: unknown, field: "sensitiveAddPatterns" | "sensitiveAllowPatterns"): string[] | null {
+  const subject = label(field);
   if (raw == null) return null;
   if (typeof raw !== "string" && !Array.isArray(raw)) {
-    throw new Error("must be a string or an array of strings");
+    throw new Error(`${subject} must be text, one pattern per line.`);
   }
   const items = Array.isArray(raw) ? raw : raw.split("\n");
   for (const item of items) {
     if (typeof item !== "string") {
-      throw new Error("must be a string or an array of strings");
+      throw new Error(`${subject} must be text, one pattern per line.`);
     }
   }
   const globs = (items as string[]).map((g) => g.trim()).filter((g) => g.length > 0);
   if (globs.length === 0) return null;
   if (globs.length > 100) {
-    throw new Error(`too many globs (${globs.length}); maximum is 100 per list`);
+    throw new Error(`${subject} may hold at most 100 patterns, not ${globs.length}.`);
   }
   for (const glob of globs) {
     // Reject globs made up entirely of wildcards, path separators, and dots
     // ("**", "**/*", "*", ".*", ...): they match everything and would disable
     // the guardrail. Every glob must carry at least one literal path character.
     if (glob.replace(/[*/.\s]/g, "").length === 0) {
-      throw new Error(`glob "${glob}" is not allowed (matches everything, which would disable the guardrail); each glob must contain a literal path character`);
+      throw new Error(`${subject} cannot hold "${glob}", which matches every file and would turn the guardrail off. Each pattern needs at least one literal path character.`);
     }
     if (glob.length > 256) {
-      throw new Error(`glob too long (${glob.length} chars): "${glob.slice(0, 30)}..."; maximum is 256 characters`);
+      throw new Error(`The pattern "${glob.slice(0, 30)}..." in ${subject} is ${glob.length} characters, more than the 256 allowed.`);
     }
     try {
       picomatch.makeRe(glob, { dot: true, debug: true });
     } catch (err) {
-      throw new Error(`invalid glob "${glob}": ${err instanceof Error ? err.message : String(err)}`);
+      throw new Error(`${subject} holds a pattern that is not valid: "${glob}" (${err instanceof Error ? err.message : String(err)}).`);
     }
   }
   return globs;
@@ -187,26 +188,27 @@ function normalizeSensitiveGlobs(raw: unknown): string[] | null {
 
 function normalizeReviewers(raw: unknown): ReviewerSelection[] {
   if (!Array.isArray(raw)) {
-    throw new Error("reviewers must be an array");
+    throw new Error(`${label("reviewers")} must be a list.`);
   }
   const seen = new Set<string>();
   const result: ReviewerSelection[] = [];
   raw.forEach((entry, index) => {
+    // Numbered from 1 for an operator, while the body numbers them from 0.
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
-      throw new Error(`reviewers[${index}] must be an object with "id" and "gates"`);
+      throw new Error(`Reviewer ${index + 1} needs an id and a gates setting.`);
     }
     const { id, gates, maxTurns } = entry as { id?: unknown; gates?: unknown; maxTurns?: unknown };
     if (typeof id !== "string" || id.length === 0) {
-      throw new Error(`reviewers[${index}].id must be a non-empty string`);
+      throw new Error(`Reviewer ${index + 1} needs an id.`);
     }
     if (typeof gates !== "boolean") {
-      throw new Error(`reviewers[${index}] ("${id}").gates must be a boolean`);
+      throw new Error(`Reviewer "${id}" needs gates turned on or off.`);
     }
     if (maxTurns !== undefined && !validReviewerMaxTurns(maxTurns)) {
-      throw new Error(`reviewers[${index}] ("${id}").maxTurns must be an integer from 1 to 200`);
+      throw new Error(`Reviewer "${id}"'s Max turns must be a whole number from 1 to 200.`);
     }
     if (seen.has(id)) {
-      throw new Error(`reviewers contains duplicate id "${id}"`);
+      throw new Error(`${label("reviewers")} lists "${id}" twice.`);
     }
     seen.add(id);
     result.push(maxTurns === undefined ? { id, gates } : { id, gates, maxTurns });
@@ -222,27 +224,28 @@ const TRUSTED_REVIEW_AUTHOR_RE = /^[a-z0-9][a-z0-9-]*(\[bot\])?$/;
 
 function normalizeTrustedReviewAuthors(raw: unknown): string[] | null {
   if (raw === null || raw === undefined) return null;
+  const subject = label("trustedReviewAuthors");
   if (!Array.isArray(raw)) {
-    throw new Error("must be an array of strings or null");
+    throw new Error(`${subject} must be a list of GitHub logins.`);
   }
   if (raw.length > 20) {
-    throw new Error(`too many entries (${raw.length}); maximum is 20`);
+    throw new Error(`${subject} may hold at most 20 logins, not ${raw.length}.`);
   }
   const seen = new Set<string>();
   const result: string[] = [];
-  raw.forEach((entry, index) => {
+  raw.forEach((entry) => {
     if (typeof entry !== "string") {
-      throw new Error(`[${index}] must be a string`);
+      throw new Error(`${subject} must hold only GitHub logins.`);
     }
     const normalized = entry.trim().toLowerCase();
     if (normalized.length === 0) {
-      throw new Error(`[${index}] must not be empty`);
+      throw new Error(`${subject} must not hold a blank login.`);
     }
     if (!TRUSTED_REVIEW_AUTHOR_RE.test(normalized)) {
-      throw new Error(`[${index}] "${entry}" is not a valid GitHub login`);
+      throw new Error(`"${entry}" in ${subject} is not a GitHub login.`);
     }
     if (seen.has(normalized)) {
-      throw new Error(`duplicate entry "${normalized}"`);
+      throw new Error(`${subject} lists "${normalized}" twice.`);
     }
     seen.add(normalized);
     result.push(normalized);
@@ -433,30 +436,85 @@ interface ValidatedTicketing {
   ticketingConfig: TicketingMappingConfig;
 }
 
-/** A save's refusal, naming the body field it concerns so a form can show it beside that field. */
+/** A setting a save can refuse: a body key, or a key of the ticketing system's configuration. */
+export type MappingRefusalField =
+  | Exclude<keyof UpsertMappingBody, "paused" | "reviewFixLifecycle">
+  | `ticketingConfig.${"jql" | "repoFieldValue" | "directory" | "statusFieldOverride" | "repoFieldOverride" | "profilesFieldOverride" | "baseBranchFieldOverride"}`;
+
+/** Each setting a save can refuse, by the label the admin UI shows it under, so a refusal names it as an operator sees it. */
+export const MAPPING_FIELD_LABELS: Record<MappingRefusalField, string> = {
+  ticketingProvider: "Ticketing System",
+  ticketingConfig: "Ticketing Config",
+  "ticketingConfig.jql": "JQL",
+  "ticketingConfig.repoFieldValue": "Repo Field Value",
+  "ticketingConfig.directory": "Ticket Directory",
+  "ticketingConfig.statusFieldOverride": "Status Field",
+  "ticketingConfig.repoFieldOverride": "Repo Field",
+  "ticketingConfig.profilesFieldOverride": "Profiles Field",
+  "ticketingConfig.baseBranchFieldOverride": "Base Branch Field",
+  teamKey: "Project Mapping Key",
+  owner: "GitHub Owner",
+  repo: "Repository Name",
+  defaultBranch: "Default Branch",
+  workflowFile: "Workflow File",
+  branchPrefix: "Branch Prefix",
+  sensitiveAddPatterns: "Additional protected files",
+  sensitiveAllowPatterns: "Exceptions to those rules",
+  skillsRepo: "Skills Repo",
+  referenceRepos: "Reference Repositories",
+  dependencyTokenScope: "Dependency Token Scope",
+  executionMode: "Execution Mode",
+  sessionMode: "Session Mode",
+  machineCpus: "CPUs",
+  machineMemoryMb: "Memory (MB)",
+  machineCpuKind: "CPU type",
+  reviewProcess: "Review process",
+  trustedReviewAuthors: "Trusted Review Authors",
+  extraEnv: "Extra Env",
+  maxInProgressAiIssues: "Max parallel AI issues",
+  maxTurns: "Max Turns",
+  maxIterations: "Max Iterations",
+  prDispatchBudget: "PR Dispatch Budget",
+  reviewers: "Reviewers",
+  maxJobMinutes: "Job Timeout (min)",
+  provider: "AI Provider",
+  awsRegion: "AWS Region",
+  planningEnabled: "Planning",
+  planningWorkflowFile: "Planning Workflow File",
+  autoApprovePlans: "Auto-approve plans",
+  autoMerge: "Auto-merge child PRs",
+};
+
+const label = (field: MappingRefusalField): string => MAPPING_FIELD_LABELS[field];
+
+/** A save's refusal, naming the setting it concerns so a form can show it beside that setting. */
 class MappingFieldError extends Error {
-  constructor(readonly field: keyof UpsertMappingBody, message: string) {
+  constructor(readonly field: MappingRefusalField, message: string) {
     super(message);
   }
 }
 
-function refuse(field: keyof UpsertMappingBody, error: string): { status: 400; body: { error: string; field: keyof UpsertMappingBody } } {
+/** A save's refusal: `error` for the operator, `field` for the form that shows it beside that setting. */
+function refuse(field: MappingRefusalField, error: string): { status: 400; body: { error: string; field: MappingRefusalField } } {
   return { status: 400, body: { error, field } };
 }
 
 function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketingConfig?: unknown }): ValidatedTicketing {
   const provider = body.ticketingProvider ?? "linear";
   if (provider !== "linear" && provider !== "jira" && provider !== "filesystem") {
-    throw new MappingFieldError("ticketingProvider", `Invalid ticketingProvider: expected "linear", "jira", or "filesystem", got ${JSON.stringify(provider)}`);
+    throw new MappingFieldError("ticketingProvider", `${label("ticketingProvider")} must be linear, jira or filesystem.`);
   }
   if (provider === "filesystem" && getRunnerMode().mode !== "local") {
-    throw new MappingFieldError("ticketingProvider", "Filesystem tickets require local runner mode (RUNNER_MODE=local)");
+    throw new MappingFieldError("ticketingProvider", `The filesystem ${label("ticketingProvider")} needs the local runner mode (RUNNER_MODE=local).`);
   }
   let config: TicketingMappingConfig;
   try {
     config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
   } catch (err) {
-    throw new MappingFieldError("ticketingConfig", err instanceof Error ? err.message : String(err));
+    const key = err instanceof TicketingConfigError ? err.key : undefined;
+    if (key === "jql" || key === "repoFieldValue") throw new MappingFieldError(`ticketingConfig.${key}`, `${label(`ticketingConfig.${key}`)} is required for Jira.`);
+    if (key === "directory") throw new MappingFieldError("ticketingConfig.directory", `${label("ticketingConfig.directory")} must be an absolute path on the orchestrator's host.`);
+    throw new MappingFieldError("ticketingConfig", `${label("ticketingConfig")} must be set for the ${provider} ${label("ticketingProvider")}.`);
   }
   if (config.kind === "jira") {
     // A field-id override is interpolated into JQL and into the fields list of a REST
@@ -472,7 +530,7 @@ function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketing
     for (const key of overrideKeys) {
       const value = config[key];
       if (value != null && !/^[A-Za-z0-9_]+$/.test(value)) {
-        throw new MappingFieldError("ticketingConfig", `Invalid ${key} "${value}". Jira field ids may only contain letters, digits, and underscores`);
+        throw new MappingFieldError(`ticketingConfig.${key}`, `${label(`ticketingConfig.${key}`)} must be a Jira field id of letters, digits and underscores.`);
       }
     }
   }
@@ -3479,57 +3537,57 @@ export function buildMappingFromBody(
 ): { key: string; mapping: RepoMapping; warnings: string[] } | { status: number; body: Record<string, unknown> } {
   // A body parsed from JSON can be any value, and only an object can describe a project.
   if (typeof body !== "object" || body === null || Array.isArray(body)) return { status: 400, body: { error: "Invalid request body" } };
-  if (!body.teamKey || !body.owner || !body.repo) {
-    return refuse(!body.teamKey ? "teamKey" : !body.owner ? "owner" : "repo", "teamKey, owner, and repo are required");
-  }
+  if (!body.teamKey) return refuse("teamKey", `${label("teamKey")} is required.`);
+  if (!body.owner) return refuse("owner", `${label("owner")} is required.`);
+  if (!body.repo) return refuse("repo", `${label("repo")} is required.`);
 
   const existingMapping = getOwnMapping(body.teamKey);
   const defaultBranch = typeof body.defaultBranch === "string"
     ? body.defaultBranch.trim()
     : (existingMapping?.defaultBranch ?? "");
   if (!defaultBranch) {
-    return refuse("defaultBranch", "defaultBranch is required");
+    return refuse("defaultBranch", `${label("defaultBranch")} is required.`);
   }
 
   const maxInProgressAiIssues =
     body.maxInProgressAiIssues ?? DEFAULT_MAX_IN_PROGRESS_AI_ISSUES;
   if (!Number.isInteger(maxInProgressAiIssues) || maxInProgressAiIssues < 1) {
-    return refuse("maxInProgressAiIssues", "maxInProgressAiIssues must be a positive integer");
+    return refuse("maxInProgressAiIssues", `${label("maxInProgressAiIssues")} must be a whole number of 1 or more.`);
   }
 
   const validExecutionModes: ExecutionMode[] = ["github-actions", "fly-machines"];
   const executionMode = (body.executionMode ?? existingMapping?.executionMode ?? DEFAULT_EXECUTION_MODE) as ExecutionMode;
   if (!validExecutionModes.includes(executionMode)) {
-    return refuse("executionMode", "executionMode must be 'github-actions' or 'fly-machines'");
+    return refuse("executionMode", `${label("executionMode")} must be github-actions or fly-machines.`);
   }
 
   const validSessionModes: SessionMode[] = ["autonomous", "interactive", "hybrid"];
   const sessionMode = (body.sessionMode ?? DEFAULT_SESSION_MODE) as SessionMode;
   if (!validSessionModes.includes(sessionMode)) {
-    return refuse("sessionMode", "sessionMode must be 'autonomous', 'interactive', or 'hybrid'");
+    return refuse("sessionMode", `${label("sessionMode")} must be autonomous, interactive or hybrid.`);
   }
 
   const machineCpus = body.machineCpus ?? DEFAULT_MACHINE_CPUS;
   if (!Number.isInteger(machineCpus) || machineCpus < 1) {
-    return refuse("machineCpus", "machineCpus must be a positive integer");
+    return refuse("machineCpus", `${label("machineCpus")} must be a whole number of 1 or more.`);
   }
 
   const machineMemoryMb = body.machineMemoryMb ?? DEFAULT_MACHINE_MEMORY_MB;
   if (!Number.isInteger(machineMemoryMb) || machineMemoryMb < 256) {
-    return refuse("machineMemoryMb", "machineMemoryMb must be an integer >= 256");
+    return refuse("machineMemoryMb", `${label("machineMemoryMb")} must be a whole number of 256 or more.`);
   }
 
   const machineCpuKind = body.machineCpuKind === undefined
     ? existingMapping?.machineCpuKind ?? "shared"
     : body.machineCpuKind;
   if (machineCpuKind !== "shared" && machineCpuKind !== "performance") {
-    return { status: 400, body: { error: "machineCpuKind must be 'shared' or 'performance'" } };
+    return refuse("machineCpuKind", `${label("machineCpuKind")} must be shared or performance.`);
   }
   if (machineCpuKind === "performance" && !VALID_CPUS.includes(machineCpus)) {
-    return { status: 400, body: { error: `machineCpus must be one of ${VALID_CPUS.join(", ")} for performance CPUs` } };
+    return refuse("machineCpus", `${label("machineCpus")} must be one of ${VALID_CPUS.join(", ")} with a performance ${label("machineCpuKind")}.`);
   }
   if (machineCpuKind === "performance" && machineMemoryMb < PERFORMANCE_MIN_MB_PER_CPU * machineCpus) {
-    return { status: 400, body: { error: `machineMemoryMb must be at least ${PERFORMANCE_MIN_MB_PER_CPU} MB per CPU for performance CPUs` } };
+    return refuse("machineMemoryMb", `${label("machineMemoryMb")} must be at least ${PERFORMANCE_MIN_MB_PER_CPU} for each CPU with a performance ${label("machineCpuKind")}.`);
   }
 
   const workflowFile = body.workflowFile || existingMapping?.workflowFile || "claude-implement.yml";
@@ -3539,7 +3597,7 @@ export function buildMappingFromBody(
   const autoMerge = body.autoMerge ?? DEFAULT_AUTO_MERGE;
 
   if (planningEnabled && !planningWorkflowFile) {
-    return refuse("planningWorkflowFile", "planningWorkflowFile is required when planningEnabled is true");
+    return refuse("planningWorkflowFile", `${label("planningWorkflowFile")} is required while ${label("planningEnabled")} is on.`);
   }
 
   for (const [field, value] of [
@@ -3547,57 +3605,57 @@ export function buildMappingFromBody(
     ["planningWorkflowFile", planningWorkflowFile],
   ] as const) {
     if (!isBareWorkflowFileName(value)) {
-      return refuse(field, `${field} must be a bare file name ending in .yml or .yaml`);
+      return refuse(field, `${label(field)} must be a file name ending in .yml or .yaml, with no folder.`);
     }
   }
   if (workflowFileNamesCollide(workflowFile, planningWorkflowFile)) {
-    return refuse("planningWorkflowFile", "workflowFile and planningWorkflowFile must not be the same file name");
+    return refuse("planningWorkflowFile", `${label("planningWorkflowFile")} must differ from ${label("workflowFile")}.`);
   }
 
   let extraEnv: Record<string, string> = {};
   if (body.extraEnv !== undefined) {
     if (typeof body.extraEnv !== "object" || Array.isArray(body.extraEnv) || body.extraEnv === null) {
-      return refuse("extraEnv", "extraEnv must be a plain object");
+      return refuse("extraEnv", `${label("extraEnv")} must be a set of names and values.`);
     }
     if (!Object.values(body.extraEnv).every((v) => typeof v === "string")) {
-      return refuse("extraEnv", "extraEnv values must all be strings");
+      return refuse("extraEnv", `${label("extraEnv")} values must all be text.`);
     }
     extraEnv = body.extraEnv as Record<string, string>;
     if (Object.keys(extraEnv).some((k) => k.toUpperCase() === EXECUTION_POLICY_ENV)) {
-      return refuse("extraEnv", `extraEnv name ${EXECUTION_POLICY_ENV} is reserved`);
+      return refuse("extraEnv", `${label("extraEnv")} cannot set ${EXECUTION_POLICY_ENV}, which the orchestrator reserves.`);
     }
     if (Object.keys(extraEnv).some((k) => isEphemeralPolicyEnvName(k) && k !== EPHEMERAL_FULL_ACCESS_EXTRA_ENV)) {
-      return refuse("extraEnv", `extraEnv name ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must be spelled exactly`);
+      return refuse("extraEnv", `${label("extraEnv")} must spell ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} exactly.`);
     }
     if (EPHEMERAL_FULL_ACCESS_EXTRA_ENV in extraEnv) {
       if (extraEnv[EPHEMERAL_FULL_ACCESS_EXTRA_ENV] !== EPHEMERAL_FULL_ACCESS_ASSERTION) {
-        return refuse("extraEnv", `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must equal ${EPHEMERAL_FULL_ACCESS_ASSERTION}`);
+        return refuse("extraEnv", `${label("extraEnv")}'s ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must equal ${EPHEMERAL_FULL_ACCESS_ASSERTION}.`);
       }
       const modeForOptIn = body.executionMode ?? existingMapping?.executionMode ?? DEFAULT_EXECUTION_MODE;
       if (modeForOptIn !== "github-actions") {
-        return refuse("extraEnv", `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"`);
+        return refuse("extraEnv", `${label("extraEnv")}'s ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} works only with the github-actions ${label("executionMode")}.`);
       }
     }
   }
 
   // AII-1437: a mode change without extraEnv in the body keeps the stored opt-in, so check the effective value.
   if (body.extraEnv === undefined && executionMode !== "github-actions" && hasEphemeralFullAccessOptIn(existingMapping?.extraEnv)) {
-    return refuse("executionMode", `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"`);
+    return refuse("executionMode", `${label("executionMode")} must stay github-actions while ${label("extraEnv")} sets ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV}.`);
   }
 
   const validProviders: ClaudeProvider[] = ["anthropic", "bedrock"];
   const provider = (body.provider ?? DEFAULT_PROVIDER) as ClaudeProvider;
   if (!validProviders.includes(provider)) {
-    return refuse("provider", "provider must be 'anthropic' or 'bedrock'");
+    return refuse("provider", `${label("provider")} must be anthropic or bedrock.`);
   }
 
   const awsRegionRaw = typeof body.awsRegion === "string" ? body.awsRegion.trim() : "";
   const awsRegion = awsRegionRaw.length > 0 ? awsRegionRaw : null;
   if (provider === "bedrock" && !awsRegion) {
-    return refuse("awsRegion", "awsRegion is required when provider is 'bedrock'");
+    return refuse("awsRegion", `${label("awsRegion")} is required for the bedrock ${label("provider")}.`);
   }
   if (provider === "bedrock" && executionMode === "fly-machines") {
-    return refuse("provider", "provider 'bedrock' is not supported with executionMode 'fly-machines'");
+    return refuse("provider", `The bedrock ${label("provider")} needs the github-actions ${label("executionMode")}.`);
   }
 
   let ticketing: ValidatedTicketing;
@@ -3608,11 +3666,11 @@ export function buildMappingFromBody(
   }
 
   if (ticketing.ticketingProvider === "filesystem" && provider !== "anthropic") {
-    return refuse("provider", "Filesystem tickets use local Docker, which requires provider 'anthropic'");
+    return refuse("provider", `Filesystem tickets run in local Docker, which needs the anthropic ${label("provider")}.`);
   }
   if (ticketing.ticketingProvider === "filesystem" &&
       (!/^[A-Za-z0-9_.-]+$/.test(body.teamKey) || body.teamKey === "." || body.teamKey === "..")) {
-    return refuse("teamKey", "Filesystem project key must contain only letters, digits, underscores, dots, or hyphens");
+    return refuse("teamKey", `${label("teamKey")} may contain only letters, digits, underscores, dots and hyphens for Filesystem tickets.`);
   }
 
   const resolveCap = (
@@ -3621,7 +3679,7 @@ export function buildMappingFromBody(
   ): number | null => {
     if (value === undefined || value === null) return null;
     if (!Number.isInteger(value) || value < 1) {
-      throw new MappingFieldError(name, `${name} must be a positive integer or null`);
+      throw new MappingFieldError(name, `${label(name)} must be a whole number of 1 or more, or blank.`);
     }
     return value;
   };
@@ -3641,37 +3699,37 @@ export function buildMappingFromBody(
 
   let branchPrefix: string | null;
   try {
-    branchPrefix = normalizeBranchPrefix(body.branchPrefix);
+    branchPrefix = normalizeBranchPrefix(body.branchPrefix, label("branchPrefix"));
   } catch (err) {
-    return refuse("branchPrefix", `branchPrefix invalid: ${err instanceof Error ? err.message : String(err)}`);
+    return refuse("branchPrefix", err instanceof Error ? err.message : String(err));
   }
 
   let skillsRepo: string | null;
   try {
     skillsRepo = normalizeSkillsRepo(body.skillsRepo);
   } catch (err) {
-    return refuse("skillsRepo", `skillsRepo invalid: ${err instanceof Error ? err.message : String(err)}`);
+    return refuse("skillsRepo", err instanceof Error ? err.message : String(err));
   }
 
   let referenceRepos: ReferenceRepo[] | null;
   try {
-    referenceRepos = normalizeReferenceRepos(body.referenceRepos);
+    referenceRepos = normalizeReferenceRepos(body.referenceRepos, label("referenceRepos"));
   } catch (err) {
-    return refuse("referenceRepos", `referenceRepos invalid: ${err instanceof Error ? err.message : String(err)}`);
+    return refuse("referenceRepos", err instanceof Error ? err.message : String(err));
   }
 
   let sensitiveAddPatterns: string[] | null;
   try {
-    sensitiveAddPatterns = normalizeSensitiveGlobs(body.sensitiveAddPatterns);
+    sensitiveAddPatterns = normalizeSensitiveGlobs(body.sensitiveAddPatterns, "sensitiveAddPatterns");
   } catch (err) {
-    return refuse("sensitiveAddPatterns", `sensitiveAddPatterns invalid: ${err instanceof Error ? err.message : String(err)}`);
+    return refuse("sensitiveAddPatterns", err instanceof Error ? err.message : String(err));
   }
 
   let sensitiveAllowPatterns: string[] | null;
   try {
-    sensitiveAllowPatterns = normalizeSensitiveGlobs(body.sensitiveAllowPatterns);
+    sensitiveAllowPatterns = normalizeSensitiveGlobs(body.sensitiveAllowPatterns, "sensitiveAllowPatterns");
   } catch (err) {
-    return refuse("sensitiveAllowPatterns", `sensitiveAllowPatterns invalid: ${err instanceof Error ? err.message : String(err)}`);
+    return refuse("sensitiveAllowPatterns", err instanceof Error ? err.message : String(err));
   }
 
   let dependencyTokenScope: "installation" | null;
@@ -3684,7 +3742,7 @@ export function buildMappingFromBody(
   } else if (rawScope === "installation") {
     dependencyTokenScope = "installation";
   } else {
-    return refuse("dependencyTokenScope", `dependencyTokenScope invalid: must be null or "installation"`);
+    return refuse("dependencyTokenScope", `${label("dependencyTokenScope")} must be blank or installation.`);
   }
 
   // Retired API input is ignored. Preserve history for a reviewed deploy revert;
@@ -3702,7 +3760,7 @@ export function buildMappingFromBody(
     try {
       reviewers = normalizeReviewers(body.reviewers);
     } catch (err) {
-      return refuse("reviewers", `reviewers invalid: ${err instanceof Error ? err.message : String(err)}`);
+      return refuse("reviewers", err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -3717,7 +3775,7 @@ export function buildMappingFromBody(
     try {
       trustedReviewAuthors = normalizeTrustedReviewAuthors(body.trustedReviewAuthors);
     } catch (err) {
-      return refuse("trustedReviewAuthors", `trustedReviewAuthors invalid: ${err instanceof Error ? err.message : String(err)}`);
+      return refuse("trustedReviewAuthors", err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -3730,7 +3788,7 @@ export function buildMappingFromBody(
   } else if (isReviewProcessId(body.reviewProcess)) {
     reviewProcess = body.reviewProcess;
   } else {
-    return refuse("reviewProcess", `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"`);
+    return refuse("reviewProcess", `${label("reviewProcess")} must be ai-implement, claude-code-review, claude-code-review-repository-fix or codex-code-review.`);
   }
   const mapping: RepoMapping = {
     owner: body.owner,

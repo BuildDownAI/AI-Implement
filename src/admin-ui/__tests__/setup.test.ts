@@ -4,7 +4,7 @@ import { mountAdminPage, type FakeApiResponse } from "../../__tests__/helpers/fi
 import { SETUP_CHECK_GROUP_LABELS } from "../../setup-checks/index.js";
 import { componentsCss } from "../components.js";
 
-type Row = { id: string; title: string; group: string; tier: string; onAdminPath: boolean; state: string; project?: string; detail?: string; fix?: string; fixUrl?: string; waitsOn?: string };
+type Row = { id: string; title: string; group: string; tier: string; onAdminPath: boolean; state: string; project?: string; detail?: string; fix?: string; fixUrl?: string; waitsOnCheck?: string };
 
 const row = (over: Partial<Row>): Row => ({ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: false, state: "pass", ...over });
 const body = (over: Record<string, unknown>) => ({ run: null, progress: null, groups: SETUP_CHECK_GROUP_LABELS, ...over });
@@ -67,7 +67,7 @@ describe("setup page", () => {
   });
 
   it("shows a project's rows waiting on the same check as one row in its card", async () => {
-    const waiting = (id: string) => row({ id, title: id, group: "tracker", project: "ENG", state: "cannot-verify", detail: "d", fix: "f", waitsOn: "tracker.provider" });
+    const waiting = (id: string) => row({ id, title: id, group: "tracker", project: "ENG", state: "cannot-verify", detail: "d", fix: "f", waitsOnCheck: "tracker.provider" });
     const results = [waiting("tracker.linear.team-access"), waiting("tracker.linear.pickup-label"), row({ id: "github.installation", group: "github", project: "ENG", state: "fail" })];
     const page = mount([reply(200, body({ run: { checkedAt: 1, results } }))]);
     await page.win.loadSetup();

@@ -50,7 +50,7 @@ describe("normalizeGitHubRepo", () => {
 
   it("distinguishes an embedded credential from a bad host", () => {
     expect(() => normalizeGitHubRepo("https://user:tok@github.com/acme/docs", "referenceRepos"))
-      .toThrow(/must not embed a username or token/);
+      .toThrow(/must not carry a username or token/);
   });
 
   // The message reaches an admin API response and the logs behind it.
@@ -61,7 +61,7 @@ describe("normalizeGitHubRepo", () => {
     } catch (err) {
       message = (err as Error).message;
     }
-    expect(message).toMatch(/must not embed/);
+    expect(message).toMatch(/must not carry/);
     expect(message).not.toContain("ghs_SUPERSECRET");
   });
 
@@ -134,7 +134,7 @@ describe("normalizeReferenceRepos", () => {
 
   it("rejects more than ten entries", () => {
     const many = Array.from({ length: 11 }, (_, i) => ({ repo: "acme/docs", path: `p${i}` }));
-    expect(() => normalizeReferenceRepos(many)).toThrow(/too many entries \(11\)/);
+    expect(() => normalizeReferenceRepos(many)).toThrow(/at most 10 entries, not 11/);
   });
 
   it("accepts exactly ten", () => {
@@ -179,7 +179,7 @@ describe("normalizeReferenceRepos path rules", () => {
   });
 
   it("rejects a path over 256 characters", () => {
-    expect(withPath("a".repeat(257))).toThrow(/path too long \(257 chars\)/);
+    expect(withPath("a".repeat(257))).toThrow(/is 257 characters/);
   });
 
   it("allows a dot-prefixed directory that is not .git", () => {

@@ -114,9 +114,9 @@ export const helpersJs = `
   // Setup-check states, worst first, which every setup surface orders rows by. The first three need attention,
   // so a page shows their rows open and folds the rest, and a marker takes the worst of them.
   const SETUP_STATE_ORDER = ['fail', 'cannot-verify', 'warn', 'pass', 'not-applicable'];
-  const SETUP_ACTIONABLE = SETUP_STATE_ORDER.slice(0, 3);
+  const SETUP_NEEDS_ATTENTION = SETUP_STATE_ORDER.slice(0, 3);
   window.SETUP_STATE_ORDER = SETUP_STATE_ORDER;
-  window.SETUP_ACTIONABLE = SETUP_ACTIONABLE;
+  window.SETUP_NEEDS_ATTENTION = SETUP_NEEDS_ATTENTION;
 
   // A setup check's row, as the Setup page and the New project stepper show it: the check and its id,
   // its state, what was found, and its fix with any page that applies it.
@@ -164,7 +164,7 @@ export const helpersJs = `
   // in the place of the first of them. Every other row stays as it is and where it is. For showing only: counts and verdicts read the rows themselves.
   // The setup command prints them the same way (joinWaitingRows).
   function groupWaitingRows(rows) {
-    const keyOf = function (row) { return row.waitsOn ? (row.project || '') + '|' + row.waitsOn : null; };
+    const keyOf = function (row) { return row.waitsOnCheck ? (row.project || '') + '|' + row.waitsOnCheck : null; };
     const waiting = {};
     rows.forEach(function (row) { const key = keyOf(row); if (key) (waiting[key] = waiting[key] || []).push(row); });
     const shown = [];
@@ -174,16 +174,34 @@ export const helpersJs = `
       if (group[0] !== row) return;
       const sameDetail = group.every(function (each) { return each.detail === row.detail; });
       shown.push({
-        title: group.length + ' checks wait on ' + row.waitsOn,
+        title: group.length + ' checks wait on ' + row.waitsOnCheck,
         id: group.map(function (each) { return each.id; }).join(', '),
         state: row.state,
-        detail: sameDetail ? row.detail : 'None of them can be read until ' + row.waitsOn + ' passes.',
+        detail: sameDetail ? row.detail : 'None of them can be read until ' + row.waitsOnCheck + ' passes.',
         fix: row.fix,
       });
     });
     return shown;
   }
   window.groupWaitingRows = groupWaitingRows;
+
+  // Rows as a setup surface lists them: worst first, ties broken by tieBreak when given and then by the rows' own order.
+  // Those that need attention are open, with rows waiting on one check joined. The rest fold away under a label counting them.
+  function splitSetupRows(rows, tieBreak) {
+    const sorted = rows.slice().sort(function (a, b) {
+      return SETUP_STATE_ORDER.indexOf(a.state) - SETUP_STATE_ORDER.indexOf(b.state) || (tieBreak ? tieBreak(a, b) : 0);
+    });
+    const needsAttention = function (row) { return SETUP_NEEDS_ATTENTION.indexOf(row.state) !== -1; };
+    const folded = sorted.filter(function (row) { return !needsAttention(row); });
+    const passing = folded.filter(function (row) { return row.state === 'pass'; }).length;
+    const notApplicable = folded.length - passing;
+    return {
+      open: groupWaitingRows(sorted.filter(needsAttention)),
+      folded: folded,
+      foldLabel: [passing ? passing + ' passing' : '', notApplicable ? notApplicable + ' not applicable' : ''].filter(Boolean).join(', '),
+    };
+  }
+  window.splitSetupRows = splitSetupRows;
 
   // The verdict a marker shows for a set of setup-check rows: the worst state among those that can be judged, one row being enough to set it.
   // Rows that do not apply, and checks that can never be verified, are left out. Null when none is left to judge.

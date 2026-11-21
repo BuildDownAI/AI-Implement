@@ -30,7 +30,7 @@ import type {
   WorkerTerminalOutcome,
 } from "./review-fix-contract.js";
 
-import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
+import type { ExecutionBackend } from "./runner-mode.js";
 
 // ---------------------------------------------------------------------------
 // Deadline and alert timing (named per the issue's "not magic" requirement)
@@ -105,7 +105,7 @@ export interface ReviewFixPendingFeedback {
  */
 export interface PreparedReviewFixAttempt {
   /** Fixed at admission; absent on older snapshots means GitHub Actions. */
-  readonly executionBackend?: DispatchAdmissionBackend;
+  readonly executionBackend?: ExecutionBackend;
   readonly attemptId: AttemptId;
   readonly scope: ScopedPrIdentity;
   readonly taskText: string;
@@ -266,7 +266,7 @@ export interface ReviewFixAttemptStorePort {
  *  this plan performs no external call. */
 export interface WorkerLaunchPlan {
   /** Absent on older plans means GitHub Actions. */
-  readonly executionBackend?: DispatchAdmissionBackend;
+  readonly executionBackend?: ExecutionBackend;
   readonly attemptId: AttemptId;
   readonly scope: ScopedPrIdentity;
   readonly taskText: string;

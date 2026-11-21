@@ -87,7 +87,7 @@ export function formatCheckRow(r: PrintedRow): string[] {
  */
 export function joinWaitingRows(rows: SetupCheckResult[]): PrintedRow[] {
   const waiting = new Map<string, SetupCheckResult[]>();
-  const keyOf = (r: SetupCheckResult) => (r.waitsOn ? `${r.project ?? ""}\n${r.waitsOn}` : null);
+  const keyOf = (r: SetupCheckResult) => (r.waitsOnCheck ? `${r.project ?? ""}\n${r.waitsOnCheck}` : null);
   for (const r of rows) {
     const key = keyOf(r);
     if (key) waiting.set(key, [...(waiting.get(key) ?? []), r]);
@@ -101,8 +101,8 @@ export function joinWaitingRows(rows: SetupCheckResult[]): PrintedRow[] {
       state: r.state,
       id: group.map((each) => each.id).join(", "),
       project: r.project,
-      title: `${group.length} checks wait on ${r.waitsOn}`,
-      detail: sameDetail ? r.detail : `None of them can be read until ${r.waitsOn} passes.`,
+      title: `${group.length} checks wait on ${r.waitsOnCheck}`,
+      detail: sameDetail ? r.detail : `None of them can be read until ${r.waitsOnCheck} passes.`,
       fix: r.fix,
     }];
   });

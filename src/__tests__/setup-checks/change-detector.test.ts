@@ -40,18 +40,31 @@ describe("the saved setup", () => {
     expect(at(2, [])).toEqual(at(3, [{ provider: "google", subject: "sub-1" }]));
   });
 
-  it("holds each project's mapping and sync apart from what the orchestrator-wide checks read", () => {
+  // A sync is read only by a per-project check, and a project's stage revision only by an orchestrator-wide one.
+  it("holds a project's sources by which checks read them: its own, the orchestrator-wide ones, or both", () => {
     const at = (overrides: Partial<SetupCheckContext>) => detection.readSavedSetup(makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping() }), ...overrides }));
     const base = at({});
     const synced = at({ githubSetupFacts: () => makeGitHubSetupFacts({ workflowSync: () => ({ id: 1, teamKey: "ENG", status: "completed", result: null, error: null, createdAt: 1, updatedAt: 1 }) }) });
-    expect(synced.perProject.ENG.sync).not.toBe(base.perProject.ENG.sync);
+    expect(synced.perProject.ENG.projectChecks).not.toBe(base.perProject.ENG.projectChecks);
+    expect(synced.perProject.ENG.orchestratorWideChecks).toBe(base.perProject.ENG.orchestratorWideChecks);
     expect(synced.orchestratorWide).toBe(base.orchestratorWide);
     // A sync queued again keeps its row's id, so only its error tells a retry that failed differently apart.
     const failedWith = (message: string) => at({ githubSetupFacts: () => makeGitHubSetupFacts({ workflowSync: () => ({ id: 1, teamKey: "ENG", status: "failed", result: null, error: { category: "unknown", message }, createdAt: 1, updatedAt: 1 }) }) });
-    expect(failedWith("the App lacks workflows: write").perProject.ENG.sync).not.toBe(failedWith("the default branch is protected").perProject.ENG.sync);
+    expect(failedWith("the App lacks workflows: write").perProject.ENG.projectChecks).not.toBe(failedWith("the default branch is protected").perProject.ENG.projectChecks);
     const adopted = at({ projectStageConfig: () => ({ configRevisionId: "rev-2", revision: 2, config: {} as never, createdAt: 1, createdBy: null, supersedesRevisionId: null }) });
-    expect(adopted.orchestratorWide).not.toBe(base.orchestratorWide);
-    expect(adopted.perProject).toEqual(base.perProject);
+    expect(adopted.perProject.ENG.orchestratorWideChecks).not.toBe(base.perProject.ENG.orchestratorWideChecks);
+    expect(adopted.perProject.ENG.projectChecks).toBe(base.perProject.ENG.projectChecks);
+    const remapped = at({ mappings: () => ({ ENG: makeMapping({ repo: "other" }) }) });
+    expect(remapped.perProject.ENG.projectChecks).not.toBe(base.perProject.ENG.projectChecks);
+    expect(remapped.perProject.ENG.orchestratorWideChecks).not.toBe(base.perProject.ENG.orchestratorWideChecks);
+  });
+
+  it("reads each project's own sources for that project alone", () => {
+    const at = (opsRepo: string) => detection.readSavedSetup(makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping(), OPS: makeMapping({ repo: opsRepo }) }) }));
+    const before = at("ops");
+    const after = at("ops-renamed");
+    expect(after.perProject.OPS).not.toEqual(before.perProject.OPS);
+    expect(after.perProject.ENG).toEqual(before.perProject.ENG);
   });
 
   // A check that reads one of these must see its change, so each part is pinned on its own.
@@ -60,7 +73,6 @@ describe("the saved setup", () => {
     ["an allowlist entry's address", { effectiveAllowlist: () => ({ entries: [makeAccessEntry({ value: "other@example.com" })], source: "db" as const }) }],
     ["an allowlist entry's role", { effectiveAllowlist: () => ({ entries: [makeAccessEntry({ role: "user" })], source: "db" as const }) }],
     ["where the allowlist comes from", { effectiveAllowlist: () => ({ entries: [makeAccessEntry()], source: "env" as const }) }],
-    ["whether the allowlist can be read", { allowlistReadAvailable: () => false }],
     ["the agent defaults' revision", { orchestratorDefaults: () => ({ configRevisionId: "rev-2", revision: 2, config: {} as never, createdAt: 1, createdBy: null, supersedesRevisionId: null }) }],
     ["the Fly sessions app", { flySessions: () => ({ token: null, app: "other-sessions", region: "iad", source: { app: "restate" as const, region: "restate" as const } }) }],
     ["the Fly sessions region", { flySessions: () => ({ token: null, app: "sessions", region: "lhr", source: { app: "restate" as const, region: "restate" as const } }) }],
@@ -98,6 +110,16 @@ describe("the saved setup", () => {
     expect([...read].filter((key) => !detection.SAVED_SETUP_SETTINGS.includes(key))).toEqual([]);
   });
 
+  // A check's declaration is what routes a change to its rows, so the rows its run reads must all be declared.
+  it("is the settings rows each check declares, read by no check beyond them", async () => {
+    const env = { KG_BASE_REPO: "acme/kg-base", KG_MATERIALIZE_DIRECT: "true", KG_EXECUTION_MODE: "fly-machines", LINEAR_PICKUP_LABEL: "AI-Implement", RUNNER_IMAGE_ALLOWED_PREFIXES: "ghcr.io/acme/", RUNNER_MODE: "fly", FLY_PROCESS_LEVEL_SECRETS: "true" };
+    for (const check of checks.SETUP_CHECKS) {
+      const read = new Set<string>();
+      await check.run(makeSetupCheckContext({ env, readSetting: (key) => { read.add(key); return null; } }));
+      expect([...read].filter((key) => !(check.settingsRows ?? []).includes(key)), check.id).toEqual([]);
+    }
+  });
+
   // The type makes every reader placed; this holds each placement to what readSavedSetup does, a GitHub read named as githubSetupFacts.<read>.
   it("reads exactly the context readers placed in the saved setup", () => {
     const read = new Set<string>();
@@ -112,20 +134,21 @@ describe("the saved setup", () => {
     detection.readSavedSetup(recording(makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping() }) }), ""));
     const { githubSetupFacts, ...readers } = detection.SAVED_SETUP_READERS;
     const placed = [...Object.entries(readers), ...Object.entries(githubSetupFacts).map(([name, place]) => [`githubSetupFacts.${name}`, place] as const)];
-    expect([...read].sort()).toEqual(placed.filter(([, place]) => place === "saved").map(([name]) => name).sort());
+    expect([...read].sort()).toEqual(placed.filter(([, place]) => "saved" in place).map(([name]) => name).sort());
   });
 });
 
 describe("what a change since the last cycle sends", () => {
   type Saved = ChangeDetectorModule.SavedSetup;
-  const base: Saved = { perProject: { ENG: { mapping: "m1", sync: "s1" } }, orchestratorWide: "o1", allChecks: "a1" };
+  const base: Saved = { perProject: { ENG: { projectChecks: "p1", orchestratorWideChecks: "w1" } }, orchestratorWide: "o1", allChecks: "a1" };
   const after = (changes: Partial<Saved>): Saved => ({ ...base, ...changes });
 
   it.each([
     ["nothing", after({}), []],
-    ["a project's mapping, which four orchestrator-wide checks list", after({ perProject: { ENG: { mapping: "m2", sync: "s1" } } }), [{ kind: "project", project: "ENG" }, { kind: "orchestrator-wide" }]],
-    ["a new project", after({ perProject: { ...base.perProject, OPS: { mapping: "m1", sync: "s1" } } }), [{ kind: "project", project: "OPS" }, { kind: "orchestrator-wide" }]],
-    ["a project's workflow sync", after({ perProject: { ENG: { mapping: "m1", sync: "s2" } } }), [{ kind: "project", project: "ENG" }]],
+    ["what both kinds of check read of a project, as of its mapping", after({ perProject: { ENG: { projectChecks: "p2", orchestratorWideChecks: "w2" } } }), [{ kind: "project", project: "ENG" }, { kind: "orchestrator-wide" }]],
+    ["a new project", after({ perProject: { ...base.perProject, OPS: { projectChecks: "p1", orchestratorWideChecks: "w1" } } }), [{ kind: "project", project: "OPS" }, { kind: "orchestrator-wide" }]],
+    ["what only a project's checks read of it, as of its workflow sync", after({ perProject: { ENG: { projectChecks: "p2", orchestratorWideChecks: "w1" } } }), [{ kind: "project", project: "ENG" }]],
+    ["what only orchestrator-wide checks read of a project, as of its stage revision", after({ perProject: { ENG: { projectChecks: "p1", orchestratorWideChecks: "w2" } } }), [{ kind: "orchestrator-wide" }]],
     ["a deleted project, whose rows the merge drops", after({ perProject: {} }), [{ kind: "orchestrator-wide" }]],
     ["what only the orchestrator-wide checks read", after({ orchestratorWide: "o2" }), [{ kind: "orchestrator-wide" }]],
     ["what reaches checks of both kinds", after({ allChecks: "a2", orchestratorWide: "o2" }), [{ kind: "full" }]],
@@ -137,7 +160,7 @@ describe("what a change since the last cycle sends", () => {
 describe("the change detector", () => {
   type Saved = ChangeDetectorModule.SavedSetup;
   const at = (projects: Record<string, string>, orchestratorWide = "o1", allChecks = "a1"): Saved => ({
-    perProject: Object.fromEntries(Object.entries(projects).map(([project, mapping]) => [project, { mapping, sync: "s1" }])),
+    perProject: Object.fromEntries(Object.entries(projects).map(([project, mapping]) => [project, { projectChecks: mapping, orchestratorWideChecks: mapping }])),
     orchestratorWide,
     allChecks,
   });
@@ -293,6 +316,26 @@ describe("the change detector", () => {
       expect(store.writes).toBe(1);
     });
 
+    // A write that failed left the next process nothing to compare with, so the record is written again though nothing changed.
+    it("writes the record again on the next cycle when its write failed", async () => {
+      const lines: string[] = [];
+      const writes: Array<"failed" | "written"> = [];
+      const detector = detection.createSetupCheckChangeDetector({
+        readSavedSetup: () => at({ ENG: "m1" }),
+        send: async () => true,
+        log: (line) => { lines.push(line); },
+        readRecord: () => null,
+        writeRecord: () => {
+          if (writes.length === 0) { writes.push("failed"); throw new Error("the database is locked"); }
+          writes.push("written");
+        },
+      });
+      await detector.onPollCycle();
+      await detector.onPollCycle();
+      expect(writes).toEqual(["failed", "written"]);
+      expect(lines).toEqual(["[setup-checks] the saved setup could not be written for the next process: the database is locked"]);
+    });
+
     it("holds fingerprints of the saved setup, never the setup itself", async () => {
       const store = fresh();
       await processOver(store, () => at({ ENG: "a-mapping-read-in-full" }, "the-orchestrator-wide-part")).detector.onPollCycle();
@@ -337,14 +380,14 @@ describe("the change detector", () => {
 });
 
 describe("the saved setup's fingerprints", () => {
-  const saved = { perProject: { ENG: { mapping: "m1", sync: "s1" } }, orchestratorWide: "o1", allChecks: "a1" };
+  const saved = { perProject: { ENG: { projectChecks: "p1", orchestratorWideChecks: "w1" } }, orchestratorWide: "o1", allChecks: "a1" };
 
   it("match for the same saved setup, and change only the part that changed", () => {
     expect(detection.fingerprintSavedSetup(saved)).toEqual(detection.fingerprintSavedSetup({ ...saved }));
     const before = detection.fingerprintSavedSetup(saved);
-    const after = detection.fingerprintSavedSetup({ ...saved, perProject: { ENG: { mapping: "m1", sync: "s2" } } });
-    expect(after.perProject.ENG.sync).not.toBe(before.perProject.ENG.sync);
-    expect(after.perProject.ENG.mapping).toBe(before.perProject.ENG.mapping);
+    const after = detection.fingerprintSavedSetup({ ...saved, perProject: { ENG: { projectChecks: "p2", orchestratorWideChecks: "w1" } } });
+    expect(after.perProject.ENG.projectChecks).not.toBe(before.perProject.ENG.projectChecks);
+    expect(after.perProject.ENG.orchestratorWideChecks).toBe(before.perProject.ENG.orchestratorWideChecks);
     expect([after.orchestratorWide, after.allChecks]).toEqual([before.orchestratorWide, before.allChecks]);
   });
 });

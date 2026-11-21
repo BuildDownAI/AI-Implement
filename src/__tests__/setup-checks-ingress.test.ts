@@ -1,7 +1,6 @@
 // The SetupChecks object's ingress client, which the admin routes, boot, hydration and the change detector call (AII-1538, AII-1541, AII-1544):
 // when each method calls, what it calls, and how a refusal, an error or a hung ingress comes back. Then the object's production dependencies,
 // and boot's two runs over them.
-import { createServer } from "node:http";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createSetupChecksHydration, createSetupChecksIngressClient } from "../restate/setup-checks.js";
 import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
@@ -317,18 +316,17 @@ describe("createProductionBootSetupChecks", () => {
     hold: () => import("../deploy-hold.js"),
   } })).modules;
 
-  it("runs the first checks once this process's server listens, and logs the rows that need attention", async () => {
+  // With a callback address set, callback.reachable would read it; the fake fails the test on any request, so the first run reads none.
+  it("runs the first checks in this process with no read of the callback address, and logs the rows that need attention", async () => {
     const { object } = await load();
+    vi.stubEnv("RUNNER_CALLBACK_BASE_URL", "https://orchestrator.test");
+    onTestFinished(() => { vi.unstubAllEnvs(); });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const server = createServer((_req, res) => res.end());
-    onTestFinished(() => new Promise<void>((resolve) => { server.close(() => resolve()); }));
-    const listeners = server.listenerCount("listening");
-    const ran = object.createProductionBootSetupChecks(() => server).beforeRestate();
-    // callback.reachable reads this process's own GET /, so the run waits on the server's listening event.
-    expect(server.listenerCount("listening")).toBe(listeners + 1);
-    server.listen(0, "127.0.0.1");
-    await ran;
-    expect(warn.mock.calls.some(([line]) => String(line).startsWith("[setup-checks] "))).toBe(true);
+    fakeFetch({}).install();
+    await object.createProductionBootSetupChecks().beforeRestate();
+    const lines = warn.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith("[setup-checks] "));
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.some((line) => line.includes("callback.reachable"))).toBe(false);
   });
 
   it("stores the orchestrator-wide run through the object once Restate serves, and logs the rows the first run did not", async () => {
@@ -340,7 +338,7 @@ describe("createProductionBootSetupChecks", () => {
       results: [{ id: "tracker.provider", title: "Ticketing system", group: "tracker", tier: "core", onAdminPath: false, state: "fail", detail: "No ticketing system is configured" }],
     };
     const fake = fakeFetch({ "POST /SetupChecks/orchestrator/runOrchestratorWide": { json: stored } }).install();
-    await object.createProductionBootSetupChecks(() => createServer()).afterServing();
+    await object.createProductionBootSetupChecks().afterServing();
     expect(fake.calls.map((call) => call.path)).toEqual(["/SetupChecks/orchestrator/runOrchestratorWide"]);
     expect(warn).toHaveBeenCalledWith("[setup-checks] tracker.provider fail: No ticketing system is configured.");
   });
@@ -352,7 +350,7 @@ describe("createProductionBootSetupChecks", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     hold.setDeployHold();
     const fake = fakeFetch({ "POST /SetupChecks/orchestrator/runOrchestratorWide": { json: RUN } }).install();
-    const stored = object.createProductionBootSetupChecks(() => createServer()).afterServing();
+    const stored = object.createProductionBootSetupChecks().afterServing();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(fake.calls).toHaveLength(0);
     hold.clearDeployHold();

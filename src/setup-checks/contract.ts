@@ -102,7 +102,7 @@ export interface SetupCheckResult {
   detail?: string;         // what was read; only on the Setup page and its route, never in a summary (ADR 047)
   fix?: string;            // set when state is warn, fail or cannot-verify; shown where detail is
   fixUrl?: string;         // a page that applies the fix; shown where detail is
-  waitsOn?: SetupCheckId;  // the check this row cannot be read without, which its fix names (`waitOn`)
+  waitsOnCheck?: SetupCheckId; // the check this row cannot be read without, which its fix names (`waitOnCheck`)
   checkedAt?: number;      // set by a run narrower than a full one; absent means the run's checkedAt
   cause?: SetupRecheckCause; // the runtime failure whose recheck answered this row
 }
@@ -118,29 +118,44 @@ export interface SetupCheckRestateStatus {
 
 /** Everything a check reads, as functions, so a reader that throws fails only the checks that call it. */
 export interface SetupCheckContext {
+  // The orchestrator's configuration: the environment, the settings table and the agent configuration.
   env: Readonly<Record<string, string | undefined>>;
   /** A raw `settings` row, or null when none exists. */
   readSetting(key: string): string | null;
   orchestratorDefaults(): ReturnType<typeof getOrchestratorDefaults>;
   projectStageConfig(key: string): ReturnType<typeof getProjectStageConfig>;
+
+  // Where runs go.
   runnerMode(): RunnerModeStatus;
   flySessions(): FlySessionsConfig;
   runnerBackendSource(): "restate" | "not-loaded";
+
+  // The projects.
   mappings(): Record<string, RepoMapping>;
+
+  // Who can sign in.
   storedAccessEntries(): AccessEntry[];
   effectiveAllowlist(): EffectiveAllowlist | null;
   /** Availability of the latest read, even when effectiveAllowlist serves cached entries. */
   allowlistReadAvailable(): boolean;
+
+  // This process: Restate, and the database and the volume it sits on.
   restateStatus(): SetupCheckRestateStatus;
   databasePath(): DatabasePath;
   /** True when `dir` is on a different filesystem from `/`, which on Fly means a mounted volume. */
   onSeparateFilesystem(dir: string): boolean;
+
+  // The ticketing systems.
   /** The provider for a ticketing provider id, built as the poll builds it. Throws when it cannot be built. */
   trackerProvider(providerId: string): Promise<TicketingProvider>;
   /** One provider's setup facts for its projects' teams, read once per context, or null when it reads none. */
   trackerSetupFacts(providerId: string): Promise<TrackerSetupFacts | null>;
+
+  // GitHub.
   /** The GitHub reads the `github` checks share, one set per context. */
   githubSetupFacts(): GitHubSetupFacts;
+
+  // The orchestrator's own address, as a run reaches it.
   /** The orchestrator's health endpoint at a base URL, read from this host the way a run reaches the orchestrator. */
   orchestratorHealthAt(baseUrl: string): Promise<OrchestratorHealthRead>;
   /** The identifier this orchestrator's own health body carries. */
@@ -170,9 +185,16 @@ export interface GitHubSetupFacts {
 }
 
 /** What a check reports; the runner adds the check's own identity fields. */
-export type SetupCheckOutcome = Pick<SetupCheckResult, "state" | "detail" | "fix" | "fixUrl" | "waitsOn" | "project">;
+export type SetupCheckOutcome = Pick<SetupCheckResult, "state" | "detail" | "fix" | "fixUrl" | "waitsOnCheck" | "project">;
+/** A context reader a check declares. The readers behind `githubSetupFacts` are declared one by one, as `GitHubSetupReader`s. */
+export type SetupCheckReader = Exclude<keyof SetupCheckContext, "githubSetupFacts">;
+export type GitHubSetupReader = keyof GitHubSetupFacts;
 
-export interface SetupCheck {
+/** The part of the context a check declares: its readers, and `githubSetupFacts` with only its declared readers when it declares any. */
+export type DeclaredSetupCheckContext<R extends SetupCheckReader, G extends GitHubSetupReader> =
+  Pick<SetupCheckContext, R> & ([G] extends [never] ? unknown : { githubSetupFacts(): Pick<GitHubSetupFacts, G> });
+
+export interface SetupCheck<R extends SetupCheckReader = SetupCheckReader, G extends GitHubSetupReader = GitHubSetupReader> {
   id: SetupCheckId;
   title: string;
   group: SetupCheckResult["group"];
@@ -182,13 +204,26 @@ export interface SetupCheck {
   perProject: boolean;
   /** False when nothing the orchestrator can read settles it, so it names what to confirm by hand and never passes. */
   verifiable: boolean;
+  /** The context readers `run` calls, the only ones it is given. */
+  contextReaders: readonly R[];
+  /** The readers `run` calls through `githubSetupFacts`. */
+  githubReaders?: readonly G[];
+  /** Every check its rows can wait on (`waitOnCheck`), so a change to one of them reaches its rows. */
+  waitsOnChecks?: readonly SetupCheckId[];
+  /** The settings rows `run` reads through `readSetting`. */
+  settingsRows?: readonly string[];
   /** One outcome for an orchestrator-wide check, one per project for a per-project check. */
-  run(ctx: SetupCheckContext): SetupCheckOutcome[] | Promise<SetupCheckOutcome[]>;
+  run(ctx: DeclaredSetupCheckContext<R, G>): SetupCheckOutcome[] | Promise<SetupCheckOutcome[]>;
 }
 
-/** The fix of a row that cannot be read until check `id` is addressed, with that check as the row's `waitsOn`. */
-export function waitOn(id: SetupCheckId): Required<Pick<SetupCheckResult, "fix" | "waitsOn">> {
-  return { fix: `More information is needed. Address the ${id} check first.`, waitsOn: id };
+/** A check, typed so `run` can call only the readers it declares. */
+export function defineCheck<const R extends SetupCheckReader = never, const G extends GitHubSetupReader = never>(check: SetupCheck<R, G>): SetupCheck {
+  return check;
+}
+
+/** The fix of a row that cannot be read until check `id` is addressed, with that check as the row's `waitsOnCheck`. */
+export function waitOnCheck(id: SetupCheckId): Required<Pick<SetupCheckResult, "fix" | "waitsOnCheck">> {
+  return { fix: `More information is needed. Address the ${id} check first.`, waitsOnCheck: id };
 }
 
 /** `outcome` as each project's own row, so a fault every project shares shows on each of them. */

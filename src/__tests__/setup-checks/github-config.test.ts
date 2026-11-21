@@ -379,7 +379,7 @@ describe("github.webhook-events", () => {
       state: "cannot-verify",
       detail: "GitHub refused the App's credentials, so its webhook events cannot be read",
       fix: "More information is needed. Address the github.app-identity check first.",
-      waitsOn: "github.app-identity",
+      waitsOnCheck: "github.app-identity",
     }]);
   });
 
