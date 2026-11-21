@@ -169,7 +169,7 @@ async function directRequest(
   method: "GET" | "POST",
   headers: Record<string, string>,
   host = "127.0.0.1",
-  body?: string,
+  body?: string | Buffer,
 ): Promise<{ status: number; body: string }> {
   const client = http2.connect(`http://${host.includes(":") ? `[${host}]` : host}:${port}`);
   try {
@@ -198,14 +198,60 @@ function directStatus(port: number, headers: Record<string, string>, host = "127
   return directDiscover(port, headers, host).then((answer) => answer.status);
 }
 
+/** A protobuf varint, used by the service-protocol frames below. */
+function protobufVarint(value: number): Buffer {
+  const bytes: number[] = [];
+  let remaining = value;
+  while (remaining >= 0x80) {
+    bytes.push((remaining & 0x7f) | 0x80);
+    remaining = Math.floor(remaining / 0x80);
+  }
+  bytes.push(remaining);
+  return Buffer.from(bytes);
+}
+
+function protobufVarintField(field: number, value: number): Buffer {
+  return Buffer.concat([protobufVarint((field << 3) | 0), protobufVarint(value)]);
+}
+
+function protobufBytesField(field: number, value: string | Buffer): Buffer {
+  const bytes = typeof value === "string" ? Buffer.from(value) : value;
+  return Buffer.concat([protobufVarint((field << 3) | 2), protobufVarint(bytes.length), bytes]);
+}
+
+/** One service-protocol message: an 8-byte type/flag/length header, then the protobuf payload. */
+function invocationFrame(type: number, payload: Buffer): Buffer {
+  const header = Buffer.alloc(8);
+  header.writeUInt16BE(type, 0);
+  header.writeUInt32BE(payload.length, 4);
+  return Buffer.concat([header, payload]);
+}
+
+/**
+ * A direct service-protocol invocation. A JSON `POST /invoke/...` cannot reach a
+ * handler (the SDK answers 415); reaching it requires the StartMessage and
+ * InputCommandMessage frames a Restate server would send. `known_entries` is one
+ * because the input command is the journal's first entry.
+ */
 function directInvoke(port: number, service: string, headers: Record<string, string>, host = "127.0.0.1"): Promise<{ status: number; body: string }> {
+  const invocationId = `inv_${randomUUID().replaceAll("-", "")}`;
+  const start = Buffer.concat([
+    protobufBytesField(1, invocationId),
+    protobufBytesField(2, invocationId),
+    protobufVarintField(3, 1),
+    protobufVarintField(9, 42),
+  ]);
+  const input = Buffer.concat([
+    protobufBytesField(14, protobufBytesField(1, JSON.stringify({ workflowKey: "process-entry-workflow" }))),
+    protobufBytesField(12, "input"),
+  ]);
   return directRequest(
     port,
     `/invoke/${service}/run`,
     "POST",
-    { "content-type": "application/json", ...headers },
+    { ...headers, "content-type": "application/vnd.restate.invocation.v7", "x-restate-invocation-id": invocationId },
     host,
-    JSON.stringify({ workflowKey: "process-entry-workflow" }),
+    Buffer.concat([invocationFrame(0x0000, start), invocationFrame(0x0400, input)]),
   );
 }
 
@@ -575,6 +621,12 @@ describe("runner-service process entry (AII-2034)", () => {
       expect(discovered.status, discovered.body).toBe(200);
       expect(JSON.parse(discovered.body)).toMatchObject({ services: expect.arrayContaining([expect.objectContaining({ name: service })]) });
     }
+
+    // The listener must also accept a signed run on IPv6. The answer is the real
+    // pipeline's failure, so a 401 or a protocol rejection (415) cannot pass it.
+    const ipv6Run = await directInvoke(RUNNER_SERVICE_PORT, service, signedHeaders(env, privatePem, `/invoke/${service}/run`), "::1");
+    expect(ipv6Run.status, ipv6Run.body).toBe(200);
+    expect(ipv6Run.body).toContain("run_config is not valid base64 JSON");
     expect(proc.exitCode).toBeNull();
   }, 60_000);
 
