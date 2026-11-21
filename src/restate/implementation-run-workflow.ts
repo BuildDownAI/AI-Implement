@@ -18,8 +18,9 @@ import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import { recordUsage, type RecordedUsage } from "../agent-usage.js";
+import { recordUsage, toRecordedUsage, type RecordedUsage } from "../agent-usage.js";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
+import type { InvocationRecordV1 } from "../pipeline/types.js";
 import { acceptOwnedRunReport, type OwnedRunReportResult, readBoundedOwnedRun, readOwnedRunStatus } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 import { restateRetentionMs } from "./retention.js";
@@ -504,6 +505,16 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     return { ...result, fingerprint: ownedRunReportFingerprint(body ?? {}) };
   }
 
+  /**
+   * One finished model call, sent by the runner while the run is still live (AII-2035).
+   * A singleton list is not a whole list: only the final result may mark usage complete.
+   */
+  async function recordInvocation(ctx: WorkflowSharedContext, record: InvocationRecordV1): Promise<void> {
+    await ctx.run("record-invocation", () => {
+      recordUsage(ctx.key, { ...toRecordedUsage({ invocations: [record] }), listWhole: false });
+    });
+  }
+
   async function status(ctx: WorkflowSharedContext): Promise<ImplementationRunStatusResult> {
     const [step, dispatchId, jobId] = await Promise.all([
       ctx.get<string>("step"),
@@ -524,6 +535,9 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         journalRetention: retentionMs,
         idempotencyRetention: retentionMs,
       }, report),
+      recordInvocation: restate.handlers.workflow.shared<void, InvocationRecordV1>({
+        journalRetention: retentionMs,
+      }, recordInvocation),
       status: restate.handlers.workflow.shared(status),
     },
     options: {

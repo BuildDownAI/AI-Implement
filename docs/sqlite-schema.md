@@ -68,8 +68,9 @@ The same transaction restores the profile revision immutable UPDATE trigger or t
 attribution `(dispatch_id, stage)` index. It also temporarily drops and restores the
 stored `trg_dispatch_log_pruned` definition, since its reference to attribution would
 prevent the rename while that table is absent. `initLogTable()` calls `getDb()` before
-`ensureAccountingTriggers()`, which recreates `trg_invocation_attribution_changed_at`
-after the rebuild. Historical copied rows therefore do not advance job timestamps.
+`ensureAccountingTriggers()`, which creates `trg_invocation_attribution_changed_at` and
+`trg_invocation_attribution_status_changed_at` after the rebuild. Historical copied rows
+therefore do not advance job timestamps.
 
 ## 2. The accounting parts (AII-1561)
 
@@ -102,10 +103,14 @@ invocation or report arrives.
 |---|---|---|---|
 | `trg_dispatch_log_changed_at` | `dispatch_log` | An update of one of the 13 columns in section 5, when `OLD` and `NEW` differ in at least one | Sets `changed_at` to now |
 | `trg_invocation_attribution_changed_at` | `model_invocation_attribution` | Insert | Sets `changed_at` on the job row in `dispatch_log` and `review_fix_attempts` |
+| `trg_invocation_attribution_status_changed_at` | `model_invocation_attribution` | An update of `status`, when `OLD` and `NEW` differ | Sets `changed_at` on the job row in `dispatch_log` and `review_fix_attempts` |
 | `trg_job_report_insert_changed_at` | `dispatch_job_report` | Insert | Same |
 | `trg_job_report_update_changed_at` | `dispatch_job_report` | Update that changes `pushed_shas_json` or `invocations_complete` | Same |
 | `trg_dispatch_log_pruned` | `dispatch_log` | Delete of a row with `completed_at` set | Raises `job_accounting_pruned`, then deletes the job's `model_invocation_attribution` and `dispatch_job_report` rows (section 4) |
 | `trg_review_fix_attempts_changed_at` | `review_fix_attempts` | Update of `state`, `terminal_outcome_json` or `completed_at` | Sets `changed_at` to now |
+
+`trg_invocation_attribution_status_changed_at` is created with `CREATE TRIGGER IF NOT EXISTS`;
+it adds no table and no column.
 
 `changed_at` is not in any `UPDATE OF` list, so these triggers never fire themselves. Bookkeeping
 columns such as `notified_at` and `machine_nonce` do not move `changed_at`.
@@ -158,8 +163,9 @@ gone, no reader can reach its call rows, so keeping them gave no value.
   those triggers again with updated references. For `completed_at`, that includes
   `trg_dispatch_log_pruned` as well as `trg_dispatch_log_changed_at`.
 - `changed_at` is named too. In `dispatch_log` and `review_fix_attempts`, it is written by
-  `trg_invocation_attribution_changed_at`, `trg_job_report_insert_changed_at` and
-  `trg_job_report_update_changed_at`. `trg_review_fix_attempts_changed_at` writes it in
+  `trg_invocation_attribution_changed_at`, `trg_invocation_attribution_status_changed_at`,
+  `trg_job_report_insert_changed_at` and `trg_job_report_update_changed_at`.
+  `trg_review_fix_attempts_changed_at` writes it in
   `review_fix_attempts`, and `trg_dispatch_log_pruned` reads it in `dispatch_log`. Removing
   `changed_at` from either table fails while any of these triggers remains.
 - The orchestrator already drops and creates `trg_dispatch_log_changed_at` at every boot. So the

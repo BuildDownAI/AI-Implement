@@ -327,6 +327,7 @@ describe("recorded usage", () => {
     const reportBefore = report();
     expect(reportBefore).toMatchObject({ pushed_shas_json: JSON.stringify(["a".repeat(40)]), invocations_complete: 1 });
     const before = rows();
+    const changedAt = db.prepare("SELECT changed_at FROM dispatch_log WHERE dispatch_id = 'usage-dispatch'").get();
     expect(before).toHaveLength(2);
     const stored = db.prepare("SELECT usage_json FROM model_invocation_attribution ORDER BY rowid").all() as { usage_json: string }[];
     expect(stored.map((r) => JSON.parse(r.usage_json))).toMatchObject([
@@ -336,11 +337,64 @@ describe("recorded usage", () => {
     expect(before).toMatchObject([{ invocation_id: "inv-review" }, { invocation_id: "inv-implementation", status: "timed_out" }]);
     expect(usage.recordUsage("usage-dispatch", JSON.parse(JSON.stringify(input)))).toBe(0);
     expect(rows()).toEqual(before);
+    expect(db.prepare("SELECT changed_at FROM dispatch_log WHERE dispatch_id = 'usage-dispatch'").get()).toEqual(changedAt);
     expect(report()).toEqual(reportBefore);
     const rejected = usage.toRecordedUsage({ invocations: [{ attribution: claim("review", { snapshotId: "other" }) }] });
     expect(usage.recordUsage("usage-dispatch", rejected)).toBe(1);
     expect(usage.recordUsage("usage-dispatch", rejected)).toBe(1);
     expect(rows()).toEqual(before);
+  });
+
+  it("upgrades an incrementally stored invocation to timed_out without duplicating or replacing its usage", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const db = dedup.getDb();
+    const dispatchId = "incremental-timeout";
+    db.prepare("INSERT INTO dispatch_log (issue_id, dispatched_at, dispatch_id, changed_at) VALUES ('incremental-timeout', 1, ?, 1)")
+      .run(dispatchId);
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, dispatchId,
+      JSON.stringify({ stages: snap.stages, profiles: snap.profiles }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+    const attribution = claim("implementation", { outcome: "error" });
+    const incremental = {
+      ...usage.toRecordedUsage({ invocations: [{ attribution, cacheReadTokens: 7, attempts: 2 }] }),
+      listWhole: false,
+    };
+    expect(incremental).toMatchObject({ listWhole: false, timedOut: false });
+    expect(usage.recordUsage(dispatchId, incremental)).toBe(0);
+    const status = () => db.prepare("SELECT status FROM model_invocation_attribution WHERE dispatch_id = ?").get(dispatchId);
+    expect(status()).toEqual({ status: "failed" });
+    db.prepare("UPDATE dispatch_log SET changed_at = 1 WHERE dispatch_id = ?").run(dispatchId);
+    const changedAt = () => db.prepare("SELECT changed_at FROM dispatch_log WHERE dispatch_id = ?").get(dispatchId) as { changed_at: number };
+    const beforeUpgrade = changedAt();
+    expect(beforeUpgrade).toEqual({ changed_at: 1 });
+
+    // The final report classifies the invocation as timed out but no longer carries its usage.
+    const final = usage.toRecordedUsage({
+      attribution: { ...attribution, usage: null },
+      invocations: [{ attribution: { ...attribution, usage: null }, cacheReadTokens: 7, attempts: 2 }],
+      failureCode: "INVOCATION_TIMEOUT",
+    });
+    expect(final).toMatchObject({ listWhole: true, timedOut: true });
+    expect(usage.recordUsage(dispatchId, final)).toBe(0);
+
+    const rows = db.prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY rowid")
+      .all(dispatchId) as Array<{ invocation_id: string; status: string; usage_json: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ invocation_id: attribution.invocationId, status: "timed_out" });
+    expect(JSON.parse(rows[0].usage_json)).toMatchObject({
+      tokensIn: 100, tokensOut: 10, costUsd: 0.5, cacheReadTokens: 7, attempts: 2,
+    });
+    expect(changedAt().changed_at).toBeGreaterThan(1);
+    const afterUpgrade = changedAt();
+    expect(usage.recordUsage(dispatchId, final)).toBe(0);
+    expect(status()).toEqual({ status: "timed_out" });
+    expect(changedAt()).toEqual(afterUpgrade);
+    expect(db.prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId))
+      .toEqual({ invocations_complete: 1 });
   });
 
   it.each([
