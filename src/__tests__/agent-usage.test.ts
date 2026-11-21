@@ -367,8 +367,10 @@ describe("recorded usage", () => {
     expect(usage.recordUsage(dispatchId, incremental)).toBe(0);
     const status = () => db.prepare("SELECT status FROM model_invocation_attribution WHERE dispatch_id = ?").get(dispatchId);
     expect(status()).toEqual({ status: "failed" });
-    const changedAt = () => db.prepare("SELECT changed_at FROM dispatch_log WHERE dispatch_id = ?").get(dispatchId);
+    db.prepare("UPDATE dispatch_log SET changed_at = 1 WHERE dispatch_id = ?").run(dispatchId);
+    const changedAt = () => db.prepare("SELECT changed_at FROM dispatch_log WHERE dispatch_id = ?").get(dispatchId) as { changed_at: number };
     const beforeUpgrade = changedAt();
+    expect(beforeUpgrade).toEqual({ changed_at: 1 });
 
     // The final report classifies the invocation as timed out but no longer carries its usage.
     const final = usage.toRecordedUsage({
@@ -386,7 +388,7 @@ describe("recorded usage", () => {
     expect(JSON.parse(rows[0].usage_json)).toMatchObject({
       tokensIn: 100, tokensOut: 10, costUsd: 0.5, cacheReadTokens: 7, attempts: 2,
     });
-    expect(changedAt()).not.toEqual(beforeUpgrade);
+    expect(changedAt().changed_at).toBeGreaterThan(1);
     const afterUpgrade = changedAt();
     expect(usage.recordUsage(dispatchId, final)).toBe(0);
     expect(status()).toEqual({ status: "timed_out" });
