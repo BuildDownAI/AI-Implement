@@ -509,11 +509,10 @@ function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketing
   }
   let config: TicketingMappingConfig;
   try {
-    config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
+    config = validateTicketingConfig(provider, body.ticketingConfig ?? null, (key) => label(`ticketingConfig.${key}` as const));
   } catch (err) {
-    const key = err instanceof TicketingConfigError ? err.key : undefined;
-    if (key === "jql" || key === "repoFieldValue") throw new MappingFieldError(`ticketingConfig.${key}`, `${label(`ticketingConfig.${key}`)} is required for Jira.`);
-    if (key === "directory") throw new MappingFieldError("ticketingConfig.directory", `${label("ticketingConfig.directory")} must be an absolute path on the orchestrator's host.`);
+    // A key at fault is one setting, named by its label in the validator's sentence. The rest is the config's shape, which a form never sends.
+    if (err instanceof TicketingConfigError && err.key) throw new MappingFieldError(`ticketingConfig.${err.key}` as const, err.message);
     throw new MappingFieldError("ticketingConfig", `${label("ticketingConfig")} must be set for the ${provider} ${label("ticketingProvider")}.`);
   }
   if (config.kind === "jira") {

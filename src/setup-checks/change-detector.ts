@@ -8,14 +8,11 @@ import { createHash } from "node:crypto";
 import { getDb } from "../dedup.js";
 import { KG_BASE_REPO_KEY, LINEAR_PICKUP_LABEL_KEY } from "../orchestrator-settings.js";
 import type { GitHubSetupReader, SetupCheck, SetupCheckContext, SetupCheckReader } from "./contract.js";
-import { SETUP_CHECKS } from "./index.js";
+import { SETUP_CHECKS, type SetupCheckRunKind } from "./index.js";
 
 // The setup checks' time in this module. The recheck hold is in index.ts, the ingress bounds in src/restate/setup-checks.ts, the Setup page's polls in its own module.
 /** The least time between two runs of one kind, so a burst of saves is checked once it settles, and the last save is always checked. */
 export const MIN_SETUP_CHECK_RUN_INTERVAL_MS = 5 * 60_000;
-
-/** A kind of run the change detector sends: every check, the orchestrator-wide checks, or one project's checks. */
-export type SetupCheckRunKind = { kind: "full" } | { kind: "orchestrator-wide" } | { kind: "project"; project: string };
 
 /**
  * The setup that saves change, as the checks read it from this orchestrator's own state, split by which checks read each part,

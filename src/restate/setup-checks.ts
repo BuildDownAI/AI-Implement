@@ -16,9 +16,8 @@ import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings, type RepoMapping } from "../config.js";
 import { whenDeployHoldClears } from "../deploy-hold.js";
-import { cacheSetupCheckRun, claimSetupCheckRun, createBootSetupChecks, createSetupCheckContext, endSetupCheckProgress, getCachedSetupCheckRun, mergeSetupCheckRun, partialRunNeedsFullRun, recheckHeld, recheckScope, recheckChecksWaitedOn, runOrchestratorWideSetupChecks, runProjectSetupChecks, runSetupChecks, runSetupChecksBeforeRestate, runSetupChecksInScope, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckContext, type SetupCheckScope, type SetupCheckRun } from "../setup-checks/index.js";
+import { cacheSetupCheckRun, claimSetupCheckRun, createBootSetupChecks, createSetupCheckContext, endSetupCheckProgress, getCachedSetupCheckRun, mergeSetupCheckRun, partialRunNeedsFullRun, recheckHeld, recheckScope, recheckChecksWaitedOn, runOrchestratorWideSetupChecks, runProjectSetupChecks, runSetupChecks, runSetupChecksBeforeRestate, runSetupChecksInScope, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckContext, type SetupCheckRunKind, type SetupCheckScope, type SetupCheckRun } from "../setup-checks/index.js";
 import { recheckKey, rememberRecheck, type SetupCheckRecheck } from "../setup-checks/recheck.js";
-import type { SetupCheckRunKind } from "../setup-checks/change-detector.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 import { getRestateStatus, restateCanServe, restateCanStartWork } from "./status.js";
 

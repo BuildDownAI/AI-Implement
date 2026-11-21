@@ -366,12 +366,13 @@ describe("a run for one project", () => {
     await expect(checks.runProjectSetupChecks(linearProject("OPS"), "ENG")).rejects.toThrow("A run for ENG needs a context holding that project alone");
   });
 
-  it("runs every per-project check and the rows they depend on, and no other orchestrator-wide check", async () => {
+  // The orchestrator-wide checks come from what the per-project checks declare they wait on, and the host clock beside the App's identity.
+  it("runs every per-project check, the orchestrator-wide checks they wait on and the clock, and no other orchestrator-wide check", async () => {
     const ids = idsOf(await checks.runProjectSetupChecks(linearProject(), "ENG"));
-    for (const id of ["tracker.provider", "tracker.linear.credentials", "github.app-identity", "github.clock", "tracker.linear.team-access", "github.installation", "github.target-secrets"]) {
+    for (const id of ["env.github-app", "tracker.provider", "tracker.linear.credentials", "github.app-identity", "github.clock", "tracker.linear.team-access", "github.installation", "github.target-secrets"]) {
       expect(ids).toContain(id);
     }
-    for (const id of ["tracker.jira.credentials", "restate", "env.github-app", "admin.path", "github.webhook-signature", "github.kg-grants", "model.credentials-adopted"]) {
+    for (const id of ["tracker.jira.credentials", "restate", "admin.path", "github.webhook-signature", "github.kg-grants", "model.credentials-adopted"]) {
       expect(ids).not.toContain(id);
     }
   });

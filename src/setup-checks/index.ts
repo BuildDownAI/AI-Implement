@@ -64,6 +64,9 @@ export interface SetupCheckScope {
   projects?: readonly string[];
 }
 
+/** A run the SetupChecks object takes: every check, the orchestrator-wide checks, or one project's checks. */
+export type SetupCheckRunKind = { kind: "full" } | { kind: "orchestrator-wide" } | { kind: "project"; project: string };
+
 /** A run as every allowlisted identity may see it on `get_tenant_health`: each row's identity and state, never its detail or fix (ADR 047). */
 export interface SetupCheckSummary {
   checkedAt: number;
@@ -231,8 +234,6 @@ export async function runSetupChecks(
 
 /** The checks whose rows no one project owns, in list order. */
 const ORCHESTRATOR_WIDE_CHECK_IDS: ReadonlySet<SetupCheckId> = new Set(SETUP_CHECKS.filter((check) => !check.perProject).map((check) => check.id));
-/** The orchestrator-wide checks every project's rows depend on, run beside them. */
-const PROJECT_RUN_DEPENDENCIES: readonly SetupCheckId[] = ["tracker.provider", "github.app-identity", "github.clock"];
 /** The orchestrator-wide checks per-project checks' rows can wait on, so a change to one reaches every project that shares it. */
 const SHARED_DEPENDENCIES: ReadonlySet<SetupCheckId> = new Set(SETUP_CHECKS.filter((check) => check.perProject)
   .flatMap((check) => check.waitsOnChecks ?? [])
@@ -241,6 +242,14 @@ const SHARED_DEPENDENCIES: ReadonlySet<SetupCheckId> = new Set(SETUP_CHECKS.filt
 export const BEFORE_FIRST_SYNC: readonly SetupCheckId[] = ["github.workflow-default-branch", "github.workflow-mapping-branch"];
 /** The credentials check of each ticketing system that has one. */
 const CREDENTIALS_CHECK: Partial<Record<string, SetupCheckId>> = { linear: "tracker.linear.credentials", jira: "tracker.jira.credentials" };
+/** Orchestrator-wide checks a project's run adds though no row waits on them: the host clock explains an App identity failure. */
+const PROJECT_RUN_DIAGNOSTICS: readonly SetupCheckId[] = ["github.clock"];
+
+/** The orchestrator-wide checks a project's run refreshes: those its per-project checks wait on, for its own ticketing system, and the diagnostics. */
+function projectRunDependencies(provider: string): ReadonlySet<SetupCheckId> {
+  const othersCredentials = Object.entries(CREDENTIALS_CHECK).filter(([id]) => id !== provider).map(([, check]) => check);
+  return new Set([...[...SHARED_DEPENDENCIES].filter((id) => !othersCredentials.includes(id)), ...PROJECT_RUN_DIAGNOSTICS]);
+}
 
 /**
  * Runs one project's checks and the orchestrator-wide checks they depend on. `ctx.mappings()` must answer that project alone,
@@ -254,9 +263,8 @@ export async function runProjectSetupChecks(
 ): Promise<SetupCheckRun> {
   const projects = Object.keys(ctx.mappings());
   if (projects.length !== 1 || projects[0] !== key) throw new Error(`A run for ${key} needs a context holding that project alone`);
-  const credentials = CREDENTIALS_CHECK[ctx.mappings()[key].ticketingProvider];
-  const checks = SETUP_CHECKS.filter((check) => !exclude.includes(check.id)
-    && (check.perProject || check.id === credentials || PROJECT_RUN_DEPENDENCIES.includes(check.id))).map((check) => check.id);
+  const dependencies = projectRunDependencies(ctx.mappings()[key].ticketingProvider);
+  const checks = SETUP_CHECKS.filter((check) => !exclude.includes(check.id) && (check.perProject || dependencies.has(check.id))).map((check) => check.id);
   const run = await runSetupChecksInScope(ctx, { checks, projects: [key] }, now);
   // tracker.provider runs only so a failing provider escalates: its stored row names every project on the provider, and this run's names one.
   return { ...run, scope: { checks: checks.filter((id) => id !== "tracker.provider"), projects: [key] } };

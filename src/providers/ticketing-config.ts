@@ -54,9 +54,12 @@ function normalizeFieldOverride(value: unknown): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
+/** A ticketing configuration key that one setting holds. */
+export type TicketingConfigKey = "jql" | "repoFieldValue" | "directory";
+
 /** A ticketing configuration refused, naming the key at fault when one is, so a save can name that setting. */
 export class TicketingConfigError extends Error {
-  constructor(message: string, readonly key?: "jql" | "repoFieldValue" | "directory") {
+  constructor(message: string, readonly key?: TicketingConfigKey) {
     super(message);
   }
 }
@@ -64,8 +67,13 @@ export class TicketingConfigError extends Error {
 /**
  * Validates that the parsed JSON is a valid TicketingMappingConfig matching
  * the expected provider. Throws a TicketingConfigError on mismatch.
+ * `subject` names a key in a refusal: its path in the stored data unless the caller names it otherwise.
  */
-export function validateTicketingConfig(provider: ProviderId, value: unknown): TicketingMappingConfig {
+export function validateTicketingConfig(
+  provider: ProviderId,
+  value: unknown,
+  subject: (key: TicketingConfigKey) => string = (key) => `ticketingConfig.${key}`,
+): TicketingMappingConfig {
   if (value === null || value === undefined) {
     if (provider === "linear") return DEFAULT_TICKETING_CONFIG;
     throw new TicketingConfigError(`ticketingConfig is required for provider "${provider}"`);
@@ -81,16 +89,16 @@ export function validateTicketingConfig(provider: ProviderId, value: unknown): T
   if (provider === "filesystem") {
     if (typeof obj.directory !== "string" || !obj.directory.trim() ||
         !isAbsolute(obj.directory.trim()) || obj.directory.includes("\0")) {
-      throw new TicketingConfigError("Filesystem ticketingConfig requires an absolute directory on the local orchestrator host", "directory");
+      throw new TicketingConfigError(`${subject("directory")} must be an absolute path on the orchestrator's host.`, "directory");
     }
     return { kind: "filesystem", directory: normalize(obj.directory.trim()) };
   }
   if (provider === "jira") {
     if (typeof obj.jql !== "string" || obj.jql.trim() === "") {
-      throw new TicketingConfigError("Jira ticketingConfig requires a non-empty jql string", "jql");
+      throw new TicketingConfigError(`${subject("jql")} is required for Jira.`, "jql");
     }
     if (typeof obj.repoFieldValue !== "string" || obj.repoFieldValue.trim() === "") {
-      throw new TicketingConfigError("Jira ticketingConfig requires a non-empty repoFieldValue string", "repoFieldValue");
+      throw new TicketingConfigError(`${subject("repoFieldValue")} is required for Jira.`, "repoFieldValue");
     }
     return {
       kind: "jira",
