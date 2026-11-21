@@ -23,7 +23,7 @@ export const VARIANTS = [["alwaysReplay"], ["disableRetries"]] as const satisfie
 
 export async function startVariants(
   services: RestateServices,
-  options: Pick<BinaryEnvironmentOptions, "invokerTimeouts"> = {},
+  options: Pick<BinaryEnvironmentOptions, "invokerTimeouts" | "requestIdentity"> = {},
 ): Promise<Map<string, RestateEnvironment>> {
   const started = await Promise.all(
     VARIANTS.map(async ([variant]) => [variant, await startBinaryEnvironment({ ...options, services, variant })] as const),
