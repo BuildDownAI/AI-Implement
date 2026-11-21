@@ -274,6 +274,26 @@ describe("fingerprintCheckList", () => {
     expect(redeclared({ contextReaders: [...list[0].contextReaders, "mappings"] })).not.toBe(before);
   });
 
+  // Keyed by every field a check declares, so a field added to SetupCheck does not compile until it has a case here.
+  const declaredDifferently: { [K in Exclude<keyof SetupCheck, "run">]-?: (check: SetupCheck) => SetupCheck[K] } = {
+    id: (check) => (check.id === "admin.path" ? "restate" : "admin.path"),
+    title: () => "Renamed",
+    group: (check) => (check.group === "github" ? "tracker" : "github"),
+    tier: (check) => (check.tier === "core" ? "feature" : "core"),
+    onAdminPath: (check) => !check.onAdminPath,
+    perProject: (check) => !check.perProject,
+    verifiable: (check) => !check.verifiable,
+    contextReaders: (check) => [...check.contextReaders, "mappings"],
+    githubReaders: (check) => [...(check.githubReaders ?? []), "app"],
+    waitsOnChecks: (check) => [...(check.waitsOnChecks ?? []), "restate"],
+    settingsRows: (check) => [...(check.settingsRows ?? []), "a_setting"],
+  };
+
+  it.each(Object.keys(declaredDifferently) as Array<keyof typeof declaredDifferently>)("changes when a check declares its %s differently", (field) => {
+    const first = checks.SETUP_CHECKS[0];
+    expect(redeclared({ [field]: declaredDifferently[field](first) })).not.toBe(checks.fingerprintCheckList(checks.SETUP_CHECKS));
+  });
+
   it("stays the same when only how a check judges changes", () => {
     expect(checks.fingerprintCheckList(checks.SETUP_CHECKS.map((check) => ({ ...check, run: () => [] })))).toBe(checks.fingerprintCheckList(checks.SETUP_CHECKS));
   });

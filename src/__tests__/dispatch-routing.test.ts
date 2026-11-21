@@ -1653,6 +1653,27 @@ describe("poll implementation submission — ImplementationRun for every project
     });
   });
 
+  // Shadow mode runs every run kind on GitHub Actions alone, so the poll resolves the backend from the runner mode, not the project's own mode.
+  it("submits a Fly project's implementation through ImplementationRun on GitHub Actions under shadow mode", async () => {
+    fakeFetch(POLL_CYCLE_ROUTES).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    const docker = await import("../local-docker.js");
+    (await import("../runner-mode.js")).setRunnerMode("shadow");
+    vi.mocked(docker.sweepExitedLocalContainers).mockResolvedValue([]);
+    store.upsertMapping("AII", jiraMapping("AII", { executionMode: "fly-machines", defaultBranch: "release/poll", maxJobMinutes: 42 }));
+    const provider = jiraProvider();
+    vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+      needsPlanning: [], readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [],
+    });
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("TOKEN_SENTINEL");
+
+    await indexModule.poll(config, makeRegistry({ provider, mappings: store.getMappings() }));
+
+    expect(implementationIngress.submit).toHaveBeenCalledTimes(1);
+    expect(implementationIngress.submit.mock.calls[0][1]).toMatchObject({ backend: "github-actions", launchContext: { runnerMode: "shadow" } });
+  });
+
   it("skips a project the forced runner mode cannot run, naming the check and asking for it to run again for the project", async () => {
     fakeFetch(POLL_CYCLE_ROUTES).install();
     const store = await import("../config.js");
