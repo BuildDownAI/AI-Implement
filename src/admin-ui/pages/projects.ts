@@ -515,14 +515,28 @@ export const projectsScript = `
 
   async function loadMappings() {
     const [res, storedSetup] = await Promise.all([window.api('/api/mappings'), loadSetupRun()]);
-    mappingsData = await res.json();
     const tbody = document.getElementById('mappings-body');
     const emptyEl = document.getElementById('mappings-empty');
+    // A refusal's body is not a map of projects, so it would render as rows.
+    if (!res.ok) {
+      let data = {};
+      try { data = await res.json(); } catch (_) {}
+      tbody.innerHTML = '';
+      if (emptyEl) {
+        emptyEl.textContent = data.error || 'Projects could not be loaded (HTTP ' + res.status + ').';
+        emptyEl.classList.remove('hidden');
+      }
+      return;
+    }
+    mappingsData = await res.json();
     tbody.innerHTML = '';
     const keys = Object.keys(mappingsData);
     renderSetupNote(keys, storedSetup);
     if (keys.length === 0) {
-      if (emptyEl) emptyEl.classList.remove('hidden');
+      if (emptyEl) {
+        emptyEl.textContent = 'No projects configured yet.';
+        emptyEl.classList.remove('hidden');
+      }
       return;
     }
     if (emptyEl) emptyEl.classList.add('hidden');

@@ -7,8 +7,8 @@ import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 type Mapping = Record<string, unknown>;
 
-/** `refused` answers the save with a refusal instead of success. */
-function mountProjects(mapping: RepoMapping = makeMapping(), refused: { save?: { status: number; body: unknown } } = {}) {
+/** `refused` answers the save, or the load, with a refusal instead of success. */
+function mountProjects(mapping: RepoMapping = makeMapping(), refused: { save?: { status: number; body: unknown }; load?: { status: number; body: unknown } } = {}) {
   const posts: unknown[] = [];
   const mounted = mountAdminPage({
     html: projectsHtml,
@@ -21,6 +21,7 @@ function mountProjects(mapping: RepoMapping = makeMapping(), refused: { save?: {
         return { ok: true, status: 200, json: async () => ({ syncJobId: null }) };
       }
       if (url === "/api/mappings") {
+        if (refused.load) return { ok: false, status: refused.load.status, json: async () => refused.load!.body };
         return { ok: true, status: 200, json: async () => ({ AII: mapping }) };
       }
       if (url === "/api/admin/config-status") {
@@ -76,6 +77,16 @@ describe("the Edit dialog's save refused by the server", () => {
     win.switchMappingTab("source");
     await save(win);
     expect([activeTab(doc), shownError(doc)]).toEqual(["source", "Invalid request body"]);
+  });
+});
+
+describe("the Projects table's load refused", () => {
+  it("shows the refusal instead of rendering its body as projects", async () => {
+    const { win, doc } = mountProjects(makeMapping(), { load: { status: 503, body: { error: "Access control is unavailable" } } });
+    await win.loadMappings();
+    expect(doc.querySelectorAll("#mappings-body tr")).toHaveLength(0);
+    const empty = doc.getElementById("mappings-empty")!;
+    expect([empty.classList.contains("hidden"), empty.textContent]).toEqual([false, "Access control is unavailable"]);
   });
 });
 
