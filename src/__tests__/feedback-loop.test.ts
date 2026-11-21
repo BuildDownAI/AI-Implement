@@ -1,7 +1,4 @@
-import {
-  CONFLICT_REPAIR_PR_SECTION_HEADING,
-  commentInstructionReviewRubric,
-} from "../pipeline/feedback-loop-core.js";
+import { commentInstructionReviewRubric } from "../pipeline/feedback-loop-core.js";
 import { createStageExecutor } from "../pipeline/stage-executor.js";
 import { ModelAuthClientError, type ModelInvocation } from "../model-auth-client.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
@@ -232,23 +229,10 @@ describe("splitPlanningContext with real assemblePlanningContext output", () => 
 });
 
 describe("feedbackLoopStep — planning context routing", () => {
-  it("adds the merge-commit scope rule only for a conflict repair", () => {
-    const plain = commentInstructionReviewRubric("Fix the documentation only")!;
-    expect(plain).not.toContain("net change against the feature branch");
-    expect(plain).not.toContain(CONFLICT_REPAIR_PR_SECTION_HEADING);
-    expect(plain).not.toContain("When this run created a merge commit");
-
-    const rubric = commentInstructionReviewRubric("Fix the documentation only", { conflictRepair: true })!;
-    const rule = "The review diff has one of two shapes";
+  it("puts the merge-commit scope rule in the trusted rubric outside the instruction guard", () => {
+    const rubric = commentInstructionReviewRubric("Fix the documentation only")!;
+    const rule = "When this run created a merge commit, the changes brought in from the merged branch are not this run's work; review the conflict resolution and this PR's own changes.";
     expect(rubric).toContain(rule);
-    expect(rubric).toContain(CONFLICT_REPAIR_PR_SECTION_HEADING);
-    expect(rubric).toContain("this PR's change before the merge");
-    expect(rubric).toContain("the net change against the feature branch after the merge");
-    expect(rubric).toContain("starts at the commit before the merge");
-    expect(rubric).toContain("Changes brought in from the merged branch are not this run's work");
-    expect(rubric).toContain("read the file");
-    expect(rubric).toContain("lost the effect of the PR's change");
-    expect(rubric).toContain("same effect");
     const guarded = wrapWithPlanningGuard("Fix the documentation only");
     expect(rubric.indexOf(rule)).toBeGreaterThan(rubric.indexOf(guarded) + guarded.length);
   });
