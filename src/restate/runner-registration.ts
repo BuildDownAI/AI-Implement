@@ -68,13 +68,14 @@ export async function registerRunnerDeploymentWithRetry(
     const result = await ctx.run(
       `register-${attempt}`,
       async (): Promise<RegisterRunnerDeploymentResult> => {
-        // A URI that Docker has not published yet is one unreachable attempt too.
-        const uri = await opts.readUri();
-        if (uri === null) return { ok: false, reason: "unreachable" };
         try {
+          // A URI that Docker has not published yet is one unreachable attempt too.
+          const uri = await opts.readUri();
+          if (uri === null) return { ok: false, reason: "unreachable" };
           return await register(uri);
         } catch {
-          // A throwing fetch is one unreachable attempt, not a reason to retry this step.
+          // A throwing URI read or register call is one unreachable attempt, not a
+          // reason to retry this step. `readPublishedPort` throws on Docker failures.
           return { ok: false, reason: "unreachable" };
         }
       },

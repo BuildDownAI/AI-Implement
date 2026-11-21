@@ -365,6 +365,32 @@ describe("registerRunnerDeploymentWithRetry (Restate)", () => {
     expect(sleeps(commands)).toHaveLength(1);
   });
 
+  it.each(VARIANTS.map(([label]) => label))("treats a throwing URI read as unreachable and registers on the next attempt (%s)", async (label) => {
+    const env = envFor(label);
+    let uriReads = 0;
+    const script = makeScript({
+      readUri: async () => {
+        uriReads++;
+        if (uriReads === 1) throw new Error("docker daemon busy");
+        return "http://127.0.0.1:1";
+      },
+    });
+
+    const { key, done } = callFixture(label, script, { bootstrapInMs: 5_000, sleepMs: 20 });
+    const result = await done;
+
+    expect(result).toEqual({ ok: true, deploymentId: "dp_fake" });
+    expect(script.readUriCalls).toBe(2);
+    expect(script.registerCalls).toBe(1);
+    expect(script.readStateCalls).toBe(1);
+
+    const commands = await journalCommands(env, key);
+    expect(registerSteps(commands).map((command) => command.name)).toEqual(["register-1", "register-2"]);
+    expect(stateSteps(commands).map((command) => command.name)).toEqual(["state-1"]);
+    expect(sleepSteps(commands).map((command) => command.name)).toEqual(["sleep-1"]);
+    expect(sleeps(commands)).toHaveLength(1);
+  });
+
   it.each(VARIANTS.map(([label]) => label))("retries after an unknown state, then succeeds (%s)", async (label) => {
     const env = envFor(label);
     const script = makeScript({
