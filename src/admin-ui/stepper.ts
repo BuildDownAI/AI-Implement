@@ -563,10 +563,17 @@ export const stepperScript = `
   };
   let jiraFieldsLoaded = false;
 
+  // Each opening of the stepper, so a Create answered after it closed and opened again never touches the new form.
+  let openCount = 0;
+  const CREATE_LABEL = 'Create project';
+
   function openNewProjectStepper() {
     // Reset state
     reviewReturnAt = null;
     continueSeq++;
+    openCount++;
+    const createBtn = document.getElementById('np-create');
+    if (createBtn) createBtn.textContent = CREATE_LABEL;
     step = 0;
     clearSetupCheck();
     data.ticketingProvider = 'linear';
@@ -1721,16 +1728,21 @@ export const stepperScript = `
 
     const teamKey = effectiveTeamKey();
     const body = mappingBody();
+    // Read before the request, since the form may be opened again for another project before it answers.
+    const validSecrets = data.secrets.filter(function (s) { return s.name && s.value; });
+    const opened = openCount;
 
     const createBtn = document.getElementById('np-create');
-    const origCreateLabel = createBtn ? createBtn.textContent : '';
     if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Creating...'; }
 
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
     let resData = {};
     try { resData = await res.json(); } catch (_) {}
-    if (createBtn) { createBtn.disabled = false; createBtn.textContent = origCreateLabel; }
+    const sameForm = opened === openCount;
+    if (sameForm && createBtn) { createBtn.disabled = false; createBtn.textContent = CREATE_LABEL; }
     if (!res.ok) {
+      // A refusal for a form that has since closed has nowhere to show.
+      if (!sameForm) return;
       // Back to the setting's step, whose Continue returns to Review, as a Review section's Change does.
       const at = fieldStep(resData.field);
       if (at !== undefined) {
@@ -1743,7 +1755,6 @@ export const stepperScript = `
     }
 
     // Seed secrets
-    const validSecrets = data.secrets.filter(function (s) { return s.name && s.value; });
     let secretFailures = 0;
     for (const s of validSecrets) {
       try {
@@ -1757,7 +1768,7 @@ export const stepperScript = `
       }
     }
 
-    closeNewProjectStepper();
+    if (sameForm) closeNewProjectStepper();
     if (window.loadMappings) await window.loadMappings();
     if (window.pollSyncStatus) window.pollSyncStatus(teamKey, resData.syncJobId);
 

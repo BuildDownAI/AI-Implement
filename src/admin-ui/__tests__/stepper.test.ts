@@ -468,6 +468,54 @@ describe("new-project stepper — Create refused by the server", () => {
   });
 });
 
+// Closing the stepper does not stop a Create already sent, and the stepper can be opened again for another project before it answers.
+describe("new-project stepper — a Create answered after the stepper opened again", () => {
+  function pendingSave() {
+    let answer: (reply: FakeApiResponse) => void = () => {};
+    const saved = new Promise<FakeApiResponse>((resolve) => { answer = resolve; });
+    return { saved, answer };
+  }
+
+  it("leaves the new form where it is when the refusal arrives", async () => {
+    const save = pendingSave();
+    const m = mountStepper({ save: () => save.saved });
+    await m.toReview();
+    await m.settled();
+    const submitted = m.win.stepperSubmit() as Promise<void>;
+    m.win.closeNewProjectStepper();
+    m.win.openNewProjectStepper();
+    save.answer(reply(400, { error: "The setting was refused.", field: "defaultBranch" }));
+    await submitted;
+    expect([m.shownStep(), m.error(), m.el("np-next").textContent]).toEqual([0, null, "Continue →"]);
+  });
+
+  it("keeps the new form open, and seeds the secrets the first project was created with, when the save succeeds", async () => {
+    const save = pendingSave();
+    const secretsSent: Array<{ url: string; body: Body }> = [];
+    const m = mountStepper({ save: () => save.saved });
+    const api = m.win.api as (url: string, init?: RequestInit) => Promise<FakeApiResponse>;
+    m.win.api = async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/secrets")) {
+        secretsSent.push({ url, body: JSON.parse(String(init?.body ?? "{}")) });
+        return reply(200, {});
+      }
+      return api(url, init);
+    };
+    await m.toReview();
+    m.win.addSecretRow();
+    (m.doc.querySelector(".np-secret-name") as HTMLInputElement).value = "TOKEN";
+    (m.doc.querySelector(".np-secret-value") as HTMLInputElement).value = "first";
+    await m.settled();
+    const submitted = m.win.stepperSubmit() as Promise<void>;
+    m.win.closeNewProjectStepper();
+    m.win.openNewProjectStepper();
+    save.answer(reply(200, { syncJobId: null }));
+    await submitted;
+    expect(m.el("np-stepper-wrap").hasAttribute("hidden")).toBe(false);
+    expect(secretsSent).toEqual([{ url: "/api/mappings/AII/secrets", body: { name: "TOKEN", value: "first" } }]);
+  });
+});
+
 describe("new-project stepper — Review's setup checks", () => {
   it("shows a section's rows waiting on the same check as one item", async () => {
     const waiting = (id: string) => result(id, "cannot-verify", { group: "tracker", fix: "f", waitsOnCheck: "tracker.provider" });
