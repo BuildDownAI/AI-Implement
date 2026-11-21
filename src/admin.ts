@@ -511,9 +511,9 @@ function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketing
   try {
     config = validateTicketingConfig(provider, body.ticketingConfig ?? null, (key) => label(`ticketingConfig.${key}` as const));
   } catch (err) {
-    // A key at fault is one setting, named by its label in the validator's sentence. The rest is the config's shape, which a form never sends.
-    if (err instanceof TicketingConfigError && err.key) throw new MappingFieldError(`ticketingConfig.${err.key}` as const, err.message);
-    throw new MappingFieldError("ticketingConfig", `${label("ticketingConfig")} must be set for the ${provider} ${label("ticketingProvider")}.`);
+    // A key at fault is one setting, named by its label in the validator's sentence. The rest is the config's shape, which a form never sends, so it keeps the validator's words.
+    const key = err instanceof TicketingConfigError ? err.key : undefined;
+    throw new MappingFieldError(key ? (`ticketingConfig.${key}` as const) : "ticketingConfig", err instanceof Error ? err.message : String(err));
   }
   if (config.kind === "jira") {
     // A field-id override is interpolated into JQL and into the fields list of a REST

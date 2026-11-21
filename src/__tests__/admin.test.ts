@@ -1239,15 +1239,18 @@ describe("admin mappings", () => {
     }
   });
 
-  it("upsertMapping rejects Jira ticketingProvider with linear ticketingConfig", async () => {
+  // A config of the wrong shape comes from an API caller, never a form, so its refusal says what is wrong with the data as sent.
+  it.each([
+    ["names the kind that does not match", { ticketingProvider: "jira", ticketingConfig: { kind: "linear" } }, ["ticketingConfig.kind", "linear", "jira"]],
+    ["says a config that is not an object is not one", { ticketingProvider: "jira", ticketingConfig: "jql" }, ["must be an object", "string"]],
+    ["says a missing config is required", { ticketingProvider: "jira" }, ["required", "jira"]],
+  ])("upsertMapping's refusal of a ticketingConfig shape %s", async (_case, ticketing, named) => {
     const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "BAD", owner: "org", repo: "bad",
-      ticketingProvider: "jira",
-      ticketingConfig: { kind: "linear" },
-    }, token);
+    const res = await request("/api/mappings", "POST", "secret", { teamKey: "BAD", owner: "org", repo: "bad", ...ticketing }, token);
     expect(res.statusCode).toBe(400);
-    expectRefusal(res, "ticketingConfig");
+    const refusal = JSON.parse(res.body) as { error: string; field: string };
+    expect(refusal.field).toBe("ticketingConfig");
+    for (const fact of named) expect(refusal.error).toContain(fact);
   });
 
   it("persists a valid branchPrefix and returns it", async () => {
