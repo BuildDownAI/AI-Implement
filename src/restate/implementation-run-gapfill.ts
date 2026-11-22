@@ -1,3 +1,4 @@
+import { implementationIntentStore } from "./implementation-launch-intent.js";
 import { decideImplementationSandbox } from "../implementation-launch.js";
 import { getFlyProcessLevelSecrets } from "../runner-mode.js";
 import { requireImplementationRunOwner } from "./implementation-run-owner.js";
@@ -318,6 +319,9 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           stageCommentGapfillLaunch(run.dispatchId, { record: privateRecord,
             target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
             ...(run.backend === "fly-machines" ? { flyApp: flyApp! } : {}), accepted: false });
+          if (run.backend === "local-docker") implementationIntentStore().write(run.dispatchId, {
+            serve: true, flyApp: null,
+          });
           launchStarted = true;
         };
         let machineId: string;

@@ -730,4 +730,8 @@ Only admin HTTP handlers call its timed ingress helpers. Inputs contain a destin
 unavailable; DELETE removes the secret before clearing. See [Stored key safety](key-safety.md)
 for the schema, handler contract, legacy behavior and adoption rules.
 
-Local Docker `ImplementationRun` runners launch in serve mode. The workflow registers the runner with Restate and waits on one `Runner_<dispatchId>.run` call instead of polling the container. Result callbacks still supply the outcome; cleanup removes the deployment after the call ends.
+Local Docker `ImplementationRun` runners launch in serve mode, exposing the service `Runner_<runId>` (the run id is the dispatch id). The workflow registers the runner deployment, saves its deployment id in the private launch intent, and makes one `run` call. Restate journals the call across server restarts. Result callbacks still supply the outcome. When the call ends, the workflow finalizes the job, removes the container and deployment, and releases admission; cancellation and deadlines stop the runner call before cleanup.
+
+Owner recovery runs outside the workflow journal. A private launch-time serve marker distinguishes these containers from older local runs. For a serve run, recovery removes the container first, confirms its status is `ended`, removes the persisted deployment, then finalizes and releases as usual. Already-absent resources are safe to retry; failed removal or unconfirmed termination retains admission. Fly, GitHub Actions and local intents without serve evidence keep their existing recovery path.
+
+Known gap (AII-2036): a deployment can remain registered if the orchestrator dies before cleanup, especially between registration and persisting its id. Recovery can remove a deployment only when its id was saved; there is no deployment discovery sweep.

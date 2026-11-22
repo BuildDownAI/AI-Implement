@@ -110,6 +110,7 @@ export interface ImplementationRunDependencies {
   readStatus(input: ImplementationRunInput, jobId: string): Promise<OwnedRunStatus>;
   /** Local serve readers; the shared helper owns registration retries. */
   runnerRegistration?(input: ImplementationRunInput, jobId: string): Pick<RunnerDeploymentRegistrationOptions, "readUri" | "readContainerState" | "register">;
+  recordRunnerDeployment?(input: ImplementationRunInput, deploymentId: string): void | Promise<void>;
   /** Successful registration is started evidence, independent of container polling. */
   markStarted?(input: ImplementationRunInput): void | Promise<void>;
   /** Test seam; production uses removeDeployment. */
@@ -465,6 +466,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           return runEnded && rowFinalized ? await wrapUpAndRelease("launch_rejected") : retain();
         }
         deploymentId = registered.deploymentId;
+        await ctx.run("record-runner-deployment", async () => { await deps.recordRunnerDeployment?.(input, registered.deploymentId); });
         runnerCall = ctx.genericCall({
           service: `Runner_${dispatchId}`, method: "run", parameter: { workflowKey: ctx.key },
           inputSerde: restate.serde.json, outputSerde: restate.serde.json,
