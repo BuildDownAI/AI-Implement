@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { implementationIntentStore } from "./implementation-launch-intent.js";
 import { modelPricesResponseSchema } from "./model-prices.js";
 import type { RunModelPrices } from "../run-config.js";
+import { removeDeployment } from "./endpoint.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 /** Production composition for the `ImplementationRun` service (AII-1557): the real deps for
  * `createImplementationRunWorkflow` on GitHub Actions, Fly Machines and local Docker. Sibling of
@@ -229,6 +230,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
     groupingParent: boolean;
     dispatchedAt: number;
     flyApp: string | null;
+    serve?: boolean;
+    runnerDeploymentId?: string;
   };
   // Recovery only: never copy launch configuration (especially arbitrary extraEnv values).
   // These are the fields consumed by provider selection, bookkeeping and backend lookup.
@@ -246,13 +249,14 @@ export function createProductionImplementationRunServices(input: ImplementationR
   function saveIntent(run: ImplementationRunInput, ctx: Prelaunch, metadata: Omit<LaunchMetadata, "ghToken">) {
     implementationIntentStore().write(run.dispatchId, {
       context: { mapping: recoveryMapping(ctx.mapping), issue: ctx.issue, generation: ctx.generation, baseBranch: ctx.baseBranch, baseBranchFieldValue: ctx.baseBranchFieldValue, runnerMode: ctx.runnerMode },
+      ...(run.backend === "local-docker" ? { serve: true } : {}),
       metadata, accounting: trackerAccounting(ctx.mapping, ctx.provider, ctx.issue), groupingParent: ctx.groupingParent,
       dispatchedAt: readAdmission(run.dispatchId)?.createdAt ?? Date.now(), flyApp: config.flySessionsApp,
     } satisfies Intent);
   }
 
   function frozenMapping(run: ImplementationRunInput): RepoMapping {
-    const mapping = implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.context.mapping ?? implementationIntentStore().readPreparation(run.dispatchId)?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
+    const mapping = implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.context?.mapping ?? implementationIntentStore().readPreparation(run.dispatchId)?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
     if (!mapping) throw new Error(`missing frozen implementation target: ${run.dispatchId}`);
     return mapping;
   }
@@ -751,7 +755,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
           throw new Error(`managed preparation identity mismatch: ${run.dispatchId}`);
         }
       }
-      const frozenMapping = stored?.snapshot.context.mapping ?? preparation?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
+      const frozenMapping = stored?.snapshot.context?.mapping ?? preparation?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
       const flyApp = backendConfig(run).flySessionsApp;
       const find = createImplementationFindExistingRun({ getMapping: () => {
         if (!frozenMapping) throw new Error(`missing frozen implementation target: ${run.dispatchId}`);
@@ -831,18 +835,22 @@ export function createProductionImplementationRunServices(input: ImplementationR
       let id: string | null;
       try {
         id = owner.jobId ?? await deps.findExistingRun(owner.input, owner.createdAt);
+        if (id !== null && owner.input.backend === "local-docker" && intent?.snapshot.serve) await cleanup(owner.input, id);
         if (id === null || await readStatus(owner.input, id) !== "ended") return { reason: "termination_unconfirmed" };
       } catch {
         return { reason: "termination_unconfirmed" };
       }
+      const serveRecovery = owner.input.backend === "local-docker" && intent?.snapshot.serve;
+      if (serveRecovery && intent.snapshot.runnerDeploymentId) await removeDeployment(intent.snapshot.runnerDeploymentId);
       await finishJob(dispatchId, readImplementationRunOwner(dispatchId)?.finishOutcome ?? { kind: "run_ended" });
-      await cleanup(owner.input, id);
+      if (!serveRecovery) await cleanup(owner.input, id);
       await onOutcome(dispatchId);
       const finished = readImplementationRunOwner(dispatchId)!;
       const reason = finished.finishResult?.release ?? (finished.finishOutcome?.kind === "deadline" ? "deadline_exceeded" : finished.finishOutcome?.kind === "cancelled" ? "cancelled" : "finalized");
       releaseImplementationRunOwner(dispatchId, reason);
       return { reason };
     },
+    recordRunnerDeployment: (run, deploymentId) => { implementationIntentStore().recordRunnerDeployment(run.dispatchId, deploymentId); },
     runnerRegistration: (_run, jobId) => ({
       readUri: async () => {
         const port = await readPublishedPort(jobId, 9080);
