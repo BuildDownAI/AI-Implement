@@ -31,8 +31,8 @@ exec docker run --rm -i \
   "$image" bash -s -- "$suite" <<'CONTAINER'
 set -euo pipefail
 apt-get update
-apt-get install -y --no-install-recommends git jq shellcheck python3 make g++
-for tool in git jq shellcheck python3 make g++ bash sh tar runuser; do
+apt-get install -y --no-install-recommends git jq shellcheck python3 make g++ curl ca-certificates
+for tool in git jq shellcheck python3 make g++ curl bash sh tar runuser; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Missing required tool: $tool" >&2
     exit 1
