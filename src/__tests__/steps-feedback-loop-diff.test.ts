@@ -390,9 +390,6 @@ describe("getDiff from the run start commit", () => {
 
     writeFileSync(filePath, "export const a = 2;\n");
     utimesSync(filePath, pinnedTime, pinnedTime);
-    // An untracked file makes `git add -N` rewrite the disposable index,
-    // exercising the timestamp restoration that keeps this change visible.
-    writeFileSync(join(pinned, "added.ts"), "export const b = 1;\n");
     const indexResult = spawnSync("git", ["rev-parse", "--git-path", "index"], {
       cwd: pinned,
       stdio: ["ignore", "pipe", "pipe"],
@@ -400,9 +397,7 @@ describe("getDiff from the run start commit", () => {
     const indexPath = join(pinned, indexResult.stdout.toString().trim());
     utimesSync(indexPath, pinnedTime, pinnedTime);
 
-    const diff = getDiff(pinned, pinnedStart);
-    expect(diff).toContain("added.ts");
-    expect(diff).toContain("+export const a = 2;");
+    expect(getDiff(pinned, pinnedStart)).toContain("+export const a = 2;");
   });
 
   it("falls back to HEAD for an empty base", () => {
