@@ -112,6 +112,7 @@ export interface ImplementationRunDependencies {
   readStatus(input: ImplementationRunInput, jobId: string): Promise<OwnedRunStatus>;
   /** Local serve readers; the shared helper owns registration retries. */
   runnerRegistration?(input: ImplementationRunInput, jobId: string): Pick<RunnerDeploymentRegistrationOptions, "readUri" | "readContainerState" | "register">;
+  recordRunnerResult?(input: ImplementationRunInput, body: import("../runner-callback.js").RunnerResultBody): void | Promise<void>;
   recordRunnerDeployment?(input: ImplementationRunInput, deploymentId: string): void | Promise<void>;
   /** Successful registration is started evidence, independent of container polling. */
   markStarted?(input: ImplementationRunInput): void | Promise<void>;
@@ -398,6 +399,9 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           }
           if (body && typeof body === "object" && "phase" in body) {
             const result = body as import("../runner-callback.js").RunnerResultBody;
+            await ctx.run("record-runner-result", async () => {
+              await deps.recordRunnerResult?.(input, result);
+            }, { maxRetryAttempts: 3 });
             await ctx.run("accept-runner-result", async () => {
               if (!deps.acceptRunnerResult) throw new Error("runner result intake unavailable");
               await deps.acceptRunnerResult(input, result);
