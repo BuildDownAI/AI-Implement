@@ -71,7 +71,7 @@ export interface RunnerServiceDeps {
   retryInitialIntervalMs?: number;
   inactivityTimeoutMs?: number;
   abortTimeoutMs?: number;
-  /** Test seam for the failure-message scrubber; production reads `process.env`. */
+  /** Test seam for the event payload scrubber; production reads `process.env`. */
   env?: NodeJS.ProcessEnv;
 }
 
@@ -96,14 +96,32 @@ export function sanitizeRunnerFailure(err: unknown, env: NodeJS.ProcessEnv = pro
   } catch {
     message = "pipeline failed";
   }
-  for (const [name, value] of Object.entries(env)) {
-    if (!value || value.length < 8 || !SECRET_ENV_NAME.test(name)) continue;
-    message = message.split(value).join("[redacted]");
-  }
-  for (const pattern of TOKEN_LIKE) message = message.replace(pattern, "[redacted]");
+  message = redactRunnerString(message, env);
   message = message.replace(/\s+/g, " ").trim();
   if (message.length === 0) return "pipeline failed";
   return message.length > MAX_FAILURE_MESSAGE_CHARS ? `${message.slice(0, MAX_FAILURE_MESSAGE_CHARS)}…` : message;
+}
+
+/** Redact values without folding whitespace or truncating result/comment bodies. */
+function redactRunnerString(text: string, env: NodeJS.ProcessEnv): string {
+  // Replace longer values first so an overlapping short secret cannot expose a suffix.
+  const secrets = Object.entries(env)
+    .filter(([name, value]) => value && SECRET_ENV_NAME.test(name))
+    .map(([, value]) => value!)
+    .sort((a, b) => b.length - a.length);
+  for (const value of secrets) text = text.split(value).join("[redacted]");
+  for (const pattern of TOKEN_LIKE) text = text.replace(pattern, "[redacted]");
+  return text;
+}
+
+/** Event payloads are JSON; copy recursively so pipeline-owned objects stay intact. */
+function redactRunnerPayload<T>(value: T, env: NodeJS.ProcessEnv): T {
+  if (typeof value === "string") return redactRunnerString(value, env) as T;
+  if (Array.isArray(value)) return value.map(item => redactRunnerPayload(item, env)) as T;
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactRunnerPayload(item, env)])) as T;
+  }
+  return value;
 }
 
 /**
@@ -153,6 +171,11 @@ export class RunnerFlight {
 
   private push(event: RunnerEvent): void {
     if (this.terminal) return;
+    if (event.kind === "step") {
+      event = { kind: "step", step: redactRunnerPayload(event.step, this.env) };
+    } else if (event.kind === "result") {
+      event = { kind: "result", result: redactRunnerPayload(event.result, this.env) };
+    }
     const index = this.events.length;
     this.events.push(event);
     if (event.kind === "settled" || event.kind === "failed") this.terminal = true;
