@@ -30,6 +30,8 @@ import type { InvocationRecordV1 } from "../../pipeline/types.js";
 import { createImplementationRunWorkflow, type ImplementationRunDependencies } from "../../restate/implementation-run-workflow.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import {
+  RunnerFlight,
+  sanitizeRunnerFailure,
   RUNNER_IDENTITY_KEY_ENV,
   RUNNER_ID_ENV,
   RUNNER_SERVICE_PORT,
@@ -411,6 +413,44 @@ function implementationWorkflow(seams: Partial<ImplementationRunDependencies> = 
 }
 
 describe("Runner_<runId> Restate service (AII-2034)", () => {
+  it("scrubs nested queued payloads without changing source objects or formatting", async () => {
+    const env: NodeJS.ProcessEnv = {};
+    const secret = "tiny";
+    const token = "sk-unconfigured123456789";
+    const text = `ordinary line\n  ${secret} ${token}\n${"x".repeat(2100)}`;
+    const safeText = `ordinary line\n  [redacted] [redacted]\n${"x".repeat(2100)}`;
+    const step = { id: "custom", type: "custom" as const, status: "failed" as const,
+      started_at: "2026-11-01T00:00:00Z", ended_at: null, parent_step_id: null, logs_url: null,
+      inputs: { nested: [{ text, githubToken: "key-only-secret" }], count: 42 },
+      outputs: { error: text } };
+    const result = { phase: "implementation" as const, outcome: "failure" as const,
+      failureReason: text, comments: [{ body: text }], failure: {
+        category: "unknown" as const, code: "UNKNOWN", stage: "custom", attempt: 1,
+        retryable: false, message: text, evidence: { stderrTail: text, truncated: false },
+      } };
+    const original = structuredClone({ step, result });
+    const flight = new RunnerFlight(async options => {
+      // Credentials may be installed by pipeline setup after flight construction.
+      env.MODEL_API_KEY = secret;
+      await options.reporter!.report(step);
+      await options.resultSink!(result);
+      return { exitCode: 1 };
+    }, env);
+    flight.start();
+    expect(await flight.next(0)).toEqual({ kind: "step", step: { ...step,
+      inputs: { nested: [{ text: safeText }], count: 42 }, outputs: { error: safeText } } });
+    expect(await flight.next(1)).toEqual({ kind: "result", result: { ...result,
+      failureReason: safeText, comments: [{ body: safeText }], failure: { ...result.failure,
+        message: safeText, evidence: { stderrTail: safeText, truncated: false } } } });
+    expect(await flight.next(2)).toEqual({ kind: "settled" });
+    expect({ step, result }).toEqual(original);
+    const failure = sanitizeRunnerFailure(new Error(text), env);
+    expect(failure).not.toContain(secret);
+    expect(failure).not.toContain(token);
+    expect(failure).not.toContain("\n");
+    expect(failure).toHaveLength(2001);
+  });
+
   it.each(VARIANTS)("a signed call to Runner_<runId>.run settles without a result body (%s)", async (label) => {
     const env = envs.get(label)!;
     const runId = randomUUID();
@@ -465,7 +505,7 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
         const runner = new PipelineRunner()
           .register("feedback-loop", { run: async () => makeFeedbackLoopOutputs() })
           .register("push", { run: async () => {
-            if (outcome === "failure") throw new Error("synthetic push failure");
+            if (outcome === "failure") throw new Error("synthetic push failure synthetic-token ghs_unconfigured12345678");
             return { prUrl: "https://github.com/acme/app/pull/1", branchPushed: true, prNumber: 1, commitSha: "a".repeat(40) };
           } });
         const endpoint = await registerRunner(env, [implementationWorkflow(), createRunnerService({ runId, runAutonomous: options => runAutonomous({ ...options,
@@ -473,12 +513,33 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
           pipeline: { id: "result", steps: ["feedback-loop", "push"].map(id => ({ id, type: "custom", moduleId: id })) },
         }) })]);
         endpoints.push(endpoint);
-        expect(await callService(env.baseUrl(), runnerServiceName(runId), "run", { workflowKey: runId }))
+        const result = await callService(env.baseUrl(), runnerServiceName(runId), "run", { workflowKey: runId });
+        expect(result)
           .toMatchObject({ phase: "implementation", outcome, comments: expect.any(Array) });
         expect(recording.calls.filter(call => call.method === "POST")).toEqual([]);
         const rows = await eventually(() => getStepsByJobId(getJobByDispatchId(runId)!.id),
           rows => rows.length === 2 && rows.every(row => row.status !== "running"), { label: "persisted pipeline steps" });
         expect(rows.map(row => row.stepId)).toEqual(["feedback-loop", "push"]);
+        if (outcome === "failure") {
+          expect(result).toMatchObject({ failureReason: expect.stringContaining("synthetic push failure") });
+          expect(rows[1]).toMatchObject({ status: "failed", outputsJson: expect.stringContaining("synthetic push failure") });
+          const invocation = await waitForInvocation(env, runnerServiceName(runId));
+          const runnerJournal = journalText(await journalEntries(env.adminAPIBaseUrl(), String(invocation.id)));
+          expect(runnerJournal).toContain('"kind":"result"');
+          expect(runnerJournal).toContain('"kind":"step"');
+          const steps = await eventually(
+            () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_handler_name = 'step' AND target_service_key = '${runId}'`),
+            found => found.length >= 4 && found.every(row => row.status === "completed"),
+            { label: "workflow step journals" },
+          );
+          const workflowJournals = (await Promise.all(steps.map(async row => journalText(await journalEntries(env.adminAPIBaseUrl(), String(row.id)))))).join("\n");
+          expect(workflowJournals).toContain("synthetic push failure");
+          for (const text of [JSON.stringify(result), runnerJournal, workflowJournals]) {
+            expect(text).toContain("[redacted]");
+            expect(text).not.toContain("synthetic-token");
+            expect(text).not.toContain("ghs_unconfigured12345678");
+          }
+        }
       } finally {
         vi.unstubAllEnvs();
         await rm(workspaceDir, { recursive: true, force: true });
