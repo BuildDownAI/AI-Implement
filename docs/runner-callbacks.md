@@ -9,13 +9,15 @@ The blast-radius section exists because of AII-567: a test suite inside a dispat
 Local serve-mode runs deliver the last `result` event body through the Restate runner call,
 rather than posting `/runner/result`. The workflow applies the shared callback lifecycle
 intake and owned-run accounting before finalizing. Pipeline settlement also ends the call
-when the pilot emits no result. Step progress still uses callbacks. Runs outside serve
-mode (currently Fly and GitHub Actions) retain result and progress callbacks.
+when the pilot emits no result. Local serve-mode implementation runs also send step
+progress through the runner's journaled event loop to `ImplementationRun.step`,
+rather than posting `/runner/progress`. Runs outside serve mode (currently Fly and
+GitHub Actions) retain result and progress callbacks.
 
 ## The path
 
 The diagram shows callback delivery for runs outside serve mode. Local serve-mode
-results use the Restate call described above; their progress follows the diagram.
+results and implementation step progress use the Restate call described above.
 
 ```mermaid
 sequenceDiagram
@@ -145,6 +147,15 @@ attempt identity before ACK. A missing store, forged attempt, or storage failure
 cannot produce a success ACK. Legacy runs do not use this route.
 
 ## The step reporter as the run signal
+
+Local serve-mode implementation runs use `RestateStepReporter`, supplied by
+`RunnerFlight` through `opts.reporter`. Each report queues one redacted `step`
+event; the runner's journaled event loop sends it one-way to the shared
+`ImplementationRun.step` handler. That handler resolves the job from the workflow
+key and calls the same `upsertStepRecord` used by `/runner/progress`. These runs
+send no step reports to `/runner/progress` or `/api/step-report`. Non-serve runs
+keep their existing reporter selection. Tool activity still uses `/runner/activity`.
+
 
 A run kind that a Restate workflow owns sends its "I started" signal as a step report: the kg-refresh runner uses `TokenStepReporter` (`src/pipeline/reporter.ts`), which posts `{ step }` to `/runner/progress` with the progress token, and the route forwards the validated, redacted step to the workflow's shared handler (`progress(dispatchId, step)`). A body with no `step` (an old runner image) is still a bare heartbeat. The result keeps `postRunnerResult` and `/runner/result` with the result token. The runner never calls the Restate ingress, which binds to loopback (ADR 023). A failed post logs and does not change the outcome of the run. `TokenStepReporter` removes credential keys from `inputs` and `outputs` with `redactStepCredentials` before the body is serialized.
 
