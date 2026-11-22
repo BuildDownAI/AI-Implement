@@ -971,7 +971,7 @@ describe("ImplementationRun durable workflow", () => {
     const initial: Step = { id: "child", type: "custom", status: "running", started_at: "2026-11-01T00:00:00Z",
       ended_at: null, parent_step_id: "parent", inputs: { value: 1 }, outputs: {}, logs_url: null };
     for (const step of [initial, { ...initial, status: "passed" as const, ended_at: "2026-11-01T00:01:00Z",
-      outputs: { value: 2 }, logs_url: "https://logs.example/child" }]) {
+      outputs: { value: 2 }, logs_url: "https://logs.example/child" }, initial]) {
       expect((await handleRunnerProgress({ authorization: `Bearer ${token}`, secret, body: { step } })).status).toBe(200);
       await callWorkflow(url, "ImplementationRun", dispatchId, "step", step);
       const read = (id: string) => getStepsByJobId(getJobByDispatchId(id)!.id)
@@ -979,6 +979,10 @@ describe("ImplementationRun durable workflow", () => {
       expect(read(dispatchId)).toEqual(read(callbackId));
       expect(read(dispatchId)).toHaveLength(1);
     }
+    expect(getStepsByJobId(getJobByDispatchId(dispatchId)!.id)[0]).toMatchObject({
+      status: "passed", endedAt: "2026-11-01T00:01:00Z",
+      outputsJson: JSON.stringify({ value: 2 }), logsUrl: "https://logs.example/child",
+    });
     await expect(callWorkflow(url, "ImplementationRun", `${dispatchId}-missing`, "step", initial)).rejects.toThrow(/job_not_found/);
   });
 

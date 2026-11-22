@@ -62,6 +62,21 @@ describe("step_log table", () => {
     expect(JSON.parse(records[0].outputsJson)).toEqual({ workspaceDir: "/tmp/work" });
   });
 
+  it.each(["passed", "failed", "skipped", "cancelled"] as const)(
+    "preserves %s details when a delayed running update arrives",
+    (status) => {
+      const jobId = log.appendLog({ issueId: "issue-1" });
+      const terminal = makeStep({ status, ended_at: "2025-01-01T00:01:00.000Z",
+        outputs: { result: "finished" }, logs_url: "https://logs.example/clone" });
+      stepLog.upsertStepRecord(jobId, terminal);
+      const before = stepLog.getStepRecord(jobId, terminal.id);
+
+      stepLog.upsertStepRecord(jobId, makeStep());
+
+      expect(stepLog.getStepRecord(jobId, terminal.id)).toEqual(before);
+    },
+  );
+
   it("stores parent_step_id for sub-steps", () => {
     const jobId = log.appendLog({ issueId: "issue-1" });
 
