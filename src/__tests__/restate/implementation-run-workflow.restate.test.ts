@@ -1,3 +1,4 @@
+import { createImplementationRunWorkflow as createLegacyImplementationRunWorkflow } from "./fixtures/legacy-implementation-run.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -164,6 +165,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
         { dispatchId: input.dispatchId, issueId: input.issueId, teamKey: input.teamKey, phase: "implementation" });
       expect(result.status).toBe(200);
     },
+    readLaunchServe: input => input.backend === "local-docker",
     async reserve(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.calls.push("reserve");
@@ -1493,8 +1495,9 @@ describe("ImplementationRun durable workflow", () => {
   }, 60_000);
 
   // A crash replay in the middle of the wait: the endpoint is replaced and the server restarted on its disk journal.
-  it("a restart during the wait replays without a second reserve, launch or release", async () => {
-    const env = await startRetryEnabled([createImplementationRunWorkflow(makeDeps(SLOW))]);
+  it.each(["wait", "confirm"])("a pre-serve local journal resumes at %s without registration or duplicate effects", async point => {
+    const replaySeams = { ...SLOW, tickMs: 3_600_000, confirmTickMs: 3_600_000 };
+    const env = await startRetryEnabled([createLegacyImplementationRunWorkflow(makeDeps(replaySeams))]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
       const dispatchId = `implementation-replay-${counter++}`;
@@ -1505,15 +1508,30 @@ describe("ImplementationRun durable workflow", () => {
         finalizeCalls: [], closeCalls: [], stuckCalls: [], clearCalls: 0, prMerged: false, events: [],
       };
       scenarios.set(dispatchId, sc);
-      const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "i", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "github-actions" };
+      const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "i", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "local-docker" };
       const original = callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "run", input);
       void original.catch(() => undefined); // ingress may disconnect during the restart
       const read = () => callWorkflow<ImplementationRunStatusResult>(env.baseUrl(), "ImplementationRun", dispatchId, "status");
       await waitForStep(read, "wait");
-      replacement = await replaceEndpoint(env, [createImplementationRunWorkflow(makeDeps(SLOW))]);
+      await eventually(async () => {
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${dispatchId}' AND target_handler_name = 'run'`);
+        if (rows.length !== 1) return false;
+        const entries = await journalEntries(env.adminAPIBaseUrl(), String(rows[0]!.id));
+        return entries.some(entry => entry.entry_type === "Command: Sleep");
+      }, Boolean, { label: "legacy polling journal suspended on its wait sleep" });
+      if (point === "confirm") {
+        sc.readGate = gate("legacy confirm");
+        await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report");
+        await sc.readGate.reached();
+      }
+      const upgraded = makeDeps(replaySeams);
+      upgraded.runnerRegistration = () => { throw new Error("legacy run must not register"); };
+      upgraded.readLaunchServe = () => { throw new Error("replay must not read mode"); };
+      replacement = await replaceEndpoint(env, [createImplementationRunWorkflow(upgraded)]);
       await env.startedRestateServer.restart();
-      await waitForStep(read, "wait");
+      await waitForStep(read, point);
       sc.status = "ended";
+      sc.readGate?.release();
       await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report");
       await eventually(() => releasesOf(dispatchId), (r) => r.length >= 1, { label: "the release after the replay" });
       expect(sc.calls.filter((c) => c === "reserve")).toHaveLength(1);

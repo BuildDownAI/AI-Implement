@@ -61,6 +61,8 @@ function checkSnapshot(prefix: string, point: string, actual: JournalCommand[]):
 
 const CASES = [
   { backend: "github-actions", prefix: "implementation-run", dispatchId: "implementation-journal-snapshot" },
+  // Legacy local polling must retain exactly the same pre-serve commands.
+  { backend: "local-docker", prefix: "implementation-run", dispatchId: "implementation-journal-snapshot-local" },
   { backend: "fly-machines", prefix: "implementation-run-fly", dispatchId: "implementation-journal-snapshot-fly" },
 ] as const satisfies ReadonlyArray<{ backend: ImplementationRunInput["backend"]; prefix: string; dispatchId: string }>;
 

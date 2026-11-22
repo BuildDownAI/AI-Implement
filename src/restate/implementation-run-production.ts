@@ -747,6 +747,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       if (held === true) requireImplementationRunOwner(run);
       return held;
     },
+    readLaunchServe: run => implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.serve === true,
     findExistingRun: async (run, dispatchedAt) => {
       if (readAdmission(run.dispatchId)?.releasedAt === null) {
         const owner = requireImplementationRunOwner(run);
