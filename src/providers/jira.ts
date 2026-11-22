@@ -31,6 +31,7 @@ import {
   type ResolvedFieldIds,
 } from "./jira-fields.js";
 import type { RepoMapping } from "../config.js";
+import { resolveRepoFieldValue } from "./ticketing-config.js";
 import { classifyByChildren, ancestorChain } from "./jira-hierarchy.js";
 import { nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
 import { parseIssueConfig } from "../issue-config.js";
@@ -308,6 +309,20 @@ export class JiraProvider implements TicketingProvider {
     this.onRepoFieldMismatch = c.onRepoFieldMismatch ?? (() => {});
   }
 
+  /**
+   * Reports, once per issue, a repo field value this project does not match. A value another Jira project
+   * matches is a sibling repository sharing the JQL, so only an empty or unmatched value is reported.
+   */
+  private reportRepoMismatch(scopeKey: string, issueKey: string, actualRepo: string): void {
+    const claimed = actualRepo !== "" && Object.entries(this.getMappings()).some(
+      ([key, m]) => key !== scopeKey && m.ticketingConfig.kind === "jira" && resolveRepoFieldValue(m) === actualRepo,
+    );
+    const mismatchKey = `${scopeKey}::${issueKey}`;
+    if (claimed || this.notifiedMismatches.has(mismatchKey)) return;
+    this.notifiedMismatches.add(mismatchKey);
+    this.onRepoFieldMismatch(scopeKey, issueKey, actualRepo);
+  }
+
   async fetchSetupFacts(projectKeys: string[]): Promise<JiraSetupFacts> {
     try {
       await this.client.verifyCredentials();
@@ -469,14 +484,11 @@ export class JiraProvider implements TicketingProvider {
       cursor ?? undefined,
     );
 
+    const expectedRepo = resolveRepoFieldValue(mapping);
     const inScope = res.issues.filter((raw) => {
       const actual = readRepoFieldValue(raw.fields[fieldIds.repoFieldId]);
-      if (actual === cfg.repoFieldValue) return true;
-      const mismatchKey = `${scopeKey}::${raw.key}`;
-      if (!this.notifiedMismatches.has(mismatchKey)) {
-        this.notifiedMismatches.add(mismatchKey);
-        this.onRepoFieldMismatch(scopeKey, raw.key, actual);
-      }
+      if (actual === expectedRepo) return true;
+      this.reportRepoMismatch(scopeKey, raw.key, actual);
       return false;
     });
 
@@ -510,6 +522,7 @@ export class JiraProvider implements TicketingProvider {
       [STATUS_VALUES.PLANNING_FAILED, { state: "failed", phase: "planning" }],
       [STATUS_VALUES.IMPLEMENTATION_FAILED, { state: "failed", phase: "implementation" }],
     ]);
+    const expectedRepo = resolveRepoFieldValue(mapping);
     const issues: IssueStatusRecord[] = [];
     let nextPageToken: string | undefined;
     for (let page = 0; page < 20; page++) {
@@ -517,7 +530,7 @@ export class JiraProvider implements TicketingProvider {
         jql, ["summary", "updated", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
       );
       for (const raw of result.issues) {
-        if (readRepoFieldValue(raw.fields[fieldIds.repoFieldId]) !== cfg.repoFieldValue) continue;
+        if (readRepoFieldValue(raw.fields[fieldIds.repoFieldId]) !== expectedRepo) continue;
         const workflowState = readStatusValue(raw.fields, fieldIds.statusFieldId);
         issues.push({
           id: raw.id,
@@ -625,14 +638,11 @@ export class JiraProvider implements TicketingProvider {
 
       // Repo pass first, so the merged-blocker lookup below only carries keys from
       // issues this mapping can actually dispatch.
+      const expectedRepo = resolveRepoFieldValue(m);
       const repoMatched = bucketIssues.filter((raw) => {
         const actualRepo = readRepoFieldValue(raw.fields[fieldIds.repoFieldId]);
-        if (actualRepo !== cfg.repoFieldValue) {
-          const mismatchKey = `${scopeKey}::${raw.key}`;
-          if (!this.notifiedMismatches.has(mismatchKey)) {
-            this.notifiedMismatches.add(mismatchKey);
-            this.onRepoFieldMismatch(scopeKey, raw.key, actualRepo);
-          }
+        if (actualRepo !== expectedRepo) {
+          this.reportRepoMismatch(scopeKey, raw.key, actualRepo);
           return false;
         }
         return true;
@@ -656,7 +666,7 @@ export class JiraProvider implements TicketingProvider {
 
       // Feature-branch enrichment: classify each candidate (leaf / feature-node / waiting)
       // and compute its featureBranchChain. Fails open to plain leaves on any error.
-      const chains = await this.enrichFeatureBranches(candidates, cfg.repoFieldValue, fieldIds);
+      const chains = await this.enrichFeatureBranches(candidates, expectedRepo, fieldIds);
 
       for (const raw of candidates) {
         const info = chains.get(raw.key);
@@ -675,9 +685,10 @@ export class JiraProvider implements TicketingProvider {
         // else: orchestrator picked it up between query and our processing; skip.
       }
 
+      // Matched as the bucket is, so projects sharing one JQL each count only their own issues.
       const capacityJql = `(${cfg.jql}) AND ${statusJqlField} in (Planning, Implementing)`;
-      const capacityIssues = await this.client.searchJql(capacityJql, ["summary"]);
-      inProgressCountsByScope[scopeKey] = capacityIssues.length;
+      const capacityIssues = await this.client.searchJql(capacityJql, [fieldIds.repoFieldId]);
+      inProgressCountsByScope[scopeKey] = capacityIssues.filter((raw) => readRepoFieldValue(raw.fields[fieldIds.repoFieldId]) === expectedRepo).length;
     }
 
     return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize };
@@ -782,7 +793,7 @@ export class JiraProvider implements TicketingProvider {
    */
   private async enrichFeatureBranches(
     candidates: import("./jira-client.js").JiraIssue[],
-    repoFieldValue: string,
+    expectedRepo: string,
     fieldIds: ResolvedFieldIds,
   ): Promise<Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[]; finalize?: boolean }>> {
     const out = new Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[]; finalize?: boolean }>();
@@ -790,7 +801,7 @@ export class JiraProvider implements TicketingProvider {
 
     const designated = (fields: Record<string, unknown>): boolean =>
       readStatusValue(fields, fieldIds.statusFieldId) !== "" &&
-      readRepoFieldValue(fields[fieldIds.repoFieldId]) === repoFieldValue;
+      readRepoFieldValue(fields[fieldIds.repoFieldId]) === expectedRepo;
 
     const childFields = [
       fieldIds.statusFieldId,
@@ -916,9 +927,10 @@ export class JiraProvider implements TicketingProvider {
       if (m.ticketingConfig.kind !== "jira") continue;
       const cfg = m.ticketingConfig;
       const fieldIds = await this.fields(scopeKey);
+      const expectedRepo = resolveRepoFieldValue(m);
       const designated = (fields: Record<string, unknown>): boolean =>
         readStatusValue(fields, fieldIds.statusFieldId) !== "" &&
-        readRepoFieldValue(fields[fieldIds.repoFieldId]) === cfg.repoFieldValue;
+        readRepoFieldValue(fields[fieldIds.repoFieldId]) === expectedRepo;
 
       const epicLinkFields = fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : [];
 
@@ -1110,7 +1122,7 @@ export class JiraProvider implements TicketingProvider {
     const repo = parent.fields[ids.repoFieldId];
     const mapping = this.getMappings()[scopeKey];
     if (mapping.ticketingConfig.kind !== "jira" || !readRepoFieldValue(repo) ||
-        readRepoFieldValue(repo) !== mapping.ticketingConfig.repoFieldValue) {
+        readRepoFieldValue(repo) !== resolveRepoFieldValue(mapping)) {
       throw new Error("Jira parent Repo does not match the mapping");
     }
     const types = await this.client.listCreateIssueTypes(project.id);
@@ -1190,9 +1202,9 @@ export function createJiraProviderFromConfig(
     siteUrl: config.jiraSiteUrl,
     getMappings,
     onRepoFieldMismatch: (mappingId, issueKey, actualRepo) => {
-      console.warn(
-        `[jira] Issue ${issueKey} (mapping ${mappingId}) has repo field "${actualRepo}", which does not match the mapping's repoFieldValue — dropping from this poll.`,
-      );
+      const project = getMappings()[mappingId];
+      const matches = project ? ` That project matches "${resolveRepoFieldValue(project)}".` : "";
+      console.warn(`[jira] Issue ${issueKey} has repo field "${actualRepo}", which matches no project on this orchestrator, so project ${mappingId} leaves it out.${matches}`);
     },
   });
 }

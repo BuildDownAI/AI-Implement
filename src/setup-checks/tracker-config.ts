@@ -9,6 +9,7 @@ import {
   STATUS_VALUES,
   type ResolvedFieldIds,
 } from "../providers/jira-fields.js";
+import { resolveRepoFieldValue } from "../providers/ticketing-config.js";
 import type { JiraFieldOptions, JiraProjectSetupFacts, JiraSetupFacts, LinearSetupFacts, TrackerSetupFacts } from "../providers/types.js";
 import { forEachProject, waitOn, type SetupCheck, type SetupCheckContext, type SetupCheckOutcome } from "./contract.js";
 
@@ -443,13 +444,22 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
       const options = project.repoOptions;
       if (options.read === "failed") return unreadOptions(options, "repo field");
       if (options.read === "not-select") return { state: "not-applicable", detail: "The repo field is a text field, so it has no options to check" };
-      const config = ctx.mappings()[key].ticketingConfig;
-      const value = config.kind === "jira" ? config.repoFieldValue : "";
+      const mapping = ctx.mappings()[key];
+      const value = resolveRepoFieldValue(mapping);
+      const repository = `${mapping.owner}/${mapping.repo}`;
+      if (value === repository) {
+        if (options.values.includes(value)) return { state: "pass", detail: `The repo field has the option ${value}, the project's repository` };
+        return {
+          state: "fail",
+          detail: `The repo field has no ${value} option, the project's repository, so the poll finds none of this project's issues`,
+          fix: `Add ${value} to the repo field's options in Jira, spelled exactly. A blank Repo Field Value matches the project's repository, so if the options name repositories another way, set the project's Repo Field Value on /admin#projects to the option for this repository.`,
+        };
+      }
       if (options.values.includes(value)) return { state: "pass", detail: `The repo field has the option ${value}` };
       return {
         state: "fail",
         detail: `The repo field has no ${value} option, so the poll finds none of this project's issues`,
-        fix: `Add ${value} to the repo field's options in Jira, spelled exactly, or correct the project's Repo Field Value on /admin#projects.`,
+        fix: `Add ${value} to the repo field's options in Jira, spelled exactly, or correct the project's Repo Field Value on /admin#projects. A blank Repo Field Value matches the project's repository, ${repository}.`,
       };
     })),
   },

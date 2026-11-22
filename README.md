@@ -374,7 +374,7 @@ The orchestrator creates a missing lifecycle label in the team at first dispatch
 | Field name | Type | Purpose |
 |---|---|---|
 | `AI-Implement Status` | Select | Requires the [nine status options](docs/ticketing-providers.md#the-ai-implement-status-options) |
-| `AI-Implement Repo` | Select or text | Identifies which GitHub repo the issue belongs to — each option should be `owner/repo` |
+| `AI-Implement Repo` | Select or text | Identifies which GitHub repo the issue belongs to — each option should be `owner/repo`, which a project matches unless its Repo Field Value names another option |
 
 ### Step 2 — GitHub App
 
@@ -387,8 +387,8 @@ The synced workflows allow the GitHub App bot that minted the workflow token by 
 Go to the orchestrator's admin UI → **Projects** → **+ New project**. The stepper walks through:
 
 - **Ticketing System** — `linear` or `jira`.
-- **Ticketing Config** — Linear: the team key (e.g. `ENG`). Jira: a scope JQL (e.g. `project = MYPROJECT` — no status clauses; the orchestrator adds those), the status/repo fields (leave at auto-discover if you used the exact names above), and the Repo Field Value option matching this repo (e.g. `your-org/your-repo`).
-- **Source** — GitHub owner, repo, and default branch. Each step's **Continue** checks what you entered against the save's own rules, so a value the save would refuse is caught on the step that holds it.
+- **Ticketing Config** — Linear: the team key (e.g. `ENG`). Jira: a scope JQL (e.g. `project = MYPROJECT`, with no status or repo clause: the orchestrator adds its own status clause and matches the repo field itself, and **Validate** warns of either), the status/repo fields (leave at auto-discover if you used the exact names above), and an optional Repo Field Value: leave it blank to match the `owner/repo` option of the repository you enter on the Source step, or pick the option for this repo when your options name repositories another way.
+- **Source** — the GitHub repository as `owner/repo` (a pasted GitHub address works too) and its default branch. Each step's **Continue** checks what you entered against the save's own rules, so a value the save would refuse is caught on the step that holds it.
 - **Runner** — `github-actions` (zero infrastructure) or `fly-machines`.
 - **Provider** — `anthropic` or `bedrock` (see [CLAUDE.md](CLAUDE.md) for Bedrock setup), plus planning toggles.
 - **Capacity** — max parallel AI issues (default 3, keep low while evaluating).

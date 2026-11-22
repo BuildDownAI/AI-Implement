@@ -3479,8 +3479,11 @@ export function buildMappingFromBody(
 ): { key: string; mapping: RepoMapping; warnings: string[] } | { status: number; body: Record<string, unknown> } {
   // A body parsed from JSON can be any value, and only an object can describe a project.
   if (typeof body !== "object" || body === null || Array.isArray(body)) return { status: 400, body: { error: "Invalid request body" } };
-  if (!body.teamKey || !body.owner || !body.repo) {
-    return refuse(!body.teamKey ? "teamKey" : !body.owner ? "owner" : "repo", "teamKey, owner, and repo are required");
+  // owner/repo is also the Repo field value a Jira project without one matches, so stray whitespace must not reach it.
+  const owner = typeof body.owner === "string" ? body.owner.trim() : "";
+  const repo = typeof body.repo === "string" ? body.repo.trim() : "";
+  if (!body.teamKey || !owner || !repo) {
+    return refuse(!body.teamKey ? "teamKey" : !owner ? "owner" : "repo", "teamKey, owner, and repo are required");
   }
 
   const existingMapping = getOwnMapping(body.teamKey);
@@ -3733,8 +3736,8 @@ export function buildMappingFromBody(
     return refuse("reviewProcess", `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"`);
   }
   const mapping: RepoMapping = {
-    owner: body.owner,
-    repo: body.repo,
+    owner,
+    repo,
     workflowFile,
     defaultBranch,
     maxInProgressAiIssues,
