@@ -103,6 +103,7 @@ export function getDiff(workspaceDir: string, base?: string): string {
 
   try {
     const env = { ...process.env, GIT_INDEX_FILE: tmpIndexPath };
+    let realIndexTimes: ReturnType<typeof statSync> | undefined;
 
     if (existsSync(realIndexPath)) {
       // Seed the disposable index from the real one so existing staged changes
@@ -110,7 +111,7 @@ export function getDiff(workspaceDir: string, base?: string): string {
       // Keep the real index's times on the copy: git trusts an index entry when
       // its timestamp is older than the index file, so a fresh copy timestamp
       // would hide a same-size change made in the entry's timestamp second.
-      const realIndexTimes = statSync(realIndexPath);
+      realIndexTimes = statSync(realIndexPath);
       copyFileSync(realIndexPath, tmpIndexPath);
       utimesSync(tmpIndexPath, realIndexTimes.atime, realIndexTimes.mtime);
     } else {
@@ -142,6 +143,13 @@ export function getDiff(workspaceDir: string, base?: string): string {
         `[getDiff] git add -N failed (exit ${addResult.status ?? "null"}): ${addResult.stderr?.toString().trim() ?? ""}`,
       );
       return "";
+    }
+
+    // `git add -N` rewrites the disposable index when it records an untracked
+    // file, which resets its timestamp. Restore the real index's times so the
+    // subsequent `git diff` still applies the same racy-git protection.
+    if (realIndexTimes) {
+      utimesSync(tmpIndexPath, realIndexTimes.atime, realIndexTimes.mtime);
     }
 
     const result = spawnSync(
