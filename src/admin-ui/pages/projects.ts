@@ -146,11 +146,12 @@ export const projectsHtml = `
               <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Base Branch&rdquo;. Otherwise pick the text field that holds the branch an issue&#x27;s PR should target instead of the repo&#x27;s default branch.</div>
             </div>
             <div class="field">
-              <label class="field-label">Repo Field Value</label>
+              <label class="field-label">Repo Field Value (override, optional)</label>
               <select class="select" id="md-jira-repo-value">
-                <option value="">Select a Repo Field first</option>
+                <option value="">(none, matches the repository)</option>
               </select>
-              <input class="input mono hidden" id="md-jira-repo-value-text" type="text" placeholder="owner/repo">
+              <input class="input mono hidden" id="md-jira-repo-value-text" type="text" placeholder="Blank matches the repository">
+              <div class="field-hint">Leave blank to match issues whose Repo field holds the repository on the Source tab, as owner/repo. Set this only when the Repo field&#x27;s options name repositories another way.</div>
             </div>
           </div>
           <div id="md-filesystem-fields" class="hidden" style="display:grid;gap:12px">
@@ -173,15 +174,10 @@ export const projectsHtml = `
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Source</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">The GitHub repository this mapping dispatches against, and how its branches are named.</p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-          <div class="field">
-            <label class="field-label">Owner</label>
-            <input class="input mono" id="md-owner" placeholder="acme-corp">
-            <div class="field-hint">Org or user that owns the repo.</div>
-          </div>
-          <div class="field">
-            <label class="field-label">Repo</label>
-            <input class="input mono" id="md-repo" placeholder="backend">
-            <div class="field-hint">Repository name only, no owner prefix.</div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">GitHub Repository</label>
+            <input class="input mono" id="md-github-repo" placeholder="acme-corp/backend or https://github.com/acme-corp/backend">
+            <div class="field-hint">The repository as owner/repo, or paste its GitHub address.</div>
           </div>
           <div class="field">
             <label class="field-label">Default Branch</label>
@@ -1193,8 +1189,7 @@ export const projectsScript = `
 
     const m = key ? (mappingsData[key] || {}) : {};
     document.getElementById('md-team-key').value = key || '';
-    document.getElementById('md-owner').value = m.owner || '';
-    document.getElementById('md-repo').value = m.repo || '';
+    document.getElementById('md-github-repo').value = m.owner && m.repo ? m.owner + '/' + m.repo : '';
     document.getElementById('md-wf').value = m.workflowFile || 'claude-implement.yml';
     document.getElementById('md-branch').value = m.defaultBranch || '';
     document.getElementById('md-max-ai').value = String(m.maxInProgressAiIssues ?? 3);
@@ -1260,7 +1255,7 @@ export const projectsScript = `
     const pendingRepoVal = (tp === 'jira' && tc.kind === 'jira' && tc.repoFieldValue) ? tc.repoFieldValue : '';
     const sel = document.getElementById('md-jira-repo-value');
     const txt = document.getElementById('md-jira-repo-value-text');
-    sel.innerHTML = '<option value="">Select a Repo Field first</option>';
+    sel.innerHTML = '<option value="">(none, matches the repository)</option>';
     sel.value = '';
     txt.value = pendingRepoVal;
     sel.classList.toggle('hidden', tp === 'jira' && !!pendingRepoVal);
@@ -1470,7 +1465,7 @@ export const projectsScript = `
         if (pendingJiraRepoFieldValue) text.value = pendingJiraRepoFieldValue;
         return;
       }
-      let html = '<option value="">(select)</option>';
+      let html = '<option value="">(none, matches the repository)</option>';
       for (const o of options) {
         html += '<option value="' + window.escAttr(o.value) + '">' + window.esc(o.value) + '</option>';
       }
@@ -1501,7 +1496,7 @@ export const projectsScript = `
     const select = document.getElementById('md-jira-repo-value');
     const text = document.getElementById('md-jira-repo-value-text');
     if (!fieldId) {
-      select.innerHTML = '<option value="">Select a Repo Field first</option>';
+      select.innerHTML = '<option value="">(none, matches the repository)</option>';
       select.classList.remove('hidden');
       text.classList.add('hidden');
       return;
@@ -1510,29 +1505,9 @@ export const projectsScript = `
   }
   window.onRepoFieldChange = onRepoFieldChange;
 
-  function detectStatusFilterInJql(jql, statusFieldOverride) {
-    // Returns a warning string if the JQL looks like it references the AI-Implement Status
-    // field. The orchestrator wraps the user's JQL with its own status filter, so any
-    // status clause here will conflict with status transitions.
-    if (/ai[\\s\\-_]?implement[\\s\\-_]?status/i.test(jql)) {
-      return 'JQL appears to reference the AI-Implement Status field. ' +
-        'The orchestrator adds its own status filter at query time — including one in ' +
-        'your JQL will prevent the issue from being picked up after status transitions ' +
-        '(e.g. Plan Approved → Implementing won\\'t flow). Remove status filters from this JQL.';
-    }
-    if (statusFieldOverride) {
-      const idPattern = new RegExp('\\\\b' + statusFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
-      if (idPattern.test(jql)) {
-        return 'JQL appears to reference customfield ' + statusFieldOverride + ' (your status field). ' +
-          'The orchestrator adds its own status filter at query time — remove the status clause here.';
-      }
-    }
-    return null;
-  }
-
   async function validateJqlButton() {
     const jql = document.getElementById('md-jira-jql').value;
-    const statusFieldOverride = document.getElementById('md-jira-status-field').value;
+    const fields = { statusField: document.getElementById('md-jira-status-field').value, repoField: document.getElementById('md-jira-repo-field').value };
     const status = document.getElementById('md-jira-jql-status');
     status.textContent = 'Validating...';
     status.style.color = '';
@@ -1550,9 +1525,9 @@ export const projectsScript = `
         return;
       }
       await res.json();
-      const warning = detectStatusFilterInJql(jql, statusFieldOverride);
+      const warning = window.jqlScopeWarning(jql, fields);
       if (warning) {
-        status.textContent = '⚠ Valid but: ' + warning;
+        status.textContent = '⚠ Valid. ' + warning;
         status.style.color = 'var(--st-warn-fg, #c80)';
       } else {
         status.textContent = 'Valid';
@@ -1620,10 +1595,12 @@ export const projectsScript = `
       return;
     }
 
+    const githubRepoText = document.getElementById('md-github-repo').value.trim();
+    const githubRepo = window.splitGithubRepo(githubRepoText);
     const body = {
       teamKey,
-      owner: document.getElementById('md-owner').value.trim(),
-      repo: document.getElementById('md-repo').value.trim(),
+      owner: githubRepo ? githubRepo.owner : '',
+      repo: githubRepo ? githubRepo.repo : '',
       workflowFile: document.getElementById('md-wf').value.trim(),
       defaultBranch,
       maxInProgressAiIssues: Number(document.getElementById('md-max-ai').value.trim() || NaN),
@@ -1670,7 +1647,7 @@ export const projectsScript = `
       body.ticketingConfig = {
         kind: 'jira',
         jql: jql,
-        repoFieldValue: repoFieldValue,
+        repoFieldValue: repoFieldValue || null,
         statusFieldOverride: statusFieldOverride,
         repoFieldOverride: repoFieldOverride,
         profilesFieldOverride: profilesFieldOverride,
@@ -1700,8 +1677,12 @@ export const projectsScript = `
         return;
       }
     }
-    if (!body.owner || !body.repo) {
-      showMappingError('Owner and Repo are required.', 'source');
+    if (!githubRepoText) {
+      showMappingError('GitHub Repository is required, as owner/repo.', 'source');
+      return;
+    }
+    if (!githubRepo) {
+      showMappingError('GitHub Repository must be owner/repo, such as acme-corp/backend, or its GitHub address.', 'source');
       return;
     }
     if (!Number.isInteger(body.maxInProgressAiIssues) || body.maxInProgressAiIssues < 1) {

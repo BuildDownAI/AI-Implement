@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { JSDOM } from "jsdom";
+import { helpersJs } from "../admin-ui/helpers.js";
 import { projectsHtml, projectsScript } from "../admin-ui/pages/projects.js";
 import { stepperHtml, stepperScript } from "../admin-ui/stepper.js";
 
@@ -91,8 +92,7 @@ describe("mapping dialog — field placement", () => {
     ["md-ticketing-provider", "ticketing"],
     ["md-filesystem-directory", "ticketing"],
     ["md-team-key", "ticketing"],
-    ["md-owner", "source"],
-    ["md-repo", "source"],
+    ["md-github-repo", "source"],
     ["md-branch", "source"],
     ["md-branch-prefix", "source"],
     ["md-skills-repo", "context"],
@@ -157,9 +157,7 @@ describe("mapping dialog — filesystem ticketing behavior", () => {
     const dom = new JSDOM(`<!doctype html><body>${projectsHtml}</body>`, { runScripts: "outside-only" });
     const win = dom.window as unknown as Record<string, any>;
     win.registerPage = () => {};
-    win.safeUrl = (s: unknown) => String(s);
-    win.esc = (s: unknown) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    win.escAttr = (s: unknown) => String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    dom.window.eval(helpersJs);
     win.api = async (path: string, init?: RequestInit) => {
       if (path === "/api/mappings" && !init) return { ok: true, json: async () => existing };
       if (path === "/api/mappings" && init?.method === "POST") {

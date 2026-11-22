@@ -290,14 +290,19 @@ describe("tracker.linear.workflow-states", () => {
   });
 });
 
-/** A Jira project as the store reads one back. Plans wait for approval unless asked, so every status option counts. */
-function jiraProject(overrides: { repoFieldValue?: string; autoApprovePlans?: boolean } = {}): RepoMapping {
+/**
+ * A Jira project as the store reads one back. Plans wait for approval unless asked, so every status option counts.
+ * A null Repo Field Value is a project saved without one, which matches its owner/repo.
+ */
+function jiraProject(overrides: { repoFieldValue?: string | null; owner?: string; repo?: string; autoApprovePlans?: boolean } = {}): RepoMapping {
   return makeMapping({
+    ...(overrides.owner ? { owner: overrides.owner } : {}),
+    ...(overrides.repo ? { repo: overrides.repo } : {}),
     ticketingProvider: "jira",
     ticketingConfig: {
       kind: "jira",
       jql: "project = OPS",
-      repoFieldValue: overrides.repoFieldValue ?? "acme/ops",
+      repoFieldValue: overrides.repoFieldValue === undefined ? "acme/ops" : overrides.repoFieldValue,
       statusFieldOverride: null,
       repoFieldOverride: null,
       profilesFieldOverride: null,
@@ -568,7 +573,24 @@ describe("tracker.jira.repo-option", () => {
         project: "OPS",
         state: "fail",
         detail: "The repo field has no acme/web option, so the poll finds none of this project's issues",
-        fix: "Add acme/web to the repo field's options in Jira, spelled exactly, or correct the project's Repo Field Value on /admin#projects.",
+        fix: "Add acme/web to the repo field's options in Jira, spelled exactly, or correct the project's Repo Field Value on /admin#projects. A blank Repo Field Value matches the project's repository, test-org/test-repo.",
+      },
+    ]);
+  });
+
+  it("passes a project saved without a Repo Field Value when its repository is an option", async () => {
+    expect(await run("tracker.jira.repo-option", onJira(acceptedJira(), { OPS: jiraProject({ repoFieldValue: null, owner: "acme", repo: "ops" }) }))).toEqual([
+      { project: "OPS", state: "pass", detail: "The repo field has the option acme/ops, the project's repository" },
+    ]);
+  });
+
+  it("fails a project saved without a Repo Field Value when its repository is not an option", async () => {
+    expect(await run("tracker.jira.repo-option", onJira(acceptedJira(), { OPS: jiraProject({ repoFieldValue: null, owner: "acme", repo: "web" }) }))).toEqual([
+      {
+        project: "OPS",
+        state: "fail",
+        detail: "The repo field has no acme/web option, the project's repository, so the poll finds none of this project's issues",
+        fix: "Add acme/web to the repo field's options in Jira, spelled exactly. A blank Repo Field Value matches the project's repository, so if the options name repositories another way, set the project's Repo Field Value on /admin#projects to the option for this repository.",
       },
     ]);
   });

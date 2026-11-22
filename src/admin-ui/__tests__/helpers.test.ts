@@ -7,6 +7,7 @@ import { deploymentsScript } from "../pages/deployments.js";
 import { issuesScript } from "../pages/issues.js";
 import { kgPipelinesScript } from "../pages/kg-pipelines.js";
 import { overviewScript } from "../pages/overview.js";
+import { projectsScript } from "../pages/projects.js";
 import { reaperScript } from "../pages/reaper.js";
 import { setupScript } from "../pages/setup.js";
 import { stepperScript } from "../stepper.js";
@@ -548,5 +549,53 @@ describe("pages on the shared helpers", () => {
 
   it.each(onSharedTime)("%s defines no time formatter of its own", (_name, script) => {
     expect(script).not.toMatch(/function (fmtAgo|fmtDuration|fmtElapsed|fmtRelative)\b/);
+  });
+
+  it.each([["stepper", stepperScript], ["projects", projectsScript]])("%s defines no JQL warning or repository parser of its own", (_name, script) => {
+    expect(script).not.toMatch(/function (detectStatusFilterInJql|detectRepoFilterInJql|splitGithubRepo)\b/);
+  });
+});
+
+describe("splitGithubRepo", () => {
+  it.each([
+    ["acme/backend", { owner: "acme", repo: "backend" }],
+    ["  acme / backend  ", { owner: "acme", repo: "backend" }],
+    ["https://github.com/acme/backend", { owner: "acme", repo: "backend" }],
+    ["https://www.github.com/acme/backend.git", { owner: "acme", repo: "backend" }],
+    ["acme/backend.git/", { owner: "acme", repo: "backend" }],
+    ["acme/backend/", { owner: "acme", repo: "backend" }],
+  ])("reads %j as owner/repo", (raw, expected) => {
+    expect(mountHelpers().splitGithubRepo(raw)).toEqual(expected);
+  });
+
+  it.each([["backend"], ["acme/"], ["/backend"], ["acme/backend/src"], ["ac me/backend"], [""], [null]])("refuses %j", (raw) => {
+    expect(mountHelpers().splitGithubRepo(raw)).toBeNull();
+  });
+});
+
+describe("jqlScopeWarning", () => {
+  const warn = (jql: string, fields: { statusField?: string; repoField?: string } = {}): string | null => mountHelpers().jqlScopeWarning(jql, fields);
+
+  it("names nothing for JQL that only scopes the project", () => {
+    expect(warn("project = APP", { statusField: "customfield_10100", repoField: "customfield_10101" })).toBeNull();
+  });
+
+  it.each([
+    ['project = APP AND "AI-Implement Status" = Ready', {}],
+    ["project = APP AND customfield_10100 = Ready", { statusField: "customfield_10100" }],
+    ["project = APP AND cf[10100] = Ready", { statusField: "customfield_10100" }],
+  ])("warns of a status clause in %j", (jql, fields) => {
+    expect(warn(jql, fields)).toMatch(/remove the status clause/i);
+  });
+
+  it.each([
+    ['project = APP AND "AI-Implement Repo" = "acme/backend"', {}],
+    ['project = APP AND cf[10101] = "acme/backend"', { repoField: "customfield_10101" }],
+  ])("warns of a repo clause in %j, saying the project does not need one", (jql, fields) => {
+    expect(warn(jql, fields)).toMatch(/does not need a repo clause/);
+  });
+
+  it("names the status clause first when the JQL has both", () => {
+    expect(warn('"AI-Implement Status" = Ready AND "AI-Implement Repo" = "acme/backend"')).toContain("status clause");
   });
 });

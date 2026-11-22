@@ -1,5 +1,8 @@
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { describe, it, expect, vi } from "vitest";
-import { validateTicketingConfig, DEFAULT_TICKETING_CONFIG } from "../../providers/ticketing-config.js";
+import { validateTicketingConfig, resolveRepoFieldValue, DEFAULT_TICKETING_CONFIG } from "../../providers/ticketing-config.js";
 import { resolveCustomFieldIds } from "../../providers/jira-fields.js";
 import type { JiraMappingConfig } from "../../providers/ticketing-config.js";
 
@@ -23,9 +26,26 @@ describe("validateTicketingConfig", () => {
     expect(() => validateTicketingConfig("jira", { kind: "linear" })).toThrow(/must match ticketingProvider/);
   });
 
-  it("requires a non-empty jql and repoFieldValue for jira", () => {
+  it("requires a non-empty jql for jira", () => {
     expect(() => validateTicketingConfig("jira", { kind: "jira", repoFieldValue: "owner/repo" })).toThrow(/jql/);
-    expect(() => validateTicketingConfig("jira", { kind: "jira", jql: "project = ENG" })).toThrow(/repoFieldValue/);
+    expect(() => validateTicketingConfig("jira", { kind: "jira", jql: "  ", repoFieldValue: "owner/repo" })).toThrow(/jql/);
+  });
+
+  // A missing value is derived from the mapping's owner/repo by resolveRepoFieldValue.
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["empty", ""],
+    ["whitespace only", "   "],
+    ["not a string", 42],
+  ])("stores a repoFieldValue that is %s as null", (_label, repoFieldValue) => {
+    const cfg = validateTicketingConfig("jira", { kind: "jira", jql: "project = ENG", repoFieldValue }) as JiraMappingConfig;
+    expect(cfg.repoFieldValue).toBeNull();
+  });
+
+  it("keeps an explicit repoFieldValue, trimmed", () => {
+    const cfg = validateTicketingConfig("jira", { ...jiraBase, repoFieldValue: "  Backend Service  " }) as JiraMappingConfig;
+    expect(cfg.repoFieldValue).toBe("Backend Service");
   });
 
   it("keeps a valid field override, trimmed", () => {
@@ -54,6 +74,49 @@ describe("validateTicketingConfig", () => {
     expect(cfg.statusFieldOverride).toBeNull();
     expect(cfg.repoFieldOverride).toBeNull();
     expect(cfg.profilesFieldOverride).toBeNull();
+  });
+});
+
+describe("resolveRepoFieldValue", () => {
+  const jiraProject = (repoFieldValue: unknown) => ({
+    owner: "acme",
+    repo: "backend",
+    ticketingConfig: validateTicketingConfig("jira", { kind: "jira", jql: "project = ENG", repoFieldValue }),
+  });
+
+  it("derives owner/repo when no value is stored", () => {
+    expect(resolveRepoFieldValue(jiraProject(null))).toBe("acme/backend");
+  });
+
+  it("matches on an explicit value rather than owner/repo", () => {
+    expect(resolveRepoFieldValue(jiraProject("Backend Service"))).toBe("Backend Service");
+  });
+
+  // A stored null means owner/repo, and comparing a string with null still compiles, so a read that
+  // skips the resolver matches nothing for such a project. The admin UI's forms edit the stored value itself.
+  // Parsed rather than searched, so a comment or a log line that names the field does not count.
+  const repoFieldValueSites = (file: string): string[] => {
+    const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+    const sites: string[] = [];
+    const visit = (node: ts.Node): void => {
+      if ((ts.isIdentifier(node) || ts.isStringLiteral(node)) && node.text === "repoFieldValue") {
+        sites.push(`${file}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}`);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    return sites;
+  };
+  const filesNamingTheField = execFileSync("git", ["grep", "--untracked", "-l", "-w", "repoFieldValue", "--", "src/*.ts"], { encoding: "utf8" })
+    .trim().split("\n").filter((file) => !file.includes("/__tests__/"));
+
+  it("the scan sees the resolver's own reads", () => {
+    expect(repoFieldValueSites("src/providers/ticketing-config.ts")).not.toHaveLength(0);
+  });
+
+  it("is the only production code outside the admin UI that reads the stored value", () => {
+    const outside = filesNamingTheField.filter((file) => file !== "src/providers/ticketing-config.ts" && !file.startsWith("src/admin-ui/"));
+    expect(outside.flatMap(repoFieldValueSites)).toEqual([]);
   });
 });
 
