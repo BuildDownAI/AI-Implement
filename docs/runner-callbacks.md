@@ -146,6 +146,15 @@ cannot produce a success ACK. Legacy runs do not use this route.
 
 ## The step reporter as the run signal
 
+Local serve-mode implementation runs use `RestateStepReporter`, supplied by
+`RunnerFlight` through `opts.reporter`. Each report queues one redacted `step`
+event; the runner's journaled event loop sends it one-way to the shared
+`ImplementationRun.step` handler. That handler resolves the job from the workflow
+key and calls the same `upsertStepRecord` used by `/runner/progress`. These runs
+send no step reports to `/runner/progress` or `/api/step-report`. Non-serve runs
+keep their existing reporter selection. Tool activity still uses `/runner/activity`.
+
+
 A run kind that a Restate workflow owns sends its "I started" signal as a step report: the kg-refresh runner uses `TokenStepReporter` (`src/pipeline/reporter.ts`), which posts `{ step }` to `/runner/progress` with the progress token, and the route forwards the validated, redacted step to the workflow's shared handler (`progress(dispatchId, step)`). A body with no `step` (an old runner image) is still a bare heartbeat. The result keeps `postRunnerResult` and `/runner/result` with the result token. The runner never calls the Restate ingress, which binds to loopback (ADR 023). A failed post logs and does not change the outcome of the run. `TokenStepReporter` removes credential keys from `inputs` and `outputs` with `redactStepCredentials` before the body is serialized.
 
 A Restate review-fix attempt does not post steps to `/runner/progress` (an attempt writes no `dispatch_log` row, so that route answers `404 job_not_found`). It reports each step through `/runner/activity` instead: `ActivityStepReporter` (`src/pipeline/reporter.ts`) records a `pipeline_step` event (`action` is the step id, `cycle` 1, `detail` carries `type`, `status`, `started_at`, `ended_at`, `parent_step_id`) on the `pipeline-steps` producer and flushes it at once. `RunnerActivitySink.shutdown()` finalizes that producer. The steps are readable through `get_review_fix_activity`. An older runner image still posts to `/runner/progress` and gets the 404.

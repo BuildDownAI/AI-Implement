@@ -6,9 +6,10 @@ import { PipelineRunner } from "../../pipeline/runner.js";
 import { NoopStepReporter } from "../../pipeline/reporter.js";
 import { makeFeedbackLoopOutputs, makeExecutor } from "../helpers/builders.js";
 import { fakeFetch } from "../helpers/fake-fetch.js";
-import { initStepLogTable } from "../../step-log.js";
+import { getStepsByJobId, initStepLogTable } from "../../step-log.js";
 import { recordUsage } from "../../agent-usage.js";
-import { handleRunnerResult } from "../../runner-callback.js";
+import type { Step } from "../../pipeline/types.js";
+import { handleRunnerProgress, handleRunnerResult } from "../../runner-callback.js";
 import * as http2 from "node:http2";
 import { createRunnerService, RUNNER_SERVICE_RETRY_POLICY } from "../../runner-service.js";
 import * as restate from "@restatedev/restate-sdk";
@@ -956,6 +957,30 @@ describe("ImplementationRun durable workflow", () => {
     // `report` carries no job outcome, so the finish step still runs once, after the ended read.
     expect(w.sc.finishCalls).toEqual([{ kind: "run_ended" }]);
   }, 60_000);
+
+  it.each(labels)("step uses the same rows and updates as the progress callback (%s)", async label => {
+    const url = baseUrl(slow, label);
+    const dispatchId = `step-parity-${label}`;
+    const callbackId = `${dispatchId}-callback`;
+    initStepLogTable();
+    for (const id of [dispatchId, callbackId]) appendLog({ dispatchId: id, issueId: `issue-${id}`,
+      issueIdentifier: "ENG-1", issueTitle: "Implement", teamKey: "ENG", repo: "o/r", phase: "implementation", status: "running" });
+    const secret = "synthetic-progress-secret";
+    const { token } = runnerTokens.mintRunToken({ dispatchId: callbackId, issueId: `issue-${callbackId}`,
+      mappingTeamKey: "ENG", phase: "implementation", audience: "progress", ttlSeconds: 3600, secret });
+    const initial: Step = { id: "child", type: "custom", status: "running", started_at: "2026-11-01T00:00:00Z",
+      ended_at: null, parent_step_id: "parent", inputs: { value: 1 }, outputs: {}, logs_url: null };
+    for (const step of [initial, { ...initial, status: "passed" as const, ended_at: "2026-11-01T00:01:00Z",
+      outputs: { value: 2 }, logs_url: "https://logs.example/child" }]) {
+      expect((await handleRunnerProgress({ authorization: `Bearer ${token}`, secret, body: { step } })).status).toBe(200);
+      await callWorkflow(url, "ImplementationRun", dispatchId, "step", step);
+      const read = (id: string) => getStepsByJobId(getJobByDispatchId(id)!.id)
+        .map(({ id: _id, jobId: _jobId, ...row }) => row);
+      expect(read(dispatchId)).toEqual(read(callbackId));
+      expect(read(dispatchId)).toHaveLength(1);
+    }
+    await expect(callWorkflow(url, "ImplementationRun", `${dispatchId}-missing`, "step", initial)).rejects.toThrow(/job_not_found/);
+  });
 
   it.each(labels)("recordInvocation stores each sent call once and never marks the list complete (%s)", async (label) => {
     const w = begin(slow, label, { status: "started" });

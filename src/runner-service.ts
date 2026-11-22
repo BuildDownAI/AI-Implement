@@ -8,9 +8,8 @@
  * The bridge is a flight per invocation id plus a queue of events. The handler
  * takes one event at a time through a journaled `ctx.run("ev-i")`, so every
  * Restate command has a fixed order and a server restart replays the journal
- * instead of starting the pipeline again. In this issue an event is either the
- * pipeline result or a sanitized failure message; later children add more
- * kinds.
+ * instead of starting the pipeline again. Events carry step progress, model
+ * invocations, results, settlement, or a sanitized failure message.
  *
  * No workflow calls this mode yet. AII-2048 supplies the launch wiring.
  */
@@ -21,7 +20,8 @@ import type { ServiceDefinition } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import { setInvocationListener } from "./pipeline/job-accounting.js";
-import type { InvocationRecordV1 } from "./pipeline/types.js";
+import { RestateStepReporter } from "./pipeline/reporter.js";
+import type { Step, InvocationRecordV1 } from "./pipeline/types.js";
 import { runAutonomous, type RunAutonomousResult } from "./run-autonomous.js";
 
 /** The run id is the dispatch id, set by the launch (AII-2048). */
@@ -50,6 +50,7 @@ export const runnerRunInputSchema = z.object({ workflowKey: z.string().min(1) })
 export type RunnerRunInput = z.infer<typeof runnerRunInputSchema>;
 
 export type RunnerEvent =
+  | { kind: "step"; step: Step }
   | { kind: "invocation"; record: InvocationRecordV1 }
   | { kind: "result"; result: import("./runner-callback.js").RunnerResultBody }
   | { kind: "settled" }
@@ -138,7 +139,10 @@ export class RunnerFlight {
 
   private async execute(): Promise<void> {
     try {
-      await this.run({ resultSink: (result) => { this.push({ kind: "result", result }); } });
+      await this.run({
+        reporter: new RestateStepReporter((event) => this.push(event)),
+        resultSink: (result) => { this.push({ kind: "result", result }); },
+      });
       this.push({ kind: "settled" });
     } catch (err) {
       this.push({ kind: "failed", message: sanitizeRunnerFailure(err, this.env) });
@@ -227,6 +231,15 @@ export function createRunnerService(deps: RunnerServiceDeps): ServiceDefinition<
       if (event.kind === "result") result = event.result;
       if (event.kind === "settled") return result;
       if (event.kind === "failed") throw new restate.TerminalError(event.message);
+      if (event.kind === "step") {
+        ctx.genericSend({
+          service: "ImplementationRun",
+          method: "step",
+          key: input.workflowKey,
+          parameter: event.step,
+          inputSerde: restate.serde.json,
+        });
+      }
       if (event.kind === "invocation") {
         ctx.genericSend({
           service: "ImplementationRun",

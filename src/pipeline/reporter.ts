@@ -121,6 +121,15 @@ export class ActivityStepReporter implements StepReporter {
   }
 }
 
+/** Sends redacted steps to the serve-mode flight before they enter its journal. */
+export class RestateStepReporter implements StepReporter {
+  constructor(private readonly push: (event: { kind: "step"; step: Step }) => void) {}
+
+  async report(step: Step): Promise<void> {
+    this.push({ kind: "step", step: redactStepCredentials(step) });
+  }
+}
+
 export class NoopStepReporter implements StepReporter {
   async report(_step: Step): Promise<void> {}
 }

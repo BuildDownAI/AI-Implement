@@ -20,7 +20,9 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import { recordUsage, toRecordedUsage, type RecordedUsage } from "../agent-usage.js";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
-import type { InvocationRecordV1 } from "../pipeline/types.js";
+import { getJobByDispatchId } from "../log.js";
+import { upsertStepRecord } from "../step-log.js";
+import type { Step, InvocationRecordV1 } from "../pipeline/types.js";
 import { acceptOwnedRunReport, type OwnedRunReportResult, readBoundedOwnedRun, readOwnedRunStatus } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 import { registerRunnerDeploymentWithRetry, type RunnerDeploymentRegistrationOptions } from "./runner-registration.js";
@@ -593,6 +595,14 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     });
   }
 
+  async function step(ctx: WorkflowSharedContext, value: Step): Promise<void> {
+    await ctx.run("write-step", () => {
+      const job = getJobByDispatchId(ctx.key);
+      if (!job) throw new restate.TerminalError("job_not_found", { errorCode: 404 });
+      upsertStepRecord(job.id, value);
+    });
+  }
+
   async function status(ctx: WorkflowSharedContext): Promise<ImplementationRunStatusResult> {
     const [step, dispatchId, jobId] = await Promise.all([
       ctx.get<string>("step"),
@@ -616,6 +626,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
       recordInvocation: restate.handlers.workflow.shared<void, InvocationRecordV1>({
         journalRetention: retentionMs,
       }, recordInvocation),
+      step: restate.handlers.workflow.shared<void, Step>({ journalRetention: retentionMs }, step),
       status: restate.handlers.workflow.shared(status),
     },
     options: {
