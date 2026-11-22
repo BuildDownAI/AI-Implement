@@ -10,6 +10,8 @@ import { authorize } from "./authorize.js";
 import { putTransaction, takeTransaction } from "./state-store.js";
 import { createSession, revokeSession, getRequestToken, SESSION_TTL_MS } from "../admin-session.js";
 import { serializeSessionCookie, clearSessionCookie } from "../cookies.js";
+import { allowlistHasNoAdmin, getEffectiveAllowlist, hasOrgClaimRole, isBoundTo, ORG_CLAIM_ROLE_TTL_MS } from "../access-entries.js";
+import { bindAccessIdentity, clearClaimRoleViaObject, recordClaimRoleViaObject } from "../restate/access-binding.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -30,9 +32,13 @@ function safeLocalPath(next: string | null | undefined, fallback = "/admin"): st
   return next;
 }
 
-/** Unauthenticated: which provider buttons to render + whether the (deprecated) access-code box applies. */
+/** Unauthenticated: which provider buttons to render, whether the (deprecated) access-code box applies, and whether signing in will leave you unable to administer anything. */
 export function handleOAuthProviders(res: http.ServerResponse, accessCodeEnabled: boolean): void {
-  json(res, 200, { providers: listConfiguredProviders(), accessCode: accessCodeEnabled });
+  json(res, 200, {
+    providers: listConfiguredProviders(),
+    accessCode: accessCodeEnabled,
+    noAdmin: allowlistHasNoAdmin(),
+  });
 }
 
 /** Start: mint the security values, stash them server-side, redirect the browser to the provider. */
@@ -90,10 +96,52 @@ export async function handleOAuthCallback(
     return redirect(res, "/admin?auth_error=failed");
   }
 
-  const decision = authorize(identity);
+  const allowlist = getEffectiveAllowlist();
+  if (!allowlist) {
+    console.error(`[oauth] ${providerId} sign-in denied: the access list could not be loaded`);
+    return redirect(res, "/admin?auth_error=failed");
+  }
+
+  const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
+    // Best-effort: the denial stands either way, and an unreachable ingress leaves a row that expires.
+    if (identity.provider === "builddown" && identity.email && hasOrgClaimRole(identity)) {
+      await clearClaimRoleViaObject(identity.email, identity.provider);
+    }
     console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirect(res, "/admin?auth_error=denied");
+  }
+
+  // First sign-in through a provider binds the entry for it; that subject is what matches from then on.
+  // Fail closed: an identity is never admitted without a recorded binding.
+  console.log(`[oauth] admitting ${identity.email} via ${providerId} as ${decision.entry.role} (source: ${decision.source})`);
+  if (decision.entry.kind === "address" && !isBoundTo(decision.entry, identity)) {
+    const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
+    if (bound === "conflict") {
+      console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: subject mismatch for ${providerId}`);
+      return redirect(res, "/admin?auth_error=denied");
+    }
+    if (bound === "unavailable") {
+      console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: binding unavailable`);
+      return redirect(res, "/admin?auth_error=denied");
+    }
+  }
+
+  // The claim-role row is written through the AccessBinding object; fail closed when it cannot be.
+  if (identity.provider === "builddown") {
+    const recorded =
+      decision.source === "org-claim"
+        ? await recordClaimRoleViaObject(identity.email!, {
+            provider: identity.provider,
+            subject: identity.sub,
+            role: decision.entry.role,
+            expiresAt: Date.now() + ORG_CLAIM_ROLE_TTL_MS,
+          })
+        : !hasOrgClaimRole(identity) || (await clearClaimRoleViaObject(identity.email!, identity.provider));
+    if (!recorded) {
+      console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: claim role unavailable`);
+      return redirect(res, "/admin?auth_error=denied");
+    }
   }
 
   const token = createSession({

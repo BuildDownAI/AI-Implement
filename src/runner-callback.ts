@@ -1,27 +1,241 @@
-import { claimJobRunId, getJobByDispatchId, updateJobPrUrl, updateJobStatus } from "./log.js";
+import { enqueueRollupReview, ROLLUP_REVIEW_RETRY_LIMIT } from "./comment-gapfill-queue.js";
+import { listRollupReviewChildren, reconcileRollupReviewChildren, ROLLUP_REVIEW_CHILD_PREFIX } from "./merge-up.js";
+import { getDb } from "./dedup.js";
+import { recordInternalReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
+import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
+import { MAX_PUBLICATION_BYTES, reviewPublicationInputSchema } from "./restate/post-push-review-publication.js";
+import * as restateClients from "@restatedev/restate-sdk-clients";
+import { RESTATE_INGRESS_BASE_URL } from "./restate/server.js";
+import type { createPostPushReviewPublication, PostPushReviewPublicationInput, PostPushReviewPublicationResult } from "./restate/post-push-review-publication.js";
+import type { PlanningIngressResult } from "./restate/planning-run-client.js";
+import type { SourceResult } from "./kg-source-results.js";
+import {
+  claimJobRunId,
+  hasCompletedCallbackLifecycle,
+  markCallbackLifecycleCompleted,
+  getJobByDispatchId,
+  markJobFailureCommented,
+  stampJobApproved,
+  updateJobFailure,
+  updateJobPrUrl,
+  updateJobStatus,
+  type Job,
+  getGapFillRowsAwaitingLateReview,
+  getPendingLateReviews,
+  clearPendingLateReview,
+  recordLateReviewEnding,
+  recordPendingLateReview,
+  setLateReviewHeadSha,
+} from "./log.js";
+import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
+import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
+import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
-import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
-import { upsertStepRecord } from "./step-log.js";
-import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
-import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
-import { renderClassification, TROUBLESHOOTING_URL, type Classification } from "./completion-classification.js";
+import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
+import { getMappings } from "./config.js";
+import { parkIssue } from "./dispatch-breaker.js";
+import { LinearGraphQLError, LinearLabelWriteError } from "./providers/linear.js";
+import { recheckSetupChecks, referenceRepoChecks, runnerFailureChecks, trackerSetupChecksSentence } from "./setup-checks/recheck.js";
+import { isManagedProject } from "./managed-dispatch-auth.js";
+import type { SetupCheckId } from "./setup-checks/contract.js";
+import { JiraApiError } from "./providers/jira-client.js";
+import { read as readAdmission } from "./dispatch-admission.js";
+import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
+import { acceptReviewFixWebhookEvent, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
+import {
+  getReviewFindingsByKeys,
+  listOpenReviewFindings,
+  markReviewFindingsDeferredByKeys,
+  markReviewFindingsRejectedByKeys,
+  markReviewFindingsResolvedByIds,
+  markReviewFindingsResolvedForPrSeenBefore,
+  type StoredReviewFinding,
+} from "./review-ledger-store.js";
+import { getInstallationToken } from "./github-app-auth.js";
+import { postPrComment, getCommitAuthorType, getPullRequestState, listPrComments, updatePrComment, postOrUpdateStickyComment } from "./github.js";
+import {
+  renderClassification,
+  renderFailureRecord,
+  buildRunUrl,
+  deriveLastSuccessfulStage,
+  redactedGuardrailReason,
+  sensitiveFilesGuardrailClassification,
+  TROUBLESHOOTING_URL,
+  type Classification,
+} from "./completion-classification.js";
+import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
+import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
+import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
+import { toRecordedUsage, recordUsage, type RecordedUsage } from "./agent-usage.js";
+import { sanitizeAttribution, type InvocationAttributionV1, type InvocationRecordV1 } from "./pipeline/types.js";
+import { isCycleSummary, stripCycleAttribution, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
+import { lateExternalReviewWorkflowKey, type LateExternalReviewInput, type LateExternalReviewState } from "./restate/late-external-review.js";
+import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
+import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
+import {
+  REVIEW_FIX_CONTRACT_VERSION,
+  REVIEW_FIX_ACTIVITY_VERSION,
+  validateReviewFixResultMetadata,
+  validateReviewFixActivityEvent,
+  validateAttemptId,
+  type ReviewFixResultMetadataV1,
+  type ReviewFixActivityEvent,
+  type ResultIntakeOutcome,
+} from "./review-fix-contract.js";
 
-export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
+export type RunnerPhase = "planning" | "implementation" | "gap-analysis" | "kg-refresh";
+
+/** The runner-callback variables that are unset, by name; empty when the callback path is configured. */
+export function missingRunnerCallbackConfig(config: {
+  runnerCallbackBaseUrl: string | null;
+  runnerTokenSecret: string | null;
+}): string[] {
+  return [
+    config.runnerCallbackBaseUrl ? null : "RUNNER_CALLBACK_BASE_URL",
+    config.runnerTokenSecret ? null : "RUNNER_TOKEN_SECRET",
+  ].filter((name): name is string => name !== null);
+}
+
+/**
+ * AII-430: planning depends entirely on the runner callback to advance.
+ *
+ * The runner posts the plan through /runner/result, and that is what moves the
+ * ticket to Plan-Complete. Without the callback the plan is dropped, the label
+ * never advances, and the issue is eligible for planning again on the next
+ * poll — a full Claude planning run burned every cycle, forever.
+ *
+ * Three things that normally bound a retry loop all miss this case:
+ *   - Planning deliberately never writes to the dedup table (`dispatchSession`
+ *     is called with `doMarkDispatched: false`), so the label is the only brake.
+ *   - The dispatch breaker scores it a *success*: a run that cannot report
+ *     still exits 0, so `recordDispatchSuccess` resets the counter each cycle.
+ *   - Boot only warns that the callback path is disabled, then carries on.
+ *
+ * `resolveRunnerCallbackBaseUrl` already defaults the URL under
+ * RUNNER_MODE=local, so in practice the secret is the half most likely to be
+ * missing — but both are checked, since an explicit-URL deployment that omits
+ * the secret lands in the same loop.
+ *
+ * Returns a human-readable reason to refuse the dispatch, or null when the
+ * callback path is configured.
+ */
+export function planningDispatchBlockReason(config: {
+  runnerCallbackBaseUrl: string | null;
+  runnerTokenSecret: string | null;
+}): string | null {
+  const missing = missingRunnerCallbackConfig(config);
+  if (missing.length === 0) return null;
+
+  return (
+    `planning needs the runner callback to post the plan and set Plan-Complete, `
+    + `but the callback path is disabled (${missing.join(" and ")} not set) — `
+    + `dispatching would re-run planning every poll without ever advancing the issue`
+  );
+}
 
 export interface RunnerResultBody {
   phase: RunnerPhase;
   outcome: "success" | "failure";
   failureReason?: string;
-  /** Machine-readable error code set when a known guardrail trips (e.g. "SENSITIVE_FILES_BLOCKED"). */
+  /**
+   * Machine-readable error code. Set either when a known guardrail trips
+   * (e.g. "SENSITIVE_FILES_BLOCKED") or, for a classified terminal failure,
+   * to `failure.code` — it is not guardrail-only.
+   */
   failureCode?: string;
+  /** Structured terminal failure classified by src/pipeline/failure-classification.ts. Shape-validated below. */
+  failure?: FailureRecord;
   comments: Array<{ body: string }>;
   prUrl?: string;
   /** True when a grouping-parent implementation run produced no changes (Case B).
    *  Allows a successful callback without prUrl; the orchestrator finalizes the issue
    *  directly so merge-up.ts can open the feature→base roll-up PR. */
   noWork?: boolean;
+  /**
+   * SHA of the snapshot commit pushed by a kg-refresh runner. Used by the
+   * orchestrator to verify the commit is visible before triggering the local rail.
+   * Only present for phase=kg-refresh.
+   */
+  snapshotCommit?: string;
+  /**
+   * Number of the refresh PR opened by a kg-refresh runner alongside snapshotCommit.
+   * The orchestrator merges it on a successful callback or closes it on a failed one.
+   * Only present for phase=kg-refresh.
+   */
+  snapshotPr?: number;
+  /** The `kg-refresh/<stamp>` branch behind snapshotPr; deleted by the orchestrator after merge or close. */
+  snapshotBranch?: string;
+  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
+  guardVerdict?: "clean" | "warnings" | "refused" | "held";
+  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
+  partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Why a `KG_SNAPSHOT_HELD` run waits; absent from runners that predate the field. */
+  cause?: "shrink" | "tracker-missing" | "source-failed";
+  /** Teams whose tracker fetch failed, for a `tracker-missing` hold. */
+  failedTeams?: string[];
+  /** True when accepting a `tracker-missing` hold would drop a skipped or failed team's served issues. */
+  acceptBlocked?: boolean;
+  /** Skipped or failed teams with issues in the served snapshot. */
+  lostTeams?: Array<{ team: string; servedIssues: number }>;
+  /** Warnings on a completed refresh; absent from runners that predate the field. */
+  warnings?: string[];
+  /** Per-source results of the refresh; absent from runners that predate the field. */
+  sources?: SourceResult[];
+  /** Reference repository clone outcomes, present only when the run declared entries. */
+  referenceRepoResults?: ReferenceRepoResult[];
+  /** Internal findings collected across review iterations, validated before storage. */
+  reviewOnly?: boolean;
+  rollupReview?: import("./runner-result.js").RollupReviewResult;
+  internalFindings?: ReviewLedgerFinding[];
+  /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
+  findingDispositions?: FindingDisposition[];
+  /**
+   * Per-cycle evidence records forwarded from the runner workspace's declared cycle-summary file
+   * (AII-801, pipeline/cycle-summary.ts). Shape-validated below; an unrecognised/malformed entry
+   * is dropped rather than failing the callback, same convention as `findingDispositions`.
+   * Recorded durably (`recordReviewFixCycleSummary`, review-fix-evidence.ts) only when this
+   * result also carries a validated `reviewFix` marker — a Legacy run has no attemptId to record
+   * against, so its cycle summaries (if any were even forwarded) are acknowledged and dropped.
+   */
+  cycleSummaries?: CycleSummary[];
+  /**
+   * Optional diagnostic attribution (AII-946). Sanitized and stripped-on-invalid in
+   * handleRunnerResult; never fails the callback. Older orchestrators ignore the unknown key.
+   * Census (AII-971 wires emission/persistence): API job/report readers, reviewer result
+   * handling and failure validators do not read this field yet. `INVOCATION_TIMEOUT` is an
+   * ordinary open-ended `failure.code` reported with the existing error outcome.
+   */
+  attribution?: InvocationAttributionV1;
+  /**
+   * Every model invocation of the job (AII-1562), sanitized per record in handleRunnerResult; invalid
+   * records are dropped with a count-only warning and never fail the callback. Stored one row per
+   * invocation id. Absent from runners that predate the field.
+   */
+  invocations?: InvocationRecordV1[];
+  /** How many invocation records the runner dropped (malformed or past the cap) before sending; absent when none. */
+  invocationsDropped?: number;
+  /**
+   * SHAs the job pushed, oldest first (AII-1562); `[]` when nothing was pushed. Absent when the runner
+   * did not report, which is distinct from empty. Dropped with a warning when malformed.
+   */
+  pushedCommits?: string[];
+  /**
+   * Optional pilot marker (AII-769 Restate review-fix pilot; shape defined by
+   * AII-770's review-fix-contract.ts). Present only on a result reported by a
+   * Restate-owned review-fix attempt — absent means Legacy. A present-but-
+   * malformed marker fails the whole callback closed before the run token is
+   * consumed (see handleRunnerResult); unlike `failure`/`findingDispositions`
+   * above, it is never dropped-and-warned into the legacy success branch.
+   */
+  reviewFix?: ReviewFixResultMetadataV1;
+  /**
+   * Head SHA the internal review approved when the run ended `external_review_pending`. Kept only
+   * when `headSha` is 40 lowercase hex characters; otherwise dropped with a warning. A failed
+   * implementation or gap-analysis result that carries it starts `LateExternalReview` (AII-1227).
+   */
+  externalReviewPending?: { headSha: string };
 }
 
 export interface HandleRunnerResultInput {
@@ -31,6 +245,46 @@ export interface HandleRunnerResultInput {
   resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
   /** When provided, bounded failure cleanup (remediateFailedJob) runs after markImplementationFailed. */
   watchdogConfig?: StuckWatchdogConfig;
+  /**
+   * Injectable seam that durably records a validated `reviewFix` result marker
+   * (AII-769/AII-803) — e.g. `SqliteReviewFixAttemptStore.recordResult`, composed
+   * with queuing the accepted result for Restate delivery. Authenticated and
+   * called before the Legacy run token is ever consumed and before any provider
+   * call, so every classification ("stored"/"duplicate"/"conflict"/"stale") is
+   * fully side-effect-free with respect to Legacy. A "stored" classification
+   * never falls through into Legacy phase handling either — see
+   * `handleRunnerResult`'s reviewFix branch, which returns directly. An absent
+   * seam fails closed: a pilot result cannot be acknowledged without storage.
+   */
+  // Forwarding keys come from authenticated claims, never from result metadata.
+  onReviewFixResult?: (result: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }, opts: { idempotencyKey: string }) => ResultIntakeOutcome | Promise<ResultIntakeOutcome>;
+  /**
+   * Ingress client for the `KgRefresh` workflow. The kg-refresh result branch is
+   * verify-only and hands the report here (AII-899). Absent → 503 so the runner retries.
+   */
+  kgRefreshClient?: KgRefreshIngressClient;
+  /** `KG_SOURCE_REPO`, from which the `KgRepo` key is derived. Null/absent → 503. */
+  kgSourceRepo?: string | null;
+  /**
+   * Reports planning completion and usage to the workflow for a Restate-owned admission.
+   * Admissions without a Restate owner are logged and left held for later backend
+   * reconciliation or the stale-admission sweep.
+   */
+  checkPlanningAdmissionTermination?: (dispatchId: string, usage?: RecordedUsage) => Promise<void | PlanningIngressResult>;
+  /**
+   * Sends `report` to the `ImplementationRun` workflow of a Restate-owned implementation attempt (AII-1557),
+   * after the outcome branch has written the job row and made its ticket moves. The hook itself tells a
+   * Restate-owned reservation from a Legacy one; a Legacy dispatch gets no `report`. The callback never
+   * releases the reservation either way: the workflow confirms the run ended first. An error it throws is
+   * logged and returns 503 for owned results so the runner can retry.
+   */
+  checkImplementationAdmissionTermination?: (dispatchId: string, usage?: RecordedUsage) => Promise<void | PlanningIngressResult>;
+  /**
+   * Starts the `LateExternalReview` workflow (AII-1227) for a failed implementation or gap-analysis
+   * result that ended `external_review_pending`. The hook itself decides whether Restate is ready;
+   * an error it throws is logged and does not change the response.
+   */
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>;
 }
 
 export interface HandleRunnerResultOutput {
@@ -39,7 +293,7 @@ export interface HandleRunnerResultOutput {
 }
 
 export interface RunnerProgressBody {
-  step: Step;
+  step?: Step;
   githubRunId?: number;
 }
 
@@ -47,6 +301,8 @@ export interface HandleRunnerProgressInput {
   authorization: string | undefined;
   body: RunnerProgressBody;
   secret: string;
+  kgRefreshClient?: KgRefreshIngressClient;
+  kgSourceRepo?: string | null;
 }
 
 export interface HandleRunnerPlanningContextInput {
@@ -55,47 +311,171 @@ export interface HandleRunnerPlanningContextInput {
   resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
 }
 
+/** Thrown by an intake seam whose Restate forward failed; the route answers 503 and the runner retries. */
+export class ReviewFixIntakeUnavailableError extends Error {
+  constructor() {
+    super("review-fix intake unavailable");
+    this.name = "ReviewFixIntakeUnavailableError";
+  }
+}
+
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
+}
+
+/** The KgRefresh workflow keyed by the dispatch id has no run — the callback is for a refresh that never started here. */
+function noRefreshInFlight(dispatchId: string): HandleRunnerResultOutput {
+  console.warn(`[runner-callback] kg-refresh callback with no refresh in flight dispatch=${dispatchId}`);
+  return bad(409, "no-refresh-in-flight");
+}
+
+const STATUS_TEXT_MAX_LEN = 200;
+
+/**
+ * Bounds a status string to its first line, capped at `STATUS_TEXT_MAX_LEN`
+ * characters, before it flows into the stuck-watchdog's markdown table cell
+ * (`stuck-watchdog.ts`) and the Slack "Last status" field (`notify.ts`) —
+ * both single-line contexts that a multi-line or oversized `failureReason`
+ * (e.g. SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED) would otherwise break.
+ */
+export function boundStatusText(text: string): string {
+  const firstLine = text.split("\n")[0] ?? "";
+  return firstLine.length > STATUS_TEXT_MAX_LEN ? `${firstLine.slice(0, STATUS_TEXT_MAX_LEN)}…` : firstLine;
 }
 
 /**
  * Renders a failure using the helper function that's shared with Slack/Teams notifications.
  * When the runner reports a known `failureCode`, makes use of the helper's structured description so the ticket reader has actionable context.
  * Passes along the raw `failureReason` string for all other failures.
+ *
+ * SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED, MAX_TURNS_EXHAUSTED, VERIFY_FAILED and INSTALL_FAILED are not
+ * part of the BAC-27111 failure taxonomy (they are guardrail/policy outcomes, not classified
+ * failures), so they are checked first and keep their existing wording regardless of `failure`.
+ * The stage-retry rail's REVIEWER_TURNS_EXHAUSTED and PROVIDER_UNAVAILABLE codes, by
+ * contrast, always arrive with a real `FailureRecord` carrying that exact `code` — their
+ * bespoke wording lives inside `classificationForFailure` itself (keyed on `failure.code`,
+ * checked ahead of its generic rendering), not as an `else if` branch here, so both this
+ * callback path and the monitor path pick it up through the one shared call below.
+ * Otherwise, a structured `failure` record (BAC-27112) renders the full evidence comment;
+ * `classifyCompletion` builds the identical body for a monitor-detected terminal job via
+ * the same `classificationForFailure` helper.
  */
 export function formatFailureComment(
   failureCode: string | undefined,
   failureReason: string | undefined,
-  prUrl?: string,
+  options: {
+    prUrl?: string;
+    failure?: FailureRecord;
+    runUrl?: string | null;
+    lastSuccessfulStage?: string | null;
+    /** See `classificationForFailure` — omit/true for an initial run, false for gap-fill/re-dispatch. */
+    isInitialRun?: boolean;
+  } = {},
 ): string {
+  const { prUrl, failure, runUrl, lastSuccessfulStage, isInitialRun } = options;
   let c: Classification;
-  if (failureCode === "SENSITIVE_FILES_BLOCKED") {
+  if (failure?.code === "ACCOUNT_USAGE_LIMIT") {
+    return renderFailureRecord(failure, prUrl, runUrl, lastSuccessfulStage, isInitialRun);
+  } else if (failureCode === "SENSITIVE_FILES_BLOCKED") {
+    // Pushed through the same redact/cap `classifyCompletion` applies to a persisted
+    // FailureRecord's `message` (BAC-27112 follow-up) — otherwise a raw, secret-bearing
+    // `failureReason` would render differently here than the byte-identical guardrail
+    // trip reported through the FailureRecord path.
+    c = sensitiveFilesGuardrailClassification(redactedGuardrailReason(failureReason));
+  } else if (failureCode === "REVIEW_UNAPPROVED" || failureCode === "MAX_TURNS_EXHAUSTED") {
+    // REVIEW_UNAPPROVED covers two stages: the first review (before the PR, which then opens
+    // as a draft) and the second review (on an open, non-draft PR, often stopped by a timeout
+    // or unreadable reviewer output rather than by a finding). Its wording must hold for both,
+    // so it names neither a draft nor an iteration limit; failureReason names the stage. It
+    // is written for readers who do not know AI-Implement.
+    const maxTurns = failureCode === "MAX_TURNS_EXHAUSTED";
+    // An initial run with no PR changed no files (a first-review approval among them), and an
+    // unapproved gap-fill does not push, so its change is discarded. Neither has a change in a
+    // PR to examine.
+    const gapFill = isInitialRun === false;
+    const noPr = !maxTurns && !gapFill && !prUrl;
     c = {
-      summary: "🔒 Blocked by security guardrail.",
-      detail: failureReason ?? "Sensitive files detected in staged changes.",
-      remediation: "Remove or .gitignore the flagged files, then re-run.",
+      summary: maxTurns
+        ? "🟡 AI-Implement did not finish the implementation."
+        : gapFill
+          ? "🟡 A review did not approve the new change, so AI-Implement discarded it."
+          : noPr
+            ? "🟡 AI-Implement did not open a pull request."
+            : "🟡 AI-Implement made the change, but a review did not approve it.",
+      detail: [
+        // A gap-fill push reports no prUrl, so check the run kind first.
+        isInitialRun === false
+          ? "The existing PR is unchanged by this run."
+          : prUrl
+            ? maxTurns
+              ? `The work so far is preserved in a draft PR: ${prUrl}`
+              : `The change is in this pull request: ${prUrl}`
+            // The no-PR summary and the reason below it already say there is no PR.
+            : noPr ? "" : "No PR could be opened (no code changes were produced).",
+        failureReason ?? "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      remediation: maxTurns
+        ? `${gapFill || !prUrl ? "Read" : "Review the draft PR and"} the run autopsy comment. Likely causes: over-broad issue scope, missing prerequisites, or thin context. Split the ticket or add context. Then reset the AI-Implement status or label on the ticket to start AI-Implement again.`
+        : [
+          "",
+          ...(noPr || gapFill
+            ? [
+              "1. Read the reason above.",
+              "2. If the ticket needs a code change, add more information to the ticket.",
+            ]
+            : [
+              "1. If the review did not finish, the change can be correct. Examine the pull request yourself.",
+              "2. If the review found problems, make the ticket smaller or add more information to it.",
+            ]),
+          // Provider-neutral: this comment serves every ticketing provider.
+          "3. To start AI-Implement again, reset the AI-Implement status or label on the ticket.",
+        ].join("\n"),
       docsUrl: TROUBLESHOOTING_URL,
     };
-  } else if (failureCode === "REVIEW_UNAPPROVED" || failureCode === "MAX_TURNS_EXHAUSTED") {
-    const cause =
-      failureCode === "MAX_TURNS_EXHAUSTED"
-        ? "the implementation hit its turn cap before completing"
-        : "the automated reviewer did not approve within the allotted iterations";
+  } else if (failureCode === "VERIFY_FAILED") {
+    // Not a review verdict: the repo's verify hook still failed after the last implement pass,
+    // so the review never ran on it. failureReason carries the exit code and the output tail.
+    const gapFill = isInitialRun === false;
     c = {
-      summary: `🟡 Implementation finished without review approval — ${cause}.`,
+      summary: gapFill
+        ? "🟡 The verify hook failed, so AI-Implement discarded the new change."
+        : "🟡 Implementation finished, but the repository's verify hook still failed.",
+      detail: [
+        // A gap-fill push reports no prUrl, and an unapproved gap-fill does not push.
+        gapFill
+          ? "The existing PR is unchanged by this run."
+          : prUrl
+            ? `The work is in a draft PR: ${prUrl}`
+            : "No PR could be opened (no code changes were produced).",
+        failureReason ?? "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      remediation:
+        "Read the hook output above: the build or check in the `verify` script failed. Fix the cause by hand or add context to the ticket, then re-dispatch.",
+      docsUrl: TROUBLESHOOTING_URL,
+    };
+  } else if (failureCode === "INSTALL_FAILED") {
+    c = {
+      summary: "🟡 Implementation finished, but dependencies did not install — build and tests never ran.",
       detail: [
         prUrl
-          ? `The work so far is preserved in a draft PR: ${prUrl}`
+          ? isInitialRun === false
+            ? "The existing PR was updated by this run."
+            : `The work is in a draft PR: ${prUrl}`
           : "No PR could be opened (no code changes were produced).",
         failureReason ?? "",
       ]
         .filter(Boolean)
         .join("\n\n"),
       remediation:
-        "Review the draft PR and the run autopsy comment. Likely causes: over-broad issue scope, missing prerequisites, or thin context — split the ticket or add context, then re-dispatch.",
+        "Fix the install (lockfile, peer ranges, registry access), or set packageManager: none in .ai-implement/config.yml and install in a setup hook. Then run it again, or review the PR by hand.",
       docsUrl: TROUBLESHOOTING_URL,
     };
+  } else if (failure) {
+    return renderFailureRecord(failure, prUrl, runUrl, lastSuccessfulStage, isInitialRun);
   } else {
     c = { summary: failureReason ?? "Unspecified failure." };
   }
@@ -134,7 +514,355 @@ function validateGithubRunId(body: unknown): number | null | HandleRunnerResultO
     : bad(400, "invalid_github_run_id");
 }
 
-export async function handleRunnerResult(
+/**
+ * Shape-validates the optional `reviewFix` marker on a `/runner/result` body.
+ * Version mismatch gets its own error code (never silently coerced to v1);
+ * any other malformation (missing/invalid attemptId, installationId,
+ * repository, prNumber, deadlineAt, githubRunId, githubRunAttempt, or
+ * outputCommit) gets a second, generic-but-distinct code — never
+ * `invalid_body`, and never allowed to fall through to the legacy success
+ * branch (see handleRunnerResult).
+ */
+function validateResultReviewFix(
+  raw: unknown,
+): { ok: true; value: ReviewFixResultMetadataV1 } | { ok: false; error: string } {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: "invalid_review_fix" };
+  }
+  if ((raw as Record<string, unknown>).version !== REVIEW_FIX_CONTRACT_VERSION) {
+    return { ok: false, error: "invalid_review_fix_version" };
+  }
+  const validated = validateReviewFixResultMetadata(raw);
+  if (!validated.ok) return { ok: false, error: "invalid_review_fix" };
+  return { ok: true, value: validated.value };
+}
+
+/**
+ * Maps a review-fix result classification to an HTTP response. `stored` is
+ * not expected to reach here in practice — a "stored" classification lets
+ * handleRunnerResult continue into its normal processing rather than
+ * returning early — but is handled for completeness and for callers that
+ * exercise this mapping directly. `duplicate`/`conflict`/`stale` are durable,
+ * terminal classifications and are never retryable; only a transient
+ * transport failure (429/5xx, or the request never completing) is — see
+ * `isRetryableStatus`.
+ */
+export function reviewFixResultIntakeResponse(outcome: ResultIntakeOutcome): HandleRunnerResultOutput {
+  switch (outcome.status) {
+    case "stored":
+      return { status: 200, body: { acknowledged: true, outcome: "stored", retryable: false } };
+    case "duplicate":
+      return {
+        status: 200,
+        body: { acknowledged: true, outcome: "duplicate", attemptId: outcome.attemptId, retryable: false },
+      };
+    case "conflict":
+      return {
+        status: 409,
+        body: {
+          acknowledged: false,
+          outcome: "conflict",
+          attemptId: outcome.attemptId,
+          reason: outcome.reason,
+          retryable: false,
+        },
+      };
+    case "stale":
+      return {
+        status: 410,
+        body: {
+          acknowledged: false,
+          outcome: "stale",
+          attemptId: outcome.attemptId,
+          reason: outcome.reason,
+          retryable: false,
+        },
+      };
+  }
+}
+
+/**
+ * `review_fix_cycles` predates AII-801 and keys evidence on `(attemptId, cycle)` alone (AII-786,
+ * src/dedup.ts) — it has no stage column to separate a feedback-loop implement/review pass from a
+ * post-push-review fix pass sharing the same attempt, and both stages number their own cycles
+ * starting at 1. Recording both under their raw `cycle` would collide and misclassify a genuine
+ * second stream as a conflicting retry of the first. Until a schema change adds a stage column
+ * (tracked with the rest of AII-790's "apply attempt outcomes under one authority" work), a
+ * post-push-review-fix cycle is offset into a disjoint numeric band well above any realistic
+ * feedback-loop iteration count, keeping the two streams distinguishable without touching the
+ * frozen schema.
+ */
+const POST_PUSH_REVIEW_FIX_CYCLE_BAND = 100_000;
+
+/** The post-push publication record sorts after every feedback-loop cycle and before any
+ *  post-push-review-fix cycle, whose later commit must stay the final one. */
+const PUBLICATION_CYCLE_BAND = 50_000;
+
+function reviewFixCycleRecordNumber(summary: CycleSummary): number {
+  if (summary.stage === "publication") return PUBLICATION_CYCLE_BAND + summary.cycle;
+  return summary.stage === "post-push-review-fix" ? POST_PUSH_REVIEW_FIX_CYCLE_BAND + summary.cycle : summary.cycle;
+}
+
+/**
+ * Cycle-summary evidence (AII-801) dispositions use the fix agent's own fixed/invalid/follow-up
+ * vocabulary (`Disposition`, pipeline/finding-dispositions.ts); `review_fix_cycles`' disposition
+ * field predates it and uses addressed/dismissed/deferred instead (AII-786). This is an
+ * evidence-only mapping for durable storage — nothing reads `review_fix_cycles.dispositions_json`
+ * back into `applyApproval` today (that reads `findingDispositions` from a separate path) — so an
+ * unrecognised value is dropped rather than failing the whole record.
+ */
+const CYCLE_DISPOSITION_TO_REVIEW_FIX: Record<string, ReviewFixFindingDisposition["disposition"]> = {
+  fixed: "addressed",
+  invalid: "dismissed",
+  "follow-up": "deferred",
+};
+
+function toReviewFixDispositions(dispositions: readonly CycleDisposition[]): ReviewFixFindingDisposition[] {
+  const out: ReviewFixFindingDisposition[] = [];
+  for (const d of dispositions) {
+    const mapped = CYCLE_DISPOSITION_TO_REVIEW_FIX[d.disposition];
+    if (mapped) out.push({ findingKey: d.key, disposition: mapped });
+  }
+  return out;
+}
+
+/**
+ * Forwards this result's shape-validated cycle summaries into the durable `review_fix_cycles`
+ * store (AII-786, review-fix-evidence.ts), completing the path AII-801's blocking review asked
+ * for: a cycle written to the runner workspace's declared file is no longer lost when the
+ * workspace/container tears down. Called only when the result also carried a validated
+ * `reviewFix` marker — `attemptId` is that marker's, never invented here. Never throws: a
+ * rejected/conflicting record is logged and otherwise ignored, matching the non-fatal,
+ * best-effort convention `writeCycleSummary` itself already uses.
+ */
+function recordOneCycleSummary(attemptId: string, summary: CycleSummary): ReviewFixCycleSummaryOutcome {
+  return recordReviewFixCycleSummary({
+      attemptId,
+      cycle: reviewFixCycleRecordNumber(summary),
+      inputCommit: summary.inputCommit,
+      outputCommit: summary.outputCommit,
+      dispositions: toReviewFixDispositions(summary.dispositions),
+      tests: summary.tests,
+      verdict: JSON.stringify(summary.verdict),
+      usage: summary.usage,
+      completedAt: summary.completedAt,
+    });
+}
+
+function recordCycleSummaries(attemptId: string, summaries: readonly CycleSummary[]): void {
+  for (const summary of summaries) {
+    const outcome = recordOneCycleSummary(attemptId, summary);
+    if (outcome.status === "conflict" || outcome.status === "rejected") {
+      console.warn(
+        `[runner-callback] cycle summary "${summary.id}" for attempt ${attemptId} not recorded (${outcome.status}): ${outcome.reason}`,
+      );
+    }
+  }
+}
+
+/** Independently persists one pilot cycle before terminal result intake. The reusable
+ * progress bearer is bound to a live prepared attempt; identical retry is idempotent. */
+export function handleRunnerCycleSummary(input: {
+  authorization: string | undefined;
+  secret: string;
+  body: unknown;
+}): HandleRunnerResultOutput {
+  const bearer = parseBearerToken(input.authorization);
+  if (!bearer) return bad(401, "missing_bearer");
+  const verified = verifyPreparedReviewFixToken(bearer, input.secret, "progress");
+  if (!verified.ok || !verified.claims.attemptId) return bad(401, verified.ok ? "wrong_scope" : verified.reason);
+  if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return bad(400, "invalid_cycle_body");
+  const { value: summary, stripped } = stripCycleAttribution((input.body as { summary?: unknown }).summary);
+  if (stripped) console.warn("[runner-callback] dropped malformed cycle summary attribution (count=1)");
+  if (!isCycleSummary(summary)) return bad(400, "invalid_cycle_summary");
+
+  const outcome = recordOneCycleSummary(verified.claims.attemptId, summary);
+  switch (outcome.status) {
+    case "recorded":
+    case "duplicate":
+      return { status: 200, body: { acknowledged: true, outcome: outcome.status } };
+    case "conflict":
+      console.warn(`[runner-callback] conflicting cycle summary for attempt ${verified.claims.attemptId} cycle ${summary.cycle}`);
+      return bad(409, "cycle_conflict");
+    case "tombstoned":
+      return bad(410, "attempt_tombstoned");
+    case "rejected":
+      return bad(400, "invalid_cycle_summary");
+  }
+}
+
+/**
+ * The only retryable outcome in the review-fix pilot's result/activity
+ * contract is a transient failure: a 429/5xx response, or a transport-level
+ * failure that never reached this classification at all. A durable
+ * classification (stored/accepted/duplicate/conflict/stale) is never
+ * retryable, regardless of the HTTP status it happens to carry.
+ */
+export function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+const LEASE_HUMAN_COMMENT_MARKER = "<!-- ai-implement lease-human -->";
+
+/**
+ * AII-749: a gap-fill's push refused because the PR branch moved underneath it
+ * (`GIT_LEASE_REJECTED`) either lost the bot's own re-dispatched review-fix work
+ * (safe to retry) or collided with a human actively pushing to the same branch
+ * (never safe to race). Distinguishes the two by asking GitHub who authored the
+ * PR's current head commit, and only ever re-enqueues on a definite "Bot"
+ * answer — both "User" and an indeterminate `null` (unknown author, or the
+ * GitHub calls themselves failing) are treated as human, since guessing "Bot"
+ * here would race a human editing the branch. Every GitHub call is inside the
+ * try/catch: a failure here must not change the callback's own HTTP result.
+ */
+async function handleLeaseRejectedFailure(
+  job: Job,
+  watchdogConfig: StuckWatchdogConfig | undefined,
+): Promise<void> {
+  if (!job.repo || !job.prUrl) return;
+  const prNumber = parsePrNumber(job.prUrl);
+  if (prNumber === null) return;
+  if (!watchdogConfig) {
+    console.warn(
+      `[runner-callback] Lease rejected on PR ${job.prUrl} but no GitHub App credentials are configured — skipping`,
+    );
+    return;
+  }
+  const slashIdx = job.repo.indexOf("/");
+  const owner = slashIdx >= 0 ? job.repo.slice(0, slashIdx) : "";
+  const repo = slashIdx >= 0 ? job.repo.slice(slashIdx + 1) : "";
+  if (!owner || !repo) return;
+
+  try {
+    const token = await getInstallationToken(watchdogConfig.githubAppId, watchdogConfig.githubAppPrivateKey, owner);
+    const prState = await getPullRequestState(token, owner, repo, prNumber);
+    const authorType = prState?.headRef ? await getCommitAuthorType(token, owner, repo, prState.headRef) : null;
+
+    if (authorType === "Bot") {
+      acceptReviewFixWebhookEvent({
+        eventId: `internal:lease_rejected:${job.dispatchId ?? job.id}`,
+        issueId: job.issueId,
+        issueIdentifier: job.issueIdentifier,
+        repo: job.repo,
+        prNumber,
+        reason: "lease_rejected",
+      });
+      console.log(`[runner-callback] Lease rejected on PR #${prNumber}; bot head, re-enqueued`);
+    } else {
+      // "User" and null (unknown author, or a GitHub call above failing) share
+      // this branch on purpose — see the function doc comment.
+      await postOrUpdateStickyComment(
+        token,
+        owner,
+        repo,
+        prNumber,
+        LEASE_HUMAN_COMMENT_MARKER,
+        `${LEASE_HUMAN_COMMENT_MARKER}\nA human pushed to this branch while AI-Implement was running, so the run stopped without pushing. Comment \`/ai-implement\` to resume.`,
+      );
+    }
+  } catch (err) {
+    console.error(`[runner-callback] leaseRejectedHandling failed for PR ${job.prUrl}:`, err);
+  }
+}
+
+/** One-line description of a refused tracker write; a Jira error carries Jira's own status and body. */
+export function describeTrackerWriteError(err: unknown): string {
+  if (err instanceof JiraApiError) {
+    return `Jira answered ${err.status}: ${err.bodyText.replace(/\s+/g, " ").trim().slice(0, 500)}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+// The orchestrator owns one local callback/database writer. Reserve a dispatch before
+// the first await so overlapping deliveries cannot both pass the persisted guard.
+// Entries exist only while callbacks are running; completion survives in the database.
+const callbackLifecycleTails = new Map<string, Promise<void>>();
+
+async function withCallbackLifecycleLock<T>(dispatchId: string, effect: () => Promise<T>): Promise<T> {
+  const previous = callbackLifecycleTails.get(dispatchId);
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  callbackLifecycleTails.set(dispatchId, current);
+  try {
+    await previous;
+    return await effect();
+  } finally {
+    release();
+    if (callbackLifecycleTails.get(dispatchId) === current) callbackLifecycleTails.delete(dispatchId);
+  }
+}
+
+/** The setup checks behind a refused plan-complete write: Jira's status options, or Linear's lifecycle labels or the app's team access. */
+export function planCompleteFailureChecks(providerId: string, err: unknown): SetupCheckId[] {
+  if (providerId === "jira") return ["tracker.jira.status-options"];
+  if (providerId !== "linear") return [];
+  if (err instanceof LinearLabelWriteError) return ["tracker.linear.lifecycle-labels"];
+  return err instanceof LinearGraphQLError ? ["tracker.linear.team-access"] : ["tracker.linear.lifecycle-labels"];
+}
+
+/** Describe the provider operation that failed after recording a plan. */
+export function planCompleteFailureText(providerId: string, awaitApproval: boolean, err: unknown): string {
+  if (providerId === "jira") {
+    return `The plan was recorded, but the tracker refused the "${awaitApproval ? "Awaiting Approval" : "Plan Approved"}" status write. ` +
+      `${describeTrackerWriteError(err)}. Fix the status field, then use Unpark at /admin#runners.`;
+  }
+  if (providerId === "linear") {
+    if (err instanceof LinearLabelWriteError) {
+      return `The plan was recorded, but Linear refused to create label "${err.label}" on team ${err.teamKey}: ${err.linearMessage}. ` +
+        "Create the label in the team by hand, or let the app create labels, then use Unpark at /admin#runners.";
+    }
+    if (err instanceof LinearGraphQLError) {
+      return `The plan was recorded, but Linear refused the plan-complete label write (${err.operation}): ${err.linearMessage}. ` +
+        "Fix the app's access to the team, then use Unpark at /admin#runners.";
+    }
+    return `The plan was recorded, but the plan-complete label write failed: ${describeTrackerWriteError(err)}. Then use Unpark at /admin#runners.`;
+  }
+  return `The plan was recorded, but the tracker refused the plan-complete write: ${describeTrackerWriteError(err)}. Then use Unpark at /admin#runners.`;
+}
+
+/**
+ * Preserve callback-owned lifecycle outcomes, then deliver owned accounting through
+ * the workflow intake. Persisted lifecycle completion skips effects on retry; the reusable
+ * credential and workflow idempotency still allow the report to be delivered.
+ */
+export async function handleRunnerResult(input: HandleRunnerResultInput): Promise<HandleRunnerResultOutput> {
+  if (input.body?.reviewFix !== undefined) return handleRunnerResultInternal(input);
+  const bearer = parseBearerToken(input.authorization);
+  const verified = bearer ? verifyRunToken(bearer, input.secret, "result", { consume: false }) : null;
+  const owned = verified?.ok && (input.body?.phase === "planning" || input.body?.phase === "implementation" || input.body?.phase === "gap-analysis")
+    && readAdmission(verified.claims.dispatchId)?.lifecycleOwner.kind === "restate";
+  if (!owned || !verified?.ok) return handleRunnerResultInternal(input);
+  const hook = input.body.phase === "planning"
+    ? input.checkPlanningAdmissionTermination : input.checkImplementationAdmissionTermination;
+  if (!hook) {
+    console.warn(`[runner-callback] forward failed kind=${input.body.phase} dispatch=${verified.claims.dispatchId}`);
+    return bad(503, "owned_result_intake_unavailable");
+  }
+  const result = await withCallbackLifecycleLock(verified.claims.dispatchId, async () => {
+    const result = await handleRunnerResultInternal({
+      ...input,
+      checkPlanningAdmissionTermination: undefined,
+      checkImplementationAdmissionTermination: undefined,
+    });
+    // Persist before releasing the lock and before the fallible forward. A retry
+    // skips lifecycle effects but still delivers its report through workflow intake.
+    if (result.status < 300) markCallbackLifecycleCompleted(verified.claims.dispatchId);
+    return result;
+  });
+  if (result.status >= 300) return result;
+  // Restate uses the dispatch id as the report idempotency key, even after a lost ACK.
+  try {
+    const forwarded = await hook(verified.claims.dispatchId, toRecordedUsage(input.body));
+    if (forwarded?.status === "conflict") return bad(409, "conflicting_report");
+    if (!forwarded || forwarded.status !== "accepted") throw new Error("report unavailable");
+    return result;
+  } catch {
+    console.warn(`[runner-callback] forward failed kind=${input.body.phase} dispatch=${verified.claims.dispatchId}`);
+    return bad(503, "owned_result_intake_unavailable");
+  }
+}
+
+async function handleRunnerResultInternal(
   input: HandleRunnerResultInput,
 ): Promise<HandleRunnerResultOutput> {
   const bearerToken = parseBearerToken(input.authorization);
@@ -144,15 +872,27 @@ export async function handleRunnerResult(
   // otherwise burn a one-time-use token and lose any chance of retry from
   // the runner.
   const body = input.body as unknown as {
+    reviewOnly?: unknown;
     phase?: unknown;
     outcome?: unknown;
     comments?: unknown;
+    failure?: unknown;
+    internalFindings?: unknown;
+    findingDispositions?: unknown;
+    cycleSummaries?: unknown;
+    attribution?: unknown;
+    invocations?: unknown;
+    invocationsDropped?: unknown;
+    pushedCommits?: unknown;
+    reviewFix?: unknown;
+    externalReviewPending?: unknown;
   } | null | undefined;
   if (!body || typeof body !== "object") return bad(400, "invalid_body");
   if (
     body.phase !== "planning" &&
     body.phase !== "implementation" &&
-    body.phase !== "gap-analysis"
+    body.phase !== "gap-analysis" &&
+    body.phase !== "kg-refresh"
   ) {
     return bad(400, "invalid_phase");
   }
@@ -172,7 +912,146 @@ export async function handleRunnerResult(
     }
   }
 
-  // Note: token is consumed atomically here BEFORE any provider call. If
+  // A present reviewFix marker puts this message under Restate's control instead
+  // of Legacy (AII-769/AII-803). It is authenticated and classified here, before
+  // the Legacy run token is ever consumed and before any provider call — a
+  // malformed marker or a failed authentication must never reach the legacy
+  // success branch below, and once classified "stored" this message must never
+  // fall through into it either: a pilot result bypasses every Legacy
+  // completion, disposition, and approval side effect (approval is applied
+  // independently by review-fix-finalize.ts, never by this callback).
+  if (body.reviewFix !== undefined) {
+    const validated = validateResultReviewFix(body.reviewFix);
+    if (!validated.ok) return bad(400, validated.error);
+
+    // Authenticate against the prepared attempt's own credential, never the
+    // request body: the token must have been minted for exactly this attempt.
+    // `onReviewFixResult` (recordResult) separately verifies the body's
+    // repository/prNumber/installationId/deadlineAt against the stored attempt
+    // row, so a caller holding a genuine token still cannot smuggle a forged
+    // scope through the marker.
+    const authenticated = verifyPreparedReviewFixToken(bearerToken, input.secret, "result");
+    if (!authenticated.ok || authenticated.claims.attemptId !== validated.value.attemptId) {
+      const reason = authenticated.ok ? "reviewfix_wrong_attempt" : authenticated.reason;
+      console.warn(
+        `[runner-callback] pilot result refused attempt=${validated.value.attemptId} reason=${reason}`,
+      );
+      return bad(401, reason);
+    }
+
+    if (!input.onReviewFixResult) {
+      console.warn(`[runner-callback] forward failed kind=review-fix dispatch=${authenticated.claims.dispatchId}`);
+      return bad(503, "reviewfix_result_intake_unavailable");
+    }
+    let outcome: ResultIntakeOutcome;
+    try {
+      outcome = await input.onReviewFixResult({ ...validated.value, usage: toRecordedUsage(body) }, { idempotencyKey: authenticated.claims.dispatchId });
+    } catch (e) {
+      console.warn(`[runner-callback] forward failed kind=review-fix dispatch=${authenticated.claims.dispatchId}`);
+      if (e instanceof ReviewFixIntakeUnavailableError) return bad(503, "reviewfix_result_intake_unavailable");
+      throw e;
+    }
+
+    // The result marker may have committed just before a process crash, leaving
+    // its attached cycles unwritten. A byte-identical duplicate may repair only
+    // that evidence; nothing else here is ever replayed.
+    if (outcome.status === "duplicate" && outcome.attemptId === validated.value.attemptId) {
+      const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
+      if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
+      recordCycleSummaries(outcome.attemptId, valid);
+      return reviewFixResultIntakeResponse(outcome);
+    }
+    if (outcome.status !== "stored") {
+      return reviewFixResultIntakeResponse(outcome);
+    }
+
+    const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
+    if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
+    recordCycleSummaries(validated.value.attemptId, valid);
+
+    console.log(`[runner-callback] pilot result accepted attempt=${validated.value.attemptId}`);
+    return reviewFixResultIntakeResponse(outcome);
+  }
+
+  // kg-refresh is verify-only (AII-899): signature and row are checked, the token is never
+  // consumed, and the report goes to the KgRefresh workflow, which absorbs a duplicate under
+  // the dispatch id and refuses a conflicting body. A retried identical body is therefore safe.
+  if (body.phase === "kg-refresh") {
+    const kgVerified = verifyRunToken(bearerToken, input.secret, "result", { consume: false });
+    if (!kgVerified.ok) {
+      console.warn(
+        `[runner-callback] result refused dispatch=${kgVerified.claims?.dispatchId ?? "unknown"} ` +
+          `phase=kg-refresh outcome=${input.body.outcome} reason=${kgVerified.reason}`,
+      );
+      return bad(401, kgVerified.reason);
+    }
+    if (kgVerified.claims.phase !== "kg-refresh") return bad(400, "phase_mismatch");
+    const dispatchId = kgVerified.claims.dispatchId;
+    if (!input.kgRefreshClient) {
+      console.warn(`[runner-callback] forward failed kind=kg-refresh dispatch=${dispatchId}`);
+      return bad(503, "kg_refresh_unavailable");
+    }
+    const reported = await input.kgRefreshClient.report(
+      dispatchId,
+      {
+        ok: input.body.outcome === "success",
+        failureCode: input.body.failureCode,
+        failureReason: input.body.failureReason,
+        snapshotPr: input.body.snapshotPr,
+        snapshotCommit: input.body.snapshotCommit,
+        snapshotBranch: input.body.snapshotBranch,
+        partTable: input.body.partTable,
+        cause: input.body.cause,
+        failedTeams: input.body.failedTeams,
+        sources: input.body.sources,
+        acceptBlocked: input.body.acceptBlocked,
+        lostTeams: input.body.lostTeams,
+        warnings: input.body.warnings,
+        guardVerdict: input.body.guardVerdict,
+        usage: toRecordedUsage(body),
+      },
+      { idempotencyKey: dispatchId },
+    );
+    if (reported.status === "unavailable") {
+      console.warn(`[runner-callback] forward failed kind=kg-refresh dispatch=${dispatchId}`);
+      return bad(503, "kg_refresh_unavailable");
+    }
+    if (reported.status === "not-found") return noRefreshInFlight(dispatchId);
+    if (reported.status === "conflict") return bad(409, "conflicting_report");
+    return { status: 200, body: { acknowledged: true } };
+  }
+
+  // Authenticate without consuming, then run every check that needs only the
+  // claims and body, so a rejected request leaves the single-use token usable
+  // for a corrected retry. The consume below stays atomic and decides races.
+  const preflight = verifyRunToken(bearerToken, input.secret, "result", { consume: false });
+  if (!preflight.ok) {
+    console.warn(
+      `[runner-callback] result refused dispatch=${preflight.claims?.dispatchId ?? "unknown"} ` +
+        `phase=${input.body.phase} outcome=${input.body.outcome} reason=${preflight.reason}`,
+    );
+    return preflight.reason === "already_consumed"
+      ? bad(409, "already_consumed")
+      : bad(401, preflight.reason);
+  }
+  if (preflight.claims.phase !== input.body.phase) {
+    console.warn(
+      `[runner-callback] result rejected dispatch=${preflight.claims.dispatchId} reason=phase_mismatch ` +
+        `token=${preflight.claims.phase} body=${input.body.phase}`,
+    );
+    return bad(400, "phase_mismatch");
+  }
+  if (
+    input.body.outcome === "success" &&
+    input.body.phase === "implementation" &&
+    !input.body.prUrl &&
+    !input.body.noWork
+  ) {
+    console.warn(`[runner-callback] result rejected dispatch=${preflight.claims.dispatchId} reason=missing_prUrl`);
+    return bad(400, "missing_prUrl");
+  }
+
+  // Legacy consumes atomically before provider calls; owned results stay check-only. If
   // postComment or a status verb fails downstream, the comments may be lost
   // (orchestrator surfaces the error in warnings[] but the runner has no
   // retry path — its token is gone). This is intentional, best-effort
@@ -180,31 +1059,114 @@ export async function handleRunnerResult(
   // user-side retries, which we don't want to encourage. Operators monitor
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
-  const verified = verifyAndConsumeRunToken(bearerToken, input.secret);
+  const owned = readAdmission(preflight.claims.dispatchId)?.lifecycleOwner.kind === "restate";
+  // Review-only delivery retains its credential while discovery or a saved notice needs retry.
+  const verified = owned || body.reviewOnly === true ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
+    console.warn(
+      `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
+        `phase=${input.body.phase} outcome=${input.body.outcome} reason=${verified.reason}`,
+    );
     return verified.reason === "already_consumed"
       ? bad(409, "already_consumed")
       : bad(401, verified.reason);
   }
+  console.log(
+    `[runner-callback] result accepted dispatch=${verified.claims.dispatchId} ` +
+      `phase=${verified.claims.phase} outcome=${input.body.outcome} comments=${input.body.comments.length}`,
+  );
 
   const { claims, mappingTeamKey } = verified;
-  if (claims.phase !== input.body.phase) return bad(400, "phase_mismatch");
 
-  if (
-    input.body.outcome === "success" &&
-    input.body.phase === "implementation" &&
-    !input.body.prUrl &&
-    !input.body.noWork
-  ) {
-    return bad(400, "missing_prUrl");
+  // Shape-validated, but a malformed record is dropped rather than rejected: the
+  // Legacy token above is already consumed, so
+  // failing the whole callback here would discard the comments, the tracker
+  // transition, and remediation over a field the orchestrator only ever displays.
+  // A newer runner reporting a FailureCategory this orchestrator doesn't yet know
+  // about must not stall the ticket.
+  const failure = isFailureRecord(body.failure) ? projectFailureRecord(body.failure) : undefined;
+  if (body.failure !== undefined && !failure) {
+    console.warn(
+      `[runner-callback] dropping malformed failure record for dispatchId=${claims.dispatchId}`,
+    );
   }
 
+  // Same sanitize-and-drop treatment as `failure` above: an unrecognised entry
+  // (e.g. from a newer runner) must never reject the whole callback.
+  const { valid: sanitizedFindingDispositions, dropped: droppedFindingDispositions } =
+    sanitizeFindingDispositions(body.findingDispositions);
+  input.body.findingDispositions = sanitizedFindingDispositions;
+  if (droppedFindingDispositions > 0) {
+    console.warn(`[runner-callback] Dropped ${droppedFindingDispositions} invalid finding disposition(s)`);
+  }
+
+  // Optional diagnostic attribution: an invalid value is stripped (count-only warn, no payload)
+  // and the terminal outcome is still delivered. Unlike invalid agentConfig, this never fails closed.
+  if (body.attribution !== undefined) {
+    const attribution = sanitizeAttribution(body.attribution);
+    if (attribution) input.body.attribution = attribution;
+    else {
+      delete input.body.attribution;
+      console.warn("[runner-callback] Dropped 1 invalid attribution record(s)");
+    }
+  }
+  // Persist against the dispatch's frozen snapshot, never the claim: identity comes from the
+  // snapshot and a claim naming another snapshot yields no row. Best-effort — a failure here
+  // must not stall the terminal callback (token already consumed, no retry).
+  // Job accounting (AII-1562): every invocation plus the pushed SHAs. A body without the lists (older
+  // runner) stores just the single attribution above; malformed entries are dropped, never fatal.
+  const accounting = toRecordedUsage({ ...body, attribution: input.body.attribution });
+  if (!owned && (accounting.attribution || accounting.records.length > 0 || accounting.pushedCommits || accounting.listWhole)) {
+    try {
+      recordUsage(claims.dispatchId, accounting);
+    } catch {
+      console.warn("[runner-callback] Could not persist 1 attribution record (count only)");
+    }
+  }
+
+  // Same sanitize-and-drop treatment again: a Legacy run (no reviewFix marker —
+  // the only way execution reaches this point) has no attemptId to record cycle
+  // evidence against, so its cycle summaries (if any were even forwarded) are
+  // acknowledged and dropped rather than recorded (AII-801).
+  const { valid: sanitizedCycleSummaries, dropped: droppedCycleSummaries } =
+    sanitizeCycleSummaries(body.cycleSummaries);
+  input.body.cycleSummaries = sanitizedCycleSummaries;
+  if (droppedCycleSummaries > 0) {
+    console.warn(`[runner-callback] Dropped ${droppedCycleSummaries} invalid cycle summary record(s)`);
+  }
+
+  if (body.externalReviewPending !== undefined) {
+    const pending = body.externalReviewPending as { headSha?: unknown } | null;
+    const headSha = pending && typeof pending === "object" ? pending.headSha : undefined;
+    if (typeof headSha === "string" && /^[0-9a-f]{40}$/.test(headSha)) {
+      input.body.externalReviewPending = { headSha };
+    } else {
+      delete input.body.externalReviewPending;
+      console.warn(
+        `[runner-callback] dropping malformed externalReviewPending for dispatchId=${claims.dispatchId}`,
+      );
+    }
+  }
+
+
+  const priorJob = owned ? getJobByDispatchId(claims.dispatchId) : null;
+  if (owned && (hasCompletedCallbackLifecycle(claims.dispatchId) ||
+    (priorJob && !["dispatched", "running"].includes(priorJob.status)))) {
+    return { status: 200, body: { acknowledged: true } };
+  }
   const provider = await input.resolveProvider(mappingTeamKey);
   if (!provider) {
     console.warn(
       `[runner-callback] mapping deleted between mint and callback: ${mappingTeamKey}`,
     );
-    return { status: 200, body: { acknowledged: true, warnings: ["mapping_deleted"] } };
+    // A 2xx means the callback was recorded; nothing can be recorded without a mapping.
+    return { status: 409, body: { error: "mapping_not_found", mappingTeamKey } };
+  }
+
+  // Look the planning job row up before any side effect: a callback with no row records nothing, so it must not answer 2xx.
+  if (input.body.phase === "planning" && !getJobByDispatchId(claims.dispatchId)) {
+    console.warn(`[runner-callback] planning callback with no job row dispatch=${claims.dispatchId}`);
+    return bad(404, "job_not_found");
   }
 
   const warnings: string[] = [];
@@ -216,6 +1178,32 @@ export async function handleRunnerResult(
     );
     warnings.push(`${op}: ${msg}`);
   };
+  /** One `report` per implementation outcome; the callback never releases the reservation (AII-1557). */
+  const sendImplementationReport = async (): Promise<void> => {
+    if (!input.checkImplementationAdmissionTermination) return;
+    try {
+      await input.checkImplementationAdmissionTermination(claims.dispatchId);
+    } catch (err) {
+      warn("checkImplementationAdmissionTermination", err);
+    }
+  };
+
+  if (body.reviewOnly === true) {
+    const job = getJobByDispatchId(claims.dispatchId);
+    let trackerWriteReserved = false;
+    try {
+      if (!input.body.rollupReview?.skipReason) {
+        await fileRollupReviewChild(input, provider, job, mappingTeamKey, claims.issueId, () => { trackerWriteReserved = true; });
+      }
+    } catch (err) {
+      warn("roll-up-review", err);
+      if (!trackerWriteReserved || err instanceof RollupNoticeDeliveryError) return { status: 503, body: { error: "Roll-up review follow-up unavailable", warnings } };
+    }
+    if (!owned) verifyAndConsumeRunToken(bearerToken, input.secret);
+    if (job) updateJobStatus(job.id, body.outcome === "success" ? "completed" : "failed", "rollup_review", undefined, { skipAdmissionRelease: true });
+    await sendImplementationReport();
+    return { status: 200, body: { acknowledged: true, warnings } };
+  }
 
   for (const c of input.body.comments) {
     try {
@@ -225,62 +1213,346 @@ export async function handleRunnerResult(
     }
   }
 
+  const missedRepos = (input.body.referenceRepoResults ?? []).filter((r) => !r.arrived);
+  if (missedRepos.length > 0) {
+    const checks = referenceRepoChecks(missedRepos);
+    recheckSetupChecks({ ids: checks, project: mappingTeamKey, cause: "runner-reported" });
+    const lines = [
+      "⚠️ One or more reference repositories could not be cloned and were unavailable to the agent during this run.",
+      "",
+      ...missedRepos.map((r) => `- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`),
+      ...(checks.length > 0 ? ["", trackerSetupChecksSentence(checks)] : []),
+    ];
+    try {
+      await provider.postComment(claims.issueId, lines.join("\n"));
+    } catch (err) {
+      warn("postComment(missing-reference-repos)", err);
+    }
+  }
+
+  // New dispatch reports reopen resolved findings; callback retries retain their original revision.
+  const internalJob = getJobByDispatchId(claims.dispatchId);
+  const findingPrUrl = internalJob?.prUrl ?? input.body.prUrl;
+  const findingTarget = findingPrUrl ? parsePrUrlTarget(findingPrUrl) : null;
+  const internalPr = findingTarget && `${findingTarget.owner}/${findingTarget.repo}` === internalJob?.repo
+    ? findingTarget.prNumber : null;
+  if (internalJob?.repo && internalPr !== null && Array.isArray(body.internalFindings)) {
+    for (const raw of body.internalFindings) {
+      if (!raw || typeof raw !== "object") continue;
+      const f = raw as ReviewLedgerFinding;
+      if (f.source !== "ai-implement-internal" || typeof f.body !== "string" || !f.body ||
+          !["blocking", "medium", "minor"].includes(f.severity) ||
+          (f.path !== undefined && typeof f.path !== "string") ||
+          (f.url !== undefined && typeof f.url !== "string") ||
+          (f.line !== undefined && (!Number.isInteger(f.line) || f.line < 1)) ||
+          (f.reviewerId !== undefined && typeof f.reviewerId !== "string")) continue;
+      const key = stableReviewFindingKey(f);
+      const existing = getReviewFindingsByKeys(internalJob.repo, internalPr, [key])[0];
+      // Reports have dispatch identity but no timestamp. When the row advanced after
+      // dispatch, only waive the time guard if this dispatch owns the current revision.
+      const canResolve = !existing || existing.status === "resolved" ||
+        existing.lastSeenAt <= internalJob.dispatchedAt || !getDb().prepare(`
+          SELECT 1 FROM internal_review_finding_reports
+          WHERE finding_id = ? AND revision = ? AND dispatch_id != ? LIMIT 1
+        `).get(existing.id, existing.revision, claims.dispatchId);
+      const report = recordInternalReviewFinding({ ...f, repo: internalJob.repo, prNumber: internalPr }, claims.dispatchId);
+      if (canResolve && sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
+        markReviewFindingResolvedIfRevision(report.id, report.revision);
+      }
+    }
+  }
+
+  // AII-756: a fixing agent may defer a finding as out-of-scope follow-up work. This must
+  // run before any phase-specific resolution below (e.g. the gap-analysis snapshot
+  // resolution) — resolving first would flip a just-deferred finding back to resolved.
+  // Applies on any phase/outcome once a PR exists, so it is not nested in the
+  // outcome/phase branches that follow.
+  const followUpDispositions = sanitizedFindingDispositions.filter((d) => d.disposition === "follow-up");
+  let deferredCount = 0;
+  if (followUpDispositions.length > 0) {
+    const dispositionJob = internalJob;
+    const dispositionPrNumber = internalPr;
+    if (dispositionJob?.repo && dispositionPrNumber !== null) {
+      const keys = followUpDispositions.map((d) => d.findingKey);
+      deferredCount = markReviewFindingsDeferredByKeys(dispositionJob.repo, dispositionPrNumber, keys);
+      const rowsByKey = new Map(
+        getReviewFindingsByKeys(dispositionJob.repo, dispositionPrNumber, keys).map((row) => [row.findingKey, row]),
+      );
+      const body = renderDeferredFindingsComment(followUpDispositions, dispositionPrNumber, rowsByKey);
+      try {
+        await provider.postComment(claims.issueId, body);
+      } catch (err) {
+        warn("postComment(deferred-findings)", err);
+      }
+    }
+  }
+
+  // Rejections apply to every phase, before fixed-only snapshot resolution.
+  const rejectedKeys = sanitizedFindingDispositions.filter((d) => d.disposition === "invalid").map((d) => d.findingKey);
+  let rejectedCount = 0;
+  if (rejectedKeys.length > 0) {
+    const job = internalJob;
+    const prNumber = internalPr;
+    if (job?.repo && prNumber !== null) {
+      rejectedCount = markReviewFindingsRejectedByKeys(job.repo, prNumber, rejectedKeys);
+    }
+  }
+
   if (input.body.outcome === "failure") {
-    if (input.body.phase === "planning") {
-      try {
-        await provider.markPlanningFailed(
-          claims.issueId,
-          mappingTeamKey,
-          input.body.failureReason ?? "unspecified",
-        );
-      } catch (err) {
-        warn("markPlanningFailed", err);
-      }
-    } else if (input.body.phase === "implementation") {
-      try {
-        await provider.markImplementationFailed(
-          claims.issueId,
-          mappingTeamKey,
-          formatFailureComment(input.body.failureCode, input.body.failureReason, input.body.prUrl),
-        );
-      } catch (err) {
-        warn("markImplementationFailed", err);
-      }
-      const job = getJobByDispatchId(claims.dispatchId);
-      if (job) {
-        // A coded unapproved failure still carries a draft PR — link it on the
-        // job row so the admin UI and merge-detection can see it.
-        if (typeof input.body.prUrl === "string" && input.body.prUrl) {
-          updateJobPrUrl(job.id, input.body.prUrl);
-        }
-        // Skip bounded cleanup for coded failures that already pushed a draft PR
-        // (REVIEW_UNAPPROVED / MAX_TURNS_EXHAUSTED): clearing AI-Working + dedup
-        // would re-queue an issue that already has an open draft PR, contradicting
-        // the "leave for human" intent. Mirror the Fly/local monitor's isDraftPr guard.
-        if (input.watchdogConfig && !input.body.prUrl) {
-          await remediateFailedJob(
-            input.watchdogConfig,
-            provider,
-            job,
-            input.body.failureCode ?? input.body.failureReason ?? "failure",
-          );
+    const job = getJobByDispatchId(claims.dispatchId);
+    const isInitialRun = !job?.prUrl;
+    // Persisted unconditionally and up front for every phase, including gap-analysis (which
+    // the callback never comments for — failure_commented_at is left for the monitor
+    // backstop to find unset in that case). `failure_commented_at` itself is stamped only
+    // after the provider call below actually posts, never pre-claimed: see the field's doc
+    // comment on `Job`.
+    if (failure && job) updateJobFailure(job.id, failure);
+
+    // Whichever phase failed, the checks behind it run again for the project, and the failure comments below name them.
+    const failureChecks = runnerFailureChecks(failure?.code ?? input.body.failureCode, { managedCredential: isManagedProject(mappingTeamKey, claims.dispatchId) });
+    recheckSetupChecks({ ids: failureChecks, project: mappingTeamKey, cause: "runner-reported" });
+    const withFailureChecks = (comment: string) => (failureChecks.length > 0 ? `${comment}\n\n${trackerSetupChecksSentence(failureChecks)}` : comment);
+
+    // AII-749: applies to any phase (including gap-analysis, which otherwise does
+    // nothing on failure below) and runs ahead of the phase-specific chain — a run
+    // record with no pr_url (an initial run) is left to that chain unchanged.
+    const isLeaseRejected = input.body.failureCode === "GIT_LEASE_REJECTED" || failure?.code === "GIT_LEASE_REJECTED";
+    if (isLeaseRejected && job?.prUrl) {
+      await handleLeaseRejectedFailure(job, input.watchdogConfig);
+    }
+
+    // AII-1227: the internal review approved but the external review was still running when the
+    // run gave up. Start the workflow that writes the approval mark if it passes later.
+    const pendingHeadSha = input.body.externalReviewPending?.headSha;
+    if (
+      input.submitLateExternalReview &&
+      pendingHeadSha &&
+      input.body.prUrl &&
+      input.body.phase === "implementation"
+    ) {
+      const target = parsePrUrlTarget(input.body.prUrl);
+      if (target) {
+        // AII-1362: record before the submit; a settled submit clears it, otherwise the poll sweep retries.
+        const workflowKey = lateExternalReviewWorkflowKey({ dispatchId: claims.dispatchId });
+        try {
+          recordPendingLateReview({
+            workflowKey,
+            dispatchId: claims.dispatchId,
+            prUrl: input.body.prUrl,
+            headSha: pendingHeadSha,
+          });
+          const settled = await input.submitLateExternalReview({
+            dispatchId: claims.dispatchId,
+            ...target,
+            prUrl: input.body.prUrl,
+            headSha: pendingHeadSha,
+          });
+          if (settled !== false) clearPendingLateReview(workflowKey);
+        } catch (err) {
+          warn("submitLateExternalReview", err);
         }
       }
     }
-    // gap-analysis failure: no status transition (PR already terminal)
+
+    if (input.body.phase === "planning") {
+      const lastSuccessfulStage =
+        failure && job ? deriveLastSuccessfulStage(getStepsByJobId(job.id), failure.stage) : null;
+      // Planning has no PR concept, so `renderFailureRecord` gets no prUrl — a persisted
+      // record renders the same evidence/remediation the implementation path does (BAC-27112
+      // follow-up); a runner that never classified the failure keeps the raw reason.
+      const reason = failure
+        ? renderFailureRecord(failure, undefined, buildRunUrl(job), lastSuccessfulStage)
+        : input.body.failureReason ?? "unspecified";
+      try {
+        const commented = await provider.markPlanningFailed(claims.issueId, mappingTeamKey, withFailureChecks(reason));
+        if (job && commented) markJobFailureCommented(job.id);
+      } catch (err) {
+        warn("markPlanningFailed", err);
+      }
+      // A Restate-owned run has no monitor to close its row, and the workflow takes `report` as proof
+      // the callback closed it, so the callback writes the failure here and then sends `report` through
+      // the hook. The backend may still be running, so the reservation stays held (as in the success
+      // branch below). A Legacy dispatch is unchanged: its monitor closes the row and no hook runs.
+      if (job && readAdmission(claims.dispatchId)?.lifecycleOwner.kind === "restate") {
+        updateJobStatus(job.id, "failed", failure?.code ?? input.body.failureCode ?? "planning_failed", undefined, { skipAdmissionRelease: true });
+        if (input.checkPlanningAdmissionTermination) {
+          try {
+            await input.checkPlanningAdmissionTermination(claims.dispatchId);
+          } catch (err) {
+            warn("checkPlanningAdmissionTermination", err);
+          }
+        }
+      }
+    } else if (input.body.phase === "implementation") {
+      const isOperatorCancelled = input.body.failureCode === "OPERATOR_CANCELLED";
+
+      if (isOperatorCancelled) {
+        // The operator closed the PR mid-run. Treat as a benign terminal: reset the
+        // ticket state (remove AI-Working label) without posting a failure comment,
+        // and skip retry remediation. The one informational notice fires later via
+        // the notification loop in index.ts.
+        try {
+          await provider.clearWorkingState(claims.issueId, mappingTeamKey, "implementation");
+        } catch (err) {
+          warn("clearWorkingState(operator_cancelled)", err);
+        }
+        if (job) {
+          // skipAdmissionRelease: true for the same reason the planning "completed" write
+          // above does — this callback is the runner's own self-report, posted from inside
+          // the still-running backend, not proof the GitHub Actions job / Fly machine /
+          // local container has actually exited (AII-783 review, third round, on PR #681).
+          // The reservation stays held for the matching Legacy monitor / stale-admission
+          // sweep to resolve once the backend is independently confirmed terminal.
+          updateJobStatus(job.id, "failed", "operator_cancelled", undefined, { skipAdmissionRelease: true });
+          console.log(
+            `[runner-callback] PR closed by operator — job ${job.id} (${claims.issueId}) marked operator_cancelled`,
+          );
+        }
+      } else {
+        const lastSuccessfulStage =
+          failure && job ? deriveLastSuccessfulStage(getStepsByJobId(job.id), failure.stage) : null;
+        try {
+          const commented = await provider.markImplementationFailed(
+            claims.issueId,
+            mappingTeamKey,
+            withFailureChecks(formatFailureComment(input.body.failureCode, input.body.failureReason, {
+              prUrl: input.body.prUrl,
+              failure,
+              runUrl: buildRunUrl(job),
+              lastSuccessfulStage,
+              isInitialRun,
+            })),
+          );
+          if (job && commented) markJobFailureCommented(job.id);
+        } catch (err) {
+          warn("markImplementationFailed", err);
+        }
+        if (job) {
+          // A coded unapproved failure still carries a draft PR — link it on the
+          // job row so the admin UI and merge-detection can see it.
+          if (typeof input.body.prUrl === "string" && input.body.prUrl) {
+            updateJobPrUrl(job.id, input.body.prUrl);
+          }
+          // Skip bounded cleanup for coded failures that already pushed a draft PR
+          // (REVIEW_UNAPPROVED / MAX_TURNS_EXHAUSTED / VERIFY_FAILED): clearing AI-Working + dedup
+          // would re-queue an issue that already has an open draft PR, contradicting
+          // the "leave for human" intent. Mirror the Fly/local monitor's isDraftPr guard.
+          if (input.watchdogConfig && !input.body.prUrl) {
+            await remediateFailedJob(
+              input.watchdogConfig,
+              provider,
+              job,
+              boundStatusText(input.body.failureReason ?? input.body.failureCode ?? "failure"),
+              { runnerReported: true },
+            );
+          }
+        }
+      }
+      await sendImplementationReport();
+    } else if (job && owned && input.body.phase === "gap-analysis") {
+      // A gap-fill can report failure without a structured record (older runners).
+      // Keep the reported code/reason without guessing a retryable classification.
+      const reportedFailure: FailureRecord = failure ?? {
+        category: "unknown",
+        code: input.body.failureCode ?? "gap_analysis_failed",
+        stage: "gap-analysis",
+        attempt: 1,
+        retryable: false,
+        message: input.body.failureReason || input.body.failureCode || "Gap-fill failed",
+        evidence: { truncated: false },
+      };
+      if (!failure) updateJobFailure(job.id, reportedFailure);
+      // Keep this best-effort effect inside the lifecycle guard, before closing the row.
+      // Report retries forward again without reposting to GitHub or the tracker.
+      if (job.prUrl) {
+        try {
+          const autopsy = input.body.comments.find(c => c.body.startsWith("## 🔎 Run autopsy — "));
+          if (!autopsy) throw new Error("Gap-fill callback has no run autopsy");
+          const target = parsePrUrlTarget(job.prUrl);
+          const mapping = getMappings()[mappingTeamKey];
+          if (!target || job.repo !== `${target.owner}/${target.repo}` ||
+              mapping?.owner !== target.owner || mapping?.repo !== target.repo || !input.watchdogConfig) {
+            throw new Error("Gap-fill PR target or GitHub credentials unavailable");
+          }
+          const token = await getInstallationToken(input.watchdogConfig.githubAppId,
+            input.watchdogConfig.githubAppPrivateKey, target.owner);
+          await postPrComment(token, target.owner, target.repo, target.prNumber,
+            autopsy.body + "\n\nTo start a new round, post a new `/ai-implement` comment with a changed instruction.");
+        } catch (err) {
+          warn("postPrComment", err);
+        }
+      }
+      // The callback is not proof the backend stopped: the workflow releases admission.
+      updateJobStatus(job.id, "failed", reportedFailure.code, undefined, { skipAdmissionRelease: true });
+      await sendImplementationReport();
+    }
+    // Legacy gap-analysis failure remains for its monitor to close.
   } else if (input.body.phase === "planning") {
+    let planStatusFailure: string | null = null;
+    // A missing mapping defaults to auto-approve.
+    const awaitApproval = getMappings()[mappingTeamKey]?.autoApprovePlans === false;
     try {
-      await provider.markPlanComplete(claims.issueId, mappingTeamKey);
+      await provider.markPlanComplete(claims.issueId, mappingTeamKey, { awaitApproval });
     } catch (err) {
       warn("markPlanComplete", err);
+      const checks = planCompleteFailureChecks(provider.id, err);
+      recheckSetupChecks({ ids: checks, project: mappingTeamKey, cause: "tracker-write" });
+      planStatusFailure = `${planCompleteFailureText(provider.id, awaitApproval, err)} ${trackerSetupChecksSentence(checks)}`.trimEnd();
+    }
+    if (planStatusFailure !== null) {
+      // The plan comments are recorded, so the response stays 200. Local writes come first so the
+      // park holds even when the tracker also refuses the failure write.
+      const failedJob = getJobByDispatchId(claims.dispatchId);
+      if (failedJob) {
+        updateJobStatus(failedJob.id, "failed", "plan_status_write_failed", undefined, { skipAdmissionRelease: true });
+        updateJobFailure(failedJob.id, {
+          category: "config",
+          code: "PLAN_STATUS_WRITE_FAILED",
+          stage: "planning-callback",
+          attempt: 1,
+          retryable: false,
+          message: planStatusFailure,
+          evidence: { truncated: false },
+        });
+      }
+      parkIssue(claims.issueId, "planning", "plan_status_write_failed", { project: mappingTeamKey, identifier: failedJob?.issueIdentifier ?? null });
+      try {
+        const commented = await provider.markPlanningFailed(claims.issueId, mappingTeamKey, planStatusFailure);
+        if (failedJob && commented) markJobFailureCommented(failedJob.id);
+      } catch (err) {
+        warn("markPlanningFailed(plan-status-write)", err);
+      }
+      if (failedJob && input.checkPlanningAdmissionTermination) {
+        try {
+          await input.checkPlanningAdmissionTermination(claims.dispatchId);
+        } catch (err) {
+          warn("checkPlanningAdmissionTermination", err);
+        }
+      }
     }
     // Finalize the job row immediately: the issue stays excluded from dispatch
     // while its planning job is in flight, so waiting for the GHA monitor to
     // notice the run finished delays the planning→implementation handoff — and
     // if run tracking failed entirely, blocks it until the stuck watchdog fires.
-    const job = getJobByDispatchId(claims.dispatchId);
+    // skipAdmissionRelease: true because this callback is the runner's own
+    // self-report, posted from inside the still-running backend — it is not proof
+    // the GitHub Actions job / Fly machine / local container has actually exited
+    // (AII-783 review, second round, on PR #681). This same "completed" write also
+    // drops the job out of getInFlightJobs()'s dispatched/running set, so the normal
+    // per-poll GHA/Fly/local monitor never looks at this job again (AII-783 review,
+    // third round) — checkPlanningAdmissionTermination immediately below is the fast
+    // confirmation path that takes its place; a still-uncertain backend falls back to
+    // the stale-admission sweep.
+    const job = planStatusFailure === null ? getJobByDispatchId(claims.dispatchId) : null;
     if (job) {
-      updateJobStatus(job.id, "completed", "planning_callback");
+      updateJobStatus(job.id, "completed", "planning_callback", undefined, { skipAdmissionRelease: true });
+      if (input.checkPlanningAdmissionTermination) {
+        try {
+          await input.checkPlanningAdmissionTermination(claims.dispatchId);
+        } catch (err) {
+          warn("checkPlanningAdmissionTermination", err);
+        }
+      }
     }
   } else if (input.body.phase === "implementation") {
     if (input.body.noWork) {
@@ -300,30 +1572,315 @@ export async function handleRunnerResult(
       }
       const job = getJobByDispatchId(claims.dispatchId);
       if (job) {
-        updateJobPrUrl(job.id, input.body.prUrl!);
+        // Stamp both approved=1 and conclusion=runner_approved atomically so the
+        // auto-merge gate can read the mark without waiting for the GHA monitor's
+        // later write (AII-460). The approved column is not touched by updateJobStatus,
+        // so any subsequent monitor write of conclusion=success cannot clear the mark.
+        stampJobApproved(job.id, input.body.prUrl!);
+      } else {
+        console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — approval mark not written`);
       }
     }
+    await sendImplementationReport();
   } else if (input.body.phase === "gap-analysis") {
     const job = getJobByDispatchId(claims.dispatchId);
     const prNumber = parsePrNumber(job?.prUrl ?? null);
     if (job?.repo && prNumber !== null) {
       const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
-      if (snapshot) {
-        markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds);
-      } else {
-        markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
+      // Only findings the agent disposed `fixed` resolve; an
+      // undisposed finding stays open so the next fix run sees it. Follow-ups and
+      // rejections were closed above and are no longer open.
+      const resolveKeys = sanitizedFindingDispositions
+        .filter((d) => d.disposition === "fixed")
+        .map((d) => d.findingKey);
+      const openNow = listOpenReviewFindings(snapshot?.repo ?? job.repo, snapshot?.prNumber ?? prNumber);
+      const snapshotIds = snapshot ? new Set(snapshot.findingIds) : null;
+      const allowedCount = openNow.filter((f) =>
+        snapshotIds ? snapshotIds.has(f.id) : f.lastSeenAt <= job.dispatchedAt,
+      ).length;
+      const resolvedCount = snapshot
+        ? markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds, resolveKeys)
+        : markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt, resolveKeys);
+      console.log(
+        `[runner-callback] gap-analysis findings dispatch=${claims.dispatchId} resolved=${resolvedCount} deferred_on_pr=${deferredCount} rejected=${rejectedCount} left_open=${allowedCount - resolvedCount}`,
+      );
+      // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
+      // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
+      // AII-1291: no approval mark here. The gap-fill pushed a head the external review has not
+      // judged yet; LateExternalReview writes the mark once that review passes on the head.
+      // Without Restate no mark is written and the PR is held until the poll sweep resubmits (an initial-run success stamps the mark in the callback).
+      updateJobStatus(job.id, "completed", "external_review_pending", job.prUrl!);
+      const target = parsePrUrlTarget(job.prUrl!);
+      if (input.submitLateExternalReview && target) {
+        // A gap-fill names the head it pushed, so the workflow judges that head, not a racy read.
+        const pushedHeadSha = input.body.externalReviewPending?.headSha;
+        const namesHead = !!pushedHeadSha;
+        if (namesHead) setLateReviewHeadSha(job.id, pushedHeadSha);
+        try {
+          await input.submitLateExternalReview({
+            dispatchId: claims.dispatchId,
+            ...target,
+            prUrl: job.prUrl!,
+            gapFill: true,
+            rowId: job.id,
+            ...(namesHead ? { headSha: pushedHeadSha } : {}),
+          });
+        } catch (err) {
+          warn("submitLateExternalReview", err);
+        }
       }
+    } else if (!job) {
+      console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — gap-analysis approval mark not written`);
     }
   }
-  // gap-analysis success: no status transition
 
   return { status: 200, body: { acknowledged: true, warnings } };
+}
+
+function parsePrUrlTarget(prUrl: string): { owner: string; repo: string; prNumber: number } | null {
+  const match = prUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:$|[?#])/);
+  return match ? { owner: match[1], repo: match[2], prNumber: Number.parseInt(match[3], 10) } : null;
 }
 
 function parsePrNumber(prUrl: string | null): number | null {
   if (!prUrl) return null;
   const match = prUrl.match(/\/pull\/(\d+)(?:$|[?#])/);
   return match ? Number.parseInt(match[1], 10) : null;
+}
+
+function renderDeferredFindingsComment(
+  followUpDispositions: FindingDisposition[],
+  prNumber: number,
+  rowsByKey: Map<string, StoredReviewFinding>,
+): string {
+  const lines = followUpDispositions.map((d) => {
+    const row = rowsByKey.get(d.findingKey);
+    if (!row) return `- ${d.reason}`;
+    const location = row.path !== undefined ? (typeof row.line === "number" ? `${row.path}:${row.line}` : row.path) : undefined;
+    const origin = [row.source, location].filter(Boolean).join(" · ");
+    const url = row.url ? ` (${row.url})` : "";
+    return `- ${origin} — ${d.reason}${url}`;
+  });
+
+  return [
+    `**AI-Implement deferred ${followUpDispositions.length} review finding(s) as follow-ups** on PR #${prNumber}.`,
+    "These asked for work this issue does not require. They no longer block the merge. Please triage them.",
+    "",
+    ...lines,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Pilot activity intake (AII-769/AII-770/AII-803) — POST /runner/activity.
+// Wired to a route in src/index.ts (AII-803); no runner call site posts to it
+// yet (a separate downstream issue). This defines the wire body, its
+// validator, and a typed injectable classification seam.
+// ---------------------------------------------------------------------------
+
+/** Wire body proposed for `POST /runner/activity`. */
+export interface RunnerActivityBody {
+  version: 1;
+  attemptId: string;
+  producerId: string;
+  events: ReviewFixActivityEvent[];
+  finalSequence?: number;
+}
+
+export type ActivityIntakeOutcome =
+  | { readonly status: "accepted"; readonly attemptId: string }
+  | { readonly status: "duplicate"; readonly attemptId: string }
+  | { readonly status: "conflict"; readonly attemptId: string; readonly reason: string }
+  | { readonly status: "stale"; readonly attemptId: string; readonly reason: string };
+
+const MAX_ACTIVITY_PRODUCER_ID_LENGTH = 128;
+
+function validateRunnerActivityBody(
+  raw: unknown,
+): { ok: true; value: RunnerActivityBody } | { ok: false; error: string } {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: "invalid_activity_body" };
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.version !== REVIEW_FIX_ACTIVITY_VERSION) {
+    return { ok: false, error: "invalid_activity_version" };
+  }
+
+  const attemptId = validateAttemptId(obj.attemptId);
+  if (!attemptId.ok) return { ok: false, error: "invalid_activity_attempt_id" };
+
+  if (
+    typeof obj.producerId !== "string" ||
+    obj.producerId.length === 0 ||
+    obj.producerId.length > MAX_ACTIVITY_PRODUCER_ID_LENGTH
+  ) {
+    return { ok: false, error: "invalid_activity_producer_id" };
+  }
+
+  if (!Array.isArray(obj.events)) return { ok: false, error: "invalid_activity_events" };
+
+  const events: ReviewFixActivityEvent[] = [];
+  let previousSequence = -1;
+  for (const rawEvent of obj.events) {
+    const event = validateReviewFixActivityEvent(rawEvent);
+    if (!event.ok) return { ok: false, error: "invalid_activity_event" };
+    if (event.value.attemptId !== attemptId.value || event.value.producerId !== obj.producerId) {
+      return { ok: false, error: "invalid_activity_event" };
+    }
+    if (event.value.sequence <= previousSequence) return { ok: false, error: "invalid_activity_event" };
+    previousSequence = event.value.sequence;
+    events.push(event.value);
+  }
+
+  let finalSequence: number | undefined;
+  if (obj.finalSequence !== undefined) {
+    if (
+      typeof obj.finalSequence !== "number" ||
+      !Number.isSafeInteger(obj.finalSequence) ||
+      obj.finalSequence < 0 ||
+      obj.finalSequence < previousSequence
+    ) {
+      return { ok: false, error: "invalid_activity_final_sequence" };
+    }
+    finalSequence = obj.finalSequence;
+  }
+
+  return {
+    ok: true,
+    value: {
+      version: REVIEW_FIX_ACTIVITY_VERSION,
+      attemptId: attemptId.value,
+      producerId: obj.producerId,
+      events,
+      ...(finalSequence !== undefined ? { finalSequence } : {}),
+    },
+  };
+}
+
+export interface HandleRunnerActivityInput {
+  authorization: string | undefined;
+  secret: string;
+  body: unknown;
+  /**
+   * Injectable seam that durably stores a validated activity batch
+   * (AII-769/AII-803) — e.g. `appendReviewFixActivityBatch`. An absent
+   * seam fails closed rather than acknowledging an unstored activity batch.
+   */
+  onReviewFixActivity?: (batch: RunnerActivityBody) => ActivityIntakeOutcome | Promise<ActivityIntakeOutcome>;
+}
+
+/**
+ * Validates, authenticates, and classifies a `/runner/activity` body
+ * (AII-769/AII-803). Authenticated with the same reusable prepared "progress"
+ * credential `handleRunnerCycleSummary` uses — a bearer bound to a live
+ * prepared attempt — never the body's own `attemptId` alone, so a caller
+ * cannot report activity for an attempt it holds no credential for.
+ */
+export async function handleRunnerActivity(input: HandleRunnerActivityInput): Promise<HandleRunnerResultOutput> {
+  const bearer = parseBearerToken(input.authorization);
+  if (!bearer) return bad(401, "missing_bearer");
+  const verified = verifyPreparedReviewFixToken(bearer, input.secret, "progress");
+  if (!verified.ok || !verified.claims.attemptId) return bad(401, verified.ok ? "wrong_scope" : verified.reason);
+
+  const validated = validateRunnerActivityBody(input.body);
+  if (!validated.ok) return bad(400, validated.error);
+  if (validated.value.attemptId !== verified.claims.attemptId) return bad(401, "activity_wrong_attempt");
+
+  if (!input.onReviewFixActivity) return bad(503, "reviewfix_activity_intake_unavailable");
+  const outcome = await input.onReviewFixActivity(validated.value);
+  return activityIntakeResponse(outcome);
+}
+
+function activityIntakeResponse(outcome: ActivityIntakeOutcome): HandleRunnerResultOutput {
+  switch (outcome.status) {
+    case "accepted":
+      return {
+        status: 200,
+        body: { acknowledged: true, outcome: "accepted", attemptId: outcome.attemptId, retryable: false },
+      };
+    case "duplicate":
+      return {
+        status: 200,
+        body: { acknowledged: true, outcome: "duplicate", attemptId: outcome.attemptId, retryable: false },
+      };
+    case "conflict":
+      return {
+        status: 409,
+        body: {
+          acknowledged: false,
+          outcome: "conflict",
+          attemptId: outcome.attemptId,
+          reason: outcome.reason,
+          retryable: false,
+        },
+      };
+    case "stale":
+      return {
+        status: 410,
+        body: {
+          acknowledged: false,
+          outcome: "stale",
+          attemptId: outcome.attemptId,
+          reason: outcome.reason,
+          retryable: false,
+        },
+      };
+  }
+}
+
+export interface ReviewPublicationIngressClient {
+  publish(input: PostPushReviewPublicationInput): Promise<PostPushReviewPublicationResult>;
+}
+
+export function createReviewPublicationIngressClient(
+  baseUrl = RESTATE_INGRESS_BASE_URL,
+  opts: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): ReviewPublicationIngressClient {
+  const ingress = restateClients.connect({ url: baseUrl, ...(opts.fetchImpl ? { fetch: opts.fetchImpl } : {}) });
+  return {
+    async publish(input) {
+      const key = `${input.owner}/${input.repo}#${input.prNumber}`;
+      return ingress.objectClient<ReturnType<typeof createPostPushReviewPublication>>(
+        { name: "PostPushReviewPublication" }, key,
+      ).publish(input, restateClients.rpc.opts({
+        timeout: opts.timeoutMs ?? 10_000,
+        idempotencyKey: `${key}:${input.headSha}:${input.iteration}`,
+      }));
+    },
+  };
+}
+
+export async function handleRunnerReviewPublication(input: {
+  authorization: string | undefined;
+  secret: string;
+  body: unknown;
+  ingress: ReviewPublicationIngressClient;
+  restateReady: () => boolean;
+}): Promise<HandleRunnerResultOutput> {
+  const token = parseBearerToken(input.authorization);
+  if (!token) return bad(401, "missing_bearer");
+  const verified = verifyRunToken(token, input.secret, "progress", { consume: false });
+  if (!verified.ok) return bad(401, verified.reason);
+  if (verified.claims.phase !== "implementation" && verified.claims.phase !== "gap-analysis") {
+    return bad(403, "phase_not_allowed");
+  }
+  const repository = getJobByDispatchId(verified.claims.dispatchId)?.repo;
+  if (!repository) return bad(403, "repository_not_found");
+  const [owner, repo] = repository.split("/");
+  if (!owner || !repo) return bad(403, "repository_not_found");
+  const fields = reviewPublicationInputSchema.omit({ owner: true, repo: true }).safeParse(input.body);
+  if (!fields.success) return bad(400, "invalid_review_publication");
+  // Zod strips unknown fields at both levels, keeping credentials out of durable input.
+  const publication = reviewPublicationInputSchema.safeParse({ ...fields.data, owner, repo });
+  if (!publication.success || Buffer.byteLength(JSON.stringify(publication.data), "utf8") > MAX_PUBLICATION_BYTES) {
+    return bad(400, "invalid_review_publication");
+  }
+  if (!input.restateReady()) return bad(503, "restate-unavailable");
+  try {
+    const result = await input.ingress.publish(publication.data);
+    return { status: 200, body: result };
+  } catch {
+    return bad(503, "restate-unavailable");
+  }
 }
 
 export async function handleRunnerProgress(
@@ -335,11 +1892,38 @@ export async function handleRunnerProgress(
   const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
 
-  const stepOrError = validateStepBody(input.body);
-  if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+  // kg-refresh progress goes to the KgRefresh workflow as a heartbeat (AII-899), not to the job row.
+  if (verified.claims.phase === "kg-refresh") {
+    if (!input.kgRefreshClient) return bad(503, "kg_refresh_unavailable");
+    // A step body is optional: an old runner image sends `{}`, which stays a bare heartbeat. The ingress
+    // journals what it is sent, so the step is redacted here, before the call.
+    let step: Step | undefined;
+    if (input.body && typeof input.body === "object" && "step" in input.body) {
+      const stepOrError = validateStepBody(input.body);
+      if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+      step = redactStepCredentials(stepOrError as Step);
+    }
+    const progressed = step
+      ? await input.kgRefreshClient.progress(verified.claims.dispatchId, step)
+      : await input.kgRefreshClient.progress(verified.claims.dispatchId);
+    if (progressed.status === "unavailable") return bad(503, "kg_refresh_unavailable");
+    if (progressed.status === "not-found") return noRefreshInFlight(verified.claims.dispatchId);
+    if (progressed.status === "conflict") return bad(409, "conflict");
+    return { status: 200, body: { acknowledged: true } };
+  }
 
   const githubRunIdOrError = validateGithubRunId(input.body);
   if (githubRunIdOrError && typeof githubRunIdOrError === "object") return githubRunIdOrError;
+
+  // step is optional — a caller may send only githubRunId to bind the workflow run without
+  // reporting a step (e.g. the GHA workflow's early "Bind workflow run ID" step).
+  const hasStep = input.body && typeof input.body === "object" && "step" in input.body;
+  let step: Step | null = null;
+  if (hasStep) {
+    const stepOrError = validateStepBody(input.body);
+    if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+    step = stepOrError as Step;
+  }
 
   const job = getJobByDispatchId(verified.claims.dispatchId);
   if (!job) return bad(404, "job_not_found");
@@ -348,8 +1932,115 @@ export async function handleRunnerProgress(
     claimJobRunId(job.id, githubRunIdOrError);
   }
 
-  upsertStepRecord(job.id, stepOrError);
+  if (step !== null) {
+    upsertStepRecord(job.id, step);
+  }
   return { status: 200, body: { acknowledged: true } };
+}
+
+export interface HandleKgTrackerDataInput {
+  authorization: string | undefined;
+  secret: string;
+  /** Pagination cursor from the previous page (null/undefined for the first page). */
+  cursor: string | null | undefined;
+  /** Team key to fetch issues for (from request body). Validated against getMappings() keys. */
+  teamKey: string;
+  /** Returns the set of configured mapping team keys; teamKey is validated against this set. */
+  getMappings: () => Record<string, unknown>;
+  /** The `TrackerExport` Restate service client (AII-1463); the route never reads a tracker itself. */
+  trackerExport: TrackerExportIngressClient;
+}
+
+/**
+ * Returns one page of issues (with their comments) from `TrackerExport.page` for
+ * the tracker of the run's mapping.
+ *
+ * Callable only by kg-refresh runs — a missing or bad token or any other phase gets 403.
+ * A valid kg-refresh token with a team that has no mapping gets 404 `unmapped-team`. This function never
+ * reads a tracker and holds no credential; the runner receives data only.
+ */
+export async function handleKgTrackerDataRequest(
+  input: HandleKgTrackerDataInput,
+): Promise<HandleRunnerResultOutput> {
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) {
+    console.warn("[kg-tracker-data] Missing or malformed Authorization header");
+    return bad(403, "Unauthorized");
+  }
+
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
+  if (!verified.ok) {
+    console.warn(`[kg-tracker-data] Token verification failed: ${verified.reason}`);
+    return bad(403, "Unauthorized");
+  }
+
+  if (verified.claims.phase !== "kg-refresh") return bad(403, "Unauthorized");
+
+  const mappedKeys = Object.keys(input.getMappings());
+  if (!input.teamKey) return bad(403, "Unauthorized");
+  if (!mappedKeys.includes(input.teamKey)) {
+    // After the token and phase checks: only a valid kg-refresh caller learns whether a team is mapped.
+    console.warn(`[kg-tracker-data] teamKey '${input.teamKey}' is not a mapped team`);
+    return bad(404, "unmapped-team");
+  }
+
+  const result = await input.trackerExport.page({ team: input.teamKey, cursor: input.cursor ?? null });
+  if (!result.ok) {
+    console.warn(`[kg-tracker-data] TrackerExport answered ${result.code} for team ${input.teamKey}`);
+    return { status: 503, body: { error: result.code } };
+  }
+  return { status: 200, body: { issues: result.page.issues, pageInfo: result.page.pageInfo } };
+}
+
+export interface KgScopeEntry {
+  teamKey: string;
+  repo: string;
+  defaultBranch: string;
+  ticketingProvider: string;
+}
+
+export interface HandleKgScopeInput {
+  authorization: string | undefined;
+  secret: string;
+  /** Returns the orchestrator's configured mappings, keyed by team key. */
+  getMappings: () => Record<string, { owner: string; repo: string; defaultBranch: string; ticketingProvider: string }>;
+}
+
+export interface HandleKgScopeOutput {
+  status: number;
+  body: KgScopeEntry[] | { error: string };
+}
+
+/**
+ * Returns the orchestrator's full mapping set as `{ teamKey, repo, defaultBranch,
+ * ticketingProvider }` — the scope a kg-refresh's kg-scope-reconcile step reconciles
+ * sources.yml against. Callable only by kg-refresh runs; any other phase or a missing/
+ * invalid token gets 403 with no distinguishing body. Only these four fields cross the
+ * boundary — no credential (ticketingConfig, tokens) ever leaves the orchestrator.
+ */
+export async function handleKgScopeRequest(input: HandleKgScopeInput): Promise<HandleKgScopeOutput> {
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) {
+    console.warn("[kg-scope] Missing or malformed Authorization header");
+    return { status: 403, body: { error: "Unauthorized" } };
+  }
+
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
+  if (!verified.ok) {
+    console.warn(`[kg-scope] Token verification failed: ${verified.reason}`);
+    return { status: 403, body: { error: "Unauthorized" } };
+  }
+
+  if (verified.claims.phase !== "kg-refresh") return { status: 403, body: { error: "Unauthorized" } };
+
+  const mappings = input.getMappings();
+  const scope: KgScopeEntry[] = Object.entries(mappings).map(([teamKey, m]) => ({
+    teamKey,
+    repo: `${m.owner}/${m.repo}`,
+    defaultBranch: m.defaultBranch,
+    ticketingProvider: m.ticketingProvider,
+  }));
+  return { status: 200, body: scope };
 }
 
 /**
@@ -387,4 +2078,241 @@ export async function handleRunnerPlanningContext(
     );
     return { status: 200, body: { planningContext: "" } };
   }
+}
+
+const LATE_REVIEW_RESUBMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * AII-1304: a gap-fill success submits LateExternalReview once; when Restate was not ready the
+ * row stays `external_review_pending`. Each poll tick with Restate ready re-submits those rows
+ * (completed within 24 h). The workflow key is the dispatch id, so a repeat submit is a no-op.
+ */
+export async function resubmitPendingGapFillReviews(opts: {
+  ready: () => boolean;
+  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill?: true; attemptId?: string; headSha?: string; rowId?: number }) => Promise<boolean | void> | boolean | void;
+  /** The workflow's state by key (AII-1524). Absent: every candidate row is submitted, as before. */
+  getState?: (key: string) => Promise<LateExternalReviewState>;
+  /** Whether the PR is merged or closed; `null` when unreadable. Absent: the PR is not checked. */
+  getPrClosed?: (target: { owner: string; repo: string; prNumber: number }) => Promise<boolean | null>;
+  now?: number;
+}): Promise<number> {
+  if (!opts.ready()) return 0;
+  let submitted = 0;
+  for (const job of getGapFillRowsAwaitingLateReview((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+    const target = parsePrUrlTarget(job.prUrl!);
+    if (!target) continue;
+    const settle = (ending: string) => {
+      if (recordLateReviewEnding(job.id, ending)) console.log(`[late-review-sweep] row ${job.id} settled: ${ending}`);
+    };
+    try {
+      if (opts.getPrClosed) {
+        const closed = await opts.getPrClosed(target);
+        if (closed === true) { settle("pr_closed"); continue; }
+        if (closed === null) continue; // unreadable PR: not evidence either way
+      }
+      if (opts.getState) {
+        const state = await opts.getState(job.dispatchId!);
+        if (state.state === "finished") { settle(state.outcome); continue; }
+        if (state.state === "running" || state.state === "unavailable") continue;
+      }
+    } catch (err) {
+      console.warn(`[late-review-sweep] state read failed dispatch=${job.dispatchId}:`, err);
+      continue;
+    }
+    console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${job.dispatchId} pr=${job.prUrl}`);
+    try {
+      await opts.submit({ dispatchId: job.dispatchId!, ...target, prUrl: job.prUrl!, gapFill: true, rowId: job.id, ...(job.lateReviewHeadSha ? { headSha: job.lateReviewHeadSha } : {}) });
+      submitted++;
+    } catch (err) {
+      console.warn(`[late-review-sweep] submit failed dispatch=${job.dispatchId}:`, err);
+    }
+  }
+  // AII-1362: the outbox, for submits whose state is not in dispatch_log (initial runs, review-fix attempts).
+  for (const pending of getPendingLateReviews((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+    const target = parsePrUrlTarget(pending.prUrl);
+    if (!target) continue;
+    console.log(`[late-review-sweep] re-submitting LateExternalReview key=${pending.workflowKey} dispatch=${pending.dispatchId} pr=${pending.prUrl}`);
+    try {
+      const settled = await opts.submit({
+        dispatchId: pending.dispatchId,
+        ...target,
+        prUrl: pending.prUrl,
+        ...(pending.headSha ? { headSha: pending.headSha } : {}),
+        ...(pending.attemptId ? { gapFill: true as const, attemptId: pending.attemptId } : {}),
+      });
+      // `false` = the hook could not reach Restate; keep the record for the next tick.
+      if (settled === false) continue;
+      clearPendingLateReview(pending.workflowKey);
+      submitted++;
+    } catch (err) {
+      console.warn(`[late-review-sweep] submit failed key=${pending.workflowKey}:`, err);
+    }
+  }
+  return submitted;
+}
+
+const ROLLUP_REVIEW_CHILD_LIMIT = 2;
+
+// A notice can be shared by legacy callbacks and separate Restate dispatches.
+// Hold its lock across preparation and delivery so a waiter reloads the receipt
+// only after the creator has saved the child identifier and finished its edit.
+const rollupNoticeTails = new Map<string, Promise<void>>();
+
+async function withRollupNoticeLock<T>(key: string, effect: () => Promise<T>): Promise<T> {
+  const previous = rollupNoticeTails.get(key);
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  rollupNoticeTails.set(key, current);
+  try {
+    await previous;
+    return await effect();
+  } finally {
+    release();
+    if (rollupNoticeTails.get(key) === current) rollupNoticeTails.delete(key);
+  }
+}
+
+class RollupNoticeDeliveryError extends Error {}
+
+interface RollupNotice {
+  headSha: string;
+  commentId: number;
+  text: string;
+  delivered: boolean;
+}
+
+/** Replay only the saved notice: tracker reservations and discovery are never revisited. */
+async function deliverRollupNotice(token: string, owner: string, repo: string, prNumber: number,
+  key: string, notice: RollupNotice): Promise<void> {
+  if (notice.delivered) return;
+  try {
+    const comments = await listPrComments(token, owner, repo, prNumber, { strict: true });
+    const verdict = comments.find(c => c.id === notice.commentId);
+    if (!verdict) throw new Error("Cannot find roll-up verdict comment");
+    // A response can be lost after GitHub applied the edit. Read before writing on every retry.
+    if (!verdict.body.includes(notice.text)) {
+      const marker = "<!-- roll-up-review follow-up -->";
+      await updatePrComment(token, owner, repo, notice.commentId,
+        verdict.body.split(marker)[0].trimEnd() + "\n\n" + notice.text);
+    }
+    getDb().prepare("UPDATE settings SET value = ? WHERE key = ?")
+      .run(JSON.stringify({ ...notice, delivered: true }), key);
+  } catch (err) {
+    throw new RollupNoticeDeliveryError(`Roll-up notice delivery pending: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Tracker discovery supplies identity; settings reservations bound concurrent/ambiguous creates without a schema change. */
+async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: TicketingProvider, job: Job | null,
+  scopeKey: string, parentId: string, onTrackerWriteReserved: () => void): Promise<void> {
+  // Partial findings remain advisory evidence; only a complete review can request a fix.
+  const complete = input.body.outcome === "success";
+  const review = input.body.rollupReview;
+  if (!review || typeof review.headSha !== "string" ||
+      (!/^[a-f0-9]{40,64}$/.test(review.headSha) && (complete || review.headSha !== "")) ||
+      typeof review.verdictUrl !== "string" || !job?.prUrl || !input.watchdogConfig) return;
+  const target = parsePrUrlTarget(job.prUrl);
+  if (!target || job.repo !== `${target.owner}/${target.repo}`) return;
+  const { owner, repo, prNumber } = target;
+  const canEnumerate = !!provider.listIssuesPage;
+  if (!canEnumerate) {
+    console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; keeping verdict without filing a follow-up child`);
+  }
+  const reservationKey = `roll-up-review:children:${owner}/${repo}#${prNumber}`;
+  const reserved = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
+  if (reserved && (JSON.parse(reserved.value) as string[]).includes(review.headSha)) onTrackerWriteReserved();
+  const configuredMapping = getMappings()[scopeKey];
+  const mapping = configuredMapping ? { ...configuredMapping, teamKey: scopeKey } : null;
+  if (!mapping || mapping.owner !== owner || mapping.repo !== repo) return;
+  const verdictMatch = review.verdictUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)#issuecomment-(\d+)$/);
+  if (!verdictMatch || verdictMatch[1] !== owner || verdictMatch[2] !== repo || Number(verdictMatch[3]) !== prNumber) return;
+  // Complete verdicts share a receipt across dispatches for the same head/comment.
+  // Incomplete reviews retain their own wording (for example, retry queued vs exhausted).
+  const noticeKey = `roll-up-review:notice:${owner}/${repo}#${prNumber}:${review.headSha}:${verdictMatch[4]}:${complete ? "complete" : job.dispatchId}`;
+  const watchdogConfig = input.watchdogConfig;
+  await withRollupNoticeLock(noticeKey, async () => {
+    const saved = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(noticeKey) as { value: string } | undefined;
+    const savedNotice = saved ? JSON.parse(saved.value) as RollupNotice : undefined;
+    if (savedNotice?.delivered) return;
+    let token: string;
+    try {
+      token = await getInstallationToken(watchdogConfig.githubAppId, watchdogConfig.githubAppPrivateKey, owner);
+    } catch (err) {
+      if (savedNotice) throw new RollupNoticeDeliveryError("Roll-up notice authentication unavailable");
+      throw err;
+    }
+    if (savedNotice) {
+      await deliverRollupNotice(token, owner, repo, prNumber, noticeKey, savedNotice);
+      return;
+    }
+    const pr = await getPullRequestState(token, owner, repo, prNumber);
+    if (!pr) throw new Error("Cannot read roll-up PR state");
+    const branch = pr.headRef?.match(/^ai-implement\/(?:feature|multi-issue)\/(.+)$/);
+    if (!branch || branch[1].toLowerCase() !== job.issueIdentifier?.toLowerCase()) return;
+    const parent = await provider.findByKey(job.issueIdentifier!, scopeKey);
+    if (!parent || parent.id !== parentId) return;
+    const closed = pr.merged || pr.state === "closed";
+    if (closed) await reconcileRollupReviewChildren(provider, mapping, scopeKey, watchdogConfig);
+    const blockers = (input.body.internalFindings ?? []).filter(f => f && f.severity === "blocking" &&
+      typeof f.body === "string" && f.body.trim() && (f.path === undefined || typeof f.path === "string") &&
+      (f.line === undefined || (Number.isInteger(f.line) && f.line > 0)));
+    const children = (canEnumerate ? await listRollupReviewChildren(provider, mapping) : []).filter(c =>
+      c.parent?.identifier === parent.identifier && c.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} `));
+    const existingHeads = children.map(c => c.title.split(" ")[2]);
+    if (existingHeads.includes(review.headSha)) onTrackerWriteReserved();
+    // Reserve synchronously before awaiting a write. Never release on an ambiguous tracker failure:
+    // the server may have created the child even when its response was lost.
+    const reservation = getDb().transaction(() => {
+      const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
+      const heads = new Set<string>([...existingHeads, ...(row ? JSON.parse(row.value) as string[] : [])]);
+      if (!complete || !blockers.length || !canEnumerate || closed || heads.has(review.headSha)) return { create: false, count: heads.size };
+      if (heads.size >= ROLLUP_REVIEW_CHILD_LIMIT) return { create: false, count: heads.size };
+      heads.add(review.headSha);
+      getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(reservationKey, JSON.stringify([...heads]));
+      return { create: true, count: heads.size };
+    })();
+    let childIdentifier = children.find(c => c.title.split(" ")[2] === review.headSha)?.identifier;
+    if (reservation.create) {
+      onTrackerWriteReserved();
+      const summary = blockers[0].body.replace(/\s+/g, " ").trim().slice(0, 70);
+      const title = `${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} ${review.headSha} ${summary}`.slice(0, 250);
+      const body = `## Problem\n\nBlocking roll-up review findings at head \`${review.headSha}\`.\n\nPR: ${job.prUrl}\nVerdict: ${review.verdictUrl}\n\n## Task\n\nFix every blocking finding below in a PR targeting the parent's feature branch.\n\n` +
+        blockers.map((f, i) => `### Finding ${i + 1}: ${f.path ?? "(general)"}:${f.line ?? "?"}\n\nScenario and finding:\n${f.body}`).join("\n\n") +
+        `\n\n## Files\n\n${[...new Set(blockers.map(f => f.path ?? "(general)"))].map(p => `- ${p}`).join("\n")}\n\n## Acceptance Criteria\n\n- [ ] Address each blocking scenario above and verify the fix with regression coverage.\n- [ ] Merge the fix into the parent's feature branch so the roll-up is reviewed again.\n`;
+      const child = await provider.createChildIssue(parentId, scopeKey, { title, body });
+      childIdentifier = child.identifier;
+      console.log(`[roll-up-review] Filed ${child.identifier} for ${owner}/${repo}#${prNumber} at ${review.headSha}`);
+      // Closure can race the tracker write; the independent poll sweep also retries this cleanup.
+      await reconcileRollupReviewChildren(provider, mapping, scopeKey, watchdogConfig);
+    }
+    const marker = "<!-- roll-up-review follow-up -->";
+    const failedReviewers = Array.isArray(review.failedReviewers)
+      ? review.failedReviewers.filter((id): id is string => typeof id === "string" && !!id.trim()) : [];
+    const failures = review.incompleteReviews;
+    const transientOnly = Array.isArray(failures) && failures.length > 0 &&
+      failures.every(r => r && typeof r.reviewerId === "string" && r.reviewerId.trim() && r.failure?.category === "transient") &&
+      failedReviewers.every(id => failures.some(r => r.reviewerId === id));
+    // Remember which callback inserted the retry so notice-write failures can be
+    // redelivered without describing that callback's queued retry as exhausted.
+    const retryNoticeKey = `roll-up-review:retry-notice:${job.dispatchId}`;
+    const retryQueued = getDb().transaction(() => {
+      const prior = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(retryNoticeKey);
+      if (prior) return true;
+      if (complete || closed || !review.headSha || !transientOnly) return false;
+      const queued = enqueueRollupReview({ owner, repo, prNumber, headSha: review.headSha, attempt: ROLLUP_REVIEW_RETRY_LIMIT });
+      if (queued) getDb().prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run(retryNoticeKey, review.headSha);
+      return queued;
+    })();
+    const resultNotice = !complete
+      ? `The review did not finish. ${failedReviewers.length ? `Failed reviewers: ${failedReviewers.join(", ")}.` : "No failed reviewer was identified; the review could not complete."} ${retryQueued ? "one retry is queued" : "no retry is left; a person decides"}.`
+      : childIdentifier ? `Blocking findings filed as ${childIdentifier}.`
+      : blockers.length ? "No additional child filed." : "No blocking findings; no child filed.";
+    const notice = `${marker}\n\n${resultNotice}` +
+      (reservation.count >= ROLLUP_REVIEW_CHILD_LIMIT
+        ? ` The automatic follow-up limit (${ROLLUP_REVIEW_CHILD_LIMIT} children per roll-up PR) is reached; a person must decide any further fixes.` : "");
+    const record: RollupNotice = { headSha: review.headSha, commentId: Number(verdictMatch[4]), text: notice, delivered: false };
+    getDb().prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").run(noticeKey, JSON.stringify(record));
+    const pending = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(noticeKey) as { value: string };
+    await deliverRollupNotice(token, owner, repo, prNumber, noticeKey, JSON.parse(pending.value) as RollupNotice);
+  });
 }

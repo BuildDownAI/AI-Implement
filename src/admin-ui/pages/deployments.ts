@@ -30,16 +30,72 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div id="deployments-watched-source" class="card" hidden style="margin-top: 16px">
+      <div class="card-body" style="padding: 12px 16px">
+        <div class="kpi-label" style="margin-bottom: 4px">Watching</div>
+        <div id="deployments-watched-source-value" style="font-size: 14px; font-family: var(--font-mono)">—</div>
+        <div id="deployments-downgrade-warn" class="kpi-trend" style="color: var(--st-warn-fg); margin-top: 4px" hidden>
+          ⚠ This ref is behind the running commit — deploying it is a downgrade.
+        </div>
+        <div style="margin-top: 8px">
+          <button class="btn btn-sm" id="deployments-check-now-btn" onclick="window.checkNow()">Check now</button>
+        </div>
+      </div>
+    </div>
+
     <div class="alert" id="deployments-outcome-alert" hidden></div>
+
+    <div class="card" id="deployments-active" hidden>
+      <div class="card-header"><h2 class="card-title">Deploy in progress <span class="badge neutral" id="deployments-active-badge">—</span></h2></div>
+      <div class="card-body">
+        <div id="deployments-active-details" class="kpi-trend" style="font-family: var(--font-mono)"></div>
+        <div style="margin-top: 8px">
+          <button class="btn btn-sm" id="deployments-cancel-btn" onclick="window.cancelDeploy()" hidden>Cancel deploy</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="deployments-last-result" hidden>
+      <div class="card-header"><h2 class="card-title">Last deploy result <span class="badge neutral" id="deployments-last-result-badge">—</span></h2></div>
+      <div class="card-body">
+        <div id="deployments-last-result-details" class="kpi-trend" style="font-family: var(--font-mono)"></div>
+      </div>
+    </div>
 
     <div class="card" id="deployments-policy" hidden>
       <div class="card-header"><h2 class="card-title">When a deployment becomes available...</h2></div>
       <div class="card-body">
+        <div style="margin-bottom: 16px">
+          <div class="kpi-label" style="margin-bottom: 6px">Watched source</div>
+          <div style="display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap">
+            <div style="flex: 1; min-width: 200px">
+              <input type="text" class="input" id="deployments-watched-repo" placeholder="owner/repo"
+                style="width: 100%; box-sizing: border-box"
+                oninput="window.refreshPolicyDirty()"
+                onblur="window.loadDeployRefs()">
+              <div class="kpi-trend text-secondary" style="margin-top: 4px">Leave blank to use the build stamp</div>
+            </div>
+            <div style="flex: 1; min-width: 160px">
+              <select class="input" id="deployments-watched-ref" style="width: 100%; box-sizing: border-box"
+                onchange="window.refreshPolicyDirty()">
+                <option value="">— select a ref —</option>
+              </select>
+              <div class="kpi-trend text-secondary" style="margin-top: 4px" id="deployments-ref-hint"></div>
+            </div>
+          </div>
+        </div>
+
         <label class="checkbox-row">
           <input type="checkbox" id="deployments-auto" onchange="window.refreshPolicyDirty()">
           <span>Deploy it automatically</span>
         </label>
         <div class="kpi-trend text-secondary" id="deployments-auto-hint" style="margin-left: 24px"></div>
+
+        <label class="checkbox-row" id="deployments-fly-toml-row">
+          <input type="checkbox" id="deployments-fly-toml" onchange="window.refreshPolicyDirty()">
+          <span>Apply fly.toml on deploy</span>
+        </label>
+        <div class="kpi-trend text-secondary" id="deployments-fly-toml-hint" style="margin-left: 24px"></div>
 
         <label class="checkbox-row" id="deployments-notify-row">
           <input type="checkbox" id="deployments-notify" onchange="window.refreshPolicyDirty()">
@@ -53,10 +109,43 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div class="card" id="deployments-retention">
+      <div class="card-header"><h2 class="card-title">Retention</h2></div>
+      <div class="card-body">
+        <div style="display: flex; gap: 16px; flex-wrap: wrap">
+          <div>
+            <div class="kpi-label" style="margin-bottom: 6px">Restate retention (days)</div>
+            <input type="number" class="input" id="deployments-retention-restate" step="1"
+              oninput="window.refreshRetentionDirty()">
+          </div>
+          <div>
+            <div class="kpi-label" style="margin-bottom: 6px">Volume snapshot retention (days)</div>
+            <input type="number" class="input" id="deployments-retention-volume" step="1"
+              oninput="window.refreshRetentionDirty()">
+          </div>
+        </div>
+        <div class="kpi-trend text-secondary" id="deployments-retention-applies" style="margin-top: 8px"></div>
+        <div class="kpi-trend text-secondary" id="deployments-retention-applied" style="margin-top: 4px"></div>
+        <div class="kpi-trend" id="deployments-retention-error" style="color: var(--st-warn-fg); margin-top: 4px" hidden></div>
+        <div style="margin-top: 12px">
+          <button class="btn btn-primary btn-sm" id="deployments-retention-save" onclick="window.saveRetention()" disabled>Save</button>
+        </div>
+      </div>
+    </div>
+
     <div id="deployments-cta" hidden style="text-align: center">
       <div style="display: inline-flex; flex-direction: column; align-items: center; gap: 8px">
         <button class="btn btn-accent btn-lg" id="deployments-deploy-btn" onclick="window.triggerDeploy()">Deploy now</button>
         <div class="kpi-trend text-secondary" style="justify-content: center; max-width: 46ch">New dispatches pause immediately, and in-flight work drains before the build starts.</div>
+      </div>
+    </div>
+
+    <div class="card" id="reservations-card">
+      <div class="card-header"><h2 class="card-title">Held dispatch reservations <span class="badge neutral" id="reservations-badge">—</span></h2></div>
+      <div class="card-body">
+        <div class="kpi-trend text-secondary">Each held reservation counts as in-flight work, so a stuck one makes a deploy wait. Release frees it only when the backend confirms its run ended (a finished job row alone is not enough); a refusal offers a forced release.</div>
+        <div id="reservations-message" class="kpi-trend" hidden></div>
+        <div id="reservations-list" style="margin-top: 8px"></div>
       </div>
     </div>
 
@@ -72,40 +161,10 @@ export const deploymentsHtml = `
 
 export const deploymentsScript = `
 (function () {
-  function fmtAgo(ms) {
-    const s = Math.floor((Date.now() - ms) / 1000);
-    if (s < 60) return s + 's ago';
-    const m = Math.floor(s / 60);
-    if (m < 60) return m + 'm ago';
-    const h = Math.floor(m / 60);
-    if (h < 24) return h + 'h ago';
-    // The last deploy of a quiet orchestrator is weeks old, and "504h ago" is unreadable.
-    const d = Math.floor(h / 24);
-    return d + 'd ago';
-  }
-  
-  // Duration since a start, not distance from now — deliberately not fmtAgo, whose
-  // "Xm ago" wording reads wrong for something still running.
-  function fmtElapsed(startedAt) {
-    const s = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-    if (s < 60) return s + 's';
-    const m = Math.floor(s / 60);
-    return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
-  }
-
   function short(sha) { return sha ? sha.slice(0, 7) : ''; }
 
   function plural(count, noun) {
-    return count + '\u00a0' + noun + (count === 1 ? '' : 's');
-  }
-
-  // Every badge in the app carries a .dot child: .badge .dot sizes it, .badge.<kind> .dot
-  // colours it, and .badge.running .dot is where the pulse animation lives. The class
-  // alone renders a dotless pill, so the span is opt-in markup that is easy to drop.
-  // Routing every badge through here is what stops that recurring on this page.
-  function setBadge(el, kind, label) {
-    el.className = 'badge ' + kind;
-    el.innerHTML = '<span class="dot"></span>' + window.esc(label);
+    return count + '\\u00a0' + noun + (count === 1 ? '' : 's');
   }
 
   // a static https:// prefix with escAttr on the path segments
@@ -159,6 +218,50 @@ export const deploymentsScript = `
   // What the server last told us. Kept so an edit can be detected, and so the 30s poll
   // does not silently revert a checkbox someone has ticked but not yet saved.
   let savedPolicy = null;
+  let stampedBranch = null;
+  // Whether a SelfDeploy is draining, applying or verifying; the Deploy button must stay
+  // disabled for exactly that long, including after triggerDeploy's finally block.
+  let deployActive = false;
+
+  function isActivePhase(phase) {
+    return phase === 'draining' || phase === 'applying' || phase === 'verifying';
+  }
+
+  function deployDetails(deploy) {
+    const t = deploy.target || {};
+    const parts = [];
+    if (t.branch) parts.push('branch ' + t.branch);
+    if (t.commit) parts.push('commit ' + short(t.commit));
+    if (t.image) parts.push('image ' + t.image);
+    return parts;
+  }
+
+  function renderSelfDeploy(deploy) {
+    const activeCard = document.getElementById('deployments-active');
+    const lastCard = document.getElementById('deployments-last-result');
+    const cancelBtn = document.getElementById('deployments-cancel-btn');
+    const phase = deploy ? deploy.phase : null;
+    deployActive = isActivePhase(phase);
+    activeCard.hidden = !deployActive;
+    cancelBtn.hidden = phase !== 'draining';
+    const isResult = phase === 'succeeded' || phase === 'failed' || phase === 'cancelled';
+    lastCard.hidden = !isResult;
+    document.getElementById('deployments-deploy-btn').disabled = deployActive;
+    if (deployActive) {
+      window.setStatusBadge(document.getElementById('deployments-active-badge'), phase === 'draining' ? 'warn' : 'running', phase);
+      const parts = deployDetails(deploy);
+      if (deploy.requestedBy) parts.push('started by ' + deploy.requestedBy);
+      if (deploy.startedAt) parts.push('started ' + new Date(deploy.startedAt).toLocaleString());
+      document.getElementById('deployments-active-details').textContent = parts.join(' · ');
+    }
+    if (isResult) {
+      window.setStatusBadge(document.getElementById('deployments-last-result-badge'), phase === 'succeeded' ? 'success' : phase === 'failed' ? 'fail' : 'neutral', phase);
+      const parts = deployDetails(deploy);
+      if (deploy.reason) parts.push('reason ' + deploy.reason);
+      if (deploy.finishedAt) parts.push('finished ' + new Date(deploy.finishedAt).toLocaleString());
+      document.getElementById('deployments-last-result-details').textContent = parts.join(' · ');
+    }
+  }
 
   function policyDirty() {
     if (!savedPolicy) return false;
@@ -167,15 +270,173 @@ export const deploymentsScript = `
     // a stored true and leave Save lit forever.
     const notifyEl = document.getElementById('deployments-notify');
     const notifyChanged = !notifyEl.disabled && notifyEl.checked !== savedPolicy.notifyAvailable;
-    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged;
+    const watchedRepoChanged = document.getElementById('deployments-watched-repo').value !== (savedPolicy.watchedRepo || '');
+    const watchedRefChanged = document.getElementById('deployments-watched-ref').value !== (savedPolicy.watchedRef || '');
+    // Same rule as the announcement switch: a disabled control is not part of the form.
+    const flyEl = document.getElementById('deployments-fly-toml');
+    const flyChanged = !flyEl.disabled && flyEl.checked !== savedPolicy.applyFlyToml;
+    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged || flyChanged || watchedRepoChanged || watchedRefChanged;
   }
 
   function refreshPolicyDirty() {
     document.getElementById('deployments-policy-save').disabled = !policyDirty();
   }
 
-  async function loadDeployments() {
-    clearMessage();
+  async function loadDeployRefs() {
+    const repo = document.getElementById('deployments-watched-repo').value.trim();
+    const refSel = document.getElementById('deployments-watched-ref');
+    const hintEl = document.getElementById('deployments-ref-hint');
+    if (!repo) {
+      refSel.innerHTML = '<option value="">— select a ref —</option>';
+      hintEl.textContent = '';
+      return;
+    }
+    hintEl.textContent = 'Loading refs…';
+    try {
+      const res = await window.api('/api/deploy-refs?repo=' + encodeURIComponent(repo));
+      if (!res.ok) {
+        const body = await res.json().catch(function () { return {}; });
+        hintEl.textContent = body.error || 'Could not load refs';
+        return;
+      }
+      const data = await res.json();
+      const prev = refSel.value;
+      const defaultBranch = data.defaultBranch || null;
+      const currentRef = savedPolicy && savedPolicy.watchedRef ? savedPolicy.watchedRef : stampedBranch;
+      const shownSet = new Set();
+
+      let html = '<option value="">— select a ref —</option>';
+      if (currentRef) {
+        shownSet.add(currentRef);
+        html += '<optgroup label="Current">';
+        html += '<option value="' + window.escAttr(currentRef) + '">' + window.esc(currentRef) + '</option>';
+        html += '</optgroup>';
+      }
+      if (defaultBranch && !shownSet.has(defaultBranch)) {
+        shownSet.add(defaultBranch);
+        html += '<optgroup label="Default">';
+        html += '<option value="' + window.escAttr(defaultBranch) + '">' + window.esc(defaultBranch) + '</option>';
+        html += '</optgroup>';
+      }
+      if (data.tags && data.tags.length) {
+        const remainingTags = data.tags.filter(function(t) { return !shownSet.has(t); });
+        if (remainingTags.length) {
+          html += '<optgroup label="Tags">';
+          for (const t of remainingTags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
+          html += '</optgroup>';
+        }
+      }
+      if (data.branches && data.branches.length) {
+        const remaining = data.branches.filter(function(b) { return !shownSet.has(b); }).sort();
+        if (remaining.length) {
+          html += '<optgroup label="Branches">';
+          for (const b of remaining) html += '<option value="' + window.escAttr(b) + '">' + window.esc(b) + '</option>';
+          html += '</optgroup>';
+        }
+      }
+      refSel.innerHTML = html;
+      // Restore previous selection if it still exists in the new list
+      if (prev) refSel.value = prev;
+      hintEl.textContent = '';
+    } catch (err) {
+      hintEl.textContent = 'Failed to load refs — ' + String(err);
+    }
+    refreshPolicyDirty();
+  }
+
+  function reservationAge(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm';
+    const h = Math.floor(m / 60);
+    return h < 24 ? h + 'h ' + (m % 60) + 'm' : Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+  }
+
+  function setReservationMessage(text, isError) {
+    const el = document.getElementById('reservations-message');
+    el.textContent = text || '';
+    el.style.color = isError ? 'var(--st-warn-fg)' : '';
+    el.hidden = !text;
+  }
+
+  async function loadReservations() {
+    const listEl = document.getElementById('reservations-list');
+    const badgeEl = document.getElementById('reservations-badge');
+    try {
+      const res = await window.api('/api/dispatch-reservations');
+      if (!res.ok) {
+        setReservationMessage('Could not read reservations (' + res.status + ')', true);
+        return;
+      }
+      const rows = (await res.json()).reservations || [];
+      window.setStatusBadge(badgeEl, rows.length ? 'warn' : 'success', String(rows.length));
+      if (!rows.length) {
+        listEl.innerHTML = '<div class="kpi-trend text-secondary">No held reservations.</div>';
+        return;
+      }
+      let html = '<table class="table"><thead><tr><th>Dispatch</th><th>Team</th><th>Issue</th><th>Phase</th><th>Backend</th><th>Owner</th><th>Age</th><th>Job</th><th></th></tr></thead><tbody>';
+      for (const r of rows) {
+        const job = r.jobStatus ? r.jobStatus + (r.jobConclusion ? ' / ' + r.jobConclusion : '') : 'no job row';
+        html += '<tr>'
+          + '<td style="font-family: var(--font-mono)">' + window.esc(r.dispatchId) + '</td>'
+          + '<td>' + window.esc(r.team) + '</td>'
+          + '<td>' + window.esc(r.issueIdentifier || r.issueId) + '</td>'
+          + '<td>' + window.esc(r.phase) + '</td>'
+          + '<td>' + window.esc(r.backend) + '</td>'
+          + '<td style="font-family: var(--font-mono)">' + window.esc(r.lifecycleOwner) + '</td>'
+          + '<td>' + window.esc(reservationAge(r.ageMs)) + '</td>'
+          + '<td>' + window.esc(job) + '</td>'
+          + '<td><button class="btn btn-sm reservation-release">Release</button></td>'
+          + '</tr>';
+      }
+      listEl.innerHTML = html + '</tbody></table>';
+      // Each button releases its own row's reservation, captured here rather than read back from the markup (ADR 002).
+      listEl.querySelectorAll('.reservation-release').forEach(function (button, i) {
+        button.addEventListener('click', function () { releaseReservation(rows[i].dispatchId); });
+      });
+    } catch (err) {
+      setReservationMessage('Could not read reservations — ' + String(err), true);
+    }
+  }
+
+  async function releaseReservation(dispatchId, force) {
+    setReservationMessage('', false);
+    try {
+      const res = await window.api('/api/tools/release_dispatch_reservation', {
+        method: 'POST',
+        body: JSON.stringify({ args: force ? { dispatchId: dispatchId, force: true } : { dispatchId: dispatchId } }),
+      });
+      const body = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        setReservationMessage('Release failed — ' + (body.error || res.status), true);
+        return;
+      }
+      let result = null;
+      try { result = JSON.parse(body.content[0].text); } catch (e) { /* plain-text error */ }
+      if (result && result.status === 'refused') {
+        const reason = 'Not released — ' + result.reason;
+        if (confirm(reason + '\\n\\nForce the release of ' + dispatchId + '? Only do this if the run is dead.')) {
+          await releaseReservation(dispatchId, true);
+          return;
+        }
+        setReservationMessage(reason, true);
+      } else if (result && result.status === 'released') {
+        setReservationMessage('Released ' + result.dispatchId + (result.forced ? ' (forced)' : ''), false);
+      } else if (result && result.status === 'nothing_to_release') {
+        setReservationMessage('Nothing to release for ' + result.dispatchId, false);
+      } else {
+        setReservationMessage('Release failed — ' + (body.content && body.content[0] ? body.content[0].text : 'unknown error'), true);
+      }
+    } catch (err) {
+      setReservationMessage('Release failed — ' + String(err), true);
+    }
+    loadDeployments();
+  }
+
+  async function loadDeployments(opts) {
+    if (!(opts && opts.keepMessage)) clearMessage();
+    loadReservations();
 
     let data;
     try {
@@ -215,16 +476,59 @@ export const deploymentsScript = `
     // deploy itself, where the banner below is the whole story.
     document.getElementById('deployments-policy').hidden = !configured;
 
+    // Watched-source field: always visible when configured; shows resolved repo + ref.
+    const watchedSourceCard = document.getElementById('deployments-watched-source');
+    watchedSourceCard.hidden = !configured;
+    if (configured) {
+      const sourceRepo = data.repo || '';
+      const sourceBranch = data.branch || '';
+      const sourceText = [sourceRepo, sourceBranch].filter(Boolean).join(' · ') || '(not configured)';
+      document.getElementById('deployments-watched-source-value').textContent = sourceText;
+      document.getElementById('deployments-downgrade-warn').hidden = data.isDowngrade !== true;
+    }
+
     const autoEl = document.getElementById('deployments-auto');
     const notifyEl = document.getElementById('deployments-notify');
+    const watchedRepoEl = document.getElementById('deployments-watched-repo');
+    const watchedRefEl = document.getElementById('deployments-watched-ref');
+    const flyEl = document.getElementById('deployments-fly-toml');
+
+    // Before the dirty check below, which ignores a disabled control. A Restate fault
+    // leaves selfDeploy null; the stored option is then unknown and reads as off.
+    const selfDeploy = data.selfDeploy || null;
+    const flyAllowed = data.applyFlyTomlAllowed !== false;
+    flyEl.disabled = !flyAllowed;
 
     // Computed against the *previous* server state, before it is replaced below — the
     // poll must not overwrite a checkbox that is ticked and not yet saved.
     if (!policyDirty()) {
       autoEl.checked = !!data.autoDeploy;
       notifyEl.checked = !!data.notifyAvailable;
+      flyEl.checked = flyAllowed && !!(selfDeploy && selfDeploy.options && selfDeploy.options.applyFlyToml);
+      watchedRepoEl.value = data.watchedRepo || '';
+      // Seed the ref selector with the saved value; the options are loaded on blur.
+      const savedRef = data.watchedRef || '';
+      if (watchedRefEl.value !== savedRef) {
+        // Add a placeholder option for the saved ref if it is not already in the list
+        const existing = watchedRefEl.querySelector('option[value="' + CSS.escape(savedRef) + '"]');
+        if (savedRef && !existing) {
+          const opt = document.createElement('option');
+          opt.value = savedRef;
+          opt.textContent = savedRef;
+          watchedRefEl.appendChild(opt);
+        }
+        watchedRefEl.value = savedRef;
+      }
     }
-    savedPolicy = { autoDeploy: !!data.autoDeploy, notifyAvailable: !!data.notifyAvailable };
+    watchedRepoEl.placeholder = data.watchedRepo || data.repo || 'owner/repo';
+    stampedBranch = data.branch || null;
+    savedPolicy = {
+      autoDeploy: !!data.autoDeploy,
+      notifyAvailable: !!data.notifyAvailable,
+      watchedRepo: data.watchedRepo || '',
+      watchedRef: data.watchedRef || '',
+      applyFlyToml: flyAllowed && !!(selfDeploy && selfDeploy.options && selfDeploy.options.applyFlyToml),
+    };
     refreshPolicyDirty();
 
     // Nothing can be announced without somewhere to announce to, so the control says so
@@ -238,10 +542,19 @@ export const deploymentsScript = `
     notifyRow.style.opacity = data.notifyConfigured ? '' : '0.5';
     notifyRow.style.cursor = data.notifyConfigured ? '' : 'not-allowed';
 
+    const flyRow = document.getElementById('deployments-fly-toml-row');
+    flyRow.style.opacity = flyAllowed ? '' : '0.5';
+    flyRow.style.cursor = flyAllowed ? '' : 'not-allowed';
+    document.getElementById('deployments-fly-toml-hint').textContent = flyAllowed
+      ? 'Off by default. On: a deploy also applies this repo\u2019s fly.toml to the machine.'
+      : 'The control plane created this machine and owns its config.';
+
+    renderSelfDeploy(selfDeploy && selfDeploy.deploy ? selfDeploy.deploy : null);
+
     document.getElementById('deployments-auto-hint').textContent = autoHint(data, available, held);
     document.getElementById('deployments-notify-hint').textContent = notifyHint(data);
 
-    // Deploy status is only meaningful once a deploy is under way, so the whole tile appears with the hold 
+    // Deploy status is only meaningful once a deploy is under way, so the whole tile appears with the hold
     const statusKpi = document.getElementById('deployments-status-kpi');
     const statusBadge = document.getElementById('kpi-deploy-status-badge');
     const statusEl = document.getElementById('kpi-deploy-status');
@@ -249,13 +562,16 @@ export const deploymentsScript = `
     const dispatchEl = document.getElementById('kpi-deploy-dispatch');
     statusKpi.hidden = !held;
     if (held) {
-      const elapsed = data.deployStartedAt ? fmtElapsed(data.deployStartedAt) + ' elapsed' : '';
+      const elapsed = data.deployStartedAt ? window.fmtDuration(Date.now() - data.deployStartedAt) + ' elapsed' : '';
       if (inFlight.length > 0) {
-        setBadge(statusBadge, 'warn', 'Draining');
-        statusEl.textContent = inFlight.map(function (w) { return plural(w.count, w.kind); }).join(', ');
+        window.setStatusBadge(statusBadge, 'warn', 'Draining');
+        statusEl.textContent = inFlight.map(function (w) {
+          if (w.kind === 'kg-refresh') return plural(w.count, 'KG ingest run');
+          return plural(w.count, w.kind);
+        }).join(', ');
         statusUnit.textContent = elapsed || 'waiting for in-flight work to finish';
       } else {
-        setBadge(statusBadge, 'running', 'Building');
+        window.setStatusBadge(statusBadge, 'running', 'Building');
         statusEl.textContent = 'Building and releasing the new image';
         // Blank without a clock, unlike Draining above: the value here is a whole sentence,
         // so filler beside it would add nothing. Only a pre-clock hold reaches that.
@@ -275,8 +591,8 @@ export const deploymentsScript = `
     const outcomeWhen = document.getElementById('kpi-deploy-outcome-when');
     const outcomeMeta = document.getElementById('kpi-deploy-outcome-meta');
     if (!outcome) {
-      setBadge(outcomeBadge, 'neutral', 'None yet');
-      outcomeCommit.textContent = '\u2014';
+      window.setStatusBadge(outcomeBadge, 'neutral', 'None yet');
+      outcomeCommit.textContent = '\\u2014';
       outcomeWhen.textContent = '';
       outcomeMeta.textContent = 'No self-deploy has completed on this orchestrator.';
     } else {
@@ -285,17 +601,20 @@ export const deploymentsScript = `
       // review_failed gets. A release whose sidecar is missing serves every route but
       // /mcp, so it is degraded rather than failed.
       if (outcome.kind === 'deployed-ok') {
-        setBadge(outcomeBadge, 'success', 'Completed');
+        window.setStatusBadge(outcomeBadge, 'success', 'Completed');
       } else if (outcome.kind === 'deployed-not-serving') {
-        setBadge(outcomeBadge, 'warn', 'Degraded');
+        window.setStatusBadge(outcomeBadge, 'warn', 'Degraded');
+      } else if (outcome.kind === 'deploy-cancelled') {
+        // Deliberate, so neither the red failure treatment nor a success.
+        window.setStatusBadge(outcomeBadge, 'neutral', 'Cancelled');
       } else {
-        setBadge(outcomeBadge, 'fail', 'Failed');
+        window.setStatusBadge(outcomeBadge, 'fail', 'Failed');
       }
       // A build failure names the commit it tried, not the one running, so this can
       // legitimately differ from the tile beside it. Only that case says so — for the
       // other two the commit here and the running one are the same value.
-      outcomeCommit.innerHTML = commitLink(data.repo, outcome.commit) || '\u2014';
-      outcomeWhen.textContent = outcome.timestamp ? fmtAgo(outcome.timestamp) : '';
+      outcomeCommit.innerHTML = commitLink(data.repo, outcome.commit) || '\\u2014';
+      outcomeWhen.textContent = outcome.timestamp ? window.fmtAgo(outcome.timestamp) : '';
       outcomeMeta.textContent = outcome.kind === 'build-failed' ? 'attempted — never released' : '';
     }
 
@@ -307,19 +626,23 @@ export const deploymentsScript = `
     outcomeAlert.hidden = !troubled;
     if (troubled) {
       const degraded = outcome.kind === 'deployed-not-serving';
+      const cancelled = outcome.kind === 'deploy-cancelled';
       outcomeAlert.className = 'alert ' + (degraded ? 'warn' : 'fail');
+      // Cancelling is deliberate: the warn treatment, not the failure one.
+      if (cancelled) outcomeAlert.className = 'alert warn';
       const title = degraded
         ? 'Released, but the knowledge graph is not serving'
-        : 'Deploy did not release';
+        : cancelled ? 'Deploy cancelled' : 'Deploy did not release';
       const explain = degraded
         ? '/mcp answers 503 while every other route is healthy. Deploy now, below, rebuilds and releases the same commit.'
+        : cancelled ? 'The deploy was cancelled while draining. The running version is unchanged.'
         : 'The running version is unchanged, and the commit is still available to deploy.';
       // The record carries a one-line reason on purpose. flyctl's real output is a 64 KB
       // tail that is logged and never stored, because the KG token rides in its argv and a
       // stored copy would outlive a rotating log and be served on every status poll.
       // Naming where the output is beats reproducing it somewhere it should not be.
       outcomeAlert.innerHTML =
-        '<div class="alert-icon">' + (degraded ? '!' : '\u00d7') + '</div>'
+        '<div class="alert-icon">' + (degraded || cancelled ? '!' : '\\u00d7') + '</div>'
         + '<div style="flex:1">'
         + '<div class="alert-title">' + window.esc(title) + '</div>'
         + '<div class="alert-desc">' + window.esc(explain) + '</div>'
@@ -332,11 +655,11 @@ export const deploymentsScript = `
     // a tag. The commits it was derived from are the value.
     const badgeEl = document.getElementById('kpi-deploy-badge');
     if (available === true) {
-      setBadge(badgeEl, 'warn', 'Available');
+      window.setStatusBadge(badgeEl, 'warn', 'Available');
     } else if (available === false) {
-      setBadge(badgeEl, 'success', 'Up to date');
+      window.setStatusBadge(badgeEl, 'success', 'Up to date');
     } else {
-      setBadge(badgeEl, 'neutral', 'Unknown');
+      window.setStatusBadge(badgeEl, 'neutral', 'Unknown');
     }
 
     // Built from whichever commits resolved rather than branching on the verdict:
@@ -349,7 +672,7 @@ export const deploymentsScript = `
     }
     document.getElementById('kpi-deploy-commit').innerHTML = links.length ? links.join(' → ') : '—';
     document.getElementById('kpi-deploy-checked').textContent =
-      data.checkedAt ? 'checked ' + fmtAgo(data.checkedAt) : 'not yet checked';
+      data.checkedAt ? 'checked ' + window.fmtAgo(data.checkedAt) : 'not yet checked';
 
     const source = [];
     if (data.repo) source.push(data.repo);
@@ -388,26 +711,59 @@ export const deploymentsScript = `
     } finally {
       // finally, not the success path: returning early there left the button dead
       // whenever a fast failure cleared the hold before the next poll could hide it.
-      btn.disabled = false;
+      btn.disabled = deployActive;
       loadDeployments();
     }
   }
 
+  async function cancelDeploy() {
+    clearMessage();
+    const btn = document.getElementById('deployments-cancel-btn');
+    btn.disabled = true;
+    try {
+      const res = await window.api('/api/deploy-cancel', { method: 'POST' });
+      if (!res.ok) {
+        let message = 'Unknown error';
+        try { const body = await res.json(); message = body.error || message; } catch (e) { /* ignore */ }
+        showMessage('error', 'Could not cancel the deploy — ' + message);
+      } else {
+        const body = await res.json().catch(function () { return {}; });
+        if (body && body.cancelled === false && body.reason === 'too-late') {
+          showMessage('warning', 'The deploy is past the drain and cannot be cancelled.');
+        }
+      }
+    } catch (err) {
+      showMessage('error', 'Could not cancel the deploy — ' + String(err));
+    } finally {
+      btn.disabled = false;
+    }
+    // keepMessage: a plain reload would erase the too-late notice just shown.
+    await loadDeployments({ keepMessage: true });
+  }
+
   async function saveDeployPolicy() {
     clearMessage();
-    // Sends only the two flags, and re-renders from the response rather than the
-    // checkbox state — the server's view is what decides whether the other flag is
-    // still meaningful, and an optimistic update would show a hint that is not true yet.
+    // Sends only the flags and override fields present, and re-renders from the response
+    // rather than the form state — the server's view decides whether flags are meaningful,
+    // and an optimistic update would show a hint that is not true yet.
     // Omits the announcement flag while it is unavailable, so saving cannot overwrite a
-    // stored preference with the forced-unchecked display. The endpoint takes a patch
-    // precisely so one control can stay out of a write.
+    // stored preference with the forced-unchecked display.
     const notifyEl = document.getElementById('deployments-notify');
+    const watchedRepoEl = document.getElementById('deployments-watched-repo');
+    const watchedRefEl = document.getElementById('deployments-watched-ref');
     const patch = { autoDeploy: document.getElementById('deployments-auto').checked };
     if (!notifyEl.disabled) patch.notifyAvailable = notifyEl.checked;
+    // Send null to clear the override when the field is blank.
+    const flyEl = document.getElementById('deployments-fly-toml');
+    if (!flyEl.disabled) patch.applyFlyToml = flyEl.checked;
+    patch.watchedRepo = watchedRepoEl.value.trim() || null;
+    patch.watchedRef = watchedRefEl.value || null;
     try {
       const res = await window.api('/api/deploy-policy', { method: 'POST', body: JSON.stringify(patch) });
-      if (!res.ok && res.status !== 401) {
-        showMessage('error', 'Could not save the deployment policy — the toggles may not reflect what is stored.');
+      if (res.status === 409) {
+        showMessage('error', 'Could not save the deployment policy — the control plane owns this machine\u2019s config, so fly.toml cannot be applied.');
+      } else if (!res.ok && res.status !== 401) {
+        showMessage('error', 'Could not save the deployment policy — the settings may not reflect what is stored.');
       }
     } catch (err) {
       showMessage('error', 'Could not save the deployment policy — ' + String(err));
@@ -415,10 +771,105 @@ export const deploymentsScript = `
     loadDeployments();
   }
 
+  let savedRetention = null;
+
+  function retentionDirty() {
+    if (!savedRetention) return false;
+    return document.getElementById('deployments-retention-restate').value !== String(savedRetention.restate.days)
+      || document.getElementById('deployments-retention-volume').value !== String(savedRetention.volume.days);
+  }
+
+  function refreshRetentionDirty() {
+    document.getElementById('deployments-retention-save').disabled = !retentionDirty();
+  }
+
+  function renderRetention(data) {
+    savedRetention = data;
+    document.getElementById('deployments-retention-restate').value = String(data.restate.days);
+    document.getElementById('deployments-retention-volume').value = String(data.volume.days);
+    for (const id of ['deployments-retention-restate', 'deployments-retention-volume']) {
+      const el = document.getElementById(id);
+      el.min = String(data.min);
+      el.max = String(data.max);
+    }
+    document.getElementById('deployments-retention-applies').innerHTML =
+      'Restate retention applies at the ' + window.esc(data.restate.appliesAt);
+    const last = data.volume.lastApplied;
+    let text = 'Volume retention: not applied since boot';
+    if (last) {
+      text = 'Volume retention last applied ' + window.fmtAgo(last.at) + ': ' + last.applied.length + ' volume(s) changed'
+        + (last.skipped ? ', not applied — ' + last.skipped : '');
+    }
+    document.getElementById('deployments-retention-applied').textContent = text;
+    refreshRetentionDirty();
+  }
+
+  async function loadRetention() {
+    try {
+      const res = await window.api('/api/retention');
+      if (res.ok) renderRetention(await res.json());
+    } catch (err) {
+      // The card keeps its last values; the rest of the page does not depend on it.
+    }
+  }
+
+  async function saveRetention() {
+    const errEl = document.getElementById('deployments-retention-error');
+    errEl.hidden = true;
+    // Only the changed field is sent, so saving one value cannot re-apply the other.
+    const patch = {};
+    const restateVal = document.getElementById('deployments-retention-restate').value;
+    const volumeVal = document.getElementById('deployments-retention-volume').value;
+    if (restateVal !== String(savedRetention.restate.days)) patch.restate = Number(restateVal);
+    if (volumeVal !== String(savedRetention.volume.days)) patch.volume = Number(volumeVal);
+    try {
+      const res = await window.api('/api/retention', { method: 'POST', body: JSON.stringify(patch) });
+      if (res.ok) {
+        renderRetention(await res.json());
+      } else if (res.status !== 401) {
+        const body = await res.json().catch(function () { return {}; });
+        errEl.textContent = body.error || 'Could not save the retention settings';
+        errEl.hidden = false;
+      }
+    } catch (err) {
+      errEl.textContent = 'Could not save the retention settings — ' + String(err);
+      errEl.hidden = false;
+    }
+  }
+
+  async function checkNow() {
+    const btn = document.getElementById('deployments-check-now-btn');
+    btn.disabled = true;
+    clearMessage();
+    try {
+      const res = await window.api('/api/deploy-check', { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(function () { return {}; });
+        showMessage('warning', 'Check failed — ' + (body.error || res.status));
+      }
+    } catch (err) {
+      showMessage('warning', 'Check failed — ' + String(err));
+    } finally {
+      btn.disabled = false;
+      loadDeployments();
+    }
+  }
+
   window.loadDeployments = loadDeployments;
   window.triggerDeploy = triggerDeploy;
+  window.cancelDeploy = cancelDeploy;
   window.saveDeployPolicy = saveDeployPolicy;
   window.refreshPolicyDirty = refreshPolicyDirty;
-  window.registerPage('deployments', function () { loadDeployments(); setInterval(loadDeployments, 30000); });
+  window.loadDeployRefs = loadDeployRefs;
+  window.checkNow = checkNow;
+  window.saveRetention = saveRetention;
+  window.refreshRetentionDirty = refreshRetentionDirty;
+  window.loadRetention = loadRetention;
+
+  window.registerPage('deployments', function () {
+    loadDeployments();
+    loadRetention();
+    setInterval(loadDeployments, 30000);
+  });
 })();
 `;

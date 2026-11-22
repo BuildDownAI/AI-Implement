@@ -1,5 +1,89 @@
+export interface RollupReviewResult {
+  /** Stale queued head: no reviewer or verdict was produced. */
+  skipReason?: string;
+  headSha: string;
+  verdictUrl: string;
+  failedReviewers?: string[];
+  incompleteReviews?: Array<{ reviewerId: string; failure?: Pick<import("./pipeline/failure-classification.js").FailureRecord, "category" | "code"> }>;
+}
+
+import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
+import type { SourceResult } from "./kg-source-results.js";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import type { FailureRecord } from "./pipeline/failure-classification.js";
+import type { FindingDisposition } from "./pipeline/finding-dispositions.js";
+import { sanitizeAttribution, sanitizeInvocationRecords, sanitizePushedCommits, type InvocationAttributionV1, type InvocationRecordV1 } from "./pipeline/types.js";
+import { collectedInvocations, collectedPushedCommits } from "./pipeline/job-accounting.js";
+import type { CycleSummary } from "./pipeline/cycle-summary.js";
+import type { ReferenceRepoResult } from "./reference-repos.js";
+import type { ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
+import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
+
+/**
+ * Mirrors runner-tokens.ts's PILOT_DELIVERY_GRACE_MS (orchestrator-only module — it imports
+ * getDb() and cannot be pulled into the runner bundle). Keep the two numerically in sync: this
+ * is the same grace window the server allows a prepared attempt's credential to remain usable
+ * past `deadlineAt`, so bounding the client's retry loop past that point buys nothing.
+ */
+const PILOT_RESULT_DELIVERY_GRACE_MS = 15 * 60_000;
+
+/** Safety backstop independent of the deadline, in case `deadlineAt` is set unreasonably far out. */
+const RESULT_DELIVERY_POLICY = { maxAttempts: 8, backoff: DEFAULT_RETRY_POLICY } as const;
+
+/** Bounds a single delivery attempt; overridable per-call via `transportTimeoutMs` for tests. */
+const PILOT_TRANSPORT_TIMEOUT_MS = 10_000;
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Bounds one delivery attempt AND aborts the underlying request at the timeout, so a slow
+ * response can't stay in flight while a later retry starts concurrently — the previous
+ * Promise-race approach only stopped *awaiting* `fetch`; the real request kept running
+ * underneath. The abort is what actually stops it; the global `fetch` honours the signal.
+ */
+async function fetchWithAbortTimeout(
+  fetchFn: typeof fetch,
+  url: string,
+  init: { method: "POST"; headers: Record<string, string>; body: string },
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchFn(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`runner-result POST timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Normalizes a delivery failure to a bounded, credential-free category for logging. Result
+ * failure logs must never include the raw response body or a thrown error's message — either
+ * can carry an echoed Authorization header, request body, or other server/transport string
+ * neither side intended to end up in a log.
+ */
+function classifyFailureReason(status: number | null, err: unknown): string {
+  if (status !== null) {
+    if (status === 429) return "rate_limited";
+    if (status >= 500) return "server_error";
+    if (status >= 400) return "client_error";
+    return "unexpected_status";
+  }
+  return err instanceof Error && err.name === "AbortError" ? "timeout" : "transport_error";
+}
 
 export function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
   const dir = join(workspaceDir, "ai-output", "comments");
@@ -38,16 +122,102 @@ export async function fetchPlanningContextFromOrchestrator(params: {
   }
 }
 
+/** Deliver one immutable cycle before terminal result intake. The progress bearer identifies
+ * the prepared pilot attempt, so this also works when no output commit was published. */
+export async function postRunnerCycleSummary(params: {
+  callbackUrl: string;
+  progressToken: string;
+  summary: CycleSummary;
+  fetchImpl?: typeof fetch;
+}): Promise<boolean> {
+  const url = `${params.callbackUrl.replace(/\/$/, "")}/runner/cycle-summary`;
+  const payload = JSON.stringify({ summary: params.summary });
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${params.progressToken}` };
+  const fetchFn = params.fetchImpl ?? fetch;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetchWithAbortTimeout(fetchFn, url, { method: "POST", headers, body: payload }, 5_000);
+      if (res.ok) return true;
+      if (!isRetryableStatus(res.status)) {
+        console.error(`[cycle-summary] durable delivery rejected (HTTP ${res.status})`);
+        return false;
+      }
+    } catch {
+      // Transport outcome is unknown; a byte-identical retry is safe because storage is idempotent.
+    }
+    if (attempt < 2) await sleep(250 * (attempt + 1));
+  }
+  console.error("[cycle-summary] durable delivery exhausted retries");
+  return false;
+}
+
 export async function postRunnerResult(params: {
-  phase: "planning" | "implementation" | "gap-analysis";
+  phase: "planning" | "implementation" | "gap-analysis" | "kg-refresh";
   workspaceDir: string;
   outcome: "success" | "failure";
   prUrl?: string;
   failureReason?: string;
-  /** Machine-readable code set when a known guardrail trips (e.g. "SENSITIVE_FILES_BLOCKED"). */
+  /**
+   * Machine-readable code. Set either when a known guardrail trips
+   * (e.g. "SENSITIVE_FILES_BLOCKED") or, for a classified terminal failure,
+   * to `failure.code` — it is not guardrail-only.
+   */
   failureCode?: string;
+  /** Structured failure record for the terminal error, classified by src/pipeline/failure-classification.ts. */
+  failure?: FailureRecord;
   /** True when a grouping-parent run produced no changes; skips prUrl requirement on the callback. */
   noWork?: boolean;
+  /** Reference repository clone outcomes, present only when the run declared entries. */
+  referenceRepoResults?: ReferenceRepoResult[];
+  /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid), present only when non-empty. */
+  reviewOnly?: boolean;
+  rollupReview?: RollupReviewResult;
+  internalFindings?: ReviewLedgerFinding[];
+  findingDispositions?: FindingDisposition[];
+  /**
+   * Per-cycle evidence records read back from this run's declared cycle-summary file (AII-801,
+   * ./pipeline/cycle-summary.js), present only when non-empty. The caller (run-autonomous.ts)
+   * only attaches these alongside a `reviewFix` marker — a Legacy run has no attemptId for the
+   * orchestrator to record them against.
+   */
+  cycleSummaries?: CycleSummary[];
+  /** Optional diagnostic attribution (AII-946). Sanitized before serialization; dropped if malformed. */
+  attribution?: InvocationAttributionV1;
+  /** Every model invocation of the job (AII-1562). Defaults to those the stage executor collected in this process. */
+  invocations?: readonly InvocationRecordV1[];
+  /** SHAs the job pushed, oldest first; `[]` = nothing pushed. Defaults to what the push step reported. */
+  pushedCommits?: readonly string[];
+  /** Head SHA the internal review approved when the run ended `external_review_pending`. */
+  externalReviewPending?: { headSha: string };
+  /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
+  snapshotCommit?: string | null;
+  /** Number of the refresh PR opened alongside snapshotCommit. Only meaningful for phase=kg-refresh. */
+  snapshotPr?: number | null;
+  /** The `kg-refresh/<stamp>` branch the snapshot was pushed to; the orchestrator deletes it after merge or close. */
+  snapshotBranch?: string | null;
+  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
+  guardVerdict?: "clean" | "warnings" | "refused" | "held";
+  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
+  partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Why a held kg-refresh waits: a content shrink or missing tracker data. */
+  cause?: "shrink" | "tracker-missing" | "source-failed";
+  /** Teams whose tracker fetch failed, for a held kg-refresh. */
+  failedTeams?: string[];
+  /** True when accepting the held kg-refresh would drop a skipped or failed team's served issues. */
+  acceptBlocked?: boolean;
+  /** Skipped or failed teams with issues in the served snapshot, for a blocked kg-refresh hold. */
+  lostTeams?: Array<{ team: string; servedIssues: number }>;
+  /** Warnings on a kg-refresh that completed: skipped or failed tracker teams with no served issues. */
+  warnings?: string[];
+  /** Per-source results of a kg-refresh (tracker teams, repos, docs sites). */
+  sources?: SourceResult[];
+  /**
+   * Optional pilot marker (AII-769 Restate review-fix pilot; AII-770 contract).
+   * Present only when this result comes from a Restate-owned review-fix
+   * attempt. Serialized verbatim — no producer calls this yet (AII-777 is
+   * contracts + validation only).
+   */
+  reviewFix?: ReviewFixResultMetadataV1;
   /**
    * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
    * Falls back to the legacy RUNNER_CALLBACK_URL env var (never set in GHA envelope mode,
@@ -55,10 +225,25 @@ export async function postRunnerResult(params: {
    */
   callbackUrl?: string | null;
   fetchImpl?: typeof fetch;
+  /** Run deadline in epoch milliseconds; reviewFix.deadlineAt takes precedence when present. */
+  deadlineAt?: number;
+  /** Backoff override for result delivery. Defaults to RESULT_DELIVERY_POLICY.backoff. */
+  retryPolicy?: RetryPolicy;
+  /** Injectable clock/sleep, for deterministic tests of the bounded retry loop only. */
+  now?: () => number;
+  sleepImpl?: (ms: number) => Promise<void>;
+  /** Per-attempt transport timeout override, for deterministic abort tests only. Defaults to PILOT_TRANSPORT_TIMEOUT_MS. */
+  transportTimeoutMs?: number;
 }): Promise<void> {
   const callbackUrl = params.callbackUrl ?? process.env.RUNNER_CALLBACK_URL;
   const runToken = process.env.RUN_TOKEN;
-  if (!callbackUrl || !runToken) return;
+  if (!callbackUrl || !runToken) {
+    if (params.reviewFix) {
+      const missing = [!callbackUrl && "callback URL", !runToken && "RUN_TOKEN"].filter(Boolean).join(" and ");
+      console.warn(`[runner-callback] review-fix result not sent: ${missing} missing`);
+    }
+    return;
+  }
   let comments: Array<{ body: string }> = [];
   try {
     comments = collectRunnerComments(params.workspaceDir);
@@ -69,17 +254,112 @@ export async function postRunnerResult(params: {
   if (params.prUrl) body.prUrl = params.prUrl;
   if (params.failureReason) body.failureReason = params.failureReason;
   if (params.failureCode) body.failureCode = params.failureCode;
+  if (params.failure) body.failure = params.failure;
   if (params.noWork) body.noWork = params.noWork;
+  if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
+    body.referenceRepoResults = params.referenceRepoResults;
+  }
+  if (params.reviewOnly) body.reviewOnly = true;
+  if (params.rollupReview) body.rollupReview = params.rollupReview;
+  if (params.internalFindings) body.internalFindings = params.internalFindings;
+  if (params.findingDispositions && params.findingDispositions.length > 0) {
+    body.findingDispositions = params.findingDispositions;
+  }
+  if (params.cycleSummaries && params.cycleSummaries.length > 0) {
+    body.cycleSummaries = params.cycleSummaries;
+  }
+  if (params.attribution !== undefined) {
+    const attribution = sanitizeAttribution(params.attribution);
+    if (attribution) body.attribution = attribution;
+    else console.warn("[runner-callback] dropping invalid attribution before delivery");
+  }
+  // Job accounting (AII-1562): every model invocation and the pushed SHAs, beside the legacy single
+  // `attribution`. Defaults to what this runner process collected, so every result path reports them.
+  const invocations = sanitizeInvocationRecords(params.invocations ?? collectedInvocations());
+  if (invocations.dropped > 0) console.warn(`[runner-callback] dropping ${invocations.dropped} invalid invocation record(s) before delivery`);
+  if (invocations.valid.length > 0) body.invocations = invocations.valid;
+  // The orchestrator cannot see a cut or a drop, so the runner says so: the job's usage is then `partial`.
+  if (invocations.dropped > 0) body.invocationsDropped = invocations.dropped;
+  const pushedCommits = sanitizePushedCommits(params.pushedCommits ?? collectedPushedCommits());
+  if (pushedCommits) body.pushedCommits = pushedCommits;
+  if (params.externalReviewPending) body.externalReviewPending = params.externalReviewPending;
+  if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
+  if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
+  if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
+  if (params.guardVerdict) body.guardVerdict = params.guardVerdict;
+  if (params.partTable) body.partTable = params.partTable;
+  if (params.cause) body.cause = params.cause;
+  if (params.failedTeams) body.failedTeams = params.failedTeams;
+  if (params.sources) body.sources = params.sources;
+  if (params.acceptBlocked) body.acceptBlocked = params.acceptBlocked;
+  if (params.lostTeams) body.lostTeams = params.lostTeams;
+  if (params.warnings) body.warnings = params.warnings;
+  if (params.reviewFix) body.reviewFix = params.reviewFix;
+  const url = `${callbackUrl.replace(/\/$/, "")}/runner/result`;
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${runToken}` };
+  // Built once and reused verbatim on every delivery attempt, including retries — a lost-ACK
+  // retry must resend byte-identical bytes, not a freshly serialized (if logically equal) body.
+  const payload = JSON.stringify(body);
   const fetchFn = params.fetchImpl ?? fetch;
-  try {
-    const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${runToken}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok)
-      console.error(`[runner-callback] POST failed HTTP ${res.status}: ${await res.text().catch(() => "")}`);
-  } catch (err) {
-    console.error("[runner-callback] POST failed:", err);
+
+  // Every result uses bounded delivery. Terminal responses (including a consumed legacy
+  // token's 401) stop immediately; retries reuse the immutable payload above.
+  const attemptContext = params.reviewFix ? ` attemptId=${params.reviewFix.attemptId}` : "";
+  const nowFn = params.now ?? Date.now;
+  const sleepFn = params.sleepImpl ?? sleep;
+  const policy = params.retryPolicy ?? RESULT_DELIVERY_POLICY.backoff;
+  const transportTimeoutMs = params.transportTimeoutMs ?? PILOT_TRANSPORT_TIMEOUT_MS;
+  const deadlineAt = params.reviewFix?.deadlineAt ?? params.deadlineAt;
+  const deadline = deadlineAt === undefined ? Infinity : deadlineAt + PILOT_RESULT_DELIVERY_GRACE_MS;
+  let lastReason = "unknown";
+
+  for (let attempt = 1; attempt <= RESULT_DELIVERY_POLICY.maxAttempts; attempt++) {
+    if (nowFn() >= deadline) {
+      console.error(
+        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome}${attemptContext}: ` +
+          `delivery deadline exceeded before attempt ${attempt} (last reason=${lastReason})`,
+      );
+      return;
+    }
+    let status: number | null = null;
+    try {
+      const res = await fetchWithAbortTimeout(fetchFn, url, { method: "POST", headers, body: payload }, transportTimeoutMs);
+      status = res.status;
+      if (res.ok) {
+        console.log(`[runner-callback] POST ok phase=${params.phase} outcome=${params.outcome}${attemptContext}`);
+        return;
+      }
+      // The body is unused and may stall after headers. Cancel it without awaiting
+      // cleanup, which can itself stall; neither body data nor cancellation errors are logged.
+      void res.body?.cancel().catch(() => {});
+      lastReason = classifyFailureReason(res.status, null);
+      if (!isRetryableStatus(res.status)) {
+        console.error(
+          `[runner-callback] POST failed HTTP ${res.status}${attemptContext} (terminal, not retrying) reason=${lastReason}`,
+        );
+        return;
+      }
+    } catch (err) {
+      lastReason = classifyFailureReason(null, err);
+    }
+
+    if (attempt === RESULT_DELIVERY_POLICY.maxAttempts) {
+      console.error(
+        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome}${attemptContext}: ` +
+          `retry attempts exhausted (${RESULT_DELIVERY_POLICY.maxAttempts}) (last reason=${lastReason})`,
+      );
+      return;
+    }
+    const backoff = computeBackoffMs(attempt, policy);
+    const remaining = deadline - nowFn();
+    if (remaining <= 0) {
+      console.error(
+        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome}${attemptContext}: ` +
+          `delivery deadline exceeded after attempt ${attempt} (last reason=${lastReason})`,
+      );
+      return;
+    }
+    console.error(`[runner-callback] POST retry after attempt ${attempt} status=${status ?? "transport_error"} reason=${lastReason}${attemptContext}`);
+    await sleepFn(Math.min(backoff, remaining));
   }
 }

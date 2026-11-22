@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   GITHUB_ACTIONS_WATCHDOG_RECONCILIATION_GRACE_MINUTES,
   GITHUB_ACTIONS_WORKFLOW_DEFAULT_TIMEOUT_MINUTES,
+  JOB_TTL_GRACE_MINUTES,
   githubActionsWatchdogDecision,
+  jobTtlDecision,
   normalizeGithubActionsJobTimeoutMinutes,
 } from "../github-actions-watchdog.js";
 
@@ -83,6 +85,48 @@ describe("githubActionsWatchdogDecision", () => {
 
     expect(decision.elapsedMs).toBe(0);
     expect(decision.overdue).toBe(false);
+  });
+});
+
+describe("jobTtlDecision", () => {
+  it("is not expired just under the default 90m + 15m limit", () => {
+    const decision = jobTtlDecision({
+      dispatchedAtMs: dispatchedMinutesAgo(104),
+      nowMs: now,
+      maxJobMinutes: null,
+    });
+
+    expect(decision.expired).toBe(false);
+    expect(decision.limitMinutes).toBe(
+      GITHUB_ACTIONS_WORKFLOW_DEFAULT_TIMEOUT_MINUTES + JOB_TTL_GRACE_MINUTES,
+    );
+  });
+
+  it("is expired once past the default 90m + 15m limit (105m)", () => {
+    const decision = jobTtlDecision({
+      dispatchedAtMs: dispatchedMinutesAgo(106),
+      nowMs: now,
+      maxJobMinutes: null,
+    });
+
+    expect(decision.expired).toBe(true);
+  });
+
+  it("uses a configured maxJobMinutes plus the 15m grace", () => {
+    const atLimit = jobTtlDecision({
+      dispatchedAtMs: dispatchedMinutesAgo(75),
+      nowMs: now,
+      maxJobMinutes: 60,
+    });
+    const overLimit = jobTtlDecision({
+      dispatchedAtMs: dispatchedMinutesAgo(76),
+      nowMs: now,
+      maxJobMinutes: 60,
+    });
+
+    expect(atLimit.expired).toBe(false);
+    expect(atLimit.limitMinutes).toBe(75);
+    expect(overLimit.expired).toBe(true);
   });
 });
 

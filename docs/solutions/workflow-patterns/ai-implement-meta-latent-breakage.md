@@ -76,12 +76,12 @@ The orchestrator webhook handler (`src/webhook.ts`, `handleIssueCommentWebhook`)
 
 ## Recovery for Stuck Gaps
 
-If an operator encounters a gap-fill that failed due to the missing meta block (on a legacy-generation repo that still has `comment-trigger.yml`):
+If an operator encounters a gap-fill that failed due to the missing meta block on a legacy-generation repo, re-sync its workflows through the orchestrator:
 
-1. Check that the `<!-- ai-implement-meta ... -->` block is present in the PR body. If it was deleted, the orchestrator can re-create it by triggering a new initial dispatch (add/remove the `AI-Implement` label) or by manually re-adding the block with the correct field values from the dispatch log.
-2. Re-comment `/ai-implement` once the block is restored.
+1. Run **Sync workflows** for the repo in the orchestrator and merge the resulting sync PR. Sync installs the current envelope workflows and removes `.github/workflows/comment-trigger.yml`. The retired template is no longer shipped; dispatch remains blocked while that file is present.
+2. Confirm the retired workflow is absent from the default branch, then re-comment `/ai-implement` to retry through the orchestrator webhook.
 
-For envelope-generation repos (after migration), the meta block is irrelevant — the orchestrator webhook never reads the PR body.
+The orchestrator webhook reads issue metadata from the dispatch log, so restoring the PR-body meta block is unnecessary.
 
 ## Prevention
 

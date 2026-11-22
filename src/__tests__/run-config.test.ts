@@ -1,11 +1,30 @@
-import { describe, expect, it } from "vitest";
+import { sealModelAuthBootstrap } from "../model-auth-seal.js";
+import { MODEL_AUTH_ENV } from "../model-auth-contract.js";
+import { makeGrant } from "./helpers/fixtures/configured-run.js";
+import { accountCombinations } from "./helpers/account-combinations.js";
+import { readFileSync } from "node:fs";
+import { describe, expect, it, vi } from "vitest";
 import {
+  copyModelPrices,
+  copyAccountFallbacks,
   encodeRunConfig,
   decodeRunConfig,
+  decodeTrustedRunConfig,
+  encodeTrustedRunConfig,
+  diagnosticProjection,
+  validateRunCredentials,
   runConfigFromTaskDocument,
+  buildImplRunConfig,
+  buildRunConfig,
+  buildKgRefreshRunConfig,
   type RunConfigV1,
   type TaskDocumentParams,
 } from "../run-config.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import type { RepoMapping, ReviewerSelection } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { managedRunConfigFields } from "../managed-dispatch-auth.js";
 
 const full: RunConfigV1 = {
   v: 1,
@@ -23,6 +42,11 @@ const full: RunConfigV1 = {
   profiles: ["backend", "webapp"],
   planningContext: { parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" },
   dependencyTokenScope: "installation",
+  reviewers: [
+    { id: "gap-analysis", gates: true },
+    { id: "code-review", gates: false },
+  ],
+  retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 },
 };
 
 describe("run-config envelope", () => {
@@ -52,6 +76,12 @@ describe("run-config envelope", () => {
     const decoded = decodeRunConfig(encodeRunConfig(big));
     expect(decoded.issue.description.length).toBeLessThanOrEqual(40_000 + 100);
     expect(decoded.issue.description).toContain("[truncated by ai-implement");
+  });
+
+  it("round-trips a description exactly at the envelope limit without truncation", () => {
+    const exact = "x".repeat(40_000);
+    const decoded = decodeRunConfig(encodeRunConfig({ ...full, issue: { ...full.issue, description: exact } }));
+    expect(decoded.issue.description).toBe(exact);
   });
 
   it("round-trips profiles", () => {
@@ -85,7 +115,7 @@ describe("run-config envelope", () => {
     const decoded = decodeRunConfig(b64);
     expect(decoded.profiles).toEqual(["backend", "webapp"]);
     expect(decoded.planningContext).toEqual({ parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" });
-    expect((decoded as Record<string, unknown>).futureField).toBeUndefined();
+    expect((decoded as unknown as Record<string, unknown>).futureField).toBeUndefined();
   });
 
   it("handles empty profiles array and absent planningContext", () => {
@@ -127,7 +157,499 @@ describe("run-config envelope", () => {
     const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
     const decoded = decodeRunConfig(b64);
     expect(decoded.dependencyTokenScope).toBe("installation");
-    expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+
+  it("round-trips retryPolicy", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-5", title: "t", description: "" },
+      retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 60 },
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).retryPolicy).toEqual({
+      ...DEFAULT_RETRY_POLICY,
+      reviewMaxTurns: 60,
+    });
+  });
+
+  it("absent retryPolicy decodes as undefined (no key materialized)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-6", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.retryPolicy).toBeUndefined();
+    expect("retryPolicy" in decoded).toBe(false);
+  });
+
+  it("round-trips reviewers through pickKnownKeys", () => {
+    const reviewers: ReviewerSelection[] = [
+      { id: "gap-analysis", gates: true, maxTurns: 45 },
+      { id: "custom", gates: false },
+    ];
+    const withExtra = { ...full, reviewers, bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.reviewers).toEqual(reviewers);
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+
+  it("drops malformed reviewers during decode instead of rejecting the envelope", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const withMalformedReviewers = { ...full, reviewers: [{ id: "gap-analysis", gates: "yes" }] };
+      const b64 = Buffer.from(JSON.stringify(withMalformedReviewers), "utf-8").toString("base64");
+      const decoded = decodeRunConfig(b64);
+      expect(decoded.issue.identifier).toBe("AII-1");
+      expect(decoded.reviewers).toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reviewers"));
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  const validReviewFix: RunConfigV1["reviewFix"] = {
+    version: 1,
+    attemptId: "attempt-1",
+    installationId: 123,
+    repository: "acme/widgets",
+    prNumber: 42,
+    deadlineAt: Date.parse("2026-01-01T00:00:00.000Z"),
+  };
+
+  it("round-trips reviewFix", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-776", title: "t", description: "" },
+      reviewFix: validReviewFix,
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).reviewFix).toEqual(validReviewFix);
+  });
+
+  it("absent reviewFix decodes as undefined (no key materialized)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-776", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.reviewFix).toBeUndefined();
+    expect("reviewFix" in decoded).toBe(false);
+  });
+
+  it("pickKnownKeys preserves reviewFix and drops unrelated unknown keys in the same payload", () => {
+    const withExtra = { ...full, reviewFix: validReviewFix, bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.reviewFix).toEqual(validReviewFix);
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+
+  it("throws (fails closed) on malformed or unsupported reviewFix instead of dropping it", () => {
+    const cases: Array<[string, unknown]> = [
+      ["version not 1", { ...validReviewFix, version: 2 }],
+      ["missing attemptId", { ...validReviewFix, attemptId: undefined }],
+      ["empty attemptId", { ...validReviewFix, attemptId: "" }],
+      ["non-integer installationId", { ...validReviewFix, installationId: 1.5 }],
+      ["non-positive installationId", { ...validReviewFix, installationId: 0 }],
+      ["repository not owner/repo shaped", { ...validReviewFix, repository: "widgets" }],
+      ["non-integer prNumber", { ...validReviewFix, prNumber: 1.5 }],
+      ["non-positive prNumber", { ...validReviewFix, prNumber: -1 }],
+      ["unparsable deadlineAt", { ...validReviewFix, deadlineAt: "not-a-date" }],
+    ];
+    for (const [label, reviewFix] of cases) {
+      const withReviewFix = { ...full, reviewFix };
+      const b64 = Buffer.from(JSON.stringify(withReviewFix), "utf-8").toString("base64");
+      expect(() => decodeRunConfig(b64), label).toThrow(/reviewFix/);
+    }
+  });
+
+  it("throws when reviewFix is not an object", () => {
+    const withReviewFix = { ...full, reviewFix: "not-an-object" };
+    const b64 = Buffer.from(JSON.stringify(withReviewFix), "utf-8").toString("base64");
+    expect(() => decodeRunConfig(b64)).toThrow(/reviewFix/);
+  });
+
+  it("drops reviewers with malformed per-reviewer maxTurns during decode", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const maxTurns of [0, 201, 1.5, "45"]) {
+        const withMalformedReviewers = { ...full, reviewers: [{ id: "gap-analysis", gates: true, maxTurns }] };
+        const b64 = Buffer.from(JSON.stringify(withMalformedReviewers), "utf-8").toString("base64");
+        const decoded = decodeRunConfig(b64);
+        expect(decoded.issue.identifier).toBe("AII-1");
+        expect(decoded.reviewers).toBeUndefined();
+      }
+      expect(warnSpy).toHaveBeenCalledTimes(4);
+      for (const call of warnSpy.mock.calls) expect(call[0]).toContain("reviewers");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+const implBaseIssue = {
+  id: "issue-uuid",
+  identifier: "ENG-42",
+  title: "Add feature X",
+  description: "Implement the feature",
+};
+
+describe("buildRunConfig", () => {
+  const fullMapping = makeMapping({
+    branchPrefix: "pr",
+    skillsRepo: "org/skills",
+    maxTurns: 50,
+    maxIterations: 3,
+    sensitiveAddPatterns: ["*.secrets.toml"],
+    sensitiveAllowPatterns: [".env"],
+    dependencyTokenScope: "installation",
+    referenceRepos: [{ repo: "https://github.com/org/ref", path: "ref", ref: "main" }],
+    reviewers: [{ id: "gap-analysis", gates: true }],
+    reviewProcess: "claude-code-review",
+    trustedReviewAuthors: ["octocat"],
+  });
+  const issue = { ...implBaseIssue, profiles: ["backend"], assigneeName: "Ada" };
+  const retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+  const reviewFix = {
+    version: 1 as const,
+    attemptId: "attempt-1",
+    installationId: 123,
+    repository: "acme/widgets",
+    prNumber: 42,
+    deadlineAt: Date.parse("2026-01-01T00:00:00.000Z"),
+  };
+  const build = (runnerPhase: RunConfigV1["runnerPhase"] & string, extra: Partial<Parameters<typeof buildRunConfig>[0]> = {}) =>
+    buildRunConfig({
+      runnerPhase,
+      issue,
+      mapping: fullMapping,
+      baseBranch: "develop",
+      runnerCallbackUrl: "https://orch.example/runner",
+      prNumber: "42",
+      commentInstruction: "do it",
+      planningContext: { parent: "p" },
+      groupingParent: true,
+      retryPolicy,
+      ...extra,
+    });
+  const common = [
+    "v", "issue", "runnerPhase", "baseBranch", "branchPrefix", "skillsRepo", "runnerCallbackUrl",
+    "maxTurns", "maxIterations", "prNumber", "commentInstruction", "sensitiveFiles", "reviewers",
+    "reviewProcess", "trustedReviewAuthors", "profiles", "assigneeName", "planningContext", "groupingParent",
+  ];
+
+  it.each([
+    ["implementation", [...common, "dependencyTokenScope", "referenceRepos", "retryPolicy"]],
+    ["gap-analysis", [...common, "dependencyTokenScope", "referenceRepos", "retryPolicy"]],
+    ["planning", common],
+  ] as const)("emits each conditional key once for %s", (phase, expected) => {
+    const cfg = build(phase);
+    const keys = Object.keys(cfg);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect([...keys].sort()).toEqual([...expected].sort());
+    expect(cfg.retryPolicy).toEqual(phase === "planning" ? undefined : retryPolicy);
+  });
+
+  it("omits referenceRepos and retryPolicy for kg-refresh", () => {
+    const cfg = build("kg-refresh");
+    expect("referenceRepos" in cfg).toBe(false);
+    expect("retryPolicy" in cfg).toBe(false);
+  });
+
+  it("falls back to DEFAULT_RETRY_POLICY on a null policy", () => {
+    expect(build("implementation", { retryPolicy: null }).retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("includes reviewFix only when set", () => {
+    expect("reviewFix" in build("gap-analysis")).toBe(false);
+    const cfg = build("gap-analysis", { reviewFix });
+    expect(cfg.reviewFix).toEqual(reviewFix);
+    expect(decodeRunConfig(encodeRunConfig(cfg)).reviewFix).toEqual(reviewFix);
+  });
+
+  it("keeps the edge cases: empty description, empty profiles, falsy baseBranch", () => {
+    const cfg = build("implementation", {
+      issue: { ...implBaseIssue, description: "", profiles: [] },
+      baseBranch: "",
+    });
+    expect(cfg.issue.description).toBe(implBaseIssue.title);
+    expect("profiles" in cfg).toBe(false);
+    expect("baseBranch" in cfg).toBe(false);
+  });
+});
+
+// buildImplRunConfig backs both the Fly Machines and local Docker implementation
+// dispatch paths (BAC-27113) — a single shared builder, tested once here.
+describe("buildImplRunConfig", () => {
+  it("stamps the caller-supplied retryPolicy into the envelope", () => {
+    const mapping = makeMapping();
+    const retryPolicy = {
+      requestRetries: 3,
+      stageRetries: 2,
+      pushRetries: 1,
+      backoffInitialMs: 45_000,
+      backoffMaxMs: 250_000,
+      backoffJitter: 0.1,
+      reviewMaxTurns: 45,
+    };
+
+    const runConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.retryPolicy).toEqual(retryPolicy);
+  });
+
+  it("carries DEFAULT_RETRY_POLICY through when the caller passes it explicitly", () => {
+    const mapping = makeMapping();
+
+    const runConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+    expect(decoded.runnerPhase).toBe("implementation");
+    expect(decoded.issue.identifier).toBe("ENG-42");
+  });
+
+  it("carries the mapping's referenceRepos and dependencyTokenScope like the inline builders it replaced", () => {
+    const repos = [{ repo: "https://github.com/acme/shared", path: "vendor/shared" }];
+    const mapping = makeMapping({ referenceRepos: repos, dependencyTokenScope: "installation" });
+
+    const runConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping,
+      baseBranch: "release",
+      runnerCallbackUrl: "https://orch.example/api/runner",
+      groupingParent: true,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.referenceRepos).toEqual(repos);
+    expect(decoded.dependencyTokenScope).toBe("installation");
+    expect(decoded.baseBranch).toBe("release");
+    expect(decoded.runnerCallbackUrl).toBe("https://orch.example/api/runner");
+    expect(decoded.groupingParent).toBe(true);
+  });
+
+  it("carries sensitiveFiles, profiles and assigneeName, and omits baseBranch when it is the default", () => {
+    const mapping = makeMapping({ sensitiveAddPatterns: ["*.pem"], sensitiveAllowPatterns: [".env"] });
+
+    const runConfig = buildImplRunConfig({
+      issue: { ...implBaseIssue, profiles: ["backend"], assigneeName: "Ada" },
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.sensitiveFiles).toEqual({ add: ["*.pem"], allow: [".env"] });
+    expect(decoded.profiles).toEqual(["backend"]);
+    expect(decoded.assigneeName).toBe("Ada");
+    expect(decoded).not.toHaveProperty("baseBranch");
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("carries the mapping's reviewers when set, including an empty array", () => {
+    const reviewers: ReviewerSelection[] = [{ id: "gap-analysis", gates: false }];
+    const mapping = makeMapping({ reviewers });
+
+    const runConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    expect(decodeRunConfig(encodeRunConfig(runConfig)).reviewers).toEqual(reviewers);
+
+    const emptyConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping: makeMapping({ reviewers: [] }),
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+    expect(decodeRunConfig(encodeRunConfig(emptyConfig)).reviewers).toEqual([]);
+  });
+
+  it("carries reviewProcess and trustedReviewAuthors when set, including an empty list, and omits them when null", () => {
+    const build = (overrides: Partial<RepoMapping>) => buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping: makeMapping(overrides),
+      baseBranch: "main",
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const set = decodeRunConfig(encodeRunConfig(
+      build({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["review-bot"] }),
+    ));
+    expect(set.reviewProcess).toBe("claude-code-review");
+    expect(set.trustedReviewAuthors).toEqual(["review-bot"]);
+
+    const empty = decodeRunConfig(encodeRunConfig(build({ trustedReviewAuthors: [] })));
+    expect(empty.trustedReviewAuthors).toEqual([]);
+
+    const nulls = build({ reviewProcess: null, trustedReviewAuthors: null });
+    expect("reviewProcess" in nulls).toBe(false);
+    expect("trustedReviewAuthors" in nulls).toBe(false);
+  });
+
+  it("drops a malformed reviewProcess with the exact warning and decodes the rest", () => {
+    for (const bad of ["github", 5]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const b64 = Buffer.from(JSON.stringify({ ...full, reviewProcess: bad }), "utf-8").toString("base64");
+        const decoded = decodeRunConfig(b64);
+        expect(decoded.issue.identifier).toBe("AII-1");
+        expect(decoded.reviewProcess).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith("[run-config] Ignoring invalid reviewProcess field; using ai-implement");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    }
+  });
+
+  it("drops a malformed trustedReviewAuthors with the exact warning and decodes the rest", () => {
+    for (const bad of ["review-bot", ["a", ""], [1]]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const b64 = Buffer.from(JSON.stringify({ ...full, trustedReviewAuthors: bad }), "utf-8").toString("base64");
+        const decoded = decodeRunConfig(b64);
+        expect(decoded.issue.identifier).toBe("AII-1");
+        expect(decoded.trustedReviewAuthors).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(
+          "[run-config] Ignoring invalid trustedReviewAuthors field; using the process's own authors",
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    }
+  });
+
+  it("round-trips kgDryRun: true", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-632", title: "t", description: "" },
+      kgDryRun: true,
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).kgDryRun).toBe(true);
+  });
+
+  it("absent kgDryRun decodes as undefined (no key materialized, never serialized as false)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-632", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.kgDryRun).toBeUndefined();
+    expect("kgDryRun" in decoded).toBe(false);
+  });
+
+  it("pickKnownKeys preserves kgDryRun alongside kgSourceRepo", () => {
+    const withKg = { ...full, kgSourceRepo: "org/kg", kgDryRun: true as const, bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withKg), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.kgSourceRepo).toBe("org/kg");
+    expect(decoded.kgDryRun).toBe(true);
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+
+  it("round-trips kgSourceRef", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-633", title: "t", description: "" },
+      kgSourceRef: "pr-head-branch",
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).kgSourceRef).toBe("pr-head-branch");
+  });
+
+  it("absent kgSourceRef decodes as undefined (no key materialized)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-633", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.kgSourceRef).toBeUndefined();
+    expect("kgSourceRef" in decoded).toBe(false);
+  });
+
+  it("pickKnownKeys preserves kgSourceRef alongside kgSourceRepo and kgDryRun", () => {
+    const withKg = { ...full, kgSourceRepo: "org/kg", kgDryRun: true as const, kgSourceRef: "feature/head", bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withKg), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.kgSourceRepo).toBe("org/kg");
+    expect(decoded.kgDryRun).toBe(true);
+    expect(decoded.kgSourceRef).toBe("feature/head");
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+});
+
+describe("buildKgRefreshRunConfig", () => {
+  const fullInput = {
+    kgSourceRepo: "org/kg",
+    issueIdentifier: "KG-REFRESH · trigger-1",
+    runnerCallbackUrl: "https://orch.example/api/runner",
+    dependencyTokenScope: "installation" as const,
+    dryRun: true,
+    kgSourceRef: "feature/head",
+  };
+  // Removed envelope fields (AII-1264); built from fragments so no source line names them.
+  const removedAccept = "kgAccept" + "NewBaseline";
+  const removedActor = "kgBaseline" + "Actor";
+
+  it("builds the exact envelope for a full input", () => {
+    expect(buildKgRefreshRunConfig(fullInput)).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · trigger-1", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "org/kg",
+      runnerCallbackUrl: "https://orch.example/api/runner",
+      dependencyTokenScope: "installation",
+      kgDryRun: true,
+      kgSourceRef: "feature/head",
+    });
+  });
+
+  it("never emits the removed accept fields, even when a legacy caller passes them", () => {
+    const legacy = { ...fullInput, acceptNewBaseline: true, actorEmail: "admin@example.com" };
+    const result = buildKgRefreshRunConfig(legacy as typeof fullInput);
+    expect(result).not.toHaveProperty(removedAccept);
+    expect(result).not.toHaveProperty(removedActor);
+  });
+
+  it("decodes an envelope from an older orchestrator and drops the removed fields", () => {
+    const old = { ...buildKgRefreshRunConfig(fullInput), [removedAccept]: true, [removedActor]: "a@b" };
+    const decoded = decodeRunConfig(encodeRunConfig(old));
+    expect(decoded).not.toHaveProperty(removedAccept);
+    expect(decoded).not.toHaveProperty(removedActor);
+    expect(decoded.kgSourceRef).toBe("feature/head");
+  });
+
+  it("builds only the identity keys for the minimal input", () => {
+    const result = buildKgRefreshRunConfig({ kgSourceRepo: "org/kg", issueIdentifier: "KG-REFRESH · t" });
+    expect(result).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · t", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "org/kg",
+    });
+    expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
+  });
+
+  it("omits keys for falsy inputs", () => {
+    const result = buildKgRefreshRunConfig({
+      kgSourceRepo: "org/kg",
+      issueIdentifier: "KG-REFRESH · t",
+      runnerCallbackUrl: "",
+      dryRun: false,
+      kgSourceRef: "",
+    });
+    expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
+  });
+
+  it("survives encode and decode unchanged", () => {
+    const built = buildKgRefreshRunConfig(fullInput);
+    expect(decodeRunConfig(encodeRunConfig(built))).toEqual(built);
   });
 });
 
@@ -209,5 +731,446 @@ describe("runConfigFromTaskDocument", () => {
     expect(decoded.profiles).toEqual(["backend"]);
     expect(decoded.maxTurns).toBe(10);
     expect(decoded.maxIterations).toBe(2);
+  });
+});
+
+describe("agentConfig resolved snapshot", () => {
+  const mk = (stage: "planning" | "implementation" | "review", agent: "claude" | "codex", provider: "anthropic" | "bedrock" | "openai", authMode: string, src = "project") => ({
+    sel: { agent, provider, model: "m", accountProfileId: `p-${stage}`, invocationTimeoutMs: 60_000 },
+    src: { agent: src, provider: src, model: src, accountProfileId: src, invocationTimeoutMs: "job-deadline" },
+    prof: { id: `p-${stage}`, identity: "acct", revision: 2, agent, provider, authMode },
+  });
+  const build = (): any => {
+    const p = mk("planning", "claude", "anthropic", "claude-subscription");
+    const i = mk("implementation", "codex", "openai", "codex-subscription", "orchestrator-default");
+    const r = mk("review", "codex", "openai", "openai-api-key");
+    return {
+      version: 1,
+      snapshotId: "snap-1",
+      configRevisions: {
+        orchestratorDefault: { configRevisionId: "11111111-1111-4111-8111-111111111111", revision: 1 },
+        project: { configRevisionId: "22222222-2222-4222-8222-222222222222", revision: 3 },
+      },
+      stages: { planning: p.sel, implementation: i.sel, review: r.sel },
+      sources: { planning: p.src, implementation: i.src, review: r.src },
+      profiles: { planning: p.prof, implementation: i.prof, review: r.prof },
+    };
+  };
+  const base = { v: 1, issue: { id: "1", identifier: "A-1", title: "t", description: "d" } };
+  const decodeWith = (agentConfig: unknown) =>
+    decodeRunConfig(Buffer.from(JSON.stringify({ ...base, agentConfig }), "utf-8").toString("base64"));
+
+  it("legacy envelope has no agentConfig key", () => {
+    expect("agentConfig" in decodeRunConfig(encodeRunConfig(base as RunConfigV1))).toBe(false);
+  });
+
+  it("round-trips a valid snapshot", () => {
+    const cfg = { ...base, agentConfig: build() } as RunConfigV1;
+    expect(decodeRunConfig(encodeRunConfig(cfg)).agentConfig).toEqual(build());
+  });
+
+  it.each(["stage", "profile"])("refuses an OpenRouter provider mismatch in %s", site => {
+    const s = build();
+    if (site !== "profile") s.stages.review.provider = "openrouter";
+    if (site !== "stage") {
+      s.profiles.review.provider = "openrouter";
+      s.profiles.review.authMode = "openrouter-api-key";
+    }
+    expect(() => decodeWith(s)).toThrow("provider does not match the stage provider");
+  });
+
+  it.each(accountCombinations)("snapshot combination $agent/$provider/$authMode: $permitted", ({ permitted, agent, provider, authMode }) => {
+    const s = build();
+    Object.assign(s.stages.review, { agent, provider });
+    Object.assign(s.profiles.review, { agent, provider, authMode });
+    if (permitted) expect(decodeWith(s).agentConfig?.profiles.review.authMode).toBe(authMode);
+    else expect(() => decodeWith(s)).toThrow("unsupported agent/provider/authMode combination");
+  });
+
+  it("accepts every auth mode", () => {
+    const combos: Array<["claude" | "codex", "anthropic" | "bedrock" | "openai", string]> = [
+      ["claude", "anthropic", "anthropic-api-key"], ["claude", "bedrock", "bedrock"],
+      ["claude", "anthropic", "claude-subscription"], ["codex", "openai", "openai-api-key"],
+      ["codex", "openai", "codex-subscription"],
+    ];
+    for (const [a, p, m] of combos) {
+      const s = build();
+      const x = mk("review", a, p, m);
+      s.stages.review = x.sel; s.profiles.review = x.prof;
+      expect(() => decodeWith(s)).not.toThrow();
+    }
+  });
+
+  const mutations: Array<[string, (s: any) => void]> = [
+    ["bad version", (s) => { s.version = 2; }],
+    ["missing stage", (s) => { delete s.stages.review; }],
+    ["extra stage", (s) => { s.stages.extra = s.stages.review; }],
+    ["zero revision", (s) => { s.profiles.review.revision = 0; }],
+    ["numeric-only config revisions", (s) => { s.configRevisions = { orchestratorDefault: 1, project: 3 }; }],
+    ["string config revision", (s) => { s.configRevisions.project.revision = "3"; }],
+    ["zero config revision", (s) => { s.configRevisions.project.revision = 0; }],
+    ["negative config revision", (s) => { s.configRevisions.project.revision = -1; }],
+    ["fractional config revision", (s) => { s.configRevisions.orchestratorDefault.revision = 1.5; }],
+    ["empty config revision id", (s) => { s.configRevisions.project.configRevisionId = ""; }],
+    ["non-string config revision id", (s) => { s.configRevisions.project.configRevisionId = 7; }],
+    ["oversized config revision id", (s) => { s.configRevisions.project.configRevisionId = "x".repeat(10_000); }],
+    ["missing config layer", (s) => { delete s.configRevisions.project; }],
+    ["negative timeout", (s) => { s.stages.review.invocationTimeoutMs = -1; }],
+    ["fractional timeout", (s) => { s.stages.review.invocationTimeoutMs = 1.5; }],
+    ["string timeout", (s) => { s.stages.review.invocationTimeoutMs = "5"; }],
+    ["bad source", (s) => { s.sources.review.model = "user"; }],
+    ["profile id mismatch", (s) => { s.profiles.review.id = "other"; }],
+    ["profile agent mismatch", (s) => { s.profiles.review.agent = "claude"; }],
+    ["profile provider mismatch", (s) => { s.profiles.review.provider = "anthropic"; }],
+    ["codex with anthropic-api-key", (s) => { s.profiles.review.authMode = "anthropic-api-key"; }],
+  ];
+  for (const [name, mutate] of mutations) {
+    it(`rejects ${name}`, () => {
+      const s = build();
+      mutate(s);
+      expect(() => decodeWith(s)).toThrow(/agentConfig/);
+      expect(() => encodeRunConfig({ ...base, agentConfig: s } as RunConfigV1)).toThrow(/agentConfig/);
+    });
+  }
+
+  it.each([null, [], "x", 5])("rejects non-object agentConfig %#", (v) => {
+    expect(() => decodeWith(v)).toThrow(/agentConfig/);
+  });
+
+  it("rejects credential-shaped fields without echoing values", () => {
+    const secret = "sk-SYNTHETIC-SECRET-VALUE";
+    const inject: Array<(s: any) => void> = [
+      (s) => { s.apiKey = secret; },
+      (s) => { s.stages.review.token = secret; },
+      (s) => { s.profiles.review.credential = secret; },
+      (s) => { s.profiles.planning.accessToken = secret; },
+      (s) => { s.sources.review.apiKey = secret; },
+      (s) => { s.configRevisions.token = secret; },
+      (s) => { s.configRevisions.project.token = secret; },
+    ];
+    for (const fn of inject) {
+      const s = build();
+      fn(s);
+      let msg = "";
+      try { decodeWith(s); } catch (e) { msg = (e as Error).message; }
+      expect(msg).toMatch(/unknown field/);
+      expect(msg).not.toContain(secret);
+      expect(msg).not.toContain("apiKey");
+      expect(msg.length).toBeLessThan(200);
+    }
+  });
+
+  it("whitelist drops unknown top-level keys and keeps the snapshot", () => {
+    const out = decodeRunConfig(Buffer.from(JSON.stringify({ ...base, extra: 1, agentConfig: build() })).toString("base64"));
+    expect("extra" in out).toBe(false);
+    expect(out.agentConfig).toEqual(build());
+  });
+
+  it("builder defaults omit agentConfig, and accept then validate an explicit snapshot", () => {
+    const mapping = makeMapping();
+    const input = { issue: implBaseIssue, mapping, baseBranch: mapping.defaultBranch, retryPolicy: DEFAULT_RETRY_POLICY };
+    expect("agentConfig" in buildImplRunConfig(input)).toBe(false);
+    expect(buildImplRunConfig({ ...input, agentConfig: build() }).agentConfig).toEqual(build());
+    const bad = build();
+    bad.stages.review.invocationTimeoutMs = 0;
+    expect(() => buildImplRunConfig({ ...input, agentConfig: bad })).toThrow(/agentConfig/);
+  });
+});
+
+describe("private credentials namespace (AII-981)", () => {
+  const base: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-1", title: "T", description: "D" } };
+  const S = (n: string) => `SENTINEL-${n}-` + "x".repeat(24);
+  const grant = {
+    version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1",
+    projectKey: "p", backend: "fly", expiresAt: 1_800_000_000_000, bearer: S("bearer") + "B".repeat(32),
+    bindings: [{ stage: "planning", profileId: "pp", profileRevision: 1, authMode: "openai-api-key" }],
+  };
+  const sealed = {
+    version: 1, algorithm: "aes-256-gcm", dispatchId: "d1", backend: "fly",
+    nonce: "A".repeat(16), ciphertext: "Zm9vYmFy", tag: "B".repeat(22),
+  };
+  const creds = (extra: Record<string, unknown> = {}) => ({ version: 1, ...extra }) as never;
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
+
+  describe("modelAuthContext (AII-1427)", () => {
+    const context = { version: 1, dispatchId: "d1", projectKey: "p", backend: "gha", modelAuthUrl: "https://orch.example.com" };
+
+    it("round-trips through the trusted encoder only and is omitted from generic and diagnostic projections", () => {
+      const config = { ...base, credentials: { version: 1, modelAuthContext: context } } as never as RunConfigV1;
+      expect(decodeTrustedRunConfig(encodeTrustedRunConfig(config)).credentials?.modelAuthContext).toEqual(context);
+      expect(encodeRunConfig(config)).not.toContain(Buffer.from("orch.example.com").toString("base64").slice(0, 8));
+      expect(JSON.stringify(decodeRunConfig(encodeRunConfig(config)))).not.toContain("orch.example.com");
+      expect(JSON.stringify(diagnosticProjection(config))).not.toContain("orch.example.com");
+    });
+
+    it.each([
+      ["unknown field", { extra: 1 }],
+      ["wrong version", { version: 2 }],
+      ["non-gha backend", { backend: "fly" }],
+      ["empty dispatch", { dispatchId: "" }],
+      ["overlong project", { projectKey: "p".repeat(129) }],
+      ["http url", { modelAuthUrl: "http://orch.example.com" }],
+      ["credentialed url", { modelAuthUrl: "https://u:p@orch.example.com" }],
+      ["query url", { modelAuthUrl: "https://orch.example.com?x=1" }],
+      ["malformed url", { modelAuthUrl: "not a url" }],
+      ["port above range", { modelAuthUrl: "https://orch.invalid:99999" }],
+    ])("rejects %s", (_n, patch) => {
+      expect(() => validateRunCredentials({ version: 1, modelAuthContext: { ...context, ...patch } })).toThrow("modelAuthContext");
+    });
+  });
+
+  it("legacy envelopes without credentials decode unchanged", () => {
+    const decoded = decodeRunConfig(encodeRunConfig(base));
+    expect(decoded).toEqual(base);
+    expect(decodeTrustedRunConfig(encodeRunConfig(base))).toEqual(base);
+    expect(decoded).not.toHaveProperty("credentials");
+  });
+
+  it.each([
+    ["resultToken"], ["progressToken"], ["publicationToken"], ["attemptToken"],
+  ])("round-trips %s through trusted transport only", (field) => {
+    const config = { ...base, credentials: creds({ [field]: S(field) }) };
+    const trusted = decodeTrustedRunConfig(encodeTrustedRunConfig(config));
+    expect(trusted.credentials).toEqual({ version: 1, [field]: S(field) });
+    expect(decodeRunConfig(encodeTrustedRunConfig(config))).not.toHaveProperty("credentials");
+    expect(Buffer.from(encodeRunConfig(config), "base64").toString()).not.toContain(S(field));
+  });
+
+  it("accepts plain and sealed modelAuthGrant", () => {
+    for (const g of [grant, sealed]) {
+      const out = decodeTrustedRunConfig(encodeTrustedRunConfig({ ...base, credentials: creds({ modelAuthGrant: g }) }));
+      expect(out.credentials?.modelAuthGrant).toEqual(g);
+    }
+  });
+
+  it("rejects malformed credentials with value-free, key-free errors", () => {
+    const unknownKey = "ATTACKER_KEY_" + S("k");
+    const cases: unknown[] = [
+      { version: 2, resultToken: S("a") },
+      { version: 1, resultToken: 42 },
+      { version: 1, resultToken: "" },
+      { version: 1, progressToken: S("a") + " space" },
+      { version: 1, publicationToken: "y".repeat(5000) },
+      { version: 1, resultToken: S("a"), [unknownKey]: S("u") },
+      { version: 1, modelAuthGrant: { ...grant, extra: S("g") } },
+      { version: 1, modelAuthGrant: { ...sealed, bearer: S("s") } },
+      { version: 1, modelAuthGrant: "string" },
+      "nope",
+      [],
+    ];
+    for (const c of cases) {
+      let message = "";
+      try { validateRunCredentials(c); } catch (e) { message = (e as Error).message; }
+      expect(message).not.toBe("");
+      expect(message.length).toBeLessThan(120);
+      expect(message).not.toContain("SENTINEL");
+      expect(message).not.toContain("ATTACKER");
+    }
+    expect(() => decodeRunConfig(b64({ ...base, credentials: { version: 1, [unknownKey]: 1 } }))).toThrow(/credentials/);
+  });
+
+  it("keeps modelAuthGrant out of agentConfig", () => {
+    expect(() => decodeRunConfig(b64({ ...base, agentConfig: { version: 1, modelAuthGrant: grant } }))).toThrow(/agentConfig/);
+  });
+
+  it("diagnostic projection and generic encode never contain credentials or encoded envelopes", () => {
+    const private_ = encodeTrustedRunConfig({
+      ...base, credentials: creds({ resultToken: S("r"), modelAuthGrant: grant }),
+    });
+    const spread = { ...base, credentials: creds({ resultToken: S("r"), modelAuthGrant: grant }),
+      encodedPrivate: private_, AI_IMPLEMENT_RUN_CONFIG: private_ } as RunConfigV1;
+    const text = JSON.stringify(diagnosticProjection(spread));
+    expect(text).not.toContain("SENTINEL");
+    expect(text).not.toContain(private_);
+    expect(text).not.toContain("encodedPrivate");
+    expect(JSON.parse(text).credentialFields).toEqual(["resultToken", "modelAuthGrant"]);
+    const generic = encodeRunConfig(spread);
+    const genericText = Buffer.from(generic, "base64").toString();
+    expect(genericText).not.toContain("SENTINEL");
+    expect(genericText).not.toContain(private_);
+    expect(genericText).not.toContain("encodedPrivate");
+    expect(genericText).not.toContain("AI_IMPLEMENT_RUN_CONFIG");
+    expect(generic).not.toContain(private_);
+    expect(Object.keys(JSON.parse(genericText)).sort()).toEqual(Object.keys(base).sort());
+  });
+
+  it("generic encode keeps description truncation and agentConfig while dropping unknown keys", () => {
+    const long = { ...base, issue: { ...base.issue, description: "x".repeat(200_000) }, extra: "nope" } as RunConfigV1;
+    const decoded = JSON.parse(Buffer.from(encodeRunConfig(long), "base64").toString());
+    expect(decoded.issue.description.length).toBeLessThan(200_000);
+    expect(decoded).not.toHaveProperty("extra");
+  });
+});
+
+
+describe("public model prices envelope", () => {
+  const prices = JSON.parse(readFileSync(new URL("./fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+  it("projects only public prices in builders and encode/decode", () => {
+    const copy = { prices: prices.map((p: object) => ({ ...p, secret: "drop" })), fetchedAt: 123, lastError: "drop", credential: "drop" };
+    const input = { issue: full.issue, mapping: makeMapping(), baseBranch: "testing", retryPolicy: DEFAULT_RETRY_POLICY, modelPrices: copy };
+    for (const built of [buildImplRunConfig(input), buildRunConfig({ ...input, runnerPhase: "implementation" })]) {
+      expect(built.modelPrices).toEqual({ prices, fetchedAt: 123 });
+      expect(decodeRunConfig(encodeRunConfig({ ...built, modelPrices: copy })).modelPrices).toEqual({ prices, fetchedAt: 123 });
+      expect(diagnosticProjection({ ...built, modelPrices: copy }).modelPrices).toEqual({ prices, fetchedAt: 123 });
+    }
+  });
+  it("drops malformed optional prices when decoding raw envelopes", () => {
+    const valid = { prices, fetchedAt: 123 };
+    const malformed: unknown[] = [null, "invalid", [], {},
+      { ...valid, prices: "invalid" }, { ...valid, prices: {} },
+      { ...valid, prices: [null] }, { ...valid, prices: [42] },
+      ...[undefined, "123", -1, 1.5, {}, 8640000000000001, Number.MAX_SAFE_INTEGER].map(fetchedAt => ({ ...valid, fetchedAt })),
+      ...["model", "version", "effectiveFrom"].flatMap(field =>
+        [undefined, 42, {}].map(value => ({ ...valid, prices: [{ ...prices[0], [field]: value }] }))),
+      { ...valid, prices: [{ ...prices[0], effectiveFrom: "invalid" }] },
+      ...["inputUsd", "outputUsd", "cacheReadUsd", "cacheWriteUsd"].flatMap(field =>
+        [undefined, null, 1, {}, "", "-1", "1e-6", "NaN", "Infinity", "1.2.3", " 1", ".5", "1."].map(value =>
+          ({ ...valid, prices: [prices[0], { ...prices[1], [field]: value }] }))),
+    ];
+    for (const modelPrices of malformed) {
+      // Encode raw JSON: encodeRunConfig itself sanitizes and would hide decode regressions.
+      const encoded = Buffer.from(JSON.stringify({ ...full, modelPrices })).toString("base64");
+      const decoded = decodeRunConfig(encoded);
+      expect(decoded.issue).toEqual(full.issue);
+      expect(decoded).not.toHaveProperty("modelPrices");
+    }
+    for (const fetchedAt of [Infinity, NaN]) {
+      expect(copyModelPrices({ ...valid, fetchedAt })).toBeUndefined();
+    }
+    for (const fetchedAt of [null, 0, 123, 8640000000000000]) {
+      const encoded = Buffer.from(JSON.stringify({ ...full, modelPrices: { ...valid, fetchedAt } })).toString("base64");
+      expect(decodeRunConfig(encoded).modelPrices).toEqual({ ...valid, fetchedAt });
+    }
+  });
+  it("omits missing and empty copies", () => {
+    for (const modelPrices of [undefined, { prices: [], fetchedAt: null }]) {
+      const built = buildRunConfig({ issue: full.issue, mapping: makeMapping(), runnerPhase: "implementation", retryPolicy: null, modelPrices });
+      expect(built).not.toHaveProperty("modelPrices");
+      expect(decodeRunConfig(encodeRunConfig(built))).not.toHaveProperty("modelPrices");
+    }
+  });
+});
+
+describe("modelFallbacks", () => {
+  it.each([{ planning: "x" }, { planning: "x".repeat(128), implementation: "openai/model:v1", review: "review" }])("preserves public maps %j through builders and transports", (modelFallbacks) => {
+    const input = { issue: full.issue, mapping: makeMapping(), baseBranch: "testing", retryPolicy: DEFAULT_RETRY_POLICY, modelFallbacks };
+    for (const built of [buildImplRunConfig(input), buildRunConfig({ ...input, runnerPhase: "planning" })]) {
+      expect(built.modelFallbacks).toEqual(modelFallbacks);
+      expect(decodeRunConfig(encodeRunConfig(built)).modelFallbacks).toEqual(modelFallbacks);
+      expect(decodeTrustedRunConfig(encodeTrustedRunConfig(built)).modelFallbacks).toEqual(modelFallbacks);
+      expect(diagnosticProjection(built).modelFallbacks).toEqual(modelFallbacks);
+    }
+  });
+
+  it.each([null, [], {}, { unknown: "x" }, { planning: "" }, { planning: 1 }, { planning: "a b" }, { planning: "a\n" }, { planning: "é" }, { planning: "x".repeat(129) }, { planning: "ok", review: false }])("drops invalid or empty maps %j without losing config", (modelFallbacks) => {
+    const raw = Buffer.from(JSON.stringify({ ...full, modelFallbacks })).toString("base64");
+    for (const decode of [decodeRunConfig, decodeTrustedRunConfig]) {
+      expect(decode(raw)).toEqual(decode(encodeRunConfig(full)));
+      expect(decode(raw)).not.toHaveProperty("modelFallbacks");
+    }
+  });
+
+  it("keeps no-fallback envelopes byte-for-byte unchanged", () => {
+    const input = { issue: full.issue, mapping: makeMapping(), retryPolicy: null, runnerPhase: "planning" as const };
+    const before = buildRunConfig(input);
+    expect(encodeRunConfig(buildRunConfig({ ...input, modelFallbacks: {} }))).toBe(encodeRunConfig(before));
+    const minimal = { v: 1 as const, issue: full.issue };
+    expect(encodeRunConfig({ ...minimal, modelFallbacks: {} })).toBe(Buffer.from(JSON.stringify(minimal)).toString("base64"));
+  });
+
+  it("matches the pre-change trusted managed envelope bytes without fallbacks", () => {
+    // Captured with HEAD's pre-modelFallbacks builder and trusted encoder. Keep this
+    // fixed: deriving expected bytes with the current builder hides wire regressions.
+    const expected = readFileSync(new URL("./helpers/fixtures/managed-run-config-pre-fallbacks.json", import.meta.url), "utf8").trimEnd();
+    for (const fallbackModels of [undefined, {}]) {
+      const config = buildRunConfig({
+        issue: { id: "managed-1", identifier: "AII-1673", title: "Managed launch", description: "No fallback configured" },
+        mapping: makeMapping(),
+        runnerPhase: "planning",
+        baseBranch: "main",
+        runnerCallbackUrl: "https://orch.example/runner",
+        retryPolicy: null,
+        ...managedRunConfigFields({ kind: "launch", snapshot: makeSnapshot(), fallbackModels }),
+        credentials: {
+          version: 1,
+          resultToken: "fixture-result-token",
+          progressToken: "fixture-progress-token",
+          modelAuthContext: { version: 1, dispatchId: "disp-1", projectKey: "proj", backend: "gha", modelAuthUrl: "https://orch.example" },
+        },
+      });
+      expect(encodeTrustedRunConfig(config)).toBe(Buffer.from(expected, "utf8").toString("base64"));
+    }
+  });
+});
+
+
+describe("accountFallbacks", () => {
+  const entry = { accountProfileId: "B", profileRevision: 2, agent: "codex" as const, provider: "openai" as const, authMode: "openai-api-key" as const, model: "model-b" };
+  const accountFallbacks = { implementation: [entry, { ...entry, accountProfileId: "C", profileRevision: 3, model: "model-c" }] };
+  it.each([
+    ["valid", accountFallbacks, accountFallbacks],
+    ["OpenRouter", { implementation: [{ ...entry, provider: "openrouter", authMode: "openrouter-api-key" }] }, { implementation: [{ ...entry, provider: "openrouter", authMode: "openrouter-api-key" }] }],
+    ["absent", undefined, undefined],
+    ["empty", { implementation: [] }, undefined],
+  ])("copies %s", (_name, input, expected) => {
+    expect(copyAccountFallbacks(input)).toEqual(expected);
+  });
+  it.each([
+    ["wrong type", []], ["unknown stage", { unknown: [entry] }],
+    ["missing field", { implementation: [{ ...entry, model: undefined }] }],
+    ["extra key", { implementation: [{ ...entry, credentialRef: "secret" }] }],
+  ])("rejects %s with a fixed error", (_name, input) => {
+    expect(() => copyAccountFallbacks(input)).toThrowError(/^invalid run_config.accountFallbacks$/);
+  });
+  it("round-trips OpenRouter fallback names", () => {
+    const accountFallbacks = { implementation: [{ ...entry, provider: "openrouter" as const, authMode: "openrouter-api-key" as const }] };
+    const config = { ...full, accountFallbacks };
+    expect(decodeRunConfig(encodeRunConfig(config)).accountFallbacks).toEqual(accountFallbacks);
+  });
+  it("forwards ordered public entries through managed builders and both transports", () => {
+    const fields = managedRunConfigFields({ kind: "launch", snapshot: makeSnapshot(), accountFallbacks });
+    const input = { issue: full.issue, mapping: makeMapping(), baseBranch: "testing", retryPolicy: DEFAULT_RETRY_POLICY, ...fields };
+    for (const built of [buildRunConfig({ ...input, runnerPhase: "implementation" }), buildImplRunConfig(input)]) {
+      expect(built.accountFallbacks).toEqual(accountFallbacks);
+      expect(decodeRunConfig(encodeRunConfig(built)).accountFallbacks).toEqual(accountFallbacks);
+      expect(decodeTrustedRunConfig(encodeTrustedRunConfig(built)).accountFallbacks).toEqual(accountFallbacks);
+      expect(diagnosticProjection(built).accountFallbacks).toEqual(accountFallbacks);
+      expect(JSON.stringify(built)).not.toContain("credentialRef");
+    }
+  });
+});
+
+describe("review-only envelope", () => {
+  it("round trips the explicit selection through the builder and codec", () => {
+    const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+    const config = buildRunConfig({ runnerPhase: "gap-analysis", mapping: makeMapping(), issue: full.issue, prNumber: "42", reviewOnly, retryPolicy: null });
+    expect(decodeRunConfig(encodeRunConfig(config)).reviewOnly).toEqual(reviewOnly);
+    expect(decodeRunConfig(encodeRunConfig(full)).reviewOnly).toBeUndefined();
+  });
+  it("rejects malformed mode rather than silently implementing", () => {
+    for (const reviewOnly of [true, {}, { reviewers: "integration-review" }]) {
+      expect(() => decodeRunConfig(Buffer.from(JSON.stringify({ ...full, reviewOnly })).toString("base64"))).toThrow(/reviewOnly/);
+    }
+  });
+});
+
+
+describe("Fly execution policy binding", () => {
+  const policy = { version: 1, implementationSandbox: "ephemeral-full-access", dispatchId: "disp-1", projectKey: "proj", backend: "fly", ephemeralRunnerAsserted: true };
+  const grant = sealModelAuthBootstrap({ grant: makeGrant(makeSnapshot()), protectionKey: { ref: MODEL_AUTH_ENV.protectionKey, key: Buffer.alloc(32, 1) } });
+  const credentials = { version: 1, executionPolicy: policy, modelAuthGrant: grant };
+  const context = { version: 1, dispatchId: "disp-1", projectKey: "proj", backend: "gha", modelAuthUrl: "https://orch.example.com" };
+  it("accepts a matching sealed grant", () => {
+    expect(validateRunCredentials(credentials).executionPolicy).toEqual(policy);
+  });
+  it.each([
+    { ...credentials, modelAuthGrant: undefined },
+    { ...credentials, modelAuthGrant: makeGrant(makeSnapshot()) },
+    { ...credentials, executionPolicy: { ...policy, dispatchId: "other" } },
+    { ...credentials, modelAuthContext: context },
+    { version: 1, executionPolicy: policy, modelAuthContext: context },
+    { ...credentials, executionPolicy: { ...policy, backend: "gha" } },
+  ])("rejects an unbound or cross-backend policy", (raw) => {
+    expect(() => validateRunCredentials(raw)).toThrow(/^run_config.credentials.executionPolicy /);
   });
 });

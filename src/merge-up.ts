@@ -1,9 +1,12 @@
+import { parkIssue } from "./dispatch-breaker.js";
 import type { RepoMapping } from "./config.js";
-import type { FeatureNodeRollUp } from "./providers/types.js";
+import type { FeatureNodeRollUp, IssueLifecycleState, TicketingProvider, TrackerIssueRecord } from "./providers/types.js";
+import { enqueueRollupReview } from "./comment-gapfill-queue.js";
+import { linkPullRequest } from "./pr-links.js";
 import { getDb } from "./dedup.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
-import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBranches, mergeBranch } from "./github.js";
+import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBranches, getBranchSha, getPullRequestState, mergeBranch } from "./github.js";
 
 /**
  * Feature-branch roll-up (the merge-up half of feature-branch grouping).
@@ -144,18 +147,39 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
   // Check PR state first — robust to squash/rebase merge where git
   // ancestry alone falsely shows the feature branch as "ahead" of base.
   const pr = await findPullRequestByBranches(ghToken, owner, repo, branch, target);
+  let ahead: number | null = null;
+  let mergedRollUpNumber: number | null = null;
+
   if (pr?.merged) {
-    await deleteBranch(ghToken, owner, repo, branch);
+    // A merged PR alone doesn't mean the branch is safe to delete: late commits can land
+    // on it after the roll-up merged (AII-642). SHA equality against the PR's recorded head
+    // is the strategy-agnostic check — it holds regardless of merge method. `ahead === 0` is
+    // kept only as a secondary signal (a real merge-commit strategy, or a since-deleted
+    // branch) — NOT as the primary squash/rebase safety net, since git ancestry alone can
+    // falsely report a squash/rebase-merged branch as still "ahead" of base (the bug AII-188
+    // fixed for the no-PR-yet path applies here too).
+    const tip = await getBranchSha(ghToken, owner, repo, branch);
+    const tipMatchesHead = tip !== null && tip === pr.headSha;
+    ahead = tipMatchesHead ? 0 : await compareBranches(ghToken, owner, repo, target, branch);
+    if (tipMatchesHead || ahead === null || ahead === 0) {
+      await deleteBranch(ghToken, owner, repo, branch);
+      await deps.finalizeMerged(rollUp.issueId, rollUp.scopeKey);
+      markRollUpHandled(owner, repo, branch);
+      console.log(`[merge-up] ${branch} merged; deleted branch + finalized ${rollUp.identifier}`);
+      return;
+    }
+    // Branch has commits beyond this merged roll-up — keep it. The roll-up that already
+    // merged did complete, so finalize it (idempotent), but do not mark the roll-up handled:
+    // that would permanently blind future polls to the still-outstanding commits (AII-286).
     await deps.finalizeMerged(rollUp.issueId, rollUp.scopeKey);
-    markRollUpHandled(owner, repo, branch);
-    console.log(`[merge-up] ${branch} merged; deleted branch + finalized ${rollUp.identifier}`);
-    return;
-  }
-  if (pr?.state === "open") return; // awaiting human merge
-  // A human may have closed the PR without merging (a deliberate veto). Respect that
-  // decision — do not re-open on every poll cycle while the branch stays ahead. The veto
-  // is permanent, so log it once per process, not once per poll forever.
-  if (pr && pr.state === "closed" && !pr.merged) {
+    mergedRollUpNumber = pr.number;
+  } else if (pr?.state === "open") {
+    requestRollupReview(owner, repo, pr.number, pr.headSha);
+    return; // awaiting human merge
+  } else if (pr && pr.state === "closed" && !pr.merged) {
+    // A human may have closed the PR without merging (a deliberate veto). Respect that
+    // decision — do not re-open on every poll cycle while the branch stays ahead. The veto
+    // is permanent, so log it once per process, not once per poll forever.
     const vetoKey = `${rollUp.identifier}#${pr.number}`;
     if (!closedVetoLogged.has(vetoKey)) {
       closedVetoLogged.add(vetoKey);
@@ -164,10 +188,11 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
       );
     }
     return;
+  } else {
+    // No PR yet — open one if the branch has commits not yet in the base.
+    ahead = await compareBranches(ghToken, owner, repo, target, branch);
   }
 
-  // No PR yet — open one if the branch has commits not yet in the base.
-  const ahead = await compareBranches(ghToken, owner, repo, target, branch);
   if (ahead === null || ahead === 0) return; // branch missing or fully merged by ancestry
   const grouped = rollUp.childIdentifiers.length
     ? `\n\nGrouped issues: ${rollUp.childIdentifiers.join(", ")}`
@@ -181,5 +206,94 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
       "to merge into the base branch. Opened for human review." +
       grouped,
   });
+  // Persist creation before further GitHub calls: this PR may close before the sweep.
+  linkPullRequest({
+    repository: `${owner}/${repo}`, number: newPr.number, url: newPr.url,
+    headRef: branch, baseRef: target, role: "roll-up", source: "result",
+    issue: {
+      trackerKind: mapping.ticketingConfig.kind, mappingKey: rollUp.scopeKey,
+      trackerIssueId: rollUp.issueId, identifier: rollUp.identifier, title: null, url: null,
+    },
+  });
+  const headSha = await getBranchSha(ghToken, owner, repo, branch);
+  if (headSha) requestRollupReview(owner, repo, newPr.number, headSha);
+  if (mergedRollUpNumber !== null) {
+    console.log(
+      `[merge-up] ${branch} is ${ahead} commits ahead of its merged roll-up #${mergedRollUpNumber}; opened a new roll-up instead of deleting`,
+    );
+  }
   console.log(`[merge-up] Opened feature→base PR ${newPr.url} for ${rollUp.identifier} (awaiting human merge)`);
+}
+
+function requestRollupReview(owner: string, repo: string, prNumber: number, headSha: string): void {
+  if (headSha && enqueueRollupReview({ owner, repo, prNumber, headSha })) {
+    console.log(`[merge-up] Enqueued advisory roll-up review for ${owner}/${repo}#${prNumber} at ${headSha}`);
+  }
+}
+
+/** Stable title identity: parent + repository/PR + reviewed head, including terminal children. */
+export const ROLLUP_REVIEW_CHILD_PREFIX = "[roll-up-review]";
+
+const providersWithoutRollupListing = new WeakSet<TicketingProvider>();
+
+export async function listRollupReviewChildren(provider: TicketingProvider, mapping: RepoMapping): Promise<TrackerIssueRecord[]> {
+  if (!provider.listIssuesPage) {
+    if (!providersWithoutRollupListing.has(provider)) {
+      providersWithoutRollupListing.add(provider);
+      console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; skipping reconciliation`);
+    }
+    return [];
+  }
+  const children: TrackerIssueRecord[] = [];
+  let cursor: string | null = null;
+  const seen = new Set<string>();
+  do {
+    const page = await provider.listIssuesPage(mapping, cursor, { titlePrefix: ROLLUP_REVIEW_CHILD_PREFIX });
+    children.push(...page.issues.filter(i => i.parent && i.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} `)));
+    if (!page.pageInfo.hasNextPage) return children;
+    cursor = page.pageInfo.endCursor;
+    if (!cursor || seen.has(cursor)) throw new Error("Incomplete roll-up review child pagination");
+    seen.add(cursor);
+  } while (true);
+}
+
+/** Independent of completed-parent discovery and handled markers: active fix children hide their parent. */
+export async function reconcileRollupReviewChildren(provider: TicketingProvider, mapping: RepoMapping, scopeKey: string, credentials: {
+  githubAppId: string; githubAppPrivateKey: string;
+}): Promise<void> {
+  const children = (await listRollupReviewChildren(provider, mapping)).filter(c =>
+    c.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} ${mapping.owner}/${mapping.repo}#`));
+  if (!children.length) return;
+  const states = new Map<string, IssueLifecycleState>();
+  // Linear returns at most 250 lifecycle states per call, without pagination.
+  // Include historical terminal children without letting them crowd out active fixes.
+  const lifecycleBatchSize = 250;
+  for (let offset = 0; offset < children.length; offset += lifecycleBatchSize) {
+    const batch = children.slice(offset, offset + lifecycleBatchSize);
+    const batchStates = await provider.fetchLifecycleStates(batch.map(c => c.id));
+    for (const [id, state] of batchStates) states.set(id, state);
+  }
+  const token = await getInstallationToken(credentials.githubAppId, credentials.githubAppPrivateKey, mapping.owner);
+  for (const child of children) {
+    if (!states.has(child.id)) throw new Error(`Cannot verify lifecycle for ${child.identifier}`);
+    if (states.get(child.id) !== "active") continue;
+    const identity = child.title.match(/^\[roll-up-review\] ([^ ]+)#(\d+) ([a-f0-9]{40,64}) /);
+    if (!identity || identity[1] !== `${mapping.owner}/${mapping.repo}`) continue;
+    const pr = await getPullRequestState(token, mapping.owner, mapping.repo, Number(identity[2]));
+    if (!pr) throw new Error(`Cannot verify roll-up PR state for ${child.identifier}`);
+    if (!pr.merged && pr.state !== "closed") continue;
+    const marker = "<!-- roll-up-review parked -->";
+    ensureSettingsTable();
+    const parkedKey = `roll-up-review:parked:${provider.id}:${scopeKey}:${child.id}`;
+    const alreadyCommented = getDb().prepare("SELECT 1 FROM settings WHERE key = ?").get(parkedKey) !== undefined ||
+      child.comments.nodes.some(c => c.body.includes(marker));
+    if (alreadyCommented) continue;
+    if (!await provider.parkForHuman(child.id, scopeKey, "implementation")) {
+      throw new Error(`Parking rejected for roll-up review child ${child.identifier}`);
+    }
+    if (provider.id === "linear") parkIssue(child.id, "implementation", "rollup_review_closed", { project: scopeKey, identifier: child.identifier });
+    await provider.postComment(child.id, `${marker}\nThe tree merged first or its roll-up PR was closed. A person should re-file this fix against the base branch \`${mapping.defaultBranch}\`. The feature branch may have been deleted.`);
+    getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(parkedKey, new Date().toISOString());
+    console.log(`[roll-up-review] Parked ${child.identifier}: roll-up #${identity[2]} closed`);
+  }
 }

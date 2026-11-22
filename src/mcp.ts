@@ -1,12 +1,12 @@
 import http from "node:http";
-import https from "node:https";
-import { verifyMcpToken } from "./mcp-oauth.js";
-import { getRunnerMode } from "./runner-mode.js";
-import { getMappings } from "./config.js";
-import { getInFlightJobs } from "./log.js";
-import { getDb } from "./dedup.js";
-import { getIssueReportCard, getFleetReport } from "./report-card.js";
-import { isKgDegraded } from "./deploy-notify.js";
+import { getDeployStartedAt } from "./deploy-hold.js";
+import { verifyMcpToken, resolveClientPath, getRefreshExpiry } from "./mcp-oauth.js";
+import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
+import { recheckIdentity, type AccessRole } from "./access-entries.js";
+import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
+import type { Caller } from "./mcp-identity.js";
+import { discoverTools, callTool } from "./restate/tools-client.js";
+import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -31,366 +31,188 @@ function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
 
 // ---- Orchestrator-native diagnostic tools ----
 
-const DIAG_TOOLS = [
-  {
-    name: "get_tenant_health",
-    description:
-      "Returns an orchestrator health summary: runner mode, in-flight job count, pending gap-fill queue count, and project count. Use as a first-pass check before digging deeper.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_runner_mode",
-    description:
-      "Returns the current global runner mode (default/gha/fly/local/shadow) and whether it came from an env var, database setting, or built-in default.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "list_projects",
-    description:
-      "Lists all configured project mappings: team key, repo, execution mode, provider, paused state, and per-project capacity cap.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "list_in_flight_jobs",
-    description:
-      "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_issue_dispatch_status",
-    description:
-      "Returns the dispatch status for a specific issue identifier (e.g. 'AII-123'): in-flight flag, dedup-window flag, and the last five dispatch log entries. Use this to diagnose why a ticket is not being picked up.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        identifier: { type: "string", description: "Issue identifier, e.g. 'AII-123'" },
-      },
-      required: ["identifier"],
-    },
-  },
-  {
-    name: "get_issue_report_card",
-    description:
-      "Returns a full report card for a specific issue: all dispatch runs with per-pass telemetry, totals (dispatches, passes, cost), approval/merge/escape status, gap-fill rounds, and review-fix rounds. Use this to understand the full history and outcome of an issue.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        issue: { type: "string", description: "Issue identifier, e.g. 'AII-123'" },
-      },
-      required: ["issue"],
-    },
-  },
-  {
-    name: "get_fleet_report",
-    description:
-      "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        days: { type: "number", description: "Look-back window in days (default 30)" },
-      },
-    },
-  },
-];
+// get_session_identity is the one read tool that stays here rather than moving onto the
+// orchestratorTools Restate service (AII-711): it reports the door's own state (the
+// identity/role this very request resolved to), which only exists at this layer.
+const GET_SESSION_IDENTITY_TOOL = {
+  name: "get_session_identity",
+  description:
+    "Returns the caller's email, sign-in provider, and role (user | admin | null when the identity has no allowlist entry) as the allowlist resolves them now. Admin-only skills call this first.",
+  inputSchema: { type: "object", properties: {} },
+};
 
-const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
-
-function callDiagnosticTool(name: string, args: Record<string, unknown>): unknown {
-  switch (name) {
-    case "get_tenant_health": {
-      const { mode, source } = getRunnerMode();
-      const inFlight = getInFlightJobs();
-      const db = getDb();
-      const { n: pendingGapfillCount } = db
-        .prepare("SELECT COUNT(*) as n FROM comment_gapfill_queue WHERE status = 'pending'")
-        .get() as { n: number };
-      const projectCount = Object.keys(getMappings()).length;
-      return { runnerMode: { mode, source }, inFlightJobCount: inFlight.length, pendingGapfillCount, projectCount, kgDegraded: isKgDegraded() };
-    }
-
-    case "get_runner_mode": {
-      const { mode, source } = getRunnerMode();
-      return { mode, source };
-    }
-
-    case "list_projects": {
-      const mappings = getMappings();
-      return Object.entries(mappings).map(([key, m]) => ({
-        teamKey: key,
-        repo: `${m.owner}/${m.repo}`,
-        executionMode: m.executionMode,
-        provider: m.provider,
-        paused: m.paused,
-        planningEnabled: m.planningEnabled,
-        maxInProgressAiIssues: m.maxInProgressAiIssues,
-        defaultBranch: m.defaultBranch,
-        workflowFile: m.workflowFile,
-        sessionMode: m.sessionMode,
-        autoMerge: m.autoMerge,
-        maxTurns: m.maxTurns,
-        maxIterations: m.maxIterations,
-        maxJobMinutes: m.maxJobMinutes,
-        branchPrefix: m.branchPrefix,
-        skillsRepo: m.skillsRepo,
-        dependencyTokenScope: m.dependencyTokenScope,
-        sensitiveAddPatterns: m.sensitiveAddPatterns,
-        sensitiveAllowPatterns: m.sensitiveAllowPatterns,
-        machineCpus: m.machineCpus,
-        machineMemoryMb: m.machineMemoryMb,
-        awsRegion: m.awsRegion,
-        planningWorkflowFile: m.planningWorkflowFile,
-        autoApprovePlans: m.autoApprovePlans,
-      }));
-    }
-
-    case "list_in_flight_jobs": {
-      const now = Date.now();
-      return getInFlightJobs().map((j) => ({
-        id: j.id,
-        issueIdentifier: j.issueIdentifier,
-        issueTitle: j.issueTitle,
-        repo: j.repo,
-        phase: j.phase,
-        status: j.status,
-        dispatchedAt: j.dispatchedAt,
-        elapsedSeconds: Math.round((now - j.dispatchedAt) / 1000),
-      }));
-    }
-
-    case "get_issue_dispatch_status": {
-      const identifier = args.identifier;
-      if (typeof identifier !== "string" || !identifier) {
-        return { error: "identifier is required and must be a non-empty string" };
-      }
-      const db = getDb();
-      const recentRows = db
-        .prepare(
-          "SELECT id, status, dispatched_at, repo, phase, pr_url, conclusion FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
-        )
-        .all(identifier) as Array<{
-          id: number;
-          status: string | null;
-          dispatched_at: number;
-          repo: string | null;
-          phase: string | null;
-          pr_url: string | null;
-          conclusion: string | null;
-        }>;
-      const dedupRow = db
-        .prepare("SELECT issue_id, dispatched_at FROM dispatched WHERE issue_identifier = ?")
-        .get(identifier) as { issue_id: string; dispatched_at: number } | undefined;
-      const inFlight = recentRows.some(
-        (j) => j.status === "dispatched" || j.status === "running",
-      );
-      return {
-        identifier,
-        inFlight,
-        inDedupWindow: !!dedupRow,
-        dedupEntry: dedupRow ?? null,
-        recentDispatches: recentRows.map((j) => ({
-          id: j.id,
-          status: j.status,
-          dispatchedAt: j.dispatched_at,
-          repo: j.repo,
-          phase: j.phase,
-          prUrl: j.pr_url,
-          conclusion: j.conclusion,
-        })),
-      };
-    }
-
-    case "get_issue_report_card": {
-      const issue = args.issue;
-      if (typeof issue !== "string" || !issue) {
-        return { error: "issue is required and must be a non-empty string" };
-      }
-      const card = getIssueReportCard(issue);
-      if (!card) return { error: `No dispatch records found for issue: ${issue}` };
-      return card;
-    }
-
-    case "get_fleet_report": {
-      const days = typeof args.days === "number" ? args.days : undefined;
-      return getFleetReport({ days });
-    }
-
-    default:
-      return { error: `Unknown diagnostic tool: ${name}` };
-  }
-}
-
-// ---- Sidecar proxy helpers ----
-
-interface SidecarRpcResponse {
-  result?: { tools?: unknown[] };
-  error?: unknown;
-}
+// Tool names bound to the orchestratorTools Restate service (src/restate/tools.ts).
+// tools/call routes a name in this set through callTool(); tools/list sources every
+// discoverable tool's description/schema live from discoverTools() rather than duplicating
+// it here — get_session_identity above is the sole read tool that isn't in this set (AII-711).
+// The six writes joined this set in AII-713: their role ("admin"), schema, and run body now
+// live on the handler itself (src/restate/tools.ts), not in this file — see
+// docs/adr/015-mcp-reads-open-writes-declared.md.
+// `params._meta.idempotencyKey` (AII-719, corrected 2026-09-17 on the AII-687 gate) is
+// checked against IDEMPOTENCY_KEY_SHAPE (below, shared with src/admin.ts so the two doors
+// cannot drift), scoped by the caller's identity with scopeIdempotencyKey (below), and then
+// forwarded to callTool. `/mcp` is stateless — it has no session id and MCP clients restart
+// their JSON-RPC ids on every connection — so nothing in a request names "one connection's
+// attempt at this call" except what the caller states explicitly. A key derived from the
+// access token's issue time and the JSON-RPC id (the prior design) let a second connection's
+// write inside the same token lifetime collide with the first: proven live with
+// `set_runner_mode` (a later connection's `id: 7` answered the first connection's cached
+// result and changed nothing). A derived key protects the wrong thing — a client retry of one
+// call whose response was lost — when MCP clients don't retry `tools/call` on their own; a
+// repeat is a human or script expressing a new intent unless they say otherwise via this field.
 
 /**
- * Extract the JSON-RPC response from a sidecar reply. The Python MCP SDK's
- * streamable-HTTP transport frames responses as SSE (`event:`/`data:` lines)
- * rather than a bare JSON body, so both encodings must be handled. Returns
- * the first event carrying a `result` (falling back to one carrying an
- * `error`), or null if nothing in the reply is a JSON-RPC response.
+ * Shape for a caller-supplied idempotency key (AII-719): the same check on both doors —
+ * `/mcp`'s `tools/call` (`params._meta.idempotencyKey`) and `POST /api/tools/<name>`'s
+ * `Idempotency-Key` header. It lives here, not in src/restate/tools-client.ts, because
+ * src/admin.ts may import Restate modules as types only (src/__tests__/restate-boundary.test.ts)
+ * and already imports RESTATE_WRITE_TOOL_NAMES from this file.
  */
-function parseSidecarRpcResponse(raw: string, contentType: string | undefined): SidecarRpcResponse | null {
-  if (contentType?.includes("text/event-stream")) {
-    let errorReply: SidecarRpcResponse | null = null;
-    // Events are separated by blank lines; one event's data may span several
-    // data: lines, joined with newlines before parsing.
-    for (const event of raw.split(/\r?\n\r?\n/)) {
-      const data = event
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, ""))
-        .join("\n");
-      if (!data) continue;
-      try {
-        const parsed = JSON.parse(data) as SidecarRpcResponse;
-        if (!parsed || typeof parsed !== "object") continue;
-        if ("result" in parsed) return parsed;
-        if ("error" in parsed) errorReply ??= parsed;
-      } catch {
-        // keep scanning; other events (pings, notifications) may share the stream
-      }
-    }
-    return errorReply;
-  }
-  try {
-    return JSON.parse(raw) as SidecarRpcResponse;
-  } catch {
-    return null;
-  }
+export const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
+ * The key that reaches Restate: the caller's identity, then the caller's own key. Restate scopes
+ * a key by (service, handler, key) and has no notion of caller, so two callers that reuse one
+ * literal key for the same write would otherwise attach to each other's cached result and the
+ * second write would silently not run. The caller still names the request — its key is the
+ * suffix, unchanged — and the prefix only keeps one caller's keys apart from another's.
+ */
+export function scopeIdempotencyKey(callerId: string, supplied: string): string {
+  return `${callerId}:${supplied}`;
 }
 
-function fetchSidecarToolsList(
-  kgSidecarUrl: string,
-  body: Buffer,
-  reqHeaders: http.IncomingHttpHeaders,
-): Promise<unknown[]> {
-  return new Promise((resolve) => {
-    const target = new URL(kgSidecarUrl);
-    const transport = target.protocol === "https:" ? https : http;
-    const forwardHeaders = { ...reqHeaders };
-    delete forwardHeaders.authorization;
-    delete forwardHeaders.host;
-    delete forwardHeaders["transfer-encoding"];
-    const options: http.RequestOptions = {
-      hostname: target.hostname,
-      port: target.port || (target.protocol === "https:" ? "443" : "80"),
-      path: target.pathname + target.search,
-      method: "POST",
-      headers: { ...forwardHeaders, host: target.host, "content-length": String(body.length) },
-    };
-    const proxyReq = transport.request(options, (proxyRes) => {
-      const chunks: Buffer[] = [];
-      proxyRes.on("data", (chunk: Buffer) => chunks.push(chunk));
-      proxyRes.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        const parsed = parseSidecarRpcResponse(raw, proxyRes.headers["content-type"]);
-        if (!parsed) {
-          console.error(
-            `[mcp] KG sidecar tools/list unparseable (status ${proxyRes.statusCode}, content-type ${proxyRes.headers["content-type"]}): ${raw.slice(0, 200)}`,
-          );
-        } else if (!parsed.result) {
-          console.error(
-            `[mcp] KG sidecar tools/list returned no result (status ${proxyRes.statusCode}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
-          );
-        }
-        resolve(parsed?.result?.tools ?? []);
-      });
-      proxyRes.on("error", () => resolve([]));
-    });
-    proxyReq.on("error", () => resolve([]));
-    proxyReq.write(body);
-    proxyReq.end();
-  });
-}
+const RESTATE_TOOL_NAMES = new Set([
+  "get_tenant_health",
+  "get_runner_mode",
+  "get_runner_backend",
+  "get_pipeline_schedule",
+  "list_projects",
+  "get_project_binding",
+  "list_in_flight_jobs",
+  "get_session_machine",
+  "list_session_machines",
+  "get_fly_setup",
+  "get_issue_dispatch_status",
+  "get_issue_report_card",
+  "get_fleet_report",
+  "get_reviewer_scorecard",
+  "get_deploy_posture",
+  "get_kg_status",
+  "get_review_fix_attempt",
+  "get_review_fix_activity",
+  "list_job_accounting",
+  "list_open_pulls",
+  "list_issue_statuses",
+  "kg_hybrid_search",
+  "kg_search",
+  "kg_semantic_search",
+  "kg_neighbors",
+  "kg_provenance",
+  "kg_path",
+  "kg_repo_history",
+  "trigger_kg_refresh",
+  "decide_kg_refresh",
+  "set_runner_mode",
+  "set_fly_machine_profile",
+  "set_runner_backend",
+  "set_pipeline_schedule",
+  "set_run_profile",
+  "pause_project",
+  "start_deploy",
+  "add_project",
+  "add_model_account",
+  "set_project_stage",
+  "set_project_agent_mode",
+  "trigger_workflow_sync",
+  "clear_dispatch_dedup",
+  "list_dispatch_reservations",
+  "release_dispatch_reservation",
+  "unpark_issue",
+]);
 
-function proxyBuffered(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  kgSidecarUrl: string,
-  body: Buffer,
-): void {
-  const target = new URL(kgSidecarUrl);
-  const transport = target.protocol === "https:" ? https : http;
+// The subset of RESTATE_TOOL_NAMES that mutates state. Not a role declaration — that lives on
+// each handler's own `mcp.role` metadata and is asserted inside the tool() wrapper regardless
+// of how a call reaches it. This list exists only to decide which calls carry an idempotency
+// key (below): attaching one to a read would make a client's identical retry of a genuine
+// re-poll return a stale cached answer instead of running again, which reads never wanted.
+export const RESTATE_WRITE_TOOL_NAMES = new Set([
+  "trigger_kg_refresh",
+  "decide_kg_refresh",
+  "set_runner_mode",
+  "set_fly_machine_profile",
+  "set_runner_backend",
+  "set_pipeline_schedule",
+  "set_run_profile",
+  "pause_project",
+  "start_deploy",
+  "add_project",
+  "add_model_account",
+  "set_project_stage",
+  "set_project_agent_mode",
+  "trigger_workflow_sync",
+  "clear_dispatch_dedup",
+  "release_dispatch_reservation",
+  "unpark_issue",
+]);
 
-  const forwardHeaders = { ...req.headers };
-  delete forwardHeaders.authorization;
-  delete forwardHeaders.host;
-  delete forwardHeaders.cookie;
-  delete forwardHeaders["transfer-encoding"];
-
-  const headers: Record<string, string | string[] | undefined> = {
-    ...forwardHeaders,
-    host: target.host,
-  };
-  if (body.length > 0) {
-    headers["content-length"] = String(body.length);
-  } else {
-    delete headers["content-length"];
-  }
-
-  const options: http.RequestOptions = {
-    hostname: target.hostname,
-    port: target.port || (target.protocol === "https:" ? "443" : "80"),
-    path: target.pathname + target.search,
-    method: req.method,
-    headers,
-  };
-
-  const proxyReq = transport.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers as http.OutgoingHttpHeaders);
-    proxyRes.on("error", (err) => {
-      console.error("[mcp] KG sidecar response error:", err);
-      if (!res.headersSent) {
-        json(res, 502, { error: "KG sidecar error" });
-      } else {
-        res.destroy(err);
-      }
-    });
-    proxyRes.pipe(res);
-  });
-
-  proxyReq.on("error", (err: NodeJS.ErrnoException) => {
-    if (res.headersSent) return;
-    if (err.code === "ECONNREFUSED") {
-      console.error(`[mcp] KG sidecar connection refused at ${kgSidecarUrl}`);
-      json(res, 502, { error: "KG sidecar unavailable: connection refused" });
-    } else {
-      console.error("[mcp] KG sidecar error:", err);
-      json(res, 502, { error: "KG sidecar error" });
-    }
-  });
-
-  if (body.length > 0) proxyReq.write(body);
-  proxyReq.end();
-}
+// admin is a strict superset of user (docs/access-model.md § Roles): an entry's role satisfies
+// a requirement when it matches exactly or is admin. Used only for the tools/list courtesy
+// filter below — the boundary itself is the tool() wrapper's own copy (src/restate/tools.ts).
+const roleAllows = (have: AccessRole | null, need: AccessRole): boolean =>
+  have === "admin" || have === need;
 
 // ---- Main handler ----
 
 export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  kgSidecarUrl: string | null,
+  // `provider` is still read by tools/list's kg_* courtesy filter (AII-641); the diagnostic
+  // string is kept in the signature so the boot wiring (src/index.ts) and the tests keep
+  // their positions. AII-715 restructures the door and drops it.
+  provider: MemoryProvider | null,
   baseUrl: string | null,
+  _providerDiagnostic?: string | null,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
     return;
   }
 
+  const requestStart = Date.now();
   const auth = req.headers.authorization;
   const submitted = auth?.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!verifyMcpToken(submitted)) {
+  const unauthorized = (cause: AuthEventCause, clientId: string | null, email: string | null): void => {
+    recordAuthEvent({
+      at: Date.now(),
+      kind: "401",
+      cause,
+      clientId,
+      clientPath: resolveClientPath(clientId),
+      identityKind: email ? "human" : null,
+      email,
+      familyId: null,
+      latencyMs: Date.now() - requestStart,
+    });
     res.writeHead(401, {
       "Content-Type": "application/json",
       "WWW-Authenticate": `Bearer realm="MCP", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
     });
     res.end(JSON.stringify({ error: "unauthorized" }));
+  };
+
+  const verification = verifyMcpToken(submitted);
+  if (!verification.ok) return unauthorized(verification.reason, verification.clientId, null);
+  const identity = verification.identity;
+
+  // An access token outlives a removal by up to an hour; re-checking closes that window.
+  const recheck = recheckIdentity(identity);
+  if (recheck.status === "unavailable") {
+    json(res, 503, { error: "access control is unavailable" });
     return;
   }
+  if (recheck.status === "denied") return unauthorized("allowlist", identity.clientId, identity.email);
+
+  const role: AccessRole | null = recheck.status === "ok" ? recheck.entry?.role ?? null : null;
 
   let body: Buffer;
   try {
@@ -400,7 +222,7 @@ export async function handleMcpRequest(
     return;
   }
 
-  // Parse JSON-RPC to route diagnostic tools vs sidecar proxy
+  // Parse JSON-RPC to route diagnostic tools vs provider
   let rpc: JsonRpcRequest | null = null;
   if (req.method === "POST" && body.length > 0) {
     try {
@@ -413,49 +235,163 @@ export async function handleMcpRequest(
     }
   }
 
-  if (rpc?.method === "tools/list") {
-    // Merge native diagnostic tools with kg_* tools from the sidecar
-    const kgTools = kgSidecarUrl
-      ? await fetchSidecarToolsList(kgSidecarUrl, body, req.headers)
-      : [];
+  // The JSON-RPC handshake (initialize/ping/notifications-initialized) is answered by the
+  // orchestrator itself, never proxied: orchestrator-native tools exist regardless of the
+  // sidecar, so a real MCP client (not just curl against tools/list) must be able to connect
+  // on a sidecar-less boot. A kg_* call without a sidecar configured degrades inside its own
+  // handler (src/restate/tools.ts) rather than gating here.
+  if (rpc?.method === "initialize") {
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,
-      result: { tools: [...DIAG_TOOLS, ...kgTools] },
+      result: {
+        protocolVersion: (rpc.params?.protocolVersion as string) ?? "2025-03-26",
+        serverInfo: { name: "ai-implement", version: "1.0.0" },
+        capabilities: { tools: {} },
+      },
+    });
+    return;
+  }
+
+  if (rpc?.method === "ping") {
+    json(res, 200, { jsonrpc: "2.0", id: rpc.id ?? null, result: {} });
+    return;
+  }
+
+  if (rpc?.method === "notifications/initialized") {
+    // A notification per the JSON-RPC spec (no `id`, no result body expected) — the
+    // streamable-HTTP transport acks with an empty 202 rather than a JSON-RPC envelope.
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end();
+    return;
+  }
+
+  if (rpc?.method === "tools/list") {
+    // Every read tool, including the six kg_* proxies, is now a handler on the
+    // orchestratorTools Restate service (AII-711) — discovered live rather than duplicated
+    // as a literal here. get_session_identity is the one exception: it reports the door's
+    // own state, so it's listed unconditionally alongside the discovered set. Hiding a tool
+    // the caller's role cannot use is a courtesy — the check in tools/call below is the
+    // boundary. The kg_* handlers are discovered like every other tool, but the list keeps
+    // the AII-641 courtesy: a kg_* tool is omitted when no KG sidecar is configured, or when
+    // the provider lacks that tool's capability, so a client never sees a tool it can never
+    // call (tools/call still refuses it inside the handler if called from a stale list). A
+    // Restate-backed tool degrades the same way when the admin API itself is unreachable:
+    // discoverTools() returns an empty list, so the discovered set drops out until it recovers.
+    const kgToolVisible = (name: string): boolean => {
+      const capKey = KG_TOOL_CAPABILITY[name];
+      if (capKey === undefined && !name.startsWith("kg_")) return true;
+      if (!provider) return false;
+      return capKey === undefined || provider.capabilities[capKey] === true;
+    };
+    const discovered = await discoverTools();
+    const restateTools = discovered
+      .filter((t) => roleAllows(role, t.role) && kgToolVisible(t.name))
+      .map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
+    json(res, 200, {
+      jsonrpc: "2.0",
+      id: rpc.id ?? null,
+      result: { tools: [GET_SESSION_IDENTITY_TOOL, ...restateTools] },
     });
     return;
   }
 
   if (rpc?.method === "tools/call") {
     const toolName = (rpc.params?.name as string) ?? "";
-    if (DIAG_TOOL_NAMES.has(toolName)) {
-      const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
-      try {
-        const result = callDiagnosticTool(toolName, toolArgs);
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
-        });
-      } catch (err) {
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: {
-            content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
-            isError: true,
-          },
-        });
-      }
+    const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
+
+    if (toolName === "get_session_identity") {
+      const refreshExpiresAt = await getRefreshExpiry(identity.clientId);
+      const result = {
+        email: identity.email,
+        provider: identity.provider,
+        role,
+        kind: identity.kind,
+        token: verification.token,
+        refresh: refreshExpiresAt !== null ? { expiresAt: refreshExpiresAt } : null,
+      };
+      json(res, 200, {
+        jsonrpc: "2.0",
+        id: rpc.id ?? null,
+        result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
+      });
       return;
     }
-  }
 
-  // Proxy everything else to the KG sidecar
-  if (!kgSidecarUrl) {
-    json(res, 503, { error: "KG sidecar not configured" });
+    if (RESTATE_TOOL_NAMES.has(toolName)) {
+      const caller: Caller = { kind: identity.kind, email: identity.email, role, grants: [] };
+      // A write carries an idempotency key only when the caller states one explicitly via
+      // the MCP `_meta` extension point (see IDEMPOTENCY_KEY_SHAPE above) — the server never
+      // derives one, but it does scope the caller's key by the caller's identity
+      // (scopeIdempotencyKey above) so two callers cannot collide on one literal key. Reads
+      // ignore the field entirely: ignoring rather than validating it keeps a read tolerant of
+      // a client that sends `_meta.idempotencyKey` on every call regardless of tool kind.
+      let idempotencyKey: string | undefined;
+      if (RESTATE_WRITE_TOOL_NAMES.has(toolName)) {
+        const meta = rpc.params?._meta;
+        const supplied = meta && typeof meta === "object" ? (meta as Record<string, unknown>).idempotencyKey : undefined;
+        if (supplied !== undefined) {
+          if (typeof supplied !== "string" || !IDEMPOTENCY_KEY_SHAPE.test(supplied)) {
+            json(res, 200, {
+              jsonrpc: "2.0",
+              id: rpc.id ?? null,
+              error: { code: -32602, message: "params._meta.idempotencyKey must match ^[A-Za-z0-9._:-]{1,128}$" },
+            });
+            return;
+          }
+          idempotencyKey = scopeIdempotencyKey(identity.email ?? identity.clientId ?? "anonymous", supplied);
+        }
+      }
+      const callResult = await callTool(toolName, toolArgs, caller, idempotencyKey ? { idempotencyKey } : undefined);
+      if (callResult.status === "deploy-held") {
+        json(res, 409, { error: "deploy-in-progress", deployStartedAt: getDeployStartedAt() });
+        return;
+      }
+      if (callResult.status === "unavailable") {
+        json(res, 503, { error: "restate-unavailable" });
+        return;
+      }
+      // The process cache behind getFlySessionsConfig() is filled by polling; refresh it here so
+      // a write through /mcp takes effect at the next dispatch, as the admin Settings path does.
+      if (toolName === "set_runner_backend" && callResult.status === "ok" && !callResult.isError) {
+        await refreshRunnerBackendCache();
+      }
+      json(res, 200, {
+        jsonrpc: "2.0",
+        id: rpc.id ?? null,
+        result: { content: callResult.content, isError: callResult.isError },
+      });
+      return;
+    }
+
+    // A tool name that is neither the door's own tool nor a discovered handler is unknown:
+    // since AII-711 every read (the kg_* tools included) is a handler, and the six writes
+    // joined them in AII-713 — nothing is proxied to the sidecar, and nothing runs inline here.
+    json(res, 200, {
+      jsonrpc: "2.0",
+      id: rpc.id ?? null,
+      error: { code: -32602, message: `Unknown tool: ${toolName}` },
+    });
     return;
   }
 
-  proxyBuffered(req, res, kgSidecarUrl, body);
+  // The raw sidecar proxy that used to sit here left with AII-711. What remains is the
+  // streamable-HTTP contract the door itself implements: POST only (no SSE channel, no
+  // server-side session to DELETE), notifications are acknowledged with no body, and any
+  // other JSON-RPC method is method-not-found.
+  if (req.method !== "POST") {
+    res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "method not allowed" }));
+    return;
+  }
+  if (rpc && rpc.id === undefined && typeof rpc.method === "string" && rpc.method.startsWith("notifications/")) {
+    res.writeHead(202);
+    res.end();
+    return;
+  }
+  json(res, 200, {
+    jsonrpc: "2.0",
+    id: rpc?.id ?? null,
+    error: { code: -32601, message: `Method not found: ${rpc?.method ?? "unknown"}` },
+  });
 }

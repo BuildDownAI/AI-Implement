@@ -1,0 +1,272 @@
+# SQLite schema changes
+
+The orchestrator changes its SQLite database at boot. There is no migration tool and no
+version table. Each boot runs idempotent statements that bring any older database up to date.
+This page explains how that works, what the accounting parts (AII-1561) added, what a
+rollback leaves behind, and the rule for a column that a trigger names.
+
+For the `dispatched` table, see [dispatch-dedup.md](dispatch-dedup.md).
+
+## 1. How the schema changes at boot
+
+Each table has an init step that runs at boot. Two of them hold most of the schema:
+
+- `getDb()` (`src/dedup.ts`) opens the one database handle and creates most tables,
+  indexes and triggers.
+- `initLogTable()` (`src/log.ts`) creates `dispatch_log`. Then it runs `ensureLogColumns()`
+  and `ensureAccountingTriggers()`, in that order.
+
+Other modules own their tables and run their own `CREATE TABLE IF NOT EXISTS` and
+`ALTER TABLE` statements from an init function that `main()` in `src/index.ts` calls at boot:
+`initMappingsTable()`, `initDispatchBreakerTable()`, `initSettingsTable()`,
+`initAccessEntriesTable()` (`src/access-entries.ts`), `initKeyBindingsTable()`
+(`src/key-bindings.ts`, also creates the secret-free ingress fence table
+`key_binding_operations`), `initReconciliationTable()`,
+`initStepLogTable()` (`src/step-log.ts`), `initMcpOAuthTables()` (`src/mcp-oauth.ts`),
+`initAccessAuditTable()`, `initAccessPageGrantsTable()`, `initAuthEventsTable()`
+(`src/mcp-auth-events.ts`) and `initReviewFixEvidenceTable()` (`src/review-fix-evidence.ts`).
+To change a table, find the module that creates it: search for `CREATE TABLE IF NOT EXISTS <name>`.
+The rest of this page describes `dispatch_log` and `review_fix_attempts`.
+
+`main()` calls these init functions before `loadConfig()`. They run
+before the Restate endpoint opens (`restateRegistration.attempt()` is called later) and before
+the first poll.
+
+Every step is idempotent, so a second boot changes nothing:
+
+- Tables and indexes use `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`.
+- A new column uses `ALTER TABLE ... ADD COLUMN`, and only when `PRAGMA table_info` shows the
+  column is missing. The column is nullable (or has a default), so SQLite does not rewrite the table.
+- Triggers use `CREATE TRIGGER IF NOT EXISTS`.
+- One trigger is the exception. `trg_dispatch_log_changed_at` is dropped and created at every
+  boot, so an older form of it is replaced by the current form.
+
+### Project CPU kind
+
+`initMappingsTable()` creates `mappings.machine_cpu_kind TEXT NOT NULL DEFAULT 'shared'`.
+For an older database it checks `PRAGMA table_info(mappings)` and adds the missing
+column with the same default. Existing projects read as `shared`; repeated boots
+leave it unchanged. Older orchestrators ignore the column on rollback.
+
+### Breaker project and identifier
+
+`initDispatchBreakerTable()` (`src/dispatch-breaker.ts`) adds two nullable columns when `PRAGMA table_info(dispatch_breaker)` shows them missing: `project TEXT`, the project (the mapping key) an issue and phase last failed or parked for, and `issue_identifier TEXT`, the tracker's identifier for the issue (such as `AII-123`). An issue whose every dispatch failed may have no `dispatch_log` or `dispatched` row, and `dispatch_log` rows are pruned, so the breaker row keeps both itself. Every writer passes what it knows as a `BreakerSubject` (`recordDispatchFailure` and `parkIssue`); a field it names replaces the stored value and a field it leaves `null` keeps it, and `recordDispatchSuccess` leaves both alone. Rows from before a column read `null` until their next failure or park names it.
+
+Code outside the module reads the table through it, never by SQL of its own: `breakersForIssue` finds an issue's rows by identifier, plus any issue ids the caller passes for rows that recorded none (rows from before the column, and PR-budget parks for a PR with no tracker issue, keyed `owner/repo#n`); `listParked` lists parked rows with both columns; `breakerProject` gives one row's project. `get_issue_dispatch_status` and the park comment read them, and `GET /api/parked` takes a parked row's identifier from it before falling back to the dispatch rows. Older orchestrators ignore the columns on rollback, since their writes name their columns.
+
+### OpenRouter CHECK constraint rebuilds (AII-1883)
+
+`getDb()` creates `model_account_profile_revisions` and `model_invocation_attribution`
+with `openrouter` in their provider CHECK lists; profile revisions also accept
+`openrouter-api-key` in their auth mode CHECK. Types and application validators are unchanged.
+For each existing table independently, it reads `sqlite_master.sql`: if the stored SQL
+contains `openrouter`, no rebuild runs. Otherwise it creates a replacement table, copies
+all named columns, drops the old table and renames the replacement, in one transaction.
+A second boot skips both rebuilds, including after only one table was upgraded.
+
+The same transaction restores the profile revision immutable UPDATE trigger or the
+attribution `(dispatch_id, stage)` index. It also temporarily drops and restores the
+stored `trg_dispatch_log_pruned` definition, since its reference to attribution would
+prevent the rename while that table is absent. `initLogTable()` calls `getDb()` before
+`ensureAccountingTriggers()`, which recreates `trg_invocation_attribution_changed_at`
+after the rebuild. Historical copied rows therefore do not advance job timestamps.
+
+## 2. The accounting parts (AII-1561)
+
+**Tables** (created in `getDb()`):
+
+- `dispatch_job_report`: what the runner reported about one job (pushed SHAs, and whether the
+  invocation list arrived whole).
+- `job_accounting_pruned`: one row (`id = 1`). It holds the newest `(changed_at, jid)` of any
+  finished job that the prune deleted. It never moves back.
+
+**Columns:**
+
+- `dispatch_log` gets `tracker_kind`, `issue_url`, `machine_cpu_kind`, `machine_cpus`,
+  `machine_memory_mb`, `compute_started_at`, `compute_stopped_at` and `changed_at`
+  (`ACCOUNTING_COLUMNS` in `src/log.ts`, added by `ensureLogColumns()`).
+- `review_fix_attempts` gets `changed_at` (added in `getDb()`).
+
+`changed_at` is epoch milliseconds. SQLite sets it, through the triggers below.
+
+**Backfill.** `ensureAccountingTriggers()` sets `changed_at = completed_at` on rows in
+`dispatch_log` and `review_fix_attempts` where `changed_at IS NULL AND completed_at IS NOT NULL`.
+This statement runs at every boot. It is idempotent, because it touches only rows with a NULL
+`changed_at`. The backfill leaves the NULL of a running row unchanged. A running row can still
+get a `changed_at` later, because the triggers below set it when a tracked column changes or an
+invocation or report arrives.
+
+**Triggers:**
+
+| Trigger | Table | Fires on | Effect |
+|---|---|---|---|
+| `trg_dispatch_log_changed_at` | `dispatch_log` | An update of one of the 13 columns in section 5, when `OLD` and `NEW` differ in at least one | Sets `changed_at` to now |
+| `trg_invocation_attribution_changed_at` | `model_invocation_attribution` | Insert | Sets `changed_at` on the job row in `dispatch_log` and `review_fix_attempts` |
+| `trg_job_report_insert_changed_at` | `dispatch_job_report` | Insert | Same |
+| `trg_job_report_update_changed_at` | `dispatch_job_report` | Update that changes `pushed_shas_json` or `invocations_complete` | Same |
+| `trg_dispatch_log_pruned` | `dispatch_log` | Delete of a row with `completed_at` set | Raises `job_accounting_pruned`, then deletes the job's `model_invocation_attribution` and `dispatch_job_report` rows (section 4) |
+| `trg_review_fix_attempts_changed_at` | `review_fix_attempts` | Update of `state`, `terminal_outcome_json` or `completed_at` | Sets `changed_at` to now |
+
+`changed_at` is not in any `UPDATE OF` list, so these triggers never fire themselves. Bookkeeping
+columns such as `notified_at` and `machine_nonce` do not move `changed_at`.
+
+**Prune rule.** `appendLog` (`src/log.ts`) keeps the newest `MAX_LOG_ENTRIES` (500) rows of
+`dispatch_log`. A finished row is kept while `COALESCE(changed_at, completed_at)` is less than
+7 days old (`FINISHED_JOB_RETENTION_MS`), even above `MAX_LOG_ENTRIES`. The table can therefore
+hold more than 500 rows. The older guards (active machine nonce, review-fix attempts) also still apply.
+
+`dispatch_log.callback_lifecycle_completed_at` is nullable callback bookkeeping. It records
+completion of owned callback lifecycle handling before the Restate forward, independently
+of job closure, and does not move `changed_at`.
+
+## 3. Rollback
+
+Nothing undoes a schema change. If you deploy older code over a newer database:
+
+- Old code ignores the new tables and columns. Its inserts name their columns, and the new
+  columns are nullable.
+- The triggers stay in the database and keep working under old code.
+- The OpenRouter rebuilds keep their wider provider and auth mode CHECK lists. Reverting
+  the code does not narrow them; an older orchestrator runs correctly only when no account
+  profile has provider `openrouter`. See [Roll back after OpenRouter](model-account-operations.md#roll-back-after-openrouter).
+- The prune trigger's deletes (section 4) stay active.
+
+## 4. The one irreversible change
+
+When a finished `dispatch_log` row is pruned (`completed_at` is set), `trg_dispatch_log_pruned`
+also deletes the `model_invocation_attribution` and `dispatch_job_report` rows with the same
+`dispatch_id`. Before AII-1561, call rows stayed for ever.
+
+Every reader finds these rows through the job row, so nothing visible is lost. The control plane
+keeps the permanent copy for orchestrators it tracks. For an orchestrator it does not track, the
+raw per-call rows of pruned jobs are gone. A rollback does not bring them back, because the trigger
+stays in the database. This was decided on purpose (user decision, 2026-10-28): once the job row is
+gone, no reader can reach its call rows, so keeping them gave no value.
+
+## 5. Rule: changing a column that a trigger names
+
+- SQLite refuses to drop a column that a trigger names. A rename does not fail: SQLite rewrites
+  the trigger to use the new name. `trg_dispatch_log_changed_at`
+  names 13 `dispatch_log` columns (`DISPATCH_LOG_CHANGE_COLUMNS` in `src/log.ts`): `status`,
+  `conclusion`, `completed_at`, `pr_url`, `issue_identifier`, `issue_title`, `tracker_kind`,
+  `issue_url`, `machine_cpu_kind`, `machine_cpus`, `machine_memory_mb`, `compute_started_at`
+  and `compute_stopped_at`. `trg_dispatch_log_pruned` also names `dispatch_log` columns
+  (`id`, `dispatch_id`, `changed_at` and `completed_at`).
+- This matters only for a change that removes one of those columns. A rename also needs the
+  trigger SQL and `DISPATCH_LOG_CHANGE_COLUMNS` updated to the new name in the same change.
+- A removal must first drop every trigger that names the column, then drop the column, then create
+  those triggers again with updated references. For `completed_at`, that includes
+  `trg_dispatch_log_pruned` as well as `trg_dispatch_log_changed_at`.
+- `changed_at` is named too. In `dispatch_log` and `review_fix_attempts`, it is written by
+  `trg_invocation_attribution_changed_at`, `trg_job_report_insert_changed_at` and
+  `trg_job_report_update_changed_at`. `trg_review_fix_attempts_changed_at` writes it in
+  `review_fix_attempts`, and `trg_dispatch_log_pruned` reads it in `dispatch_log`. Removing
+  `changed_at` from either table fails while any of these triggers remains.
+- The orchestrator already drops and creates `trg_dispatch_log_changed_at` at every boot. So the
+  column change only needs to run before that step (before `ensureAccountingTriggers()` in
+  `initLogTable()`), and the trigger's column list must be updated in the same change. All other
+  triggers are created with `IF NOT EXISTS`, so SQLite does not restore them after a drop. The
+  change must drop each affected trigger, update its definition, and create it again in the same
+  schema change.
+- If someone forgets, the column drop fails at boot, and that orchestrator does not start. The
+  test `adds the columns to an old table, leaving old rows null` in `src/__tests__/jobs.test.ts`
+  drops the trigger first for exactly this reason. The same rule applies to `review_fix_attempts`
+  columns named by `trg_review_fix_attempts_changed_at` (`state`, `terminal_outcome_json`,
+  `completed_at`).
+
+One difference for `review_fix_attempts`: `getDb()` creates its trigger with
+`CREATE TRIGGER IF NOT EXISTS`, and boot does not recreate it. So the column change must drop
+the trigger itself, and the same change must create the trigger again with the new column list.
+Running the change before `ensureAccountingTriggers()` is not enough for this table.
+
+## 6. How to add a schema change safely
+
+1. Write the statement so a second boot changes nothing (`IF NOT EXISTS`, or check
+   `PRAGMA table_info` before `ADD COLUMN`).
+2. Make a new column nullable, or give it a default.
+3. Add a test that boots an old database (create the old shape, run `initLogTable()` twice,
+   check the result). Use the test named in section 5 as the pattern.
+4. If the change drops a column that a trigger names (or renames one), follow section 5.
+5. Read the deploy paths in [deployment.md](deployment.md#deploy-paths). Remember that a
+   rollback keeps the schema change (section 3).
+
+### Pull request cancellation decisions
+
+On first access, `src/pr-links.ts` adds nullable `pull_request_link.cancel_checked_at INTEGER` after checking `PRAGMA table_info`, before importing surviving job rows.
+Existing rows keep NULL. Closed-unmerged links with NULL are reconsidered without
+another GitHub read; final decisions receive an epoch-millisecond timestamp.
+In-flight runs and provider errors leave NULL for retry. Link metadata refreshes
+preserve the marker, and rollback leaves the nullable column in place.
+
+## Gap-fill dispatch uncertainty
+
+`src/comment-gapfill-queue.ts` owns `comment_gapfill_launch`, keyed by
+`dispatch_id`, with `recovery_json` containing only the original job attribution,
+workflow target, confirmed-acceptance flag and optional rejected disposition
+(HTTP status only). It freezes issue title, mapping identity, admission generation,
+accounting and launch contract. Instructions,
+credentials, prepared inputs and grant/bootstrap secrets are never stored here.
+
+This table is intentionally initialized lazily with `CREATE TABLE IF NOT EXISTS`
+on access, including recovery reads, so older databases can recover without a new
+boot caller. No `src/index.ts` change is required. The intent commits before the
+external dispatch attempt; acceptance is recorded separately before job insertion.
+A uniquely matched run adopted without a prior intent also persists its validated
+original owner, repository and workflow plus explicitly selected job attribution,
+with acceptance, before job insertion, run binding or queue completion. Retries
+reuse this snapshot across restarts and project mapping changes or removal;
+status and cancellation continue to address the original repository. Failed
+snapshot persistence leaves adoption bookkeeping untouched. No intent is created
+for an empty, ambiguous or invalid initial lookup.
+A crash between intent and call is indistinguishable from an uncertain attempted
+call: both recover conservatively as unknown, retaining admission and preventing
+another preparation, grant or dispatch even when a successful listing is empty.
+Reconstructed recovery revokes an unconfirmed managed grant through exact-dispatch
+settlement using the grant’s persisted profile/generation bindings (deduplicated
+across stages). Incomplete settlement fails closed and is retried without another
+launch; confirmed acceptance or backend adoption preserves the grant.
+
+Definite rejection retains its disposition before settlement and creates no job.
+Exact-dispatch retries return rejected without preparing or dispatching again.
+Accepted and unknown intents must not be removed because a job or backend listing is absent. Coordinated
+retention with dispatch/admission records belongs to AII-1565; until that policy is
+implemented these intents are retained. Deadline/escape release policy remains
+AII-1787; this table does not change it. Schema deployment requires operator review;
+this change performs no live database migration.
+
+## Implementation launch recovery
+
+`implementation_launch_intent` is created idempotently on first ImplementationRun recovery access
+by `src/restate/implementation-launch-intent.ts`, using the shared connection. Its dispatch-keyed
+private snapshot is written before backend acceptance and never overwritten by retry preparation.
+`bookkeeping_done` suppresses repeated tracker dispatch effects after adoption. It is separate from
+`dispatch_log`, so definitive pre-launch rejection cannot leave a ghost in-flight job or dedup mark.
+
+Rows keyed `preparation:<dispatchId>` in the same table record the managed pre-grant phase:
+admission generation, project/backend, allowlisted mapping and frozen Fly app, without credentials.
+Finder recovery uses this identity only while the matching admission remains owned and unbound.
+These rows and ordinary intent rows require coordinated deletion with dispatch recovery data (AII-1565);
+this introduces no separate retention policy.
+
+## Reviewer scorecard evidence
+
+`review_findings.disposition` is nullable TEXT, added at boot only when absent.
+Existing rows keep NULL; there is no backfill. Guarded fixed-disposition updates
+write `fixed`; reopening clears it. Bulk PR resolution does not claim a fix, so
+the scorecard counts historical resolved rows without evidence as ignored.
+
+`internal_review_finding_reports` records `(dispatch_id, finding_id, revision)`
+with a primary key on dispatch and finding. Ingestion writes it atomically with
+the finding so callback retries reuse the original revision, while a new dispatch
+can reopen a resolved finding and clear stale fixed credit.
+
+`comment_gapfill_queue` admission refusal tracking uses additive, boot-time
+`PRAGMA table_info` guarded migrations (existing rows are preserved):
+
+| Column | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `refusal_count` | INTEGER NOT NULL | 0 | Admission refusals for this queue row |
+| `last_refusal_reason` | TEXT nullable | NULL | Last admission refusal, retained when skipped |
+| `last_refusal_dispatch_id` | TEXT nullable | NULL | Deduplicates reservation step retries |
+
+`comment_gapfill_refusals` stores durable reservation decisions with `queue_item_id INTEGER NOT NULL`, `dispatch_id TEXT NOT NULL`, and `reason TEXT NOT NULL`; the composite primary key is `(queue_item_id, dispatch_id)`. Boot uses additive `CREATE TABLE IF NOT EXISTS` and seeds the previously recorded last refusal with `INSERT OR IGNORE`. Decisions remain available after terminal queue transitions.

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { sidebarHtml, SIDEBAR_ROUTES } from "../sidebar.js";
+import { sidebarHtml, SIDEBAR_ROUTES, GRANT_BLOCKERS } from "../sidebar.js";
+import { PAGE_ROUTES } from "../../access-page-grants.js";
 import { componentsCss } from "../components.js";
 
 describe("sidebar", () => {
@@ -8,6 +9,29 @@ describe("sidebar", () => {
     for (const label of ["Work", "Configure", "Platform", "Developer"]) {
       expect(html).toContain(`>${label}<`);
     }
+  });
+
+  it("lists Knowledge Graph Pipelines as the last Work item, after Reports", () => {
+    const html = sidebarHtml();
+    const work = html.slice(html.indexOf(">Work<"), html.indexOf(">Configure<"));
+    const routes = [...work.matchAll(/data-route="([^"]+)"/g)].map((m) => m[1]);
+    expect(routes[routes.length - 1]).toBe("kg-pipelines");
+    expect(routes[routes.length - 2]).toBe("reports");
+    expect(html).toContain("Knowledge Graph Pipelines");
+  });
+
+  it("keeps kg-pipelines admin-only: a grant blocker and no PAGE_ROUTES entry", () => {
+    expect(GRANT_BLOCKERS["kg-pipelines"]).toBe("Starts knowledge-graph refreshes and changes the materialize setting.");
+    expect(Object.keys(PAGE_ROUTES)).not.toContain("kg-pipelines");
+  });
+
+  // A page in neither list is missing from the grant editor, so nobody can tell whether it is grantable.
+  it.each(SIDEBAR_ROUTES)("lists %s in the grant editor: grantable, or with the reason it never is", (key) => {
+    expect(key in PAGE_ROUTES !== key in GRANT_BLOCKERS, key).toBe(true);
+  });
+
+  it("makes Setup grantable by its read route alone, so a grant never starts a run", () => {
+    expect(PAGE_ROUTES.setup).toEqual(["/api/setup-checks"]);
   });
 
   it("includes a data-route attribute for every routable item", () => {
@@ -37,7 +61,7 @@ describe("sidebar", () => {
       "overview", "issues", "jobs", "pulls", "blockers",
       "projects", "pipelines", "models", "channels", "policies",
       "runners", "sessions", "reaper", "secrets", "settings",
-      "mcp", "webhooks", "audit", "customizations", "updates",
+      "webhooks", "audit", "customizations", "updates",
     ]));
   });
 });

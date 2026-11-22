@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RepoMapping } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { GitHubApiError } from "./github-errors.js";
+import { classifyGitHubAppError, GitHubApiError, type GitHubAppErrorCategory } from "./github-errors.js";
 
 const GH_HEADERS = {
   Accept: "application/vnd.github+json",
@@ -11,23 +11,45 @@ const GH_HEADERS = {
   "User-Agent": "ai-implement-orchestrator",
 } as const;
 
-const ALWAYS_SYNC_FILES = [
-  {
-    local: "workflows/claude-implement.yml",
-    remote: ".github/workflows/claude-implement.yml",
-    message: "Sync claude-implement.yml from ai-implement",
-  },
-  {
-    local: "workflows/claude-plan.yml",
-    remote: ".github/workflows/claude-plan.yml",
-    message: "Sync claude-plan.yml from ai-implement",
-  },
-] as const;
+interface AlwaysSyncFile {
+  local: string;
+  remote: string;
+  message: string;
+}
+
+function alwaysSyncFiles(mapping: RepoMapping): AlwaysSyncFile[] {
+  return [
+    {
+      local: "workflows/claude-implement.yml",
+      remote: `.github/workflows/${mapping.workflowFile}`,
+      message: `Sync ${mapping.workflowFile} from ai-implement`,
+    },
+    {
+      local: "workflows/claude-plan.yml",
+      remote: `.github/workflows/${mapping.planningWorkflowFile}`,
+      message: `Sync ${mapping.planningWorkflowFile} from ai-implement`,
+    },
+  ];
+}
+
+/** Whether `name` is safe to join under `.github/workflows/` as a sync target: a bare `.yml`/`.yaml` file name with no path separators or `..`. */
+export function isBareWorkflowFileName(name: string): boolean {
+  return /\.(ya?ml)$/i.test(name) && !name.includes("/") && !name.includes("\\") && !name.includes("..");
+}
+
+/** Whether `workflowFile` and `planningWorkflowFile` would collide on the same `.github/workflows/` path. */
+export function workflowFileNamesCollide(workflowFile: string, planningWorkflowFile: string): boolean {
+  return workflowFile === planningWorkflowFile;
+}
 
 const REMOVE_FILES = [
   {
     remote: ".github/workflows/comment-trigger.yml",
     message: "Remove comment-trigger.yml — /ai-implement is now handled by the orchestrator",
+  },
+  {
+    remote: ".github/workflows/claude-kg-refresh.yml",
+    message: "Remove claude-kg-refresh.yml — kg-refresh now dispatches claude-implement.yml with runner_phase=kg-refresh",
   },
 ] as const;
 
@@ -73,12 +95,7 @@ export interface WorkflowSyncResult {
 // show actionable guidance instead of a raw "GitHub 403 /repos/...: {...}" dump.
 // Reused by BOTH the auto-sync-on-save path and the manual /sync-workflows endpoint.
 
-export type SyncErrorCategory =
-  | "app-not-installed"
-  | "repo-not-found"
-  | "permission-denied"
-  | "clock-skew-suspected"
-  | "unknown";
+export type SyncErrorCategory = GitHubAppErrorCategory;
 
 export interface ClassifiedSyncError {
   category: SyncErrorCategory;
@@ -97,25 +114,7 @@ const SYNC_ERROR_MESSAGES: Record<Exclude<SyncErrorCategory, "unknown">, string>
 };
 
 export function classifySyncError(err: unknown): ClassifiedSyncError {
-  if (err instanceof GitHubApiError) {
-    // 401 first: a bad/expired App JWT is rejected at GitHub's auth layer regardless of endpoint,
-    // so catch every 401 here before the 404 "not installed" check.
-    // Host clock skew is the usual cause — the JWT tolerates ±300s of drift (AII-199), so a 401 implies drift beyond that or bad credentials.
-    if (err.status === 401) return classify("clock-skew-suspected", err.message);
-    if (err.status === 403) return classify("permission-denied", err.message); // incl. missing `workflows` perm on .github/workflows PUT
-    
-    // Same status, different meaning by endpoint — disambiguate on the path.
-    if (err.status === 404 && err.path) {
-      if (/\/installation$/.test(err.path)) return classify("app-not-installed", err.message);
-      // Matches ONLY the bare-repo existence probe (`/repos/owner/repo`, the first repo call in syncWorkflowTemplates).
-      // Intentionally narrow: deeper 404s (e.g. a missing base branch at /repos/owner/repo/git/ref/heads/...) are not "repo not found" and correctly fall to unknown.
-      if (/^\/repos\/[^/]+\/[^/]+$/.test(err.path)) return classify("repo-not-found", err.message);
-    }
-    // A typed GitHub error whose status we don't categorize.
-    // Kept separate from the final catch-all (which handles non-GitHubApiError throws) so the two "unknown" cases can diverge later without silently affecting each other
-    return classify("unknown", err.message);
-  }
-  return classify("unknown", err instanceof Error ? err.message : String(err));
+  return classify(classifyGitHubAppError(err), err instanceof Error ? err.message : String(err));
 }
 
 function classify(category: SyncErrorCategory, raw: string): ClassifiedSyncError {
@@ -182,7 +181,7 @@ class GitHubClient {
   }
 }
 
-function buildSyncBranchName(prefix: string | null | undefined): string {
+export function buildSyncBranchName(prefix: string | null | undefined): string {
   const cleaned = (prefix ?? "").trim().replace(/^\/+|\/+$/g, "");
   return cleaned ? `${cleaned}/sync/ai-implement` : "sync/ai-implement";
 }
@@ -342,12 +341,12 @@ async function findSyncPr(
   return prs[0] ?? null;
 }
 
-function syncPrBody(): string {
+function syncPrBody(alwaysSynced: AlwaysSyncFile[]): string {
   return [
     "Auto-synced from ai-implement.",
     "",
     "**Always updated:**",
-    ...ALWAYS_SYNC_FILES.map((file) => `- \`${file.remote}\``),
+    ...alwaysSynced.map((file) => `- \`${file.remote}\``),
     "",
     "**Added once (never overwritten):**",
     ...SEED_ONCE_FILES.map((file) => `- \`${file.remote}\` — ${file.description}`),
@@ -362,15 +361,16 @@ async function createSyncPr(params: {
   repo: string;
   baseBranch: string;
   syncBranch: string;
+  alwaysSynced: AlwaysSyncFile[];
 }): Promise<PullRequest> {
-  const { gh, repo, baseBranch, syncBranch } = params;
+  const { gh, repo, baseBranch, syncBranch, alwaysSynced } = params;
   return await gh.request<PullRequest>(`/repos/${repo}/pulls`, {
     method: "POST",
     body: JSON.stringify({
       title: "Sync AI implementation workflow files",
       head: syncBranch,
       base: baseBranch,
-      body: syncPrBody(),
+      body: syncPrBody(alwaysSynced),
     }),
   });
 }
@@ -399,12 +399,31 @@ export async function syncWorkflowTemplates(
   const token = await getToken(options.githubAppId, options.githubAppPrivateKey, mapping.owner);
   const gh = new GitHubClient(token, options.fetchImpl ?? fetch);
 
+  for (const [field, value] of [
+    ["workflowFile", mapping.workflowFile],
+    ["planningWorkflowFile", mapping.planningWorkflowFile],
+  ] as const) {
+    if (!isBareWorkflowFileName(value)) {
+      throw new Error(
+        `Mapping ${field} "${value}" is not a bare workflow file name — it must end in .yml or .yaml ` +
+          `and contain no "/", "\\", or "..".`,
+      );
+    }
+  }
+  if (workflowFileNamesCollide(mapping.workflowFile, mapping.planningWorkflowFile)) {
+    throw new Error(
+      `Mapping workflowFile and planningWorkflowFile are both "${mapping.workflowFile}" — they must name ` +
+        `different files under .github/workflows/.`,
+    );
+  }
+  const syncedFiles = alwaysSyncFiles(mapping);
+
   const repo = await gh.request<{ default_branch: string }>(`/repos/${targetRepo}`);
   const baseBranch = options.targetBase || mapping.defaultBranch || repo.default_branch;
   await ensureSyncBranch({ gh, repo: targetRepo, baseBranch, syncBranch });
 
   const changedFiles: string[] = [];
-  for (const file of ALWAYS_SYNC_FILES) {
+  for (const file of syncedFiles) {
     const content = readTemplate(templatesRoot, file.local);
     if (content === null) {
       throw new Error(`Missing workflow template: ${file.local}`);
@@ -460,7 +479,7 @@ export async function syncWorkflowTemplates(
     };
   }
 
-  const finalPr = pr ?? await createSyncPr({ gh, repo: targetRepo, baseBranch, syncBranch });
+  const finalPr = pr ?? await createSyncPr({ gh, repo: targetRepo, baseBranch, syncBranch, alwaysSynced: syncedFiles });
   return {
     status: pr ? "pr-updated" : "pr-opened",
     targetRepo,

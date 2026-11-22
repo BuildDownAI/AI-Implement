@@ -1,7 +1,22 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
 import { parseWorkflowMd } from "../workflow-md.js";
 
 describe("parseWorkflowMd", () => {
+  it.each(["PLANNING.md", "workflows/PLANNING.md"])(
+    "%s preserves the machine-block instructions in the rendered planning prompt",
+    (file) => {
+      const raw = readFileSync(new URL(`../../${file}`, import.meta.url), "utf-8");
+      const { body } = parseWorkflowMd(raw, { ISSUE_IDENTIFIER: "ENG-42" });
+
+      expect(body).toContain("ENG-42");
+      expect(body).toContain("ai-implement-planning");
+      expect(body).toMatch(/^v: 1$/m);
+      expect(body).toMatch(/^files: \[.+\]$/m);
+      expect(body).toMatch(/^risk: low$/m);
+    },
+  );
+
   it("extracts model + setup + verify from front matter", () => {
     const md = `---\nmodel: claude-opus-4-7\nsetup: scripts/setup.sh\nverify: scripts/verify.sh\n---\n\n# Body content\n\${ISSUE_TITLE}\n`;
     const out = parseWorkflowMd(md, { ISSUE_TITLE: "Fix the thing" });

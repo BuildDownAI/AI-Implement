@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
+import { INPUT_CONTRACT } from "./helpers/fixtures/workflow-input-contract.js";
+import { GITHUB_WRITE_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
 const IMPLEMENT_WORKFLOWS = [
   "workflows/claude-implement.yml",
@@ -14,6 +17,30 @@ const FILES = [...IMPLEMENT_WORKFLOWS];
 const SYNCED_WORKFLOW_FILES = [...IMPLEMENT_WORKFLOWS, ...PLANNING_WORKFLOWS];
 
 describe("GHA workflow shims", () => {
+  it.each([
+    ["pipeline/kg-refresh-run.js, phase=kg-refresh", true],
+    ["pipeline/kg-refresh-run.js, phase=kg-refresh, source=env", true],
+    ["pipeline/kg-refresh-run.js, phase=kg-refresh, source=envelope", false],
+    ["pipeline/kg-refresh-run.js, phase=kg-refresh, source=default", false],
+    ["pipeline/kg-refresh-run.js, phase=implementation", false],
+    ["run-autonomous.js, phase=kg-refresh, source=env", false],
+  ])("runner handoff gate checks %s (accepted=%s)", (handoff, accepted) => {
+    const doc = parse(readFileSync(".github/workflows/build-runner.yml", "utf-8"));
+    const step = doc.jobs.build.steps.find((item: { name?: string }) => item.name?.startsWith("Entrypoint handoff"));
+    // Execute the workflow's actual matcher so a log-format change cannot
+    // pass unit tests while silently preventing runner channel promotion.
+    const matcher = step.run.match(/grep (-q[EF]) \\\n\s+"(Invoking TS pipeline[^"]+)"/);
+    expect(matcher).not.toBeNull();
+    expect(step.run).toContain("-e RUNNER_PHASE=kg-refresh");
+    expect(step.run).toContain('grep -q "POST /runner/result" "$requests_log"');
+    const result = spawnSync("grep", [matcher![1], matcher![2]], {
+      input: `[session] 2026-09-14T00:00:00Z Invoking TS pipeline (node /app/dist/${handoff})...\n`,
+      encoding: "utf-8",
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(accepted ? 0 : 1);
+  });
+
   it("ships workflow templates in the orchestrator image for admin-triggered syncs", () => {
     expect(readFileSync("Dockerfile", "utf-8")).toMatch(/COPY workflows\/ \.\/workflows\//);
   });
@@ -63,37 +90,129 @@ describe("GHA workflow shims", () => {
     expect(promoteStep.run).toContain("re-test and promote the digest image");
     expect(promoteStep.run).toContain('if [ "$current_sha" != "${{ github.sha }}" ]; then');
     expect(promoteStep.run).toContain("Skipping channel promotion");
+    // Equivalence check: script is called when head advanced past tested SHA
+    expect(promoteStep.run).toContain('bash scripts/image-equiv-check.sh "${{ github.sha }}" "$current_sha"');
     expect(promoteStep.run).toContain("Re-pull immediately before tagging");
     expect(promoteStep.run).toContain('docker pull "$digest_ref"');
-    expect(promoteStep.run).toContain(
-      'docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"',
-    );
+    // Channel tag uses a bash variable (channel=) so the value is set once at the top
+    expect(promoteStep.run).toContain('docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${channel}"');
     expect(promoteStep.run).toContain(
       'docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"',
     );
-    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"');
+    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${channel}"');
     expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"');
+    // Head date tag is pushed when head advanced with no image-relevant changes
+    expect(promoteStep.run).toContain("head_date_tag=");
+    expect(promoteStep.run).toContain('"$head_date_tag"');
   });
 
-  it("keeps the canonical and synced dispatch workflows byte-for-byte identical", () => {
-    expect(readFileSync(".github/workflows/claude-implement.yml", "utf-8")).toBe(
-      readFileSync("workflows/claude-implement.yml", "utf-8"),
-    );
+  // Tests the dual-copy invariant generically rather than relying on someone
+  // remembering to update a hardcoded per-file assertion.
+  it("keeps every workflows/*.yml template byte-identical to its .github/workflows/ synced copy", () => {
+    const canonicals = [...IMPLEMENT_WORKFLOWS, ...PLANNING_WORKFLOWS].filter((f) => f.startsWith("workflows/"));
+    expect(canonicals.length).toBeGreaterThan(0);
+    for (const canonical of canonicals) {
+      const synced = canonical.replace("workflows/", ".github/workflows/");
+      expect(readFileSync(synced, "utf-8")).toBe(readFileSync(canonical, "utf-8"));
+    }
   });
 
-  it("keeps the canonical and synced planning workflows byte-for-byte identical", () => {
-    expect(readFileSync(".github/workflows/claude-plan.yml", "utf-8")).toBe(
-      readFileSync("workflows/claude-plan.yml", "utf-8"),
-    );
-  });
+  for (const f of [...IMPLEMENT_WORKFLOWS, ...PLANNING_WORKFLOWS]) {
+    it(`${f} advertises the static private-envelope marker without a dispatch input`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/^# ai-implement-capability: private-run-config-v1$/m);
+      expect(yaml).toMatch(/^# ai-implement-capability: stage-agent-config-v1$/m);
+      expect(yaml).toMatch(/^# ai-implement-capability: stage-agent-launch-context-v1$/m);
+      expect(yaml).toMatch(/^# ai-implement-capability: openrouter-accounts-v1$/m);
+      const doc = parse(yaml) as any;
+      for (const name of Object.keys(doc.on.workflow_dispatch.inputs)) {
+        expect(name).not.toMatch(/private|capab|marker/i);
+      }
+    });
+
+    it(`${f} ${IMPLEMENT_WORKFLOWS.includes(f) ? "advertises" : "does not advertise"} the ephemeral execution policy capability`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const marker = /^# ai-implement-capability: github-hosted-execution-policy-v2$/m;
+      // Only the implementation workflow projects the policy; planning rejects it as an unknown credential key.
+      expect(marker.test(yaml)).toBe(IMPLEMENT_WORKFLOWS.includes(f));
+      expect(yaml.includes("AI_IMPLEMENT_EXECUTION_POLICY")).toBe(IMPLEMENT_WORKFLOWS.includes(f));
+    });
+
+    it(`${f} never decodes or dumps run_config outside the projection`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/base64 -d \| jq \.\s/);
+      expect(yaml).not.toMatch(/set -[a-z]*x/);
+    });
+  }
+
+  for (const f of IMPLEMENT_WORKFLOWS) {
+    it(`${f} declares the optional attempt correlation input alongside the legacy envelope inputs`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual(Object.keys(INPUT_CONTRACT.implement.inputs));
+    });
+
+    it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const input = doc.on.workflow_dispatch.inputs.issue_identifier;
+      expect(input.required).toBe(false);
+      expect(input.type).toBe("string");
+      expect(input.default).toBe("");
+    });
+
+    it(`${f} titles the run with the ticket key via run-name:`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain("inputs.run_attempt_token");
+      expect(yaml).toContain("inputs.issue_identifier");
+      expect(yaml).not.toMatch(/^run-name:.*(?:run_token|run_progress_token|run_publication_token)/m);
+      const doc = parse(yaml) as any;
+      expect(doc.on.workflow_dispatch.inputs.run_attempt_token).toMatchObject({ required: false, type: "string", default: "" });
+      expect(doc["run-name"]).toContain("inputs.run_attempt_token");
+    });
+  }
+
+  for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} declares exactly the 8 envelope inputs, in order`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual(Object.keys(INPUT_CONTRACT.plan.inputs));
+    });
+
+    it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const input = doc.on.workflow_dispatch.inputs.issue_identifier;
+      expect(input.required).toBe(false);
+      expect(input.type).toBe("string");
+      expect(input.default).toBe("");
+    });
+
+    it(`${f} titles the run with the ticket key via run-name:`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain(
+        "run-name: ${{ inputs.issue_identifier && format('Claude AI Planning — {0}', inputs.issue_identifier) || 'Claude AI Planning' }}",
+      );
+    });
+  }
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} never references inputs.issue_identifier from a step (display-only)`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      for (const job of jobs) {
+        for (const step of job.steps ?? []) {
+          expect(JSON.stringify(step)).not.toContain("inputs.issue_identifier");
+        }
+      }
+    });
+  }
 
   it("keeps seeded gap-fill Git writes under pipeline control", () => {
     const workflow = readFileSync("workflows/WORKFLOW.md", "utf-8");
     const gapFill = workflow.split("## Gap-fill instructions")[1]?.split("## Issue")[0] ?? "";
 
-    expect(gapFill).toContain("Do NOT commit or push");
-    expect(gapFill).toContain("leave your file changes unstaged and uncommitted");
-    expect(gapFill).toContain("pipeline will\ncommit and push them to the existing PR branch");
+    // Match the authoritative Git instructions appended by run-autonomous.ts.
+    expect(gapFill).toContain("Do NOT commit, push, or open a pull request.");
+    expect(gapFill).toContain("Leave your file changes unstaged and uncommitted.");
+    expect(gapFill).toContain("pipeline will commit and push");
+    expect(gapFill).not.toContain("Local commits");
     expect(gapFill).not.toContain("Commit your changes to the current\nbranch and push");
   });
 
@@ -105,6 +224,123 @@ describe("GHA workflow shims", () => {
       for (const ref of actionRefs) {
         expect(ref).toMatch(/@[0-9a-f]{40}$/);
       }
+    });
+
+    // Dependabot reads the trailing version comment to know which release a SHA pin is; without it the
+    // synced template looks outdated in every target repo and Dependabot keeps reopening bump PRs there.
+    it(`${f} labels every pinned action with its release version`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const usesLines = [...yaml.matchAll(/^\s*uses:\s*\S+@[0-9a-f]{40}.*$/gm)].map((m) => m[0].trim());
+      expect(usesLines.length).toBeGreaterThan(0);
+      for (const line of usesLines) {
+        expect(line).toMatch(/@[0-9a-f]{40} # v\d+\.\d+\.\d+$/);
+      }
+    });
+  }
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} never interpolates runner token inputs directly into run: script text`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      for (const job of jobs) {
+        for (const step of job.steps ?? []) {
+          if (typeof step.run === "string") {
+            expect(step.run).not.toContain("inputs.run_token");
+            expect(step.run).not.toContain("inputs.run_progress_token");
+            expect(step.run).not.toContain("inputs.run_publication_token");
+          }
+        }
+      }
+    });
+  }
+
+  // The AII-458 forward-secrets step used `${{ toJSON(secrets) }}`, which GitHub's
+  // malicious-workflow scanner flags — gating every dispatch behind manual approval and
+  // taking the pipeline down fleet-wide (AII-502). The scanner-safe replacement reads ONE
+  // literal secret (AI_IMPLEMENT_FORWARDED_ENV, KEY=VALUE lines). These guards keep the
+  // flagged pattern out for good and pin the replacement's contract.
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    const forwardStepOf = (): { yaml: string; forwardStep: any; containerJob: any } => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      return { yaml, forwardStep, containerJob };
+    };
+
+    it(`${f} never uses toJSON(secrets) (trips GitHub's malicious-workflow scanner)`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toContain("toJSON(secrets)");
+    });
+
+    it(`${f} never indexes the secrets context dynamically`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/secrets\s*\[/);
+    });
+
+    it(`${f} has a "Forward repository secrets" step`, () => {
+      expect(forwardStepOf().forwardStep).toBeDefined();
+    });
+
+    it(`${f} forward step reads exactly one literal secret: AI_IMPLEMENT_FORWARDED_ENV`, () => {
+      const { forwardStep } = forwardStepOf();
+      const refs = [...JSON.stringify(forwardStep).matchAll(/secrets\.([A-Z_][A-Z0-9_]*)/g)].map((m) => m[1]);
+      expect(refs).toEqual(["AI_IMPLEMENT_FORWARDED_ENV"]);
+    });
+
+    it(`${f} forward step precedes the pipeline step and follows the mask step`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const pipelineStepName = f.includes("plan") ? "Run planning" : "Run pipeline";
+      expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Forward repository secrets"));
+      expect(yaml.indexOf("Forward repository secrets")).toBeLessThan(yaml.indexOf(pipelineStepName));
+    });
+
+    it(`${f} forward step reserved-name list covers all GITHUB_WRITE_CREDENTIAL_KEYS entries`, () => {
+      const { forwardStep } = forwardStepOf();
+      const reservedLine = (forwardStep.run as string).match(/reserved="([^"]+)"/)?.[1] ?? "";
+      const reservedNames = reservedLine.split(" ");
+      for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) {
+        expect(reservedNames).toContain(key);
+      }
+    });
+
+    it(`${f} forward step reserved-name list covers all secrets the template reads`, () => {
+      const { yaml, forwardStep } = forwardStepOf();
+      const forwardScript: string = forwardStep.run;
+      const secretRefs = [...yaml.matchAll(/secrets\.([A-Z_][A-Z0-9_]*)/g)]
+        .map((m) => m[1])
+        .filter((name) => name !== "AI_IMPLEMENT_FORWARDED_ENV");
+      expect(secretRefs.length).toBeGreaterThan(0);
+      for (const name of secretRefs) {
+        expect(forwardScript).toContain(name);
+      }
+    });
+
+    it(`${f} forward step rejects the RUN_ and AI_IMPLEMENT_ prefixes`, () => {
+      const { forwardStep } = forwardStepOf();
+      expect(forwardStep.run).toContain('"$name" == RUN_*');
+      expect(forwardStep.run).toContain('"$name" == AI_IMPLEMENT_*');
+    });
+
+    it(`${f} documents AI_IMPLEMENT_FORWARDED_ENV in the header comment`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain("AI_IMPLEMENT_FORWARDED_ENV");
+      expect(yaml).toContain("hooks");
+    });
+
+    it(`${f} does not expose FORWARDED_ENV or AI_IMPLEMENT_FORWARDED_SECRETS in the pipeline step env block`, () => {
+      const { containerJob } = forwardStepOf();
+      const pipelineStep = containerJob.steps.find(
+        (s: any) => s.name === "Run pipeline" || s.name === "Run planning",
+      );
+      expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("FORWARDED_ENV");
+      expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("AI_IMPLEMENT_FORWARDED_SECRETS");
+    });
+
+    it(`${f} forward step declares shell: bash`, () => {
+      const { forwardStep } = forwardStepOf();
+      expect(forwardStep.shell).toBe("bash");
     });
   }
 
@@ -180,24 +416,50 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER is empty/);
     });
 
-    it(`${f} masks runner progress tokens before the container step uses them`, () => {
+    it(`${f} runs the container job with Docker's init and no added privileges`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const containerJob = (Object.values(doc.jobs) as any[]).find((j: any) => j.container);
+      expect(String(containerJob.container.options).split(/\s+/)).toContain("--init");
+      expect(String(containerJob.container.options)).not.toMatch(/--privileged|--cap-add|--security-opt|--group-add|--user/);
+    });
+
+    it(`${f} masks runner progress tokens from the event file before consumers use them`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const maskStep = containerJob.steps.find((s: any) => s.name === "Mask runner callback tokens");
+      expect(maskStep).toBeDefined();
+      expect(maskStep.env ?? {}).toEqual(f.includes("implement")
+        ? { AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: "${{ runner.environment }}" } : {});
+      expect(maskStep.run).toContain(".run_progress_token");
+      expect(maskStep.run).toContain("GITHUB_EVENT_PATH");
+      expect(maskStep.run).not.toContain("inputs.run_progress_token");
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
     });
 
-    it(`${f} accepts and masks a dedicated publication token only for the pipeline step`, () => {
+    it(`${f} masks the publication token from the event file and exposes it only to the pipeline`, () => {
       const yaml = readFileSync(f, "utf-8");
       const doc = parse(yaml) as any;
       expect(doc.on.workflow_dispatch.inputs.run_publication_token).toBeDefined();
       expect(doc.on.workflow_dispatch.inputs.run_publication_token.required).toBe(false);
-      expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_publication_token\s*\}\}/);
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
 
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const maskStep = containerJob.steps.find((s: any) => s.name === "Mask runner callback tokens");
+      expect(maskStep.env ?? {}).toEqual(f.includes("implement")
+        ? { AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: "${{ runner.environment }}" } : {});
+      expect(maskStep.run).toContain(".run_publication_token");
+      expect(maskStep.run).not.toContain("inputs.run_publication_token");
+
       const pipelineStep = doc.jobs.implement.steps.find((step: any) => step.name === "Run pipeline");
-      expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBe("${{ inputs.run_publication_token }}");
-      const nonPipelineSteps = doc.jobs.implement.steps.filter((step: any) => step.name !== "Run pipeline");
-      expect(JSON.stringify(nonPipelineSteps)).not.toContain("RUN_PUBLICATION_TOKEN");
+      // Delivered as a masked bootstrap-step output mapped into this step only.
+      expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBe("${{ steps.bootstrap.outputs.run_publication_token }}");
+      const otherSteps = doc.jobs.implement.steps.filter(
+        (step: any) => step.name !== "Run pipeline" && step.name !== "Mask runner callback tokens",
+      );
+      expect(JSON.stringify(otherSteps)).not.toContain("RUN_PUBLICATION_TOKEN");
     });
 
     it(`${f} validates Bedrock config before configuring AWS credentials`, () => {
@@ -208,85 +470,6 @@ describe("GHA workflow shims", () => {
       expect(yaml.indexOf("Validate Bedrock inputs")).toBeLessThan(yaml.indexOf("Configure AWS credentials (Bedrock)"));
     });
   }
-
-  it("comment trigger fires on a /ai-implement prefix and passes the remainder as an instruction", () => {
-    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
-    // Anchored prefix match — not a `contains()` check and not exact-equality.
-    expect(yaml).not.toMatch(/contains\([^)]*\/ai-implement/);
-    expect(yaml).not.toMatch(/body\.trim\(\) === "\/ai-implement"/);
-    expect(yaml).toContain("/^\\/ai-implement(?:\\s+([\\s\\S]*))?$/");
-    expect(yaml).toMatch(/if:\s*needs\.check-trigger\.outputs\.matched == 'true'/);
-    // Remainder is base64-encoded and plumbed through to the runner.
-    expect(yaml).toContain('Buffer.from(instruction, "utf-8").toString("base64")');
-    expect(yaml).toMatch(/comment_instruction:\s*\$\{\{\s*steps\.trigger\.outputs\.comment_instruction\s*\}\}/);
-    expect(yaml).toMatch(/COMMENT_INSTRUCTION_B64:\s*\$\{\{\s*needs\.check-trigger\.outputs\.comment_instruction\s*\}\}/);
-    expect(yaml).toContain('export AI_IMPLEMENT_COMMENT_INSTRUCTION=$(echo "$COMMENT_INSTRUCTION_B64" | base64 -d)');
-  });
-
-  it("comment trigger allows maintainers and preserves the intended missing metadata error", () => {
-    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
-    expect(yaml).toMatch(/\["write", "maintain", "admin"\]/);
-    expect(yaml).toMatch(/core\.setFailed\("PR body has no ai-implement-meta block"\);\n\s+return;/);
-  });
-
-  it("comment trigger validates repository configured runner images with an explicit override variable", () => {
-    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
-    expect(yaml).toMatch(/runner_image:\s*\$\{\{\s*steps\.runner-image\.outputs\.runner_image\s*\}\}/);
-    expect(yaml).toMatch(/image:\s*\$\{\{\s*needs\.check-trigger\.outputs\.runner_image\s*\}\}/);
-    expect(yaml).toMatch(/AI_IMPLEMENT_RUNNER_IMAGE/);
-    expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
-    expect(yaml).toMatch(/invalid characters for a container image reference/);
-    expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
-    expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER/);
-    expect(yaml).toMatch(/ghcr\.io\/\$\{owner\}\//);
-    expect(yaml).toMatch(/contents\/\.ai-implement\/image\.yml/);
-    expect(yaml).not.toMatch(/image\.yml\?ref=/);
-    // The image.yml parse must not abort the job under `set -euo pipefail` (SIGPIPE on multi-match).
-    expect(yaml).toMatch(/head -n1\)" \|\| true/);
-    // Allowlist match must be literal — quoted "$prefix" so glob chars in an operator prefix can't widen it.
-    expect(yaml).toMatch(/\[\[ "\$runner_image" == "\$prefix"\* \]\]/);
-    expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER is empty/);
-  });
-
-  it("comment trigger passes the PR base branch to the runner as GITHUB_DEFAULT_BRANCH", () => {
-    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
-    expect(yaml).toMatch(/default_branch:\s*\$\{\{\s*steps\.pr\.outputs\.default_branch\s*\}\}/);
-    expect(yaml).toMatch(/core\.setOutput\("default_branch", pr\.data\.base\.ref/);
-    expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*needs\.check-trigger\.outputs\.default_branch\s*\}\}/);
-  });
-
-  it("documents and constrains the ISSUE_META eval trust boundary", () => {
-    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
-    expect(yaml).toMatch(/lower_snake_case keys/);
-    expect(yaml).toMatch(/select\(\.key \| IN\("issue_id", "issue_identifier", "issue_title", "issue_description_b64"\)\)/);
-    expect(yaml).not.toMatch(/IN\([^)]*github_token/);
-    expect(yaml).not.toMatch(/IN\([^)]*anthropic_api_key/);
-    expect(yaml).toMatch(/jq @sh quotes values/);
-    expect(yaml).toMatch(/jq -r 'to_entries\[\] \| select/);
-    expect(yaml).toMatch(/@sh/);
-    expect(yaml).toMatch(/ISSUE_DESCRIPTION_B64.*base64 -d/);
-  });
-
-  it("comment trigger grants OIDC only to the container implementation job", () => {
-    const doc = parse(readFileSync("workflows/comment-trigger.yml", "utf-8")) as any;
-    expect(doc.permissions).not.toHaveProperty("id-token");
-    expect(doc.jobs["check-trigger"].permissions).toBeUndefined();
-    expect(doc.jobs.implement.permissions["id-token"]).toBe("write");
-  });
-
-  it("comment trigger acknowledges valid trigger comments", () => {
-    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
-    expect(yaml).toMatch(/Acknowledge trigger/);
-    expect(yaml).toMatch(/createForIssueComment/);
-    expect(yaml).toMatch(/content: "\+1"/);
-  });
-
-  it("comment trigger validates Bedrock config before configuring AWS credentials", () => {
-    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
-    expect(yaml).toMatch(/Validate Bedrock inputs/);
-    expect(yaml).toMatch(/AI_IMPLEMENT_AWS_REGION repository or organization variable is empty/);
-    expect(yaml.indexOf("Validate Bedrock inputs")).toBeLessThan(yaml.indexOf("Configure AWS credentials (Bedrock)"));
-  });
 
   for (const f of PLANNING_WORKFLOWS) {
     it(`${f} accepts run_config as the required envelope input and passes it through as AI_IMPLEMENT_RUN_CONFIG`, () => {
@@ -334,8 +517,12 @@ describe("GHA workflow shims", () => {
 
     it(`${f} wires run tokens to the entrypoint env`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/RUN_TOKEN:\s*\$\{\{\s*inputs\.run_token\s*\}\}/);
-      expect(yaml).toMatch(/RUN_PROGRESS_TOKEN:\s*\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      expect(yaml).toMatch(/RUN_TOKEN:\s*\$\{\{\s*steps\.bootstrap\.outputs\.run_token\s*\}\}/);
+      expect(yaml).toMatch(/RUN_PROGRESS_TOKEN:\s*\$\{\{\s*steps\.bootstrap\.outputs\.run_progress_token\s*\}\}/);
+      const doc = parse(yaml);
+      const bootstrap = doc.jobs.plan.steps.find((s: any) => s.name === "Mask runner callback tokens");
+      expect(bootstrap.run).toContain("RUN_TOKEN");
+      expect(bootstrap.run).toContain("RUN_PROGRESS_TOKEN");
       expect(yaml).not.toMatch(/run_publication_token/);
       expect(yaml).not.toMatch(/RUN_PUBLICATION_TOKEN/);
     });
@@ -345,6 +532,64 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/configure-aws-credentials/);
       expect(yaml).toMatch(/if:\s*inputs\.provider == 'bedrock'/);
       expect(yaml).toMatch(/role-session-duration:\s*14400/);
+    });
+  }
+
+  // Print dispatch inputs step tests (BAC-25597)
+  for (const f of IMPLEMENT_WORKFLOWS) {
+    it(`${f} masks tokens before Print dispatch inputs in the implement job`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      expect(doc.jobs.implement.steps[0].name).toBe("Mask runner callback tokens");
+      expect(doc.jobs.implement.steps[1].name).toBe("Validate attempt correlation");
+      expect(doc.jobs.implement.steps[2].name).toBe("Print dispatch inputs");
+    });
+
+    it(`${f} Print dispatch inputs never passes run_token or run_progress_token as raw expressions`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const printStep = doc.jobs.implement.steps.find((step: any) => step.name === "Print dispatch inputs");
+      expect(printStep.name).toBe("Print dispatch inputs");
+      const stepStr = JSON.stringify(printStep);
+      expect(stepStr).not.toContain("inputs.run_token }}");
+      expect(stepStr).not.toContain("inputs.run_progress_token }}");
+      expect(stepStr).not.toContain("inputs.run_publication_token }}");
+    });
+  }
+
+  for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} masks tokens before Print dispatch inputs in the plan job`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      expect(doc.jobs.plan.steps[0].name).toBe("Mask runner callback tokens");
+      expect(doc.jobs.plan.steps[1].name).toBe("Print dispatch inputs");
+    });
+
+    it(`${f} Print dispatch inputs never passes run_token as a raw expression`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const printStep = doc.jobs.plan.steps.find((step: any) => step.name === "Print dispatch inputs");
+      expect(printStep.name).toBe("Print dispatch inputs");
+      const stepStr = JSON.stringify(printStep);
+      expect(stepStr).not.toContain("inputs.run_token }}");
+    });
+  }
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} image-resolution step echoes the resolved runner_image on success`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain("[dispatch-inputs] resolved runner_image: $runner_image");
+    });
+
+    // provider/aws_region are top-level inputs (they gate the OIDC step before run_config
+    // is decoded) and the runner reads them from env — run-autonomous.ts does
+    // `env.PROVIDER || "anthropic"` — so a template that drops them from the entrypoint
+    // env silently downgrades every Bedrock repo to the anthropic provider.
+    it(`${f} forwards provider and aws_region to the entrypoint env`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const pipelineStep = containerJob.steps.find(
+        (s: any) => s.name === "Run pipeline" || s.name === "Run planning",
+      );
+      expect(pipelineStep.env.PROVIDER).toBe("${{ inputs.provider }}");
+      expect(pipelineStep.env.AWS_REGION).toBe("${{ inputs.aws_region }}");
     });
   }
 });

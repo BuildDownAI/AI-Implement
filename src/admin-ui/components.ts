@@ -114,10 +114,20 @@ export const componentsCss = `
   align-items: center;
   gap: 10px;
   padding: 8px;
-  border-radius: var(--r-sm);
-  cursor: pointer;
 }
-.sidebar-user:hover { background: var(--bg-hover); }
+.sidebar-user-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px 8px;
+}
+/* Squared to the avatar above so the two column-align; the default icon padding insets the glyph. */
+.sidebar-user-actions .btn-icon {
+  width: 24px; height: 24px;
+  padding: 0;
+  justify-content: center;
+}
+.sidebar-user-actions .btn-danger { background: transparent; border-color: transparent; }
 .sidebar-user .avatar {
   width: 24px; height: 24px;
   border-radius: 6px;
@@ -130,10 +140,12 @@ export const componentsCss = `
   font-size: 12.5px;
   font-weight: 500;
   color: var(--fg-primary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .sidebar-user .user-email {
   font-size: 11px;
-  color: var(--fg-tertiary);
+  color: var(--fg-secondary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
 /* ── Main content area ─────────────────────────────────────── */
@@ -146,6 +158,7 @@ export const componentsCss = `
 
 .page-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   padding: 20px 32px 18px;
@@ -153,7 +166,8 @@ export const componentsCss = `
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-app);
 }
-.page-header-left { min-width: 0; }
+/* The title side keeps a readable width; below it the actions wrap underneath instead of squeezing the subtitle. */
+.page-header-left { min-width: 0; flex: 1 1 320px; }
 .page-title {
   font-size: 17px;
   font-weight: 600;
@@ -269,7 +283,37 @@ export const componentsCss = `
   margin-top: 2px;
 }
 .card-body { padding: 16px 18px; }
-.card-body.tight { padding: 0; }
+.tbl-scroll { max-width: 100%; overflow-x: auto; }
+.tbl-scroll .tbl th, .tbl-scroll .tbl td { white-space: nowrap; }
+.card-body.tight { padding: 0; overflow-x: auto; }
+
+/* A card that IS the control — a real <button>, so focus and Enter/Space come with the element. */
+.card-action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  padding: 16px 18px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: background 80ms ease, border-color 80ms ease;
+}
+.card-action:hover { background: var(--bg-active); border-color: var(--accent); }
+.card-action:focus-visible { outline: none; border-color: var(--border-focus); box-shadow: var(--shadow-focus); }
+.card-action-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-primary);
+}
+.card-action-title .svg-icon { margin-left: auto; flex: none; color: var(--accent); }
+.card-action:hover .card-action-title .svg-icon { color: var(--accent-hover); }
 
 /* ── KPI tiles ─────────────────────────────────────────────── */
 .kpi-grid {
@@ -398,16 +442,21 @@ export const componentsCss = `
   font-variant-numeric: tabular-nums;
 }
 .tbl tbody tr:last-child td { border-bottom: none; }
-.tbl tbody tr {
-  cursor: pointer;
-  transition: background 80ms ease;
-}
+.tbl tbody tr { transition: background 80ms ease; }
+/* Only a row that opens something shows the pointer; today that is a job row, which opens the drawer. */
+.tbl tbody tr[data-job-id] { cursor: pointer; }
 .tbl tbody tr:hover { background: var(--bg-hover); }
 .tbl tbody tr.active { background: var(--bg-active); }
 .tbl tbody tr.failed-row td { background: rgba(220, 38, 38, 0.025); }
 .tbl tbody tr.failed-row:hover td { background: rgba(220, 38, 38, 0.05); }
 .tbl tbody tr.redispatch-row td { background: var(--st-warn-bg); }
 .tbl tbody tr.redispatch-row:hover td { background: var(--bg-hover); }
+.tbl tbody tr.row-new td { background: var(--st-success-bg); }
+.tbl tbody tr.row-new td:first-child { box-shadow: inset 3px 0 0 var(--st-success-dot); }
+.tbl tbody tr.row-changed td { background: var(--st-warn-bg); }
+.tbl tbody tr.row-changed td:first-child { box-shadow: inset 3px 0 0 var(--st-warn-dot); }
+.tbl tbody tr.row-new:hover td,
+.tbl tbody tr.row-changed:hover td { background: var(--bg-hover); }
 
 .mono {
   font-family: var(--font-mono);
@@ -488,6 +537,37 @@ export const componentsCss = `
   color: var(--fg-tertiary);
   line-height: 1.45;
 }
+
+/* The marker is drawn here because the native one cannot be styled across browsers. */
+.explain { margin-top: 2px; }
+.explain > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent);
+}
+.explain > summary::-webkit-details-marker { display: none; }
+.explain > summary::before {
+  content: "›";
+  font-size: 15px;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+.explain[open] > summary::before { transform: rotate(90deg); }
+.explain > summary:hover { color: var(--accent-hover); }
+.explain-body {
+  font-size: 12px;
+  color: var(--fg-secondary);
+  line-height: 1.6;
+  margin-top: 8px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-subtle);
+}
+.explain-body + .explain-body { margin-top: 10px; }
 .input, .select, .textarea {
   width: 100%;
   background: var(--bg-elev);
@@ -796,17 +876,21 @@ export const componentsCss = `
 /* ── Stepper (new project flow) ────────────────────────────── */
 .stepper {
   display: flex;
-  align-items: center;
-  gap: 0;
-  padding: 16px 24px;
-  border-bottom: 1px solid var(--border-subtle);
+  flex-direction: column;
+  gap: 2px;
+  padding: 16px 12px;
+  border-right: 1px solid var(--border-subtle);
+  overflow-y: auto;
 }
 .stepper-step {
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 0;
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--r-sm);
   color: var(--fg-tertiary);
   font-size: 12px;
   font-weight: 500;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .stepper-step .num {
   width: 20px; height: 20px;
@@ -818,7 +902,7 @@ export const componentsCss = `
   font-variant-numeric: tabular-nums;
   font-weight: 600;
 }
-.stepper-step.active { color: var(--fg-primary); }
+.stepper-step.active { color: var(--fg-primary); background: var(--bg-hover); }
 .stepper-step.active .num {
   background: var(--accent);
   border-color: var(--accent);
@@ -828,12 +912,6 @@ export const componentsCss = `
   background: var(--accent-soft);
   border-color: var(--accent-soft);
   color: var(--accent-soft-fg);
-}
-.stepper-divider {
-  flex: 1;
-  height: 1px;
-  background: var(--border-subtle);
-  margin: 0 14px;
 }
 
 /* ── Misc ──────────────────────────────────────────────────── */
@@ -963,7 +1041,7 @@ deck-stage, .dc-artboard { background: var(--bg-app); }
 .ac-row { display: flex; gap: 8px; }
 .ac-row .input { flex: 1; min-width: 0; }
 
-/* ── Native <dialog> for legacy mapping form ─────────────────────────── */
+/* ── Native <dialog> shell for the project mapping form ──────────────── */
 dialog {
   border: none;
   border-radius: var(--r-md);
@@ -973,6 +1051,15 @@ dialog {
   background: var(--bg-elev);
   color: var(--fg-primary);
   box-shadow: var(--shadow-lg);
+  /* Top-pinned rather than UA-centred, so a content height change cannot shift it. */
+  margin-top: 7vh;
+  margin-bottom: auto;
+  max-height: 86vh;
+}
+/* Scoped to [open]: a bare display here beats the UA rule that hides a closed dialog. */
+dialog[open] {
+  display: flex;
+  flex-direction: column;
 }
 dialog::backdrop { background: rgba(0,0,0,0.5); }
 .md-header {
@@ -989,13 +1076,9 @@ dialog::backdrop { background: rgba(0,0,0,0.5); }
   display: flex;
   flex-direction: column;
   gap: 12px;
-  max-height: 70vh;
+  flex: 0 1 auto;
+  min-height: 0;
   overflow-y: auto;
-}
-.md-cols {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
 }
 .md-footer {
   padding: 12px 20px;
@@ -1003,42 +1086,6 @@ dialog::backdrop { background: rgba(0,0,0,0.5); }
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-}
-.md-field {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  margin-bottom: 8px;
-}
-.md-field:last-child { margin-bottom: 0; }
-.md-field label {
-  font-size: 11px;
-  color: var(--fg-secondary);
-  font-weight: 500;
-}
-.md-field input,
-.md-field select,
-.md-field textarea {
-  width: 100%;
-  background: var(--bg-elev);
-  border: 1px solid var(--border-default);
-  border-radius: var(--r-sm);
-  padding: 7px 10px;
-  font-size: 12.5px;
-  color: var(--fg-primary);
-  transition: border-color 80ms ease, box-shadow 80ms ease;
-}
-.md-field input:focus,
-.md-field select:focus,
-.md-field textarea:focus {
-  outline: none;
-  border-color: var(--border-focus);
-  box-shadow: var(--shadow-focus);
-}
-.md-field textarea {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  resize: vertical;
 }
 
 /* ── Legacy button class aliases (preserved during ported-page migration) */
@@ -1090,4 +1137,39 @@ button.secondary,
   color: var(--fg-tertiary);
   font-weight: 500;
 }
+/* A setup check stacked for a narrow container (window.setupCheckItem), at 12px so it reads after the settings it sits beside. */
+.setup-check-item {
+  padding: 9px 12px;
+  font-size: 12px;
+  color: var(--fg-secondary);
+}
+.setup-check-title { color: var(--fg-primary); }
+.setup-check-id { font-size: 10.5px; color: var(--fg-tertiary); margin-top: 2px; overflow-wrap: anywhere; }
+/* What was found and the fix, each labeled as the Setup page's columns are, the labels in a gutter so both texts line up. */
+.setup-check-line {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  gap: 6px;
+  margin-top: 5px;
+}
+.setup-check-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-primary);
+  padding-top: 1px;
+}
+/* A Review section's checks: a card under its settings, headed so what they are is said, the checks on a sunken body. */
+.np-review-checks .card { margin-top: 10px; }
+.np-checks-card .card-header { padding: 8px 12px; }
+.np-checks-card .card-title { font-size: 12px; font-weight: 500; color: var(--fg-secondary); }
+.np-checks-body { background: var(--bg-sunken); }
+/* Every other check a step lighter, mixed from the theme's own colors so the step reads alike in both themes.
+   The caller marks which items are shaded, so a fold between them does not break the alternation. */
+.setup-check-item.shaded { background: color-mix(in srgb, var(--bg-sunken), var(--fg-primary) 3%); }
+.np-review-fold { padding: 4px 6px; }
+.np-review-note { padding: 8px 12px; color: var(--fg-secondary); font-size: 12px; }
+/* A Review section's explanation, under its heading. */
+.np-review-lead { font-size: 12px; color: var(--fg-tertiary); margin: -4px 0 8px; }
 `;

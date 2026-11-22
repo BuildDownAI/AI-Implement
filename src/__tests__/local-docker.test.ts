@@ -3,11 +3,13 @@ import {
   buildDockerEnvFileContent,
   buildDockerRunArgs,
   buildLocalRunnerEnv,
+  startLocalRunnerContainer,
   selectSweepableContainers,
   splitLocalRunnerEnv,
 } from "../local-docker.js";
 import type { LocalRunnerInput } from "../local-docker.js";
-import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import { encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, type RunConfigV1 } from "../run-config.js";
+import { testTempRoot } from "./helpers/test-dir.js";
 
 const baseInput: LocalRunnerInput = {
   image: "ai-implement-runner:local",
@@ -40,8 +42,17 @@ describe("buildLocalRunnerEnv", () => {
     expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
     expect(env.ORCHESTRATOR_URL).toBe("http://host.docker.internal:8080");
-    expect(env.SESSION_MODE).toBe("autonomous");
+    expect(env).not.toHaveProperty("SESSION_MODE");
   });
+
+  it.each([undefined, "autonomous", "hybrid", "shadow", ""])(
+    "ignores deprecated sessionMode %j",
+    (sessionMode) => {
+      const env = buildLocalRunnerEnv({ ...baseInput, sessionMode });
+      expect(env).toEqual(buildLocalRunnerEnv(baseInput));
+      expect(env).not.toHaveProperty("SESSION_MODE");
+    },
+  );
 
   it("uses OAuth when provided instead of requiring an Anthropic key", () => {
     const env = buildLocalRunnerEnv({
@@ -67,10 +78,10 @@ describe("buildLocalRunnerEnv", () => {
   it("lets mapping extraEnv override defaults", () => {
     const env = buildLocalRunnerEnv({
       ...baseInput,
-      extraEnv: { SESSION_MODE: "hybrid", CUSTOM_VAR: "ok" },
+      extraEnv: { ISSUE_ID: "override", CUSTOM_VAR: "ok" },
     });
 
-    expect(env.SESSION_MODE).toBe("hybrid");
+    expect(env.ISSUE_ID).toBe("override");
     expect(env.CUSTOM_VAR).toBe("ok");
   });
 
@@ -189,7 +200,7 @@ describe("buildLocalRunnerEnv", () => {
         ...baseInput,
         extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
       });
-      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as Record<string, unknown>;
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as unknown as Record<string, unknown>;
       expect(decoded.SESSION_TOKEN).toBeUndefined();
       expect(decoded.GITHUB_TOKEN).toBeUndefined();
       expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();
@@ -223,6 +234,26 @@ describe("buildDockerRunArgs", () => {
   });
 });
 
+describe("buildDockerRunArgs default name", () => {
+  it("keeps the issue-key name when no containerName is given", () => {
+    const args = buildDockerRunArgs(baseInput);
+    expect(args[args.indexOf("--name") + 1]).toMatch(/^ai-implement-eng-42-[a-z0-9]+$/);
+  });
+});
+
+describe("startLocalRunnerContainer", () => {
+  it("calls the launch marker only after local preparation succeeds", async () => {
+    // The secret env file's directory is created under os.tmpdir(), which reads the temp variables per call.
+    testTempRoot("local-docker");
+    let marked = false;
+    await expect(startLocalRunnerContainer({
+      ...baseInput,
+      onBeforeLaunch: () => { marked = true; throw new Error("stop before docker"); },
+    })).rejects.toThrow("stop before docker");
+    expect(marked).toBe(true);
+  });
+});
+
 describe("splitLocalRunnerEnv", () => {
   it("separates secrets from public docker argv env", () => {
     const { publicEnv, secretEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv(baseInput));
@@ -235,6 +266,53 @@ describe("splitLocalRunnerEnv", () => {
     // The App private key is gone entirely — present in neither map.
     expect(publicEnv.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
     expect(secretEnv.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
+  });
+
+  it("keeps RUN_PROGRESS_TOKEN out of docker argv env", () => {
+    const { publicEnv, secretEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv({
+      ...baseInput,
+      extraEnv: { RUN_PROGRESS_TOKEN: "progress-token" },
+    }));
+
+    expect(publicEnv.RUN_PROGRESS_TOKEN).toBeUndefined();
+    expect(secretEnv.RUN_PROGRESS_TOKEN).toBe("progress-token");
+  });
+
+  it("keeps RUN_PUBLICATION_TOKEN out of docker argv env", () => {
+    const { publicEnv, secretEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv({
+      ...baseInput,
+      runPublicationToken: "publication-token",
+    }));
+
+    expect(publicEnv.RUN_PUBLICATION_TOKEN).toBeUndefined();
+    expect(secretEnv.RUN_PUBLICATION_TOKEN).toBe("publication-token");
+  });
+
+  it("sets the progress and publication tokens only when non-empty", () => {
+    const set = buildLocalRunnerEnv({
+      ...baseInput,
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+    });
+    expect(set.RUN_PROGRESS_TOKEN).toBe("progress-token");
+    expect(set.RUN_PUBLICATION_TOKEN).toBe("publication-token");
+
+    for (const overrides of [{ runProgressToken: "", runPublicationToken: "" }, {}]) {
+      const env = buildLocalRunnerEnv({ ...baseInput, ...overrides });
+      expect(env).not.toHaveProperty("RUN_PROGRESS_TOKEN");
+      expect(env).not.toHaveProperty("RUN_PUBLICATION_TOKEN");
+    }
+  });
+
+  it("extraEnv overrides the progress and publication tokens", () => {
+    const env = buildLocalRunnerEnv({
+      ...baseInput,
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+      extraEnv: { RUN_PROGRESS_TOKEN: "extra-progress", RUN_PUBLICATION_TOKEN: "extra-publication" },
+    });
+    expect(env.RUN_PROGRESS_TOKEN).toBe("extra-progress");
+    expect(env.RUN_PUBLICATION_TOKEN).toBe("extra-publication");
   });
 });
 
@@ -273,5 +351,80 @@ describe("selectSweepableContainers", () => {
     const fresh = exited("d".repeat(64), "n", "Exited (0) 10 seconds ago");
     const subSecond = exited("e".repeat(64), "n", "Exited (0) Less than a second ago");
     expect(selectSweepableContainers([fresh, subSecond], [])).toEqual([]);
+  });
+});
+
+describe("protected model auth (AII-1390)", () => {
+  const BEARER = "B".repeat(43);
+  const bootstrap = {
+    version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1", projectKey: "AII",
+    backend: "local", expiresAt: 1, bearer: BEARER, bindings: [{ stage: "implementation", profileId: "cdx", profileRevision: 1, authMode: "codex-subscription" }],
+  } as unknown as NonNullable<LocalRunnerInput["protectedModelAuth"]>["bootstrap"];
+  const runConfig: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "ENG-42", title: "t", description: "d" } } as RunConfigV1;
+  const protectedInput: LocalRunnerInput = {
+    ...baseInput,
+    anthropicApiKey: undefined,
+    protectedModelAuth: { bootstrap, projectKey: "AII", runConfig, modelAuthUrl: "http://host.docker.internal:8080" },
+  };
+
+  it("keeps the bearer, run config and model-auth values out of argv and in the env file", () => {
+    const env = buildLocalRunnerEnv(protectedInput);
+    const args = buildDockerRunArgs({ ...protectedInput, containerName: "c" }, "/tmp/x.env").join("\n");
+    expect(args).not.toContain(BEARER);
+    expect(args).not.toContain("AI_IMPLEMENT_RUN_CONFIG");
+    expect(args).not.toContain("AI_IMPLEMENT_MODEL_AUTH");
+    const { secretEnv } = splitLocalRunnerEnv(env, { protectedModelAuth: true });
+    const content = buildDockerEnvFileContent(secretEnv);
+    expect(content).toContain("AI_IMPLEMENT_MODEL_AUTH_URL=http://host.docker.internal:8080");
+    expect(content).toContain("AI_IMPLEMENT_MODEL_AUTH_BACKEND=local");
+    expect(content).toContain("AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID=d1");
+    expect(content).toContain("AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY=AII");
+    const rc = decodeTrustedRunConfig(secretEnv.AI_IMPLEMENT_RUN_CONFIG!);
+    expect(rc.credentials?.modelAuthGrant).toMatchObject({ bearer: BEARER, backend: "local" });
+  });
+
+  it("applies authoritative values after extraEnv", () => {
+    const env = buildLocalRunnerEnv({ ...protectedInput, extraEnv: { ISSUE_ID: "override" } });
+    expect(env.ISSUE_ID).toBe("override");
+    expect(env.AI_IMPLEMENT_MODEL_AUTH_URL).toBe("http://host.docker.internal:8080");
+  });
+
+  it.each(["AI_IMPLEMENT_MODEL_AUTH_URL", "ai_implement_run_config", "OPENAI_API_KEY"])(
+    "rejects extraEnv %s without echoing the value",
+    (name) => {
+      expect(() => buildLocalRunnerEnv({ ...protectedInput, extraEnv: { [name]: "leak-me" } })).toThrow(/rejected/);
+      try { buildLocalRunnerEnv({ ...protectedInput, extraEnv: { [name]: "leak-me" } }); } catch (e) {
+        expect((e as Error).message).not.toContain("leak-me");
+      }
+    },
+  );
+
+  it("rejects legacy credentials and a pre-set grant", () => {
+    expect(() => buildLocalRunnerEnv({ ...protectedInput, anthropicApiKey: "sk-ant" })).toThrow(/rejected/);
+    expect(() => buildLocalRunnerEnv({ ...protectedInput, claudeOAuthToken: "tok" })).toThrow(/rejected/);
+    expect(() => buildLocalRunnerEnv({
+      ...protectedInput,
+      protectedModelAuth: { ...protectedInput.protectedModelAuth!, runConfig: { ...runConfig, credentials: { version: 1, modelAuthGrant: bootstrap } } as RunConfigV1 },
+    })).toThrow(/rejected/);
+  });
+
+  it("legacy input keeps today's docker run args, extraEnv last", () => {
+    const args = buildDockerRunArgs({ ...baseInput, containerName: "c", extraEnv: { ISSUE_ID: "override", FOO: "bar" } }, "/tmp/x.env");
+    expect(args).toEqual([
+      "run", "-d", "--name", "c", "--add-host", "host.docker.internal:host-gateway", "--env-file", "/tmp/x.env",
+      "-e", "AI_IMPLEMENT_MODE=local",
+      "-e", "ISSUE_ID=override",
+      "-e", "ISSUE_IDENTIFIER=ENG-42",
+      "-e", "ISSUE_TITLE=Add local mode",
+      "-e", "ISSUE_DESCRIPTION=Run implementation jobs locally",
+      "-e", "GITHUB_OWNER=BuildDownAI",
+      "-e", "GITHUB_REPO=AI-Implement",
+      "-e", "GITHUB_DEFAULT_BRANCH=main",
+      "-e", "MACHINE_NONCE=nonce-123",
+      "-e", "RUNNER_PHASE=implementation",
+      "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8080",
+      "-e", "FOO=bar",
+      "ai-implement-runner:local",
+    ]);
   });
 });

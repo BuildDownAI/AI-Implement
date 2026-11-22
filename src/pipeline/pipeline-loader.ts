@@ -1,8 +1,12 @@
 import { readFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
-import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
+import { hasResolvableCustomModule, resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
+import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./steps/kg-tracker-data.js";
+import { skillAgentsForSnapshot } from "./steps/install-skills.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",
@@ -19,6 +23,7 @@ interface YamlStep {
   id: string;
   type: StepType;
   moduleId?: string;
+  depth?: number | "full";
 }
 
 interface YamlPipeline {
@@ -29,6 +34,8 @@ interface YamlPipeline {
 export interface LoadPipelineOptions extends ResolveModuleOptions {
   /** Injectable fs.readFileSync for testing. */
   readFileSyncImpl?: (path: string, encoding: "utf-8") => string;
+  /** Injectable import function for the custom-override check (testing). Receives a file:// URL. */
+  importFn?: (url: string) => Promise<unknown>;
 }
 
 function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
@@ -51,7 +58,7 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
     if (!step || typeof step !== "object") {
       throw new Error(`Pipeline YAML at "${sourcePath}" step[${i}] is not an object`);
     }
-    const { id: stepId, type, moduleId } = step as Record<string, unknown>;
+    const { id: stepId, type, moduleId, depth } = step as Record<string, unknown>;
     if (typeof stepId !== "string" || !stepId) {
       throw new Error(`Pipeline YAML at "${sourcePath}" step[${i}] missing 'id'`);
     }
@@ -64,7 +71,24 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
     if (moduleId !== undefined && typeof moduleId !== "string") {
       throw new Error(`Pipeline YAML at "${sourcePath}" step "${stepId}" has non-string 'moduleId'`);
     }
-    return { id: stepId, type: type as StepType, ...(moduleId ? { moduleId } : {}) };
+    let parsedDepth: number | "full" | undefined;
+    if (depth !== undefined) {
+      if (depth === "full") {
+        parsedDepth = "full";
+      } else if (typeof depth === "number" && Number.isInteger(depth) && depth > 0) {
+        parsedDepth = depth;
+      } else {
+        throw new Error(
+          `Pipeline YAML at "${sourcePath}" step "${stepId}" has invalid 'depth': expected a positive integer or "full"`,
+        );
+      }
+    }
+    return {
+      id: stepId,
+      type: type as StepType,
+      ...(moduleId ? { moduleId } : {}),
+      ...(parsedDepth !== undefined ? { depth: parsedDepth } : {}),
+    };
   });
 
   return { id, steps: parsedSteps };
@@ -77,10 +101,51 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 /**
+ * True only when both the first install attempt and its retry (after
+ * feedback-loop) failed. A skipped install-retry (first install succeeded)
+ * leaves empty outputs, so this is false in that case.
+ */
+export function dependenciesMissing(ctx: PipelineContext): boolean {
+  return (
+    ctx.getOutputs("install").installFailed === true &&
+    ctx.getOutputs("install-retry").installFailed === true
+  );
+}
+
+/**
+ * Whether the registered post-push-review step would skip for this context.
+ * Shared by the step's own `skip` wiring below and by run-autonomous.ts's
+ * "is post-push-review authoritative" check, so the same skip contract
+ * cannot go stale in one copy while the other is updated (AII-886).
+ */
+export function shouldSkipPostPushReview(ctx: PipelineContext): boolean {
+  // Gap-fill runs update an existing PR and retain their established
+  // review flow; do not start a second post-push review cycle here.
+  if (ctx.data.reviewOnly || ctx.data.prNumber) return true;
+  // Never run further review/force-push cycles against an unapproved
+  // draft — the review budget is already exhausted.
+  if (ctx.getOutputs("feedback-loop").approved !== true) return true;
+  // The run is not verified when dependencies never installed; leave the PR
+  // for a human rather than running a review cycle against it.
+  if (dependenciesMissing(ctx)) return true;
+  const pushOutputs = ctx.getOutputs("push");
+  return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
+}
+
+/**
  * Standard input wiring for the autonomous pipeline steps. Applied by step ID
  * so the YAML only needs to declare IDs, types, and optional moduleIds.
  */
-function applyWiring(step: YamlStep): StepDefinition {
+function applyWiring(step: YamlStep, options?: LoadPipelineOptions): StepDefinition {
+  const wired = applyNormalWiring(step, options);
+  const normalSkip = wired.skip;
+  return { ...wired, skip: (ctx) => {
+    if (ctx.data.reviewOnly && !["clone", "feedback-loop"].includes(step.id)) return "review-only";
+    return normalSkip ? normalSkip(ctx) : false;
+  } };
+}
+
+function applyNormalWiring(step: YamlStep, options?: LoadPipelineOptions): StepDefinition {
   switch (step.id) {
     case "clone":
       return {
@@ -95,7 +160,22 @@ function applyWiring(step: YamlStep): StepDefinition {
           prNumber: ctx.data.prNumber,
           orchestratorUrl: ctx.data.orchestratorUrl,
           machineNonce: ctx.data.nonce,
+          callbackUrl: ctx.data.callbackUrl,
+          depth: step.depth,
         }),
+      };
+
+    case "reference-repos":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          referenceRepos: ctx.data.referenceRepos,
+          callbackUrl: ctx.data.callbackUrl,
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.referenceRepos?.length,
       };
 
     case "install-skills":
@@ -104,6 +184,7 @@ function applyWiring(step: YamlStep): StepDefinition {
         inputs: (ctx: PipelineContext) => ({
           skillsRepoUrl: ctx.data.skillsRepo ?? "",
           githubToken: ctx.getOutputs("clone").githubToken,
+          agents: skillAgentsForSnapshot(ctx.data.agentConfig),
         }),
         skip: (ctx: PipelineContext) => !ctx.data.skillsRepo,
       };
@@ -129,6 +210,18 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "install-retry":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          packageManager: ctx.getOutputs("install").packageManager,
+          retry: true,
+        }),
+        skip: (ctx: PipelineContext) =>
+          ctx.getOutputs("install").installFailed === true ? false : "first install succeeded",
+      };
+
     case "setup":
       return {
         ...step,
@@ -143,20 +236,30 @@ function applyWiring(step: YamlStep): StepDefinition {
       return {
         ...step,
         inputs: (ctx: PipelineContext) => {
-          const repoModels = ctx.getOutputs("install").repoModels as
+          const installOutputs = ctx.getOutputs("install");
+          const repoModels = installOutputs.repoModels as
             | { implement?: string; review?: string }
             | undefined;
+          const referenceRepoOutputs = ctx.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] };
           return {
             workspaceDir: ctx.getOutputs("clone").workspaceDir,
             issueTitle: ctx.data.issueTitle,
             issueDescription: ctx.data.issueDescription,
             implementationPrompt: ctx.data.implementationPrompt,
             planningContext: ctx.data.planningContext,
+            referenceRepoResults: referenceRepoOutputs.results,
             repoImplementModel: repoModels?.implement,
             repoReviewModel: repoModels?.review,
             provider: ctx.data.provider,
             maxTurns: ctx.data.maxTurns,
             maxIterations: ctx.data.maxIterations,
+            reviewRubric: ctx.data.reviewRubric,
+            installFailed: installOutputs.installFailed === true,
+            verifyScriptPath: ctx.data.hooks?.verify,
+            installMethod:
+              typeof installOutputs.installMethod === "string" ? installOutputs.installMethod : undefined,
+            installError:
+              typeof installOutputs.installError === "string" ? installOutputs.installError : undefined,
           };
         },
       };
@@ -168,7 +271,11 @@ function applyWiring(step: YamlStep): StepDefinition {
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
           packageManager: ctx.getOutputs("install").packageManager,
         }),
-        skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
+        skip: (ctx: PipelineContext) => {
+          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
+          if (dependenciesMissing(ctx)) return "dependency install failed";
+          return false;
+        },
       };
 
     case "push":
@@ -207,10 +314,12 @@ function applyWiring(step: YamlStep): StepDefinition {
             existingPrNumber,
             baseBranch: checkedOutBranch,
             baseRef: cloneOutputs.clonedRef,
-            prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
+            prTitle: ctx.data.assigneeName
+              ? `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle} (${ctx.data.assigneeName})`
+              : `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
             sensitiveFiles: ctx.data.sensitiveFiles,
             groupingParent: ctx.data.groupingParent,
-            draft: !approved,
+            draft: !approved || dependenciesMissing(ctx),
             reviewSummary: approved
               ? undefined
               : {
@@ -229,11 +338,21 @@ function applyWiring(step: YamlStep): StepDefinition {
         ...step,
         inputs: (ctx: PipelineContext) => ({
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
-          scriptPath: ctx.data.hooks?.verify,
         }),
-        skip: (ctx: PipelineContext) => {
-          if (!ctx.data.hooks?.verify) return true;
-          return ctx.getOutputs("feedback-loop").approved !== true;
+        // The built-in hook runs inside feedback-loop (after each implement pass, before its
+        // review). This step skips, in order: (1) no `verify:` hook, (2) the loop did not
+        // approve, (3) dependencies missing, (4) no `custom/steps/verify.ts` override.
+        // `runner.ts` evaluates `skip` before it loads the module, so an override only runs
+        // when all four pass: it then runs after push. No `scriptPath` is passed, because the
+        // loop already ran the hook; an override that wants it again reads
+        // `context.data.hooks.verify` itself. The built-in `steps/verify.ts` stays registered
+        // as the fallback module for that path.
+        skip: async (ctx: PipelineContext) => {
+          if (!ctx.data.hooks?.verify) return "no verify hook configured";
+          if (ctx.getOutputs("feedback-loop").approved !== true) return "feedback loop did not approve";
+          if (dependenciesMissing(ctx)) return "dependencies missing";
+          // Same rule as resolveModuleImport: a custom file with no default export is no override.
+          return (await hasResolvableCustomModule("steps/verify", options)) ? false : "verify hook runs inside feedback-loop";
         },
       };
 
@@ -245,16 +364,174 @@ function applyWiring(step: YamlStep): StepDefinition {
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
           reviewProviders: ctx.getOutputs("install").reviewProviders,
           reviewCheckNames: ctx.getOutputs("install").reviewCheckNames,
+          reviewers: ctx.data.reviewers,
+          reviewProcess: ctx.data.reviewProcess,
+          trustedReviewAuthors: ctx.data.trustedReviewAuthors,
+          trustedReviewerDefinitions: ctx.data.trustedReviewerDefinitions,
+          reviewerDefinitions: ctx.getOutputs("install").reviewers,
+          trustedConfigReviewerDefinitions: ctx.getOutputs("install").trustedConfigReviewers,
+          pushedSha: ctx.getOutputs("push").commitSha ?? undefined,
         }),
+        skip: shouldSkipPostPushReview,
+      };
+
+    case "kg-tracker-data":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          callbackUrl: ctx.data.callbackUrl,
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
+        }),
+      };
+
+    case "kg-scope-reconcile":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          callbackUrl: ctx.data.callbackUrl,
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          dryRun: ctx.data.kgDryRun === true,
+          // The KG repo is mapped in the orchestrator too; it must not become its own secondary.
+          selfRepoSlug: (() => {
+            const c = ctx.getOutputs("clone");
+            return typeof c.repoOwner === "string" && typeof c.repoRepo === "string" && c.repoOwner && c.repoRepo
+              ? `${c.repoOwner}/${c.repoRepo}`
+              : undefined;
+          })(),
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
+        }),
+      };
+
+    case "clone-code-repo": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const codeRepo = readCodeRepoFromSourcesYml(workspaceDir);
+          const slug = codeRepo?.slug ?? "";
+          const slashIdx = slug.indexOf("/");
+          const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
+          const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
+          return {
+            repoOwner,
+            repoRepo,
+            branch: codeRepo?.branch ?? "",
+            githubToken: "",
+            workspaceDir,
+            targetDir: "code-repo",
+            depth: step.depth,
+          };
+        },
         skip: (ctx: PipelineContext) => {
-          // Gap-fill runs update an existing PR and retain their established
-          // review flow; do not start a second post-push review cycle here.
-          if (ctx.data.prNumber) return true;
-          // Never run further review/force-push cycles against an unapproved
-          // draft — the review budget is already exhausted.
-          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
-          const pushOutputs = ctx.getOutputs("push");
-          return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          if (readCodeRepoFromSourcesYml(workspaceDir) === null) {
+            console.warn("[clone-code-repo] sources.yml has no code_repo.slug — skipping");
+            return "no code_repo configured in sources.yml";
+          }
+          // Skip if dependency-auth did not acquire a token: without a git credential
+          // helper the clone would fail unauthenticated against a private repo, which
+          // would abort the entire kg-refresh pipeline instead of degrading gracefully.
+          if (ctx.getOutputs("dependency-auth").acquired !== true) {
+            return "dependency-auth did not acquire a token";
+          }
+          return false;
+        },
+      };
+    }
+
+    case "clone-secondary-repos": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const repos = readSecondaryReposFromSourcesYml(workspaceDir);
+          const targets = repos.map(({ slug, branch }) => {
+            const slashIdx = slug.indexOf("/");
+            const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
+            const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
+            return { repoOwner, repoRepo, targetDir: join("repos", basename(slug)), ...(branch !== undefined ? { branch } : {}) };
+          });
+          return {
+            repoOwner: "",
+            repoRepo: "",
+            branch: "",
+            githubToken: "",
+            workspaceDir,
+            targets,
+            depth: step.depth,
+          };
+        },
+        skip: (ctx: PipelineContext) => {
+          // Skip if dependency-auth did not acquire a token: without the git credential
+          // helper the clones would fail unauthenticated against private repos.
+          if (ctx.getOutputs("dependency-auth").acquired !== true) {
+            return "dependency-auth did not acquire a token";
+          }
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const repos = readSecondaryReposFromSourcesYml(workspaceDir);
+          if (repos.length === 0) {
+            console.warn("[clone-secondary-repos] no secondary_repos in sources.yml — skipping");
+            return "no secondary_repos configured in sources.yml";
+          }
+          return false;
+        },
+      };
+    }
+
+    case "kg-ingest": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const codeRepoOutputs = ctx.getOutputs("clone-code-repo");
+          const codeRepoDir =
+            typeof codeRepoOutputs.workspaceDir === "string"
+              ? codeRepoOutputs.workspaceDir
+              : undefined;
+          // Only wire reposRootDir when clone-secondary-repos actually ran (not skipped).
+          // Skipped steps leave no outputs, so clonedCount is undefined when skipped.
+          const secondaryReposOutputs = ctx.getOutputs("clone-secondary-repos");
+          const reposRootDir =
+            secondaryReposOutputs.clonedCount !== undefined
+              ? join(workspaceDir, "repos")
+              : undefined;
+          return {
+            workspaceDir,
+            ...(codeRepoDir ? { codeRepoDir } : {}),
+            ...(reposRootDir !== undefined ? { reposRootDir } : {}),
+            ...(ctx.data.dependencyToken ? { ghToken: ctx.data.dependencyToken } : {}),
+          };
+        },
+      };
+    }
+
+    case "kg-snapshot-push":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const scopeOutputs = ctx.getOutputs("kg-scope-reconcile");
+          return {
+            workspaceDir: ctx.getOutputs("clone").workspaceDir,
+            githubToken: ctx.getOutputs("clone").githubToken,
+            clonedRef: ctx.getOutputs("clone").clonedRef,
+            defaultBranch: ctx.data.branch,
+            dryRun: ctx.data.kgDryRun === true,
+            repoOwner: ctx.getOutputs("clone").repoOwner,
+            repoRepo: ctx.getOutputs("clone").repoRepo,
+            orchestratorUrl: ctx.data.orchestratorUrl,
+            machineNonce: ctx.data.nonce,
+            callbackUrl: ctx.data.callbackUrl,
+            scope: {
+              addedRepos: Array.isArray(scopeOutputs.addedRepoSlugs) ? (scopeOutputs.addedRepoSlugs as string[]) : [],
+              addedTeams: Array.isArray(scopeOutputs.addedTeamNames) ? (scopeOutputs.addedTeamNames as string[]) : [],
+              mappedProjectCount: typeof scopeOutputs.mappedProjectCount === "number" ? scopeOutputs.mappedProjectCount : 0,
+            },
+          };
         },
       };
 
@@ -278,6 +555,6 @@ export function loadPipelineDefinition(
   const parsed = parseYamlPipeline(raw, resolvedPath);
   return {
     id: parsed.id,
-    steps: parsed.steps.map(applyWiring),
+    steps: parsed.steps.map((s) => applyWiring(s, options)),
   };
 }

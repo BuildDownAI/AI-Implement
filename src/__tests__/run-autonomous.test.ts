@@ -1,17 +1,113 @@
+import { ModelAuthClientError } from "../model-auth-client.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { runAutonomous, resolveLogLevel, waitForContainerRemoval, runAutonomousLocally } from "../run-autonomous.js";
+import {
+  runAutonomous,
+  resolveLogLevel,
+  waitForContainerRemoval,
+  runAutonomousLocally,
+  resolveActivityReporting,
+  RunnerActivitySink,
+  type RunnerActivityReporting,
+} from "../run-autonomous.js";
 import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
+import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
+import { verifyStep } from "../pipeline/steps/verify.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import { encodeRunConfig } from "../run-config.js";
-import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
+import { buildImplRunConfig, encodeRunConfig } from "../run-config.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import type { PipelineContext, PipelineDefinition, StepModule, StepReporter } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
+import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
+import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary.js";
+import type { GhSpawn } from "../pipeline/review-ledger.js";
+import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
+import { EXTERNAL_REVIEW_PENDING_NEXT_STEP } from "../pipeline/steps/post-push-review.js";
+import { DEFAULT_MODEL } from "../pipeline/default-model.js";
+import { ClaudeCliExecutor } from "../pipeline/executor.js";
+import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, ghaGrant, ghaRunStepEnv, oldShapedRunEnv, stubRunEnv } from "./helpers/fixtures/gha-handoff.js";
+import { CODEX_CHILD_GLOBAL, S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback, installCodexChild, resetCodexChild } from "./helpers/fixtures/codex-composition.js";
+import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
+import type { ModelAuthTransport } from "../model-auth-client.js";
+import { makeExecutor, makeFeedbackLoopOutputs, makeIssue, makeMapping, makeReviewFixRunConfig } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Reply, type ReplyInit } from "./helpers/fake-fetch.js";
+import { activityAccepted, cycleSummaryRecorded, noPlanningContext, progressAccepted, resultAccepted, reviewFixResultStored } from "./helpers/replies/orchestrator.js";
+import { testDir } from "./helpers/test-dir.js";
+
+// Passthrough except for the `codex` command while a test installs a fake child (see helpers/fixtures/codex-composition.ts).
+vi.mock("node:child_process", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:child_process")>();
+  const spawn = ((...a: Parameters<typeof real.spawn>) => {
+    const slots = (globalThis as unknown as Record<string, { spawn?: (...args: unknown[]) => unknown } | undefined>)[CODEX_CHILD_GLOBAL];
+    return a[0] === "codex" && slots?.spawn ? slots.spawn(...a) : real.spawn(...a);
+  }) as typeof real.spawn;
+  return { ...real, spawn };
+});
+
+// The orchestrator's runner routes (src/index.ts), answered with replies/orchestrator.ts.
+const RESULT = "POST /runner/result";
+const PLANNING_CONTEXT = "GET /runner/planning-context";
+const PROGRESS = "POST /runner/progress";
+const CYCLE_SUMMARY = "POST /runner/cycle-summary";
+const ACTIVITY = "POST /runner/activity";
+
+// The result handler's answer to an implementation success that names no PR (handleRunnerResult, src/runner-callback.ts).
+const missingPrUrlRejected = { status: 400, json: { error: "missing_prUrl" } };
+
+function routesRequested(fake: FakeFetch): string[] {
+  return fake.calls.map((call) => `${call.method} ${call.path}`);
+}
+
+/** The body of the run's one result callback. */
+function resultBody(fake: FakeFetch): Record<string, unknown> {
+  const results = fake.calls.filter((call) => `${call.method} ${call.path}` === RESULT);
+  expect(results).toHaveLength(1);
+  return JSON.parse(results[0].body) as Record<string, unknown>;
+}
+
+/** The push step's outputs when an initial run opened PR `prNumber` on the run's repository. */
+function openedPr(prNumber: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    prUrl: `https://github.com/acme/app/pull/${prNumber}`,
+    prNumber,
+    branchPushed: true,
+    commitSha: "c".repeat(40),
+    draft: false,
+    pushAttempts: 1,
+    ...overrides,
+  };
+}
+
+/** The push step's outputs when a gap-fill run pushed to its existing PR, which returns no PR URL. */
+function updatedPr(prNumber: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { prUrl: null, prNumber, branchPushed: true, commitSha: "c".repeat(40), draft: false, pushAttempts: 1, ...overrides };
+}
+
+/** The envelope the orchestrator dispatches an implementation run of AII-1 with (buildImplRunConfig). */
+function implEnvelope(opts: { baseBranch?: string; runnerCallbackUrl?: string } = {}): string {
+  const mapping = makeMapping();
+  return encodeRunConfig(buildImplRunConfig({
+    issue: makeIssue({ id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" }),
+    mapping,
+    baseBranch: opts.baseBranch ?? mapping.defaultBranch,
+    runnerCallbackUrl: opts.runnerCallbackUrl,
+    retryPolicy: DEFAULT_RETRY_POLICY,
+  }));
+}
+
+/** `gh` for a gap-fill run's PR with no unresolved review threads; every gap-fill run lists them. */
+const noReviewThreads: GhSpawn = () => ({
+  exitCode: 0,
+  stdout: JSON.stringify({
+    data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } },
+  }),
+});
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -27,12 +123,6 @@ function stubRequiredEnv() {
   for (const [k, v] of Object.entries(REQUIRED_ENV)) {
     vi.stubEnv(k, v);
   }
-}
-
-function makeMockExecutor(exitCode = 0): LLMExecutor {
-  return {
-    invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode, tokensUsed: 0 }),
-  };
 }
 
 function installCredentialRecordingClaude(workspaceDir: string): string {
@@ -94,7 +184,7 @@ describe("runAutonomous", () => {
 
   beforeEach(() => {
     __resetPublicationCredentialForTests();
-    workspaceDir = mkdtempSync(join(tmpdir(), "run-autonomous-test-"));
+    workspaceDir = testDir("run-autonomous");
     stubRequiredEnv();
     vi.stubEnv("LINEAR_API_KEY", "");
     vi.stubEnv("ORCHESTRATOR_URL", "");
@@ -117,11 +207,29 @@ describe("runAutonomous", () => {
   afterEach(() => {
     __resetPublicationCredentialForTests();
     vi.unstubAllEnvs();
-    try {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    } catch {
-      // On Windows, bash-created files may be locked briefly after the process exits
-    }
+  });
+
+  it.each([false, true])("reports review-only completion without dispositions or teardown (failed: %s)", async (failed) => {
+    const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig({ v: 1,
+      issue: { id: "i", identifier: "ENG-1", title: "review", description: "review" },
+      runnerPhase: "gap-analysis", prNumber: "42", reviewOnly, runnerCallbackUrl: "https://orch.test",
+    }));
+    vi.stubEnv("RUN_TOKEN", "test-run-token");
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nReview\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), "touch teardown-ran");
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const gh = vi.fn<GhSpawn>(() => ({ stdout: "", exitCode: 0 }));
+    const { pipeline, runner } = makeSingleStepPipeline("feedback-loop", { run: async ctx => {
+      expect(ctx.data.reviewOnly).toEqual(reviewOnly);
+      return { terminationReason: failed ? "review_error" : "approved", approved: !failed };
+    } });
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(), ghSpawn: gh, fetchImpl: fake.fetch });
+    expect(resultBody(fake)).toMatchObject({ reviewOnly: true, phase: "gap-analysis", outcome: failed ? "failure" : "success" });
+    expect(resultBody(fake)).not.toHaveProperty("findingDispositions");
+    expect(existsSync(join(workspaceDir, "teardown-ran"))).toBe(false);
+    expect(gh).not.toHaveBeenCalled();
   });
 
   it("removes the publication bearer before any pipeline step runs", async () => {
@@ -139,7 +247,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(mod.run).toHaveBeenCalledTimes(1);
@@ -154,7 +262,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.exitCode).toBe(0);
@@ -171,7 +279,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.exitCode).toBe(1);
@@ -192,7 +300,7 @@ describe("runAutonomous", () => {
     };
     const { pipeline, runner } = makeSingleStepPipeline("record-credentials", mod);
 
-    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter() });
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), ghSpawn: noReviewThreads });
 
     expect(readFileSync(tokenPath, "utf-8").trim()).toBe(expectedToken);
   });
@@ -217,7 +325,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedBranch).toBe("development");
@@ -225,14 +333,7 @@ describe("runAutonomous", () => {
 
   it("uses run_config.baseBranch as branch for non-gap-fill runs, overriding GITHUB_DEFAULT_BRANCH", async () => {
     vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
-    vi.stubEnv(
-      "AI_IMPLEMENT_RUN_CONFIG",
-      encodeRunConfig({
-        v: 1,
-        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
-        baseBranch: "ai-implement/feature/ool-126",
-      }),
-    );
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope({ baseBranch: "ai-implement/feature/ool-126" }));
 
     let capturedBranch: string | undefined;
     const mod: StepModule = {
@@ -243,20 +344,15 @@ describe("runAutonomous", () => {
     };
     const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
 
-    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0) });
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor() });
 
     expect(capturedBranch).toBe("ai-implement/feature/ool-126");
   });
 
   it("falls back to GITHUB_DEFAULT_BRANCH when run_config.baseBranch is absent", async () => {
     vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
-    vi.stubEnv(
-      "AI_IMPLEMENT_RUN_CONFIG",
-      encodeRunConfig({
-        v: 1,
-        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
-      }),
-    );
+    // The envelope leaves baseBranch out when the run targets the mapping's default branch.
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope());
 
     let capturedBranch: string | undefined;
     const mod: StepModule = {
@@ -267,13 +363,14 @@ describe("runAutonomous", () => {
     };
     const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
 
-    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0) });
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor() });
 
     expect(capturedBranch).toBe("main");
   });
 
   it("does not use run_config.baseBranch for gap-fill runs — uses GITHUB_DEFAULT_BRANCH (PR checkout branch)", async () => {
-    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "ai-implement/ai-implement-aii-1-fix-something");
+    // The PR's own branch, named from the issue when the initial run opened it (buildIssueBranchName).
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "ai-implement/aii-1-test-issue");
     vi.stubEnv(
       "AI_IMPLEMENT_RUN_CONFIG",
       encodeRunConfig({
@@ -294,10 +391,17 @@ describe("runAutonomous", () => {
     };
     const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
 
-    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0) });
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      ghSpawn: noReviewThreads,
+    });
 
     // Gap-fill: uses the PR checkout branch (GITHUB_DEFAULT_BRANCH), not envelope baseBranch
-    expect(capturedBranch).toBe("ai-implement/ai-implement-aii-1-fix-something");
+    expect(capturedBranch).toBe("ai-implement/aii-1-test-issue");
   });
 
   it("reads model from WORKFLOW.md front matter and passes it through context", async () => {
@@ -317,7 +421,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedModel).toBe("claude-opus-4-7");
@@ -341,7 +445,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedModel).toBe("anthropic.claude-sonnet-bedrock-v1:0");
@@ -367,7 +471,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedPrompt).toContain("Custom prompt for AII-1: Test issue");
@@ -394,7 +498,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedPrompt).toContain("Create a branch and open a PR for AII-1");
@@ -417,7 +521,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedPrompt).toContain("Validation command discipline");
@@ -442,7 +546,8 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
+      ghSpawn: noReviewThreads,
     });
 
     expect(capturedPrompt).toContain("Gap-fill run");
@@ -472,13 +577,32 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
+      ghSpawn: noReviewThreads,
     });
 
     expect(capturedPrompt).toContain("Operator instruction for this run (authoritative)");
     expect(capturedPrompt).toContain("fix the implementation, do NOT weaken the test");
     expect(capturedPrompt).toContain("Gap-fill run");
   });
+
+  it.each([undefined, "", "   ", "Document both editing surfaces"])(
+    "routes only a non-empty comment instruction to the review rubric (%s)",
+    async instruction => {
+      if (instruction !== undefined) vi.stubEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION", instruction);
+      let rubric: string | undefined;
+      const { pipeline, runner } = makeSingleStepPipeline("check-rubric", {
+        run: vi.fn(async ctx => { rubric = ctx.data.reviewRubric; return {}; }),
+      });
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor() });
+      if (instruction?.trim()) {
+        expect(rubric).toContain(instruction);
+        expect(rubric).toContain("scope of this run");
+      } else {
+        expect(rubric).toBeUndefined();
+      }
+    },
+  );
 
   it("does not duplicate pipeline-owned git instructions from custom prompts", async () => {
     writeFileSync(
@@ -500,7 +624,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedPrompt?.match(/Pipeline-owned Git and PR handling/g)).toHaveLength(1);
@@ -524,13 +648,13 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedModel).toBe("claude-haiku-4-5");
   });
 
-  it("falls back to claude-sonnet-4-6 when no model configured", async () => {
+  it("falls back to DEFAULT_MODEL when no model configured", async () => {
     let capturedModel: string | undefined;
     const mod: StepModule = {
       run: vi.fn(async (ctx) => {
@@ -545,14 +669,14 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
-    expect(capturedModel).toBe("claude-sonnet-4-6");
+    expect(capturedModel).toBe(DEFAULT_MODEL);
   });
 
   it("invokes the provided llmExecutor when step calls it", async () => {
-    const executor = makeMockExecutor(0);
+    const executor = makeExecutor();
     const mod: StepModule = {
       run: vi.fn(async (ctx) => {
         await ctx.llmExecutor.invoke({ prompt: "hello", model: ctx.data.model! });
@@ -570,17 +694,14 @@ describe("runAutonomous", () => {
     });
 
     expect(executor.invoke).toHaveBeenCalledOnce();
-    expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-sonnet-4-6");
+    expect(vi.mocked(executor.invoke).mock.calls[0][0].model).toBe(DEFAULT_MODEL);
   });
 
   it("fetches planning context from the orchestrator using the progress token", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orch.example.com");
     vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
 
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ planningContext: "" }),
-    });
+    const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
 
     const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
     const { pipeline, runner } = makeSingleStepPipeline("noop", mod);
@@ -590,21 +711,18 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
-    expect(mockFetch).toHaveBeenCalledWith(
-      "https://orch.example.com/runner/planning-context",
-      expect.objectContaining({
-        method: "GET",
-        headers: expect.objectContaining({ Authorization: "Bearer ptok" }),
-      }),
-    );
+    expect(fake.calls.map((call) => `${call.method} ${call.url.href}`)).toEqual([
+      "GET https://orch.example.com/runner/planning-context",
+    ]);
+    expect(fake.calls[0].headers.get("Authorization")).toBe("Bearer ptok");
   });
 
   it("does not fetch planning context when no callback token is present", async () => {
-    const mockFetch = vi.fn();
+    const fake = fakeFetch({});
     const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
     const { pipeline, runner } = makeSingleStepPipeline("noop", mod);
 
@@ -613,22 +731,19 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
-    expect(mockFetch).not.toHaveBeenCalled();
+    expect(fake.calls).toEqual([]);
   });
 
   it("stores fetched planning context on the pipeline context", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orch.example.com");
     vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
 
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        planningContext: "## Planning Context\n\nUse the service layer",
-      }),
+    const fake = fakeFetch({
+      [PLANNING_CONTEXT]: { json: { planningContext: "## Planning Context\n\nUse the service layer" } },
     });
 
     let capturedPlanningContext: string | undefined;
@@ -645,8 +760,8 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(capturedPlanningContext).toContain("Use the service layer");
@@ -668,18 +783,16 @@ describe("runAutonomous", () => {
         }),
       })
       .register("install", { run: vi.fn().mockResolvedValue({}) })
-      .register("feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) })
+      .register("feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })) })
       // Push no longer skips on an unapproved feedback-loop result — it opens a
       // draft PR instead — so the default pipeline needs a push module here too.
-      .register("push", {
-        run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: true }),
-      });
+      .register("push", { run: vi.fn().mockResolvedValue(openedPr(1, { draft: true })) });
 
     const result = await runAutonomous({
       workspaceDir,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.exitCode).toBe(0);
@@ -693,7 +806,7 @@ describe("runAutonomous", () => {
   });
 
   it("skips planning context fetch when LINEAR_API_KEY is absent", async () => {
-    const mockFetch = vi.fn();
+    const fake = fakeFetch({});
     const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
     const { pipeline, runner } = makeSingleStepPipeline("noop", mod);
 
@@ -702,11 +815,11 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
-    expect(mockFetch).not.toHaveBeenCalled();
+    expect(fake.calls).toEqual([]);
   });
 
   it("sets context extras (workspaceDir, githubOwner, githubRepo, prNumber)", async () => {
@@ -732,7 +845,8 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
+      ghSpawn: noReviewThreads,
     });
 
     expect(extras.workspaceDir).toBe(workspaceDir);
@@ -748,10 +862,10 @@ describe("runAutonomous", () => {
     writeFileSync(join(workspaceDir, "ai-output", "comments", "02-second.md"), "second");
     writeFileSync(join(workspaceDir, "ai-output", "comments", "01-first.md"), "first");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
-      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
     ]);
 
     const result = await runAutonomous({
@@ -759,19 +873,16 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    expect(mockFetch).toHaveBeenCalledWith(
-      "https://orchestrator.example/runner/result",
-      expect.objectContaining({
-        method: "POST",
-        headers: expect.objectContaining({ Authorization: "Bearer run-token" }),
-      }),
-    );
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    expect(fake.calls.map((call) => `${call.method} ${call.url.href}`)).toEqual([
+      "POST https://orchestrator.example/runner/result",
+    ]);
+    expect(fake.calls[0].headers.get("Authorization")).toBe("Bearer run-token");
+    const body = resultBody(fake) as {
       phase: string;
       outcome: string;
       prUrl: string;
@@ -791,18 +902,11 @@ describe("runAutonomous", () => {
     // callback URL inside the envelope. Regression test for the bug where postRunnerResult
     // silently no-op'd because it only ever read the legacy env var. The envelope takes
     // precedence over the flat ISSUE_ID/etc env vars stubbed by stubRequiredEnv() above.
-    vi.stubEnv(
-      "AI_IMPLEMENT_RUN_CONFIG",
-      encodeRunConfig({
-        v: 1,
-        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
-        runnerCallbackUrl: "https://orchestrator.example",
-      }),
-    );
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope({ runnerCallbackUrl: "https://orchestrator.example" }));
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) };
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue(openedPr(1)) };
     const { pipeline, runner } = makeSingleStepPipeline("push", mod);
 
     const result = await runAutonomous({
@@ -810,25 +914,22 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    expect(mockFetch).toHaveBeenCalledWith(
-      "https://orchestrator.example/runner/result",
-      expect.objectContaining({
-        method: "POST",
-        headers: expect.objectContaining({ Authorization: "Bearer run-token" }),
-      }),
-    );
+    expect(fake.calls.map((call) => `${call.method} ${call.url.href}`)).toEqual([
+      "POST https://orchestrator.example/runner/result",
+    ]);
+    expect(fake.calls[0].headers.get("Authorization")).toBe("Bearer run-token");
   });
 
   it("uses token-backed progress reporting when a progress token is present", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_PROGRESS_TOKEN", "progress-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [PROGRESS]: progressAccepted });
     const mod: StepModule = {
       run: vi.fn(async (_ctx, _inputs, reporter) => {
         await reporter.report({
@@ -851,25 +952,24 @@ describe("runAutonomous", () => {
       workspaceDir,
       pipeline,
       runner,
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    expect(mockFetch).toHaveBeenCalledWith(
-      "https://orchestrator.example/runner/progress",
-      expect.objectContaining({
-        method: "POST",
-        headers: expect.objectContaining({ Authorization: "Bearer progress-token" }),
-      }),
-    );
+    const progress = fake.calls.filter((call) => `${call.method} ${call.path}` === PROGRESS);
+    expect(progress.length).toBeGreaterThan(0);
+    for (const call of progress) {
+      expect(call.url.href).toBe("https://orchestrator.example/runner/progress");
+      expect(call.headers.get("Authorization")).toBe("Bearer progress-token");
+    }
   });
 
   it("posts implementation failure callback when pipeline fails", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example/");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const mod: StepModule = { run: vi.fn().mockRejectedValue(new Error("push failed")) };
     const { pipeline, runner } = makeSingleStepPipeline("push", mod);
 
@@ -878,20 +978,853 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(1);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       phase: string;
       outcome: string;
       failureReason: string;
+      failure?: { stage?: string };
     };
     expect(body).toMatchObject({
       phase: "implementation",
       outcome: "failure",
       failureReason: "push failed",
+    });
+    // PipelineRunner attaches the classified record (stage = the failing
+    // step's id) onto the rethrown error; without that, this would read
+    // back stage: "pipeline" instead of the actual failing step.
+    expect(body.failure?.stage).toBe("push");
+  });
+
+  describe("reviewFix result metadata (AII-794)", () => {
+    const REVIEW_FIX_IDENTITY: ReviewFixMetadataV1 = {
+      version: 1,
+      attemptId: "attempt-1",
+      installationId: 12345,
+      repository: "acme/app",
+      prNumber: 42,
+      deadlineAt: Date.now() + 60 * 60_000,
+    };
+
+    // A pilot attempt is always a gap-fill on its PR, with the callback URL in the envelope only, and is always
+    // launched with a progress token (review-fix-production.ts mints one; the workflow passes it as RUN_PROGRESS_TOKEN).
+    function stubReviewFixEnvelope() {
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig(REVIEW_FIX_IDENTITY)));
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+    }
+
+    it("attaches the full reviewFix result marker on success, reporting the actual published commit (not GITHUB_SHA)", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      vi.stubEnv("GITHUB_SHA", "0".repeat(40));
+
+      const publishedCommit = "b".repeat(40);
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(fake.calls.map((call) => `${call.method} ${call.url.href}`)).toEqual([
+        "GET https://orchestrator.example/runner/planning-context",
+        "POST https://orchestrator.example/runner/result",
+      ]);
+      const body = resultBody(fake) as { outcome: string; reviewFix?: Record<string, unknown> };
+      expect(body.outcome).toBe("success");
+      expect(body.reviewFix).toEqual({
+        version: 1,
+        attemptId: "attempt-1",
+        installationId: 12345,
+        repository: "acme/app",
+        prNumber: 42,
+        deadlineAt: REVIEW_FIX_IDENTITY.deadlineAt,
+        githubRunId: 999888,
+        githubRunAttempt: 2,
+        outputCommit: publishedCommit,
+      });
+    });
+
+    it("forwards this run's declared cycle summaries alongside an attached reviewFix marker (AII-801)", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const cycleSummary: CycleSummary = {
+        id: "feedback-loop.1",
+        stage: "feedback-loop",
+        cycle: 1,
+        inputCommit: "a".repeat(40),
+        outputCommit: null,
+        outputCommitStatus: "pending_push",
+        dispositions: [],
+        tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: true, reason: "approved" },
+        usage: { tokensIn: 10, tokensOut: 20, costUsd: 0.01 },
+        truncated: false,
+        limitReached: false,
+        completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(cycleSummary)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"),
+        JSON.stringify([{ findingKey: "f".repeat(64), disposition: "fixed", reason: "done" }]));
+
+      const publishedCommit = "b".repeat(40);
+      const fake = fakeFetch({
+        [PLANNING_CONTEXT]: noPlanningContext,
+        [CYCLE_SUMMARY]: cycleSummaryRecorded,
+        [RESULT]: reviewFixResultStored,
+      });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT, CYCLE_SUMMARY, CYCLE_SUMMARY, RESULT]);
+      expect(JSON.parse(fake.calls[1].body)).toEqual({ summary: cycleSummary });
+      // The pre-push record is forwarded unchanged; a distinct publication record follows with the
+      // real pushed commit and the validated dispositions file, then the result.
+      const findingKey = "f".repeat(64);
+      const publication = (JSON.parse(fake.calls[2].body) as { summary: CycleSummary }).summary;
+      expect(publication).toMatchObject({ id: "publication.1", stage: "publication", outputCommit: publishedCommit,
+        outputCommitStatus: "committed", dispositions: [{ key: findingKey, disposition: "fixed" }],
+        tests: cycleSummary.tests, verdict: cycleSummary.verdict,
+        usage: { tokensIn: null, tokensOut: null, costUsd: null } });
+      // Measured usage stays on the source cycle; the publication record never duplicates it.
+      expect((JSON.parse(fake.calls[1].body) as { summary: CycleSummary }).summary.usage).toEqual(cycleSummary.usage);
+      const body = resultBody(fake) as { cycleSummaries?: CycleSummary[] };
+      expect(body.cycleSummaries).toEqual([cycleSummary, publication]);
+    });
+
+    it("emits no approval-bearing publication when the native review rejected a pushed change", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      const rejected: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: "a".repeat(40), outputCommit: null,
+        outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: false, reason: "rejected" }, usage: { tokensIn: 5, tokensOut: 6, costUsd: 0.02 },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(rejected)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"),
+        JSON.stringify([{ findingKey: "f".repeat(64), disposition: "fixed", reason: "done" }]));
+      const fake = fakeFetch({
+        [PLANNING_CONTEXT]: noPlanningContext,
+        [CYCLE_SUMMARY]: cycleSummaryRecorded,
+        [RESULT]: reviewFixResultStored,
+      });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: "b".repeat(40) })) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch, ghSpawn: noReviewThreads });
+      const bodies = fake.calls.filter((c) => c.method === "POST")
+        .map((c) => JSON.parse(c.body) as { summary?: CycleSummary; outcome?: string; cycleSummaries?: CycleSummary[] });
+      expect(bodies.filter((b) => b.summary).map((b) => b.summary!.id)).toEqual(["feedback-loop.1"]);
+      expect(bodies.find((b) => b.outcome)?.outcome).toBe("failure");
+      expect(bodies.find((b) => b.outcome)?.cycleSummaries?.map((c) => c.id)).toEqual(["feedback-loop.1"]);
+    });
+
+    it("publishes only validated dispositions: invalid entries are dropped and an unpushed run emits no publication record", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      const pending: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: "a".repeat(40), outputCommit: null,
+        outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: true, reason: "approved" }, usage: { tokensIn: null, tokensOut: null, costUsd: null },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(pending)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"), JSON.stringify([
+        { findingKey: "f".repeat(64), disposition: "bogus", reason: "done" },
+        { findingKey: "", disposition: "fixed", reason: "done" },
+      ]));
+      const pushed = updatedPr(42, { commitSha: "b".repeat(40) });
+      const routes = { [PLANNING_CONTEXT]: noPlanningContext, [CYCLE_SUMMARY]: cycleSummaryRecorded, [RESULT]: reviewFixResultStored };
+      const summariesSent = (fake: FakeFetch) => fake.calls.filter((c) => `${c.method} ${c.path}` === CYCLE_SUMMARY)
+        .map((c) => (JSON.parse(c.body) as { summary: CycleSummary }).summary);
+      const first = fakeFetch(routes);
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(pushed) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        fetchImpl: first.fetch, ghSpawn: noReviewThreads });
+      const publication = summariesSent(first)[1];
+      expect(publication).toMatchObject({ id: "publication.1", outputCommit: "b".repeat(40), dispositions: [] });
+
+      // Nothing was pushed (no commit): the pending record alone is forwarded and no publication is built.
+      // The push step's no-change gap-fill answer, when HEAD cannot be resolved.
+      const second = fakeFetch(routes);
+      const none = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: 42, branchPushed: false, commitSha: null, draft: false }) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline: none.pipeline, runner: none.runner, reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(), fetchImpl: second.fetch, ghSpawn: noReviewThreads });
+      expect(summariesSent(second).map((s) => s.id)).toEqual(["feedback-loop.1"]);
+    });
+
+    it("delivers a failed cycle before no-output pilot result is skipped", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      // The cycle feedback-loop writes when the provider stays unavailable through review (feedback-loop.ts);
+      // the push then fails before it publishes anything.
+      const summary: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1,
+        inputCommit: "a".repeat(40), outputCommit: null, outputCommitStatus: "pending_push",
+        dispositions: [], tests: [{ name: "npm test", status: "failed" }],
+        verdict: { approved: null, reason: "provider_unavailable", summary: "Model provider was unavailable during review after 2 attempt(s)." },
+        usage: { tokensIn: 1, tokensOut: 1, costUsd: null },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(summary)}\n`);
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [CYCLE_SUMMARY]: cycleSummaryRecorded });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ terminationReason: "provider_unavailable" })) }],
+        ["push", { run: vi.fn().mockRejectedValue(new Error("push failed before publishing")) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(), fetchImpl: fake.fetch, ghSpawn: noReviewThreads });
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT, CYCLE_SUMMARY]);
+      expect(fake.calls[1].url.href).toBe("https://orchestrator.example/runner/cycle-summary");
+      expect(JSON.parse(fake.calls[1].body)).toEqual({ summary });
+    });
+
+    it("sends no cycleSummaries field when the run wrote none", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = resultBody(fake) as { cycleSummaries?: CycleSummary[] };
+      expect(body.cycleSummaries).toBeUndefined();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome on an unapproved gap-fill whose push was skipped — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "1");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
+      const pushRun = vi.fn().mockResolvedValue(updatedPr(42));
+      // The default pipeline's push skip (pipeline-loader.ts): an unapproved gap-fill pushes nothing.
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "feedback-loop", type: "custom", moduleId: "feedback-loop" },
+          {
+            id: "push",
+            type: "custom",
+            moduleId: "push",
+            skip: (ctx) => Boolean(ctx.data.prNumber) && ctx.getOutputs("feedback-loop").approved !== true,
+          },
+        ],
+      };
+      const runner = new PipelineRunner()
+        .register("feedback-loop", {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
+        })
+        .register("push", { run: pushRun });
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(pushRun).not.toHaveBeenCalled();
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("attempt-1"));
+      errSpy.mockRestore();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome when GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT cannot be parsed — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
+    it.each([
+      ["fly-machines", false], ["fly-machines", true],
+      ["local-docker", false], ["local-docker", true],
+    ] as const)("attaches a %s result with GitHub ids present: %s", async (executionBackend, githubIdsPresent) => {
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig({ ...REVIEW_FIX_IDENTITY, executionBackend })));
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", githubIdsPresent ? "555" : "");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", githubIdsPresent ? "1" : "");
+      const publishedCommit = "b".repeat(40);
+
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = resultBody(fake) as { reviewFix?: Record<string, unknown> };
+      expect(body.reviewFix).toEqual({ ...REVIEW_FIX_IDENTITY, executionBackend, outputCommit: publishedCommit });
+      expect(body.reviewFix).not.toHaveProperty("githubRunId");
+      expect(body.reviewFix).not.toHaveProperty("githubRunAttempt");
+    });
+
+    it.each(["fly-machines", "local-docker"] as const)("skips %s result delivery when push fails without publishing a commit", async (executionBackend) => {
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig({ ...REVIEW_FIX_IDENTITY, executionBackend })));
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "555");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockRejectedValue(new Error("push failed")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome on a caught pipeline failure with no push at all — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["setup", { run: vi.fn().mockRejectedValue(new Error("setup exploded before push ran")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
+    it("attaches the reviewFix marker on a caught pipeline failure once push already published a commit", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+
+      const publishedCommit = "d".repeat(40);
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
+      // verify runs after push on an approved run; post-push review never runs on a gap-fill.
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
+        ["verify", { run: vi.fn().mockRejectedValue(new Error("verify hook exploded")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(1);
+      const body = resultBody(fake) as {
+        outcome: string;
+        reviewFix?: Record<string, unknown>;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.reviewFix).toMatchObject({ attemptId: "attempt-1", outputCommit: publishedCommit });
+    });
+
+    it("reports INSTALL_FAILED under the Restate attempt identity after a published gap-fill", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const publishedCommit = "f".repeat(40);
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci" }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "dependency conflict" }) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT, RESULT]);
+      const body = resultBody(fake);
+      expect(body).toMatchObject({
+        outcome: "failure",
+        failureCode: "INSTALL_FAILED",
+        reviewFix: {
+          attemptId: "attempt-1",
+          githubRunId: 999888,
+          githubRunAttempt: 2,
+          outputCommit: publishedCommit,
+        },
+      });
+    });
+
+    it("never attaches a reviewFix marker for a Legacy (non-pilot) dispatch", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = resultBody(fake);
+      expect(body).not.toHaveProperty("reviewFix");
+    });
+  });
+
+  describe("runner-activity reporting (AII-798)", () => {
+    const REVIEW_FIX_IDENTITY: ReviewFixMetadataV1 = {
+      version: 1,
+      attemptId: "attempt-activity-1",
+      installationId: 999,
+      repository: "acme/app",
+      prNumber: 7,
+      deadlineAt: Date.now() + 60 * 60_000,
+    };
+
+    function makeNoopSink(): RunnerActivityReporting["sink"] {
+      return { toolStart: () => {}, toolResult: () => {}, cycleSummary: () => {}, final: () => {} };
+    }
+
+    describe("resolveActivityReporting", () => {
+      it("resolves a sink only when reviewFix identity, callback URL, and progress token are all present", () => {
+        const resolved = resolveActivityReporting(REVIEW_FIX_IDENTITY, "https://orchestrator.example", "ptok");
+        expect(resolved).toBeDefined();
+        expect(resolved?.attemptId).toBe("attempt-activity-1");
+      });
+
+      it("is undefined for a Legacy (non-pilot) dispatch, even with a callback URL and progress token", () => {
+        expect(resolveActivityReporting(undefined, "https://orchestrator.example", "ptok")).toBeUndefined();
+      });
+
+      it("is undefined without a callback URL", () => {
+        expect(resolveActivityReporting(REVIEW_FIX_IDENTITY, null, "ptok")).toBeUndefined();
+      });
+
+      it("is undefined without a progress token", () => {
+        expect(resolveActivityReporting(REVIEW_FIX_IDENTITY, "https://orchestrator.example", null)).toBeUndefined();
+      });
+    });
+
+    describe("RunnerActivitySink", () => {
+
+      it("delivers a buffered tool start/result batch plus the final marker to /runner/activity on shutdown()", async () => {
+        const fake = fakeFetch({ [ACTIVITY]: activityAccepted("attempt-activity-1") });
+        const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", fake.fetch);
+
+        sink.toolStart(
+          { attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 0 },
+          { cycle: 1, action: "Bash", detail: { command: "ls" } },
+        );
+        sink.toolResult(
+          { attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 1 },
+          { cycle: 1, action: "Bash", output: { text: "file.txt", truncated: false } },
+        );
+        sink.final({ attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 1 }, 1);
+
+        await sink.shutdown();
+
+        expect(fake.calls.map((call) => `${call.method} ${call.url.href}`)).toEqual([
+          "POST https://orchestrator.example/runner/activity",
+        ]);
+        expect(fake.calls[0].headers.get("Authorization")).toBe("Bearer ptok");
+        const body = JSON.parse(fake.calls[0].body) as {
+          attemptId: string;
+          producerId: string;
+          events: Array<{ kind: string; sequence: number }>;
+          finalSequence?: number;
+        };
+        expect(body.attemptId).toBe("attempt-activity-1");
+        expect(body.producerId).toBe("implement-1");
+        expect(body.events.map((e) => e.kind)).toEqual(["tool_start", "tool_result"]);
+        expect(body.finalSequence).toBe(1);
+      });
+
+      it("delivers the empty-stream marker and final sequence for a producerId that recorded no tool events — an empty model invocation still gets a final marker", async () => {
+        const fake = fakeFetch({ [ACTIVITY]: activityAccepted("attempt-activity-1") });
+        const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", fake.fetch);
+
+        sink.final({ attemptId: "attempt-activity-1", producerId: "never-touched", sequence: 0 }, 0);
+        await sink.shutdown();
+
+        expect(routesRequested(fake)).toEqual([ACTIVITY]);
+        const body = JSON.parse(fake.calls[0].body) as {
+          attemptId: string;
+          producerId: string;
+          events: Array<{ kind: string; sequence: number }>;
+          finalSequence?: number;
+        };
+        expect(body.attemptId).toBe("attempt-activity-1");
+        expect(body.producerId).toBe("never-touched");
+        expect(body.events.map((e) => e.kind)).toEqual(["activity_stream_empty"]);
+        expect(body.finalSequence).toBe(0);
+      });
+    });
+
+    describe("attempt step reporting through the activity stream", () => {
+      // The envelope the review-fix worker launches this attempt with; the callback URL travels in it alone.
+      function stubAttemptEnv(): void {
+        vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig(REVIEW_FIX_IDENTITY)));
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        vi.stubEnv("GITHUB_RUN_ID", "1");
+        vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      }
+
+      type Post = { path: string; body: { producerId?: string; events?: Array<{ kind: string; action: string; cycle: number; payload: string }>; finalSequence?: number } };
+
+      /** The runner routes these runs reach, each answering as its handler does and recording what was posted. */
+      function recordingApi(posts: Post[], log?: string[], result: ReplyInit = reviewFixResultStored): FakeFetch {
+        const record = (reply: ReplyInit): Reply => (call) => {
+          posts.push({ path: call.path, body: JSON.parse(call.body || "{}") as Post["body"] });
+          log?.push(`post:${call.path}`);
+          return reply;
+        };
+        return fakeFetch({
+          [PLANNING_CONTEXT]: noPlanningContext,
+          [ACTIVITY]: record(activityAccepted(REVIEW_FIX_IDENTITY.attemptId)),
+          [PROGRESS]: record(progressAccepted),
+          [CYCLE_SUMMARY]: record(cycleSummaryRecorded),
+          [RESULT]: record(result),
+        });
+      }
+
+      const stepPosts = (posts: Post[]) => posts.filter((p) => p.path === "/runner/activity" && p.body.producerId === "pipeline-steps");
+
+      it("posts each step to /runner/activity as a pipeline_step event and nothing to /runner/progress", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: recordingApi(posts).fetch, ghSpawn: noReviewThreads });
+
+        expect(posts.some((p) => p.path === "/runner/progress")).toBe(false);
+        const events = stepPosts(posts).flatMap((p) => p.body.events ?? []);
+        expect(events.length).toBeGreaterThan(0);
+        for (const e of events) {
+          expect(e.kind).toBe("pipeline_step");
+          expect(e.cycle).toBe(1);
+          expect(Object.keys((JSON.parse(e.payload) as { detail: object }).detail).sort()).toEqual(["ended_at", "parent_step_id", "started_at", "status", "type"]);
+        }
+        expect(events.map((e) => (JSON.parse(e.payload) as { action: string }).action)).toContain("do-work");
+      });
+
+      it("delivers a step's event before the next step starts", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const log: string[] = [];
+        const first: StepModule = { run: vi.fn().mockImplementation(async () => { log.push("run:first"); return {}; }) };
+        const second: StepModule = { run: vi.fn().mockImplementation(async () => { log.push("run:second"); return {}; }) };
+        const { pipeline, runner } = makeStepsPipeline([["first", first], ["second", second]]);
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: recordingApi(posts, log).fetch, ghSpawn: noReviewThreads });
+
+        const secondRun = log.indexOf("run:second");
+        expect(log.slice(0, secondRun)).toContain("post:/runner/activity");
+      });
+
+      it.each([
+        ["success", { run: vi.fn().mockResolvedValue({}) }],
+        ["a thrown pipeline error", { run: vi.fn().mockRejectedValue(new Error("step exploded")) }],
+      ] as Array<[string, StepModule]>)("finalizes the pipeline-steps producer on %s", async (_name, mod) => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: recordingApi(posts).fetch, ghSpawn: noReviewThreads });
+
+        const batches = stepPosts(posts);
+        expect(batches.length).toBeGreaterThan(0);
+        expect(batches[batches.length - 1].body.finalSequence).toBeTypeOf("number");
+      });
+
+      it("lets opts.reporter win over the activity step reporter", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const reported: string[] = [];
+        const reporter: StepReporter = { report: async (s) => { reported.push(s.id); } };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, reporter, llmExecutor: makeExecutor(), fetchImpl: recordingApi(posts).fetch, ghSpawn: noReviewThreads });
+
+        expect(reported).toContain("do-work");
+        expect(stepPosts(posts)).toHaveLength(0);
+      });
+
+      it("keeps TokenStepReporter (/runner/progress) for a run that is not an attempt", async () => {
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: recordingApi(posts, undefined, resultAccepted).fetch });
+
+        expect(posts.some((p) => p.path === "/runner/progress")).toBe(true);
+        expect(stepPosts(posts)).toHaveLength(0);
+      });
+    });
+
+    describe("runAutonomous finally-block wiring", () => {
+      it("attempts activity shutdown from the outer finally block on a successful run", async () => {
+        const shutdown = vi.fn().mockResolvedValue(undefined);
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeExecutor(),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+      });
+
+      it("attempts activity shutdown from the outer finally block even when the pipeline throws — mirrors the always-runs teardown hook", async () => {
+        const shutdown = vi.fn().mockResolvedValue(undefined);
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockRejectedValue(new Error("step exploded")) };
+        const { pipeline, runner } = makeSingleStepPipeline("bad-step", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeExecutor(),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not let a rejecting shutdown() crash the run — logged, never fatal", async () => {
+        const shutdown = vi.fn().mockRejectedValue(new Error("network down"));
+        const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeExecutor(),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+        expect(errSpy.mock.calls.some((c) => String(c[0]).includes("[activity] shutdown failed"))).toBe(true);
+        errSpy.mockRestore();
+      });
+
+      it("auto-resolves activity reporting from a pilot reviewFix envelope (no injected override) without throwing", async () => {
+        vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig(REVIEW_FIX_IDENTITY)));
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        vi.stubEnv("GITHUB_RUN_ID", "1");
+        vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+
+        const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
+        const { pipeline, runner } = makeStepsPipeline([
+          ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+          ["push", { run: vi.fn().mockResolvedValue(updatedPr(7)) }],
+        ]);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeExecutor(),
+          fetchImpl: fake.fetch,
+          ghSpawn: noReviewThreads,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT, RESULT]);
+      });
+
+      it("never constructs activity reporting for a Legacy (non-pilot) dispatch, even with a callback URL and progress token set", async () => {
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+
+        const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: resultAccepted });
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeExecutor(),
+          fetchImpl: fake.fetch,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT, RESULT]);
+      });
     });
   });
 
@@ -901,10 +1834,10 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
-      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/42" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
     ]);
 
     const result = await runAutonomous({
@@ -912,12 +1845,13 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+      ghSpawn: noReviewThreads,
     });
 
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       phase: string;
       outcome: string;
     };
@@ -927,16 +1861,118 @@ describe("runAutonomous", () => {
     });
   });
 
+  it("a gap-analysis success that pushed reports the push commit as externalReviewPending.headSha (AII-1484)", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: "b".repeat(40) })) }],
+    ]);
+    await runAutonomous({
+      workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+    });
+    expect(resultBody(fake)).toMatchObject({ outcome: "success", externalReviewPending: { headSha: "b".repeat(40) } });
+  });
+
+  it("a gap-analysis success with no push commit, and an implementation success, send no externalReviewPending (AII-1484)", async () => {
+    for (const [phase, commitSha] of [["gap-analysis", null], ["implementation", "b".repeat(40)]] as const) {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_PHASE", phase);
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha })) }],
+      ]);
+      await runAutonomous({
+        workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+      });
+      expect(resultBody(fake)).not.toHaveProperty("externalReviewPending");
+    }
+  });
+
+  it("a gap-analysis failure that pushed sends no externalReviewPending (AII-1484)", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: "b".repeat(40) })) }],
+    ]);
+    await runAutonomous({
+      workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+    });
+    expect(resultBody(fake)).toMatchObject({ outcome: "failure" });
+    expect(resultBody(fake)).not.toHaveProperty("externalReviewPending");
+  });
+
+  it("names no review stage when a run on an existing PR is not approved", async () => {
+    // A gap-fill has one review, on the open PR; "before the pull request" would be false.
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 2,
+        finalFeedback: "Still missing a test.",
+        terminationReason: "iterations_exhausted",
+        passes: [],
+      }) }],
+      ["push", { run: vi.fn().mockResolvedValue({}) }],
+    ]);
+
+    // Real gh can launch background send-telemetry, which writes .local after cleanup.
+    const ghSpawn = vi.fn(noReviewThreads);
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+      ghSpawn,
+    });
+
+    expect(ghSpawn).toHaveBeenCalledTimes(1);
+    expect(ghSpawn.mock.calls[0][0]).toEqual(expect.arrayContaining(["api", "graphql"]));
+
+    const body = resultBody(fake) as { failureReason: string };
+    expect(body.failureReason).toContain(
+      "The review did not approve the change. The review examined the change 2 times and found problems each time. (Code: `iterations_exhausted`)",
+    );
+    expect(body.failureReason).not.toContain("before the pull request");
+    expect(body.failureReason).not.toContain("second review");
+    const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+    expect(autopsy).toContain("The existing PR is unchanged by this run: https://github.com/acme/app/pull/42");
+    expect(autopsy).not.toContain("No PR could be opened");
+    expect(autopsy).not.toContain("before the pull request");
+  });
+
   it("uses RUNNER_PHASE instead of inferring callback phase from PR_NUMBER", async () => {
     vi.stubEnv("PR_NUMBER", "42");
     vi.stubEnv("RUNNER_PHASE", "implementation");
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: missingPrUrlRejected });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
-      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/99" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
     ]);
 
     const result = await runAutonomous({
@@ -944,12 +1980,13 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+      ghSpawn: noReviewThreads,
     });
 
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       phase: string;
       outcome: string;
     };
@@ -967,8 +2004,10 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const mod: StepModule = {
+      run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false }),
+    };
     const { pipeline, runner } = makeSingleStepPipeline("push", mod);
 
     const result = await runAutonomous({
@@ -976,13 +2015,13 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    expect(mockFetch).toHaveBeenCalledOnce();
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    expect(routesRequested(fake)).toEqual([RESULT]);
+    const body = resultBody(fake) as {
       phase: string;
       outcome: string;
       failureCode: string;
@@ -996,7 +2035,7 @@ describe("runAutonomous", () => {
     expect(body.prUrl).toBeUndefined();
   });
 
-  it("reports failure with REVIEW_UNAPPROVED and the draft PR url when the loop never approved", async () => {
+  it("reports VERIFY_FAILED when the loop ended on a failing verify hook", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
@@ -1007,9 +2046,9 @@ describe("runAutonomous", () => {
         {
           run: vi.fn().mockResolvedValue({
             approved: false,
-            iterations: 3,
-            finalFeedback: "nope",
-            terminationReason: "iterations_exhausted",
+            iterations: 2,
+            finalFeedback: "The verify hook failed with exit code 3.",
+            terminationReason: "verify_failed",
             passes: [],
           }),
         },
@@ -1032,12 +2071,120 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       fetchImpl: mockFetch,
     });
 
-    expect(result.exitCode).toBe(0); // job stays green — warning only
+    expect(result.exitCode).toBe(0);
     const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      failureCode: string;
+      failureReason: string;
+      prUrl: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("VERIFY_FAILED");
+    expect(body.failureReason).toContain("The verify hook failed with exit code 3.");
+    expect(body.failureReason).not.toContain("did not approve");
+    expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
+  });
+
+  it("does not credit the post-push review when the in-loop review approved but push opened no PR", async () => {
+    // Post-push review is skipped without a PR, so the run ends with the in-loop result
+    // ("approved"). The autopsy must not say a post-push review ran.
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true }],
+      }) }],
+      ["push", { run: vi.fn().mockResolvedValue({}) }],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as { failureReason: string };
+    expect(body.failureReason).not.toContain("second review");
+    expect(body.failureReason).toContain(
+      "The first review approved the change. AI-Implement did not open a pull request, because the change did not modify any files.",
+    );
+    expect(body.failureReason).not.toContain("did not approve");
+    const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+    expect(autopsy).toContain("AI-Implement did not open a pull request, because the change did not modify any files.");
+    expect(autopsy).not.toContain("second review");
+  });
+
+  it("states the external_review_pending sentence and code tag once in the failure reason", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, finalFeedback: "ok", terminationReason: "approved", passes: [] }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/9", prNumber: 9, branchPushed: true }) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 1,
+        finalFeedback: EXTERNAL_REVIEW_PENDING_NEXT_STEP,
+        terminationReason: "external_review_pending",
+      }) }],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as { failureReason: string };
+    const count = (text: string) => body.failureReason.split(text).length - 1;
+    expect(count("The external review check did not finish in the time limit.")).toBe(1);
+    expect(count("(Code: `external_review_pending`)")).toBe(1);
+    expect(count("did not approve")).toBe(1);
+    expect(body.failureReason).toContain(`Review notes: ${EXTERNAL_REVIEW_PENDING_NEXT_STEP}`);
+  });
+
+  it("reports failure with REVIEW_UNAPPROVED and the draft PR url when the loop never approved", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(9, { draft: true })) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0); // job stays green — warning only
+    const body = resultBody(fake) as {
       outcome: string;
       failureCode: string;
       failureReason: string;
@@ -1046,7 +2193,197 @@ describe("runAutonomous", () => {
     expect(body.outcome).toBe("failure");
     expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
     expect(body.failureReason).toContain("iterations_exhausted");
-    expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
+    expect(body.failureReason).not.toContain("second review");
+    // Names the stage, and keeps the draft cue the ticket comment no longer carries.
+    expect(body.failureReason).toContain(
+      "The first review (before the pull request) did not approve the change. The review examined the change 1 time and found problems. AI-Implement opened a draft pull request. (Code: `iterations_exhausted`)",
+    );
+    expect(body.failureReason).toContain("Review notes: Changes requested.");
+    expect(body.prUrl).toBe("https://github.com/acme/app/pull/9");
+  });
+
+  it("reports INSTALL_FAILED (not success) when an approved run's dependencies never installed", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict".repeat(30) }) }],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(9, { draft: true })) }],
+    ]);
+
+    try {
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = resultBody(fake) as {
+        outcome: string;
+        failureCode: string;
+        failureReason: string;
+        prUrl: string;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.failureCode).toBe("INSTALL_FAILED");
+      expect(body.prUrl).toBe("https://github.com/acme/app/pull/9");
+      expect(body.failureReason).toContain(
+        "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.",
+      );
+      expect(body.failureReason).toContain("npm ci failed again: dependency conflict");
+      // Capped at the first 500 characters of the retry's installError.
+      expect(body.failureReason.length).toBeLessThan(700);
+
+      expect(existsSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"))).toBe(false);
+      const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+      expect(autopsy).toContain("**Run notes:**");
+      expect(autopsy).toContain(body.failureReason.split("\n")[0]);
+      expect(resultBody(fake).comments).toContainEqual({ body: autopsy });
+
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(warnings).toContain(
+        "::warning::AI-Implement: dependency install failed — draft PR opened: https://github.com/acme/app/pull/9",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reports INSTALL_FAILED (not REVIEW_UNAPPROVED) when an initial run's dependencies never installed and post-push-review is registered but skipped", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict" }) }],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(9, { draft: true })) }],
+      // Registered so pipeline.steps.some(id === "post-push-review") is true, mirroring a
+      // real pipeline. Its outputs resolve empty ({}) because the real step's own skip
+      // wiring (dependenciesMissing) would have skipped it — this stand-in never actually
+      // consults that skip logic, so the empty resolve simulates that outcome directly.
+      ["post-push-review", { run: vi.fn().mockResolvedValue({}) }],
+    ]);
+
+    try {
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = resultBody(fake) as {
+        outcome: string;
+        failureCode: string;
+        prUrl: string;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.failureCode).toBe("INSTALL_FAILED");
+      expect(body.prUrl).toBe("https://github.com/acme/app/pull/9");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reports INSTALL_FAILED with gap-fill wording (no literal 'undefined') when a gap-fill run's dependencies never installed", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict" }) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
+    ]);
+
+    try {
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = resultBody(fake) as {
+        outcome: string;
+        failureCode: string;
+        prUrl: string | null | undefined;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.failureCode).toBe("INSTALL_FAILED");
+      expect(body.prUrl).toBeFalsy();
+      const comments = resultBody(fake).comments as Array<{ body: string }>;
+      const autopsy = comments.find(c => c.body.startsWith("## 🔎 Run autopsy — "))?.body;
+      expect(autopsy).toContain("**Run notes:**");
+      expect(autopsy).toContain("npm ci failed again: dependency conflict");
+      expect(autopsy).toContain("The existing PR was updated by this run, but the change was not verified: https://github.com/acme/app/pull/42");
+      expect(autopsy).not.toContain("unchanged");
+      expect(autopsy).not.toContain("**Reviewer's final feedback:**");
+
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(warnings).toContain(
+        "::warning::AI-Implement: dependency install failed — gap-fill on PR #42",
+      );
+      expect(warnings).not.toContain("undefined");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps REVIEW_UNAPPROVED (not INSTALL_FAILED) when an unapproved run's dependencies also never installed", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "conflict" }) }],
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
+        },
+      ],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "still conflict" }) }],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(9, { draft: true })) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      outcome: string;
+      failureCode: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
   });
 
   it("reports the push step's actual non-draft PR state when an unapproved run reuses a real PR", async () => {
@@ -1056,26 +2393,10 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: false,
-            iterations: 1,
-            finalFeedback: "not approved",
-            terminationReason: "iterations_exhausted",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
         },
       ],
-      [
-        "push",
-        {
-          run: vi.fn().mockResolvedValue({
-            prUrl: "https://github.com/o/r/pull/9",
-            prNumber: 9,
-            branchPushed: true,
-            draft: false,
-          }),
-        },
-      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(9)) }],
     ]);
 
     try {
@@ -1084,30 +2405,29 @@ describe("runAutonomous", () => {
         pipeline,
         runner,
         reporter: new NoopStepReporter(),
-        llmExecutor: makeMockExecutor(0),
+        llmExecutor: makeExecutor(),
       });
     } finally {
       const summary = error.mock.calls.map((call) => call.join(" ")).join("\n");
       const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
       error.mockRestore();
       warn.mockRestore();
-      expect(summary).toContain("outcome: PR https://github.com/o/r/pull/9");
-      expect(summary).not.toContain("outcome: draft PR https://github.com/o/r/pull/9");
-      expect(warnings).toContain("PR opened: https://github.com/o/r/pull/9");
-      expect(warnings).not.toContain("draft PR opened: https://github.com/o/r/pull/9");
+      expect(summary).toContain("outcome: PR https://github.com/acme/app/pull/9");
+      expect(summary).not.toContain("outcome: draft PR https://github.com/acme/app/pull/9");
+      expect(warnings).toContain("PR opened: https://github.com/acme/app/pull/9");
+      expect(warnings).not.toContain("draft PR opened: https://github.com/acme/app/pull/9");
     }
   });
 
   it("the default dirty gap-fill existing-PR pipeline reports REVIEW_UNAPPROVED instead of success", async () => {
     vi.stubEnv("PR_NUMBER", "42");
+    // A gap-fill run checks out its PR's branch, which the clone reports back unchanged.
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "ai-implement/aii-1-test-issue");
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const pushRun = vi.fn().mockResolvedValue({
-      prNumber: 42,
-      branchPushed: true,
-    });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const pushRun = vi.fn().mockResolvedValue(updatedPr(42));
     const runner = new PipelineRunner()
       .register("clone", {
         run: vi.fn().mockResolvedValue({
@@ -1115,19 +2435,13 @@ describe("runAutonomous", () => {
           repoOwner: "acme",
           repoRepo: "app",
           githubToken: "ghs_test",
-          branch: "ai-implement/pr-42",
+          branch: "ai-implement/aii-1-test-issue",
           clonedRef: "base-sha",
         }),
       })
       .register("install", { run: vi.fn().mockResolvedValue({}) })
       .register("feedback-loop", {
-        run: vi.fn().mockResolvedValue({
-          approved: false,
-          iterations: 2,
-          finalFeedback: "missing regression coverage",
-          terminationReason: "iterations_exhausted",
-          passes: [],
-        }),
+        run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
       })
       .register("push", {
         run: pushRun,
@@ -1138,13 +2452,14 @@ describe("runAutonomous", () => {
       pipeline: DEFAULT_PIPELINE,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+      ghSpawn: noReviewThreads,
     });
 
     expect(result.exitCode).toBe(0);
-    expect(mockFetch).toHaveBeenCalledOnce();
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    expect(routesRequested(fake)).toEqual([RESULT]);
+    const body = resultBody(fake) as {
       phase: string;
       outcome: string;
       failureCode: string;
@@ -1164,8 +2479,8 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const pushRun = vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/1", prNumber: 1, branchPushed: true });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const pushRun = vi.fn().mockResolvedValue(updatedPr(42));
     const pipeline: PipelineDefinition = {
       id: "test",
       steps: [
@@ -1180,13 +2495,7 @@ describe("runAutonomous", () => {
     };
     const runner = new PipelineRunner()
       .register("feedback-loop", {
-        run: vi.fn().mockResolvedValue({
-          approved: false,
-          iterations: 2,
-          finalFeedback: "still missing tests",
-          terminationReason: "iterations_exhausted",
-          passes: [],
-        }),
+        run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
       })
       .register("push", { run: pushRun });
 
@@ -1195,13 +2504,14 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+      ghSpawn: noReviewThreads,
     });
 
     expect(pushRun).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(0); // job stays green — warning only
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       outcome: string;
       failureCode: string;
       prUrl?: string;
@@ -1218,8 +2528,8 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const pushRun = vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/1", prNumber: 1, branchPushed: true });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const pushRun = vi.fn().mockResolvedValue(updatedPr(42));
     const pipeline: PipelineDefinition = {
       id: "test",
       steps: [
@@ -1234,7 +2544,7 @@ describe("runAutonomous", () => {
     };
     const runner = new PipelineRunner()
       .register("feedback-loop", {
-        run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }),
+        run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
       })
       .register("push", { run: pushRun });
 
@@ -1243,13 +2553,14 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+      ghSpawn: noReviewThreads,
     });
 
     expect(pushRun).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       phase: string;
       outcome: string;
       failureCode?: string;
@@ -1265,32 +2576,20 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
             approved: false,
-            iterations: 1,
             finalFeedback: "ran out of turns",
             terminationReason: "max_turns",
-            passes: [],
-          }),
+          })),
         },
       ],
-      [
-        "push",
-        {
-          run: vi.fn().mockResolvedValue({
-            prUrl: "https://github.com/o/r/pull/10",
-            prNumber: 10,
-            branchPushed: true,
-            draft: true,
-          }),
-        },
-      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(10, { draft: true })) }],
       ["post-push-review", { run: postPushReviewRun }],
     ]);
     pipeline.steps[2].skip = () => true;
@@ -1300,35 +2599,230 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       failureCode: string;
       failureReason: string;
     };
     expect(postPushReviewRun).not.toHaveBeenCalled();
     expect(body.failureCode).toBe("MAX_TURNS_EXHAUSTED");
     expect(body.failureReason).toContain("ran out of turns");
+    // The review never examined the last pass, so the reason must not call it a non-approval.
+    // The ticket comment for MAX_TURNS_EXHAUSTED already names the draft PR.
+    expect(body.failureReason).toContain(
+      "The implementation used all of its permitted steps before it finished. Thus the review did not examine the final version of the change. (Code: `max_turns`)",
+    );
+    expect(body.failureReason).not.toContain("did not approve");
+    expect(body.failureReason).not.toContain("draft pull request");
+    // The feedback is the implement loop's own message, not a review's.
+    expect(body.failureReason).toContain("Run notes: ran out of turns");
+    expect(body.failureReason).not.toContain("Review notes");
   });
 
-  it("writes the autopsy comment file on unapproved runs", async () => {
+  it("uses PROVIDER_UNAVAILABLE with the classified failure when the in-loop review stage is exhausted by a transient outage (BAC-27134)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const providerFailure = {
+      category: "transient" as const,
+      code: "PROVIDER_UNAVAILABLE",
+      stage: "review",
+      attempt: 2,
+      retryable: false,
+      message: "upstream returned 529 overloaded_error",
+      evidence: { truncated: false },
+    };
+    const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
         {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
+            approved: false,
+            finalFeedback: "Tried 2 time(s). upstream returned 529 overloaded_error",
+            terminationReason: "provider_unavailable",
+            failure: providerFailure,
+          })),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(12, { draft: true })) }],
+      ["post-push-review", { run: postPushReviewRun }],
+    ]);
+    pipeline.steps[2].skip = () => true;
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof providerFailure;
+    };
+    expect(postPushReviewRun).not.toHaveBeenCalled();
+    expect(body.failureCode).toBe("PROVIDER_UNAVAILABLE");
+    expect(body.failureReason).not.toContain("did not approve");
+    // The stuck-job status cell and the give-up alert keep only the first line, so it names the outage.
+    expect(body.failureReason).toBe("The AI service was not available.\n\nTried 2 time(s). upstream returned 529 overloaded_error");
+    expect(body.failure).toEqual(providerFailure);
+  });
+
+  it.each(["review", "implement"])("publishes the draft and renders exhausted %s accounts as a usage limit", async stage => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const providerFailure = {
+      category: "auth" as const,
+      code: "ACCOUNT_USAGE_LIMIT",
+      stage,
+      attempt: 2,
+      retryable: false,
+      message: "Usage limit reached on every account: A, B",
+      evidence: { truncated: false },
+    };
+    const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
+            approved: false,
+            finalFeedback: providerFailure.message,
+            terminationReason: stage === "review" ? "review_error" : "provider_unavailable",
+            failure: providerFailure,
+          })),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(12, { draft: true })) }],
+      ["post-push-review", { run: postPushReviewRun }],
+    ]);
+    pipeline.steps[2].skip = () => true;
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof providerFailure;
+    };
+    expect(postPushReviewRun).not.toHaveBeenCalled();
+    expect(body.failureCode).toBe("ACCOUNT_USAGE_LIMIT");
+    expect(body.failureReason).not.toContain("did not approve");
+    // The stuck-job status cell and the give-up alert keep only the first line, so it names the usage limit.
+    expect(body.failureReason).toBe(providerFailure.message);
+    const { formatFailureComment } = await import("../runner-callback.js");
+    const comment = formatFailureComment(body.failureCode, body.failureReason, { failure: body.failure, prUrl: "https://github.com/o/r/pull/12" });
+    expect(comment).toMatch(/usage limit/i);
+    expect(comment).not.toContain("a review did not approve it");
+    expect(body.failure).toEqual(providerFailure);
+  });
+
+  it("words the PROVIDER_UNAVAILABLE fallback reason as the AI service when the run has no feedback", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const providerFailure = {
+      category: "transient" as const,
+      code: "PROVIDER_UNAVAILABLE",
+      stage: "review",
+      attempt: 2,
+      retryable: false,
+      message: "upstream returned 529 overloaded_error",
+      evidence: { truncated: false },
+    };
+    const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
+            approved: false,
+            finalFeedback: "",
+            terminationReason: "provider_unavailable",
+            failure: providerFailure,
+          })),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(12, { draft: true })) }],
+      ["post-push-review", { run: postPushReviewRun }],
+    ]);
+    pipeline.steps[2].skip = () => true;
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof providerFailure;
+    };
+    expect(postPushReviewRun).not.toHaveBeenCalled();
+    expect(body.failureCode).toBe("PROVIDER_UNAVAILABLE");
+    expect(body.failureReason).toBe("The AI service was not available and the run could not complete.");
+    expect(body.failure).toEqual(providerFailure);
+  });
+
+  it("uses REVIEWER_TURNS_EXHAUSTED with the classified failure when the post-push reviewer exhausts its turn cap", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const reviewerFailure = {
+      category: "invalid_output" as const,
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "post-push-review/review-1",
+      attempt: 1,
+      retryable: false,
+      message: "The runner reported no detail.",
+      evidence: { truncated: false },
+    };
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
+      [
+        "post-push-review",
+        {
           run: vi.fn().mockResolvedValue({
             approved: false,
-            iterations: 2,
-            finalFeedback: "nope",
-            terminationReason: "iterations_exhausted",
-            passes: [],
+            iterations: 1,
+            finalFeedback: "The reviewer used all of its permitted steps.",
+            terminationReason: "reviewer_turns_exhausted",
+            forcePushedRevisions: 0,
+            failure: reviewerFailure,
           }),
         },
       ],
-      ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, draft: true }) }],
     ]);
 
     const result = await runAutonomous({
@@ -1336,7 +2830,359 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof reviewerFailure;
+    };
+    expect(body.failureCode).toBe("REVIEWER_TURNS_EXHAUSTED");
+    expect(body.failureReason).toContain("The second review (on the pull request) did not finish.");
+    expect(body.failureReason).not.toMatch(/post-push/i);
+    expect(body.failureReason).toContain("the review is incomplete");
+    expect(body.failureReason).not.toContain("did not approve");
+    expect(body.failureReason).toContain("completed reviewer reports");
+    expect(body.failure).toEqual(reviewerFailure);
+  });
+
+  it("forwards reviewedHeadSha as externalReviewPending.headSha when the run ends external_review_pending", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "waiting",
+            terminationReason: "external_review_pending",
+            forcePushedRevisions: 0,
+            reviewedHeadSha: "a".repeat(40),
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as {
+      externalReviewPending?: { headSha: string };
+    };
+    expect(body.externalReviewPending).toEqual({ headSha: "a".repeat(40) });
+  });
+
+  it("omits externalReviewPending for any other termination reason even if reviewedHeadSha is present", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "waiting",
+            terminationReason: "iterations_exhausted",
+            forcePushedRevisions: 0,
+            reviewedHeadSha: "a".repeat(40),
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as {
+      externalReviewPending?: { headSha: string };
+    };
+    expect(body.externalReviewPending).toBeUndefined();
+  });
+
+  it("uses CHECKS_PERMISSION_DENIED with the classified failure when post-push review terminates on a check-runs permission error (AII-736)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const checksFailure = {
+      category: "invalid_output" as const,
+      code: "CHECKS_PERMISSION_DENIED",
+      stage: "post-push-review/review-1",
+      attempt: 1,
+      retryable: false,
+      message: "Check runs could not be read: the GitHub App lacks Checks: read.",
+      evidence: { truncated: false },
+    };
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(13)) }],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "Check runs could not be read: the GitHub App lacks Checks: read.",
+            terminationReason: "checks_permission_denied",
+            forcePushedRevisions: 0,
+            failure: checksFailure,
+          }),
+        },
+      ],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof checksFailure;
+    };
+    expect(body.failureCode).toBe("CHECKS_PERMISSION_DENIED");
+    expect(body.failureReason).not.toContain("did not approve");
+    expect(body.failure).toEqual(checksFailure);
+  });
+
+  it("turn exhaustion describes incomplete review and includes iteration count in disposition and warning", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const reviewerFailure = {
+      category: "invalid_output" as const,
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "post-push-review/review-2",
+      attempt: 1,
+      retryable: false,
+      message: "The runner reported no detail.",
+      evidence: { truncated: false },
+    };
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(12)) }],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 2,
+            finalFeedback:
+              "0 automated fix revision(s) were pushed and not re-reviewed.\n\nBlocking issues from the previous review:\n1. **Some finding**",
+            terminationReason: "reviewer_turns_exhausted",
+            forcePushedRevisions: 0,
+            failure: reviewerFailure,
+          }),
+        },
+      ],
+    ]);
+
+    let result: { exitCode: number };
+    try {
+      result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+      });
+    } finally {
+      const summary = error.mock.calls.map((call) => call.join(" ")).join("\n");
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      error.mockRestore();
+      warn.mockRestore();
+      // disposition
+      expect(summary).toContain("a reviewer used all of its permitted steps after 2 iteration(s) (reviewer_turns_exhausted)");
+      // ::warning:: text
+      expect(warnings).toContain(
+        "::warning::AI-Implement: a reviewer used all of its permitted steps after 2 iteration(s) (reviewer_turns_exhausted)",
+      );
+      expect(warnings).toContain("PR opened: https://github.com/acme/app/pull/12");
+      expect(warnings).not.toContain("draft PR opened");
+    }
+
+    expect(result!.exitCode).toBe(0);
+    const body = resultBody(fake) as { failureReason: string };
+    expect(body.failureReason).toContain("the review is incomplete");
+    expect(body.failureReason).not.toContain("the code was not reviewed");
+  });
+
+  it("falls back to DEFAULT_RETRY_POLICY.reviewMaxTurns (30) in the ticket comment when run_config.retryPolicy is missing reviewMaxTurns", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    vi.stubEnv(
+      "AI_IMPLEMENT_RUN_CONFIG",
+      encodeRunConfig({
+        v: 1,
+        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+        // A partial retryPolicy, as could arrive over the envelope (decodeRunConfig does not
+        // validate it) — missing reviewMaxTurns entirely.
+        retryPolicy: { pushRetries: 3 } as unknown as import("../pipeline/retry-backoff.js").RetryPolicy,
+      }),
+    );
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(13)) }],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "gap-analysis used all of its permitted steps.",
+            terminationReason: "reviewer_turns_exhausted",
+            forcePushedRevisions: 0,
+            failure: {
+              category: "invalid_output" as const,
+              code: "REVIEWER_TURNS_EXHAUSTED",
+              stage: "post-push-review/review-1",
+              attempt: 1,
+              retryable: false,
+              message: "The runner reported no detail.",
+              evidence: { truncated: false },
+            },
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as { failureReason: string };
+    // DEFAULT_RETRY_POLICY.reviewMaxTurns is 30 — the value normalizeRetryPolicy substitutes
+    // for the missing field, which this fallback then reads back out.
+    expect(body.failureReason).toContain("permitted steps (30)");
+  });
+
+  it("uses the reviewer-specific exhausted turn cap in the ticket comment and autopsy", async () => {
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope({ runnerCallbackUrl: "https://orchestrator.example" }));
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(14)) }],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "gap-analysis used all of its permitted steps.",
+            terminationReason: "reviewer_turns_exhausted",
+            forcePushedRevisions: 0,
+            failure: {
+              category: "invalid_output" as const,
+              code: "REVIEWER_TURNS_EXHAUSTED",
+              stage: "post-push-review/gap-analysis-review-1",
+              attempt: 1,
+              retryable: false,
+              reviewMaxTurns: 3,
+              message: "The runner reported no detail.",
+              evidence: { truncated: false },
+            },
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as { failureReason: string };
+    expect(body.failureReason).toContain("permitted steps (3)");
+    expect(body.failureReason).not.toContain("permitted steps (30)");
+    const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+    expect(autopsy).toContain("permitted steps (3)");
+    expect(autopsy).not.toContain("permitted steps (30)");
+  });
+
+  it("writes the autopsy comment file on unapproved runs", async () => {
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false, finalFeedback: "nope" })),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(1, { draft: true })) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.exitCode).toBe(0);
@@ -1349,10 +3195,10 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved" }) }],
-      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/11", prNumber: 11, branchPushed: true, draft: false }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
     ]);
 
     const result = await runAutonomous({
@@ -1360,29 +3206,97 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       outcome: string;
       prUrl: string;
       failureCode?: string;
     };
     expect(body.outcome).toBe("success");
-    expect(body.prUrl).toBe("https://github.com/o/r/pull/11");
+    expect(body.prUrl).toBe("https://github.com/acme/app/pull/11");
     expect(body.failureCode).toBeUndefined();
+  });
+
+  it("writes a ticket-facing Total cost that includes feedback-loop's extraCostUsd and the post-push reviewer's costUsd (BAC-27201)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, implementTurns: 5, implementOutcome: "success", costUsd: 0.20, reviewCostUsd: 0.05, reviewApproved: true }],
+        // A superseded implement/review retry attempt's cost (BAC-27201) — never in `passes`.
+        extraCostUsd: 0.10,
+      }) }],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(20)) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        // The post-push reviewer's own review+fix invocation cost (BAC-27201).
+        costUsd: 0.45,
+      }) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const stats = readFileSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"), "utf-8");
+    // 0.20 + 0.05 (pass) + 0.10 (feedback-loop retries) + 0.45 (post-push review + fix)
+    expect(stats).toContain("**Total cost:** $0.80");
+  });
+
+  it("labels the ticket-facing total partial when post-push review or a retry reports no cost (AII-113)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
+        passes: [{ iteration: 1, implementTurns: 5, implementOutcome: "success", costUsd: 0.20, reviewCostUsd: 0.05, reviewApproved: true }],
+        extraCostUsd: null,
+        extraCostUnreported: 0,
+      })) }],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(20)) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", costUsd: null }) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const stats = readFileSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"), "utf-8");
+    expect(stats).toContain("**Total cost:** ≥ $0.25 (partial)");
   });
 
   it("does not report success when the post-push review rejects an internally approved PR", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved" }) }],
-      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/12", prNumber: 12, branchPushed: true, draft: false }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(12)) }],
       ["post-push-review", { run: vi.fn().mockResolvedValue({
         approved: false,
         iterations: 2,
@@ -1396,12 +3310,12 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       outcome: string;
       failureCode?: string;
       failureReason?: string;
@@ -1410,7 +3324,14 @@ describe("runAutonomous", () => {
     expect(body.outcome).toBe("failure");
     expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
     expect(body.failureReason).toContain("iterations_exhausted");
-    expect(body.prUrl).toBe("https://github.com/o/r/pull/12");
+    expect(body.failureReason).toContain(
+      "The second review (on the pull request) did not approve the change. The review examined the change 2 times and found problems each time. (Code: `iterations_exhausted`)",
+    );
+    expect(body.failureReason).toContain("Review notes: External Claude finding remains.");
+    expect(body.prUrl).toBe("https://github.com/acme/app/pull/12");
+    // The ticket's autopsy names the stage that stopped the run.
+    const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+    expect(autopsy).toContain("Then the second review (on the pull request) stopped the run.");
   });
 
   it("approved mounted run exits 0, posts success with no prUrl, writes no autopsy", async () => {
@@ -1419,17 +3340,12 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: missingPrUrlRejected });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: true,
-            iterations: 1,
-            terminationReason: "approved",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
         },
       ],
     ]);
@@ -1439,12 +3355,12 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       outcome: string;
       failureCode?: string;
       prUrl?: string;
@@ -1462,18 +3378,12 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: false,
-            iterations: 2,
-            terminationReason: "iterations_exhausted",
-            finalFeedback: "implementation incomplete",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
         },
       ],
     ]);
@@ -1483,12 +3393,12 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0); // job stays green — warning only
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       outcome: string;
       failureCode: string;
     };
@@ -1502,8 +3412,8 @@ describe("runAutonomous", () => {
     mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
     writeFileSync(join(workspaceDir, "ai-output", "comments"), "not a directory");
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) };
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue(openedPr(1)) };
     const { pipeline, runner } = makeSingleStepPipeline("push", mod);
 
     const result = await runAutonomous({
@@ -1511,12 +3421,12 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
-      fetchImpl: mockFetch,
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
     });
 
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+    const body = resultBody(fake) as {
       comments: Array<{ body: string }>;
     };
     expect(body.comments).toEqual([]);
@@ -1544,7 +3454,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.exitCode).toBe(1);
@@ -1561,7 +3471,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.exitCode).toBe(0);
@@ -1582,7 +3492,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.exitCode).toBe(1);
@@ -1606,7 +3516,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedSkillsRepo).toBe("https://github.com/org/skills");
@@ -1627,7 +3537,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedSkillsRepo).toBeUndefined();
@@ -1650,7 +3560,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedProfiles).toEqual(["backend", "webapp"]);
@@ -1671,7 +3581,7 @@ describe("runAutonomous", () => {
       pipeline,
       runner,
       reporter: new NoopStepReporter(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(capturedProfiles).toEqual([]);
@@ -1687,12 +3597,12 @@ describe("runAutonomous", () => {
       vi.stubEnv("AI_IMPLEMENT_UNTIL_STEP", "setup");
 
       const setupMod: StepModule = { run: vi.fn().mockResolvedValue({}) };
-      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue({ approved: true }) };
+      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) };
 
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", setupMod],
         ["feedback-loop", feedbackMod],
-        ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/pr/1" }) }],
+        ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
       ]);
 
       const result = await runAutonomous({
@@ -1700,7 +3610,7 @@ describe("runAutonomous", () => {
         pipeline,
         runner,
         reporter: new NoopStepReporter(),
-        llmExecutor: makeMockExecutor(0),
+        llmExecutor: makeExecutor(),
       });
 
       expect(result.exitCode).toBe(0);
@@ -1714,7 +3624,7 @@ describe("runAutonomous", () => {
       const setupMod: StepModule = {
         run: vi.fn().mockRejectedValue(new Error("hook exploded")),
       };
-      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) };
 
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", setupMod],
@@ -1726,7 +3636,7 @@ describe("runAutonomous", () => {
         pipeline,
         runner,
         reporter: new NoopStepReporter(),
-        llmExecutor: makeMockExecutor(0),
+        llmExecutor: makeExecutor(),
       });
 
       expect(result.exitCode).toBe(1);
@@ -1740,7 +3650,7 @@ describe("runAutonomous", () => {
 
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", { run: vi.fn().mockResolvedValue({}) }],
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ]);
 
       const result = await runAutonomous({
@@ -1748,7 +3658,7 @@ describe("runAutonomous", () => {
         pipeline,
         runner,
         reporter: new NoopStepReporter(),
-        llmExecutor: makeMockExecutor(0),
+        llmExecutor: makeExecutor(),
       });
 
       expect(result.exitCode).toBe(0);
@@ -1760,8 +3670,8 @@ describe("runAutonomous", () => {
       vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "cloned");
       vi.stubEnv("AI_IMPLEMENT_UNTIL_STEP", "setup");
       vi.stubEnv("AI_IMPLEMENT_SHELL_MODE", "true");
-      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1 }) };
-      const pushMod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/pr/1" }) };
+      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) };
+      const pushMod: StepModule = { run: vi.fn().mockResolvedValue(openedPr(1)) };
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", { run: vi.fn().mockResolvedValue({}) }],
         ["feedback-loop", feedbackMod],
@@ -1773,12 +3683,273 @@ describe("runAutonomous", () => {
         pipeline,
         runner,
         reporter: new NoopStepReporter(),
-        llmExecutor: makeMockExecutor(0),
+        llmExecutor: makeExecutor(),
       });
 
       expect(result.exitCode).toBe(0);
       expect(feedbackMod.run).toHaveBeenCalledOnce();
       expect(pushMod.run).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("finding dispositions", () => {
+    // Mirrors replyToDispositionThreads' own test fixture (finding-dispositions.test.ts):
+    // a single unresolved thread whose body/path/line match the disposition's findingKey.
+    function makeGhSpawn(threadBody: string, threadPath: string, threadLine: number): { ghSpawn: GhSpawn; calls: string[][] } {
+      const calls: string[][] = [];
+      const ghSpawn: GhSpawn = (args) => {
+        calls.push(args);
+        if (args.some((a) => a.includes("addPullRequestReviewThreadReply"))) {
+          return { exitCode: 0, stdout: JSON.stringify({ data: { addPullRequestReviewThreadReply: { comment: { id: "IC_1" } } } }) };
+        }
+        if (args.some((a) => a.includes("resolveReviewThread"))) {
+          return { exitCode: 0, stdout: JSON.stringify({ data: { resolveReviewThread: { thread: { id: "RT_1" } } } }) };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            data: {
+              repository: {
+                pullRequest: {
+                  reviewThreads: {
+                    nodes: [
+                      { id: "RT_1", isResolved: false, path: threadPath, line: threadLine, comments: { nodes: [{ body: threadBody }] } },
+                    ],
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                  },
+                },
+              },
+            },
+          }),
+        };
+      };
+      return { ghSpawn, calls };
+    }
+
+    it("gap-fill run's prompt contains the disposition instructions exactly once", async () => {
+      vi.stubEnv("PR_NUMBER", "42");
+
+      let capturedPrompt: string | undefined;
+      const mod: StepModule = {
+        run: vi.fn(async (ctx) => {
+          capturedPrompt = ctx.data.implementationPrompt;
+          return {};
+        }),
+      };
+      const { pipeline, runner } = makeSingleStepPipeline("check-prompt", mod);
+
+      await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(capturedPrompt?.match(/## Finding dispositions/g)).toHaveLength(1);
+    });
+
+    it("a gap-fill run that pushed and wrote a dispositions file posts thread replies and sends dispositions on the callback", async () => {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const threadBody = "Missing null check.";
+      const threadPath = "src/app.ts";
+      const threadLine = 10;
+      const findingKey = stableReviewFindingKey({
+        source: "github-review-thread",
+        severity: "medium",
+        body: threadBody,
+        path: threadPath,
+        line: threadLine,
+      });
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(
+        join(workspaceDir, DISPOSITIONS_FILE),
+        JSON.stringify([{ findingKey, disposition: "follow-up", reason: "Out of scope for this issue." }]),
+      );
+
+      const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(calls.some((c) => c.some((a) => a.includes("addPullRequestReviewThreadReply")))).toBe(true);
+      expect(calls.some((c) => c.some((a) => a.includes("resolveReviewThread")))).toBe(true);
+      const body = resultBody(fake) as {
+        findingDispositions?: FindingDisposition[];
+      };
+      expect(body.findingDispositions).toEqual([
+        { findingKey, disposition: "follow-up", reason: "Out of scope for this issue." },
+      ]);
+    });
+
+    it("a gap-fill run with no code change and a follow-up disposition still replies, resolves the thread, and sends the dispositions", async () => {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const threadBody = "Consider caching this result.";
+      const threadPath = "src/service.ts";
+      const threadLine = 42;
+      const findingKey = stableReviewFindingKey({
+        source: "github-review-thread",
+        severity: "medium",
+        body: threadBody,
+        path: threadPath,
+        line: threadLine,
+      });
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(
+        join(workspaceDir, DISPOSITIONS_FILE),
+        JSON.stringify([{ findingKey, disposition: "follow-up", reason: "Not required by the acceptance criteria." }]),
+      );
+
+      const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      // No git change: push reports a no-op (existing-PR shape), mirroring push.ts's
+      // branchPushed=false with no prUrl for an already-up-to-date PR branch.
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: 42, branchPushed: false, commitSha: "c".repeat(40), draft: false }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(calls.some((c) => c.some((a) => a.includes("addPullRequestReviewThreadReply")))).toBe(true);
+      expect(calls.some((c) => c.some((a) => a.includes("resolveReviewThread")))).toBe(true);
+      const body = resultBody(fake) as {
+        findingDispositions?: FindingDisposition[];
+      };
+      expect(body.findingDispositions).toEqual([
+        { findingKey, disposition: "follow-up", reason: "Not required by the acceptance criteria." },
+      ]);
+    });
+
+    it("a gap-fill run whose push step failed with an error posts no replies", async () => {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const threadBody = "Missing null check.";
+      const threadPath = "src/app.ts";
+      const threadLine = 10;
+      const findingKey = stableReviewFindingKey({
+        source: "github-review-thread",
+        severity: "medium",
+        body: threadBody,
+        path: threadPath,
+        line: threadLine,
+      });
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(
+        join(workspaceDir, DISPOSITIONS_FILE),
+        JSON.stringify([{ findingKey, disposition: "follow-up", reason: "Out of scope for this issue." }]),
+      );
+
+      const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockRejectedValue(new Error("push failed")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(calls).toHaveLength(0);
+    });
+
+    it("an initial run sends the post-push review step's dispositions on the result callback", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const dispositions: FindingDisposition[] = [
+        { findingKey: "a".repeat(64), disposition: "fixed", reason: "Addressed in this pass." },
+      ];
+      const internalFindings = [{ source: "ai-implement-internal", severity: "blocking", body: "Fix validation" }];
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
+        [
+          "post-push-review",
+          { run: vi.fn().mockResolvedValue({ approved: true, internalFindings, findingDispositions: dispositions }) },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = resultBody(fake) as {
+        internalFindings?: unknown;
+        findingDispositions?: FindingDisposition[];
+      };
+      expect(body.internalFindings).toEqual(internalFindings);
+      expect(body.findingDispositions).toEqual(dispositions);
+    });
+
+    it("sends no findingDispositions field when there are none", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = resultBody(fake);
+      expect(body.findingDispositions).toBeUndefined();
     });
   });
 });
@@ -1838,26 +4009,12 @@ describe("runAutonomousLocally", () => {
   }
 
   beforeEach(() => {
-    workspaceDir = mkdtempSync(join(tmpdir(), "local-auto-test-"));
-  });
-
-  afterEach(() => {
-    try {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    } catch {
-      // best-effort
-    }
+    workspaceDir = testDir("local-autonomous");
   });
 
   it("returns exitCode 0 and approved=true when feedback-loop approves", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 2,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ iterations: 2 })),
     });
 
     const result = await runAutonomousLocally({
@@ -1899,13 +4056,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedPlanningContext = ctx.data.planningContext;
-        return {
-          approved: true,
-          iterations: 1,
-          terminationReason: "approved",
-          passes: [],
-          finalFeedback: "",
-        };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -1927,7 +4078,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedPlanningContext = ctx.data.planningContext;
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -1948,7 +4099,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (_ctx, inputs: Record<string, unknown>) => {
         capturedInputs = inputs;
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -1977,7 +4128,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedModel = ctx.data.model;
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -2003,7 +4154,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedModel = ctx.data.model;
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -2073,13 +4224,7 @@ describe("runAutonomousLocally", () => {
 
   it("returns effectiveMaxTurns and effectiveMaxIterations in result", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
     });
 
     const result = await runAutonomousLocally({
@@ -2099,13 +4244,7 @@ describe("runAutonomousLocally", () => {
 
   it("uses default effectiveMaxTurns=50 and effectiveMaxIterations=3 when not specified", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
     });
 
     const result = await runAutonomousLocally({
@@ -2150,6 +4289,34 @@ describe("runAutonomousLocally", () => {
     expect(result.tokenSummary!.tokensOut).toBeNull();
     expect(result.tokenSummary!.cacheReadTokens).toBeNull();
     expect(result.tokenSummary!.cacheCreationTokens).toBeNull();
+  });
+
+  it("sums reviewCostUsd into the completion payload's costUsd, not implement cost alone (BAC-27201)", async () => {
+    const passes = [
+      { iteration: 1, implementTurns: 5, implementOutcome: "ok", costUsd: 0.05, reviewCostUsd: 0.02, reviewApproved: true },
+      { iteration: 2, implementTurns: 3, implementOutcome: "ok", costUsd: 0.03, reviewCostUsd: null, reviewApproved: true },
+    ];
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 2,
+        terminationReason: "approved",
+        passes,
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.tokenSummary).not.toBeNull();
+    expect(result.tokenSummary!.costUsd).toBeCloseTo(0.10);
   });
 
   it("returns tokenSummary null when no passes ran", async () => {
@@ -2297,13 +4464,7 @@ describe("runAutonomousLocally", () => {
     writeFileSync(join(workspaceDir, "teardown.sh"), 'printf "" > teardown-ran.marker\n');
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
     });
 
     await runAutonomousLocally({
@@ -2324,9 +4485,9 @@ describe("runAutonomousLocally", () => {
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockResolvedValue({
-        approved: true,
+        approved: false,
         iterations: 1,
-        terminationReason: "approved",
+        terminationReason: "verify_failed",
         passes: [],
         finalFeedback: "",
       }),
@@ -2346,19 +4507,56 @@ describe("runAutonomousLocally", () => {
     expect(result.approved).toBe(false);
   });
 
-  it.skipIf(isWindows)("verify does not run when review did not approve", async () => {
+  it.skipIf(isWindows)("default local pipeline hands hooks.verify to the feedback loop", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nverify: verify.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "verify.sh"), "exit 0\n");
+
+    let captured: Record<string, unknown> | undefined;
+    const runner = new PipelineRunner().register("feedback-loop", {
+      run: vi.fn().mockImplementation(async (_ctx, inputs) => {
+        captured = inputs as Record<string, unknown>;
+        return {
+          approved: true,
+          iterations: 1,
+          terminationReason: "approved",
+          passes: [],
+          finalFeedback: "",
+        };
+      }),
+    });
+
+    // No `pipeline` option: exercises LOCAL_FEEDBACK_PIPELINE.
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      runner,
+    });
+
+    expect(captured?.verifyScriptPath).toBe("verify.sh");
+  });
+
+  it.skipIf(isWindows)("unapproved: the loop receives verifyScriptPath and the post-push verify step does not run the hook", async () => {
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nverify: verify.sh\n---\nbody\n");
     writeFileSync(join(workspaceDir, "verify.sh"), 'printf "" > verify-ran.marker\n');
 
-    const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: false,
-        iterations: 2,
-        terminationReason: "iterations_exhausted",
-        passes: [],
-        finalFeedback: "",
-      }),
-    });
+    const full = loadPipelineDefinition("pipelines/autonomous.yml", { existsSyncImpl: () => false });
+    const pipeline: PipelineDefinition = {
+      id: "test-local-verify",
+      steps: full.steps
+        .filter((s) => s.id === "feedback-loop" || s.id === "verify")
+        .map((s) => (s.id === "verify" ? { ...s, inputs: () => ({ workspaceDir, scriptPath: "verify.sh" }) } : s)),
+    };
+    let loopInputs: Record<string, unknown> | undefined;
+    const runner = new PipelineRunner()
+      .register("feedback-loop", {
+        run: vi.fn().mockImplementation(async (_ctx, inputs) => {
+          loopInputs = inputs as Record<string, unknown>;
+          return { approved: false, iterations: 2, terminationReason: "iterations_exhausted", passes: [], finalFeedback: "" };
+        }),
+      })
+      .register("verify", verifyStep);
 
     await runAutonomousLocally({
       workspaceDir,
@@ -2369,6 +4567,7 @@ describe("runAutonomousLocally", () => {
       runner,
     });
 
+    expect(loopInputs?.verifyScriptPath).toBe("verify.sh");
     expect(existsSync(join(workspaceDir, "verify-ran.marker"))).toBe(false);
   });
 
@@ -2395,5 +4594,407 @@ describe("runAutonomousLocally", () => {
 
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+});
+
+describe("configured (opted-in) autonomous runs", () => {
+  let workspaceDir: string;
+  const snap = makeSnapshot();
+
+  beforeEach(() => {
+    __resetPublicationCredentialForTests();
+    workspaceDir = testDir("run-autonomous-configured");
+    stubRequiredEnv();
+    for (const k of [
+      "ORCHESTRATOR_URL", "MACHINE_NONCE", "RUNNER_CALLBACK_URL", "RUN_TOKEN", "RUN_PROGRESS_TOKEN", "RUNNER_PHASE",
+      "PR_NUMBER", "AI_IMPLEMENT_UNTIL_STEP", "AI_IMPLEMENT_SHELL_MODE", "GITHUB_REF_NAME",
+    ]) vi.stubEnv(k, "");
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv("CLAUDE_MODEL", "env-claude-model");
+    vi.stubEnv("PROVIDER", "bedrock");
+  });
+
+  afterEach(() => {
+    __resetPublicationCredentialForTests();
+    vi.unstubAllEnvs();
+  });
+
+  function stubConfiguredEnv(): void {
+    for (const [k, v] of Object.entries(envelopeEnv(snap, makeGrant(snap)))) vi.stubEnv(k, v);
+  }
+
+  /** Captures the context the runner builds; optionally invokes the executor from inside a step. */
+  function capture(invokeStage?: "implementation" | "review") {
+    const seen: { ctx?: PipelineContext; result?: unknown } = {};
+    const { pipeline, runner } = makeSingleStepPipeline("capture", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        seen.ctx = ctx;
+        if (invokeStage) seen.result = await ctx.llmExecutor.invoke({ prompt: "p", model: "caller-model", agentStage: invokeStage });
+        return {};
+      }),
+    });
+    return { seen, pipeline, runner };
+  }
+
+  it("managed and local runs receive the same resolved stage settings, overriding every legacy model source", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nmodel: workflow-model\n---\nDo it.\n");
+    stubConfiguredEnv();
+    const managedClient = fakeClient();
+    const m = capture();
+    const managed = await runAutonomous({
+      workspaceDir, ...m, reporter: new NoopStepReporter(),
+      configured: { modelAuthClient: managedClient, now: () => NOW },
+    });
+    const localClient = fakeClient();
+    const l = capture();
+    const local = await runAutonomousLocally({
+      workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", model: "opts-model",
+      pipeline: l.pipeline, runner: l.runner,
+      configured: {
+        agentConfig: snap, modelAuthClient: localClient, localCredentialPort: { load: vi.fn() },
+      },
+    });
+    expect(managed.exitCode).toBe(0);
+    expect(local.exitCode).toBe(0);
+    expect(m.seen.ctx!.data.agentConfig).toEqual(snap);
+    expect(l.seen.ctx!.data.agentConfig).toEqual(m.seen.ctx!.data.agentConfig);
+    for (const c of [m.seen.ctx!, l.seen.ctx!]) {
+      expect(c.data.model).toBe("gpt-impl");
+      expect(c.data.provider).toBe("anthropic");
+    }
+    for (const c of [m.seen.ctx!, l.seen.ctx!]) {
+      expect(JSON.stringify(c.data)).not.toContain(SENTINEL_BEARER);
+    }
+  });
+
+  it("selects the executor from the snapshot per call and passes the injected executor only as Claude", async () => {
+    stubConfiguredEnv();
+    const client = fakeClient();
+    const injected = makeExecutor();
+    const c = capture("review");
+    await runAutonomous({
+      workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected,
+      configured: { modelAuthClient: client, now: () => NOW },
+    });
+    expect(c.seen.ctx!.llmExecutor).not.toBe(injected);
+    expect(injected.invoke).toHaveBeenCalledTimes(1);
+    expect((injected.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
+    expect(client.checkout).toHaveBeenCalledTimes(1);
+    expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
+    expect(client.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])("checks out a fallback profile once and preserves checkout failures (refused=%s)", async refused => {
+    const client = fakeClient();
+    const injected = makeExecutor();
+    const checkoutFailure = { category: "auth" as const, code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", stage: "review", attempt: 1, retryable: false, message: "model-auth client error: profile_not_allowed", evidence: { truncated: false } };
+    if (refused) vi.mocked(client.checkout).mockResolvedValueOnce(undefined).mockRejectedValueOnce(new ModelAuthClientError("profile_not_allowed"));
+    const entries = [{ accountProfileId: "fallback-review", profileRevision: 2, agent: "claude" as const, provider: "anthropic" as const, authMode: "anthropic-api-key" as const, model: "claude-next" }];
+    const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "review", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+    vi.mocked(injected.invoke).mockResolvedValueOnce({ stdout: "", exitCode: 1, tokensUsed: 0, failure });
+    const { pipeline, runner } = makeSingleStepPipeline("capture", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        const params = { prompt: "p", model: "ignored", agentStage: "review" as const };
+        await ctx.llmExecutor.invoke(params);
+        if (refused) {
+          await expect(ctx.llmExecutor.invoke(params)).rejects.toMatchObject({ failure: checkoutFailure });
+          await expect(ctx.llmExecutor.invoke(params)).rejects.toMatchObject({ failure: checkoutFailure });
+        } else {
+          await ctx.llmExecutor.invoke(params);
+          await ctx.llmExecutor.invoke(params);
+        }
+        return {};
+      }),
+    });
+    await runAutonomousLocally({
+      workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", pipeline, runner, llmExecutor: injected,
+      configured: { agentConfig: snap, modelAuthClient: client, localCredentialPort: { load: vi.fn() }, accountFallbacks: { review: entries } },
+    });
+    expect(client.checkout).toHaveBeenCalledTimes(2);
+    expect(client.checkout).toHaveBeenNthCalledWith(2, { profileId: "fallback-review", authMode: "anthropic-api-key" });
+    expect(client.invoke).toHaveBeenCalledTimes(refused ? 1 : 3);
+  });
+
+  it("finishes and disposes once on success and as failed on a thrown step", async () => {
+    stubConfiguredEnv();
+    const ok = fakeClient();
+    const c = capture("review");
+    await runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(), configured: { modelAuthClient: ok, now: () => NOW } });
+    // The capture pipeline has no approval, so the run is a coded failure, not a completion.
+    expect(ok.finish).toHaveBeenCalledTimes(1);
+    expect(ok.finish).toHaveBeenCalledWith("p-rev", "failed");
+    expect(ok.dispose).toHaveBeenCalledTimes(1);
+
+    const bad = fakeClient();
+    const { pipeline, runner } = makeSingleStepPipeline("boom", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        await ctx.llmExecutor.invoke({ prompt: "p", model: "m", agentStage: "review" });
+        throw new Error("step exploded");
+      }),
+    });
+    const r = await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(), configured: { modelAuthClient: bad, now: () => NOW } });
+    expect(r.exitCode).toBe(1);
+    expect(bad.finish).toHaveBeenCalledWith("p-rev", "failed");
+    expect(bad.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds instead of releasing when a child may still be live", async () => {
+    stubConfiguredEnv();
+    const client = fakeClient();
+    const live = { invoke: vi.fn().mockRejectedValue(Object.assign(new Error("still running"), { possiblyLive: true })) };
+    const { pipeline, runner } = makeSingleStepPipeline("live", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        await ctx.llmExecutor.invoke({ prompt: "p", model: "m", agentStage: "review" });
+        return {};
+      }),
+    });
+    const r = await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: live, configured: { modelAuthClient: client, now: () => NOW } });
+    expect(r.exitCode).toBe(1);
+    expect(client.finish).not.toHaveBeenCalled();
+    expect(client.dispose).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid bootstrap before any runner, hook or executor work, even with injection", async () => {
+    const hook = join(workspaceDir, "setup-ran");
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), `---\nsetup: touch ${hook}\n---\nDo it.\n`);
+    const injected = makeExecutor();
+    const client = fakeClient();
+    const cases: Array<[string, Record<string, string>]> = [
+      ["missing grant", envelopeEnv(snap, undefined)],
+      ["expired grant", envelopeEnv(snap, makeGrant(snap, { expiresAt: NOW }))],
+      ["context mismatch", { ...envelopeEnv(snap, makeGrant(snap)), AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: "other" }],
+    ];
+    for (const [, env] of cases) {
+      for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+      const c = capture();
+      await expect(
+        runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { modelAuthClient: client, now: () => NOW } }),
+      ).rejects.toThrow(/Configured run rejected before execution/);
+      expect(c.seen.ctx).toBeUndefined();
+      vi.unstubAllEnvs();
+      stubRequiredEnv();
+    }
+    expect(injected.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(existsSync(hook)).toBe(false);
+  });
+
+  // ---- AII-1427: the trusted launch context arrives from the real GHA bootstrap, never from the test ----
+
+  function loopbackTransport() {
+    const hits: string[] = [];
+    const transport: ModelAuthTransport = {
+      post: vi.fn(async (route: string) => {
+        hits.push(route);
+        const body = route === MODEL_AUTH_ROUTES.checkout
+          ? { version: 1, ok: true, profileId: "p-rev", authMode: "anthropic-api-key", secret: { kind: "api-key", apiKey: "sk-synthetic-review-key-000000" } }
+          : { version: 1, ok: true, acknowledged: true };
+        return { status: 200, body };
+      }),
+    };
+    return { transport, hits };
+  }
+  const fakeCodexFactory = () => {
+    const created: string[] = [];
+    const calls: unknown[] = [];
+    const createCodex = (id: string) => {
+      created.push(id);
+      return { invoke: async (p: unknown) => (calls.push(p), { stdout: "done", exitCode: 0, tokensUsed: 1 }) };
+    };
+    return { createCodex, created, calls };
+  };
+
+  for (const file of GHA_IMPLEMENT_WORKFLOWS) {
+    describe(`GHA bootstrap handoff via ${file}`, () => {
+      let hook: string;
+      beforeEach(() => {
+        hook = join(workspaceDir, "setup-ran");
+        writeFileSync(join(workspaceDir, "WORKFLOW.md"), `---\nsetup: touch ${hook}\n---\nDo it.\n`);
+        for (const k of ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN"]) vi.stubEnv(k, REQUIRED_ENV[k]);
+      });
+
+      it("baseline: an old-shaped Run env (envelope present, no AI_IMPLEMENT_MODEL_AUTH_*) is rejected with bootstrap_context_missing and no work", async () => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const input = { snapshot, grant: ghaGrant(snapshot), callback: false };
+        // The repaired bootstrap refuses a grant without context, so the OLD environment is constructed directly.
+        expect(ghaRunStepEnv(file, input).bootStatus).toBe(1);
+        stubRunEnv(oldShapedRunEnv(file, input));
+        const { transport, hits } = loopbackTransport();
+        const codex = fakeCodexFactory();
+        const injected = makeExecutor();
+        const c = capture("implementation");
+        await expect(
+          runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+        ).rejects.toMatchObject({ code: "CONFIGURED_RUN_INVALID", reason: "bootstrap_context_missing" });
+        expect(c.seen.ctx).toBeUndefined();
+        expect(hits).toEqual([]);
+        expect(codex.created).toEqual([]);
+        expect(injected.invoke).not.toHaveBeenCalled();
+        expect(existsSync(hook)).toBe(false);
+      });
+
+      for (const authMode of ["codex-subscription", "openai-api-key"] as const) {
+        it(`implementation entrypoint, Codex ${authMode}: the real CodexExecutor checks out the selected profile and its child receives only that credential`, async () => {
+          const snapshot = makeSnapshot(authMode);
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, callback: false });
+          expect(handoff.bootStatus).toBe(0);
+          expect(handoff.githubEnv).toBe("");
+          stubRunEnv(handoff.runEnv);
+          for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY", "CHATGPT_PLAN_ACCESS_TOKEN"]) vi.stubEnv(k, S_AMBIENT);
+          const { transport, checkouts, routes } = codexLoopback({ "p-plan": "anthropic-api-key", "p-impl": authMode, "p-rev": "anthropic-api-key" });
+          const child = installCodexChild("exec");
+          const injected = makeExecutor();
+          const c = capture("implementation");
+          try {
+            const result = await runAutonomous({
+              workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected,
+              configured: { modelAuthTransport: transport, now: () => NOW },
+            });
+            expect(result.exitCode).toBe(0);
+          } finally {
+            resetCodexChild();
+          }
+          // Successful stage outcome from the real executor, not the legacy Claude one.
+          expect(c.seen.result).toMatchObject({ exitCode: 0, stdout: "done" });
+          expect(injected.invoke).not.toHaveBeenCalled();
+          // Exactly one checkout, for the selected Codex profile and auth mode, then finish/release.
+          expect(checkouts).toEqual([{ profileId: "p-impl", authMode }]);
+          expect(routes()[0]).toBe(MODEL_AUTH_ROUTES.checkout);
+          expect(routes().at(-1)).toBe(MODEL_AUTH_ROUTES.finish);
+          // One `codex` child with the selected credential and nothing ambient, opposite or bootstrap-derived.
+          expect(child).toHaveLength(1);
+          expect(child[0].cmd).toBe("codex");
+          expect(child[0].args).toContain("gpt-impl");
+          const env = child[0].env;
+          const dump = JSON.stringify(env);
+          if (authMode === "codex-subscription") {
+            expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBe(S_CHATGPT);
+            expect(env.CODEX_API_KEY).toBeUndefined();
+            expect(dump).not.toContain(S_OPENAI);
+            expect(child[0].args.some((a) => a.includes("chatgpt_plan"))).toBe(true);
+          } else {
+            expect(env.CODEX_API_KEY).toBe(S_OPENAI);
+            expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBeUndefined();
+            expect(dump).not.toContain(S_CHATGPT);
+            expect(child[0].args.some((a) => a.includes("chatgpt_plan"))).toBe(false);
+          }
+          expect(env.OPENAI_API_KEY).toBeUndefined();
+          expect(dump).not.toContain(S_AMBIENT);
+          expect(dump).not.toContain(SENTINEL_BEARER);
+          expect(Object.keys(env).filter((k) => k.startsWith("AI_IMPLEMENT_") || k.startsWith("RUN_"))).toEqual([]);
+        });
+      }
+
+      it("implementation entrypoint, Claude API key stage: bootstrap-derived env drives checkout through the loopback transport", async () => {
+        const snapshot = makeSnapshot("openai-api-key");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, callback: false });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const injected = makeExecutor();
+        const c = capture("review");
+        await runAutonomous({
+          workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected,
+          configured: { modelAuthTransport: transport, now: () => NOW },
+        });
+        expect(hits[0]).toBe(MODEL_AUTH_ROUTES.checkout);
+        expect(injected.invoke).toHaveBeenCalledTimes(1);
+      });
+
+      const forgeries: Array<[string, Parameters<typeof ghaGrant>[1]]> = [
+        ["dispatch", { dispatchId: "other-dispatch" }],
+        ["project", { projectKey: "other-project" }],
+        ["backend", { backend: "fly" }],
+        ["snapshot", { snapshotId: "other-snapshot" }],
+      ];
+      for (const [field, over] of forgeries) {
+        it(`a grant with an altered ${field} is rejected against the independent context before any clone, hook or model work`, async () => {
+          const snapshot = makeSnapshot("codex-subscription");
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot, over), context: GHA_CONTEXT, callback: false });
+          if (handoff.bootStatus !== 0) {
+            expect(handoff.runEnv).toEqual({});
+            return;
+          }
+          stubRunEnv(handoff.runEnv);
+          const { transport, hits } = loopbackTransport();
+          const codex = fakeCodexFactory();
+          const injected = makeExecutor();
+          const c = capture("implementation");
+          await expect(
+            runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+          ).rejects.toThrow(/Configured run rejected before execution/);
+          expect(c.seen.ctx).toBeUndefined();
+          expect(hits).toEqual([]);
+          expect(codex.created).toEqual([]);
+          expect(injected.invoke).not.toHaveBeenCalled();
+          expect(existsSync(hook)).toBe(false);
+        });
+      }
+
+      it("an altered launch context (grant unchanged) is rejected by the runner before any clone, hook or model work", async () => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, projectKey: "tampered" }, callback: false });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const codex = fakeCodexFactory();
+        const injected = makeExecutor();
+        const c = capture("implementation");
+        await expect(
+          runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+        ).rejects.toMatchObject({ reason: "bootstrap_invalid" });
+        expect(c.seen.ctx).toBeUndefined();
+        expect(hits).toEqual([]);
+        expect(codex.created).toEqual([]);
+        expect(injected.invoke).not.toHaveBeenCalled();
+        expect(existsSync(hook)).toBe(false);
+      });
+
+      it.each([
+        ["http", "http://orchestrator.invalid/model-auth"],
+        ["userinfo", "https://user:pw@orchestrator.invalid/model-auth"],
+        ["query", "https://orchestrator.invalid/model-auth?x=1"],
+      ])("an unsafe context URL (%s) is refused by the bootstrap, so the Run step never starts", (_n, modelAuthUrl) => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, modelAuthUrl }, callback: false });
+        expect(handoff.bootStatus).not.toBe(0);
+        expect(handoff.runEnv).toEqual({});
+        expect(handoff.githubEnv).toBe("");
+        expect(existsSync(hook)).toBe(false);
+      });
+    });
+  }
+
+  it("local: cleans up on setup-hook failure and on a thrown pipeline", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nsetup: exit 3\n---\nDo it.\n");
+    const client = fakeClient();
+    const l = capture();
+    const configured = {
+      agentConfig: snap, modelAuthClient: client, localCredentialPort: { load: vi.fn() },
+    };
+    const r = await runAutonomousLocally({ workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", pipeline: l.pipeline, runner: l.runner, configured });
+    expect(r.terminationReason).toBe("setup_failed");
+    expect(l.seen.ctx).toBeUndefined();
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("an absent snapshot preserves legacy construction and injection byte-for-byte", async () => {
+    const injected = makeExecutor();
+    const c = capture();
+    await runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected });
+    expect(c.seen.ctx!.llmExecutor).toBe(injected);
+    expect(c.seen.ctx!.data.agentConfig).toBeUndefined();
+    expect(c.seen.ctx!.data.model).toBe("env-claude-model");
+    expect(c.seen.ctx!.data.provider).toBe("bedrock");
+
+    const built = capture();
+    await runAutonomous({ workspaceDir, ...built, reporter: new NoopStepReporter() });
+    expect(built.seen.ctx!.llmExecutor).toBeInstanceOf(ClaudeCliExecutor);
+
+    const l = capture();
+    await runAutonomousLocally({ workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", llmExecutor: injected, pipeline: l.pipeline, runner: l.runner });
+    expect(l.seen.ctx!.llmExecutor).toBe(injected);
+    expect(l.seen.ctx!.data.agentConfig).toBeUndefined();
   });
 });

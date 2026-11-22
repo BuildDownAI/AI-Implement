@@ -11,6 +11,7 @@ export const issuesHtml = `
   </header>
   <div class="page-body">
     <div id="issues-error" class="alert fail" hidden></div>
+    <div id="issues-partial" class="alert warn" hidden></div>
 
     <div class="card">
       <div class="card-header">
@@ -66,13 +67,13 @@ export const issuesScript = `
       const tr = document.createElement('tr');
       const stateKind = stateBadgeKind(issue.stateType);
       const planBadge = issue.bucket === 'ready'
-        ? '<span class="badge success"><span class="dot"></span>Ready</span>'
-        : '<span class="badge info"><span class="dot"></span>Plan pending</span>';
+        ? window.statusBadge('success', 'Ready')
+        : window.statusBadge('info', 'Plan pending');
       tr.innerHTML = '<td><span class="mono">' + window.esc(issue.identifier) + '</span> ' + window.esc(issue.title) + '</td>'
         + '<td><span class="mono">' + window.esc(issue.teamKey) + '</span></td>'
-        + '<td><span class="badge ' + stateKind + '"><span class="dot"></span>' + window.esc(issue.stateName) + '</span></td>'
+        + '<td>' + window.statusBadge(stateKind, issue.stateName) + '</td>'
         + '<td>' + planBadge + '</td>'
-        + '<td><a class="text-accent" href="https://linear.app/issue/' + window.escAttr(issue.identifier) + '" target="_blank">Open ↗</a></td>';
+        + '<td>' + (issue.issueUrl ? '<a class="text-accent" href="' + window.safeUrl(issue.issueUrl) + '" target="_blank">Open \u2197</a>' : '<span class="text-tertiary">\u2014</span>') + '</td>';
       tbody.appendChild(tr);
     }
   }
@@ -106,6 +107,15 @@ export const issuesScript = `
     if (el) el.textContent = issues.length + ' matched \xb7 ' + inProgress + ' currently implementing';
   }
 
+  // A tracker whose snapshot failed: its issues, and the counts for its teams, are missing from this load.
+  function renderPartial(failedTrackers) {
+    const el = document.getElementById('issues-partial');
+    if (!failedTrackers || failedTrackers.length === 0) { el.hidden = true; return; }
+    const named = failedTrackers.map(function (t) { return window.esc(t.provider) + ': ' + window.esc(t.error); }).join('; ');
+    el.innerHTML = '<div style="flex:1"><div class="alert-title">Some ticketing systems did not answer</div><div class="alert-desc">' + named + '. Their issues, and the in-progress counts for their teams, are missing below until they answer.</div></div>';
+    el.hidden = false;
+  }
+
   async function loadIssues() {
     const errorEl = document.getElementById('issues-error');
     errorEl.hidden = true;
@@ -118,6 +128,7 @@ export const issuesScript = `
       } catch (_) { /* ignore parse errors */ }
       errorEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load issues</div><div class="alert-desc">' + window.esc(errorMsg) + '</div></div>';
       errorEl.hidden = false;
+      document.getElementById('issues-partial').hidden = true;
       document.getElementById('issues-body').innerHTML = '';
       document.getElementById('issues-progress-body').innerHTML = '';
       document.getElementById('issues-empty').classList.add('hidden');
@@ -130,6 +141,7 @@ export const issuesScript = `
     renderInbox(data.issues);
     renderProgress(data.inProgressCountsByTeam);
     renderSubtitle(data.issues, data.inProgressCountsByTeam);
+    renderPartial(data.failedTrackers);
   }
 
   window.loadIssues = loadIssues;

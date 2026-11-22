@@ -1,36 +1,57 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import crypto from "node:crypto";
 import type * as DedupModule from "../dedup.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
+import { testDb } from "./helpers/test-db.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `runner-tokens-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerTokens = await import("../runner-tokens.js");
-  // Force DB init so the runner_tokens table exists for the first test access.
-  dedup.getDb();
+  ({ dedup, runnerTokens } = (
+    await testDb({ modules: { dedup: () => import("../dedup.js"), runnerTokens: () => import("../runner-tokens.js") } })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 
 describe("mintRunToken", () => {
+  it.each(["", "   "])("refuses an empty mapping key %j and inserts no row", (key) => {
+    const count = () => (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM runner_tokens").get() as { n: number }).n;
+    const before = count();
+    expect(() => runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: key, phase: "planning", ttlSeconds: 60, secret: SECRET,
+    })).toThrow(/mapping key/);
+    expect(count()).toBe(before);
+  });
+
+  it("a stale publication release cannot clear a newer claim, even within one millisecond", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-1", mappingTeamKey: "ENG", phase: "implementation",
+      audience: "publication", repository: "acme/app", ttlSeconds: 60, secret: SECRET,
+    });
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const first = runnerTokens.verifyRunToken(token, SECRET, "publication", { consume: true });
+      expect(first.ok).toBe(true);
+      if (!first.ok || first.consumedAt === null) throw new Error("missing first claim stamp");
+      expect(runnerTokens.releasePublicationClaim(dispatchId, first.consumedAt)).toBe(true);
+
+      const second = runnerTokens.verifyRunToken(token, SECRET, "publication", { consume: true });
+      expect(second.ok).toBe(true);
+      if (!second.ok || second.consumedAt === null) throw new Error("missing second claim stamp");
+      expect(second.consumedAt).not.toBe(first.consumedAt);
+      expect(runnerTokens.releasePublicationClaim(dispatchId, first.consumedAt)).toBe(false);
+      const replay = runnerTokens.verifyRunToken(token, SECRET, "publication", { consume: true });
+      expect(replay).toMatchObject({ ok: false, reason: "already_consumed" });
+    } finally { vi.restoreAllMocks(); }
+  });
+
   it("returns a token and dispatchId, persists a row", () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "issue-1",
@@ -204,7 +225,7 @@ describe("verifyAndConsumeRunToken", () => {
     expect(runnerTokens.verifyAndConsumeRunToken("nodothere", SECRET).ok).toBe(false);
   });
 
-  it("returns malformed when no row exists for the dispatchId", () => {
+  it("returns missing_row when no row exists for the dispatchId", () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "issue-1",
       mappingTeamKey: "ENG",
@@ -215,7 +236,7 @@ describe("verifyAndConsumeRunToken", () => {
     dedup.getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ?").run(dispatchId);
     const result = runnerTokens.verifyAndConsumeRunToken(token, SECRET);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toBe("malformed");
+    if (!result.ok) expect(result.reason).toBe("missing_row");
   });
 
   it("allows progress tokens to be verified repeatedly without consuming them", () => {
@@ -247,5 +268,451 @@ describe("verifyAndConsumeRunToken", () => {
     const result = runnerTokens.verifyRunToken(token, SECRET, "progress", { consume: false });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("wrong_audience");
+  });
+});
+
+describe("verifyRunToken — claims on a refusal", () => {
+  it("carries claims when the token is already consumed", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    expect(runnerTokens.verifyAndConsumeRunToken(token, SECRET).ok).toBe(true);
+
+    const second = runnerTokens.verifyAndConsumeRunToken(token, SECRET);
+    expect(second.ok).toBe(false);
+    if (!second.ok) {
+      expect(second.reason).toBe("already_consumed");
+      expect(second.claims?.dispatchId).toBe(dispatchId);
+      expect(second.claims?.phase).toBe("implementation");
+    }
+  });
+
+  it("carries claims when the audience does not match", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const result = runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("wrong_audience");
+      expect(result.claims?.dispatchId).toBe(dispatchId);
+    }
+  });
+
+  it("carries claims when the token has expired", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: -1,
+      secret: SECRET,
+    });
+
+    const result = runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("expired");
+      expect(result.claims?.dispatchId).toBe(dispatchId);
+    }
+  });
+
+  it("omits claims when the token is malformed or badly signed", () => {
+    const malformed = runnerTokens.verifyRunToken("not-a-token", SECRET, "result", { consume: false });
+    expect(malformed.ok).toBe(false);
+    if (!malformed.ok) {
+      expect(malformed.reason).toBe("malformed");
+      expect(malformed.claims).toBeUndefined();
+    }
+
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const tampered = `${token.split(".")[0]}.${"A".repeat(token.split(".")[1].length)}`;
+
+    const badSig = runnerTokens.verifyRunToken(tampered, SECRET, "result", { consume: false });
+    expect(badSig.ok).toBe(false);
+    if (!badSig.ok) {
+      expect(badSig.reason).toBe("bad_signature");
+      expect(badSig.claims).toBeUndefined();
+    }
+  });
+
+  it("carries claims when the payload verified but its row is gone", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    dedup.getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ?").run(dispatchId);
+
+    const result = runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("missing_row");
+      expect(result.claims?.dispatchId).toBe(dispatchId);
+    }
+  });
+});
+
+const PILOT_ATTEMPT = "reviewfix-pilot-attempt-1";
+
+function seedPreparedPilotAttempt(deadlineAt = Date.now() + 60_000): void {
+  const db = dedup.getDb();
+  db.prepare(`
+    INSERT INTO dispatch_admissions
+      (dispatch_id, mapping_key, issue_scope, issue_id, installation_id,
+       repository, pr_number, lifecycle_owner, phase, backend, created_at)
+    VALUES (?, 'AII', 'pr', 'acme/app#42', '7', 'acme/app', 42,
+            ?, 'implementation', 'github-actions', ?)
+  `).run(PILOT_ATTEMPT, `restate:${PILOT_ATTEMPT}`, Date.now());
+  db.prepare(`
+    INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository,
+       pr_number, issue_scope, issue_id, owner, state, created_at, deadline_at,
+       task_snapshot_json, finding_versions_json)
+    VALUES (?, ?, 'AII', '7', 'acme/app', 42, 'pr', 'acme/app#42',
+            ?, 'prepared', ?, ?, '{}', '[]')
+  `).run(PILOT_ATTEMPT, PILOT_ATTEMPT, PILOT_ATTEMPT, Date.now(), deadlineAt);
+}
+
+function resignPilotClaims(token: string, changes: Record<string, unknown>): string {
+  const [payload] = token.split(".");
+  const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+  const alteredPayload = Buffer.from(JSON.stringify({ ...claims, ...changes })).toString("base64url");
+  const signature = crypto.createHmac("sha256", SECRET).update(alteredPayload).digest("base64url");
+  return `${alteredPayload}.${signature}`;
+}
+
+describe("prepared review-fix credentials", () => {
+  describe.each(["github-actions", "fly-machines", "local-docker"])("publication scope for %s", (backend) => {
+    function prepare() {
+      const now = Date.now();
+      seedPreparedPilotAttempt(now + 1000);
+      dedup.getDb().prepare(`UPDATE review_fix_attempts SET state = 'launch_intent',
+        execution_backend = ?, execution_ref = 'machine-1', github_run_id = 123,
+        github_run_attempt = 2 WHERE attempt_id = ?`).run(backend, PILOT_ATTEMPT);
+      const { token } = runnerTokens.mintPreparedReviewFixToken({
+        attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET,
+      });
+      return { now, token };
+    }
+
+    it.each([
+      { name: "matching IDs", githubRunId: 123, githubRunAttempt: 2 },
+      { name: "absent IDs", githubRunId: undefined, githubRunAttempt: undefined },
+      { name: "different run ID", githubRunId: 999, githubRunAttempt: 2 },
+      { name: "different attempt", githubRunId: 123, githubRunAttempt: 3 },
+      { name: "nonpositive IDs", githubRunId: 0, githubRunAttempt: 0 },
+    ])("checks $name against the stored backend", ({ githubRunId, githubRunAttempt }) => {
+      const { token } = prepare();
+      const result = runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: { repository: "acme/app", githubRunId, githubRunAttempt },
+      });
+      expect(result).toMatchObject(backend !== "github-actions" || (githubRunId === 123 && githubRunAttempt === 2)
+        ? { ok: true } : { ok: false, reason: "wrong_scope" });
+    });
+
+    it("ends publication authority on release while retaining ordinary result retries", () => {
+      const { now, token } = prepare();
+      const execution = { repository: "acme/app", githubRunId: 123, githubRunAttempt: 2 };
+      const publication = runnerTokens.mintPreparedReviewFixToken({
+        attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET,
+      });
+      const progress = runnerTokens.mintPreparedReviewFixToken({
+        attemptId: PILOT_ATTEMPT, audience: "progress", secret: SECRET,
+      });
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: execution,
+      }).ok).toBe(true);
+      dedup.getDb().prepare("UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?")
+        .run(now, PILOT_ATTEMPT);
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: execution,
+      })).toMatchObject({ ok: false, reason: "revoked" });
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result").ok).toBe(true);
+      expect(runnerTokens.verifyPreparedReviewFixToken(progress.token, SECRET, "progress"))
+        .toMatchObject({ ok: false, reason: "revoked" });
+      expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication", {
+        consumePublication: true, publicationExecution: execution,
+      })).toMatchObject({ ok: false, reason: "revoked" });
+      expect(() => runnerTokens.mintPreparedReviewFixToken({
+        attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET,
+      })).toThrow(/no current authority/);
+      dedup.getDb().prepare("UPDATE review_fix_attempts SET authority_revoked_at = ? WHERE attempt_id = ?")
+        .run(now, PILOT_ATTEMPT);
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result"))
+        .toMatchObject({ ok: false, reason: "revoked" });
+    });
+
+    it("rejects an unbound execution", () => {
+      const { token } = prepare();
+      dedup.getDb().prepare(`UPDATE review_fix_attempts SET execution_ref = NULL,
+        github_run_id = NULL, github_run_attempt = NULL WHERE attempt_id = ?`).run(PILOT_ATTEMPT);
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: { repository: "acme/app" },
+      })).toMatchObject({ ok: false, reason: "wrong_scope" });
+    });
+
+    it("rejects a repository mismatch", () => {
+      const { token } = prepare();
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: { repository: "other/repo", githubRunId: 123, githubRunAttempt: 2 },
+      })).toMatchObject({ ok: false, reason: "wrong_scope" });
+    });
+
+    it.each([1000, 1001])("refuses publication at deadline + %i ms from preparation", (elapsed) => {
+      const { now, token } = prepare();
+      vi.spyOn(Date, "now").mockReturnValue(now + elapsed);
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: { repository: "acme/app", githubRunId: 123, githubRunAttempt: 2 },
+      })).toMatchObject({ ok: false, reason: "revoked" });
+    });
+
+    it.each(["state = 'completed'", "terminal_outcome_json = '{}'", "completed_at = 1", "authority_revoked_at = 1"])(
+      "refuses ended authority: %s", (assignment) => {
+        const { token } = prepare();
+        dedup.getDb().prepare(`UPDATE review_fix_attempts SET ${assignment} WHERE attempt_id = ?`).run(PILOT_ATTEMPT);
+        expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+          publicationExecution: { repository: "acme/app", githubRunId: 123, githubRunAttempt: 2 },
+        })).toMatchObject({ ok: false, reason: "revoked" });
+      },
+    );
+  });
+
+  it("permits publication only for the bound live execution, then rejects revocation and termination", () => {
+    seedPreparedPilotAttempt();
+    const db = dedup.getDb();
+    db.prepare("UPDATE review_fix_attempts SET state = 'launch_intent', github_run_id = 123, github_run_attempt = 2 WHERE attempt_id = ?")
+      .run(PILOT_ATTEMPT);
+    const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
+    const result = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    const execution = { repository: "acme/app", githubRunId: 123, githubRunAttempt: 2 };
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result", { publicationExecution: execution }).ok).toBe(true);
+    expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication", {
+      consumePublication: true, publicationExecution: { ...execution, githubRunAttempt: 3 },
+    })).toMatchObject({ ok: false, reason: "wrong_scope" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication", {
+      consumePublication: true, publicationExecution: execution,
+    }).ok).toBe(true);
+    db.prepare("UPDATE review_fix_attempts SET authority_revoked_at = ? WHERE attempt_id = ?").run(Date.now(), PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result", { publicationExecution: execution }))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    db.prepare("UPDATE review_fix_attempts SET authority_revoked_at = NULL, terminal_outcome_json = '{}' WHERE attempt_id = ?")
+      .run(PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result", { publicationExecution: execution }))
+      .toMatchObject({ ok: false, reason: "revoked" });
+  });
+
+  it("holds publication at the deadline while preserving result-delivery grace", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    seedPreparedPilotAttempt(now + 1000);
+    const db = dedup.getDb();
+    db.prepare("UPDATE review_fix_attempts SET state = 'launch_intent', github_run_id = 123, github_run_attempt = 1 WHERE attempt_id = ?")
+      .run(PILOT_ATTEMPT);
+    const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
+    const result = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    clock.mockReturnValue(now + 1001);
+    const execution = { repository: "acme/app", githubRunId: 123, githubRunAttempt: 1 };
+    expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication", {
+      consumePublication: true, publicationExecution: execution,
+    })).toMatchObject({ ok: false, reason: "revoked" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result").ok).toBe(true);
+    expect(() => runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET }))
+      .toThrow(/publication authority has ended/);
+  });
+  it("reuses the stored identity and expiry without resetting a consumed publication claim", () => {
+    seedPreparedPilotAttempt();
+    const first = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
+    const expiry = (dedup.getDb().prepare(
+      "SELECT expires_at FROM runner_tokens WHERE dispatch_id = ? AND audience = 'publication'",
+    ).get(PILOT_ATTEMPT) as { expires_at: number }).expires_at;
+    expect(runnerTokens.verifyPreparedReviewFixToken(first.token, SECRET, "publication", { consumePublication: true }).ok).toBe(true);
+
+    const retry = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
+    expect(retry).toEqual(first);
+    const row = dedup.getDb().prepare(
+      "SELECT expires_at, consumed_at FROM runner_tokens WHERE dispatch_id = ? AND audience = 'publication'",
+    ).get(PILOT_ATTEMPT) as { expires_at: number; consumed_at: number | null };
+    expect(row.expires_at).toBe(expiry);
+    expect(row.consumed_at).not.toBeNull();
+    const replay = runnerTokens.verifyPreparedReviewFixToken(retry.token, SECRET, "publication", { consumePublication: true });
+    expect(replay).toMatchObject({ ok: false, reason: "already_consumed" });
+  });
+
+  it("validates pilot result repeatedly without consuming before durable intake", () => {
+    seedPreparedPilotAttempt();
+    const minted = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "result").ok).toBe(true);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "result").ok).toBe(true);
+    const row = dedup.getDb().prepare(
+      "SELECT consumed_at FROM runner_tokens WHERE dispatch_id = ? AND audience = 'result'",
+    ).get(PILOT_ATTEMPT) as { consumed_at: number | null };
+    expect(row.consumed_at).toBeNull();
+  });
+
+  it("rejects wrong audience, repository, attempt, mapping, and expiry even when re-signed", () => {
+    seedPreparedPilotAttempt();
+    const minted = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "progress"))
+      .toMatchObject({ ok: false, reason: "wrong_audience" });
+    for (const change of [
+      { repository: "other/repo" },
+      { attemptId: "other-attempt" },
+      { installationId: 8 },
+      { prNumber: 43 },
+      { issueId: "other-issue" },
+      { exp: Date.now() + 10_000_000 },
+    ]) {
+      const altered = resignPilotClaims(minted.token, change);
+      expect(runnerTokens.verifyPreparedReviewFixToken(altered, SECRET, "result"))
+        .toMatchObject({ ok: false });
+    }
+    dedup.getDb().prepare("UPDATE runner_tokens SET mapping_team_key = 'WRONG' WHERE dispatch_id = ?")
+      .run(PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "result"))
+      .toMatchObject({ ok: false, reason: "wrong_scope" });
+  });
+
+  it("uses the persisted deadline plus bounded grace and rejects revoked or released authority", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    seedPreparedPilotAttempt(now + 60_000);
+    const minted = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "progress", secret: SECRET });
+    const result = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
+    const row = dedup.getDb().prepare(
+      "SELECT expires_at FROM runner_tokens WHERE dispatch_id = ? AND audience = 'progress'",
+    ).get(PILOT_ATTEMPT) as { expires_at: number };
+    expect(row.expires_at).toBe(now + 60_000 + 15 * 60_000);
+    clock.mockReturnValue(row.expires_at + 1);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "progress"))
+      .toMatchObject({ ok: false, reason: "expired" });
+
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result"))
+      .toMatchObject({ ok: false, reason: "expired" });
+    clock.mockReturnValue(now);
+    dedup.getDb().prepare("UPDATE review_fix_attempts SET authority_revoked_at = ? WHERE attempt_id = ?")
+      .run(now, PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "progress"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    expect(() => runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET }))
+      .toThrow(/no current authority/);
+
+    dedup.getDb().prepare("UPDATE review_fix_attempts SET authority_revoked_at = NULL WHERE attempt_id = ?")
+      .run(PILOT_ATTEMPT);
+    dedup.getDb().prepare("UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?")
+      .run(now, PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "progress"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result").ok).toBe(true);
+  });
+
+  it("allows a credential retry during delivery grace but no first issuance after the deadline", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    seedPreparedPilotAttempt(now + 1_000);
+    const first = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    clock.mockReturnValue(now + 1_001);
+    expect(runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET }))
+      .toEqual(first);
+    expect(runnerTokens.verifyPreparedReviewFixToken(first.token, SECRET, "result").ok).toBe(true);
+    expect(() => runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "progress", secret: SECRET }))
+      .toThrow(/deadline has passed/);
+  });
+
+  it("rejects credentials if the admission is reassigned", () => {
+    seedPreparedPilotAttempt();
+    const minted = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    dedup.getDb().prepare("UPDATE dispatch_admissions SET lifecycle_owner = 'legacy' WHERE dispatch_id = ?")
+      .run(PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "result"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    expect(() => runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "progress", secret: SECRET }))
+      .toThrow(/no current authority/);
+    dedup.getDb().prepare("UPDATE dispatch_admissions SET lifecycle_owner = ?, repository = 'other/app' WHERE dispatch_id = ?")
+      .run(`restate:${PILOT_ATTEMPT}`, PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "result"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+  });
+});
+
+describe("mintLaunchTokens", () => {
+  const base = { issueId: "issue-1", mappingTeamKey: "ENG", ttlSeconds: 60, secret: SECRET, repository: "acme/app" };
+  const audiences = (dispatchId: string) =>
+    (dedup.getDb().prepare("SELECT audience FROM runner_tokens WHERE dispatch_id = ? ORDER BY audience").all(dispatchId) as { audience: string }[])
+      .map((r) => r.audience);
+
+  it("mints exactly the audiences of LAUNCH_TOKEN_AUDIENCES for each phase", () => {
+    for (const phase of Object.keys(runnerTokens.LAUNCH_TOKEN_AUDIENCES) as (keyof typeof runnerTokens.LAUNCH_TOKEN_AUDIENCES)[]) {
+      const dispatchId = `d-${phase}`;
+      const minted = runnerTokens.mintLaunchTokens({ ...base, phase, dispatchId });
+      expect(audiences(dispatchId)).toEqual([...runnerTokens.LAUNCH_TOKEN_AUDIENCES[phase]].sort());
+      expect(Boolean(minted.runPublicationToken)).toBe(phase !== "planning");
+      expect(minted.runToken).toBeTruthy();
+      expect(minted.runProgressToken).toBeTruthy();
+    }
+  });
+
+  it("a second call for the same dispatch id replaces the unconsumed rows", () => {
+    runnerTokens.mintLaunchTokens({ ...base, phase: "planning", dispatchId: "d-1" });
+    const second = runnerTokens.mintLaunchTokens({ ...base, phase: "planning", dispatchId: "d-1" });
+    expect(audiences("d-1")).toEqual(["progress", "result"]);
+    expect(runnerTokens.verifyRunToken(second.runToken, SECRET, "result", { consume: false }).ok).toBe(true);
+  });
+
+  it("keeps a consumed row, so re-minting that audience still throws", () => {
+    const first = runnerTokens.mintLaunchTokens({ ...base, phase: "planning", dispatchId: "d-2" });
+    expect(runnerTokens.verifyRunToken(first.runToken, SECRET, "result", { consume: true }).ok).toBe(true);
+    expect(() => runnerTokens.mintLaunchTokens({ ...base, phase: "planning", dispatchId: "d-2" })).toThrow(/UNIQUE/);
+    const consumed = dedup.getDb().prepare("SELECT consumed_at FROM runner_tokens WHERE dispatch_id = 'd-2' AND audience = 'result'").get() as { consumed_at: number | null };
+    expect(consumed.consumed_at).not.toBeNull();
+  });
+
+  it("does not touch another dispatch id", () => {
+    runnerTokens.mintLaunchTokens({ ...base, phase: "implementation", dispatchId: "other" });
+    runnerTokens.mintLaunchTokens({ ...base, phase: "implementation", dispatchId: "d-3" });
+    expect(audiences("other")).toEqual(["progress", "publication", "result"]);
+  });
+
+  it("requires an owner/repo binding when the phase mints a publication token", () => {
+    expect(() => runnerTokens.mintLaunchTokens({ ...base, phase: "implementation", dispatchId: "d-4", repository: "bad" })).toThrow(/owner\/repository/);
+  });
+});
+
+describe("implementationTtlSeconds", () => {
+  it("keeps the 2 h floor for the default, null and invalid timeouts", () => {
+    for (const v of [undefined, null, 0, -5, 1.5, NaN]) {
+      expect(runnerTokens.implementationTtlSeconds(v)).toBe(runnerTokens.IMPLEMENTATION_TTL_SECONDS);
+    }
+  });
+
+  it("adds the grace to a long job timeout", () => {
+    expect(runnerTokens.implementationTtlSeconds(240)).toBe(15300);
+  });
+
+  it("is exactly the floor at 105 minutes and grows past it", () => {
+    expect(runnerTokens.implementationTtlSeconds(105)).toBe(7200);
+    expect(runnerTokens.implementationTtlSeconds(106)).toBe(7260);
   });
 });

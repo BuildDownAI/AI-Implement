@@ -1,9 +1,7 @@
+import { inlineCommentBody } from "../pipeline/review-inline-comments.js";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as WebhookModule from "../webhook.js";
 import type * as LogModule from "../log.js";
 import type * as ReconciliationModule from "../reconciliation.js";
@@ -11,7 +9,13 @@ import type * as DedupModule from "../dedup.js";
 import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
+import type { ReviewFixFeedbackEvent } from "../restate/review-fix-pr.js";
 import type { RepoMapping } from "../config.js";
+import type { KgPrCheckConfig } from "../webhook.js";
+import { makeAppendLogEntry, makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/replies/github.js";
+import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for /ai-implement path ----------
 
@@ -19,12 +23,11 @@ const hoisted = vi.hoisted(() => ({
   getMappings: vi.fn<() => Record<string, RepoMapping>>(() => ({})),
   getInstallationToken: vi.fn<() => Promise<string>>(() => Promise.resolve("fake-token")),
   resolveWorkflowContract: vi.fn<() => Promise<"envelope" | "legacy">>(() => Promise.resolve("envelope")),
-  refreshAvailability: vi.fn<() => Promise<unknown>>(() => Promise.resolve({})),
 }));
 
-vi.mock("../deploy-availability.js", () => ({ refreshAvailability: hoisted.refreshAvailability }));
-
-vi.mock("../config.js", () => ({ getMappings: hoisted.getMappings }));
+vi.mock("../config.js", () => ({
+  getMappings: hoisted.getMappings,
+}));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: hoisted.getInstallationToken }));
 vi.mock("../workflow-probe.js", () => ({
   resolveWorkflowContract: hoisted.resolveWorkflowContract,
@@ -32,6 +35,15 @@ vi.mock("../workflow-probe.js", () => ({
 }));
 
 // ---------- Test infrastructure ----------
+
+function recordingReviewIngress() {
+  const events: ReviewFixFeedbackEvent[] = [];
+  const feedback = vi.fn(async (_scope: unknown, event: ReviewFixFeedbackEvent) => {
+    events.push(event);
+    return { status: "accepted" as const };
+  });
+  return { events, feedback };
+}
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -79,86 +91,69 @@ function sign(secret: string, body: string | Buffer): string {
   return `sha256=${crypto.createHmac("sha256", secret).update(buf).digest("hex")}`;
 }
 
+/** A signed delivery as GitHub sends it, with a fresh `x-github-delivery` id unless `extraHeaders` sets one
+ *  (a redelivery repeats its id); `""` omits the header, for the paths that identify an event without it. */
 function makeRequest(
   secret: string,
   event: string,
   payload: unknown,
   signWith?: string,
-): { req: MockRequest; res: MockResponse } {
+  extraHeaders?: Record<string, string>,
+): { req: MockRequest; res: MockResponse; deliveryId: string | undefined } {
   const body = JSON.stringify(payload);
   const sig = sign(signWith ?? secret, body);
-  const req = new MockRequest(
-    {
-      "x-hub-signature-256": sig,
-      "x-github-event": event,
-      "content-type": "application/json",
-    },
-    body,
-  );
-  return { req, res: new MockResponse() };
+  const headers: Record<string, string> = {
+    "x-hub-signature-256": sig,
+    "x-github-event": event,
+    "x-github-delivery": crypto.randomUUID(),
+    "content-type": "application/json",
+    ...extraHeaders,
+  };
+  if (headers["x-github-delivery"] === "") delete headers["x-github-delivery"];
+  return { req: new MockRequest(headers, body), res: new MockResponse(), deliveryId: headers["x-github-delivery"] };
+}
+
+/** Writes the dispatch row an implementation run leaves for one of this file's AII issues. */
+function appendDispatch(entry: Partial<Parameters<typeof LogModule.appendLog>[0]>): number {
+  return log.appendLog(makeAppendLogEntry({ teamKey: "AII", ...entry }));
 }
 
 // ---------- Module isolation ----------
 
 const SECRET = "test-webhook-secret";
 
-let dbPath: string;
+const loaders = {
+  dedup: () => import("../dedup.js"),
+  log: () => import("../log.js"),
+  reconciliation: () => import("../reconciliation.js"),
+  links: () => import("../pr-links.js"),
+  webhook: () => import("../webhook.js"),
+  reviewStore: () => import("../review-ledger-store.js"),
+  reviewFixQueue: () => import("../review-fix-queue.js"),
+  commentGapfillQueue: () => import("../comment-gapfill-queue.js"),
+};
+
 let webhook: typeof WebhookModule;
 let log: typeof LogModule;
 let reconciliation: typeof ReconciliationModule;
+let links: typeof import("../pr-links.js");
 let dedup: typeof DedupModule;
 let reviewStore: typeof ReviewLedgerStoreModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
 let commentGapfillQueue: typeof CommentGapfillQueueModule;
-const mockFetch = vi.fn<typeof fetch>();
+/** Answers nothing: a test whose handler reaches GitHub installs the routes it calls over this. */
+let unrouted: FakeFetch;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `webhook-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  reconciliation = await import("../reconciliation.js");
-  webhook = await import("../webhook.js");
-  reviewStore = await import("../review-ledger-store.js");
-  reviewFixQueue = await import("../review-fix-queue.js");
-  commentGapfillQueue = await import("../comment-gapfill-queue.js");
-  log.initLogTable();
-  reconciliation.initReconciliationTable();
+  ({ dedup, log, reconciliation, links, webhook, reviewStore, reviewFixQueue, commentGapfillQueue } =
+    (await testDb({ modules: loaders })).modules);
 
   // Reset hoisted mocks to safe defaults for each test
   hoisted.getMappings.mockReturnValue({});
   hoisted.getInstallationToken.mockResolvedValue("fake-token");
   hoisted.resolveWorkflowContract.mockResolvedValue("envelope");
-  hoisted.refreshAvailability.mockReset();
-  hoisted.refreshAvailability.mockResolvedValue({});
 
-  // Reset fetch mock call history and set default implementation
-  mockFetch.mockReset();
-  mockFetch.mockImplementation((url: string | URL | Request) => {
-    const urlStr = String(url);
-    if (urlStr.includes("/collaborators/")) {
-      return Promise.resolve(new Response(JSON.stringify({ permission: "write" }), { status: 200 }));
-    }
-    if (urlStr.includes("/reactions")) {
-      return Promise.resolve(new Response("", { status: 201 }));
-    }
-    return Promise.resolve(new Response("", { status: 404 }));
-  });
-  vi.stubGlobal("fetch", mockFetch);
-});
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    // ignore
-  }
+  unrouted = fakeFetch({}).install();
 });
 
 // ---------- Signature validation ----------
@@ -252,20 +247,69 @@ describe("event filtering", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).ignored).toBe(true);
   });
+
+  it("queues a pilot cancellation before acknowledging an authenticated PR close", async () => {
+    const onClosed = vi.fn(async () => undefined);
+    const payload = { action: "closed", pull_request: { number: 5, merged: false },
+      repository: { full_name: "org/repo" } };
+    const valid = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(valid.req as never, valid.res as never, SECRET,
+      undefined, undefined, undefined, undefined, onClosed);
+    await valid.res.done;
+    expect(valid.res.statusCode).toBe(200);
+    expect(onClosed).toHaveBeenCalledWith("org/repo", 5);
+
+    onClosed.mockClear();
+    const invalid = makeRequest(SECRET, "pull_request", payload, "wrong-secret");
+    webhook.handleGitHubWebhook(invalid.req as never, invalid.res as never, SECRET,
+      undefined, undefined, undefined, undefined, onClosed);
+    await invalid.res.done;
+    expect(invalid.res.statusCode).toBe(401);
+    expect(onClosed).not.toHaveBeenCalled();
+  });
+
+  it("answers 503 when forwarding the pilot cancellation fails, so GitHub redelivers", async () => {
+    const onClosed = vi.fn(async () => { throw new Error("review-fix cancellation forward unavailable"); });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const payload = { action: "closed", pull_request: { number: 5, merged: false },
+      repository: { full_name: "org/repo" } };
+    const closed = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(closed.req as never, closed.res as never, SECRET,
+      undefined, undefined, undefined, undefined, onClosed);
+    await closed.res.done;
+    expect(closed.res.statusCode).toBe(503);
+  });
+});
+
+describe("workflow_run delivery", () => {
+  it("is answered like any other event the handler does not use", async () => {
+    const unused = makeRequest(SECRET, "ping", { zen: "Keep it logically awesome." });
+    webhook.handleGitHubWebhook(unused.req as never, unused.res as never, SECRET);
+    await unused.res.done;
+
+    const { req, res } = makeRequest(SECRET, "workflow_run", {
+      action: "completed", repository: { full_name: "acme/kg" }, workflow_run: { id: 777, conclusion: "success" },
+    });
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+    expect(res.statusCode).toBe(unused.res.statusCode);
+    expect(res.body).toBe(unused.res.body);
+    expect(JSON.parse(res.body).ignored).toBe(true);
+  });
 });
 
 // ---------- Non-AI PR matching ----------
 
 describe("non-AI PR matching", () => {
-  it("ignores a merged PR with no matching dispatch log entry", async () => {
-    // No dispatch log entries — nothing to match against
+  it("ignores a merged PR with no link even with a matching dispatch", async () => {
+    appendDispatch({ issueId: "issue-99", issueIdentifier: "AII-99", repo: "org/repo" });
     const { req, res } = makeRequest(SECRET, "pull_request", {
       action: "closed",
       pull_request: {
         number: 99,
         merged: true,
         html_url: "https://github.com/org/repo/pull/99",
-        head: { ref: "feature/random-branch" },
+        head: { ref: "AII-99/implement" },
         merge_commit_sha: "abc123",
       },
       repository: { full_name: "org/repo" },
@@ -275,12 +319,13 @@ describe("non-AI PR matching", () => {
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
     expect(body.ignored).toBe(true);
-    expect(body.reason).toMatch(/no matching dispatch/);
+    expect(body.reason).toBe("no pull request link");
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(0);
   });
 
   it("ignores a merged PR from a different repo", async () => {
     // Add a dispatch log entry for a different repo
-    log.appendLog({ issueId: "issue-1", issueIdentifier: "AII-1", repo: "org/other-repo" });
+    appendDispatch({ issueId: "issue-1", issueIdentifier: "AII-1", repo: "org/other-repo" });
 
     const { req, res } = makeRequest(SECRET, "pull_request", {
       action: "closed",
@@ -300,122 +345,566 @@ describe("non-AI PR matching", () => {
   });
 });
 
-// ---------- Reconciliation enqueue ----------
+// ---------- KG PR-triggered dry-run rail (AII-633) ----------
 
-describe("reconciliation enqueue", () => {
-  it("enqueues a reconciliation job when branch matches issue identifier prefix", async () => {
-    log.appendLog({ issueId: "issue-1", issueIdentifier: "AII-27", repo: "org/repo" });
+describe("KG PR-triggered dry-run (AII-633)", () => {
+  const KG_SOURCE_REPO = "org/kg-source";
+  const KG_BASE_REPO = "org/kg-base";
 
-    const { req, res } = makeRequest(SECRET, "pull_request", {
-      action: "closed",
+  function makeKgPrCheck(overrides: Partial<KgPrCheckConfig> = {}): KgPrCheckConfig {
+    return {
+      kgSourceRepo: KG_SOURCE_REPO,
+      kgBaseRepo: KG_BASE_REPO,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "app-key",
+      enqueueDryRun: vi.fn<KgPrCheckConfig["enqueueDryRun"]>(async () => ({ status: "accepted", value: { triggerId: "t-1" } })),
+      ...overrides,
+    };
+  }
+
+  /** GitHub's changed-files listing for one pull request on the KG source repo, which `listPullRequestFiles` reads. */
+  function prFiles(prNumber: number, reply: string[] | Reply): FakeFetch {
+    const answer: Reply = Array.isArray(reply) ? { json: reply.map((filename) => ({ filename, status: "modified" })) } : reply;
+    return fakeFetch({ [`GET /repos/${KG_SOURCE_REPO}/pulls/${prNumber}/files`]: answer }).install();
+  }
+
+  function prPayload(opts: {
+    action: string;
+    number: number;
+    ref: string;
+    sha: string;
+    repo: string;
+    labels?: string[];
+    /** The single label GitHub reports as added on a `labeled` action (distinct from the cumulative `labels` list). */
+    label?: string;
+  }) {
+    return {
+      action: opts.action,
       pull_request: {
-        number: 42,
-        merged: true,
-        html_url: "https://github.com/org/repo/pull/42",
-        head: { ref: "AII-27/implement-webhook" },
-        merge_commit_sha: "sha-abc123",
+        number: opts.number,
+        html_url: `https://github.com/${opts.repo}/pull/${opts.number}`,
+        head: { ref: opts.ref, sha: opts.sha },
+        labels: (opts.labels ?? []).map((name) => ({ name })),
       },
-      repository: { full_name: "org/repo" },
-    });
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      ...(opts.label !== undefined ? { label: { name: opts.label } } : {}),
+      repository: { full_name: opts.repo },
+    };
+  }
+
+  it("dispatches a dry-run when a KG source repo PR touches kg_ingest/", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(42, ["kg_ingest/loader.py"]);
+
+    const { req, res, deliveryId } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 42, ref: "feature/x", sha: "sha-42", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun).toHaveBeenCalledWith(
+      `${KG_SOURCE_REPO}#42`,
+      { ref: "feature/x", report: { repo: KG_SOURCE_REPO, prNumber: 42, sha: "sha-42" } },
+      { idempotencyKey: deliveryId },
+    );
+    expect(res.statusCode).toBe(202);
+  });
+
+  it("ignores the rail's own kg-refresh/ snapshot PR without fetching files or enqueueing (AII-1107)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    hoisted.getInstallationToken.mockClear();
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 55, ref: "kg-refresh/20261005T142052Z", sha: "sha-55", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("rail_snapshot_pr");
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(hoisted.getInstallationToken).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
+  });
+
+  it("still dispatches a non-rail PR that changes snapshot/** (AII-1107)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(56, ["snapshot/parts/doc.nt"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 56, ref: "feature/x", sha: "sha-56", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(202);
+  });
+
+  it("skips a base-repo-only PR touching a guarded path without enqueueing", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(6, ["kg_ingest/loader.py"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 6, ref: "ai-implement/kgb-46", sha: "sha-6", repo: KG_BASE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "base_repo_pr" });
+  });
+
+  it("still enqueues when the base repo is also the source repo", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, kgBaseRepo: KG_SOURCE_REPO });
+    prFiles(8, ["kg_ingest/loader.py"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 8, ref: "feature/y", sha: "sha-8", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatches on the source repo when the head branch matches an upstream-merge pattern, even with no guard-path change", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+
+    const { req, res, deliveryId } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "opened",
+        number: 5,
+        ref: "kg-upstream/2026-09-13",
+        sha: "sha-5",
+        repo: KG_SOURCE_REPO,
+      }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun).toHaveBeenCalledWith(
+      `${KG_SOURCE_REPO}#5`,
+      { ref: "kg-upstream/2026-09-13", report: { repo: KG_SOURCE_REPO, prNumber: 5, sha: "sha-5" } },
+      { idempotencyKey: deliveryId },
+    );
+    expect(res.statusCode).toBe(202);
+    // The branch alone is guard-relevant, so the changed files are never listed.
+    expect(unrouted.calls).toEqual([]);
+  });
+
+  it("does not trigger a synchronize touching only unrelated files", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(6, ["docs/README.md"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 6, ref: "docs-update", sha: "sha-6", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body).ignored).toBe(true);
+  });
+
+  it.each(["labeled", "unlabeled"])("a %s accept-baseline event is ignored: no re-report, no 503", async (action) => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action, number: 9, ref: "feature/x", sha: "sha-9", repo: KG_SOURCE_REPO, labels: ["accept-baseline"], label: "accept-baseline" }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(res.statusCode).not.toBe(503);
+  });
+
+  it("a transient listPullRequestFiles failure is reported distinctly from a genuine no-guard-relevant-change ignore", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(60, { status: 500, json: { message: "Server Error" } });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 60, ref: "feature/flaky", sha: "sha-60", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    // AII-639: on `synchronize` the KG check never owns the response — the normal
+    // pull_request handling answers — so the distinct reason is in the log instead.
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes("files fetch failed"))).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  it("a branch-pattern match still dispatches when the files fetch fails, since the branch alone is guard-relevant", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 61, ref: "kg-upstream/2026-09-13", sha: "sha-61", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(unrouted.calls).toEqual([]);
+    // AII-639: the dispatch is asserted on `enqueueDryRun`; the response belongs to the normal handling.
+    expect(JSON.parse(res.body).reason).toBe("no matching dispatch");
+  });
+
+  it("hands two deliveries for the same head sha to the object, each with its own delivery id; a duplicate answers 200 (AII-977)", async () => {
+    const enqueueDryRun = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "accepted", value: { triggerId: "t-1" } })
+      .mockResolvedValueOnce({ status: "accepted", value: { duplicate: true } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(7, ["sources.yml"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const payload = prPayload({
+      action: "synchronize",
+      number: 7,
+      ref: "feature/z",
+      sha: "sha-dup",
+      repo: KG_SOURCE_REPO,
+    });
+
+    const first = makeRequest(SECRET, "pull_request", payload, undefined, { "x-github-delivery": "delivery-1" });
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await first.res.done;
+
+    const second = makeRequest(SECRET, "pull_request", payload, undefined, { "x-github-delivery": "delivery-2" });
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await second.res.done;
+
+    // The webhook keeps no sha dedup: the KgRepo object absorbs a same-sha event.
+    expect(enqueueDryRun).toHaveBeenCalledTimes(2);
+    expect(enqueueDryRun.mock.calls.map((c) => c[2])).toEqual([
+      { idempotencyKey: "delivery-1" },
+      { idempotencyKey: "delivery-2" },
+    ]);
+    // the duplicate is logged as skipped, not dispatched
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("skipped (duplicate sha)"));
+  });
+
+  it("a guard-relevant synchronize on the KG source repo runs both rails: the dry-run dispatches and the normal pull_request handling answers (AII-639)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(70, ["kg_ingest/tracker.py"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 70, ref: "feature/kgb-x", sha: "sha-70", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun.mock.calls[0][1]).toMatchObject({ ref: "feature/kgb-x" });
+    // The KG repos are ordinary onboarded projects too: gap-fill matching still ran.
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
+  });
+
+  it("a KG-repo PR with a live dispatch_log match gets both the dry-run trigger and the gap-fill acknowledgement (AII-639/AII-640)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(80, ["kg_ingest/tracker.py"]);
+
+    const jobId = appendDispatch({ issueId: "issue-kg-1", issueIdentifier: "AII-900", repo: KG_SOURCE_REPO });
+    log.updateJobStatus(jobId, "running", null, `https://github.com/${KG_SOURCE_REPO}/pull/80`);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 80, ref: "feature/kgb-y", sha: "sha-80", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    // The dry-run side effect still fires...
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun.mock.calls[0][1]).toMatchObject({ ref: "feature/kgb-y" });
+    // ...and the normal pull_request handling still owns the response, finding the
+    // real dispatch_log row rather than falling back to "no matching dispatch".
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ acknowledged: true, reason: "awaiting_gap_analysis_result" });
+  });
+
+  it("a synchronize on the KG source repo touching only docs does not dispatch and still reaches the normal pull_request handling (AII-639)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(71, ["docs/README.md"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 71, ref: "docs/tweak", sha: "sha-71", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
+  });
+
+  it("an opened event on the KG source repo is still answered by the KG check (nothing else handles opened)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(72, ["docs/README.md"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 72, ref: "docs/tweak", sha: "sha-72", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no_guard_relevant_change" });
+  });
+
+  it("falls through to the existing pull_request handling for a repo that is neither the KG source nor base repo", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 11, ref: "feature/w", sha: "sha-11", repo: "org/unrelated-repo" }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
-    expect(body.queued).toBe(true);
-    expect(body.reconciliationId).toBeGreaterThan(0);
-
-    const pending = reconciliation.getPendingReconciliations();
-    expect(pending).toHaveLength(1);
-    expect(pending[0].issueId).toBe("issue-1");
-    expect(pending[0].issueIdentifier).toBe("AII-27");
-    expect(pending[0].prNumber).toBe(42);
-    expect(pending[0].repo).toBe("org/repo");
-    expect(pending[0].mergeCommitSha).toBe("sha-abc123");
-    expect(pending[0].status).toBe("pending");
+    expect(body.ignored).toBe(true);
+    expect(body.reason).toBe("no matching dispatch");
   });
 
-  it("enqueues when matching by stored PR URL", async () => {
-    const jobId = log.appendLog({ issueId: "issue-2", issueIdentifier: "AII-10", repo: "org/repo" });
-    // Simulate a stored pr_url on the job
-    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/7");
+  it("a dry-run held behind a running refresh answers queued and logs the queued dispatch", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { queued: true } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(20, ["kg_ingest/loader.py"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    const { req, res } = makeRequest(SECRET, "pull_request", {
-      action: "closed",
-      pull_request: {
-        number: 7,
-        merged: true,
-        html_url: "https://github.com/org/repo/pull/7",
-        head: { ref: "some-unrelated-branch-name" },
-        merge_commit_sha: "sha-xyz789",
-      },
-      repository: { full_name: "org/repo" },
-    });
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 20, ref: "br2", sha: "sha-2", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).queued).toBe(true);
-
-    const pending = reconciliation.getPendingReconciliations();
-    expect(pending[0].issueId).toBe("issue-2");
-    expect(pending[0].prNumber).toBe(7);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toEqual({ queued: true });
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes("(queued dispatch)"))).toBe(true);
+    logSpy.mockRestore();
   });
 
-  it("branch prefix match is case-insensitive", async () => {
-    log.appendLog({ issueId: "issue-3", issueIdentifier: "AII-99", repo: "org/repo" });
+  it("passes the x-github-delivery header as the idempotency key (Q6)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(21, ["kg_ingest/loader.py"]);
 
-    const { req, res } = makeRequest(SECRET, "pull_request", {
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 21, ref: "br1", sha: "sha-1", repo: KG_SOURCE_REPO }),
+      undefined,
+      { "x-github-delivery": "delivery-abc" },
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun).toHaveBeenCalledWith(
+      `${KG_SOURCE_REPO}#21`,
+      { ref: "br1", report: { repo: KG_SOURCE_REPO, prNumber: 21, sha: "sha-1" } },
+      { idempotencyKey: "delivery-abc" },
+    );
+    expect(JSON.parse(res.body)).toEqual({ triggered: true, triggerId: "t-1" });
+  });
+
+  it("an unavailable enqueue answers 502, and a redelivery of the same sha is enqueued again", async () => {
+    const enqueueDryRun = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "unavailable" })
+      .mockResolvedValueOnce({ status: "accepted", value: { triggerId: "t-2" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(22, ["kg_ingest/loader.py"]);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const payload = prPayload({ action: "opened", number: 22, ref: "br1", sha: "sha-22", repo: KG_SOURCE_REPO });
+    const redelivery = { "x-github-delivery": "delivery-22" };
+
+    const first = makeRequest(SECRET, "pull_request", payload, undefined, redelivery);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await first.res.done;
+    expect(first.res.statusCode).toBe(502);
+
+    const second = makeRequest(SECRET, "pull_request", payload, undefined, redelivery);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await second.res.done;
+    expect(second.res.statusCode).toBe(202);
+    expect(enqueueDryRun).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
+  });
+
+  it("a closed event evicts this PR's stored dry-run state (AII-636)", async () => {
+    const outcomeStore = new Set<string>();
+    const storeKey = (repo: string, prNumber: number) => `${repo}#${prNumber}`;
+    outcomeStore.add(storeKey(KG_SOURCE_REPO, 55));
+
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const forgetKgPr = vi.fn((repo: string, prNumber: number) => {
+      outcomeStore.delete(storeKey(repo, prNumber));
+    });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, forgetKgPr });
+
+    const closed = makeRequest(SECRET, "pull_request", {
       action: "closed",
       pull_request: {
         number: 55,
-        merged: true,
-        html_url: "https://github.com/org/repo/pull/55",
-        head: { ref: "aii-99/my-fix" }, // lowercase identifier
-        merge_commit_sha: "sha-case",
+        merged: false,
+        html_url: `https://github.com/${KG_SOURCE_REPO}/pull/55`,
+        head: { ref: "feature/a" },
+        merge_commit_sha: null,
       },
+      repository: { full_name: KG_SOURCE_REPO },
+    });
+    webhook.handleGitHubWebhook(closed.req as never, closed.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await closed.res.done;
+
+    expect(forgetKgPr).toHaveBeenCalledWith(KG_SOURCE_REPO, 55);
+    expect(outcomeStore.has(storeKey(KG_SOURCE_REPO, 55))).toBe(false);
+  });
+});
+
+// ---------- Reconciliation enqueue ----------
+
+describe("reconciliation enqueue", () => {
+  function link(role: "implementation" | "roll-up" = "implementation", identifier: string | null = "AII-27") {
+    return links.linkPullRequest({
+      repository: "org/repo", number: 42, url: "https://github.com/org/repo/pull/42",
+      role, source: "backfill",
+      issue: { trackerKind: "linear", mappingKey: "AII", trackerIssueId: "tracker-issue-27",
+        identifier, title: null, url: null },
+    });
+  }
+
+  async function deliver() {
+    const { req, res } = makeRequest(SECRET, "pull_request", {
+      action: "closed",
+      pull_request: { number: 42, merged: true, html_url: "https://github.com/org/repo/pull/42",
+        head: { ref: "unrelated-branch" }, merge_commit_sha: "sha-abc123" },
       repository: { full_name: "org/repo" },
     });
     webhook.handleGitHubWebhook(req as never, res as never, SECRET);
     await res.done;
-
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).queued).toBe(true);
+    return JSON.parse(res.body);
+  }
+
+  it.each(["AII-27", null])("queues the linked issue without a dispatch row (identifier %s)", async (identifier) => {
+    link("implementation", identifier);
+    expect((await deliver()).queued).toBe(true);
+    expect(reconciliation.getPendingReconciliations()).toEqual([expect.objectContaining({
+      issueId: "tracker-issue-27", issueIdentifier: identifier, repo: "org/repo", prNumber: 42,
+      mergeCommitSha: "sha-abc123", status: "pending",
+    })]);
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
+    expect(await deliver()).toEqual({ ignored: true, reason: "already queued" });
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
   });
 
-  it("does not enqueue a second reconciliation row on a redelivered merged-PR webhook", async () => {
-    log.appendLog({ issueId: "issue-4", issueIdentifier: "AII-77", repo: "org/repo" });
+  it("promotes a close tombstone after reopening and merging, with repeated deliveries deduplicated", async () => {
+    link();
+    const poll = await import("../poll-merged-prs.js");
+    await poll.detectMergedPrs({
+      getPullRequestState: async () => ({ merged: false, state: "closed" }),
+      tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
+      finalizeGroupingParent: async () => true,
+      mappingForRepo: () => makeMapping({ owner: "org", repo: "repo" }),
+    });
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(0);
+    const before = dedup.getDb().prepare("SELECT id FROM reconciliation_queue").get();
+    links.setLinkOutcome("org/repo", 42, "open", null);
+    expect((await deliver()).queued).toBe(true);
+    expect(await deliver()).toEqual({ ignored: true, reason: "already queued" });
+    expect(links.findLinkByPr("org/repo", 42)?.outcome).toBe("merged");
+    expect(reconciliation.getPendingReconciliations()).toEqual([expect.objectContaining({
+      status: "pending", mergeCommitSha: "sha-abc123",
+    })]);
+    expect(dedup.getDb().prepare("SELECT id FROM reconciliation_queue").all()).toEqual([before]);
+  });
 
-    const payload = {
-      action: "closed",
-      pull_request: {
-        number: 77,
-        merged: true,
-        html_url: "https://github.com/org/repo/pull/77",
-        head: { ref: "AII-77/add-feature" },
-        merge_commit_sha: "sha-dedup",
-      },
-      repository: { full_name: "org/repo" },
-    };
+  it("queues the job's issue when its PR URL was written by updateJobPrUrl", async () => {
+    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
+    const jobId = appendDispatch({
+      issueId: "tracker-issue-27", issueIdentifier: "AII-27", repo: "org/repo",
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/42");
 
-    // First delivery — should enqueue
-    const { req: req1, res: res1 } = makeRequest(SECRET, "pull_request", payload);
-    webhook.handleGitHubWebhook(req1 as never, res1 as never, SECRET);
-    await res1.done;
-    expect(res1.statusCode).toBe(200);
-    expect(JSON.parse(res1.body).queued).toBe(true);
+    expect((await deliver()).queued).toBe(true);
+    expect(reconciliation.getPendingReconciliations()).toEqual([expect.objectContaining({
+      issueId: "tracker-issue-27", issueIdentifier: "AII-27", repo: "org/repo", prNumber: 42,
+      mergeCommitSha: "sha-abc123", status: "pending",
+    })]);
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
+  });
+
+  it("records the merge even when reconciliation was already queued", async () => {
+    link();
+    reconciliation.enqueueReconciliation({ issueId: "tracker-issue-27", issueIdentifier: "AII-27",
+      repo: "org/repo", prNumber: 42, mergeCommitSha: "sha-abc123" });
+    expect(links.findLinkByPr("org/repo", 42)?.outcome).toBe("open");
+    expect(await deliver()).toEqual({ ignored: true, reason: "already queued" });
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
     expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
+  });
 
-    // Second delivery (redelivery) — should be ignored, no new row
-    const { req: req2, res: res2 } = makeRequest(SECRET, "pull_request", payload);
-    webhook.handleGitHubWebhook(req2 as never, res2 as never, SECRET);
-    await res2.done;
-    expect(res2.statusCode).toBe(200);
-    const body2 = JSON.parse(res2.body);
-    expect(body2.ignored).toBe(true);
-    expect(body2.reason).toBe("already queued");
-    // Queue must still have exactly one row
-    expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
+  it("records a roll-up merge without queueing reconciliation", async () => {
+    link("roll-up");
+    expect(await deliver()).toEqual({ ignored: true });
+    expect(links.findLinkByPr("org/repo", 42)).toMatchObject({ outcome: "merged", closedAt: expect.any(Number) });
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(0);
   });
 });
 
@@ -462,7 +951,7 @@ describe("reconciliation queue", () => {
 
 describe("review feedback ingestion", () => {
   it("stores CHANGES_REQUESTED reviews and queues a late fix for matching AI PRs", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-1",
       issueIdentifier: "AII-1",
       repo: "org/repo",
@@ -475,12 +964,14 @@ describe("review feedback ingestion", () => {
         state: "changes_requested",
         body: "Please fix the callback race.",
         html_url: "https://github.com/org/repo/pull/42#pullrequestreview-1",
-        user: { login: "claude[bot]" },
+        user: { login: "claude[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        submitted_at: new Date().toISOString(),
       },
       pull_request: {
         number: 42,
         html_url: "https://github.com/org/repo/pull/42",
-        head: { ref: "ai-implement/AII-1-fix" },
+        head: { ref: "ai-implement/aii-1-fix", sha: "sha-current" },
       },
       repository: { full_name: "org/repo" },
     });
@@ -518,10 +1009,310 @@ describe("review feedback ingestion", () => {
     ]);
   });
 
+  it("increments the finding's revision when the same review body is reported again", async () => {
+    const jobId = appendDispatch({
+      issueId: "issue-revision",
+      issueIdentifier: "AII-801",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/50");
+
+    // Two genuinely separate review submissions with identical text — distinguished from a
+    // redelivery of one webhook (see the "duplicate delivery" tests below) by their distinct
+    // delivery ids.
+    const makeReviewRequest = (submittedAt: string) =>
+      makeRequest(SECRET, "pull_request_review", {
+        action: "submitted",
+        review: {
+          state: "changes_requested",
+          body: "Please fix the callback race.",
+          html_url: "https://github.com/org/repo/pull/50#pullrequestreview-1",
+          user: { login: "claude[bot]", type: "Bot" },
+          commit_id: "sha-current",
+          submitted_at: submittedAt,
+        },
+        pull_request: {
+          number: 50,
+          html_url: "https://github.com/org/repo/pull/50",
+          head: { ref: "ai-implement/aii-801-fix", sha: "sha-current" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+
+    const first = makeReviewRequest(new Date().toISOString());
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(1);
+
+    const second = makeReviewRequest(new Date(Date.now() + 5 * 60_000).toISOString());
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(false);
+    expect(secondResponse.findingId).toBe(firstResponse.findingId);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(2);
+  });
+
+  it("without a delivery header, an exact repeat (same body/timestamp/actor/commit) synthesizes the same identity and is a no-op (AII-792)", async () => {
+    const jobId = appendDispatch({
+      issueId: "issue-synth-dup",
+      issueIdentifier: "AII-802",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/52");
+
+    const submittedAt = new Date().toISOString();
+    const makeReviewRequest = () =>
+      makeRequest(SECRET, "pull_request_review", {
+        action: "submitted",
+        review: {
+          state: "changes_requested",
+          body: "Please fix the callback race.",
+          html_url: "https://github.com/org/repo/pull/52#pullrequestreview-1",
+          user: { login: "claude[bot]", type: "Bot" },
+          commit_id: "sha-current",
+          submitted_at: submittedAt,
+        },
+        pull_request: {
+          number: 52,
+          html_url: "https://github.com/org/repo/pull/52",
+          head: { ref: "ai-implement/aii-802-fix", sha: "sha-current" },
+        },
+        repository: { full_name: "org/repo" },
+      }, undefined, { "x-github-delivery": "" });
+
+    const first = makeReviewRequest();
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+
+    const second = makeReviewRequest();
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(true);
+    expect(secondResponse.findingId).toBe(firstResponse.findingId);
+    expect(secondResponse.reviewFixId).toBe(firstResponse.reviewFixId);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(1);
+    expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
+  });
+
+  it("a redelivered pull_request_review (same x-github-delivery) is a no-op: no revision bump, no second queue/event row (AII-792)", async () => {
+    const jobId = appendDispatch({
+      issueId: "issue-dup-review",
+      issueIdentifier: "AII-803",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/51");
+
+    const payload = {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body: "Please fix the callback race.",
+        html_url: "https://github.com/org/repo/pull/51#pullrequestreview-1",
+        user: { login: "claude[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        submitted_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: 51,
+        html_url: "https://github.com/org/repo/pull/51",
+        head: { ref: "ai-implement/aii-803-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    };
+    const headers = { "x-github-delivery": "delivery-review-1" };
+
+    const first = makeRequest(SECRET, "pull_request_review", payload, undefined, headers);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+
+    const second = makeRequest(SECRET, "pull_request_review", payload, undefined, headers);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(true);
+    expect(secondResponse.findingId).toBe(firstResponse.findingId);
+    expect(secondResponse.reviewFixId).toBe(firstResponse.reviewFixId);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(1);
+    expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
+  });
+
+  it("a redelivered bot pull_request_review_comment (same x-github-delivery) is a no-op (AII-792)", async () => {
+    const jobId = appendDispatch({
+      issueId: "issue-dup-comment",
+      issueIdentifier: "AII-804",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/53");
+
+    const payload = {
+      action: "created",
+      comment: {
+        body: "This line still accepts null owners.",
+        html_url: "https://github.com/org/repo/pull/53#discussion_r1",
+        path: "src/auth.ts",
+        line: 12,
+        user: { login: "claude[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: new Date(Date.now() + 1_000).toISOString(),
+      },
+      pull_request: {
+        number: 53,
+        html_url: "https://github.com/org/repo/pull/53",
+        head: { ref: "ai-implement/aii-804-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    };
+    const headers = { "x-github-delivery": "delivery-comment-1" };
+
+    const first = makeRequest(SECRET, "pull_request_review_comment", payload, undefined, headers);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+
+    const second = makeRequest(SECRET, "pull_request_review_comment", payload, undefined, headers);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(true);
+    expect(secondResponse.findingId).toBe(firstResponse.findingId);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 53)).toHaveLength(1);
+    expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
+  });
+
+  it("keeps headerless bot inline comments at different paths distinct even with identical text", async () => {
+    const jobId = appendDispatch({ issueId: "issue-inline-paths", issueIdentifier: "AII-805", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
+    const base = {
+      action: "created",
+      pull_request: { number: 54, html_url: "https://github.com/org/repo/pull/54", head: { ref: "ai-implement/aii-805-fix", sha: "sha-current" } },
+      repository: { full_name: "org/repo" },
+    };
+    // One timestamp for both deliveries, so the path is the only field that differs.
+    const createdAt = new Date(Date.now() + 1_000).toISOString();
+    const deliver = async (path: string) => {
+      const request = makeRequest(SECRET, "pull_request_review_comment", {
+        ...base,
+        comment: {
+          body: "Guard this value.",
+          path,
+          line: 12,
+          user: { login: "claude[bot]", type: "Bot" },
+          commit_id: "sha-current",
+          created_at: createdAt,
+        },
+      }, undefined, { "x-github-delivery": "" });
+      webhook.handleGitHubWebhook(request.req as never, request.res as never, SECRET);
+      await request.res.done;
+      return JSON.parse(request.res.body) as { reviewFixId: number; duplicate: boolean };
+    };
+
+    const first = await deliver("src/one.ts");
+    const second = await deliver("src/two.ts");
+    expect(first.duplicate).toBe(false);
+    expect(second.duplicate).toBe(false);
+    expect(reviewFixQueue.listReviewFixEvents(first.reviewFixId)).toHaveLength(2);
+  });
+
+  it("a redelivered Claude PR summary comment (same x-github-delivery) is a no-op across multiple findings (AII-792)", async () => {
+    const jobId = appendDispatch({
+      issueId: "issue-dup-summary",
+      issueIdentifier: "AII-806",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
+
+    const payload = {
+      action: "created",
+      comment: {
+        body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.\n\n**2. Missing test**\nAdd a regression test.",
+        html_url: "https://github.com/org/repo/issues/54#issuecomment-1",
+        user: { login: "claude-code[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 54,
+        html_url: "https://github.com/org/repo/pull/54",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/54" },
+      },
+      repository: { full_name: "org/repo" },
+    };
+    const headers = { "x-github-delivery": "delivery-summary-1" };
+
+    const first = makeRequest(SECRET, "issue_comment", payload, undefined, headers);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingIds: number[]; reviewFixId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+    expect(firstResponse.findingIds).toHaveLength(2);
+
+    const second = makeRequest(SECRET, "issue_comment", payload, undefined, headers);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingIds: number[]; reviewFixId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(true);
+    expect(secondResponse.findingIds).toEqual(firstResponse.findingIds);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 54)).toHaveLength(2);
+    expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
+  });
+
+  it("propagates a DB failure instead of writing the blanket 200 ack, so GitHub can redeliver (AII-792)", async () => {
+    const jobId = appendDispatch({
+      issueId: "issue-db-fail",
+      issueIdentifier: "AII-807",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/60");
+
+    const db = dedup.getDb();
+    vi.spyOn(db, "transaction").mockImplementation(() => {
+      throw new Error("simulated DB failure");
+    });
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body: "Please fix the callback race.",
+        html_url: "https://github.com/org/repo/pull/60#pullrequestreview-1",
+        user: { login: "claude[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        submitted_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: 60,
+        html_url: "https://github.com/org/repo/pull/60",
+        head: { ref: "ai-implement/aii-807-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    await expect(webhook.handleGitHubWebhook(req as never, res as never, SECRET)).rejects.toThrow(
+      "simulated DB failure",
+    );
+    // No premature ack: the 200 write never happened, so a caller wrapper (as index.ts does for
+    // this exact endpoint) is free to answer 500, which leaves the delivery failed in GitHub's log;
+    // GitHub never resends on its own, so only a redelivery (webhook-redelivery.ts's sweep) retries it.
+    expect(res.body).toBe("");
+  });
+
   it("ignores AI-Implement native request-changes reviews to avoid self-triggered fix loops", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-self",
-      issueIdentifier: "AII-SELF",
+      issueIdentifier: "AII-808",
       repo: "org/repo",
     });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/46");
@@ -532,11 +1323,12 @@ describe("review feedback ingestion", () => {
         state: "changes_requested",
         body: "<!-- ai-implement native-review -->\nAI-Implement post-push review found unresolved blockers.",
         html_url: "https://github.com/org/repo/pull/46#pullrequestreview-1",
+        user: { login: "ai-implement[bot]", type: "Bot" },
       },
       pull_request: {
         number: 46,
         html_url: "https://github.com/org/repo/pull/46",
-        head: { ref: "ai-implement/AII-SELF-fix" },
+        head: { ref: "ai-implement/aii-808-fix" },
       },
       repository: { full_name: "org/repo" },
     });
@@ -550,6 +1342,45 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  // The native review's lead sentence changed from "AI-Implement post-push review …" to
+  // "AI-Implement second review …". Reviews already on open PRs keep the old text, so both
+  // prefixes must still be recognised without the marker.
+  it.each([
+    ["the old prefix", "AI-Implement post-push review found unresolved blockers.", 47],
+    ["the new prefix", "AI-Implement second review: the pull request still has blocking problems.", 48],
+  ])("ignores AI-Implement native request-changes reviews detected by %s alone, with no marker", async (_label, body, prNumber) => {
+    const jobId = appendDispatch({
+      issueId: `issue-self-${prNumber}`,
+      issueIdentifier: `AII-${prNumber}`,
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${prNumber}`);
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body,
+        html_url: `https://github.com/org/repo/pull/${prNumber}#pullrequestreview-1`,
+        user: { login: "ai-implement[bot]", type: "Bot" },
+      },
+      pull_request: {
+        number: prNumber,
+        html_url: `https://github.com/org/repo/pull/${prNumber}`,
+        head: { ref: `ai-implement/aii-${prNumber}-fix` },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true, reason: "self_review" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", prNumber)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
   it("ignores malformed review payloads with 200 so GitHub does not retry", async () => {
     const { req, res } = makeRequest(SECRET, "pull_request_review", {
       action: "submitted",
@@ -559,7 +1390,7 @@ describe("review feedback ingestion", () => {
       },
       pull_request: {
         html_url: "https://github.com/org/repo/pull/42",
-        head: { ref: "ai-implement/AII-1-fix" },
+        head: { ref: "ai-implement/aii-1-fix" },
       },
       repository: { full_name: "org/repo" },
     });
@@ -574,8 +1405,8 @@ describe("review feedback ingestion", () => {
     });
   });
 
-  it("stores PR review comments as non-blocking context and queues a late fix for matching AI PRs", async () => {
-    const jobId = log.appendLog({
+  it("stores a human PR review comment as non-blocking context without queueing a fix run", async () => {
+    const jobId = appendDispatch({
       issueId: "issue-2",
       issueIdentifier: "AII-2",
       repo: "org/repo",
@@ -593,7 +1424,7 @@ describe("review feedback ingestion", () => {
       pull_request: {
         number: 43,
         html_url: "https://github.com/org/repo/pull/43",
-        head: { ref: "ai-implement/AII-2-fix" },
+        head: { ref: "ai-implement/aii-2-fix" },
       },
       repository: { full_name: "org/repo" },
     });
@@ -611,11 +1442,12 @@ describe("review feedback ingestion", () => {
         line: 12,
       },
     ]);
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(JSON.parse(res.body)).toMatchObject({ recorded: true, reason: "awaiting_changes_requested" });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
   it("ignores edited PR review comments so typo fixes do not requeue gap-fill", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-2",
       issueIdentifier: "AII-2",
       repo: "org/repo",
@@ -633,7 +1465,7 @@ describe("review feedback ingestion", () => {
       pull_request: {
         number: 43,
         html_url: "https://github.com/org/repo/pull/43",
-        head: { ref: "ai-implement/AII-2-fix" },
+        head: { ref: "ai-implement/aii-2-fix" },
       },
       repository: { full_name: "org/repo" },
     });
@@ -656,7 +1488,7 @@ describe("review feedback ingestion", () => {
       },
       pull_request: {
         number: 43,
-        head: { ref: "ai-implement/AII-2-fix" },
+        head: { ref: "ai-implement/aii-2-fix" },
       },
       repository: { full_name: "org/repo" },
     });
@@ -672,7 +1504,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("stores Claude PR summary comments and queues a late fix for matching AI PRs", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-4",
       issueIdentifier: "AII-4",
       repo: "org/repo",
@@ -684,7 +1516,8 @@ describe("review feedback ingestion", () => {
       comment: {
         body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
         html_url: "https://github.com/org/repo/issues/45#issuecomment-1",
-        user: { login: "claude-code[bot]" },
+        user: { login: "claude-code[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
       },
       issue: {
         number: 45,
@@ -711,7 +1544,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores edited Claude PR summary comments so progress edits do not requeue gap-fill", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-4",
       issueIdentifier: "AII-4",
       repo: "org/repo",
@@ -723,7 +1556,8 @@ describe("review feedback ingestion", () => {
       comment: {
         body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
         html_url: "https://github.com/org/repo/issues/45#issuecomment-1",
-        user: { login: "claude-code[bot]" },
+        user: { login: "claude-code[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
       },
       issue: {
         number: 45,
@@ -748,7 +1582,8 @@ describe("review feedback ingestion", () => {
       comment: {
         body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
         html_url: "https://github.com/org/repo/issues/45#issuecomment-1",
-        user: { login: "claude-code[bot]" },
+        user: { login: "claude-code[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
       },
       issue: {
         html_url: "https://github.com/org/repo/pull/45",
@@ -768,7 +1603,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("does not trust generic github-actions bot PR summary comments", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-4",
       issueIdentifier: "AII-4",
       repo: "org/repo",
@@ -780,7 +1615,8 @@ describe("review feedback ingestion", () => {
       comment: {
         body: "### PR Review: Changes requested\n\n**1. Spoofable action feedback**\nThis should not be trusted from generic Actions.",
         html_url: "https://github.com/org/repo/issues/45#issuecomment-2",
-        user: { login: "github-actions[bot]" },
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
       },
       issue: {
         number: 45,
@@ -799,8 +1635,312 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  // ---------- AII-817: webhook reads the review-findings block, shared author rule ----------
+
+  it("ignores a review-findings block from an author outside the trusted allowlist", async () => {
+    const jobId = appendDispatch({ issueId: "issue-60", issueIdentifier: "AII-60", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/60");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"body\":\"Should not be trusted from this author.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/60#issuecomment-10",
+        user: { login: "random-user", type: "User" },
+      },
+      issue: {
+        number: 60,
+        html_url: "https://github.com/org/repo/pull/60",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/60" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 60)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores a github-actions[bot] issue_comment with no findings block and no Claude review heading", async () => {
+    const jobId = appendDispatch({ issueId: "issue-61", issueIdentifier: "AII-61", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/61");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "Deployed a preview environment for this PR: https://preview.example.com",
+        html_url: "https://github.com/org/repo/issues/61#issuecomment-11",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 61,
+        html_url: "https://github.com/org/repo/pull/61",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/61" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 61)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores an approve verdict block with no findings as approved, without enqueueing", async () => {
+    const jobId = appendDispatch({ issueId: "issue-62", issueIdentifier: "AII-62", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/62");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nLooks good, no notes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[]}\n```",
+        html_url: "https://github.com/org/repo/issues/62#issuecomment-12",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 62,
+        html_url: "https://github.com/org/repo/pull/62",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/62" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "approved" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 62)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores an approve verdict with only minor findings as approved, without enqueueing", async () => {
+    const jobId = appendDispatch({ issueId: "issue-71", issueIdentifier: "AII-71", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/71");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit one.\"},{\"severity\":\"minor\",\"path\":\"src/y.ts\",\"line\":2,\"body\":\"Nit two.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/71#issuecomment-71",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 71,
+        html_url: "https://github.com/org/repo/pull/71",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/71" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "approved" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 71)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("still enqueues a prose Claude summary whose medium findings sit beside a ready-to-merge line", async () => {
+    const jobId = appendDispatch({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "**Claude finished the review**\n\n### Review\n\n### Issues\n- Real concern in src/x.ts that needs a change.\n\n**Merge readiness:** Ready to merge",
+        html_url: "https://github.com/org/repo/issues/73#issuecomment-73",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 73,
+        html_url: "https://github.com/org/repo/pull/73",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/73" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+  });
+
+  it("still enqueues an approve verdict that carries a blocking finding", async () => {
+    const jobId = appendDispatch({ issueId: "issue-72", issueIdentifier: "AII-72", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/72");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Bug.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/72#issuecomment-72",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 72,
+        html_url: "https://github.com/org/repo/pull/72",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/72" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("still enqueues a changes_requested verdict with only a minor finding", async () => {
+    const jobId = appendDispatch({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit one.\"},{\"severity\":\"minor\",\"path\":\"src/y.ts\",\"line\":2,\"body\":\"Nit two.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/73#issuecomment-73",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 73,
+        html_url: "https://github.com/org/repo/pull/73",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/73" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("upserts review-contract findings and enqueues a review-fix (reason=review_contract) from a findings block", async () => {
+    const jobId = appendDispatch({ issueId: "issue-63", issueIdentifier: "AII-63", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/63");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nBlocking issue found.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":10,\"body\":\"Missing null check.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/63#issuecomment-13",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 63,
+        html_url: "https://github.com/org/repo/pull/63",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/63" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 63)).toMatchObject([
+      {
+        source: "review-contract",
+        severity: "blocking",
+        path: "src/x.ts",
+        line: 10,
+        body: "Missing null check.",
+      },
+    ]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toMatchObject([
+      {
+        issueId: "issue-63",
+        issueIdentifier: "AII-63",
+        repo: "org/repo",
+        prNumber: 63,
+        reason: "review_contract",
+      },
+    ]);
+  });
+
+  it("ignores an unclosed review-findings block as findings_unavailable and logs it", async () => {
+    const jobId = appendDispatch({ issueId: "issue-64", issueIdentifier: "AII-64", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/64");
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[",
+        html_url: "https://github.com/org/repo/issues/64#issuecomment-14",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 64,
+        html_url: "https://github.com/org/repo/pull/64",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/64" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "findings_unavailable" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 64)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("findings unavailable"))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it("ignores an explicit incomplete verdict with no findings as findings_unavailable", async () => {
+    const jobId = appendDispatch({ issueId: "issue-65", issueIdentifier: "AII-65", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/65");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"incomplete\",\"findings\":[]}\n```",
+        html_url: "https://github.com/org/repo/issues/65#issuecomment-15",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 65,
+        html_url: "https://github.com/org/repo/pull/65",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/65" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "findings_unavailable" });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
   it("does not resolve stored findings when a matching PR receives a new synchronize event", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-3",
       issueIdentifier: "AII-3",
       repo: "org/repo",
@@ -820,7 +1960,7 @@ describe("review feedback ingestion", () => {
         number: 44,
         merged: false,
         html_url: "https://github.com/org/repo/pull/44",
-        head: { ref: "ai-implement/AII-3-fix" },
+        head: { ref: "ai-implement/aii-3-fix" },
       },
       repository: { full_name: "org/repo" },
     });
@@ -843,7 +1983,7 @@ describe("review feedback ingestion", () => {
       action: "synchronize",
       pull_request: {
         merged: false,
-        head: { ref: "ai-implement/AII-3-fix" },
+        head: { ref: "ai-implement/aii-3-fix" },
       },
       repository: { full_name: "org/repo" },
     });
@@ -859,36 +1999,521 @@ describe("review feedback ingestion", () => {
   });
 });
 
+// ---------- Bot review gate (AII-745 / ADR 027) ----------
+
+describe("shouldEnqueueReviewEvent", () => {
+  const BASE = {
+    authorType: "Bot" as string | undefined,
+    body: "Please fix the null check.",
+    commitId: "sha-current" as string | undefined,
+    headSha: "sha-current" as string | undefined,
+    eventAt: 1_000 as number | undefined,
+    latestRunDispatchedAt: null as number | null,
+  };
+
+  it("never enqueues when the body carries the self marker, regardless of author or other disqualifying fields", () => {
+    expect(
+      webhook.shouldEnqueueReviewEvent({
+        ...BASE,
+        authorType: undefined,
+        body: "<!-- ai-implement finding-disposition -->\nAcknowledged.",
+        commitId: "sha-old",
+        headSha: "sha-new",
+        latestRunDispatchedAt: 2_000,
+      }),
+    ).toEqual({ enqueue: false, reason: "self" });
+  });
+
+  it("enqueues a current-head Bot review quoting the self marker mid-body", () => {
+    expect(webhook.shouldEnqueueReviewEvent({
+      ...BASE,
+      body: "## Claude review\nThe guard skips comments quoting `<!-- ai-implement`.",
+    })).toEqual({ enqueue: true });
+  });
+
+  it.each(["", " \n\t"])("drops a leading self marker after whitespace %j", whitespace => {
+    expect(webhook.shouldEnqueueReviewEvent({
+      ...BASE, body: `${whitespace}<!-- ai-implement status -->\nDone.`,
+    })).toEqual({ enqueue: false, reason: "self" });
+  });
+
+  it("enqueues a human author unconditionally (today's behavior)", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, authorType: "User" })).toEqual({ enqueue: true });
+  });
+
+  it("treats an author with no declared type as human, matching existing fixtures that omit user.type", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, authorType: undefined })).toEqual({ enqueue: true });
+  });
+
+  it("enqueues a bot event describing the PR's current head with no run dispatched since", () => {
+    expect(webhook.shouldEnqueueReviewEvent(BASE)).toEqual({ enqueue: true });
+  });
+
+  it("rejects a bot event describing a stale head as stale_head", () => {
+    expect(
+      webhook.shouldEnqueueReviewEvent({ ...BASE, commitId: "sha-old", headSha: "sha-current" }),
+    ).toEqual({ enqueue: false, reason: "stale_head" });
+  });
+
+  it("rejects a bot event as run_after_review when a run was dispatched after it", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, latestRunDispatchedAt: 2_000 })).toEqual({
+      enqueue: false,
+      reason: "run_after_review",
+    });
+  });
+
+  it("does not treat a dispatch at or before the event as run_after_review", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, latestRunDispatchedAt: 1_000 })).toEqual({ enqueue: true });
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, latestRunDispatchedAt: 500 })).toEqual({ enqueue: true });
+  });
+
+  it("rejects a bot issue_comment (no commit fields) with no event timestamp as missing_fields", () => {
+    expect(
+      webhook.shouldEnqueueReviewEvent({ ...BASE, commitId: undefined, headSha: undefined, eventAt: undefined }),
+    ).toEqual({ enqueue: false, reason: "missing_fields" });
+  });
+
+  it("enqueues a bot issue_comment (no commit fields) once an event timestamp is present", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, commitId: undefined, headSha: undefined })).toEqual({
+      enqueue: true,
+    });
+  });
+
+  it("rejects a bot review or review-comment missing only commit_id as missing_fields", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, commitId: undefined })).toEqual({
+      enqueue: false,
+      reason: "missing_fields",
+    });
+  });
+
+  it("rejects a bot review or review-comment missing only head.sha as missing_fields", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, headSha: undefined })).toEqual({
+      enqueue: false,
+      reason: "missing_fields",
+    });
+  });
+});
+
+describe("bot review gate integration (AII-745)", () => {
+  it("enqueues a bot pull_request_review_comment matching the PR's current head with no run dispatched since", async () => {
+    const jobId = appendDispatch({ issueId: "issue-50", issueIdentifier: "AII-50", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/50");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "Still missing a null check here.",
+        html_url: "https://github.com/org/repo/pull/50#discussion_r99",
+        path: "src/x.ts",
+        line: 5,
+        user: { login: "claude[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: 50,
+        html_url: "https://github.com/org/repo/pull/50",
+        head: { ref: "ai-implement/aii-50-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("ignores a bot pull_request_review_comment on a stale head as stale_head, touching no ledger state", async () => {
+    const jobId = appendDispatch({ issueId: "issue-51", issueIdentifier: "AII-51", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/51");
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "Still missing a null check here.",
+        html_url: "https://github.com/org/repo/pull/51#discussion_r100",
+        user: { login: "claude[bot]", type: "Bot" },
+        commit_id: "sha-old",
+        created_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: 51,
+        html_url: "https://github.com/org/repo/pull/51",
+        head: { ref: "ai-implement/aii-51-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "stale_head" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 51)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+    expect(
+      logSpy.mock.calls.some((c) => String(c[0]).includes("Ignored bot review on PR #51: stale_head")),
+    ).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  it("records a human's inline comment without queueing, then a Request changes review queues one fix run carrying it", async () => {
+    const jobId = appendDispatch({ issueId: "issue-52", issueIdentifier: "AII-52", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/52");
+
+    const pullRequest = {
+      number: 52,
+      html_url: "https://github.com/org/repo/pull/52",
+      head: { ref: "ai-implement/AII-52-fix", sha: "sha-current" },
+    };
+    const human = { login: "a-human", type: "User" };
+
+    for (const [index, body] of ["Still missing a null check here.", "Rename this variable."].entries()) {
+      const comment = makeRequest(SECRET, "pull_request_review_comment", {
+        action: "created",
+        comment: {
+          id: 101 + index,
+          body,
+          html_url: `https://github.com/org/repo/pull/52#discussion_r${101 + index}`,
+          path: "src/x.ts",
+          line: 5 + index,
+          user: human,
+          commit_id: "sha-current",
+          created_at: new Date().toISOString(),
+        },
+        pull_request: pullRequest,
+        repository: { full_name: "org/repo" },
+      });
+      webhook.handleGitHubWebhook(comment.req as never, comment.res as never, SECRET);
+      await comment.res.done;
+
+      expect(comment.res.statusCode).toBe(200);
+      expect(JSON.parse(comment.res.body)).toMatchObject({ recorded: true, reason: "awaiting_changes_requested" });
+    }
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 52)).toHaveLength(2);
+
+    const review = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        id: 900,
+        state: "changes_requested",
+        body: "Please address the inline comments.",
+        html_url: "https://github.com/org/repo/pull/52#pullrequestreview-900",
+        user: human,
+        commit_id: "sha-current",
+        submitted_at: new Date().toISOString(),
+      },
+      pull_request: pullRequest,
+      repository: { full_name: "org/repo" },
+    });
+    webhook.handleGitHubWebhook(review.req as never, review.res as never, SECRET);
+    await review.res.done;
+
+    expect(review.res.statusCode).toBe(200);
+    expect(JSON.parse(review.res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 52).map((f) => f.source)).toEqual([
+      "github-review-thread",
+      "github-review-thread",
+      "github-review",
+    ]);
+  });
+
+  it("a redelivered human inline comment does not bump the recorded finding's revision", async () => {
+    const jobId = log.appendLog({ issueId: "issue-58", issueIdentifier: "AII-58", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/58");
+
+    const payload = {
+      action: "created",
+      comment: {
+        id: 158,
+        body: "Guard this value.",
+        path: "src/x.ts",
+        line: 3,
+        user: { login: "a-human", type: "User" },
+      },
+      pull_request: {
+        number: 58,
+        html_url: "https://github.com/org/repo/pull/58",
+        head: { ref: "ai-implement/AII-58-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    };
+    const headers = { "x-github-delivery": "delivery-human-comment-1" };
+
+    const responses: Array<{ findingId: number }> = [];
+    for (let i = 0; i < 2; i++) {
+      const { req, res } = makeRequest(SECRET, "pull_request_review_comment", payload, undefined, headers);
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+      responses.push(JSON.parse(res.body) as { findingId: number });
+    }
+
+    expect(responses[1].findingId).toBe(responses[0].findingId);
+    expect(reviewStore.getReviewFindingById(responses[0].findingId)?.revision).toBe(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("reopens a resolved finding when a human posts the same inline comment again", async () => {
+    const jobId = log.appendLog({ issueId: "issue-59", issueIdentifier: "AII-59", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/59");
+
+    const deliver = async (commentId: number) => {
+      const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+        action: "created",
+        comment: {
+          id: commentId,
+          body: "Guard this value.",
+          path: "src/x.ts",
+          line: 3,
+          user: { login: "a-human", type: "User" },
+        },
+        pull_request: {
+          number: 59,
+          html_url: "https://github.com/org/repo/pull/59",
+          head: { ref: "ai-implement/AII-59-fix" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+      return JSON.parse(res.body) as { findingId: number };
+    };
+
+    const first = await deliver(159);
+    expect(reviewStore.markReviewFindingResolvedIfRevision(first.findingId, 1)).toBe(1);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 59)).toEqual([]);
+
+    const second = await deliver(160);
+    expect(second.findingId).toBe(first.findingId);
+    expect(reviewStore.getReviewFindingById(first.findingId)).toMatchObject({ status: "open", revision: 2 });
+  });
+
+  it("does not queue a fix run for an inline comment with no author type, treating it as human", async () => {
+    const jobId = log.appendLog({ issueId: "issue-57", issueIdentifier: "AII-57", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/57");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: { body: "Guard this value.", path: "src/x.ts", line: 3 },
+      pull_request: {
+        number: 57,
+        html_url: "https://github.com/org/repo/pull/57",
+        head: { ref: "ai-implement/AII-57-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ recorded: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 57)).toHaveLength(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("rejects a bot pull_request_review_comment as run_after_review when a run was dispatched after it", async () => {
+    const jobId = appendDispatch({ issueId: "issue-53", issueIdentifier: "AII-53", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
+
+    const eventAt = new Date(Date.now() - 60_000).toISOString();
+
+    const rerunJobId = appendDispatch({ issueId: "issue-53", issueIdentifier: "AII-53", repo: "org/repo" });
+    log.updateJobStatus(rerunJobId, "completed", "success", "https://github.com/org/repo/pull/54");
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "Still missing a null check here.",
+        html_url: "https://github.com/org/repo/pull/54#discussion_r102",
+        user: { login: "claude[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: eventAt,
+      },
+      pull_request: {
+        number: 54,
+        html_url: "https://github.com/org/repo/pull/54",
+        head: { ref: "ai-implement/aii-53-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "run_after_review" });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+    expect(
+      logSpy.mock.calls.some((c) => String(c[0]).includes("Ignored bot review on PR #54: run_after_review")),
+    ).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  it("never enqueues a pull_request_review whose body carries the self marker, for a bot or human author", async () => {
+    const jobId = appendDispatch({ issueId: "issue-55", issueIdentifier: "AII-55", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/55");
+
+    for (const author of [{ login: "claude[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
+      const { req, res } = makeRequest(SECRET, "pull_request_review", {
+        action: "submitted",
+        review: {
+          state: "changes_requested",
+          body: "<!-- ai-implement finding-disposition -->\nAcknowledged and resolved.",
+          html_url: "https://github.com/org/repo/pull/55#pullrequestreview-9",
+          user: author,
+          commit_id: "sha-current",
+          submitted_at: new Date().toISOString(),
+        },
+        pull_request: {
+          number: 55,
+          html_url: "https://github.com/org/repo/pull/55",
+          head: { ref: "ai-implement/aii-55-fix", sha: "sha-current" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    }
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores its inline finding trailer from a trusted Bot on the current head after dispatch", async () => {
+    const jobId = appendDispatch({ issueId: "issue-56", issueIdentifier: "AII-56", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/56");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: inlineCommentBody({ severity: "medium", body: "Add a null check.", path: "src/x.ts", line: 5 }),
+        html_url: "https://github.com/org/repo/pull/56#discussion_r103",
+        path: "src/x.ts",
+        line: 5,
+        user: { login: "ai-implement[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: new Date(Date.now() + 1_000).toISOString(),
+      },
+      pull_request: {
+        number: 56,
+        html_url: "https://github.com/org/repo/pull/56",
+        head: { ref: "ai-implement/aii-56-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 56)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("never enqueues a pull_request_review_comment whose body carries the self marker, for a bot or human author", async () => {
+    const jobId = appendDispatch({ issueId: "issue-56", issueIdentifier: "AII-56", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/56");
+
+    for (const author of [{ login: "claude[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
+      const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+        action: "created",
+        comment: {
+          body: "<!-- ai-implement finding-disposition -->\nAcknowledged and resolved.",
+          html_url: "https://github.com/org/repo/pull/56#discussion_r103",
+          user: author,
+          commit_id: "sha-current",
+          created_at: new Date().toISOString(),
+        },
+        pull_request: {
+          number: 56,
+          html_url: "https://github.com/org/repo/pull/56",
+          head: { ref: "ai-implement/aii-56-fix", sha: "sha-current" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    }
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("never enqueues a trusted-author issue_comment whose body carries the self marker", async () => {
+    const jobId = appendDispatch({ issueId: "issue-57", issueIdentifier: "AII-57", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/57");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "<!-- ai-implement finding-disposition -->\n### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
+        html_url: "https://github.com/org/repo/issues/57#issuecomment-3",
+        user: { login: "claude-code[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 57,
+        html_url: "https://github.com/org/repo/pull/57",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/57" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    // classifyReviewIssueComment's isAiImplementComment self-guard rejects this comment
+    // before it is ever classified as a review, so it lands in the generic "not a
+    // recognized review" bucket rather than reaching shouldEnqueueReviewEvent's own
+    // (redundant, for this path) self check.
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+});
+
 // ---------- /ai-implement comment trigger ----------
 
-function makeMappedEnvelopeRepo(owner = "org", repo = "repo"): Record<string, RepoMapping> {
-  return {
-    "team-key": {
-      owner,
-      repo,
-      workflowFile: "claude-implement.yml",
-      defaultBranch: "main",
-      maxInProgressAiIssues: 3,
-      executionMode: "github-actions",
-      sessionMode: "autonomous",
-      machineCpus: 2,
-      machineMemoryMb: 4096,
-      planningEnabled: false,
-      planningWorkflowFile: "",
-      autoApprovePlans: true,
-      extraEnv: {},
-      provider: "anthropic",
-      awsRegion: null,
-      ticketingProvider: "linear",
-      ticketingConfig: { kind: "linear" },
-      paused: false,
-      maxTurns: null,
-      maxIterations: null,
-      maxJobMinutes: null,
-      branchPrefix: null,
-      skillsRepo: null,
-    },
-  };
+/** The mapping set with one project on org/repo, keyed by its team as the store keys it. */
+function orgRepoMapping(overrides: Partial<RepoMapping> = {}): Record<string, RepoMapping> {
+  return { AII: makeMapping({ owner: "org", repo: "repo", ...overrides }) };
+}
+
+/** GitHub's answer to the collaborator-permission read for alice on org/repo. */
+function collaboratorPermission(permission: string): Reply {
+  return { json: { permission, role_name: permission, user: { login: "alice", type: "User" } } };
+}
+
+/** GitHub's REST answers for a comment trigger on org/repo: the commenter's permission (a role name, or the replies
+ *  themselves, a list served in order), then the 👀 reaction, and the reason comment the handler posts when it gives
+ *  up, routed only with `reasonComment`. `reaction: null` leaves the reaction unrouted, so a test that expects none
+ *  fails if one is sent, even after the test's own assertions, since the handler sends it without awaiting it. */
+function commentTriggerApi(
+  opts: { permission?: string | Reply | Reply[]; reaction?: Reply | null; reasonComment?: boolean; commentId?: number } = {},
+): FakeFetch {
+  const { permission = "write", commentId = 9001 } = opts;
+  const reaction: Reply | null = opts.reaction === undefined
+    ? { status: 201, json: { id: 1, content: "eyes", user: { login: "ai-implement[bot]", type: "Bot" } } }
+    : opts.reaction;
+  return fakeFetch({
+    "GET /repos/org/repo/collaborators/alice/permission": typeof permission === "string" ? collaboratorPermission(permission) : permission,
+    ...(reaction ? { [`POST /repos/org/repo/issues/comments/${commentId}/reactions`]: reaction } : {}),
+    ...(opts.reasonComment
+      ? { "POST /repos/org/repo/issues/1/comments": { status: 201, json: { id: 5001, html_url: "https://github.com/org/repo/pull/1#issuecomment-5001" } } }
+      : {}),
+  }).install();
 }
 
 function makeAiImplComment(body: string, commentId = 9001, login = "alice") {
@@ -911,7 +2536,8 @@ function makeAiImplComment(body: string, commentId = 9001, login = "alice") {
 
 describe("/ai-implement comment trigger", () => {
   it("(a) write-permission collaborator with instruction enqueues a row and returns queued:true", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
+    const github = commentTriggerApi();
 
     const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement fix the tests"));
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
@@ -932,15 +2558,18 @@ describe("/ai-implement comment trigger", () => {
       status: "pending",
     });
 
-    // verify 👀 reaction was requested
-    const reactionCall = mockFetch.mock.calls.find(([url]) => String(url).includes("/reactions"));
-    expect(reactionCall).toBeDefined();
-    const [, opts] = reactionCall!;
-    expect(JSON.parse((opts as RequestInit).body as string)).toMatchObject({ content: "eyes" });
+    // verify 👀 reaction was requested; the handler sends it without awaiting it
+    const reactionCall = await vi.waitFor(() => {
+      const call = github.calls.find((c) => c.path === "/repos/org/repo/issues/comments/9001/reactions");
+      expect(call).toBeDefined();
+      return call!;
+    });
+    expect(JSON.parse(reactionCall.body)).toMatchObject({ content: "eyes" });
   });
 
   it("(b) bare /ai-implement enqueues with empty instruction", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
+    commentTriggerApi();
 
     const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement"));
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
@@ -955,7 +2584,7 @@ describe("/ai-implement comment trigger", () => {
   });
 
   it("(c-i) /ai-implementfoo is ignored", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
 
     const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implementfoo"));
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
@@ -967,7 +2596,7 @@ describe("/ai-implement comment trigger", () => {
   });
 
   it("(c-ii) comment with /ai-implement mid-text is ignored", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
 
     const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("please /ai-implement this"));
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
@@ -979,13 +2608,8 @@ describe("/ai-implement comment trigger", () => {
   });
 
   it("(d) read-only collaborator is ignored with insufficient_permission", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
-    mockFetch.mockImplementation((url: string | URL | Request) => {
-      if (String(url).includes("/collaborators/")) {
-        return Promise.resolve(new Response(JSON.stringify({ permission: "read" }), { status: 200 }));
-      }
-      return Promise.resolve(new Response("", { status: 201 }));
-    });
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
+    const github = commentTriggerApi({ permission: "read", reaction: null });
 
     const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement fix it"));
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
@@ -995,11 +2619,11 @@ describe("/ai-implement comment trigger", () => {
     expect(JSON.parse(res.body)).toMatchObject({ ignored: true, reason: "insufficient_permission" });
     expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
     // no reaction fetch call
-    expect(mockFetch.mock.calls.some(([url]) => String(url).includes("/reactions"))).toBe(false);
+    expect(github.calls.some((c) => c.path.endsWith("/reactions"))).toBe(false);
   });
 
   it("(e) legacy-generation repo is ignored with legacy_repo", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
     hoisted.resolveWorkflowContract.mockResolvedValue("legacy");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement fix it"));
@@ -1011,8 +2635,82 @@ describe("/ai-implement comment trigger", () => {
     expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
   });
 
+  describe("transient GitHub failures (AII-1292)", () => {
+    const reasonComments = (github: FakeFetch) => github.calls.filter((c) => c.method === "POST" && c.path === "/repos/org/repo/issues/1/comments");
+    const reactions = (github: FakeFetch) => github.calls.filter((c) => c.path.endsWith("/reactions"));
+
+    async function post(): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+      const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement fix it"));
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
+      await res.done;
+      return { statusCode: res.statusCode, body: JSON.parse(res.body) };
+    }
+
+    it("probe failing twice posts one reason comment, no 👀, nothing queued, contract_probe_failed", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      hoisted.resolveWorkflowContract.mockClear();
+      hoisted.resolveWorkflowContract.mockRejectedValue(new Error("probe"));
+      const github = commentTriggerApi({ reaction: null, reasonComment: true });
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "contract_probe_failed" });
+      expect(hoisted.resolveWorkflowContract).toHaveBeenCalledTimes(2);
+      expect((hoisted.resolveWorkflowContract.mock.calls[0] as unknown[])[0]).toMatchObject({ failOnTransient: true });
+      expect(reasonComments(github)).toHaveLength(1);
+      expect(reactions(github)).toHaveLength(0);
+      expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
+    });
+
+    it("probe failing once then succeeding queues the comment with 👀", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      hoisted.resolveWorkflowContract.mockRejectedValueOnce(new Error("probe")).mockResolvedValue("envelope");
+      const github = commentTriggerApi();
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ queued: true });
+      expect(reasonComments(github)).toHaveLength(0);
+      // The handler sends the reaction without awaiting it.
+      await vi.waitFor(() => expect(reactions(github)).toHaveLength(1));
+    });
+
+    it("permission API errors twice give permission_check_failed with one comment", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      const github = commentTriggerApi({ permission: githubError(503, "Service Unavailable"), reaction: null, reasonComment: true });
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "permission_check_failed" });
+      expect(reasonComments(github)).toHaveLength(1);
+      expect(reactions(github)).toHaveLength(0);
+      expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
+    });
+
+    it("a permission error then a 200 queues the comment", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      const github = commentTriggerApi({ permission: [githubError(500, "Internal Server Error"), collaboratorPermission("write")] });
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ queued: true });
+      expect(reasonComments(github)).toHaveLength(0);
+      await vi.waitFor(() => expect(reactions(github)).toHaveLength(1));
+    });
+
+    it("a 404 from the permission API is a non-writer, not an error", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      const github = commentTriggerApi({ permission: githubError(404, "Not Found"), reaction: null });
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "insufficient_permission" });
+      expect(reasonComments(github)).toHaveLength(0);
+    });
+  });
+
   it("(f-i) non-PR issue comment is ignored", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
       action: "created",
@@ -1041,16 +2739,18 @@ describe("/ai-implement comment trigger", () => {
   });
 
   it("(g) duplicate webhook delivery with same comment_id produces a single row", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
+    commentTriggerApi({ commentId: 9999 });
 
     const payload = makeAiImplComment("/ai-implement fix it", 9999);
+    const redelivery = { "x-github-delivery": "delivery-9999" };
 
-    const { req: req1, res: res1 } = makeRequest(SECRET, "issue_comment", payload);
+    const { req: req1, res: res1 } = makeRequest(SECRET, "issue_comment", payload, undefined, redelivery);
     webhook.handleGitHubWebhook(req1 as never, res1 as never, SECRET, "app-id", "private-key");
     await res1.done;
     expect(JSON.parse(res1.body)).toMatchObject({ queued: true });
 
-    const { req: req2, res: res2 } = makeRequest(SECRET, "issue_comment", payload);
+    const { req: req2, res: res2 } = makeRequest(SECRET, "issue_comment", payload, undefined, redelivery);
     webhook.handleGitHubWebhook(req2 as never, res2 as never, SECRET, "app-id", "private-key");
     await res2.done;
     expect(JSON.parse(res2.body)).toMatchObject({ queued: true });
@@ -1059,16 +2759,10 @@ describe("/ai-implement comment trigger", () => {
   });
 
   it("reaction 403 does not prevent the enqueued row from being saved", async () => {
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
-    mockFetch.mockImplementation((url: string | URL | Request) => {
-      const urlStr = String(url);
-      if (urlStr.includes("/collaborators/")) {
-        return Promise.resolve(new Response(JSON.stringify({ permission: "write" }), { status: 200 }));
-      }
-      if (urlStr.includes("/reactions")) {
-        return Promise.resolve(new Response("Forbidden", { status: 403 }));
-      }
-      return Promise.resolve(new Response("", { status: 404 }));
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
+    commentTriggerApi({
+      commentId: 8001,
+      reaction: { status: 403, json: { message: "Resource not accessible by integration" } },
     });
 
     const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement", 8001));
@@ -1081,22 +2775,24 @@ describe("/ai-implement comment trigger", () => {
   });
 
   it("existing trusted-review-bot path is unaffected by the new /ai-implement branch", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-4",
       issueIdentifier: "AII-4",
       repo: "org/repo",
     });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/45");
 
-    hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+    hoisted.getMappings.mockReturnValue(orgRepoMapping());
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
       action: "created",
+      installation: { id: 7 },
       comment: {
         id: 7001,
         body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
         html_url: "https://github.com/org/repo/issues/45#issuecomment-7001",
-        user: { login: "claude-code[bot]" },
+        user: { login: "claude-code[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
       },
       issue: {
         number: 45,
@@ -1106,82 +2802,403 @@ describe("/ai-implement comment trigger", () => {
       repository: { full_name: "org/repo" },
     });
 
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
+    const ingress = recordingReviewIngress();
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key", undefined, undefined, undefined, ingress as never);
     await res.done;
 
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
-    expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toHaveLength(1);
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toEqual({ forwarded: true });
+    expect(ingress.events[0]?.findings).toHaveLength(1);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toHaveLength(0);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
     expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
   });
 });
 
-describe("push events", () => {
-  const TARGET = {
-    owner: "BuildDownAI",
-    repo: "AI-Implement",
-    branch: "testing",
-    runningCommit: "1111111111111111111111111111111111111111",
-  };
-
-  // Not a default parameter: `undefined` is a case under test, and a default
-  // would silently substitute TARGET for it.
-  async function push(ref: string, selfDeploy: typeof TARGET | undefined) {
-    const { req, res } = makeRequest(SECRET, "push", { ref });
-    await webhook.handleGitHubWebhook(
-      req as never,
-      res as never,
-      SECRET,
-      "app-id",
-      "private-key",
-      selfDeploy,
-    );
+describe("review process on inline review comments (AII-1181)", () => {
+  async function postInline(
+    pr: number,
+    user: { login: string; type: string },
+    body: string,
+    mapping?: Partial<RepoMapping>,
+  ) {
+    const jobId = appendDispatch({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
+    hoisted.getMappings.mockReturnValue(mapping ? orgRepoMapping(mapping) : {});
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      installation: { id: 7 },
+      comment: {
+        id: pr * 10,
+        body,
+        html_url: `https://github.com/org/repo/pull/${pr}#discussion_r${pr}`,
+        path: "src/x.ts",
+        line: 5,
+        user,
+        commit_id: "sha-current",
+        created_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: pr,
+        html_url: `https://github.com/org/repo/pull/${pr}`,
+        head: { ref: `ai-implement/aii-${pr}-fix`, sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+    const ingress = recordingReviewIngress();
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
     await res.done;
-    return res;
+    return { body: JSON.parse(res.body), severities: [...reviewStore.listOpenReviewFindings("org/repo", pr), ...ingress.events.flatMap((e) => e.findings ?? [])].map((f) => f.severity) };
   }
 
-  it("refreshes availability for a push to the watched branch", async () => {
-    const res = await push("refs/heads/testing", TARGET);
+  const CLAUDE = { login: "claude[bot]", type: "Bot" };
+  const TOPIA = { login: "topia-ai-implement-bot[bot]", type: "Bot" };
 
-    expect(hoisted.refreshAvailability).toHaveBeenCalledWith({
-      appId: "app-id",
-      privateKey: "private-key",
-      ...TARGET,
+  it("stores minor / blocking / minor for untagged / 🔴 / 🟡 from claude[bot] on a claude-code-review project", async () => {
+    const cases: Array<[string, string]> = [["plain note", "minor"], ["🔴 bug", "blocking"], ["🟡 nit", "minor"]];
+    let pr = 700;
+    for (const [text, severity] of cases) {
+      const out = await postInline(pr, CLAUDE, text, { reviewProcess: "claude-code-review" });
+      expect(out.body).toMatchObject({ forwarded: true });
+      expect(out.severities).toEqual([severity]);
+      pr++;
+    }
+  });
+
+  it("skips a 🟣 comment as pre_existing and stores nothing", async () => {
+    const out = await postInline(710, CLAUDE, "🟣 old code", { reviewProcess: "claude-code-review" });
+    expect(out.body).toEqual({ ignored: true, reason: "pre_existing" });
+    expect(out.severities).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("keeps medium for every marker on an ai-implement project and on an unmapped one", async () => {
+    let pr = 720;
+    for (const mapping of [{ reviewProcess: null }, undefined] as const) {
+      for (const text of ["plain", "🔴 bug", "🟡 nit", "🟣 old"]) {
+        const out = await postInline(pr, CLAUDE, text, mapping);
+        expect(out.severities).toEqual(["medium"]);
+        pr++;
+      }
+    }
+  });
+
+  it("ignores an unlisted bot on claude-code-review and reads it with the project list", async () => {
+    const without = await postInline(740, TOPIA, "🔴 bug", { reviewProcess: "claude-code-review", trustedReviewAuthors: [] });
+    expect(without.body).toEqual({ ignored: true, reason: "untrusted_author" });
+    expect(without.severities).toEqual([]);
+
+    const withList = await postInline(741, TOPIA, "🔴 bug", {
+      reviewProcess: "claude-code-review",
+      trustedReviewAuthors: ["topia-ai-implement-bot[bot]"],
     });
+    expect(withList.severities).toEqual(["blocking"]);
+  });
+
+  it("ignores an unlisted bot on ai-implement and unmapped projects, and reads it with the project list", async () => {
+    let pr = 750;
+    for (const base of [{ reviewProcess: null }, undefined] as const) {
+      const without = await postInline(pr, TOPIA, "note", base ? { ...base, trustedReviewAuthors: [] } : undefined);
+      expect(without.body).toEqual({ ignored: true, reason: "untrusted_author" });
+      expect(without.severities).toEqual([]);
+      const withList = await postInline(pr + 1, TOPIA, "🔴 note", { ...(base ?? {}), trustedReviewAuthors: ["topia-ai-implement-bot[bot]"] });
+      expect(withList.severities).toEqual(["medium"]);
+      pr += 2;
+    }
+  });
+
+  it("ignores an unlisted bot's CHANGES_REQUESTED review under every process, and reads it when listed", async () => {
+    let pr = 770;
+    const postReview = async (user: { login: string; type: string }, mapping: Partial<RepoMapping>) => {
+      const jobId = appendDispatch({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+      log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
+      hoisted.getMappings.mockReturnValue(orgRepoMapping(mapping));
+      const { req, res } = makeRequest(SECRET, "pull_request_review", {
+        action: "submitted",
+        installation: { id: 7 },
+        review: { id: pr, state: "changes_requested", body: "Fix this.", user, commit_id: "sha-current", submitted_at: new Date().toISOString() },
+        pull_request: { number: pr, html_url: `https://github.com/org/repo/pull/${pr}`, head: { ref: `ai-implement/aii-${pr}-fix`, sha: "sha-current" } },
+        repository: { full_name: "org/repo" },
+      });
+      const ingress = recordingReviewIngress();
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+      await res.done;
+      pr++;
+      return JSON.parse(res.body);
+    };
+    for (const reviewProcess of [null, "claude-code-review"] as const) {
+      expect(await postReview(TOPIA, { reviewProcess, trustedReviewAuthors: [] })).toEqual({ ignored: true, reason: "untrusted_author" });
+      expect(await postReview(TOPIA, { reviewProcess, trustedReviewAuthors: ["topia-ai-implement-bot[bot]"] })).toMatchObject({ forwarded: true });
+    }
+  });
+
+  it("keeps a built-in author trusted with an unrelated extra list", async () => {
+    const out = await postInline(742, CLAUDE, "🔴 bug", { reviewProcess: "claude-code-review", trustedReviewAuthors: ["other[bot]"] });
+    expect(out.severities).toEqual(["blocking"]);
+  });
+
+  it("keeps a human's inline comment medium, even with a 🟣 marker, under claude-code-review", async () => {
+    const out = await postInline(743, { login: "a-human", type: "User" }, "🟣 note", { reviewProcess: "claude-code-review" });
+    expect(out.severities).toEqual(["medium"]);
+  });
+});
+
+describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", () => {
+  type Outcome = { status: "accepted" } | { status: "unavailable" };
+  function fakeIngress(outcome: Outcome = { status: "accepted" }) {
+    const feedback = vi.fn(async (_scope: unknown, _event: unknown, _opts: { idempotencyKey: string }) => outcome);
+    return { feedback };
+  }
+
+  function mapRepo(lifecycle: "restate" | "legacy" | null) {
+    hoisted.getMappings.mockReturnValue(orgRepoMapping({ reviewFixLifecycle: lifecycle }));
+  }
+
+  function seedDispatch(pr: number) {
+    const jobId = appendDispatch({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
+  }
+
+  const pull = (pr: number, sha = "sha-current") => ({
+    number: pr,
+    html_url: `https://github.com/org/repo/pull/${pr}`,
+    head: { ref: `ai-implement/aii-${pr}-fix`, sha },
+  });
+
+  const payloads: Record<string, (pr: number, body: string, commit?: string) => { event: string; payload: unknown }> = {
+    review: (pr, body, commit = "sha-current") => ({
+      event: "pull_request_review",
+      payload: {
+        action: "submitted",
+        installation: { id: 7 },
+        review: { id: pr, state: "changes_requested", body, html_url: `https://github.com/org/repo/pull/${pr}#pullrequestreview-${pr}`, user: { login: "human", type: "User" }, commit_id: commit },
+        pull_request: pull(pr),
+        repository: { full_name: "org/repo" },
+      },
+    }),
+    reviewComment: (pr, body, commit = "sha-current") => ({
+      event: "pull_request_review_comment",
+      payload: {
+        action: "created",
+        installation: { id: 7 },
+        // A trusted bot: a human's inline comment is recorded, never forwarded or queued.
+        comment: { id: pr, body, html_url: `https://github.com/org/repo/pull/${pr}#discussion_r${pr}`, path: "a.ts", line: 3, user: { login: "claude[bot]", type: "Bot" }, commit_id: commit, created_at: new Date(Date.now() + 1_000).toISOString() },
+        pull_request: pull(pr),
+        repository: { full_name: "org/repo" },
+      },
+    }),
+    issueComment: (pr, body) => ({
+      event: "issue_comment",
+      payload: {
+        action: "created",
+        installation: { id: 7 },
+        comment: { id: pr, body, html_url: `https://github.com/org/repo/issues/${pr}#issuecomment-${pr}`, user: { login: "github-actions[bot]", type: "Bot" }, created_at: new Date().toISOString() },
+        issue: { number: pr, html_url: `https://github.com/org/repo/pull/${pr}`, pull_request: { url: `https://api.github.com/repos/org/repo/pulls/${pr}` } },
+        repository: { full_name: "org/repo" },
+      },
+    }),
+  };
+
+  const issueBody = "## Review\n\nBlocking issue found.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":10,\"body\":\"Missing null check.\"}]}\n```";
+
+  async function post(kind: string, pr: number, opts: { ingress?: ReturnType<typeof fakeIngress>; delivery?: string | null; body?: string; commit?: string; installation?: false } = {}) {
+    const body = opts.body ?? (kind === "issueComment" ? issueBody : "Please fix this.");
+    const { event, payload } = payloads[kind]!(pr, body, opts.commit);
+    if (opts.installation === false) delete (payload as { installation?: unknown }).installation;
+    const headers = { "x-github-delivery": opts.delivery === null ? "" : opts.delivery ?? `delivery-${pr}` };
+    const { req, res } = makeRequest(SECRET, event, payload, undefined, headers);
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, opts.ingress as never);
+    return { status: res.statusCode, body: JSON.parse(res.body) as Record<string, unknown> };
+  }
+
+  it.each([0, 1, 2])("Codex P%s forwards only blocking findings", async (priority) => {
+    hoisted.getMappings.mockReturnValue(orgRepoMapping({ reviewFixLifecycle: "restate", reviewProcess: "codex-code-review" }));
+    seedDispatch(90 + priority);
+    const ingress = fakeIngress();
+    const { event, payload } = payloads.reviewComment!(90 + priority,
+      `**<sub><sub>![P${priority} Badge](https://img.shields.io/badge/P${priority}-orange?style=flat)</sub></sub>  Bug**`);
+    (payload as { comment: { user: unknown } }).comment.user = { login: "chatgpt-codex-connector[bot]", type: "Bot" };
+    const { req, res } = makeRequest(SECRET, event, payload, undefined, { "x-github-delivery": `codex-${priority}` });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+    expect(ingress.feedback).toHaveBeenCalledTimes(priority === 2 ? 0 : 1);
+    if (priority !== 2) expect(ingress.feedback.mock.calls[0]![1]).toMatchObject({ findings: [{ severity: "blocking" }] });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 90 + priority)).toEqual([]);
+  });
+
+  it.each([
+    { login: "chatgpt-codex-connector[bot]", commit: "sha-old", reason: "stale_head" },
+    { login: "untrusted-codex[bot]", commit: "sha-current", reason: "untrusted_author" },
+  ])("rejects Codex P1 intake: $reason", async ({ login, commit, reason }) => {
+    hoisted.getMappings.mockReturnValue(orgRepoMapping({ reviewFixLifecycle: "restate", reviewProcess: "codex-code-review" }));
+    seedDispatch(95);
+    const ingress = fakeIngress();
+    const { event, payload } = payloads.reviewComment!(95,
+      "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Bug**", commit);
+    (payload as { comment: { user: unknown } }).comment.user = { login, type: "Bot" };
+    const { req, res } = makeRequest(SECRET, event, payload, undefined, { "x-github-delivery": `codex-${reason}` });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ refreshed: true });
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+    expect(reviewStore.listOpenReviewFindings("org/repo", 95)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
-  it("ignores a push to any other branch", async () => {
-    const res = await push("refs/heads/main", TARGET);
-
-    expect(hoisted.refreshAvailability).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true });
+  it.each(["review", "reviewComment", "issueComment"])("%s: forwards with the delivery id, answers 202, writes nothing", async (kind) => {
+    mapRepo("restate");
+    seedDispatch(10);
+    const ingress = fakeIngress();
+    const out = await post(kind, 10, { ingress, delivery: "d-abc" });
+    expect(out).toEqual({ status: 202, body: { forwarded: true } });
+    expect(ingress.feedback).toHaveBeenCalledTimes(1);
+    const [scope, event, opts] = ingress.feedback.mock.calls[0]! as [unknown, { deliveryId: string; eventId: string; repo: string }, { idempotencyKey: string }];
+    expect(scope).toEqual({ installationId: 7, repository: "org/repo", prNumber: 10 });
+    expect(event.deliveryId).toBe("d-abc");
+    expect(event.eventId).toBe("gh-delivery:d-abc");
+    expect(opts.idempotencyKey).toBe("d-abc");
+    expect(reviewStore.listOpenReviewFindings("org/repo", 10)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
-  it("ignores a tag push even when the tag shares the branch name", async () => {
-    // refs/tags/testing must not be mistaken for refs/heads/testing — the reason
-    // the ref is stripped by prefix rather than by taking the last path segment.
-    const res = await push("refs/tags/testing", TARGET);
-
-    expect(hoisted.refreshAvailability).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true });
-  });
-
-  it("ignores a push when the image carries no self-deploy stamps", async () => {
-    const res = await push("refs/heads/testing", undefined);
-
-    expect(hoisted.refreshAvailability).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true });
-  });
-
-  it("still answers 200 when the refresh fails, since the poll recomputes anyway", async () => {
-    hoisted.refreshAvailability.mockRejectedValueOnce(new Error("HTTP 502"));
-
-    const res = await push("refs/heads/testing", TARGET);
-
+  it("records a human's inline comment on a Restate project without forwarding it", async () => {
+    mapRepo("restate");
+    seedDispatch(13);
+    const ingress = fakeIngress();
+    const { event, payload } = payloads.reviewComment!(13, "Please fix this.");
+    (payload as { comment: { user: unknown } }).comment.user = { login: "human", type: "User" };
+    const { req, res } = makeRequest(SECRET, event, payload, undefined, { "x-github-delivery": "d-human" });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ refreshed: false });
+    expect(JSON.parse(res.body)).toMatchObject({ recorded: true, reason: "awaiting_changes_requested" });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+    expect(reviewStore.listOpenReviewFindings("org/repo", 13)).toHaveLength(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("issueComment: an approve verdict with only minor findings is not forwarded", async () => {
+    mapRepo("restate");
+    seedDispatch(12);
+    const ingress = fakeIngress();
+    const body = "## Review\n\nNits.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit.\"}]}\n```";
+    const out = await post("issueComment", 12, { ingress, body });
+    expect(out.status).toBe(200);
+    expect(out.body).toEqual({ ignored: true, reason: "approved" });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  it("never calls acceptReviewFixWebhookEvent on the Restate path", async () => {
+    mapRepo("restate");
+    seedDispatch(11);
+    const spy = vi.spyOn(reviewFixQueue, "acceptReviewFixWebhookEvent");
+    await post("reviewComment", 11, { ingress: fakeIngress() });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it.each(["review", "reviewComment", "issueComment"])("%s: answers 503 restate_unavailable when the ingress is unavailable, writing nothing", async (kind) => {
+    mapRepo("restate");
+    seedDispatch(12);
+    const ingress = fakeIngress({ status: "unavailable" });
+    const out = await post(kind, 12, { ingress });
+    expect(out).toEqual({ status: 503, body: { error: "restate_unavailable" } });
+    expect(ingress.feedback).toHaveBeenCalledTimes(1);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("answers 503 and never falls back to SQLite when no ingress client is wired", async () => {
+    mapRepo("restate");
+    seedDispatch(13);
+    const out = await post("review", 13);
+    expect(out).toEqual({ status: 503, body: { error: "restate_unavailable" } });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("forwards a duplicate delivery id with the same idempotency key both times", async () => {
+    mapRepo("restate");
+    seedDispatch(14);
+    const ingress = fakeIngress();
+    const first = await post("reviewComment", 14, { ingress, delivery: "dup-1" });
+    const second = await post("reviewComment", 14, { ingress, delivery: "dup-1" });
+    expect([first.status, second.status]).toEqual([202, 202]);
+    expect(ingress.feedback.mock.calls.map((c) => c[2].idempotencyKey)).toEqual(["dup-1", "dup-1"]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("truncates an oversized multibyte body on a UTF-8 boundary within the cap", async () => {
+    mapRepo("restate");
+    seedDispatch(15);
+    const ingress = fakeIngress();
+    // 3-byte characters, so the cap falls mid-character for an odd cap offset.
+    const body = "€".repeat(20_000);
+    await post("reviewComment", 15, { ingress, body });
+    const event = ingress.feedback.mock.calls[0]![1] as { findings: Array<{ body: string }> };
+    const sent = event.findings[0]!.body;
+    expect(Buffer.byteLength(sent, "utf8")).toBeLessThanOrEqual(16 * 1024);
+    expect(sent).not.toContain("\uFFFD");
+    expect(sent.length).toBeGreaterThan(0);
+  });
+
+  it("answers 400 without forwarding when the delivery id is absent", async () => {
+    mapRepo("restate");
+    seedDispatch(16);
+    const ingress = fakeIngress();
+    const out = await post("review", 16, { ingress, delivery: null });
+    expect(out.status).toBe(400);
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  it("answers 400 without forwarding when the installation id is absent", async () => {
+    mapRepo("restate");
+    seedDispatch(40);
+    const ingress = fakeIngress();
+    const out = await post("review", 40, { ingress, installation: false });
+    expect(out.status).toBe(400);
+    expect(out.body).toEqual({ error: "missing_installation" });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  it("does not forward a gated event (stale_head), for a Restate project", async () => {
+    mapRepo("restate");
+    seedDispatch(17);
+    const ingress = fakeIngress();
+    const base = payloads.reviewComment!(17, "note", "old-sha");
+    const payload = base.payload as { comment: { user: unknown } };
+    payload.comment.user = { login: "claude[bot]", type: "Bot" };
+    const { req, res } = makeRequest(SECRET, base.event, payload, undefined, { "x-github-delivery": "g-1" });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true, reason: "stale_head" });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  it("does not forward on a bad signature", async () => {
+    mapRepo("restate");
+    seedDispatch(18);
+    const ingress = fakeIngress();
+    const { event, payload } = payloads.review!(18, "x");
+    const { req, res } = makeRequest(SECRET, event, payload, "wrong-secret", { "x-github-delivery": "g-2" });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+    expect(res.statusCode).toBe(401);
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  describe.each(["legacy", null] as const)("stored lifecycle %s", (lifecycle) => {
+    it.each(["review", "reviewComment", "issueComment"])("%s forwards through Restate without writing the legacy queue", async (kind) => {
+      mapRepo(lifecycle);
+      seedDispatch(19);
+      const ingress = fakeIngress();
+      const out = await post(kind, 19, { ingress });
+      expect(out.status).toBe(202);
+      expect(ingress.feedback).toHaveBeenCalledTimes(1);
+      expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    });
+
+    it.each(["review", "reviewComment", "issueComment"])("%s stays unavailable without falling back to SQLite", async (kind) => {
+      mapRepo(lifecycle);
+      seedDispatch(19);
+      const out = await post(kind, 19);
+      expect(out).toEqual({ status: 503, body: { error: "restate_unavailable" } });
+      expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    });
   });
 });

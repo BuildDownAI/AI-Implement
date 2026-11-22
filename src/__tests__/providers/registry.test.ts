@@ -1,33 +1,11 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ProviderRegistry } from "../../providers/registry.js";
 import { configureLinearAuth } from "../../linear-app-auth.js";
-import type { RepoMapping } from "../../config.js";
+import type { TicketingProvider } from "../../providers/types.js";
+import { makeIssue, makeMapping, makeProvider, makeRegistry } from "../helpers/builders.js";
+import { recordRechecks } from "../helpers/fixtures/setup-checks.js";
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "test",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    awsRegion: null,
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    paused: false,
-    ...overrides,
-  };
-}
-
-const linearMapping = makeMapping({ ticketingProvider: "linear", ticketingConfig: { kind: "linear" } });
+const linearMapping = makeMapping();
 const jiraMapping = makeMapping({
   ticketingProvider: "jira",
   ticketingConfig: { kind: "jira", jql: "project = TEST", repoFieldValue: "acme/test" },
@@ -37,8 +15,33 @@ const jiraMapping = makeMapping({
 beforeEach(() => {
   configureLinearAuth("client-id", "client-secret");
 });
+afterEach(() => vi.unstubAllEnvs());
 
 describe("ProviderRegistry", () => {
+  const filesystemMapping = makeMapping({
+    ticketingProvider: "filesystem",
+    ticketingConfig: { kind: "filesystem", directory: "/tmp/test-tickets" },
+  });
+
+  it("resolves and caches filesystem tickets locally without tracker credentials", async () => {
+    vi.stubEnv("RUNNER_MODE", "local");
+    const reg = new ProviderRegistry({}, () => ({ LOCAL: filesystemMapping }));
+    const first = await reg.forMapping(filesystemMapping);
+    expect(first.id).toBe("filesystem");
+    expect(await reg.forMapping(filesystemMapping)).toBe(first);
+    expect(await reg.forAllMappings([filesystemMapping, filesystemMapping])).toEqual([first]);
+    reg.invalidate();
+    expect(await reg.forMapping(filesystemMapping)).not.toBe(first);
+  });
+
+  it("refuses filesystem tickets outside local mode even after caching a provider", async () => {
+    vi.stubEnv("RUNNER_MODE", "local");
+    const reg = new ProviderRegistry({}, () => ({ LOCAL: filesystemMapping }));
+    await reg.forMapping(filesystemMapping);
+    vi.stubEnv("RUNNER_MODE", "gha");
+    await expect(reg.forMapping(filesystemMapping)).rejects.toThrow(/local runner mode/);
+  });
+
   it("returns a Linear provider for a Linear mapping", async () => {
     const reg = new ProviderRegistry({}, () => ({}));
     const p = await reg.forMapping(linearMapping);
@@ -81,6 +84,17 @@ describe("ProviderRegistry", () => {
     warn.mockRestore();
   });
 
+  it("forAllMappings names tracker.provider in a skipped provider's line and asks for it to run again", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const send = await recordRechecks();
+    await new ProviderRegistry({}, () => ({})).forAllMappings([linearMapping, jiraMapping]);
+    expect(send.mock.calls).toEqual([[{ id: "tracker.provider", project: undefined, cause: "tracker-read" }]]);
+    const lines = warn.mock.calls.map(([line]) => String(line));
+    expect(lines).toEqual([expect.stringContaining('"jira"')]);
+    expect(lines[0]).toContain("tracker.provider");
+    warn.mockRestore();
+  });
+
   it("invalidate() drops cached instances", async () => {
     const reg = new ProviderRegistry({}, () => ({}));
     const p1 = await reg.forMapping(linearMapping);
@@ -89,3 +103,52 @@ describe("ProviderRegistry", () => {
     expect(p1).not.toBe(p2);
   });
 });
+
+describe("ProviderRegistry.findByKeyInAnyTracker", () => {
+  const issue = makeIssue({ id: "i1", identifier: "KEY-1" });
+  function stub(id: string, behavior: "issue" | "null" | "throw") {
+    return makeProvider({
+      id,
+      findByKey: vi.fn(async () => {
+        if (behavior === "throw") throw new Error("boom");
+        return behavior === "issue" ? issue : null;
+      }),
+    });
+  }
+  // One mapping per tracker, so the real forAllMappings picks each stub through its mapping.
+  function setup(stubs: TicketingProvider[]) {
+    return makeRegistry({
+      providers: Object.fromEntries(stubs.map((s) => [s.id, s])),
+      mappings: Object.fromEntries(stubs.map((s) => [s.id, makeMapping({ ticketingProvider: s.id })])),
+    });
+  }
+
+  it("found: exactly one issue, none throw", async () => {
+    const r = await setup([stub("linear", "null"), stub("jira", "issue")]).findByKeyInAnyTracker("KEY-1");
+    expect(r).toMatchObject({ kind: "found", failedProviderIds: [] });
+    expect((r as { provider: { id: string } }).provider.id).toBe("jira");
+  });
+
+  it("found with failures: one issue, one throws", async () => {
+    const r = await setup([stub("linear", "throw"), stub("jira", "issue")]).findByKeyInAnyTracker("KEY-1");
+    expect(r).toMatchObject({ kind: "found", failedProviderIds: ["linear"] });
+  });
+
+  it("ambiguous: queries every provider and sorts ids", async () => {
+    const stubs = [stub("linear", "issue"), stub("jira", "issue"), stub("filesystem", "throw")];
+    const r = await setup(stubs).findByKeyInAnyTracker("KEY-1");
+    expect(r).toEqual({ kind: "ambiguous", providerIds: ["jira", "linear"] });
+    for (const s of stubs) expect(s.findByKey).toHaveBeenCalledWith("KEY-1");
+  });
+
+  it("none: all return null", async () => {
+    const r = await setup([stub("linear", "null"), stub("jira", "null")]).findByKeyInAnyTracker("KEY-1");
+    expect(r).toEqual({ kind: "none", failedProviderIds: [] });
+  });
+
+  it("none: mix of null and throws lists failed ids sorted", async () => {
+    const r = await setup([stub("linear", "throw"), stub("jira", "null"), stub("filesystem", "throw")]).findByKeyInAnyTracker("KEY-1");
+    expect(r).toEqual({ kind: "none", failedProviderIds: ["filesystem", "linear"] });
+  });
+});
+

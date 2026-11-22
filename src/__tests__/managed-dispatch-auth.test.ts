@@ -1,0 +1,499 @@
+/**
+ * Tests for `src/managed-dispatch-auth.ts` (AII-1386) against a temp SQLite file with the real config store,
+ * ownership layer and session store. Synthetic runtime, no network.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
+import type * as DedupModule from "../dedup.js";
+import type * as AdapterModule from "../managed-dispatch-auth.js";
+import type * as StoreModule from "../agent-config-store.js";
+import type * as OwnershipModule from "../model-session-ownership.js";
+import type * as SessionModule from "../model-session-store.js";
+import type * as PrepModule from "../agent-run-preparation.js";
+import type { ModelAuthRuntime } from "../model-auth-runtime.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
+
+const OPERATOR = { synthetic: "operator" };
+const REPO = { owner: "acme", repo: "app" };
+
+let dedup: typeof DedupModule;
+let adapter: typeof AdapterModule;
+let prepMod: typeof PrepModule;
+let store: typeof StoreModule;
+let own: typeof OwnershipModule;
+let sessions: SessionModule.ModelSessionStore;
+let ownership: OwnershipModule.ModelSessionOwnership;
+let runtime: ModelAuthRuntime;
+let prepDepsOverride: ((d: PrepModule.AgentRunPreparationDeps) => PrepModule.AgentRunPreparationDeps) | undefined;
+const calls = { preparationDeps: 0, ownershipReserve: 0 };
+
+function stage(profile: string, agent: "claude" | "codex", provider: "anthropic" | "openai") {
+  return { agent, provider, model: "m", accountProfileId: profile, invocationTimeoutMs: 60_000 };
+}
+
+function useCodex(fallbackModel?: string) {
+  store.setOrchestratorDefaults({
+    version: 1, mode: "configured",
+    stages: {
+      planning: { ...stage("cdx", "codex", "openai"), ...(fallbackModel ? { fallbackModel } : {}) },
+      implementation: stage("cdx", "codex", "openai"),
+      review: stage("cdx", "codex", "openai"),
+    },
+  });
+}
+
+function useStages(impl: string) {
+  store.setOrchestratorDefaults({
+    version: 1, mode: "configured",
+    stages: {
+      planning: stage("cdx", "codex", "openai"),
+      implementation: impl === "sub" ? stage("sub", "claude", "anthropic") : stage("cdx", "codex", "openai"),
+      review: stage("cdx", "codex", "openai"),
+    },
+  });
+}
+
+function withSubscriptionToken() {
+  const previous = prepDepsOverride;
+  prepDepsOverride = (deps) => {
+    const d = previous ? previous(deps) : deps;
+    return {
+      ...d,
+      credentials: {
+        ...d.credentials,
+        resolveProtectedSecret: (ref) => ref === "model-account:sub" ? "synthetic-setup-token" : null,
+      },
+    };
+  };
+}
+
+function expectSubscriptionLaunch(d: AdapterModule.ManagedDispatchDecision) {
+  const launch = launchOf(d);
+  expect(launch.snapshot.profiles.implementation.authMode).toBe("claude-subscription");
+  expect(launch.takeBootstrap()?.bearer).toBeTruthy();
+  expect(count("model_profile_reservations")).toBe(0);
+  expect(count("model_credential_grants")).toBe(1);
+  expect(calls.preparationDeps).toBe(1);
+}
+
+function req(over: Partial<AdapterModule.ManagedDispatchRequest> = {}): AdapterModule.ManagedDispatchRequest {
+  return { dispatchId: "d1", projectKey: "AII", backend: "fly-machines", ...REPO, workflowFile: "claude-implement.yml", ...over };
+}
+
+function count(table: string): number {
+  return (dedup.getDb().prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
+}
+
+function revokedAt(dispatchId = "d1"): number | null {
+  return (dedup.getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = ?").get(dispatchId) as { revoked_at: number | null }).revoked_at;
+}
+
+function launchOf(d: AdapterModule.ManagedDispatchDecision) {
+  if (d.kind !== "launch") throw new Error(`expected launch, got ${JSON.stringify(d)}`);
+  return d;
+}
+
+beforeEach(async () => {
+  const modules = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      adapter: () => import("../managed-dispatch-auth.js"),
+      store: () => import("../agent-config-store.js"),
+      own: () => import("../model-session-ownership.js"),
+      sessionMod: () => import("../model-session-store.js"),
+      prepMod: () => import("../agent-run-preparation.js"),
+    },
+  })).modules;
+  ({ dedup, adapter, store, own, prepMod } = modules);
+  sessions = modules.sessionMod.createModelSessionStore({
+    keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-managed-secret" }),
+    verifyOwner: own.sessionOwnerVerifier,
+    authorizeOperator: (op) => op === OPERATOR,
+  });
+  const base = own.createModelSessionOwnership({ store: sessions, probe: () => "terminated" });
+  ownership = { ...base, reserve: (i) => { calls.ownershipReserve++; return base.reserve(i); } } as typeof base;
+  calls.preparationDeps = 0;
+  calls.ownershipReserve = 0;
+  prepDepsOverride = undefined;
+  const credentials = { sessionStore: sessions, resolveProtectedSecret: () => null };
+  runtime = {
+    sessionStore: sessions,
+    ownership,
+    credentials,
+    preparationDeps: () => {
+      calls.preparationDeps++;
+      const d: PrepModule.AgentRunPreparationDeps = {
+        ownership,
+        credentials,
+        readDefaultBranchWorkflows: async () => ({}),
+        checkRunnerCapability: async () => true,
+      };
+      return prepDepsOverride ? prepDepsOverride(d) : d;
+    },
+  };
+  const seeded = sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: serializeChatGptPlanRecord(makeChatGptPlanRecord()) });
+  if (!seeded.ok) throw new Error("plan record seed failed");
+  store.saveAccountProfileRevision({
+    profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
+    authMode: "codex-subscription",
+  });
+  store.saveAccountProfileRevision({
+    profileId: "sub", identity: "Sub", revision: 1, agent: "claude", provider: "anthropic",
+    authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" },
+  });
+  useCodex();
+  store.setProjectConfigured("AII", true);
+});
+
+afterEach(async () => {
+  // A test that resets the registry mid-test to apply a vi.doMock re-imports modules that open a second connection
+  // to the test's database file; close it so the directory can be removed (testDb closes its own).
+  (await import("../dedup.js")).closeDb();
+});
+
+describe("prepareManagedDispatch", () => {
+  it("returns legacy for an opted-out project without touching any runtime dependency", async () => {
+    store.setProjectConfigured("AII", false);
+    const spy = vi.spyOn(runtime, "preparationDeps");
+    const d = await adapter.prepareManagedDispatch(req(), runtime);
+    expect(d).toEqual({ kind: "legacy" });
+    expect(spy).not.toHaveBeenCalled();
+    expect(calls).toEqual({ preparationDeps: 0, ownershipReserve: 0 });
+  });
+
+  it("returns legacy for an empty project key", async () => {
+    expect(await adapter.prepareManagedDispatch(req({ projectKey: "" }), runtime)).toEqual({ kind: "legacy" });
+    expect(calls.preparationDeps).toBe(0);
+  });
+
+  it("launches a resolved claude-subscription profile with a stored setup-token", async () => {
+    useStages("sub");
+    withSubscriptionToken();
+    expectSubscriptionLaunch(await adapter.prepareManagedDispatch(req(), runtime));
+  });
+
+  it("refuses a claude-subscription profile without a stored setup-token", async () => {
+    useStages("sub");
+    expect(await adapter.prepareManagedDispatch(req(), runtime))
+      .toEqual({ kind: "refuse", category: "authentication-required", code: "session_unavailable" });
+    expect(count("model_profile_reservations")).toBe(0);
+    expect(count("model_credential_grants")).toBe(0);
+    expect(calls).toEqual({ preparationDeps: 1, ownershipReserve: 0 });
+  });
+
+  it("launches a stored claude-subscription snapshot even after the project opted out", async () => {
+    useStages("sub");
+    withSubscriptionToken();
+    // Persist the snapshot directly, as an earlier preparation would have.
+    const resolved = store.resolveProjectStageConfig("AII");
+    if (resolved.resolution.mode !== "configured") throw new Error("expected configured");
+    const refs = resolved.configReferences!;
+    dedup.getDb().prepare(
+      `INSERT INTO run_agent_config_snapshots (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("s1", "d1", "AII", JSON.stringify({ stages: resolved.resolution.stages, profiles: resolved.resolution.profiles }),
+      JSON.stringify(resolved.resolution.sources), JSON.stringify({ orchestratorDefault: refs.orchestratorDefault, project: refs.project }), Date.now());
+    store.setProjectConfigured("AII", false);
+    expect(adapter.isManagedProject("AII", "d1")).toBe(true);
+    const d = await adapter.prepareManagedDispatch(req(), runtime);
+    expectSubscriptionLaunch(d);
+  });
+
+  it("holds with preparation_failed when preparation throws", async () => {
+    prepDepsOverride = () => { throw new Error("boom"); };
+    expect(await adapter.prepareManagedDispatch(req(), runtime)).toEqual({ kind: "hold", code: "preparation_failed" });
+  });
+
+  it("launches with a fresh grant and no reservations", async () => {
+    const d = launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+    expect(d.dispatchId).toBe("d1");
+    expect(d.backend).toBe("fly-machines");
+    expect(d.takeBootstrap()?.bearer).toBeTruthy();
+    expect(d.takeBootstrap()).toBeUndefined();
+    expect(count("model_profile_reservations")).toBe(0);
+    expect(revokedAt()).toBeNull();
+  });
+
+  it("holds with bootstrap_consumed on a repeat call", async () => {
+    launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+    expect(await adapter.prepareManagedDispatch(req(), runtime)).toEqual({ kind: "hold", code: "bootstrap_consumed" });
+  });
+
+  it("refuses to build credentials without a safe callback base URL, leaving the bootstrap untaken", async () => {
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    for (const url of [null, undefined, "", "http://orch.example.com", "https://u:p@orch.example.com", "https://orch.example.com/?q=1"]) {
+      expect(() => adapter.ghaManagedCredentials(d, url)).toThrow("model auth context unavailable");
+    }
+    expect(adapter.ghaManagedCredentials(d, "https://orch.example.com")?.modelAuthGrant).toBeDefined();
+  });
+
+  it.each([
+    [{ status: "legacy" }, { kind: "legacy" }],
+    [{ status: "queued", dispatchId: "d1", busyProfiles: ["sub"] }, { kind: "leave-queued", code: "profile_busy" }],
+    [{ status: "configuration-error", code: "snapshot_invalid" }, { kind: "refuse", category: "configuration-error", code: "snapshot_invalid" }],
+    [{ status: "authentication-required", code: "credential_unavailable", stage: "implementation", profileId: "p" }, { kind: "refuse", category: "authentication-required", code: "credential_unavailable" }],
+    [{ status: "configuration-error", code: "resolution_unavailable" }, { kind: "hold", code: "resolution_unavailable" }],
+    [{ status: "recovery-required", code: "grant_expired" }, { kind: "hold", code: "grant_expired" }],
+  ])("maps %j", async (result, expected) => {
+    vi.resetModules();
+    vi.doMock("../agent-run-preparation.js", async () => {
+      const actual = await vi.importActual<typeof PrepModule>("../agent-run-preparation.js");
+      return { ...actual, prepareAgentRun: async () => result };
+    });
+    const mocked = await import("../managed-dispatch-auth.js");
+    expect(await mocked.prepareManagedDispatch(req(), runtime)).toEqual(expected);
+    vi.doUnmock("../agent-run-preparation.js");
+  });
+
+  it("releases owners then refuses when ready carries reservations (mocked preparation)", async () => {
+    vi.resetModules();
+    const release = vi.fn(() => ({ complete: true, results: [] }));
+    const reservations = [{ profileId: "sub", generation: 1 }];
+    vi.doMock("../agent-run-preparation.js", async () => {
+      const actual = await vi.importActual<typeof PrepModule>("../agent-run-preparation.js");
+      return {
+        ...actual,
+        releaseRejectedLaunch: release,
+        prepareAgentRun: async () => ({
+          status: "ready", dispatchId: "d1", snapshot: {}, grant: {}, reused: false, reservations, takeBootstrap: () => undefined,
+        }),
+      };
+    });
+    const mocked = await import("../managed-dispatch-auth.js");
+    const d = await mocked.prepareManagedDispatch(req(), runtime);
+    expect(release).toHaveBeenCalledWith("d1", reservations, { ownership: runtime.ownership });
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "reserved_account_unsupported" });
+    vi.doUnmock("../agent-run-preparation.js");
+  });
+
+
+});
+
+const CAPABLE = "name: Implement\n# ai-implement-capability: stage-agent-config-v1\n# ai-implement-capability: stage-agent-launch-context-v1\n";
+const WORKFLOW = ".github/workflows/claude-implement.yml";
+
+function gha(files: Record<string, string | null> | (() => Promise<Record<string, string | null>>)) {
+  const spies = { reads: 0, secrets: 0 };
+  prepDepsOverride = (d) => ({
+    ...d,
+    credentials: { ...d.credentials, resolveProtectedSecret: (...a: Parameters<typeof d.credentials.resolveProtectedSecret>) => { spies.secrets++; return d.credentials.resolveProtectedSecret(...a); } },
+    readDefaultBranchWorkflows: async () => {
+      spies.reads++;
+      return typeof files === "function" ? files() : files;
+    },
+  });
+  return spies;
+}
+
+const ABSENT_RETIRED = { ".github/workflows/comment-trigger.yml": null, ".github/workflows/claude-kg-refresh.yml": null };
+const ghaReq = (over: Partial<AdapterModule.ManagedDispatchRequest> = {}) => req({ backend: "github-actions", ...over });
+
+describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
+  const noRunner = () => {
+    expect(count("model_profile_reservations")).toBe(0);
+    expect(count("model_credential_grants")).toBe(0);
+  };
+
+  it("opted out: legacy, no workflow read", async () => {
+    store.setProjectConfigured("AII", false);
+    const spies = gha({});
+    expect(await adapter.prepareManagedDispatch(ghaReq(), runtime)).toEqual({ kind: "legacy" });
+    expect(spies.reads).toBe(0);
+    noRunner();
+  });
+
+  it("opted in with a capable template: launches with the frozen snapshot and a protected bootstrap", async () => {
+    const spies = gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    expect(spies.reads).toBe(1);
+    expect(d.backend).toBe("github-actions");
+    expect(d.snapshot.profiles.implementation.authMode).toBe("codex-subscription");
+    expect(JSON.stringify(d)).not.toContain("bearer");
+    const creds = adapter.ghaManagedCredentials(d, "https://orch.example.com");
+    expect(creds?.version).toBe(1);
+    expect(creds?.modelAuthGrant).toMatchObject({ dispatchId: "d1", backend: "gha" });
+    expect(creds?.modelAuthContext).toEqual({
+      version: 1, dispatchId: d.dispatchId, projectKey: d.projectKey, backend: "gha", modelAuthUrl: "https://orch.example.com",
+    });
+    expect(() => adapter.ghaManagedCredentials(d, "https://orch.example.com")).toThrow("managed dispatch bootstrap unavailable");
+    expect(adapter.ghaManagedCredentials({ kind: "legacy" }, "https://orch.example.com")).toBeUndefined();
+  });
+
+  it("defaults the frozen Codex implementation to full access without an Extra Env flag", async () => {
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    const creds = adapter.ghaManagedCredentials(d, "https://orch.example.com", {});
+    expect(creds?.executionPolicy).toEqual({
+      version: 1, implementationSandbox: "ephemeral-full-access", dispatchId: d.dispatchId, projectKey: d.projectKey,
+      backend: "gha", ephemeralRunnerAsserted: true,
+    });
+    const bootstrap = creds?.modelAuthGrant;
+    if (!bootstrap || !("bearer" in bootstrap)) throw new Error("expected private grant");
+    const stub = { ...d, takeBootstrap: () => bootstrap };
+    // Planning omits the implementation marker, even with a Codex implementation in its snapshot.
+    expect(adapter.ghaManagedCredentials(stub, "https://orch.example.com")).not.toHaveProperty("executionPolicy");
+    // Mutable defaults cannot replace the already frozen selection.
+    const claudeSnapshot = { ...d.snapshot, stages: { ...d.snapshot.stages,
+      implementation: { ...d.snapshot.stages.implementation, agent: "claude" as const } } };
+    expect(adapter.ghaManagedCredentials({ ...stub, snapshot: claudeSnapshot }, "https://orch.example.com", {}))
+      .not.toHaveProperty("executionPolicy");
+    expect(() => adapter.ghaManagedCredentials({ ...stub, backend: "fly-machines" }, "https://orch.example.com", {}))
+      .toThrow(/GitHub Actions/);
+  });
+
+  it.each([
+    ["an old template without the capability marker", { [WORKFLOW]: "name: old\n", ...ABSENT_RETIRED }, "runner_incompatible"],
+    ["a custom template", { [WORKFLOW]: "name: custom\non: workflow_dispatch\n", ...ABSENT_RETIRED }, "runner_incompatible"],
+    ["a missing workflow file", { [WORKFLOW]: null, ...ABSENT_RETIRED }, "runner_incompatible"],
+    ["a retired comment trigger", { [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED, ".github/workflows/comment-trigger.yml": "name: x" }, "retired_workflow_present"],
+    ["a retired kg-refresh workflow", { [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED, ".github/workflows/claude-kg-refresh.yml": "name: x" }, "retired_workflow_present"],
+    ["an unlisted path in the read", { [WORKFLOW]: CAPABLE }, "delivery_unreadable"],
+  ])("refuses %s with a fixed code and launches nothing", async (_n, files, code) => {
+    gha(files);
+    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code });
+    noRunner();
+  });
+
+  it("refuses an unreadable workflow without leaking the thrown message", async () => {
+    gha(async () => { throw new Error("SENTINEL-TOKEN HTTP 500"); });
+    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "delivery_unreadable" });
+    expect(JSON.stringify(d)).not.toContain("SENTINEL");
+    noRunner();
+  });
+
+  it("refuses a disabled account with no fallback to legacy", async () => {
+    store.saveAccountProfileRevision({
+      profileId: "cdx", identity: "Cdx", revision: 2, agent: "codex", provider: "openai",
+      authMode: "codex-subscription", status: "disabled",
+    });
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "resolution_failed" });
+    expect(d).not.toEqual({ kind: "legacy" });
+    noRunner();
+  });
+
+  it("launches claude-subscription with a stored setup-token and a capable template", async () => {
+    useStages("sub");
+    const spies = gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    withSubscriptionToken();
+    expectSubscriptionLaunch(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    expect(spies.reads).toBe(1);
+  });
+
+  it("keeps the snapshot across a config change and mints no second bootstrap", async () => {
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const first = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    store.setProjectConfigured("AII", false);
+    const second = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(second).toEqual({ kind: "hold", code: "bootstrap_consumed" });
+    expect(count("model_credential_grants")).toBe(1);
+    expect(prepMod.loadStoredSnapshot("d1")).toEqual(first.snapshot);
+  });
+
+  it("settles a rejected or uncertain GitHub Actions launch by revoking the grant", async () => {
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    for (const outcome of ["rejected", "unknown"] as const) {
+      const id = `gha-${outcome}`;
+      const d = launchOf(await adapter.prepareManagedDispatch(ghaReq({ dispatchId: id }), runtime));
+      expect(adapter.settleLaunch(d, outcome, runtime)).toEqual({ revoked: true });
+      expect(revokedAt(id)).not.toBeNull();
+    }
+    const kept = launchOf(await adapter.prepareManagedDispatch(ghaReq({ dispatchId: "gha-ok" }), runtime));
+    expect(adapter.settleLaunch(kept, "accepted", runtime)).toEqual({ revoked: false });
+    expect(revokedAt("gha-ok")).toBeNull();
+  });
+
+  it("maps a dispatch result to a settle outcome", () => {
+    expect(adapter.ghaLaunchOutcome({ success: true })).toBe("accepted");
+    expect(adapter.ghaLaunchOutcome({ success: false, outcome: "rejected" })).toBe("rejected");
+    expect(adapter.ghaLaunchOutcome({ success: false, outcome: "unknown" })).toBe("unknown");
+    expect(adapter.ghaLaunchOutcome({ success: false })).toBe("unknown");
+  });
+});
+
+describe("settleLaunch", () => {
+  it("revokes the grant on rejected and unknown", async () => {
+    for (const outcome of ["rejected", "unknown"] as const) {
+      const id = `d-${outcome}`;
+      const d = launchOf(await adapter.prepareManagedDispatch(req({ dispatchId: id }), runtime));
+      expect(adapter.settleLaunch(d, outcome, runtime)).toEqual({ revoked: true });
+      expect(revokedAt(id)).not.toBeNull();
+    }
+  });
+
+  it("keeps the grant on accepted", async () => {
+    const d = launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+    expect(adapter.settleLaunch(d, "accepted", runtime)).toEqual({ revoked: false });
+    expect(revokedAt()).toBeNull();
+  });
+
+  it.each([
+    { kind: "legacy" },
+    { kind: "leave-queued", code: "profile_busy" },
+    { kind: "refuse", category: "configuration-error", code: "x" },
+    { kind: "hold", code: "x" },
+  ] as AdapterModule.ManagedDispatchDecision[])("does nothing for %j", (decision) => {
+    for (const outcome of ["accepted", "rejected", "unknown"] as const) {
+      expect(adapter.settleLaunch(decision, outcome, runtime)).toEqual({ revoked: false });
+    }
+  });
+});
+
+describe("secrets", () => {
+  it("never serialises the bearer or a profile id", async () => {
+    const launch = launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+    const bearer = launch.takeBootstrap()!.bearer;
+    const decisions: AdapterModule.ManagedDispatchDecision[] = [
+      launch,
+      await adapter.prepareManagedDispatch(req({ backend: "github-actions" }), runtime),
+      await adapter.prepareManagedDispatch(req({ projectKey: "" }), runtime),
+      { kind: "hold", code: "bootstrap_consumed" },
+      { kind: "leave-queued", code: "profile_busy" },
+    ];
+    const texts = decisions.map((d) => JSON.stringify(d));
+    texts.push(JSON.stringify(adapter.settleLaunch(launch, "rejected", runtime)));
+    for (const d of decisions) {
+      if (d.kind === "refuse" || d.kind === "hold" || d.kind === "leave-queued") texts.push(adapter.refusalText(d));
+    }
+    for (const t of texts) {
+      expect(t).not.toContain(bearer);
+    }
+    // Only the launch decision carries the snapshot; every other text is free of profile ids.
+    for (const t of texts.slice(1)) expect(t).not.toContain("cdx");
+  });
+});
+
+describe("classifyLaunchError", () => {
+  // Expectations copied from isDefinitiveFlyRejectionError / isDefinitiveLocalDockerLaunchFailure in src/index.ts.
+  const flyRejects = (e: unknown) => e instanceof Error && /\((\d{3})\)/.test(e.message) && Number(/\((\d{3})\)/.exec(e.message)![1]) >= 400 && Number(/\((\d{3})\)/.exec(e.message)![1]) < 500;
+  const errors: unknown[] = [new Error("Fly API (422): bad"), new Error("Fly API (503): down"), new Error("fetch failed"), "boom"];
+
+  it.each(errors.map((e) => [e]))("matches the index.ts classifiers for %j", (e) => {
+    expect(adapter.classifyLaunchError("fly-machines", true, e)).toBe(flyRejects(e) ? "rejected" : "unknown");
+    expect(adapter.classifyLaunchError("local-docker", true, e)).toBe("unknown");
+    expect(adapter.classifyLaunchError("github-actions", true, e)).toBe("unknown");
+  });
+
+  it("is rejected before any attempt, for every backend", () => {
+    for (const b of ["fly-machines", "local-docker", "github-actions"] as const) {
+      expect(adapter.classifyLaunchError(b, false, new Error("x"))).toBe("rejected");
+    }
+  });
+});
+
+it("carries preparation fallbacks and pairs managed envelope fields", async () => {
+  useCodex("fallback-model");
+  const decision = launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+  expect(decision.fallbackModels).toEqual({ planning: "fallback-model" });
+  expect(adapter.managedRunConfigFields(decision)).toEqual({ agentConfig: decision.snapshot, modelFallbacks: { planning: "fallback-model" } });
+  expect(adapter.managedRunConfigFields({ ...decision, fallbackModels: {} })).toEqual({ agentConfig: decision.snapshot });
+  expect(adapter.managedRunConfigFields({ kind: "launch", snapshot: decision.snapshot })).toEqual({ agentConfig: decision.snapshot });
+  expect(adapter.managedRunConfigFields({ kind: "legacy" })).toEqual({});
+  expect(adapter.managedRunConfigFields(undefined)).toEqual({});
+});

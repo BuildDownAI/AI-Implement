@@ -1,3 +1,5 @@
+import { sanitizeAttribution, type InvocationAttributionV1 } from "../pipeline/types.js";
+
 export type LocalRunOutcome = "success" | "unapproved" | "capped" | "failed";
 
 export interface LocalRunTokenSummary {
@@ -18,6 +20,8 @@ export interface LocalRunPass {
   tokensOut?: number | null;
   cacheReadTokens?: number | null;
   cacheCreationTokens?: number | null;
+  /** Optional diagnostic attribution (AII-946); absent on legacy artifacts. */
+  attribution?: InvocationAttributionV1 | null;
 }
 
 /**
@@ -39,6 +43,8 @@ export interface LocalRunSummary {
   failureCode: string | null;
   repairAction: string | null;
   artifactDir: string;
+  /** Optional final-result attribution (AII-946); absent on legacy summaries — use readSummaryAttribution. */
+  attribution?: InvocationAttributionV1 | null;
 }
 
 /**
@@ -62,7 +68,9 @@ export interface LocalArtifactInput {
   endedAt: Date;
   passes: LocalRunPass[];
   tokenSummary?: LocalRunTokenSummary | null;
-  /** Machine-readable failure code, e.g. "REVIEW_UNAPPROVED" or "MAX_TURNS_EXHAUSTED". */
+  /** Optional final-result attribution (AII-946); re-sanitized and written to summary.json by writeRunArtifacts when valid. */
+  attribution?: InvocationAttributionV1 | null;
+  /** Machine-readable failure code, e.g. "REVIEW_UNAPPROVED", "MAX_TURNS_EXHAUSTED", or "INSTALL_FAILED". */
   failureCode?: string | null;
   /** Single human-readable repair action for failed, capped, or unapproved runs. */
   repairAction?: string | null;
@@ -85,3 +93,15 @@ export interface LocalArtifactInput {
   /** Override the output root. Defaults to /output/runs. */
   outputRoot?: string;
 }
+
+/** Safe reader for a parsed summary.json (or pass): a legacy or malformed attribution yields `null`. */
+export function readSummaryAttribution(parsed: { attribution?: unknown } | null | undefined): InvocationAttributionV1 | null {
+  return sanitizeAttribution(parsed?.attribution);
+}
+
+/**
+ * Workspace-relative file (under git-excluded `ai-output/`) where the local full loop records the
+ * latest invocation's sanitized attribution: `{ latestAttribution }`. Not whole-run spend and not
+ * per-stage — only the last attribution the loop returned.
+ */
+export const LOCAL_FULL_LOOP_RESULT_FILE = "ai-output/local-full-loop-result.json";

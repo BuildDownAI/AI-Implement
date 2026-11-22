@@ -1,0 +1,103 @@
+# 047. Orchestrator setup checks only read, and what they show depends on who can reach an admin
+
+**Status:** Accepted. The result contract and the orchestrator's own checks landed with [AII-1532](https://linear.app/eudoxus/issue/AII-1532); the surfaces in decisions 2 and 3 landed with later children of [AII-1531](https://linear.app/eudoxus/issue/AII-1531), as the amendments below record.
+**Date:** 2026-10-23
+**References:** ADR 015, ADR 022, [orchestrator-configuration.md](../orchestrator-configuration.md), [access-model.md](../access-model.md), [deployment.md](../deployment.md) § "The health body (`GET /`)", [mcp-server.md](../mcp-server.md)
+
+## Context
+
+A self-hosted orchestrator's setup spans its own environment, a GitHub App and its installation, a tracker, each target repository, a runner backend and model credentials. At boot, `loadConfig` (`src/index.ts`) requires only the GitHub App credential pair, and it checks that pair, like every other value, for presence alone. No credential is exercised until a poll or a run first uses it, so a wrong value fails late and often silently. The orchestrator setup checks (`src/setup-checks/`) find those failures before a real issue does, and again when setup drifts.
+
+Three properties of the checks need a rule, because each is easy to get wrong in a way that harms the deployment the checks protect:
+
+- **They run unattended and often**: on a schedule, after saves, and when a runtime failure names one. Anything a check does, it does repeatedly, in systems the customer owns.
+- **Their results map where a deployment is weak**, and the surfaces that could carry them have different audiences:
+  - `GET /` answers anyone.
+  - `get_tenant_health` answers every allowlisted identity (ADR 015).
+  - The admin API answers admins, plus a `user` on the read routes of a page granted to them (`PAGE_ROUTES`, `src/access-page-grants.ts`).
+
+  Until an admin path is configured, nobody can sign in as an admin. So on a new orchestrator, the one person who can act on the results is the operator who has not yet configured sign-in.
+- **They are read when something else is broken.** A check that depends on the subsystem it reports on, or on a document that has since moved, fails exactly when it is needed, and a check that re-reads a value its own way can disagree with what the orchestrator does with it.
+
+## Decision
+
+**1. A check only reads.**
+- A fact that only a write can prove reports `cannot-verify`, together with what to check by hand. The model case is whether the Linear app may create a workspace-scoped label.
+- Writes happen only in self-heal actions an operator triggers. Those reuse actions the orchestrator already exposes, under their existing roles.
+
+**2. Results are tiered by audience.**
+
+| Surface | Audience | Content |
+|---|---|---|
+| The admin setup page and its API route | admins, and users granted the page | every check, its detail and its fix |
+| `get_tenant_health` | every allowlisted identity | each check's `title` and state |
+| `GET /` | anyone | the count of failing core checks |
+
+A result's `id`, `title` and `state` never carry a configured value, because `get_tenant_health` shows those three fields to every allowlisted identity, and no field ever carries a secret's value.
+
+**3. Bootstrap mode.** While no admin path is configured, `GET /` also names the failing checks on the path to an admin, and only those:
+- `env.github-app`;
+- `env.admin-access-code`;
+- `volume.database`;
+- `restate`;
+- `admin.path`;
+- `admin.providers`;
+- `admin.redirect-url`;
+- `admin.allowlist`.
+
+An admin path is configured when any of these holds:
+- `ADMIN_ACCESS_CODE` is set and is not the published `.env.example` placeholder, which boot refuses (`effectiveAccessCode`, `src/admin-session.ts`); or
+- at least one sign-in provider that boot keeps (`resolveProviders`, `src/oauth/providers.ts`) and `OAUTH_REDIRECT_BASE_URL` are set, and the effective allowlist holds an admin address; or
+- the BuildDown provider and `OAUTH_REDIRECT_BASE_URL` are set, since its organization role claim admits an organization owner or admin as admin with no allowlist entry (`authorize`, `src/oauth/authorize.ts`).
+
+The test reads configuration only. When the stored allowlist cannot be read, the path counts as configured, so the mode stays off.
+
+Project, tracker and repository checks are never named on `GET /`. Projects are created only by an admin (`POST /api/mappings`, the `add_project` tool), so a new orchestrator has none to name.
+
+**4. Existing health surfaces change only by addition.** Current fields keep their names and meanings, so existing consumers keep working.
+
+**5. A check reports what the orchestrator does, as independently as it can of what it reports on.**
+- **It shares the orchestrator's own decision code.** Where the orchestrator decides something from a value (a parse, a precedence, which providers to keep), the decision is a pure function that the orchestrator and the check both call, such as `parsePollIntervalMs`, `resolveRunnerMode`, `resolveProviders` and `SEED_ONCE_SETTINGS`. A decision found inline is extracted first, so the check never parses the value its own way, the two cannot disagree, and a change to the decision changes the check with it.
+- **It reads any runtime state through a reader its caller passes in** (`SetupCheckContext`, defined once by `createSetupCheckContext`). The setup command runs in its own process and the `SetupChecks` object inside Restate, so each supplies the readers that are true where it runs; the Restate status has no default for that reason. A reader that throws makes only the checks that call it `cannot-verify`, and the others still report (`runSetupChecks` runs them under `Promise.allSettled`).
+- **Its text names only what the code owns**: a variable, an admin page, a log prefix, `fly.toml`. It never names a `docs/` file, which can change or move with nothing noticing. Documentation points at checks instead, by id: the ids are declared once (`SETUP_CHECK_IDS`) and never renamed, since stored runs, runtime failures and self-heal actions name checks by id. A test fails when any check's detail or fix names a `docs/` file.
+
+## Alternatives considered
+
+- **Reversible write probes**, such as creating then deleting a label or a branch. Rejected: every scheduled run would write into customer systems, and a failed delete leaves debris behind.
+- **Results for admins only.** Rejected: `user` callers over `/mcp`, the system-questions skill and uptime monitors could not see setup state.
+- **Check names on `GET /` always.** Rejected: it publishes the map of a deployment's weak points to anyone who knows its address.
+- **Bootstrap mode triggered by an unreachable admin path.** Rejected: an outage would switch public detail on, on an orchestrator that already has projects.
+  - An unreadable stored allowlist answers 503 rather than logging admins out ([access-model.md](../access-model.md)).
+  - A first sign-in binds through Restate (`bindAccessIdentity`, `src/restate/access-binding.ts`), so a Restate outage denies it.
+- **A check that reads module state directly**, such as `getRestateStatus()`. Rejected: the setup command runs in a separate process with no sidecar state, so it would report the sidecar as still starting.
+- **A check that parses a value itself.** Rejected: two parses of one variable drift, and the check would then report a state the orchestrator is not in.
+- **Check text that links a reference page.** Rejected: the page is maintained on its own schedule, and a renamed or moved section leaves every check that cites it wrong.
+
+## Consequences
+
+- Some setup facts report `cannot-verify` instead of being proven: write permissions that only a write would show, and target-repository secrets the App cannot read. The report says so, which replaces today's silence. It does not replace the fact.
+- Anyone who knows an orchestrator's address learns how many of its core checks fail. A new orchestrator also discloses which of its checks on the path to an admin fail.
+- A scheduled run spends tracker and GitHub API calls. Its cadence is an operator setting, and the schedule can be off.
+- Sharing decision code moved several inline decisions into named functions, and boot now calls them too: the placeholder access code is refused at boot rather than only reported, and boot logs every sign-in provider it drops, including one with only some of its variables set.
+
+## Amendment (2026-11-04): the first surfaces, and decision 1's example
+
+**Decision 1's example no longer arises.** The orchestrator now creates `Ready for Review` in the issue's team, as it creates the other lifecycle labels, which needs no workspace admin ([AII-231](https://linear.app/eudoxus/issue/AII-231)). So no check asks whether the Linear app may create a workspace-scoped label, and `tracker.linear.lifecycle-labels` passes a missing lifecycle label, since the orchestrator creates it at first use. The rule stands: a fact only a write could prove still reports `cannot-verify`.
+
+**`get_tenant_health` shows a little more than decision 2's table names.** It landed with [AII-1538](https://linear.app/eudoxus/issue/AII-1538) as the `setupChecks` field, holding each row's `id`, `title`, `state` and `project`, the count of failing core rows (`failingCore`) and the run's `checkedAt`. A row's `project` is a configured value, unlike the three fields the decision names, but it is the project's key, which `list_projects` (`role: "user"`) already shows the same audience, so it discloses nothing new. Detail and fix stay on the admin surfaces. The admin API route landed with the same issue, as `GET /api/setup-checks` and `POST /api/setup-checks/run`. `GET /` and bootstrap mode landed with [AII-1539](https://linear.app/eudoxus/issue/AII-1539) (the amendment below), and the admin setup page landed with [AII-1541](https://linear.app/eudoxus/issue/AII-1541) (the 2026-11-11 amendment below).
+
+## Amendment (2026-11-05): public health bootstrap checks
+
+**Decision 3 names all eight ids the code marks `onAdminPath`.** Its list once left out `env.admin-access-code` and `admin.path`, both on the path to an admin. **Decision 2's table says `title`**, the result contract's field, where it once said "name". Both follow the code, as standing rule 3 asks of an ADR. **`GET /` landed with [AII-1539](https://linear.app/eudoxus/issue/AII-1539)** as the `setupChecks` field: the last known run's `checkedAt` and its failing core count, plus, in bootstrap mode, the ids of the failing admin-path checks, run afresh on each request. Titles, details and fixes stay off `GET /`.
+
+## Amendment (2026-11-11): the Setup page, and checks with nothing to apply to
+
+**The admin setup page landed with [AII-1541](https://linear.app/eudoxus/issue/AII-1541)**, as `/admin#setup`, with decision 2's audience: a user granted the page reads every check with its detail and fix, and only an admin starts a run, since a grant reaches a page's `GET` routes alone. A run now starts without waiting: `POST /api/setup-checks/run` answers 202 at once, and `GET /api/setup-checks` carries the run in progress beside the stored run. While Restate cannot serve, that route's 503 names the setup command, which runs every check without Restate.
+
+**A check whose prerequisite does not apply answers with no row.** With no project on Linear or on Jira, only that provider's credentials check reports it; with no project at all, only `tracker.provider` does, for the GitHub checks that run once per project as well. One row then speaks for the checks that depend on it, so every surface shows that row once rather than the same not-applicable answer from each dependent check. Decision 2's tiers are unchanged, and a check that cannot read what another check reports still answers `cannot-verify`, naming that check.
+
+## Amendment (2026-11-13): one project's checks, and checks that can never pass
+
+**Onboarding surfaces landed with [AII-1543](https://linear.app/eudoxus/issue/AII-1543), all within decision 2's admin row.** The New project stepper's Review shows an unsaved project's checks (`POST /api/setup-checks/candidate`, run in process, storing nothing), and the Projects page shows each project's markers from the stored run, with a project's own checks run from its row before any run has checked it, from its card on the Setup page, and after a sync the admin UI started. Those runs go through `POST /api/setup-checks/project` into the `SetupChecks` object's `runProject`, which merges the project's rows into the stored run, or runs every check when a check all projects share fails, since that fault reaches each of them. Both routes are admin-only, and every run still only reads (decision 1).
+
+**The result contract gained two fields, by addition.** A row from a run narrower than a full one carries its own `checkedAt`, while the run's `startedAt` and `checkedAt` keep dating the last full run, which `GET /` and `get_tenant_health` show. A check that can never be verified marks its rows `verifiable: false`: `github.target-secrets`, and now `github.review-process`, which names a review process's outside reviewer, since no App credential can see another App's installation on a repository. The first consequence below holds for both, and the admin UI's markers and the stepper's Create gate leave those rows out, so a project is not held for a fact no check can settle. `get_tenant_health`'s summary picks its fields by name and carries neither.

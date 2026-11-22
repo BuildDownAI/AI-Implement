@@ -1,0 +1,432 @@
+import { parseSourceResults } from "../kg-source-results.js";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { decodeRunConfig } from "../run-config.js";
+import { postRunnerResult } from "../runner-result.js";
+import { DefaultPipelineContext } from "./context.js";
+import { PipelineRunner } from "./runner.js";
+import { loadPipelineDefinition } from "./pipeline-loader.js";
+import { NoopStepReporter, TokenStepReporter } from "./reporter.js";
+import { cloneStep } from "./steps/clone.js";
+import { dependencyAuthStep } from "./steps/dependency-auth.js";
+import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotFileTooLargeError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError, KgSnapshotHeldError } from "./steps/kg-snapshot-push.js";
+import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
+import { kgScopeReconcileStep } from "./steps/kg-scope-reconcile.js";
+import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
+import { ClaudeCliExecutor } from "./executor.js";
+import {
+  ConfiguredRunError,
+  hasConfiguredIntent,
+  prepareConfiguredRun,
+  resolveLogLevel,
+  type ConfiguredRunOptions,
+} from "../run-autonomous.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import type { LLMExecutor, PipelineContext, StepReporter, StepModule } from "./types.js";
+
+
+/**
+ * Dev-harness clone step for kg-refresh runs: clones from file:///kg-source (the
+ * operator's KG source checkout bind-mounted read-only by the dev harness) rather
+ * than from GitHub, so uncommitted edits to sources.yml take effect immediately.
+ *
+ * clone-code-repo and clone-secondary-repos declare no moduleId in pipelines/kg-refresh.yml
+ * (by design — see cloneStep), so they resolve to this same "clone" moduleKey as the
+ * primary workspace clone. Only the primary clone (no targetDir/targets in inputs) should
+ * use the file:// override; delegate everything else to the real cloneStep so the harness
+ * exercises production's clone-depth, incremental-fetch, and credential-helper auth logic
+ * instead of drifting from it (AII-601).
+ */
+export const devHarnessKgCloneStep: StepModule = {
+  async run(
+    context: PipelineContext,
+    inputs: Record<string, unknown>,
+    reporter: StepReporter,
+  ): Promise<Record<string, unknown>> {
+    if (inputs.targetDir !== undefined || inputs.targets !== undefined) {
+      return cloneStep.run(context, inputs as Parameters<typeof cloneStep.run>[1], reporter);
+    }
+
+    const workspaceDir = inputs.workspaceDir as string;
+    const kgSourceDir = process.env.KG_SOURCE_DIR ?? "/kg-source";
+    // session/entrypoint.sh clones the repo into the workspace for every non-mounted
+    // run before the pipeline starts. That clone is throwaway here: the operator's
+    // checkout at /kg-source (uncommitted edits included) is the source of truth, and
+    // git refuses to clone into a non-empty directory. Clear the contents, keep the
+    // directory (it may be the container's working dir), then clone.
+    if (existsSync(workspaceDir) && readdirSync(workspaceDir).length > 0) {
+      console.log(`[clone] dev-harness: replacing the entrypoint's clone at ${workspaceDir} with file://${kgSourceDir}`);
+      for (const entry of readdirSync(workspaceDir)) rmSync(join(workspaceDir, entry), { recursive: true, force: true });
+    }
+    console.log(`[clone] dev-harness: cloning from file://${kgSourceDir} into ${workspaceDir}`);
+    const cloneResult = spawnSync(
+      "git",
+      ["clone", `file://${kgSourceDir}`, workspaceDir],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    if (cloneResult.status !== 0) {
+      const stderr = cloneResult.stderr?.toString().trim() ?? "";
+      throw new Error(`git clone from ${kgSourceDir} failed (exit ${cloneResult.status ?? "null"}): ${stderr}`);
+    }
+    const headResult = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const clonedRef = headResult.status === 0 ? headResult.stdout.toString().trim() : "unknown";
+    return {
+      workspaceDir,
+      clonedRef,
+      cloneMethod: "fresh",
+      repoOwner: context.data.githubOwner,
+      repoRepo: context.data.githubRepo,
+      branch: context.data.branch,
+      githubToken: context.data.githubToken,
+    };
+  },
+};
+
+/** Installed location of the credential helper shell script (baked into the session image). */
+const DEV_HARNESS_CREDENTIAL_HELPER_PATH = "/opt/ai-implement/git-credential-helper.sh";
+
+/**
+ * Dev-harness dependency-auth step for kg-refresh runs: satisfies the
+ * clone-code-repo / clone-secondary-repos skip condition (acquired=true) using the
+ * operator's local GH_TOKEN without contacting the orchestrator. Installs the same
+ * git credential helper the real dependencyAuthStep installs — clone-code-repo and
+ * clone-secondary-repos clone bare https://github.com/... URLs with no token embedded,
+ * relying entirely on that helper for auth, so the stub must give it something to read.
+ */
+export function makeDevHarnessDependencyAuthStep(
+  token: string,
+  testOverrides: {
+    spawnSyncImpl?: typeof spawnSync;
+    writeFileSyncImpl?: (path: string, data: string, options?: { mode?: number }) => void;
+    credentialHelperPath?: string;
+  } = {},
+): StepModule {
+  return {
+    async run(context: PipelineContext): Promise<Record<string, unknown>> {
+      const spawnFn = testOverrides.spawnSyncImpl ?? spawnSync;
+      const writeFn = testOverrides.writeFileSyncImpl ?? writeFileSync;
+      const credentialHelperPath = testOverrides.credentialHelperPath ?? DEV_HARNESS_CREDENTIAL_HELPER_PATH;
+
+      context.data.dependencyToken = token;
+
+      // expires_at: null — the credential helper's `jq -r '.expires_at // empty'` treats
+      // null the same as absent and skips its refresh branch, which is correct here:
+      // there is no orchestrator callback to refresh from in the local dev harness.
+      const tokenFilePath = join("/tmp", `ai-implement-dep-token-${process.pid}.json`);
+      writeFn(tokenFilePath, JSON.stringify({ token, expires_at: null }), { mode: 0o600 });
+      process.env.GIT_DEPENDENCY_TOKEN_FILE = tokenFilePath;
+
+      const configResult = spawnFn(
+        "git",
+        ["config", "--global", "credential.https://github.com.helper", credentialHelperPath],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      if ((configResult.status ?? 1) !== 0) {
+        console.warn(
+          `[dependency-auth] failed to register git credential helper (exit ${configResult.status ?? "null"})`,
+        );
+      }
+
+      return { acquired: true, expiresAt: null };
+    },
+  };
+}
+
+export interface RunKgRefreshOptions {
+  workspaceDir?: string;
+  reporter?: StepReporter;
+  llmExecutor?: LLMExecutor;
+  /** Seams for an opted-in (snapshot-carrying) run. Ignored for legacy runs. */
+  configured?: ConfiguredRunOptions;
+  fetchImpl?: typeof fetch;
+  stepsOverride?: {
+    clone?: StepModule;
+    dependencyAuth?: StepModule;
+    kgScopeReconcile?: StepModule;
+    kgTrackerData?: StepModule;
+    kgIngest?: StepModule;
+    kgSnapshotPush?: StepModule;
+  };
+}
+
+export interface RunKgRefreshResult {
+  exitCode: number;
+}
+
+function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
+  issueId: string;
+  issueIdentifier: string;
+  issueTitle: string;
+  issueDescription: string;
+  githubOwner: string;
+  githubRepo: string;
+  githubToken: string;
+  defaultBranch: string;
+  callbackUrl: string | null;
+  provider: string;
+  maxTurns: number | undefined;
+  dependencyTokenScope: "installation" | undefined;
+  kgDryRun: boolean;
+  agentConfig: ResolvedAgentSnapshotV1 | undefined;
+} {
+  const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
+  let issueId = "";
+  let issueIdentifier = "KG-REFRESH";
+  let issueTitle = "KG refresh";
+  let issueDescription = "Refresh the knowledge-graph snapshot";
+  let callbackUrl: string | null = null;
+  let maxTurns: number | undefined;
+  let dependencyTokenScope: "installation" | undefined;
+  let kgDryRun = false;
+  let agentConfig: ResolvedAgentSnapshotV1 | undefined;
+
+  if (rawConfig) {
+    try {
+      const cfg = decodeRunConfig(rawConfig);
+      issueId = cfg.issue.id;
+      issueIdentifier = cfg.issue.identifier;
+      issueTitle = cfg.issue.title;
+      issueDescription = cfg.issue.description;
+      callbackUrl = cfg.runnerCallbackUrl ?? null;
+      if (cfg.maxTurns && Number.isInteger(cfg.maxTurns) && cfg.maxTurns > 0) {
+        maxTurns = cfg.maxTurns;
+      }
+      dependencyTokenScope = cfg.dependencyTokenScope;
+      kgDryRun = cfg.kgDryRun === true;
+      agentConfig = cfg.agentConfig;
+    } catch (err) {
+      // An opted-in envelope is authoritative: malformed configured input never degrades to the legacy
+      // environment fallbacks, and the diagnostic is fixed text (the decode error is not echoed).
+      if (hasConfiguredIntent(rawConfig)) throw new ConfiguredRunError("snapshot_incomplete");
+      console.warn("[kg-refresh] Could not decode run_config envelope; using env fallbacks:", err);
+    }
+  }
+
+  const githubOwner = env.GITHUB_OWNER ?? "";
+  const githubRepo = env.GITHUB_REPO ?? "";
+  const githubToken = env.GITHUB_TOKEN ?? env.GH_TOKEN ?? "";
+  const defaultBranch = env.GITHUB_DEFAULT_BRANCH ?? "main";
+  const provider = env.PROVIDER ?? "anthropic";
+
+  if (!githubOwner || !githubRepo) throw new Error("Missing required env var: GITHUB_OWNER or GITHUB_REPO");
+  if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
+
+  return {
+    issueId: issueId || "kg-refresh",
+    issueIdentifier,
+    issueTitle,
+    issueDescription,
+    githubOwner,
+    githubRepo,
+    githubToken,
+    defaultBranch,
+    callbackUrl: callbackUrl ?? env.RUNNER_CALLBACK_URL?.trim() ?? null,
+    provider,
+    maxTurns,
+    dependencyTokenScope,
+    kgDryRun,
+    agentConfig,
+  };
+}
+
+
+
+export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunKgRefreshResult> {
+  const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
+  const {
+    issueId,
+    issueIdentifier,
+    issueTitle,
+    issueDescription,
+    githubOwner,
+    githubRepo,
+    githubToken,
+    defaultBranch,
+    callbackUrl,
+    provider,
+    maxTurns,
+    dependencyTokenScope,
+    kgDryRun: kgDryRunFromConfig,
+    agentConfig,
+  } = resolveKgRefreshInputs(process.env);
+
+  // Validate an opted-in run before the clone, ingest or any model work. The deterministic kg-refresh
+  // pipeline has no agent step, so the selected executor serves only the context's model-driven repair.
+  const configured = await prepareConfiguredRun({
+    env: process.env,
+    snapshot: agentConfig,
+    workspaceDir,
+    options: opts.configured,
+  });
+
+  // The env var stays as the dev-harness path (AII-586); the envelope field is the
+  // real dispatch path (AII-632). Either one flips dry-run on.
+  const kgDryRun = kgDryRunFromConfig || process.env.AI_IMPLEMENT_KG_DRY_RUN === "true";
+  const depTokenOverride = process.env.AI_IMPLEMENT_DEP_TOKEN_OVERRIDE?.trim() || null;
+  const nonce = process.env.MACHINE_NONCE ?? "";
+  const orchestratorUrl = process.env.ORCHESTRATOR_URL ?? "";
+
+  const context = new DefaultPipelineContext(
+    {
+      jobId: 0,
+      issueId,
+      issueIdentifier,
+      issueTitle,
+      issueDescription,
+      nonce,
+      orchestratorUrl,
+      workspaceDir,
+      implementationPrompt: "",
+      githubOwner,
+      githubRepo,
+      githubToken,
+      branch: defaultBranch,
+      provider: configured ? configured.provider : provider,
+      agentConfig: configured?.snapshot,
+      maxTurns,
+      callbackUrl: callbackUrl ?? undefined,
+      dependencyTokenScope,
+      kgDryRun,
+    },
+    configured
+      ? configured.createExecutor({
+          workspaceDir,
+          legacy: opts.llmExecutor,
+          logLevel: resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL),
+        })
+      : opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
+  );
+
+  const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
+  const runner = new PipelineRunner();
+
+  // Dev-harness mode: when AI_IMPLEMENT_DEP_TOKEN_OVERRIDE is set, use a file://
+  // clone from the bind-mounted KG source dir and a stub dependency-auth that marks
+  // acquired=true using the operator's local token, satisfying clone-code-repo and
+  // clone-secondary-repos.
+  if (depTokenOverride) {
+    // src/dev-harness/index.ts never encodes dependencyTokenScope into
+    // AI_IMPLEMENT_RUN_CONFIG for kg-refresh — force it on here so the shared
+    // dependency-auth skip in pipeline-loader.ts (`!ctx.data.dependencyTokenScope`)
+    // actually lets the stub below run. Without this, dependency-auth skips
+    // silently and clone-code-repo/clone-secondary-repos skip right after it (AII-601).
+    context.data.dependencyTokenScope = "installation";
+    runner.register("clone", opts.stepsOverride?.clone ?? devHarnessKgCloneStep);
+    runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? makeDevHarnessDependencyAuthStep(depTokenOverride));
+  } else {
+    runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
+    runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
+  }
+  runner.register("kg-scope-reconcile", opts.stepsOverride?.kgScopeReconcile ?? kgScopeReconcileStep);
+  runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
+  runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
+  runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
+
+  // The token stays out of context.data: it is a live bearer secret. The local dev harness has none.
+  const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim();
+  const reporter: StepReporter =
+    opts.reporter ??
+    (callbackUrl && progressToken
+      ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
+      : new NoopStepReporter());
+
+  const untilStep = process.env.AI_IMPLEMENT_UNTIL_STEP?.trim() || undefined;
+
+  try {
+    await runner.run(pipeline, context, reporter, { stopAfterStep: untilStep });
+  } catch (err) {
+    const isMissing = err instanceof KgSnapshotMissingError;
+    const isStale = err instanceof KgSnapshotStaleError;
+    const isTrackerDataError = err instanceof KgTrackerDataFetchError;
+    const isTrackerRegression = err instanceof KgSnapshotTrackerRegressionError;
+    const held = err instanceof KgSnapshotHeldError ? err : undefined;
+    const isHeld = held !== undefined;
+    const isIngestFailed = err instanceof KgIngestError;
+    const isTooLarge = err instanceof KgSnapshotFileTooLargeError;
+    const failureCode = isMissing
+      ? "KG_SNAPSHOT_MISSING"
+      : isTooLarge
+        ? "KG_SNAPSHOT_FILE_TOO_LARGE"
+        : isStale
+        ? "KG_SNAPSHOT_STALE"
+        : isTrackerDataError
+          ? "KG_TRACKER_DATA_FETCH_FAILED"
+          : isTrackerRegression
+            ? "KG_SNAPSHOT_TRACKER_REGRESSION"
+            : isHeld
+              ? "KG_SNAPSHOT_HELD"
+              : isIngestFailed
+                ? "KG_INGEST_FAILED"
+                : undefined;
+    const failureReason = err instanceof Error ? err.message : String(err);
+    console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
+    await configured?.finish("failed");
+    // A guard refusal from kg-snapshot-push carries its per-part table on the error
+    // itself (AII-632) so both dry-run and real refusals report the table via
+    // get_kg_status (AII-638).
+    const guardPartTable = isTrackerRegression
+      ? (err as KgSnapshotTrackerRegressionError).partTable
+      : isHeld
+        ? held.partTable
+        : undefined;
+    await postRunnerResult({
+      phase: "kg-refresh",
+      workspaceDir,
+      outcome: "failure",
+      failureReason: failureReason.slice(-4000),
+      ...(failureCode ? { failureCode } : {}),
+      ...(guardPartTable ? { guardVerdict: isHeld ? ("held" as const) : ("refused" as const), partTable: guardPartTable } : {}),
+      // A held shrink already pushed its snapshot branch and opened the PR; report them so the orchestrator can act on it.
+      ...(held
+        ? {
+            ...(held.prNumber !== null ? { snapshotPr: held.prNumber } : {}),
+            ...(held.commitSha ? { snapshotCommit: held.commitSha } : {}),
+            snapshotBranch: held.branchName,
+            cause: held.cause,
+            failedTeams: held.failedTeams,
+            ...(held.acceptBlocked ? { acceptBlocked: true, lostTeams: held.lostTeams } : {}),
+            ...(held.sources.length > 0 ? { sources: held.sources } : {}),
+          }
+        : {}),
+      callbackUrl,
+      fetchImpl: opts.fetchImpl,
+    });
+    return { exitCode: 1 };
+  }
+
+  await configured?.finish("completed");
+  const snapshotPushOutputs = context.getOutputs("kg-snapshot-push");
+  const sources = parseSourceResults(snapshotPushOutputs.sources);
+  const warnings = Array.isArray(snapshotPushOutputs.warnings)
+    ? snapshotPushOutputs.warnings.filter((w): w is string => typeof w === "string")
+    : [];
+  await postRunnerResult({
+    phase: "kg-refresh",
+    workspaceDir,
+    outcome: "success",
+    snapshotCommit: typeof snapshotPushOutputs.commitSha === "string" ? snapshotPushOutputs.commitSha : undefined,
+    snapshotPr: typeof snapshotPushOutputs.prNumber === "number" ? snapshotPushOutputs.prNumber : undefined,
+    snapshotBranch: typeof snapshotPushOutputs.branchName === "string" ? snapshotPushOutputs.branchName : undefined,
+    ...(kgDryRun && (snapshotPushOutputs.guardVerdict === "clean" || snapshotPushOutputs.guardVerdict === "warnings")
+      ? { guardVerdict: snapshotPushOutputs.guardVerdict, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
+      : {}),
+    ...(sources.length > 0 ? { sources } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
+    callbackUrl,
+    fetchImpl: opts.fetchImpl,
+  });
+  return { exitCode: 0 };
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  runKgRefresh()
+    .then((r) => process.exit(r.exitCode))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}

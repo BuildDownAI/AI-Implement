@@ -23,19 +23,19 @@
 
 # AI-Implement — Codebase Guide
 
-A Node.js service that polls Linear or Jira for issues labeled `AI-Implement` and dispatches containerized runs of Claude Code to implement them. It also serves an admin UI and manages the workflow templates synced to target repos.
+A Node.js service that polls Linear or Jira for issues that carry the pickup label (default `AI-Implement`, set at `/admin#settings`) and dispatches containerized runs of Claude Code to implement them. It also serves an admin UI and manages the workflow templates synced to target repos.
 
 ## Issue tracker bindings
 
 Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, etc.). These are read by name — keep the keys intact when editing.
 
 - tracker.kind: linear
-- MCP server: `linear-eudoxus` (declared in the project `.mcp.json`; **not** pre-approved — `.claude/` is gitignored and absent here, so each machine approves the server on first use)
+- MCP server: the global claude.ai **Linear** connector (`https://mcp.linear.app/mcp`), not a project `.mcp.json` entry. Confirm it reaches `Eudoxus` with `get_workspace` before any write
 - Workspace: `eudoxus` (bound at OAuth time)
 - Team: `AII`  ← issues filed/listed/searched against this team
 - Team URL: https://linear.app/eudoxus/team/AII/overview
 - GitHub repo (PRs land here): `BuildDownAI/AI-Implement`
-- Implement label: `AI-Implement` (orchestrator pickup trigger)
+- Implement label: `AI-Implement` (orchestrator pickup trigger; this is the orchestrator's default — the effective label is a settings-table row, changeable at `/admin#settings`. Change it only for a planned migration: issues that carry the old label stop dispatching at the next poll)
 - Agent mention (PR comment re-trigger): `/ai-implement`
 
 
@@ -48,16 +48,22 @@ Bindings for the KG skills (bd-kg-search, kg recon — format: skills `plugin/sk
 > resolve. Use the `bd-shared/` path in new references.
 
 - kg.present:      true
-- kg.orchestrator: https://ai-implement-testing-orchestrator.fly.dev
-- kg.mcp_server:   orch-ai-implement-testing
-- kg.search_tool:  mcp__orch-ai-implement-testing__kg_hybrid_search
-- kg.source_repo:  BuildDownAI/knowledge-graph-ai-implement
-- kg.local_mcp_server:  ai-implement-kg
-- kg.local_search_tool: mcp__ai-implement-kg__kg_hybrid_search
-- kg.prefer:       orchestrator
+
+The KG is served by the testing orchestrator's `/mcp` (`https://ai-implement-testing-orchestrator.fly.dev/mcp`), reached through a global claude.ai connector — no project `.mcp.json` entry and no local KG server. Skills discover the connector with ToolSearch `get_project_binding`, and that call returns the rest of the binding (search tool, source repo); the old `kg.mcp_server` / `kg.search_tool` / `kg.orchestrator` / `kg.source_repo` / `kg.prefer` keys are retired.
 
 Project-specific orchestrator instances can override the bundled graph with `KG_SOURCE_REPO=owner/repo`.
 The value is a GitHub repo identifier, not a URL; see `docs/kg-sidecar.md`.
+
+## Standing rules
+
+Four operator rules apply to every plan, issue, ADR, review, and change. **Full reference: [docs/standing-rules.md](docs/standing-rules.md).**
+
+1. Verify each claim in code, or by an experiment against the pinned version, before you present it. A theory is not a finding.
+2. Prefer the design that needs no new GitHub or GitHub Actions right: runner image or orchestrator first, then a `run_config` field, then a template change, then an App permission last.
+3. As Restate use grows, re-check an ADR's rule and its rejection reasons before you rely on them; amend the ADR when a reason no longer holds.
+4. When you move working behavior into Restate or behind a new caller, wrap the proven mechanism as it is (same command, same arguments). Change the mechanism only as a separate, explicit decision by the operator. Every merge into `testing` redeploys the testing orchestrator, so group multi-issue orchestrator changes in a feature branch.
+
+A tool the BuildDown control plane calls is a cross-repo contract: arguments arrive only inside `args`, its paging and `null` rules are documented, and its request and response are recorded from the real handler in `docs/contracts/<tool>/` for the control plane's tests. See `docs/mcp-server.md` § "Tools the control plane calls".
 
 ## Architecture
 
@@ -85,24 +91,41 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Subsystem | Start at | Reference |
 |---|---|---|
 | Pipeline, steps, custom overrides | `src/pipeline/` | [docs/pipeline-architecture.md](docs/pipeline-architecture.md) |
+| Stored issue and pull request links | `src/pr-links.ts` | [docs/pull-request-links.md](docs/pull-request-links.md) |
+| Spotter PR and issue status read tools | `src/open-pulls.ts`, `src/issue-statuses.ts` | [docs/spotter-status-tools.md](docs/spotter-status-tools.md) |
 | Review findings → fix dispatches | `src/review-fix-queue.ts` | [docs/review-fix-rail.md](docs/review-fix-rail.md) |
+| Restate review-fix pilot setup, recovery, drain, rollback | `src/restate/review-fix-attempt.ts`, `src/restate/review-fix-pr.ts` | [docs/restate-review-fix-pilot.md](docs/restate-review-fix-pilot.md) |
+| Per-review-cycle evidence (input/output commit, dispositions, tests, verdict, usage) | `src/pipeline/cycle-summary.ts` | [docs/cycle-summary-evidence.md](docs/cycle-summary-evidence.md) |
 | Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
+| Issueless run kinds (kg-refresh lifecycle and pattern) | `src/kg-refresh.ts`, `src/index.ts` | [docs/issueless-runs.md](docs/issueless-runs.md) |
+| Stage agents, account lists, defaults and project overrides | `src/agent-config.ts`, `src/agent-run-preparation.ts` | [docs/stage-agent-configuration.md](docs/stage-agent-configuration.md) |
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
+| Runner context settings (skills repo, reference repositories, dependency token scope) | `src/pipeline/steps/install-skills.ts`, `src/pipeline/steps/reference-repos.ts`, `src/pipeline/steps/dependency-auth.ts` | [docs/runner-context.md](docs/runner-context.md) |
+| Private npm registry auth in the `install` step | `src/pipeline/steps/install.ts` | [docs/private-npm-registry.md](docs/private-npm-registry.md) |
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | Knowledge graph end-to-end (ingest → snapshot → image → serve) | `Dockerfile` KG stages, `docker-entrypoint.sh` | [docs/kg-architecture.md](docs/kg-architecture.md) |
-| KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
+| KG sidecar, its OAuth flow, and the image build | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
+| MCP door, identity contract, tools service, entry points, roles | `src/restate/tools.ts`, `src/mcp.ts`, `src/mcp-oauth.ts`, `src/mcp-identity.ts` | [docs/mcp-server.md](docs/mcp-server.md), [ADR 025](docs/adr/025-mcp-tools-are-restate-handlers-and-the-operator-object-is-the-refresh-authority.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
-| Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
-| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
-| Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | |
+| Orchestrator configuration (what boot checks, which source wins) and the setup checks | `loadConfig` in `src/index.ts`, `src/setup-checks/`, `src/check-setup.ts`, `src/restate/setup-checks.ts` | [docs/orchestrator-configuration.md](docs/orchestrator-configuration.md), [docs/setup-checks.md](docs/setup-checks.md), [ADR 047](docs/adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md) |
+| Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | [docs/ticketing-providers.md](docs/ticketing-providers.md) |
+| Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
+| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md), [docs/execution-backends.md](docs/execution-backends.md) |
+| Durable runner (kept Fly machine per pipeline) | `src/restate/fly-machine-profile.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md), [ADR 037](docs/adr/037-a-durable-runner-is-a-profile-object-that-owns-one-kept-machine.md) |
+| Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
 | Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
-| Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | |
-| `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | |
+| Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | [docs/workflow-sync.md](docs/workflow-sync.md) |
+| `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | [docs/comment-gapfill-rail.md](docs/comment-gapfill-rail.md) |
 | Stuck-run recovery | `src/reaper.ts`, `src/stuck-watchdog.ts` | |
 | Per-team dispatch capacity | `src/poll-selection.ts` | |
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
-| Admin SSO / OIDC | `src/oauth/`, `src/admin-session.ts` | |
-| Admin SPA | `src/admin-ui/` | |
+| Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
+| Stored key destination bindings and redaction | `src/restate/key-binding.ts`, `src/model-credentials.ts` | [docs/key-safety.md](docs/key-safety.md) |
+| Admin SPA: how it is built, routed and gated, which page owns which setting, adding a page | `src/admin-ui/` | [docs/admin-ui.md](docs/admin-ui.md) |
+| Restate engine: sidecar, endpoint, workflows, test job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
+| Unit test suite: setup files, the environment allowlist, shared fixture builders and harnesses, type checking, CI jobs | `src/__tests__/setup/`, `src/__tests__/helpers/`, `vitest.config.ts` | [docs/unit-tests.md](docs/unit-tests.md) |
+
+**Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
 ## Running locally
 
@@ -111,11 +134,16 @@ cp .env.example .env   # GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY are the only req
 npm install
 npm run dev            # checks the Node major, loads .env when present, runs src/index.ts via tsx
 npm run dev:local      # rebuilds the local runner image, then runs dispatches in local Docker
+npm run check-setup    # runs the setup checks read-only against .env and the local database
 ```
 
 Only the GitHub App pair is hard-required — `loadConfig` throws without it. Ticketing credentials are not: an absent Linear or Jira configuration logs a warning and skips that provider's mappings, so the orchestrator still boots and serves.
 
-Health check `curl http://localhost:8080/` · Admin UI `http://localhost:8080/admin` (needs an OAuth provider **or** `ADMIN_ACCESS_CODE`).
+`npm run dev` also spawns the Restate sidecar (`RestateSidecar`, `src/restate/server.ts`) from `node_modules`, with its data under `./restate` — boot waits for Restate readiness, successful registration, and completion of the registered hook before dispatch begins. Startup, registration, or hook failure exits 1, as does expiry of the five-minute boot deadline unless registration is `declined-conflict`; that state keeps boot waiting and retrying registration every 60 seconds, even beyond the deadline. See [docs/restate.md](docs/restate.md#boot-sequence) § Boot sequence and the [ADR 023 amendment](docs/adr/023-run-the-restate-server-as-an-orchestrator-sidecar.md#amendment-2026-11-07-restate-is-a-hard-dependency).
+
+Health check `curl http://localhost:8080/` · Admin UI `http://localhost:8080/admin` (needs an OAuth provider **or** `ADMIN_ACCESS_CODE`; the code older `.env.example` files shipped, `your-secret-access-code`, is refused at boot).
+
+`npm run check-setup` runs the setup checks without the server: it reads the environment and the database read-only, takes Restate's status from a running orchestrator's `GET /`, and exits 1 when a core check fails. On Fly, run `fly ssh console -a <app> -C "node /app/dist/check-setup.js"`. **Full reference: [docs/setup-checks.md](docs/setup-checks.md).**
 
 Node is pinned to 24 (`engines`, `.tool-versions`). On a Node-major switch, `npm test` fails wholesale inside `getDb()` with a `NODE_MODULE_VERSION` mismatch — check which Node you are on before reaching for `npm rebuild better-sqlite3`, since the native modules are usually right and the shell is wrong.
 
@@ -137,52 +165,93 @@ The task file is Markdown with front matter: `title` required; `identifier`, `ma
 
 Per-run artifacts land in `.dev-runs/<timestamp>/` (gitignored): `run.log`, `changes.diff`, `diffstat.txt`, `telemetry.json`.
 
+### kg-refresh phase
+
+`--phase kg-refresh` runs the kg-refresh pipeline locally without a mounted workspace — the operator's KG source checkout is the workspace, and the container clones it via `file://` rather than binding it directly. This lets the pipeline exercise the real clone and secondary-repo paths (branch selection, depth, credential helper) against uncommitted local edits to `sources.yml`.
+
+```bash
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --until clone-secondary-repos
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --until kg-ingest --shell
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --tracker-data td.json --until clone-secondary-repos
+```
+
+**The harness fetches tracker data itself by default.** When `--tracker-data` is omitted, `startDevRun` reads `ORCHESTRATOR_URL` plus an admin credential (`ADMIN_ACCESS_CODE`, or a bearer in `AI_IMPLEMENT_ADMIN_TOKEN`) from the operator's env, mints an admin session the way the admin UI does, calls `GET /api/kg/tracker-data` with no `team` — the union of every team in scope, deduplicated by issue id — and writes it to `.dev-runs/<timestamp>/tracker-data.json` before bind-mounting it read-only at `/dev-tracker-data.json`; the `kg-tracker-data` pipeline step detects the mount via `KG_TRACKER_DATA_FILE` and skips the orchestrator fetch from inside the container. The harness logs which source supplied the data. Neither `--tracker-data` nor a usable orchestrator env present fails fast, naming both options.
+
+`--tracker-data <file>` is the offline path and always wins when given, regardless of the orchestrator env. The file is a pre-fetched tracker-data JSON — the same shape `GET /api/kg/tracker-data` returns, single-team (`?team=<teamKey>`) or the default all-teams export; see `docs/issueless-runs.md` § "Local dev path for kg-refresh". **A single-team file is partial relative to the default export and trips the snapshot guard** the same way a stale one would — prefer the no-`team` export or the harness's automatic fetch for anything beyond a single-team smoke test.
+
+The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE`, which activates a stub `dependency-auth` step that satisfies the `clone-secondary-repos` skip condition (`acquired=true`) without contacting the orchestrator.
+
+`kg-snapshot-push` runs in **dry-run mode** for all local kg-refresh runs (`AI_IMPLEMENT_KG_DRY_RUN=true`): all regression guards and validation run, the per-part line-count table is printed to the log, but no commit or push happens. This lets you verify the snapshot guard verdict locally before dispatching to a real run.
+
+`--until` and `--shell` are both supported for this phase. The shell opens in `/workspace` (the scratch clone inside the container); `git remote -v` shows `file:///kg-source` and `cat sources.yml` shows the uncommitted local version.
+
 ## Running tests
+
+Follow the [Rules for a reliable test](docs/unit-tests.md#rules-for-a-reliable-test) when writing or repairing tests.
+
+A test never proves a result with a wall-clock limit or a fixed sleep; see [Timing rules](docs/restate-testing.md#timing-rules).
 
 ```bash
 npm test          # vitest run
-npm run typecheck # tsc --noEmit
+npm run typecheck # tsc --noEmit, then tsc --noEmit -p tsconfig.tests.json (test files included)
+npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — one runtime, the `restate-server` binary from node_modules (the one production runs); Docker is not needed; not part of npm test
 ```
 
-**`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
+**Vitest strips types without checking them, so `npm run typecheck` is what catches a type error in a test file.** Its second pass, `tsconfig.tests.json`, checks every `src/**/*.ts` file, test files included. A new test file is checked from the day it is added; never add a file to its `exclude` list, and keep the empty `exclude` key, since without it `extends` inherits `src/__tests__` from `tsconfig.json`.
+
+Build test fixtures with the shared builders in `src/__tests__/helpers/builders.ts`, and a test's database, fake `fetch` and temporary directories with the harnesses beside them (`testDb`, `fakeFetch`, `testDir`), not a new per-file copy; a type built as a fixture, or a harness need, that recurs in a third test file goes there ([src/__tests__/helpers/README.md](src/__tests__/helpers/README.md)).
+
+Fixing a bug: write the failing test first, then the fix, in one pull request — see [docs/bug-fix-tests.md](docs/bug-fix-tests.md).
 
 ## Data layer
 
-One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 22 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 61 tables (including tables initialized on first use). `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+
+Schema changes run at boot and a trigger can block a column change — read [docs/sqlite-schema.md](docs/sqlite-schema.md) before changing a table or column.
 
 **Dedup has no TTL.** The `dispatched` table is a bare existence check with no retention logic: an entry clears only when something explicitly removes it — a failed or timed-out run, the reconcile loop reaching a terminal issue, or a manual delete. There is no time-based auto-retry. This is a recurring source of documentation errors claiming a 24-hour window; the only genuine 24-hour figure belongs to the reaper's summary statistic.
 
 ## Environment variables
 
-**`.env.example` is canonical** — it carries every orchestrator variable with grouped comments, and is kept in lockstep with the code. Consult it rather than a second list here.
+**`.env.example` is canonical** — it carries every orchestrator variable with grouped comments, and is kept in lockstep with the code. Consult it rather than a second list here. What boot checks, where a value can live besides the environment, which source wins, and how numeric values parse: **Full reference: [docs/orchestrator-configuration.md](docs/orchestrator-configuration.md).**
 
 Only the non-obvious ones are worth restating:
 
 - `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` — the only pair that throws at boot when absent. Everything else warns and degrades a feature.
 - `RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET` — **not Fly-specific.** All three execution modes report through them; the GHA path receives the URL as a workflow input rather than an env var. Without them a planning run never reports completion and the issue stalls.
-- `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` — fail-closed. Empty means deny everyone.
-- `KG_SIDECAR_URL` — unset degrades `/mcp`, but an unauthenticated probe still gets **401** and cannot detect it. Only an unset `OAUTH_REDIRECT_BASE_URL` 503s every caller.
-- `AI_IMPLEMENT_LOG_LEVEL`, `AI_IMPLEMENT_RUNNER_LABEL`, `AI_IMPLEMENT_PROVIDER` — repo/org **Actions variables**, not orchestrator env, and effective only after the target repo re-syncs `claude-implement.yml`. `LOG_LEVEL` is `summary` (one result line per invocation — outcome, turns, duration, cost, tokens) or `stream` (additionally tees each tool call, not its output); telemetry is captured at both. `RUNNER_LABEL` overrides `runs-on`, default `ubuntu-latest` — pointing it at a larger runner roughly halves the CPU-bound implement job, but **write access to that variable lets the holder retarget the job to an arbitrary self-hosted runner that would then see the job's secrets.**
+- `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` — fail-closed, and a **seed rather than the list**: they apply until the first save at `/admin#access`, then go inert while the stored list has entries. Empty and nothing stored means deny everyone.
+- `KG_SIDECAR_URL` — unset drops only the `kg_*` tools from `/mcp`: OAuth sign-in and every other tool still serve, so neither a `/mcp` probe (**401**) nor the `.well-known` routes (**200**) can detect it — read `sidecar` on `GET /` instead. Only an unset `OAUTH_REDIRECT_BASE_URL` 503s every caller, on `/mcp` and its OAuth routes alike.
+- `AI_IMPLEMENT_LOG_LEVEL`, `AI_IMPLEMENT_RUNNER_LABEL` — repo/org **Actions variables**, not orchestrator env, and effective only after the target repo re-syncs `claude-implement.yml`. `LOG_LEVEL` is `summary` (one result line per invocation — outcome, turns, duration, cost, tokens) or `stream` (additionally tees each tool call, not its output); telemetry is captured at both. `RUNNER_LABEL` overrides `runs-on`, default `ubuntu-latest` — pointing it at a larger runner roughly halves the CPU-bound implement job, but **write access to that variable lets the holder retarget the job to an arbitrary self-hosted runner that would then see the job's secrets.** Forwarded hook secrets are a separate **Actions secret**, `AI_IMPLEMENT_FORWARDED_ENV` (`KEY=VALUE` lines, one per line), read by the synced templates as one literal reference — never `toJSON(secrets)`, which trips GitHub's malicious-workflow scanner and gates every dispatch behind manual approval (AII-502). Forwarded values reach setup and verify hooks only; they are stripped from the model process before Claude Code starts.
+- `AI_IMPLEMENT_NPM_REGISTRY` + `AI_IMPLEMENT_NPM_SCOPE` — target-repo Actions **variables** read by the built-in `install` step; the registry token is an `NPM_TOKEN=…` line in `AI_IMPLEMENT_FORWARDED_ENV`, not a separate secret (the forwarding rails reserve the `AI_IMPLEMENT_` prefix). It lives in `install` because `install` runs **before** the `setup:` hook, so a hook cannot rescue a failing install. The token goes into a per-run `NPM_CONFIG_USERCONFIG` file that is removed after install — never `~/.npmrc` — and `modelProcessEnv` strips `NPM_TOKEN` by name. **Full reference: [docs/private-npm-registry.md](docs/private-npm-registry.md).**
 - `AI_IMPLEMENT_SOURCE_COMMIT` / `_REPO` / `_BRANCH` — **stamped by the image build, not set by an operator** (`Dockerfile` build args). Self-deploy compares the stamp against the branch head, so an image built without all three goes inert and reports availability as *unknown*, never as up to date — a hand-run `fly deploy` that omits them silently disables the feature. No webhook or inbound reachability is needed; those only cut detection latency from one poll cycle to seconds.
 - `FLY_DEPLOY_TOKEN` — the orchestrator's own deploy credential, distinct from `FLY_SESSIONS_TOKEN`, which is scoped to the sessions app and cannot deploy the orchestrator. Scope it to the single app it deploys. The app name needs no variable: Fly injects `FLY_APP_NAME` into every machine, so an orchestrator can only ever deploy itself.
 
 Adding or renaming a variable means updating `.env.example` in the same change; it is the operator's only discovery surface.
 
+A change that adds or alters an architectural feature must update the matching `docs/` reference in the same change; a new pattern with no existing home in `docs/` gets one.
+
 ## Adding a new target repo
 
-1. Add the mapping at `/admin` via the **New project** stepper. On the Source step, **Check installation** probes whether the App is installed and can see the repo, linking straight to the fix — install the App, or add the repo to an existing install. The check is advisory; you can save regardless.
+1. Add the mapping at `/admin` via the **New project** stepper. Its Review step runs the project's setup checks before it is saved, each failing one with its fix. Only the project's own failing required checks hold Create; the rest are advisory, so a network blip or an orchestrator-wide fault never blocks a save. Full reference: [docs/admin-ui.md](docs/admin-ui.md) § What each page shows and changes.
 2. **Save.** The mapping persists immediately and sync runs in the background, polling to a terminal state. The mapping is saved however the sync resolves.
-3. Merge the sync PR in the target repo.
+3. Merge the sync PR in the target repo. Add the pickup label to the first issue only after the sync pull request merges.
+
+A new project starts configured when the orchestrator stage defaults are on (unless a stored project row already exists or configuration fails to resolve); existing projects keep their mode.
 
 The GitHub App needs **Workflows** permission alongside **Contents** — GitHub rejects writes under `.github/workflows/` without it, and the sync fails with "permission denied" before opening its PR. If the orchestrator restarts mid-sync, the poll loop reclaims the orphaned job after a stale window.
 
-The target repo's "Allow GitHub Actions to create and approve pull requests" toggle is **not** a prerequisite, despite older instructions saying so. Every synced workflow opens PRs with a **GitHub App token**, while that toggle governs the default `github-actions[bot]` actor — a different identity. Leaving it on is harmless; the real prerequisite is the App installed with contents, pull-requests, and workflows permissions.
+The App also needs **Checks: read**. Without it, every check-runs read (post-push review's wait for the external review check, its CI gate, and `getCombinedChecksState` for the late external review) gets a 403 instead of data — reported as `CHECKS_PERMISSION_DENIED`, not a review timeout. Child auto-merge's readiness gate reads the PR's `mergeable_state`, which GitHub computes, not check runs. Granting the permission after the App is already installed requires the installation to accept the updated permission set, not just a settings change.
 
-`.github/workflows/sync-workflow.yml` remains a manual bulk fallback, but normal distribution happens from the orchestrator.
+The target repo's "Allow GitHub Actions to create and approve pull requests" toggle is **not** a prerequisite, despite older instructions saying so. Every synced workflow opens PRs with a **GitHub App token**, while that toggle governs the default `github-actions[bot]` actor — a different identity. Leaving it on is harmless; the real prerequisite is the App installed with contents, pull-requests, workflows, and checks permissions.
+
+Orchestrator sync is the only distribution path for workflow templates to target repos.
 
 ## Workflow templates
 
-`workflows/claude-implement.yml` and `claude-plan.yml` are synced to target repos; `WORKFLOW.md` and `PLANNING.md` are **seeded once and never overwritten**, so every repo keeps whatever template it was created with. Sync also *removes* `comment-trigger.yml`, since the orchestrator webhook now handles `/ai-implement` for envelope repos.
+`claude-plan.yml` is a thin container shim over the shared runner image: `entrypoint.sh` with `RUNNER_PHASE=planning` invokes `run-planning.js`, so planning runs identically on GitHub Actions, Fly, and local Docker. Bedrock planning is GHA-only; Fly and local Docker reject `provider=bedrock`.
+
+`workflows/claude-implement.yml` and `claude-plan.yml` are synced to target repos under the mapping's Workflow File and Planning Workflow File names (defaults `claude-implement.yml`, `claude-plan.yml`); a sync never touches a workflow file the mapping does not name. `WORKFLOW.md` and `PLANNING.md` are **seeded once and never overwritten**, so every repo keeps whatever template it was created with. Sync also *removes* `comment-trigger.yml`, since the orchestrator webhook now handles `/ai-implement` for envelope repos. **Full reference: [docs/workflow-sync.md](docs/workflow-sync.md).**
 
 That seed-once rule has a consequence worth internalising: **a template correction never reaches an existing repo.** Fixing a bug in `workflows/WORKFLOW.md` fixes it for repos onboarded afterward and for nobody else.
 
@@ -191,8 +260,8 @@ Non-obvious behaviour:
 - **Model IDs pass through verbatim**, and nothing validates them against the provider. A Bedrock mapping with an Anthropic-style `model:` fails at Claude invocation time rather than at dispatch. Per-phase model selection lives in `.ai-implement/config.yml`, not front matter.
 - **Prompt assembly** — the runner uses `WORKFLOW.md`'s body with front matter and HTML comments stripped and `${UPPER_SNAKE}` substituted, then appends its own blocks. Any *unrecognised* `${TOKEN}` becomes an empty string, so a shell example containing one is silently blanked. Never put `${PLANNING_CONTEXT}` in the body: it is substituted *and* appended, emitting the block twice.
 - **The pipeline owns repository writes on every autonomous run.** Initial runs create the branch, commit, push, and PR. Gap-fill runs leave the existing PR branch checked out, then the pipeline commits and pushes reviewed changes to it. Templates must tell the agent to leave changes uncommitted in both modes.
-- **Unapproved runs still ship** as a draft PR carrying the reviewer's final feedback and per-pass stats, reported as a coded failure (`REVIEW_UNAPPROVED` / `MAX_TURNS_EXHAUSTED`) so the ticket updates and notifications fire, while the GHA job stays green with a `::warning::`. If the repo plan rejects draft PRs (422), it opens normally prefixed `[NEEDS REVIEW — unapproved]`.
-- **Hooks work in every execution mode.** `setup` / `verify` / `teardown` front-matter paths run around the implement loop — setup failure aborts early, teardown always runs. All three modes enter through `session/entrypoint.sh`, which populates the workspace before the runner starts.
+- **Unapproved runs still ship** as a draft PR carrying the reviewer's final feedback and per-pass stats, reported as a coded failure (`REVIEW_UNAPPROVED` / `MAX_TURNS_EXHAUSTED` / `VERIFY_FAILED` / `INSTALL_FAILED`) so the ticket updates and notifications fire, while the GHA job stays green with a `::warning::`. If the repo plan rejects draft PRs (422), it opens normally prefixed `[NEEDS REVIEW — unapproved]`.
+- **Hooks work in every execution mode.** `setup` / `verify` / `teardown` front-matter paths run around the implement loop — setup failure aborts early, teardown always runs. `verify` runs *inside* the feedback loop, after each implement pass and before its review; a failure (exit code plus the last 200 lines of output) goes back to the agent as feedback, counts as an iteration, and if it persists the run ends `VERIFY_FAILED` (draft PR for initial runs, no push for gap-fill). The loop snapshots the workspace before the hook and restores it after, so a hook cannot change what ships (ignored build output stays). Hook output streams to the runner log live and is redacted by value (forwarded secrets included) before it reaches the prompt, PR body or ticket. The post-push `verify` step skips unless a `custom/steps/verify.ts` override resolves, in which case the override runs after push (ADR 048). All three modes enter through `session/entrypoint.sh`, which populates the workspace before the runner starts.
 - **Planning writes files, it does not post.** A planning run writes `ai-output/comments/NN-*.md`; the orchestrator posts them to the ticket. Runner-written files are collected in lexicographic order — avoid the `90-` prefix, which the run autopsy uses.
 
 `/ai-implement` comment handling requires the App subscribed to `issue_comment`, `GITHUB_WEBHOOK_SECRET` set on both sides, a publicly reachable orchestrator, and an envelope-generation target repo. Legacy repos are silently ignored.
@@ -205,22 +274,25 @@ Editable per mapping; blank means the default.
 |---|---|---|
 | Max Turns | `50` | Claude turns per implement pass |
 | Max Iterations | bedrock `2`, anthropic `3` | implement/review cycles |
-| Job Timeout (min) | `90` | GHA only |
+| Job Timeout (min) | `90` | All execution modes; the monitor times a Fly or local-docker run out at this limit |
 | Branch Prefix | none | Path segment prepended to the implementation branch |
 | Sensitive Add / Allow Globs | none | Extends or un-blocks the push step's blocklist; **allow always wins** |
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
+| PR Dispatch Budget | 4 | Gap-fill runs per PR per rolling 24 h; at the limit the PR is parked for a human |
+| Trusted Review Authors | none | Extra GitHub logins (additive to the built-ins) whose `approve` block can gate a merge |
+| Review process | `ai-implement` | Who reviews a PR and who fixes it (ADR 038): `ai-implement`, `claude-code-review`, `claude-code-review-repository-fix`, or `codex-code-review`. Codex trusts `chatgpt-codex-connector[bot]` (also the bare login), reads the head-specific state comment, and forwards only P0/P1; P2 stays minor. Stored as NULL for the default. The Claude and AI-Implement processes apply to every project; mapped repositories forward review-fix feedback to `ReviewFixPR.feedback` regardless of stored lifecycle. Set in the project drawer; read by the webhook, the in-run gate, and `ReviewFixPR.check`. `claude-code-review` trusts `claude[bot]` and reads the verdict from the review check run and Claude's inline comments. Full reference: [docs/review-fix-rail.md](docs/review-fix-rail.md) |
+
+**Secrets** seeded via the Projects-row action stop at the hooks — they are stripped from the model process and the agent never sees them. On Fly, they are also excluded at the Fly boundary by default (process-level mode). **Extra Env** entries are passed through to the model process and are visible to the agent.
+
+Legacy `comment-trigger.yml` repositories still use repo variables `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, `AI_IMPLEMENT_MAX_JOB_MINUTES`, and `AI_IMPLEMENT_SKILLS_REPO` for caps and skills selection. The legacy runner reads the turn/iteration caps and skills repo from environment (`src/run-autonomous.ts`); job timeout is a workflow-level cap, passed separately as `job_timeout_minutes` by `src/github.ts`, rather than read by the runner. These legacy settings remain relevant until those repositories move to envelope generation.
 
 Caps apply to re-dispatches, not just initial runs. Branch prefix affects only the initial run — gap-fill commits to the existing PR branch. Sensitive-file globs travel **exclusively** in the envelope, so a repo must be on envelope generation before setting them.
 
-On **legacy** repos only — those still carrying `comment-trigger.yml` — the repo variables `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, `AI_IMPLEMENT_MAX_JOB_MINUTES`, and `AI_IMPLEMENT_SKILLS_REPO` still cap comment-triggered gap-fill runs. They are deprecated and unnecessary once a repo is on envelope generation, where the mapping's own values ride the envelope instead.
-
 **Jira profiles** ride `run_config.profiles`, read from a multi-select custom field that must be named exactly `AI-Implement Profiles` unless `profilesFieldOverride` pins its ID. Option names must not contain commas — the contract is a comma-joined list. **No built-in step consumes profiles**; they exist as the contract surface for image-baked `custom/` steps.
 
-**Jira repo matching derives from the mapping's `owner`/`repo`.** A Jira mapping's `repoFieldValue` is optional (`null` by default) and resolved at read time through `resolveRepoFieldValue` (`src/providers/ticketing-config.ts`): blank means "match issues whose repo field equals `owner/repo`", so the GitHub repository is entered once in the admin UI and never duplicated into the JQL or a separate repo-value field. Set `repoFieldValue` explicitly only when the repo field's options are labelled with something other than `owner/repo`. **A repo `=` clause in the JQL is unnecessary for candidate selection** - the orchestrator filters candidates by the repo field client-side (it tolerates both option-object and bare-string serializations, which a JQL `=` does not), so such a clause is redundant for matching and can silently drop issues; the admin JQL validator flags one as an advisory. One caveat before removing it: in-flight **capacity is counted per JQL scope** (`inProgressCountsByScope`, `src/providers/jira.ts`), so if several mappings share one project-scoped JQL, a repo clause is currently what scopes each mapping's in-flight count - keep it in that case, or give the mapping its own JQL.
+**Jira repo matching reads the resolved value.** A Jira mapping's `repoFieldValue` is `null` when its Repo Field Value was left blank, which means the mapping's own `owner/repo`. Read it only through `resolveRepoFieldValue` (`src/providers/ticketing-config.ts`): comparing a string with `null` compiles and matches nothing, and a test fails on any other read outside the admin UI. Every Jira search filters by that value in code, so a JQL needs no repo clause. Full reference: [docs/ticketing-providers.md](docs/ticketing-providers.md).
 
-**Dependency Token Scope** runs on a deliberate two-token split. The **primary** token carries the App's full grants but is scoped to the target repository alone; the **dependency** token is installation-wide but strictly `contents: read`. The `dependency-auth` step fetches the second from `POST /api/runner/dependency-token`, installs it as a git credential helper for `github.com` and as `COMPOSER_AUTH`, and the helper re-mints it when under ten minutes remain. So the implementer can read sibling repos it needs and can never push to them.
-
-Two things to know before enabling it. The scope is **all-or-nothing** — the token reads every repository the App installation covers, not a chosen subset (a per-project list is a planned v2; the field is stored as text so a JSON array slots in without a migration). And it needs a **publicly reachable orchestrator**, since the token is fetched over the runner callback; runs dispatched without a progress token skip the fetch and proceed without private-dependency access rather than failing.
+**Dependency Token Scope** runs on a deliberate two-token split: the primary token carries the App's full grants but is scoped to the target repository alone, while the dependency token is installation-wide and strictly `contents: read` plus `pull_requests: read` (the second grant lets the KG ingest list pull requests with `gh`). Two things to know before enabling it — the scope is **all-or-nothing**, and it needs a **publicly reachable orchestrator**.
 
 > **Behaviour change for existing Fly deployments.** The Fly-mode `/api/token` endpoint used to mint a full-installation token. It now narrows the primary token to the target repository, matching the GHA path. A deployment that incidentally relied on org-wide primary-token access to read private sibling repos must set this field to restore it.
 
@@ -230,10 +302,11 @@ Optional, in the target repo. Parsed with a real YAML parser; a missing file, ma
 
 | Key | Effect |
 |---|---|
-| `packageManager` | Overrides the install step's lockfile detection |
+| `packageManager` | Overrides the install step's lockfile detection; `none` turns off the built-in install entirely (do the real install from a `setup:` hook instead) |
 | `models.implement` / `models.review` | Per-phase models |
 | `reviewProviders` | External review sources; `github-claude-code-review` is the only recognised value |
-| `reviewCheckNames` | Check-run names that identify the external review gate. Defaults to `review`, `code-review-plugin`, `claude-review`, `claude code review`, `claude-code-review`, plus any name containing both `claude` and `review`. A target repo with an unrelated CI job named `review` should set this to avoid that job becoming the review gate |
+| `reviewCheckNames` | Check-run names that identify the external review gate. Defaults to `review`, `code-review-plugin`, `claude-review`, `claude code review`, `claude-code-review`, plus any name containing both `claude` and `review`. A target repo with an unrelated CI job named `review` should set this to avoid that job becoming the review gate. Under a non-default review process (`claude-code-review`) a check run must also come from the process's posting app (`app.slug`), so a same-named check from another app never counts |
+| `reviewers` | Prompt-only definitions with required `id` and `prompt`, and optional `model`. Project settings grant gating authority. A selected gating config reviewer uses its trusted default-branch definition; a changed branch version also runs as advisory, while identical definitions run once. New or selected non-gating reviewers use the branch definition as advisory. Missing trusted gating definitions fail closed. Built-in and image-baked definitions take precedence over matching config ids |
 
 **This is where per-phase model selection lives.** Both keys take precedence over `WORKFLOW.md`'s `model:` — the chain is `config.yml` → front matter → built-in default. Pairing a strong implement model with a cheap review model is the supported way to hold down review cost.
 
@@ -245,11 +318,12 @@ The two `.ai-implement/` files read from different refs: `image.yml` from the **
 
 A file at `custom/<path>` overrides the corresponding built-in. Resolution searches the workspace root, then `AI_IMPLEMENT_CUSTOM_ROOT`, then the package root — see [docs/pipeline-architecture.md](docs/pipeline-architecture.md) for the mechanics and the step contract.
 
-Built-in step keys, in pipeline order: `clone`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `preflight`, `push`, `verify`, `post-push-review`.
+Built-in step keys, in pipeline order: `clone`, `reference-repos`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `install-retry`, `preflight`, `push`, `verify`, `post-push-review`. `verify` is skipped by the built-in wiring (the hook runs inside `feedback-loop`) and runs only when a `custom/steps/verify.ts` override resolves.
 
 - `custom/` belongs to an AI-Implement **fork**, not a target repo; sync never creates it there.
 - **Place client-specific behaviour in `custom/`** rather than editing built-in modules — that is what keeps a fork rebasing cleanly.
 - A `custom/` file with no `default` export warns and falls back to the built-in rather than misbehaving silently.
+- **A fork updates from upstream with a git merge** (`git fetch upstream && git merge upstream/testing`), not through the orchestrator — procedure in `custom/README.md` § "Updating a fork from upstream".
 - `protect-custom.yml` flags upstream PRs touching `custom/`, but is **advisory only** — it emits a `::warning::`, never fails, and only runs on PRs targeting `main`, so PRs into `testing` never trigger it.
 
 ## Feature-branch grouping
@@ -260,33 +334,39 @@ Labels: `AI-Implement` → `AI-Planning` → `Plan-Complete` → `AI-Working` �
 
 The cascade **self-advances** and self-heals: a child PR landing dirty is re-queued through the comment-gapfill rail (capped at 2 attempts), a parent with an open roll-up PR is held from dispatch, and siblings whose declared `Files:` overlap an in-flight sibling are deferred (failing open). Requires a publicly reachable runner callback, and the runner image channel paired to the orchestrator's.
 
+A child PR is auto-merged only when the project's Auto-merge setting is on and the run has an **approval mark** (`runner_approved` conclusion) on its run record — the result callback writes it for an initial run, while a gap-fill's mark comes from `LateExternalReview` (when Restate was not ready, the poll sweep submits it later); with the setting off, approved children are left for a person to merge. A PR with no run record (including human-opened PRs into a grouping branch) or a run that ended without approval is held — see §8 of `docs/feature-branch-grouping.md`.
+
 **Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
 
 ## Issue completion on PR merge
 
-Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll detector** that needs no configuration and catches everything within a tick, and a **webhook** that merely reduces latency. Completion runs even for paused projects. Jira target repos need a `Merged` option on their AI-Implement status field.
+Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll detector** that needs no configuration and catches everything within a tick, and a **webhook** that merely reduces latency. Both paths read the stored pull request link, independently of job-history retention. A close without a merge cancels an eligible implementation issue with a comment; roll-ups and grouping-parent finalization have separate handling, and cancellation waits for in-flight runs and requires no other open PR. Completion runs even for paused projects. Jira target repos need a `Merged` option on their AI-Implement status field.
 
 ## Admin UI and auth
 
-SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. **Authorization and session identity key on different claims, and it is easy to state this backwards:** authorization is a fail-closed allowlist matched against the verified *email*, while the session stores the provider's stable `sub`, because email is mutable.
+SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. The fail-closed allowlist is **database-backed and edited at `/admin#access`** — `OAUTH_ALLOWED_*` seed it and apply until the first save, which hands authority to the stored list permanently. Every entry carries a role: `admin` reaches everything, `user` reaches `/mcp` plus whichever pages have been granted — none, until someone grants some.
 
-The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — all client JS is concatenated into one inline `<script>` at module load. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the HTML-escaping helpers (below) rather than bare globals. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts`.
+Four things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`** — so a domain-only seed admits everyone and lets nobody administer, a misconfiguration the boot log and the sign-in page both flag. An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing — and re-pointing a bound entry takes two saves, not one. **Page grants restrict the admin UI, not what a user can read**: `/mcp` reads are open to every allowlisted identity, so a user granted nothing still reaches every read tool; the declared write tools (the `role: "admin"` handlers on the tools service, `src/restate/tools.ts`) require that role, asserted inside the `tool()` wrapper on every entry point. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
+
+Every authenticated request re-checks against an in-memory list, so a removal ends a session on the next request rather than at token expiry. **Full reference: [docs/access-model.md](docs/access-model.md)** — precedence, the audit trail, and the host command that recovers from lockout.
+
+The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — each module is emitted as its own inline `<script>` element (theme → helpers → auth → router → one per page → the drawer, filesystem-issue, local-job-logs and stepper overlays). **Never merge them back into a single element**: a parse or runtime error in one page's `<script>` then stops only that element; the shared helpers, login and routing (the first four elements) always run. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the shared helpers in `helpers.ts` (the escaping helpers below, the badge builders, the time formatters) rather than bare globals or a copy of their own. **An admin UI module imports only other admin UI modules at runtime**: the server composes the page while its own modules load, so an import of server code joins the server's import cycle and throws `Cannot access … before initialization` at boot under Node, while vitest's transform hides it. Text the server owns reaches a page through its route; `bundle-syntax.test.ts` enforces the boundary. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts` — and it is ungrantable until listed in `PAGE_ROUTES` (`access-page-grants.ts`), which is deliberate: grantability is declared by naming what a page may read, so a new page and a new endpoint both fail closed.
 
 **HTML escaping — three-way rule** (full rationale: [docs/adr/002-admin-ui-html-escaping.md](docs/adr/002-admin-ui-html-escaping.md)):
 
 | Context | Helper | Why |
 |---|---|---|
-| Text content (`innerHTML`, `textContent`) | `window.esc()` | Escapes `&`, `<`, `>` via DOM round-trip |
+| Text interpolated into markup (`innerHTML`) | `window.esc()` | Escapes `&`, `<`, `>` via DOM round-trip. A value assigned to `textContent` needs **no** helper — it is never parsed as HTML |
 | Quoted attribute value (`title=`, `data-*`, path in `href=`) | `window.escAttr()` | Also escapes `"` and `'` |
 | Full URL in `href=`/`src=` (scheme from data) | `window.safeUrl()` | Validates scheme; `javascript:` returns `'#'` |
 
-`window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first. Use `window.raw(markup)` to opt out for pre-built HTML. Use `html` for all new markup-building code. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. Note: when a URL is assembled in a variable and then placed in `html`, the template cannot detect the URL context — call `safeUrl()` explicitly in that case.
+`window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first, and `window.raw(markup)` opts out for pre-built HTML. **No page module uses it** — every call site concatenates strings with explicit `esc()`/`escAttr()`, because nesting a template literal inside the page's own script template means escaping every backtick and `${`. Follow the call sites. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. And when a URL is assembled in a variable before being interpolated, no helper can detect the URL context — call `safeUrl()` explicitly there.
 
-Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
+Five routes (`channels`, `policies`, `secrets`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
 
 ## Backend outage playbook
 
-The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute.
+The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute. Runner mode `gha` also sends the next KG refresh to the KG repo's Actions and leaves the kept machine untouched; the KG page's Backend setting picks the backend in `default` mode.
 
 Ineligible mappings are **skipped at dispatch** — `provider=bedrock` is GHA-only, and Fly needs a sessions app — staying queued with dedup untouched and appearing in the Runners banner and `GET /api/runner-mode`. Flip back to `default` afterward; skipped issues dispatch on the next poll.
 

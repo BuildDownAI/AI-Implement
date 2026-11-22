@@ -1,16 +1,18 @@
 import crypto from "node:crypto";
 import { GitHubApiError } from "./github-errors.js";
+import { defaultFetchSignal } from "./github.js";
 
 export interface InstallationDetails {
   token: string;
-  installationId: number; // Currently inert — no caller reads this yet. Reserved for an OAuth follow-up (if approved), which will add a repo to a "selected repositories" install via the API and needs the installation id to target it
+  expiresAt: number; // Epoch milliseconds; 0 when GitHub omits a valid expiry.
+  installationId: number;
   repositorySelection: "all" | "selected";
 }
 
-// Cache: owner → { token, expiresAt }
-const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+// Cache the installation identity with the token so admission and dispatch use the same install.
+const tokenCache = new Map<string, { token: string; expiresAt: number; installationId: number }>();
 // Cache: scopedCacheKey(owner, options) → { token, real expiresAt (ISO), staleAt (cache cutoff, ms) }
-const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number }>();
+const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number; installationId: number }>();
 let cachedAppSlug: string | null = null;
 const TOKEN_CACHE_TTL_MS = 50 * 60 * 1000;
 
@@ -65,9 +67,26 @@ function parsePrivateKey(pem: string): crypto.KeyObject {
   return crypto.createPrivateKey(normalized);
 }
 
+/** The App key as configured: literal `\n` sequences unescaped, then parsed. Throws when it is not a private key. */
+export function parseAppPrivateKey(raw: string): crypto.KeyObject {
+  return parsePrivateKey(raw.replace(/\\n/g, "\n"));
+}
+
+/** Why the App's ID and key cannot sign a JWT, naming the variables, or null when both are set and the key parses. */
+export function appCredentialsProblem(env: Readonly<Record<string, string | undefined>>): string | null {
+  const missing = ["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY"].filter((name) => !env[name]);
+  if (missing.length > 0) return `${missing.join(" and ")} not set`;
+  try {
+    parseAppPrivateKey(env.GITHUB_APP_PRIVATE_KEY!);
+    return null;
+  } catch {
+    return "GITHUB_APP_PRIVATE_KEY does not parse as a private key";
+  }
+}
+
 // exp is minted this many seconds below GitHub's 600s cap (and iat backdated the same)
 // so a host clock running ahead of GitHub still validates. Larger drift needs a clock resync (NTP).
-const CLOCK_SKEW_TOLERANCE_S = 300;
+export const CLOCK_SKEW_TOLERANCE_S = 300;
 
 /**
  * Creates a signed JWT for authenticating as a GitHub App.
@@ -86,12 +105,12 @@ export function createAppJwt(appId: string, privateKey: string): string {
   const signing = `${header}.${payload}`;
   const sign = crypto.createSign("RSA-SHA256");
   sign.update(signing);
-  const keyObject = parsePrivateKey(privateKey);
+  const keyObject = parseAppPrivateKey(privateKey);
   const sig = sign.sign(keyObject, "base64url");
   return `${signing}.${sig}`;
 }
 
-function githubAppHeaders(authValue: string): Record<string, string> {
+export function githubAppHeaders(authValue: string): Record<string, string> {
   return {
     Authorization: `Bearer ${authValue}`,
     Accept: "application/vnd.github+json",
@@ -100,21 +119,29 @@ function githubAppHeaders(authValue: string): Record<string, string> {
   };
 }
 
+/** An owner's App installation as GitHub returns it, narrowed to the fields the orchestrator reads. */
+export interface AppInstallation {
+  id: number;
+  repository_selection: "all" | "selected";
+  /** Each permission the installation has accepted, with its level ("read" or "write"). */
+  permissions: Record<string, string>;
+}
+
 /**
- * Resolves the GitHub App installation ID for an owner.
+ * Resolves the GitHub App installation for an owner.
  * Tries the org endpoint first and falls back to the user endpoint on 404.
  * Throws GitHubApiError on any non-ok response.
  */
 async function resolveInstallationId(
   headers: Record<string, string>,
   owner: string,
-): Promise<{ id: number; repository_selection?: "all" | "selected" }> {
+): Promise<AppInstallation> {
   // `path` (…/installation) lets classifySyncError tell a 404-not-installed from a 404-repo-not-found.
   let installPath = `/orgs/${owner}/installation`;
-  let installRes = await fetch(`https://api.github.com${installPath}`, { headers });
+  let installRes = await fetch(`https://api.github.com${installPath}`, { headers, signal: defaultFetchSignal() });
   if (installRes.status === 404) {
     installPath = `/users/${owner}/installation`;
-    installRes = await fetch(`https://api.github.com${installPath}`, { headers });
+    installRes = await fetch(`https://api.github.com${installPath}`, { headers, signal: defaultFetchSignal() });
   }
   if (!installRes.ok) {
     const body = await installRes.text();
@@ -125,7 +152,74 @@ async function resolveInstallationId(
       message: `GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`,
     });
   }
-  return installRes.json() as Promise<{ id: number; repository_selection?: "all" | "selected" }>;
+  return installRes.json() as Promise<AppInstallation>;
+}
+
+/** The App's installation on an owner, or null when GitHub has none on either endpoint. Uncached and mints no token. */
+export async function getAppInstallation(appId: string, privateKey: string, owner: string): Promise<AppInstallation | null> {
+  const jwt = createAppJwt(appId, privateKey.replace(/\\n/g, "\n"));
+  try {
+    return await resolveInstallationId(githubAppHeaders(jwt), owner);
+  } catch (error) {
+    if (error instanceof GitHubApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+const PERMISSION_RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
+
+/** `owner|permission` pairs already warned about; cleared by clearTokenCache(). */
+const warnedPermissionPairs = new Set<string>();
+
+function warnPermissionOnce(owner: string, permission: string, requested: string, granted: string | undefined): void {
+  const key = `${owner}|${permission}`;
+  if (warnedPermissionPairs.has(key)) return;
+  warnedPermissionPairs.add(key);
+  console.warn(
+    `[github-app-auth] Installation for "${owner}" ${granted ? "lowers" : "does not grant"} permission "${permission}": ` +
+      `requested ${requested}, granted ${granted ?? "none"}; ${granted ? "minting at the granted level" : "minting without it"}`,
+  );
+}
+
+/**
+ * Intersects the requested permissions with what the installation grants. Drops ungranted keys,
+ * lowers a level to the granted one when the granted level ranks lower, and passes through any
+ * level the rank does not know. `granted` undefined means no restriction is known.
+ */
+function intersectPermissions(
+  owner: string,
+  installationId: number,
+  requested: Record<string, string>,
+  granted: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!granted) return requested;
+  const result: Record<string, string> = {};
+  const dropped: string[] = [];
+  for (const [name, level] of Object.entries(requested)) {
+    const have = granted[name];
+    if (have === undefined) {
+      dropped.push(`${name}: ${level}`);
+      warnPermissionOnce(owner, name, level, undefined);
+      continue;
+    }
+    const want = PERMISSION_RANK[level];
+    const got = PERMISSION_RANK[have];
+    if (want !== undefined && got !== undefined && got < want) {
+      result[name] = have;
+      warnPermissionOnce(owner, name, level, have);
+    } else {
+      result[name] = level;
+    }
+  }
+  if (Object.keys(result).length === 0 && dropped.length > 0) {
+    throw new GitHubApiError({
+      status: 403,
+      path: `/app/installations/${installationId}/access_tokens`,
+      bodyText: "",
+      message: `GitHub App installation for owner "${owner}" grants none of the requested permissions: ${dropped.join(", ")}`,
+    });
+  }
+  return result;
 }
 
 /**
@@ -147,7 +241,7 @@ export async function getInstallation(
   const install = await resolveInstallationId(headers, owner);
 
   const tokenPath = `/app/installations/${install.id}/access_tokens`;
-  const tokenRes = await fetch(`https://api.github.com${tokenPath}`, { method: "POST", headers });
+  const tokenRes = await fetch(`https://api.github.com${tokenPath}`, { method: "POST", headers, signal: defaultFetchSignal() });
   if (!tokenRes.ok) {
     const body = await tokenRes.text();
     throw new GitHubApiError({
@@ -157,10 +251,13 @@ export async function getInstallation(
       message: `Failed to get installation token for owner "${owner}" (${tokenRes.status}): ${body}`,
     });
   }
-  const tokenData = (await tokenRes.json()) as { token: string };
+  const tokenData = (await tokenRes.json()) as { token: string; expires_at?: string };
+  const parsedExpiry = tokenData.expires_at ? Date.parse(tokenData.expires_at) : NaN;
+  const expiresAt = Number.isFinite(parsedExpiry) ? parsedExpiry : 0;
 
   return {
     token: tokenData.token,
+    expiresAt,
     installationId: install.id,
     repositorySelection: install.repository_selection === "all" ? "all" : "selected",
   };
@@ -182,6 +279,8 @@ export interface ScopedInstallationToken {
   token: string;
   /** GitHub's actual expiry for this token (ISO 8601), passed through verbatim. */
   expiresAt: string;
+  /** The GitHub App installation the token was minted from. */
+  installationId: number;
 }
 
 function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
@@ -206,6 +305,12 @@ function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
  * Cache TTL is derived from `expires_at` minus a 5-minute safety margin, so the
  * cache stays accurate regardless of the actual token lifetime.
  * Cached per (owner, permissions, repositories) tuple — distinct option sets never collide.
+ *
+ * The cache key is built from the raw requested permissions, not the intersected set: the lookup
+ * runs before the installation is resolved, so a cache hit stays free of a network call. Only the
+ * mint body uses the intersection with the installation's granted permissions (an ungranted key is
+ * dropped, a level above the grant is lowered, each warned once per owner and permission). A token
+ * minted before the App was granted a permission is reused until it goes stale.
  */
 export async function getScopedInstallationToken(
   appId: string,
@@ -216,7 +321,7 @@ export async function getScopedInstallationToken(
   const cacheKey = scopedCacheKey(owner, options);
   const cached = scopedTokenCache.get(cacheKey);
   if (!options?.forceRefresh && cached && Date.now() < cached.staleAt) {
-    return { token: cached.token, expiresAt: cached.expiresAt };
+    return { token: cached.token, expiresAt: cached.expiresAt, installationId: cached.installationId };
   }
 
   const normalizedKey = privateKey.replace(/\\n/g, "\n");
@@ -226,7 +331,9 @@ export async function getScopedInstallationToken(
   const install = await resolveInstallationId(headers, owner);
 
   const bodyData: Record<string, unknown> = {};
-  if (options?.permissions && Object.keys(options.permissions).length > 0) bodyData.permissions = options.permissions;
+  if (options?.permissions && Object.keys(options.permissions).length > 0) {
+    bodyData.permissions = intersectPermissions(owner, install.id, options.permissions, install.permissions);
+  }
   if (options?.repositories && options.repositories.length > 0) bodyData.repositories = options.repositories;
   const hasBody = Object.keys(bodyData).length > 0;
 
@@ -235,6 +342,7 @@ export async function getScopedInstallationToken(
     method: "POST",
     headers: hasBody ? { ...headers, "Content-Type": "application/json" } : headers,
     body: hasBody ? JSON.stringify(bodyData) : undefined,
+    signal: defaultFetchSignal(),
   });
 
   if (!tokenRes.ok) {
@@ -255,24 +363,20 @@ export async function getScopedInstallationToken(
     ? tokenData.expires_at
     : new Date(Date.now() + 55 * 60 * 1000).toISOString();
   const staleAt = Number.isFinite(expMs) ? expMs - 5 * 60 * 1000 : Date.now() + 50 * 60 * 1000;
-  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt, staleAt });
-  return { token: tokenData.token, expiresAt };
+  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt, staleAt, installationId: install.id });
+  return { token: tokenData.token, expiresAt, installationId: install.id };
 }
 
 /**
- * Whether the installation can see a given repo. Only meaningful when repositorySelection === "selected"
- * (an "all" install sees everything, so the caller skips this). 
- * 
- * Pages through GET /installation/repositories with the install token, short-circuiting as soon as the repo is found.
+ * Each page of the repository names a selected-repositories installation includes, lowercased, read through
+ * GET /installation/repositories with the installation's token. A caller that stops iterating stops the reads.
  */
-export async function installationIncludesRepo(token: string, repoName: string): Promise<boolean> {
+async function* installationRepositoryPages(token: string): AsyncGenerator<string[]> {
   const headers = githubAppHeaders(token);
   const perPage = 100;
-  const target = repoName.toLowerCase();
-
   for (let page = 1; ; page++) {
     const path = `/installation/repositories?per_page=${perPage}&page=${page}`;
-    const res = await fetch(`https://api.github.com${path}`, { headers });
+    const res = await fetch(`https://api.github.com${path}`, { headers, signal: defaultFetchSignal() });
     if (!res.ok) {
       const body = await res.text();
       throw new GitHubApiError({
@@ -284,10 +388,19 @@ export async function installationIncludesRepo(token: string, repoName: string):
     }
 
     const data = (await res.json()) as { total_count: number; repositories: Array<{ name: string }> };
-    if (data.repositories.some((r) => r.name.toLowerCase() === target)) return true;
+    yield data.repositories.map((r) => r.name.toLowerCase());
     // Stop once this page was short (the last page) or we've already covered total_count.
-    if (data.repositories.length < perPage || page * perPage >= data.total_count) return false;
+    if (data.repositories.length < perPage || page * perPage >= data.total_count) return;
   }
+}
+
+/** Every repository name a selected-repositories installation includes, lowercased, read with that installation's token. */
+export async function listInstallationRepositoryNames(token: string): Promise<Set<string>> {
+  const names = new Set<string>();
+  for await (const page of installationRepositoryPages(token)) {
+    for (const name of page) names.add(name);
+  }
+  return names;
 }
 
 /**
@@ -299,30 +412,92 @@ export async function installationIncludesRepo(token: string, repoName: string):
 export async function getAppSlug(appId: string, privateKey: string): Promise<string> {
   if (cachedAppSlug) return cachedAppSlug;
 
-  const normalizedKey = privateKey.replace(/\\n/g, "\n");
-  const jwt = createAppJwt(appId, normalizedKey);
-  const path = "/app";
-  const res = await fetch(`https://api.github.com${path}`, { headers: githubAppHeaders(jwt) });
-
-  if (!res.ok) {
-    const body = await res.text();
+  const app = await readAppIdentity(appId, privateKey);
+  if (app.slug === null) {
     throw new GitHubApiError({
-      status: res.status,
-      path,
-      bodyText: body,
-      message: `Failed to read GitHub App metadata (${res.status}): ${body}`,
+      status: app.status,
+      path: "/app",
+      bodyText: app.errorBody,
+      message: `Failed to read GitHub App metadata (${app.status}): ${app.errorBody}`,
     });
   }
-
-  const data = (await res.json()) as { slug: string };
-  cachedAppSlug = data.slug;
+  cachedAppSlug = app.slug;
   return cachedAppSlug;
+}
+
+/** The page GitHub serves for installing the App on an account, or for adding repositories to an installation. */
+export function appInstallUrl(slug: string): string {
+  return `https://github.com/apps/${slug}/installations/new`;
+}
+
+/** What `GET /app` answered for the App's JWT, with GitHub's clock beside this host's. */
+export interface AppIdentityRead {
+  status: number;
+  /** Null when GitHub answered anything but 200: a refusal (`appCredentialsRefused`) or no judgment at all. */
+  slug: string | null;
+  /** The webhook events the App subscribes to, null when `slug` is. */
+  events: string[] | null;
+  /** The response body when GitHub refused, else "". */
+  errorBody: string;
+  /** GitHub's time from the response's `Date` header, in epoch milliseconds, or null when absent. */
+  githubTime: number | null;
+  /** This host's time when the response arrived, in epoch milliseconds. */
+  localTime: number;
+}
+
+/** Reads `GET /app` uncached. A refused JWT is an answer, not an error, so a caller can tell a bad key from a skewed clock. */
+export async function readAppIdentity(appId: string, privateKey: string): Promise<AppIdentityRead> {
+  const jwt = createAppJwt(appId, privateKey.replace(/\\n/g, "\n"));
+  const res = await fetch("https://api.github.com/app", { headers: githubAppHeaders(jwt), signal: defaultFetchSignal() });
+  const localTime = Date.now();
+  const date = Date.parse(res.headers.get("date") ?? "");
+  const githubTime = Number.isFinite(date) ? date : null;
+  if (!res.ok) return { status: res.status, slug: null, events: null, errorBody: await res.text(), githubTime, localTime };
+  const data = (await res.json()) as { slug: string; events: string[] };
+  return { status: res.status, slug: data.slug, events: data.events, errorBody: "", githubTime, localTime };
+}
+
+/** Whether GitHub refused the App's credentials: 401 for a bad key or a skewed clock, 404 for an App ID it does not know. Any other status is GitHub not answering normally. */
+export function appCredentialsRefused(read: Pick<AppIdentityRead, "status">): boolean {
+  return read.status === 401 || read.status === 404;
+}
+
+export interface SourceTokenResult {
+  token: string | null;
+  authMode: "installation" | "public";
+}
+
+/**
+ * Mints a scoped installation token for the given source-repo owner.
+ * When the App is not installed on that owner (404 from both endpoints), falls back to
+ * unauthenticated (public) reads — no token is returned. GitHub rejects App JWTs on
+ * /repos/... content endpoints; unauthenticated reads work for public repos.
+ * Logs which auth path was taken. Any non-404 error from the mint is rethrown unchanged.
+ */
+export async function mintSourceTokenOrJwt(
+  appId: string,
+  privateKey: string,
+  owner: string,
+  options?: ScopedTokenOptions,
+): Promise<SourceTokenResult> {
+  try {
+    const { token } = await getScopedInstallationToken(appId, privateKey, owner, options);
+    return { token, authMode: "installation" };
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 404) {
+      console.log(
+        `[deploy] App not installed on "${owner}"; falling back to unauthenticated reads for public repos (auth=public)`,
+      );
+      return { token: null, authMode: "public" };
+    }
+    throw err;
+  }
 }
 
 /**
  * Returns a cached installation access token for the given owner.
- * Tokens are valid for 1 hour; we cache for 50 minutes.
- * 
+ * Cache until five minutes before the reported expiry, or 50 minutes if absent.
+ *
  * Thin caching layer over getInstallation — the hot dispatch path only needs the token.
  */
 export async function getInstallationToken(
@@ -337,6 +512,18 @@ export async function getInstallationToken(
   return refreshInstallationToken(appId, privateKey, owner);
 }
 
+/** Return the numeric GitHub installation identity used by PR-scoped admission. */
+export async function getInstallationId(
+  appId: string,
+  privateKey: string,
+  owner: string,
+): Promise<number> {
+  const cached = tokenCache.get(owner);
+  if (cached && Date.now() < cached.expiresAt) return cached.installationId;
+  await refreshInstallationToken(appId, privateKey, owner);
+  return tokenCache.get(owner)!.installationId;
+}
+
 /**
  * Mint and cache a new installation token even when an older cached token is
  * still within the dispatch cache window. Runner vending uses this path so a
@@ -347,8 +534,9 @@ export async function refreshInstallationToken(
   privateKey: string,
   owner: string,
 ): Promise<string> {
-  const { token } = await getInstallation(appId, privateKey, owner);
-  tokenCache.set(owner, { token, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS });
+  const { token, expiresAt, installationId } = await getInstallation(appId, privateKey, owner);
+  const cacheExpiry = expiresAt > 0 ? expiresAt - 5 * 60 * 1000 : Date.now() + TOKEN_CACHE_TTL_MS;
+  tokenCache.set(owner, { token, expiresAt: cacheExpiry, installationId });
   return token;
 }
 
@@ -356,4 +544,5 @@ export async function refreshInstallationToken(
 export function clearTokenCache(): void {
   tokenCache.clear();
   scopedTokenCache.clear();
+  warnedPermissionPairs.clear();
 }

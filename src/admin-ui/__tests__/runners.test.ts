@@ -7,9 +7,23 @@ describe("runners page", () => {
       expect(runnersHtml).toContain(`id="${id}"`);
     }
   });
+  it("declares fly-process-level-secrets ids", () => {
+    expect(runnersHtml).toContain('id="fly-process-level-secrets-toggle"');
+    expect(runnersHtml).toContain('id="fly-process-level-secrets-env-warning"');
+  });
+  it("fly-process-level-secrets env warning has warning hidden classes", () => {
+    expect(runnersHtml).toContain('id="fly-process-level-secrets-env-warning" class="warning hidden"');
+  });
   it("registers route + exposes loadRunners", () => {
     expect(runnersScript).toContain("window.registerPage('runners'");
     expect(runnersScript).toContain("window.loadRunners = loadRunners");
+  });
+  it("exposes setFlyProcessLevelSecrets", () => {
+    expect(runnersScript).toContain("window.setFlyProcessLevelSecrets = setFlyProcessLevelSecrets");
+  });
+  it("setFlyProcessLevelSecrets posts to /api/runner-mode with flyProcessLevelSecrets field", () => {
+    expect(runnersScript).toContain("flyProcessLevelSecrets: enabled");
+    expect(runnersScript).toContain("/api/runner-mode");
   });
   it("calls the four expected endpoints", () => {
     for (const ep of ["/api/runner-mode", "/api/mappings", "/api/sessions", "/api/reaper/summary"]) {

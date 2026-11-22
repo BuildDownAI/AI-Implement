@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
-import { resolveCustomFieldIds, getCachedFieldIds, clearFieldCache, adfParagraph, adfWithLink, STATUS_VALUES } from "../../providers/jira-fields.js";
+import { resolveCustomFieldIds, getCachedFieldIds, clearFieldCache, adfWithLink, STATUS_VALUES } from "../../providers/jira-fields.js";
 
-const baseOverrides = { statusOverride: null, repoOverride: null, profilesOverride: null };
+const baseOverrides = { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null };
 const baseFields = [
   { id: "customfield_10042", name: "AI-Implement Status", custom: true },
   { id: "customfield_10043", name: "AI-Implement Repo", custom: true },
@@ -21,12 +21,13 @@ describe("resolveCustomFieldIds", () => {
     expect(ids.repoFieldId).toBe("customfield_10043");
   });
 
-  it("respects explicit overrides without calling listFields when all three are set", async () => {
+  it("respects explicit overrides without calling listFields when all four are set", async () => {
     const client = { listFields: vi.fn() };
     const ids = await resolveCustomFieldIds(client as any, {
       statusOverride: "customfield_99",
       repoOverride: "customfield_98",
       profilesOverride: "customfield_97",
+      baseBranchOverride: "customfield_96",
     });
     expect(ids.statusFieldId).toBe("customfield_99");
     expect(ids.repoFieldId).toBe("customfield_98");
@@ -44,6 +45,7 @@ describe("resolveCustomFieldIds", () => {
       statusOverride: "customfield_99",
       repoOverride: "customfield_98",
       profilesOverride: null,
+      baseBranchOverride: null,
     });
     expect(client.listFields).toHaveBeenCalledTimes(1);
   });
@@ -58,6 +60,7 @@ describe("resolveCustomFieldIds", () => {
       statusOverride: "customfield_status_override",
       repoOverride: null,
       profilesOverride: null,
+      baseBranchOverride: null,
     });
     expect(ids.statusFieldId).toBe("customfield_status_override");
     expect(ids.repoFieldId).toBe("customfield_x");
@@ -131,18 +134,21 @@ describe("resolveCustomFieldIds — profilesFieldId (lenient resolution)", () =>
       statusOverride: null,
       repoOverride: null,
       profilesOverride: "customfield_explicit_profiles",
+      baseBranchOverride: null,
     });
     expect(ids.profilesFieldId).toBe("customfield_explicit_profiles");
   });
 
-  it("does not call listFields when all three overrides are set (profiles included)", async () => {
+  it("does not call listFields when all four overrides are set (profiles and base branch included)", async () => {
     const client = { listFields: vi.fn() };
     const ids = await resolveCustomFieldIds(client as any, {
       statusOverride: "customfield_s",
       repoOverride: "customfield_r",
       profilesOverride: "customfield_p",
+      baseBranchOverride: "customfield_b",
     });
     expect(ids.profilesFieldId).toBe("customfield_p");
+    expect(ids.baseBranchFieldId).toBe("customfield_b");
     expect(client.listFields).not.toHaveBeenCalled();
   });
 });
@@ -151,24 +157,24 @@ describe("getCachedFieldIds", () => {
   it("queries listFields once per cache key, then serves from cache", async () => {
     clearFieldCache();
     const client = { listFields: vi.fn().mockResolvedValue(baseFields) };
-    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
-    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
+    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
+    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
     expect(client.listFields).toHaveBeenCalledTimes(1);
   });
 
   it("treats different cache keys as separate entries", async () => {
     clearFieldCache();
     const client = { listFields: vi.fn().mockResolvedValue(baseFields) };
-    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
-    await getCachedFieldIds("k2", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
+    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
+    await getCachedFieldIds("k2", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
     expect(client.listFields).toHaveBeenCalledTimes(2);
   });
 
   it("re-resolves when the same cache key is called with a changed override", async () => {
     clearFieldCache();
     const client = { listFields: vi.fn().mockResolvedValue(baseFields) };
-    const a = await getCachedFieldIds("k1", client as any, { statusOverride: "customfield_A", repoOverride: null, profilesOverride: null });
-    const b = await getCachedFieldIds("k1", client as any, { statusOverride: "customfield_B", repoOverride: null, profilesOverride: null });
+    const a = await getCachedFieldIds("k1", client as any, { statusOverride: "customfield_A", repoOverride: null, profilesOverride: null, baseBranchOverride: null });
+    const b = await getCachedFieldIds("k1", client as any, { statusOverride: "customfield_B", repoOverride: null, profilesOverride: null, baseBranchOverride: null });
     expect(a.statusFieldId).toBe("customfield_A");
     expect(b.statusFieldId).toBe("customfield_B");
   });
@@ -176,8 +182,8 @@ describe("getCachedFieldIds", () => {
   it("re-resolves when profilesOverride changes for the same cache key", async () => {
     clearFieldCache();
     const client = { listFields: vi.fn().mockResolvedValue(baseFields) };
-    const a = await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
-    const b = await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: "customfield_P" });
+    const a = await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
+    const b = await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: "customfield_P", baseBranchOverride: null });
     expect(a.profilesFieldId).toBeNull();
     expect(b.profilesFieldId).toBe("customfield_P");
     expect(client.listFields).toHaveBeenCalledTimes(2);
@@ -214,12 +220,6 @@ describe("STATUS_VALUES", () => {
 });
 
 describe("ADF helpers", () => {
-  it("adfParagraph wraps text in a single-paragraph ADF doc", () => {
-    const doc = adfParagraph("hello") as any;
-    expect(doc.type).toBe("doc");
-    expect(doc.content[0].content[0]).toEqual({ type: "text", text: "hello" });
-  });
-
   it("adfWithLink includes a link mark on the label", () => {
     const doc = adfWithLink("PR opened: ", "PR-123", "https://example.com/pr/123") as any;
     const linkText = doc.content[0].content[1];

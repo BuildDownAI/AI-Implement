@@ -29,7 +29,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         const a = sampleIssue({ id: "a", identifier: "TEST-A" });
         const b = sampleIssue({ id: "b", identifier: "TEST-B" });
         const provider = await factory({ initialIssues: [a, b] });
-        await provider.markPlanComplete("b", "TEAM");
+        await provider.markPlanComplete("b", "TEAM", { awaitApproval: false });
         const snap = await provider.fetchAIImplementSnapshot();
         expect(snap.needsPlanning.map((i) => i.id)).toEqual(["a"]);
         expect(snap.readyForImplementation.map((i) => i.id)).toEqual(["b"]);
@@ -93,9 +93,28 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         const a = sampleIssue({ id: "a" });
         const provider = await factory({ initialIssues: [a] });
         await provider.markImplementing("a", "TEAM");
-        await provider.clearWorkingState("a", "TEAM");
+        await provider.clearWorkingState("a", "TEAM", "implementation");
         const snap = await provider.fetchAIImplementSnapshot();
         expect(snap.inProgressCountsByScope.TEAM ?? 0).toBe(0);
+      });
+    });
+
+    describe("parkForHuman", () => {
+      it("removes the issue from both pickup buckets", async () => {
+        const a = sampleIssue({ id: "a" });
+        const provider = await factory({ initialIssues: [a] });
+        expect(await provider.parkForHuman("a", "TEAM", "implementation")).toBe(true);
+        const snap = await provider.fetchAIImplementSnapshot();
+        expect(snap.needsPlanning.map((i) => i.id)).not.toContain("a");
+        expect(snap.readyForImplementation.map((i) => i.id)).not.toContain("a");
+        expect(snap.inProgressCountsByScope.TEAM ?? 0).toBe(0);
+      });
+
+      it("returns false for a terminal issue", async () => {
+        const a = sampleIssue({ id: "a" });
+        const provider = await factory({ initialIssues: [a] });
+        await provider.markMerged("a", "TEAM");
+        expect(await provider.parkForHuman("a", "TEAM", "implementation")).toBe(false);
       });
     });
 
@@ -128,6 +147,45 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         const provider = await factory({ initialIssues: [] });
         expect(await provider.findByKey("UNKNOWN-99999")).toBeNull();
       });
+    });
+  });
+}
+
+/** Creation adapters inspect native parent/scope and pickup fields where lookup omits them. */
+export function runChildIssueContract(label: string, factory: () => Promise<{
+  provider: TicketingProvider;
+  parentId: string;
+  scopeKey: string;
+  inspect: (identity: { id: string; identifier: string }) => Promise<{
+    title: string; body: string; parentId: string; scopeKey: string; pickupReady: boolean;
+  }>;
+}>): void {
+  describe(`TicketingProvider child creation: ${label}`, () => {
+    it("creates a distinct child with the supplied content, parent, scope and pickup signal", async () => {
+      const { provider, parentId, scopeKey, inspect } = await factory();
+      const identity = await provider.createChildIssue(parentId, scopeKey, { title: "Blocking finding", body: "Fix the regression." });
+      expect(identity.id).toBeTruthy();
+      expect(identity.identifier).toBeTruthy();
+      expect(identity.id).not.toBe(parentId);
+      expect(await inspect(identity)).toEqual({
+        title: "Blocking finding", body: "Fix the regression.", parentId, scopeKey, pickupReady: true,
+      });
+    });
+  });
+}
+
+/** Provider adapters verify the native writes and comments, including absence of terminal writes. */
+export function runPrClosedUnmergedContract(label: string, factory: (terminal: boolean) => Promise<{
+  provider: TicketingProvider; issueId: string; scopeKey: string;
+  verify: (terminal: boolean, comment: string) => Promise<void>;
+  restartSentence: string;
+}>): void {
+  describe(`TicketingProvider unmerged close: ${label}`, () => {
+    it.each([false, true])("handles terminal=%s", async (terminal) => {
+      const { provider, issueId, scopeKey, verify, restartSentence } = await factory(terminal);
+      const url = "https://github.com/acme/widgets/pull/42";
+      expect(await provider.markPrClosedUnmerged(issueId, scopeKey, url)).toBe(!terminal);
+      await verify(terminal, `The pull request ${url} was closed without a merge. AI-Implement cancelled this issue. ${restartSentence}`);
     });
   });
 }

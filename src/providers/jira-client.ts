@@ -1,12 +1,13 @@
+import { defaultFetchSignal } from "../github.js";
+
 export interface JiraClientConfig {
   /** API token (used with Basic auth) or OAuth 2.0 access token (Bearer). */
   token: string;
   /**
    * Service-account email. When set, the client authenticates with Basic auth
-   * (email:token) against `siteUrl` — the durable API-token path for Jira
-   * Cloud (tokens from id.atlassian.com don't expire). When unset, it falls
-   * back to Bearer auth through the OAuth gateway (api.atlassian.com), which
-   * requires `cloudId`.
+   * (email:token) against `siteUrl`, with an API token from id.atlassian.com,
+   * which Atlassian caps at a year. When unset, it falls back to Bearer auth
+   * through the OAuth gateway (api.atlassian.com), which requires `cloudId`.
    */
   email?: string;
   /** Site base URL (https://<site>.atlassian.net). Required for Basic auth. */
@@ -25,6 +26,7 @@ export interface JiraComment {
   id: string;
   body: unknown; // ADF JSON
   created?: string; // ISO 8601 timestamp
+  author?: { displayName?: string } | null;
 }
 
 export interface JiraField {
@@ -48,6 +50,8 @@ export class JiraFieldNotSelectError extends Error {
     this.name = "JiraFieldNotSelectError";
   }
 }
+
+const SEARCH_PAGE_SIZE = 100;
 
 export class JiraClient {
   private readonly apiBase: string;
@@ -86,6 +90,7 @@ export class JiraClient {
           "Content-Type": "application/json",
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: defaultFetchSignal(),
       });
     } catch (err) {
       // Node/undici throws a generic "fetch failed" TypeError for anything below
@@ -136,7 +141,7 @@ export class JiraClient {
    * GET /search is deprecated). Pages with nextPageToken. Caps at MAX_PAGES.
    */
   async searchJql(jql: string, fields: string[]): Promise<JiraIssue[]> {
-    const PAGE_SIZE = 100;
+    const PAGE_SIZE = SEARCH_PAGE_SIZE;
     const MAX_PAGES = 20;
     const all: JiraIssue[] = [];
     let nextPageToken: string | undefined;
@@ -159,15 +164,67 @@ export class JiraClient {
     return all;
   }
 
-  /** Validate JQL without executing it via /rest/api/3/jql/parse. */
+  /**
+   * One page of POST /rest/api/3/search/jql. The caller owns the loop: pass the
+   * previous page's `nextPageToken` (omit for the first page); an absent token in
+   * the result means the last page. Same request body as `searchJql`.
+   */
+  async searchJqlPage(
+    jql: string,
+    fields: string[],
+    nextPageToken?: string,
+    maxResults = SEARCH_PAGE_SIZE,
+  ): Promise<{ issues: JiraIssue[]; nextPageToken?: string }> {
+    const body: Record<string, unknown> = { jql, fields, maxResults };
+    if (nextPageToken) body.nextPageToken = nextPageToken;
+    const res = await this.requestJson<{ issues?: JiraIssue[]; nextPageToken?: string }>(
+      "POST", "/rest/api/3/search/jql", body,
+    );
+    return { issues: res.issues ?? [], nextPageToken: res.nextPageToken || undefined };
+  }
+
+  /**
+   * Validate JQL without executing it via /rest/api/3/jql/parse. Jira answers 200 even for a
+   * rejected query and reports the problem in `queries[].errors` (syntax errors, unknown fields,
+   * a dropdown value with no matching option), so the body must be read, not just the status.
+   */
   async validateJql(jql: string): Promise<{ valid: true } | { valid: false; errors: string[] }> {
     try {
-      await this.request("POST", "/rest/api/3/jql/parse", { queries: [jql] });
-      return { valid: true };
+      const res = await this.requestJson<{ queries?: Array<{ errors?: string[] }> }>(
+        "POST", "/rest/api/3/jql/parse", { queries: [jql] },
+      );
+      const errors = res.queries?.[0]?.errors ?? [];
+      return errors.length > 0 ? { valid: false, errors } : { valid: true };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { valid: false, errors: [message] };
     }
+  }
+
+  async listCreateIssueTypes(projectId: string): Promise<Array<{ id: string; subtask: boolean; hierarchyLevel?: number }>> {
+    type IssueType = { id: string; subtask: boolean; hierarchyLevel?: number };
+    const types: IssueType[] = [];
+    for (;;) {
+      const page = await this.requestJson<{ issueTypes?: IssueType[]; values?: IssueType[]; total?: number; isLast?: boolean }>(
+        "GET", `/rest/api/3/issue/createmeta/${encodeURIComponent(projectId)}/issuetypes?startAt=${types.length}&maxResults=100`,
+      );
+      const batch = page.issueTypes ?? page.values ?? [];
+      types.push(...batch);
+      if (!batch.length || page.isLast === true || (page.total !== undefined ? types.length >= page.total : page.isLast !== false)) return types;
+    }
+  }
+
+  async listProjectIssueTypes(projectId: string): Promise<Array<{ id: string; hierarchyLevel: number }>> {
+    // Unlike create metadata, this endpoint includes each type's hierarchy level.
+    return this.requestJson("GET", `/rest/api/3/issuetype/project?projectId=${encodeURIComponent(projectId)}`);
+  }
+
+  async getProject(projectId: string): Promise<{ simplified: boolean }> {
+    return this.requestJson("GET", `/rest/api/3/project/${encodeURIComponent(projectId)}`);
+  }
+
+  async createIssue(fields: Record<string, unknown>): Promise<{ id: string; key: string }> {
+    return this.requestJson("POST", "/rest/api/3/issue", { fields });
   }
 
   async setField(issueKey: string, fieldId: string, value: unknown): Promise<void> {
@@ -213,31 +270,30 @@ export class JiraClient {
     return all;
   }
 
+  /**
+   * Proves the credentials with the cheapest call any account that can use Jira may make, needing only the
+   * `read:jira-work` scope the poll needs. Most reads answer a wrong or missing credential as an anonymous
+   * caller instead of refusing it, and this one refuses with 401.
+   */
+  async verifyCredentials(): Promise<void> {
+    await this.requestJson("GET", "/rest/api/3/resolution/search?maxResults=1");
+  }
+
   async listFields(): Promise<JiraField[]> {
     return this.requestJson<JiraField[]>("GET", "/rest/api/3/field");
   }
 
   /**
-   * Returns the merged option list for a select-type custom field.
+   * Returns the merged option list for a select-type custom field, every page of contexts and of options.
    * Throws JiraFieldNotSelectError if the field has no contexts (typically
    * means it is not a select / multi-select).
-   *
-   * Note: reads only the first page of contexts and the first page of options
-   * per context. Jira's default page size is 100, which is far above any
-   * realistic AI-Implement Repo or Status field. If a field exceeds that, the
-   * returned list will be silently truncated — add pagination if that becomes
-   * a real-world concern.
    */
   async getFieldOptions(fieldId: string): Promise<Array<{ id: string; value: string }>> {
     const id = encodeURIComponent(fieldId);
 
     let contexts: Array<{ id: string }>;
     try {
-      const res = await this.requestJson<{ values: Array<{ id: string }> }>(
-        "GET",
-        `/rest/api/3/field/${id}/context`,
-      );
-      contexts = res.values;
+      contexts = await this.allPages<{ id: string }>(`/rest/api/3/field/${id}/context`);
     } catch (err) {
       if (err instanceof JiraApiError && err.status === 404) {
         throw new JiraFieldNotSelectError(fieldId);
@@ -247,15 +303,24 @@ export class JiraClient {
 
     const merged = new Map<string, { id: string; value: string }>();
     for (const ctx of contexts) {
-      const ctxId = encodeURIComponent(ctx.id);
-      const optRes = await this.requestJson<{ values: Array<{ id: string; value: string }> }>(
-        "GET",
-        `/rest/api/3/field/${id}/context/${ctxId}/option`,
+      const options = await this.allPages<{ id: string; value: string }>(
+        `/rest/api/3/field/${id}/context/${encodeURIComponent(ctx.id)}/option`,
       );
-      for (const opt of optRes.values) {
+      for (const opt of options) {
         if (!merged.has(opt.id)) merged.set(opt.id, opt);
       }
     }
     return Array.from(merged.values());
+  }
+
+  /** Every page of a `startAt`-paged list. A page without `isLast` is taken as the last. */
+  private async allPages<T>(path: string): Promise<T[]> {
+    const all: T[] = [];
+    for (;;) {
+      // The first page needs no offset, since startAt defaults to 0.
+      const page = await this.requestJson<{ values: T[]; isLast?: boolean }>("GET", all.length === 0 ? path : `${path}?startAt=${all.length}`);
+      all.push(...page.values);
+      if (page.isLast !== false || page.values.length === 0) return all;
+    }
   }
 }

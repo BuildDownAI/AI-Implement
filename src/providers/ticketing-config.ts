@@ -1,4 +1,11 @@
 import type { ProviderId } from "./types.js";
+import { isAbsolute, normalize } from "node:path";
+
+export interface FilesystemMappingConfig {
+  kind: "filesystem";
+  /** Absolute directory on the local orchestrator host containing Markdown tickets. */
+  directory: string;
+}
 
 export interface LinearMappingConfig {
   kind: "linear";
@@ -9,11 +16,8 @@ export interface JiraMappingConfig {
   /** Scope JQL clause; orchestrator wraps with the AI-Implement Status filter. */
   jql: string;
   /**
-   * Option value of the AI-Implement Repo field that this mapping matches.
-   * NULL means derive it from the mapping's own `owner`/`repo` as "owner/repo",
-   * which is the convention almost every instance follows. Set it only when the
-   * repo field's options carry some other label. Read through
-   * {@link resolveRepoFieldValue} rather than directly, so the derived case works.
+   * Option value of the AI-Implement Repo field that this mapping matches, or null to match the
+   * mapping's own owner/repo. Read it through resolveRepoFieldValue, never directly.
    */
   repoFieldValue: string | null;
   /** Optional explicit customfield_NNNNN override for the status field. */
@@ -22,11 +26,36 @@ export interface JiraMappingConfig {
   repoFieldOverride?: string | null;
   /** Optional explicit customfield_NNNNN override for the profiles field. */
   profilesFieldOverride?: string | null;
+  /** Optional explicit customfield_NNNNN override for the base branch field. */
+  baseBranchFieldOverride?: string | null;
 }
 
-export type TicketingMappingConfig = LinearMappingConfig | JiraMappingConfig;
+export type TicketingMappingConfig = LinearMappingConfig | JiraMappingConfig | FilesystemMappingConfig;
 
 export const DEFAULT_TICKETING_CONFIG: LinearMappingConfig = { kind: "linear" };
+
+/**
+ * Normalizes a `*FieldOverride` value or the repoFieldValue from untrusted JSON:
+ * anything not a non-blank string becomes null, and a non-blank string is trimmed.
+ *
+ * Without this, a blank-but-present override survives validation and is then read
+ * as a literal Jira field id by resolveCustomFieldIds (src/providers/jira-fields.ts):
+ * - `""` is not nullish, so `overrides.statusOverride ?? lookup(STATUS_FIELD_NAME)`
+ *   yields `""` instead of falling back to discovery by name; profilesFieldId's
+ *   `=== null` guard is likewise skipped.
+ * - `"   "` is truthy, so the all-overrides-set short-circuit returns early and
+ *   listFields() is never called at all.
+ * Both leave the provider querying an empty or whitespace field id.
+ *
+ * The admin UI already normalizes with `|| null` at both call sites, so this closes
+ * the API path and puts the rule at the validation boundary rather than in two
+ * callers that have to remember it.
+ */
+function normalizeFieldOverride(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
 
 /**
  * Validates that the parsed JSON is a valid TicketingMappingConfig matching
@@ -45,6 +74,13 @@ export function validateTicketingConfig(provider: ProviderId, value: unknown): T
     throw new Error(`ticketingConfig.kind ("${obj.kind}") must match ticketingProvider ("${provider}")`);
   }
   if (provider === "linear") return { kind: "linear" };
+  if (provider === "filesystem") {
+    if (typeof obj.directory !== "string" || !obj.directory.trim() ||
+        !isAbsolute(obj.directory.trim()) || obj.directory.includes("\0")) {
+      throw new Error("Filesystem ticketingConfig requires an absolute directory on the local orchestrator host");
+    }
+    return { kind: "filesystem", directory: normalize(obj.directory.trim()) };
+  }
   if (provider === "jira") {
     if (typeof obj.jql !== "string" || obj.jql.trim() === "") {
       throw new Error("Jira ticketingConfig requires a non-empty jql string");
@@ -52,39 +88,22 @@ export function validateTicketingConfig(provider: ProviderId, value: unknown): T
     return {
       kind: "jira",
       jql: obj.jql,
-      // Absent or blank means "derive from owner/repo" - see resolveRepoFieldValue.
-      repoFieldValue:
-        typeof obj.repoFieldValue === "string" && obj.repoFieldValue.trim() !== ""
-          ? obj.repoFieldValue.trim()
-          : null,
-      statusFieldOverride: typeof obj.statusFieldOverride === "string" ? obj.statusFieldOverride : null,
-      repoFieldOverride: typeof obj.repoFieldOverride === "string" ? obj.repoFieldOverride : null,
-      profilesFieldOverride: typeof obj.profilesFieldOverride === "string" ? obj.profilesFieldOverride : null,
+      repoFieldValue: normalizeFieldOverride(obj.repoFieldValue),
+      statusFieldOverride: normalizeFieldOverride(obj.statusFieldOverride),
+      repoFieldOverride: normalizeFieldOverride(obj.repoFieldOverride),
+      profilesFieldOverride: normalizeFieldOverride(obj.profilesFieldOverride),
+      baseBranchFieldOverride: normalizeFieldOverride(obj.baseBranchFieldOverride),
     };
   }
   throw new Error(`Unknown provider for ticketingConfig: ${provider}`);
 }
 
 /**
- * The AI-Implement Repo field value this mapping matches issues on.
- *
- * Resolved at read time rather than stored, so the GitHub repo is entered once
- * (as owner/repo) and never duplicated into the ticketing config. An explicit
- * `repoFieldValue` still wins, for instances whose repo field options are
- * labelled with something other than "owner/repo".
- *
- * Takes the structural shape rather than importing RepoMapping, which would
- * close a cycle with config.ts.
+ * The AI-Implement Repo field value a mapping matches issues on: its stored repoFieldValue,
+ * or its owner/repo when none is stored. Takes the mapping's shape rather than RepoMapping,
+ * since config.ts imports this module.
  */
-export function resolveRepoFieldValue(mapping: {
-  owner: string;
-  repo: string;
-  ticketingConfig: TicketingMappingConfig;
-}): string {
+export function resolveRepoFieldValue(mapping: { owner: string; repo: string; ticketingConfig: TicketingMappingConfig }): string {
   const cfg = mapping.ticketingConfig;
-  if (cfg.kind === "jira") {
-    const explicit = cfg.repoFieldValue?.trim();
-    if (explicit) return explicit;
-  }
-  return `${mapping.owner}/${mapping.repo}`;
+  return cfg.kind === "jira" && cfg.repoFieldValue !== null ? cfg.repoFieldValue : `${mapping.owner}/${mapping.repo}`;
 }

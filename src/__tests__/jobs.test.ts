@@ -1,26 +1,23 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
 import type * as LogModule from "../log.js";
 import type * as DedupModule from "../dedup.js";
+import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let log: typeof LogModule;
 let dedup: typeof DedupModule;
+let queue: typeof CommentGapfillQueueModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `jobs-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  log.initLogTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ dedup, log, queue } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        queue: () => import("../comment-gapfill-queue.js"),
+      },
+    })
+  ).modules);
 });
 
 describe("jobs table", () => {
@@ -33,6 +30,57 @@ describe("jobs table", () => {
     const child = jobs.find((j) => j.id === childId);
     expect(parent?.groupingParent).toBe(true);
     expect(child?.groupingParent).toBe(false);
+  });
+
+  it("re-enqueues a gap-fill run that failed at push, once (AII-922)", async () => {
+    const prUrl = "https://github.com/org/repo/pull/7";
+    const fail = (jobId: number) => {
+      log.updateJobFailure(jobId, {
+        category: "auth", code: "GIT_AUTH", stage: "push", attempt: 1, retryable: false,
+        message: "denied", evidence: { truncated: false },
+      });
+      log.updateJobStatus(jobId, "failed", "failure", prUrl);
+    };
+    const dispatch = (rowId: number) => {
+      queue.markCommentGapfillProcessed(rowId, "dispatched");
+      return log.appendLog({ issueId: "i", repo: "org/repo", trigger: "comment", prUrl } as Parameters<typeof log.appendLog>[0]);
+    };
+
+    const rowId = queue.enqueueCommentGapfill({
+      owner: "org", repo: "repo", prNumber: 7, commentId: 3001, commenter: "alice", instruction: "fix it",
+    });
+    fail(dispatch(rowId));
+    const [retry] = queue.claimPendingCommentGapfills();
+    expect(retry.commenter).toBe(queue.PUSH_RETRY_COMMENTER);
+
+    fail(dispatch(retry.id));
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
+  it("does not re-enqueue a gap-fill run that failed outside push or with a conflict (AII-922)", async () => {
+    const prUrl = "https://github.com/org/repo/pull/8";
+    const failAt = (rowId: number, stage: "push" | "implement", category: "auth" | "transient" | "conflict") => {
+      queue.markCommentGapfillProcessed(rowId, "dispatched");
+      const jobId = log.appendLog({ issueId: "i", repo: "org/repo", trigger: "comment", prUrl } as Parameters<typeof log.appendLog>[0]);
+      log.updateJobFailure(jobId, {
+        category, code: "X", stage, attempt: 1, retryable: false, message: "m", evidence: { truncated: false },
+      });
+      log.updateJobStatus(jobId, "failed", "failure", prUrl);
+    };
+    const row = () => queue.enqueueCommentGapfill({
+      owner: "org", repo: "repo", prNumber: 8, commentId: 4001 + Math.floor(Math.random() * 1e6), commenter: "alice", instruction: "fix",
+    });
+    failAt(row(), "implement", "transient");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+    failAt(row(), "push", "conflict");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+
+    // A conflict-resolution row that dies at push is not replayed as a push retry either.
+    const conflictId = queue.enqueueConflictResolution({
+      owner: "org", repo: "repo", prNumber: 8, featureBranch: "ai-implement/feature/x",
+    });
+    failAt(conflictId, "push", "auth");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
   });
 
   it("appendLog creates a job with dispatched status and returns an id", () => {
@@ -235,7 +283,7 @@ describe("jobs table", () => {
   });
 
   it("getInFlightJobs returns only dispatched and running jobs", () => {
-    const id1 = log.appendLog({ issueId: "issue-1" });
+    log.appendLog({ issueId: "issue-1" });
     const id2 = log.appendLog({ issueId: "issue-2" });
     const id3 = log.appendLog({ issueId: "issue-3" });
 
@@ -261,7 +309,7 @@ describe("jobs table", () => {
   it("getUnnotifiedTerminalJobs returns terminal jobs that haven't been notified", () => {
     const id1 = log.appendLog({ issueId: "issue-1" });
     const id2 = log.appendLog({ issueId: "issue-2" });
-    const id3 = log.appendLog({ issueId: "issue-3" });
+    log.appendLog({ issueId: "issue-3" });
 
     log.updateJobStatus(id1, "completed", "success");
     log.updateJobStatus(id2, "failed", "failure");
@@ -382,7 +430,9 @@ describe("jobs table", () => {
   it("clears terminal nonces and allows their rows to be pruned", () => {
     const terminalId = log.appendLog({ issueId: "terminal-run", machineNonce: "terminal-nonce" });
     log.updateJobStatus(terminalId, "failed", "failure");
-    dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 0 WHERE id = ?").run(terminalId);
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 0, completed_at = 0 WHERE id = ?").run(terminalId);
+    // The trigger stamps the wall clock on the write above; pin the change time afterwards.
+    dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = 0 WHERE id = ?").run(terminalId);
 
     expect(log.getJobByNonce("terminal-nonce")).toBeNull();
     for (let i = 0; i < 501; i++) {
@@ -540,6 +590,31 @@ describe("schema migration", () => {
     expect(jobs[0].runId).toBeNull();
   });
 
+  it("migration only rewrites open GitHub Actions rows with no run id", () => {
+    const db = dedup.getDb();
+    const ins = db.prepare(
+      "INSERT INTO dispatch_log (issue_id, dispatched_at, status, conclusion, execution_mode) VALUES (?, ?, ?, ?, ?)",
+    );
+    const now = Date.now();
+    for (const st of ["failed", "completed", "timed_out", "review_failed", "dispatch-failed"]) {
+      ins.run(`closed-${st}`, now, st, "dispatch_rejected", "github-actions");
+    }
+    ins.run("open-dispatched", now, "dispatched", null, "github-actions");
+    ins.run("open-running", now, "running", null, null);
+    ins.run("fly-open", now, "running", null, "fly-machines");
+
+    log.initLogTable();
+
+    const byIssue = new Map(log.listLog().map((j) => [j.issueId, j]));
+    for (const st of ["failed", "completed", "timed_out", "review_failed", "dispatch-failed"]) {
+      expect(byIssue.get(`closed-${st}`)?.status).toBe(st);
+      expect(byIssue.get(`closed-${st}`)?.conclusion).toBe("dispatch_rejected");
+    }
+    expect(byIssue.get("open-dispatched")?.status).toBe("unknown");
+    expect(byIssue.get("open-running")?.status).toBe("unknown");
+    expect(byIssue.get("fly-open")?.status).toBe("running");
+  });
+
   it("backfills runner_mode column on existing tables and leaves legacy rows null", () => {
     // Insert a row before the runner_mode column would have existed.
     // The migration in ensureLogColumns should add the column; legacy rows
@@ -553,6 +628,39 @@ describe("schema migration", () => {
 
     const jobs = log.listLog();
     expect(jobs.find((j) => j.issueId === "legacy")?.runnerMode).toBeNull();
+  });
+});
+
+describe("listLog evidence stripping", () => {
+  it("strips evidence tails in listLog() but keeps them on a single-job read", () => {
+    const dispatchId = "dispatch-evidence-1";
+    const jobId = log.appendLog({ issueId: "issue-evidence", dispatchId });
+    log.updateJobFailure(jobId, {
+      category: "crash",
+      code: "PROCESS_EXIT_NONZERO",
+      stage: "push",
+      attempt: 1,
+      retryable: false,
+      message: "boom",
+      evidence: {
+        stdoutTail: "a".repeat(100),
+        stderrTail: "b".repeat(100),
+        truncated: false,
+        llmSubtype: null,
+        llmIsError: null,
+      },
+    });
+
+    const listed = log.listLog().find((j) => j.id === jobId);
+    expect(listed?.failure?.category).toBe("crash");
+    expect(listed?.failure?.code).toBe("PROCESS_EXIT_NONZERO");
+    expect(listed?.failure?.stage).toBe("push");
+    expect(listed?.failure?.evidence.stdoutTail).toBeUndefined();
+    expect(listed?.failure?.evidence.stderrTail).toBeUndefined();
+
+    const single = log.getJobByDispatchId(dispatchId);
+    expect(single?.failure?.evidence.stdoutTail).toBe("a".repeat(100));
+    expect(single?.failure?.evidence.stderrTail).toBe("b".repeat(100));
   });
 });
 
@@ -579,6 +687,19 @@ describe("getJobById", () => {
 });
 
 describe("getPulls", () => {
+  it("carries reviewer failure classification without raw log tails", () => {
+    const id = log.appendLog({ issueId: "review-incomplete", issueIdentifier: "ENG-9" });
+    log.updateJobStatus(id, "review_failed", "REVIEWER_TURNS_EXHAUSTED", "https://github.com/org/repo/pull/9");
+    log.updateJobFailure(id, {
+      category: "invalid_output", code: "REVIEWER_TURNS_EXHAUSTED", stage: "post-push-review", attempt: 1,
+      retryable: false, reviewMaxTurns: 30, message: "Turn limit reached", evidence: { stderrTail: "private logs", truncated: false },
+    });
+    const [pull] = log.getPulls();
+    expect(pull.conclusion).toBe("REVIEWER_TURNS_EXHAUSTED");
+    expect(pull.failure).toMatchObject({ code: "REVIEWER_TURNS_EXHAUSTED", reviewMaxTurns: 30 });
+    expect(pull.failure?.evidence.stderrTail).toBeUndefined();
+  });
+
   it("returns one entry per unique prUrl, latest wins", () => {
     const id1 = log.appendLog({
       issueId: "issue-pr-1",
@@ -674,5 +795,99 @@ describe("stuck_attempts counter", () => {
     expect(log.incrementStuckAttempts(id)).toBe(2);
     log.resetStuckAttempts(id);
     expect(log.getStuckAttempts(id)).toBe(0);
+  });
+});
+
+describe("per-job accounting columns", () => {
+  const NEW_COLUMNS = ["tracker_kind", "issue_url", "machine_cpu_kind", "machine_cpus", "machine_memory_mb", "compute_started_at", "compute_stopped_at"];
+  const columns = () => (dedup.getDb().prepare("PRAGMA table_info(dispatch_log)").all() as Array<{ name: string; notnull: number }>);
+  const row = (id: number) => dedup.getDb().prepare("SELECT * FROM dispatch_log WHERE id = ?").get(id) as Record<string, unknown>;
+
+  it("creates nullable columns, and a second init changes nothing", () => {
+    const before = columns();
+    for (const name of NEW_COLUMNS) expect(before.find((c) => c.name === name)?.notnull).toBe(0);
+    log.initLogTable();
+    expect(columns()).toEqual(before);
+  });
+
+  it("adds the columns to an old table, leaving old rows null", () => {
+    const db = dedup.getDb();
+    // The guarded trigger's WHEN names these columns, so SQLite refuses to drop them while it exists; boot recreates it.
+    db.exec("DROP TRIGGER trg_dispatch_log_changed_at");
+    for (const name of NEW_COLUMNS) db.exec(`ALTER TABLE dispatch_log DROP COLUMN ${name}`);
+    db.prepare("INSERT INTO dispatch_log (issue_id, dispatched_at) VALUES ('old', ?)").run(Date.now());
+    log.initLogTable();
+    log.initLogTable();
+    const names = columns().map((c) => c.name);
+    for (const name of NEW_COLUMNS) expect(names).toContain(name);
+    const old = db.prepare("SELECT * FROM dispatch_log WHERE issue_id = 'old'").get() as Record<string, unknown>;
+    for (const name of NEW_COLUMNS) expect(old[name]).toBeNull();
+  });
+
+  it("adds late_review_head_sha as a nullable column to an old table, idempotently, outside the accounting trigger (AII-1596)", () => {
+    const db = dedup.getDb();
+    db.exec("DROP TRIGGER trg_dispatch_log_changed_at");
+    db.exec("ALTER TABLE dispatch_log DROP COLUMN late_review_head_sha");
+    db.prepare("INSERT INTO dispatch_log (issue_id, dispatched_at) VALUES ('old-head', ?)").run(Date.now());
+    log.initLogTable();
+    log.initLogTable();
+    const col = columns().find((c) => c.name === "late_review_head_sha");
+    expect(col?.notnull).toBe(0);
+    expect((db.prepare("PRAGMA table_info(dispatch_log)").all() as Array<{ name: string; type: string }>).find((c) => c.name === "late_review_head_sha")?.type).toBe("TEXT");
+    const old = db.prepare("SELECT * FROM dispatch_log WHERE issue_id = 'old-head'").get() as Record<string, unknown>;
+    expect(old.late_review_head_sha).toBeNull();
+    const id = old.id as number;
+    db.prepare("UPDATE dispatch_log SET changed_at = 0 WHERE id = ?").run(id);
+    log.setLateReviewHeadSha(id, "a".repeat(40));
+    expect(row(id).late_review_head_sha).toBe("a".repeat(40));
+    expect(row(id).changed_at).toBe(0);
+  });
+
+  it("saves tracker kind, issue URL, size and start on append", () => {
+    const id = log.appendLog({
+      issueId: "i", trackerKind: "linear", issueUrl: "https://linear.app/x/issue/A-1",
+      machineSize: { cpuKind: "shared", cpus: 4, memoryMb: 8192 }, computeStartedAt: 1000,
+    });
+    expect(row(id)).toMatchObject({
+      tracker_kind: "linear", issue_url: "https://linear.app/x/issue/A-1",
+      machine_cpu_kind: "shared", machine_cpus: 4, machine_memory_mb: 8192, compute_started_at: 1000, compute_stopped_at: null,
+    });
+    expect(row(log.appendLog({ issueId: "j" })).tracker_kind).toBeNull();
+  });
+
+  it("stamps the stop once per machine; a gone backend falls back to completed_at", () => {
+    const id = log.appendLog({ issueId: "i", machineId: "m1", computeStartedAt: 1000 });
+    log.recordComputeStoppedByMachine("m1", { at: 5000 });
+    log.recordComputeStoppedByMachine("m1", { at: 9000 });
+    log.recordComputeStoppedByMachine("m1", { gone: true, at: 9500 });
+    expect(row(id).compute_stopped_at).toBe(5000);
+
+    const other = log.appendLog({ issueId: "k", machineId: "m2" });
+    dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = 7000 WHERE id = ?").run(other);
+    log.recordComputeStoppedByMachine("m2", { gone: true, at: 9500 });
+    expect(row(other).compute_stopped_at).toBe(7000);
+  });
+
+  it("stamps only the newest open row of a reused machine", () => {
+    const first = log.appendLog({ issueId: "i", machineId: "m" });
+    log.recordComputeStoppedByMachine("m", { at: 100 });
+    const second = log.appendLog({ issueId: "i", machineId: "m" });
+    log.recordComputeStoppedByMachine("m", { at: 200 });
+    expect(row(first).compute_stopped_at).toBe(100);
+    expect(row(second).compute_stopped_at).toBe(200);
+  });
+
+  it("records GHA times as epoch ms only once the run is completed, first stop wins", () => {
+    const id = log.appendLog({ issueId: "i" });
+    log.updateJobRunId(id, 77);
+    const times = { run_started_at: "2026-10-26T10:00:00Z", updated_at: "2026-10-26T10:05:00Z" };
+    log.recordGhaRunCompleted(77, { status: "in_progress", ...times });
+    expect(row(id).compute_stopped_at).toBeNull();
+    log.recordGhaRunCompleted(77, { status: "completed", ...times });
+    log.recordGhaRunCompleted(77, { status: "completed", run_started_at: times.run_started_at, updated_at: "2026-10-26T11:00:00Z" });
+    expect(row(id)).toMatchObject({
+      compute_started_at: Date.parse(times.run_started_at), compute_stopped_at: Date.parse(times.updated_at),
+      machine_cpus: null, machine_memory_mb: null,
+    });
   });
 });

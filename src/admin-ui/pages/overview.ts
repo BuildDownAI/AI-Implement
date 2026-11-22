@@ -6,14 +6,15 @@ export const overviewHtml = `
       <div class="page-subtitle" id="overview-subtitle">&mdash;</div>
     </div>
     <div class="page-header-actions">
+      <button class="btn btn-sm" id="overview-poll-now" onclick="pollNowClick()">&#9889; Poll now</button>
       <button class="btn btn-sm" onclick="loadOverview()">&#8635; Refresh</button>
     </div>
   </header>
   <div class="page-body">
 
-    <!-- Environment status pills -->
-    <div id="overview-env-status" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
-      <!-- populated by loadEnvStatus() -->
+    <!-- The last setup-check run in one line, linking to the Setup page -->
+    <div id="overview-setup-status" class="text-secondary" style="margin-bottom:16px;font-size:0.9em">
+      <!-- populated by loadSetupStatus() -->
     </div>
 
     <!-- Stale-template alert (hidden when everything is current) -->
@@ -89,6 +90,7 @@ export const overviewHtml = `
         <div class="card-body">
           <div id="overview-atcap-body" style="display:flex;flex-direction:column;gap:8px"></div>
           <div id="overview-atcap-empty" class="hidden text-tertiary" style="padding:4px 0">All projects have available capacity. <a href="#blockers" onclick="window.navigate('blockers');return false" style="color:var(--accent)">View blockers page</a> for more details.</div>
+          <div id="overview-atcap-unavailable" class="hidden text-tertiary" style="padding:4px 0">Capacity data is unavailable right now &mdash; team status can&rsquo;t be determined.</div>
         </div>
       </div>
     </div>
@@ -135,24 +137,6 @@ export const overviewHtml = `
 
 export const overviewScript = `
 (function () {
-  function fmtAgo(ts) {
-    const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
-    if (s < 60) return s + 's ago';
-    const m = Math.floor(s / 60);
-    if (m < 60) return m + 'm ago';
-    const h = Math.floor(m / 60);
-    return h + 'h ago';
-  }
-
-  function fmtDuration(ms) {
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return s + 's';
-    const m = Math.floor(s / 60);
-    if (m < 60) return m + 'm ' + (s % 60) + 's';
-    const h = Math.floor(m / 60);
-    return h + 'h ' + (m % 60) + 'm';
-  }
-
   function sparkline(values) {
     if (!values || values.length === 0) {
       return '<div class="text-tertiary" style="font-size:11px">no data</div>';
@@ -181,11 +165,42 @@ export const overviewScript = `
       + '</div>';
   }
 
-  function statusBadge(status) {
-    const map = { running: 'running', review_failed: 'warn', failed: 'fail', 'dispatch-failed': 'fail', completed: 'success' };
+  function capacityMeterUnavailable() {
+    return '<span class="text-tertiary" style="font-size:11px">unavailable</span>';
+  }
+
+  // Reservation-backed totals from the /api/blockers capacity projection
+  // (src/admin.ts#buildCapacityByMapping) — never derived by filtering the job log,
+  // so a prepared/unknown/stopping reservation with no visible running row still
+  // counts as used, and a stranded tracker label can never mask real capacity.
+  function capacityAtCapTeams(capacityByMapping) {
+    return Object.entries(capacityByMapping).filter(function (pair) {
+      return pair[1].used >= pair[1].cap;
+    });
+  }
+
+  function isReviewIncomplete(e) {
+    if (!e || e.status !== 'review_failed') return false;
+    const failure = e.failure;
+    const code = failure && typeof failure.code === 'string' ? failure.code : e.conclusion;
+    const stage = failure && typeof failure.stage === 'string' ? failure.stage : '';
+    return code === 'REVIEWER_TURNS_EXHAUSTED'
+      || code === 'invalid_review'
+      || code === 'review_invalid'
+      || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
+  }
+
+  function jobStatusBadge(status, entry) {
+    const map = { running: 'running', review_failed: 'warn', timed_out: 'warn', failed: 'fail', 'dispatch-failed': 'fail', completed: 'success' };
     const kind = map[status] || 'neutral';
-    const label = status === 'review_failed' ? 'review failed' : status === 'dispatch-failed' ? 'dispatch failed' : status;
-    return '<span class="badge ' + kind + '">' + window.esc(label) + '</span>';
+    const label = isReviewIncomplete(entry)
+      ? 'review incomplete'
+      : status === 'review_failed'
+        ? 'review failed'
+        : status === 'dispatch-failed'
+          ? 'dispatch failed'
+          : status;
+    return window.statusBadge(kind, label);
   }
 
   function dispatch24hBuckets(log) {
@@ -205,28 +220,14 @@ export const overviewScript = `
   function renderHeaderSubtitle(reaper) {
     const el = document.getElementById('overview-subtitle');
     if (!el) return;
-    el.textContent = 'last sweep ' + (reaper.lastSweepAt ? fmtAgo(reaper.lastSweepAt) : 'never');
+    el.textContent = 'last sweep ' + (reaper.lastSweepAt ? window.fmtAgo(reaper.lastSweepAt) : 'never');
   }
 
-  function renderKpis(log, mappings, running) {
+  function renderKpis(log, running, capacityByMapping) {
     const now = Date.now();
     const failed24h = log.filter(function (e) {
-      return (e.status === 'failed' || e.status === 'review_failed') && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && (e.conclusion === 'stuck_giveup' || e.conclusion === 'stuck_review_fix'))) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     });
-
-    const mappingEntries = Object.entries(mappings);
-    const sumMax = mappingEntries.reduce(function (acc, pair) {
-      return acc + (pair[1].maxInProgressAiIssues != null ? pair[1].maxInProgressAiIssues : 3);
-    }, 0);
-    const pct = sumMax > 0 ? Math.round((running.length / sumMax) * 100) : 0;
-
-    const atCapCount = mappingEntries.filter(function (pair) {
-      const key = pair[0];
-      const m = pair[1];
-      const cap = m.maxInProgressAiIssues != null ? m.maxInProgressAiIssues : 3;
-      const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
-      return cnt >= cap;
-    }).length;
 
     const teams = new Set(running.filter(function (r) { return r.teamKey; }).map(function (r) { return r.teamKey; }));
 
@@ -236,14 +237,31 @@ export const overviewScript = `
     if (rs) rs.textContent = 'across ' + teams.size + ' team' + (teams.size === 1 ? '' : 's');
 
     const cv = document.getElementById('kpi-capacity-value');
-    if (cv) cv.textContent = String(running.length);
     const cu = document.getElementById('kpi-capacity-unit');
-    if (cu) cu.textContent = '/ ' + sumMax;
     const cs = document.getElementById('kpi-capacity-sub');
-    if (cs) cs.textContent = pct + '% of total slots';
-
     const bv = document.getElementById('kpi-blocked-value');
-    if (bv) bv.textContent = String(atCapCount);
+    const bs = document.getElementById('kpi-blocked-sub');
+
+    if (!capacityByMapping) {
+      // Missing/failed capacity projection is unavailable, never rendered as 0/free.
+      if (cv) cv.textContent = '—';
+      if (cu) cu.textContent = '';
+      if (cs) cs.textContent = 'Capacity data unavailable';
+      if (bv) bv.textContent = '—';
+      if (bs) bs.textContent = 'Capacity data unavailable';
+    } else {
+      const capacityEntries = Object.values(capacityByMapping);
+      const sumUsed = capacityEntries.reduce(function (acc, c) { return acc + c.used; }, 0);
+      const sumCap = capacityEntries.reduce(function (acc, c) { return acc + c.cap; }, 0);
+      const pct = sumCap > 0 ? Math.round((sumUsed / sumCap) * 100) : 0;
+      const atCapCount = capacityAtCapTeams(capacityByMapping).length;
+
+      if (cv) cv.textContent = String(sumUsed);
+      if (cu) cu.textContent = '/ ' + sumCap;
+      if (cs) cs.textContent = pct + '% of total slots';
+      if (bv) bv.textContent = String(atCapCount);
+      if (bs) bs.textContent = 'at concurrency cap';
+    }
 
     const fv = document.getElementById('kpi-failed-value');
     if (fv) fv.textContent = String(failed24h.length);
@@ -271,32 +289,36 @@ export const overviewScript = `
       tr.style.cursor = 'pointer';
       const issueLabel = e.issueIdentifier || e.issueId || '—';
       const title = e.issueTitle ? window.esc(e.issueTitle) : '';
-      const duration = e.dispatchedAt ? fmtDuration(now - new Date(e.dispatchedAt).getTime()) : '—';
+      const duration = e.dispatchedAt ? window.fmtDuration(now - new Date(e.dispatchedAt).getTime()) : '—';
       tr.innerHTML = '<td class="col-grow">'
         + '<div><span class="mono" style="color:var(--fg-tertiary);margin-right:8px">' + window.esc(issueLabel) + '</span>'
         + (title ? '<span>' + title + '</span>' : '') + '</div>'
         + '<div style="font-size:11px;color:var(--fg-tertiary);margin-top:2px">'
         + window.esc(e.teamKey || '—') + ' &middot; ' + window.esc(e.repo || '—')
         + '</div></td>'
-        + '<td>' + statusBadge(e.status) + '</td>'
+        + '<td>' + jobStatusBadge(e.status, e) + '</td>'
         + '<td style="text-align:right" class="mono text-secondary">' + duration + '</td>';
       tbody.appendChild(tr);
     });
   }
 
-  function renderAtCapacity(running, mappings) {
+  function renderAtCapacity(capacityByMapping) {
     const body = document.getElementById('overview-atcap-body');
     const empty = document.getElementById('overview-atcap-empty');
+    const unavailable = document.getElementById('overview-atcap-unavailable');
     const subtitle = document.getElementById('overview-atcap-subtitle');
     if (!body || !empty) return;
     body.innerHTML = '';
-    const atCap = Object.entries(mappings).filter(function (pair) {
-      const key = pair[0];
-      const m = pair[1];
-      const cap = m.maxInProgressAiIssues != null ? m.maxInProgressAiIssues : 3;
-      const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
-      return cnt >= cap;
-    });
+
+    if (!capacityByMapping) {
+      empty.classList.add('hidden');
+      if (unavailable) unavailable.classList.remove('hidden');
+      if (subtitle) subtitle.textContent = 'Capacity data unavailable';
+      return;
+    }
+    if (unavailable) unavailable.classList.add('hidden');
+
+    const atCap = capacityAtCapTeams(capacityByMapping);
     if (subtitle) subtitle.textContent = atCap.length + ' team' + (atCap.length === 1 ? '' : 's') + ' at cap';
     if (atCap.length === 0) {
       empty.classList.remove('hidden');
@@ -305,12 +327,10 @@ export const overviewScript = `
     empty.classList.add('hidden');
     atCap.forEach(function (pair) {
       const key = pair[0];
-      const m = pair[1];
-      const cap = m.maxInProgressAiIssues != null ? m.maxInProgressAiIssues : 3;
-      const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
+      const c = pair[1];
       const div = document.createElement('div');
       div.innerHTML = '<span class="mono">' + window.esc(key) + '</span> '
-        + '<span class="text-secondary">at capacity (' + cnt + '/' + cap + ')</span>';
+        + '<span class="text-secondary">at capacity (' + c.used + '/' + c.cap + ')</span>';
       body.appendChild(div);
     });
   }
@@ -321,7 +341,7 @@ export const overviewScript = `
     if (!tbody || !empty) return;
     const now = Date.now();
     const failures = log.filter(function (e) {
-      return (e.status === 'failed' || e.status === 'review_failed') && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && (e.conclusion === 'stuck_giveup' || e.conclusion === 'stuck_review_fix'))) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     }).sort(function (a, b) {
       return new Date(b.dispatchedAt).getTime() - new Date(a.dispatchedAt).getTime();
     }).slice(0, 8);
@@ -337,9 +357,10 @@ export const overviewScript = `
       tr.style.cursor = 'pointer';
       const issueLabel = e.issueIdentifier || e.issueId || '—';
       const failedAt = e.dispatchedAt ? new Date(e.dispatchedAt).toLocaleString() : '—';
-      const when = e.dispatchedAt ? fmtAgo(e.dispatchedAt) : '—';
+      const when = e.dispatchedAt ? window.fmtAgo(e.dispatchedAt) : '—';
       tr.innerHTML = '<td class="col-grow"><span class="mono text-secondary">' + window.esc(issueLabel) + '</span>'
-        + (e.issueTitle ? ' <span>' + window.esc(e.issueTitle) + '</span>' : '') + '</td>'
+        + (e.issueTitle ? ' <span>' + window.esc(e.issueTitle) + '</span>' : '')
+        + ' <span style="margin-left:6px">' + jobStatusBadge(e.status, e) + '</span></td>'
         + '<td class="mono text-tertiary" style="white-space:nowrap">' + failedAt + '</td>'
         + '<td style="text-align:right" class="mono text-tertiary">' + when + '</td>';
       tbody.appendChild(tr);
@@ -361,7 +382,7 @@ export const overviewScript = `
     });
   }
 
-  function renderProjectGrid(log, mappings) {
+  function renderProjectGrid(mappings, capacityByMapping) {
     const tbody = document.getElementById('overview-projects-body');
     const empty = document.getElementById('overview-projects-empty');
     if (!tbody || !empty) return;
@@ -372,52 +393,48 @@ export const overviewScript = `
       return;
     }
     empty.classList.add('hidden');
-    const running = log.filter(function (e) { return e.status === 'running'; });
     entries.forEach(function (pair) {
       const key = pair[0];
       const m = pair[1];
-      const cap = m.maxInProgressAiIssues != null ? m.maxInProgressAiIssues : 3;
-      const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
+      const c = capacityByMapping ? capacityByMapping[key] : null;
       const isFly = m.executionMode === 'fly-machines';
       const runnerKind = isFly ? 'success' : 'info';
       const runnerLabel = isFly ? 'fly' : 'gha';
       const tr = document.createElement('tr');
       tr.innerHTML = '<td><span class="mono" style="font-weight:600">' + window.esc(key) + '</span></td>'
         + '<td class="mono text-secondary">' + window.esc((m.owner || '?') + '/' + (m.repo || '?')) + '</td>'
-        + '<td><span class="badge ' + runnerKind + '">' + runnerLabel + '</span></td>'
+        + '<td>' + window.labelBadge(runnerKind, runnerLabel) + '</td>'
         + '<td class="text-secondary">' + window.esc(m.provider || 'anthropic') + '</td>'
-        + '<td>' + capacityMeter(cnt, cap) + '</td>'
+        + '<td>' + (c ? capacityMeter(c.used, c.cap) : capacityMeterUnavailable()) + '</td>'
         + '<td style="text-align:right" class="mono text-secondary">&mdash;</td>';
       tbody.appendChild(tr);
     });
   }
 
-  function renderEnvStatus(status) {
-    const container = document.getElementById('overview-env-status');
-    if (!container) return;
-    const pills = [
-      { label: 'Linear', on: !!status.linear, hint: 'LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET' },
-      { label: 'Jira', on: !!status.jira, hint: 'JIRA_TOKEN + JIRA_SITE_URL + (JIRA_EMAIL or JIRA_CLOUD_ID)' },
-      { label: 'Runner callback', on: !!status.runnerCallback, hint: 'RUNNER_CALLBACK_BASE_URL + RUNNER_TOKEN_SECRET' },
-      { label: 'Gap-fill trigger', on: !!status.gapFillTrigger, hint: 'GAP_FILL_TRIGGER_SECRET' },
-    ];
-    container.innerHTML = pills.map(function (p) {
-      const tint = p.on ? 'var(--st-ok-fg, #2a8)' : 'var(--text-tertiary, #888)';
-      const dot = p.on ? '●' : '○';
-      const text = p.label + ' ' + (p.on ? 'ON' : 'off');
-      return '<span title="' + window.escAttr(p.hint) + '" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border, #2a2a2a);border-radius:999px;font-size:0.85em;color:' + tint + '"><span style="font-size:0.7em">' + dot + '</span>' + window.esc(text) + '</span>';
-    }).join('');
+  // One line from GET /api/setup-checks: which groups the last run found failing, in the route's group order,
+  // or why there is nothing to show.
+  function setupStatusText(data) {
+    if (!data) return 'Setup checks cannot be read right now.';
+    if (data.progress) return 'Setup checks are running.';
+    if (!data.run) return 'Setup checks have not run yet.';
+    const failing = Object.keys(data.groups).filter(function (group) {
+      return data.run.results.some(function (row) { return row.group === group && row.state === 'fail'; });
+    });
+    if (failing.length === 0) return 'No setup check fails.';
+    return 'Failing setup checks: ' + failing.map(function (group) { return data.groups[group]; }).join(', ') + '.';
   }
 
-  async function loadEnvStatus() {
+  async function loadSetupStatus() {
+    const el = document.getElementById('overview-setup-status');
+    if (!el) return;
+    let data = null;
     try {
-      const res = await window.api('/api/admin/config-status');
-      if (!res.ok) return;
-      const status = await res.json();
-      renderEnvStatus(status);
+      const res = await window.api('/api/setup-checks');
+      if (res.ok) data = await res.json();
     } catch (err) {
-      console.error('loadEnvStatus failed:', err);
+      console.error('loadSetupStatus failed:', err);
     }
+    el.innerHTML = window.esc(setupStatusText(data)) + ' <a href="#setup">Open Setup</a>';
   }
 
   function renderTemplateStatus(entries) {
@@ -449,12 +466,27 @@ export const overviewScript = `
     }
   }
 
+  // The capacity projection rides /api/blockers's capacityByMapping (same field
+  // blockers.ts reads), so both pages report identical at-cap teams without either
+  // recomputing it from the job log or a tracker label.
+  async function readCapacityByMapping(capacityRes) {
+    if (!capacityRes || !capacityRes.ok) return null;
+    try {
+      const data = await capacityRes.json();
+      if (!data || typeof data.capacityByMapping !== 'object' || data.capacityByMapping === null) return null;
+      return data.capacityByMapping;
+    } catch (err) {
+      return null;
+    }
+  }
+
   async function loadOverview() {
     try {
-      const [logRes, mappingsRes, reaperRes] = await Promise.all([
+      const [logRes, mappingsRes, reaperRes, capacityRes] = await Promise.all([
         window.api('/api/log'),
         window.api('/api/mappings'),
         window.api('/api/reaper/summary'),
+        window.api('/api/blockers').catch(function () { return null; }),
       ]);
       const log = await logRes.json();
       const mappings = await mappingsRes.json();
@@ -462,13 +494,14 @@ export const overviewScript = `
       const safeLog = Array.isArray(log) ? log : [];
       const safeMappings = mappings && typeof mappings === 'object' && !Array.isArray(mappings) ? mappings : {};
       const running = safeLog.filter(function (e) { return e.status === 'running'; });
+      const capacityByMapping = await readCapacityByMapping(capacityRes);
       renderHeaderSubtitle(reaper);
-      renderKpis(safeLog, safeMappings, running);
+      renderKpis(safeLog, running, capacityByMapping);
       renderRunningNow(running);
-      renderAtCapacity(running, safeMappings);
+      renderAtCapacity(capacityByMapping);
       renderRecentFailures(safeLog);
-      renderProjectGrid(safeLog, safeMappings);
-      loadEnvStatus();
+      renderProjectGrid(safeMappings, capacityByMapping);
+      loadSetupStatus();
       loadTemplateStatus();
     } catch (err) {
       console.error('loadOverview failed:', err);
@@ -476,6 +509,27 @@ export const overviewScript = `
   }
 
   window.loadOverview = loadOverview;
+
+  async function pollNowClick() {
+    const btn = document.getElementById('overview-poll-now');
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    try {
+      const res = await window.api('/api/poll-now', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) btn.textContent = (data && data.error) || 'Unavailable';
+      else btn.textContent = data.started ? 'Poll started' : 'Poll already running';
+    } catch (err) {
+      btn.textContent = 'Failed';
+      console.error('pollNow failed:', err);
+    }
+    setTimeout(function () {
+      btn.innerHTML = original;
+      btn.disabled = false;
+      loadOverview();
+    }, 2500);
+  }
+  window.pollNowClick = pollNowClick;
 
   window.registerPage('overview', function () {
     loadOverview();

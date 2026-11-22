@@ -1,0 +1,263 @@
+import { describe, expect, it } from "vitest";
+import vm from "node:vm";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { adminHtml } from "../index.js";
+import { themeJs } from "../theme.js";
+import { helpersJs } from "../helpers.js";
+import { authJs } from "../auth.js";
+import { routerJs } from "../router.js";
+import { overviewScript } from "../pages/overview.js";
+import { settingsScript } from "../pages/settings.js";
+import { projectsScript } from "../pages/projects.js";
+import { pipelinesScript } from "../pages/pipelines.js";
+import { reaperScript } from "../pages/reaper.js";
+import { sessionsScript } from "../pages/sessions.js";
+import { auditScript } from "../pages/audit.js";
+import { issuesScript } from "../pages/issues.js";
+import { pullsScript } from "../pages/pulls.js";
+import { blockersScript } from "../pages/blockers.js";
+import { customizationsScript } from "../pages/customizations.js";
+import { pipelinesAndStepsScript } from "../pages/pipelines-and-steps.js";
+import { modelsAndProvidersScript } from "../pages/models-and-providers.js";
+import { runnersScript } from "../pages/runners.js";
+import { reportsScript } from "../pages/reports.js";
+import { kgPipelinesScript } from "../pages/kg-pipelines.js";
+import { deploymentsScript } from "../pages/deployments.js";
+import { accessScript } from "../pages/access.js";
+import { setupScript } from "../pages/setup.js";
+import { drawerScript } from "../drawer.js";
+import { filesystemIssueScript } from "../filesystem-issue.js";
+import { localJobLogsScript } from "../local-job-logs.js";
+import { stepperScript } from "../stepper.js";
+import { SIDEBAR_ROUTES, sidebarHtml } from "../sidebar.js";
+
+/**
+ * Defence in depth against the 2026-09-05 lockout (AII-535):
+ *
+ * Layer 1 (this suite, element-level sweep): parse every <script> element that adminHtml
+ * actually emits — a syntax error in any element fails here before it reaches prod.
+ *
+ * Layer 2 (per-module named parse): parse each exported *Script string individually so a
+ * failure names the module ("overview") rather than "inline script 3".
+ *
+ * Layer 3 (poison isolation): verify that a deliberately broken page <script> does NOT
+ * prevent the auth/router elements from parsing — the structural property that would have
+ * prevented the lockout even if one script slipped through CI.
+ *
+ * Layer 4 (runtime containment): verify that the pageScript try-catch wrapper catches a
+ * runtime throw without propagating, and that the router's registerPage wrapper catches
+ * an init-callback throw without propagating to subsequent pages.
+ */
+
+// Every module adminHtml emits as a <script> element, in emitted order: the infrastructure, the pages, then the overlays.
+const MODULES: [string, string][] = [
+  ["theme", themeJs],
+  ["helpers", helpersJs],
+  ["auth", authJs],
+  ["router", routerJs],
+  ["overview", overviewScript],
+  ["settings", settingsScript],
+  ["projects", projectsScript],
+  ["pipelines", pipelinesScript],
+  ["reaper", reaperScript],
+  ["sessions", sessionsScript],
+  ["audit", auditScript],
+  ["issues", issuesScript],
+  ["pulls", pullsScript],
+  ["blockers", blockersScript],
+  ["customizations", customizationsScript],
+  ["pipelines-and-steps", pipelinesAndStepsScript],
+  ["models-and-providers", modelsAndProvidersScript],
+  ["runners", runnersScript],
+  ["reports", reportsScript],
+  ["kg-pipelines", kgPipelinesScript],
+  ["deployments", deploymentsScript],
+  ["access", accessScript],
+  ["setup", setupScript],
+  ["drawer", drawerScript],
+  ["filesystem-issue", filesystemIssueScript],
+  ["local-job-logs", localJobLogsScript],
+  ["stepper", stepperScript],
+];
+
+// ─── element-level sweep ─────────────────────────────────────────────────────
+
+describe("admin UI inline bundle", () => {
+  const scripts = [...adminHtml.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+
+  it("emits one inline script per module, each in an element of its own", () => {
+    // Merging modules back into one element would collapse the count, and a module added without its entry
+    // in MODULES fails here, so the per-module parse below cannot fall behind the page.
+    expect(scripts.length).toBe(MODULES.length);
+    for (const [name, src] of MODULES) expect(scripts.filter((element) => element.includes(src)), name).toHaveLength(1);
+  });
+
+  it("every emitted <script> element parses as valid JavaScript (a syntax error in one element stops only that element)", () => {
+    for (const [i, src] of scripts.entries()) {
+      expect(() => new vm.Script(src, { filename: `admin-inline-${i}.js` }), `inline script ${i}`).not.toThrow();
+    }
+  });
+});
+
+// ─── per-module named parse ───────────────────────────────────────────────────
+
+describe("per-module script parse", () => {
+  it.each(MODULES)("%s module parses as valid JavaScript", (name, src) => {
+    expect(() => new vm.Script(src, { filename: `${name}.js` })).not.toThrow();
+  });
+});
+
+// ─── poison isolation ─────────────────────────────────────────────────────────
+
+describe("structural isolation", () => {
+  it("helpers, auth and router scripts still parse when a page script element contains invalid JS", () => {
+    // This is the test that would have structurally prevented the 2026-09-05 lockout:
+    // with a single <script>, poisoning any content kills everything including login.
+    // With per-element isolation, only the poisoned element fails.
+    const elements = [...adminHtml.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    // Elements: 0=theme, 1=helpers, 2=auth, 3=router, 4+=page scripts
+    expect(elements.length).toBeGreaterThanOrEqual(5);
+    const poisoned = [...elements];
+    poisoned[4] = "this is }{{{ not valid JS";
+    // The poisoned element fails
+    expect(() => new vm.Script(poisoned[4])).toThrow();
+    // Infrastructure elements (theme, helpers, auth, router) are unaffected
+    expect(() => new vm.Script(poisoned[0]), "theme must survive").not.toThrow();
+    expect(() => new vm.Script(poisoned[1]), "helpers must survive").not.toThrow();
+    expect(() => new vm.Script(poisoned[2]), "auth must survive").not.toThrow();
+    expect(() => new vm.Script(poisoned[3]), "router must survive").not.toThrow();
+  });
+});
+
+// ─── pageScript name ↔ data-page route alignment ─────────────────────────────
+
+describe("pageScript name to data-page route alignment", () => {
+  // Sections that intentionally have no script wrapper (stub routes + utility page)
+  const UNSCRIPTED_ROUTES = new Set([
+    "no-access",
+    "channels", "policies", "secrets", "webhooks", "updates",
+  ]);
+
+  it("every scripted page section's data-page value has a matching pageScript(name) call", () => {
+    const sectionRoutes = [...adminHtml.matchAll(/<section[^>]*\sdata-page="([^"]+)"/g)].map((m) => m[1]);
+    const scriptedRoutes = sectionRoutes.filter((r) => !UNSCRIPTED_ROUTES.has(r));
+
+    // Names passed to markPageFailed come from the pageScript(name, ...) first argument
+    const failedPageNames = new Set(
+      [...adminHtml.matchAll(/markPageFailed\("([^"]+)"/g)].map((m) => m[1]),
+    );
+
+    for (const route of scriptedRoutes) {
+      expect(
+        failedPageNames.has(route),
+        `data-page="${route}" has no matching pageScript("${route}", ...) — name mismatch in index.ts`,
+      ).toBe(true);
+    }
+  });
+});
+
+// ─── runtime containment ──────────────────────────────────────────────────────
+
+describe("runtime error containment", () => {
+  it("pageScript-style try-catch wrapper catches a runtime throw and records it in failedPages", () => {
+    const failedPages: Record<string, unknown> = {};
+    const ctx = vm.createContext({
+      window: {
+        failedPages,
+        markPageFailed: (k: string, e: unknown) => {
+          failedPages[k] = e;
+        },
+      },
+      console: { error: () => {} },
+    });
+    // Simulate pageScript('boom-page', '(function(){ throw new Error("boom"); }())')
+    const wrapped = `try{(function(){ throw new Error("boom"); }())}catch(_e){window.markPageFailed&&window.markPageFailed("boom-page",_e);console.error("[admin-ui] page boom-page failed to register",_e);}`;
+    expect(() => new vm.Script(wrapped).runInContext(ctx)).not.toThrow();
+    // vm sandbox Error !== outer Error; check duck-type instead
+    expect(failedPages["boom-page"]).toBeTruthy();
+    expect((failedPages["boom-page"] as { message: string }).message).toBe("boom");
+  });
+
+  it("a throwing page IIFE does not prevent a later page script from running", () => {
+    const failedPages: Record<string, unknown> = {};
+    const registered: string[] = [];
+    const ctx = vm.createContext({
+      window: {
+        failedPages,
+        markPageFailed: (k: string, e: unknown) => {
+          failedPages[k] = e;
+        },
+        registerPage: (k: string) => {
+          registered.push(k);
+        },
+      },
+      console: { error: () => {} },
+    });
+    const throwing = `try{(function(){ throw new Error("p1 boom"); }())}catch(_e){window.markPageFailed&&window.markPageFailed("p1",_e);}`;
+    const working = `try{(function(){ window.registerPage("p2",function(){}); }())}catch(_e){window.markPageFailed&&window.markPageFailed("p2",_e);}`;
+    new vm.Script(throwing).runInContext(ctx);
+    new vm.Script(working).runInContext(ctx);
+    // vm sandbox Error !== outer Error; check duck-type instead
+    expect(failedPages["p1"]).toBeTruthy();
+    expect((failedPages["p1"] as { message: string }).message).toBe("p1 boom");
+    expect(registered).toContain("p2");
+  });
+
+  it("a page init that throws when called by the router is contained and does not propagate", () => {
+    const ctx = vm.createContext({
+      window: { addEventListener: () => {} },
+      document: {
+        querySelectorAll: (sel: string) => {
+          if (sel === ".nav-item:not([hidden])") return [{ getAttribute: () => "throwing-page" }];
+          return [];
+        },
+        querySelector: () => null,
+        addEventListener: () => {},
+      },
+      location: { hash: "#throwing-page" },
+      console: { error: () => {} },
+    });
+    new vm.Script(routerJs).runInContext(ctx);
+    // Register a page whose init throws — the router's registerPage wraps it in try-catch
+    new vm.Script(`window.registerPage("throwing-page", function(){ throw new Error("init boom"); });`).runInContext(ctx);
+    // startRouting triggers show("throwing-page") which calls the wrapped init — must not throw
+    expect(() => new vm.Script(`window.startRouting();`).runInContext(ctx)).not.toThrow();
+  });
+});
+
+describe("journal removal (AII-1262)", () => {
+  it("the admin bundle has no journal page, sidebar entry, or renderRestateJournal", () => {
+    const html = adminHtml;
+    expect(html).not.toContain('data-page="journal"');
+    expect(html).not.toContain("registerPage('journal'");
+    expect(html).not.toContain('registerPage("journal"');
+    expect(html).not.toContain("renderRestateJournal");
+    expect(sidebarHtml()).not.toContain("journal");
+    expect(SIDEBAR_ROUTES).not.toContain("journal");
+  });
+});
+
+// ─── module boundary ──────────────────────────────────────────────────────────
+
+describe("admin UI module boundary", () => {
+  // The server composes the admin page while its own modules load, so a page module that imports server
+  // code joins the server's import cycle: Node then throws "Cannot access … before initialization" at
+  // boot, while vitest's transform hides it by reading the export as undefined. Data a page needs comes
+  // from its route instead.
+  const adminUi = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const modules = readdirSync(adminUi, { recursive: true, encoding: "utf8" })
+    .filter((file) => file.endsWith(".ts") && !file.split(/[\\/]/).includes("__tests__"));
+
+  it.each(modules)("%s imports only other admin UI modules at runtime", (file) => {
+    const source = readFileSync(join(adminUi, file), "utf8");
+    // A runtime import in any form: with bindings, bare for its side effects, or re-exported, in either quote style.
+    const runtimeImport = /^(?:import\s+(?!type\b)(?:[^;]*?\sfrom\s+)?|export\s+(?!type\b)(?:\*|\{)[^;]*?\sfrom\s+)["']([^"']+)["']/gm;
+    const imports = [...source.matchAll(runtimeImport)].map((m) => m[1]);
+    for (const spec of imports) {
+      const target = resolve(dirname(join(adminUi, file)), spec);
+      expect(relative(adminUi, target).startsWith(".."), spec).toBe(false);
+    }
+  });
+});

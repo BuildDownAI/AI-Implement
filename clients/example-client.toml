@@ -4,14 +4,9 @@
 # File name = client slug (used for FLY_API_TOKEN_<SLUG> secret lookup).
 #
 # Copy this file to `<client-slug>.toml` and fill in the values.
-# Then:
-#   1. Create the Fly app:  fly apps create <app_name> --org <org>
-#   2. Add the volume:      fly volumes create dedup_data --size 1 --region <region> --app <app_name>
-#   3. Set secrets:         fly secrets set LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... GITHUB_APP_ID=... ... --app <app_name>
-#   4. Add a GitHub secret: FLY_API_TOKEN_<SLUG_UPPERCASE>=<fly-deploy-token>
-#   5. Commit and push — the deploy-clients.yml workflow will pick it up automatically.
-#
-# Or run scripts/provision-client.sh <client-slug> to be guided through all of this.
+# Run npm run provision-client -- <client-slug> for guided setup.
+# Client files stay local. The matrix workflow does not currently deploy them.
+# The command deploys from the checkout and prints any deferred commands.
 #
 # Session machines run Claude Code in ephemeral Fly containers.
 # The [sessions] org can differ from [fly] org for cost isolation —

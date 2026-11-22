@@ -1,5 +1,8 @@
 import { getDb } from "./dedup.js";
-import { notifyDeploy, type DeployNotification } from "./notify.js";
+import { notifyKgRecovery, notifyDeploy, type DeployNotification } from "./notify.js";
+import { CANARY_DEADLINE_MS, CANARY_RETRY_MS } from "./kg-refresh.js";
+import type { SidecarHealth } from "./kg-provider.js";
+import { sidecarHealthFields } from "./kg-provider.js";
 
 export interface BootStateInput {
   currentImageRef: string;
@@ -19,22 +22,21 @@ export interface DeployNotifyConfig {
   kgSidecarUrl: string | null;
 }
 
+/** The terminal SelfDeploy record, as far as this module reads it. Structural so this file never imports src/restate/. */
+export interface DeployRecordLike {
+  deployId: string;
+  phase: string;
+  target: { commit: string };
+  finishedAt: number | null;
+  reason: string | null;
+}
+
 export interface DeployOutcome {
-  kind: "deployed-ok" | "deployed-not-serving" | "build-failed";
+  kind: "deployed-ok" | "deployed-not-serving" | "build-failed" | "deploy-failed" | "deploy-cancelled";
   /** null when the image was not stamped with AI_IMPLEMENT_SOURCE_COMMIT at build time */
   commit: string | null;
   timestamp: number;
   detail?: string;
-}
-
-export interface DeployOutcomeInput {
-  holdWasSet: boolean;
-  prevImageRef: string | null;
-  currentImageRef: string;
-  /** Absent means the sidecar never came up — see decideDeployOutcome. */
-  kgSidecarUrl: string | null;
-  commit: string | null;
-  now: number;
 }
 
 const LAST_IMAGE_REF_KEY = "deploy_last_image_ref";
@@ -76,24 +78,12 @@ export function decideBootNotification(input: BootStateInput): BootDecision | nu
   return lastShutdownAt != null ? { kind: "restarted", downtimeMs } : null;
 }
 
-/**
- * Whether this boot is the far side of a self-deploy, and whether that release serves.
- *
- * docker-entrypoint.sh exports KG_SIDECAR_URL only after the sidecar answers its readiness
- * check, so an absent value here is the sidecar-less signal. Probing /mcp cannot substitute:
- * its 401 gate sits above the sidecar check, so an unauthenticated caller sees 401 either way.
- */
-export function decideDeployOutcome(input: DeployOutcomeInput): DeployOutcome | null {
-  const { holdWasSet, prevImageRef, currentImageRef, kgSidecarUrl, commit, now } = input;
-
-  // No hold means no deploy was in flight. A null or unchanged ref means this process
-  // was not replaced by one — a fresh volume, or a restart on the same version.
-  if (!holdWasSet) return null;
-  if (prevImageRef === null || prevImageRef === currentImageRef) return null;
-
-  return kgSidecarUrl
-    ? { kind: "deployed-ok", commit, timestamp: now }
-    : { kind: "deployed-not-serving", commit, timestamp: now, detail: "KG sidecar did not start" };
+/** Maps a terminal SelfDeploy record to the stored outcome; `detail` carries the reason code. */
+export function outcomeFromDeployRecord(record: DeployRecordLike): DeployOutcome {
+  const base = { commit: record.target.commit, timestamp: record.finishedAt ?? Date.now() };
+  if (record.phase === "succeeded") return { kind: "deployed-ok", ...base };
+  if (record.phase === "cancelled") return { kind: "deploy-cancelled", ...base };
+  return { kind: "deploy-failed", ...base, ...(record.reason ? { detail: record.reason } : {}) };
 }
 
 /** Present only inside a Fly Machine, so it doubles as the "this is a real deployment" gate. */
@@ -113,6 +103,8 @@ function describe(kind: DeployNotification["kind"], imageRef: string, downtimeMs
     imageRef,
     downtimeMs,
     kgDegraded: isKgDegraded(),
+    kgUnavailable: sidecarHealthFields().kgUnavailable,
+    sidecarError: sidecarHealthFields().sidecar.lastError,
   };
 }
 
@@ -154,9 +146,51 @@ export async function postShutdownNotice(config: DeployNotifyConfig): Promise<vo
   }
 }
 
+// Process-local, like sidecar health. Keep delivery ordering when a poll recovers during the send.
+let recoveryNotice: { delivered: Promise<boolean>; send: (signal: AbortSignal) => Promise<void> } | null = null;
+
+export function hasKgRecoveryNotice(): boolean {
+  return recoveryNotice !== null;
+}
+
+/** Abandon a recovery notice after its journaled delivery attempts are exhausted. */
+export function clearKgRecoveryNotice(): void {
+  recoveryNotice = null;
+}
+
+/** Bound both warning delivery ordering and the recovery HTTP request using the existing warm-up budget. */
+export async function postKgRecoveryNotice(deadlineMs = CANARY_DEADLINE_MS): Promise<void> {
+  const pending = recoveryNotice;
+  if (!pending) return;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error("KG recovery notice timed out");
+      reject(error);
+      controller.abort(error);
+    }, deadlineMs);
+  });
+  try {
+    // Race the ordering wait too: the original warning webhook may itself stall.
+    const delivered = await Promise.race([pending.delivered, deadline]);
+    if (!delivered) return;
+    await Promise.race([pending.send(controller.signal), deadline]);
+    if (recoveryNotice === pending) recoveryNotice = null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export interface BootWarmup {
+  probe: (remainingMs: number) => Promise<SidecarHealth>;
+  retryMs?: number;
+  deadlineMs?: number;
+}
+
 export async function postBootNotice(
   config: DeployNotifyConfig,
-  opts: { holdWasSet?: boolean } = {},
+  warmup?: BootWarmup,
 ): Promise<void> {
   const imageRef = flyImageRef();
   if (!imageRef) return;
@@ -170,15 +204,6 @@ export async function postBootNotice(
     now: Date.now(),
   });
 
-  const outcome = decideDeployOutcome({
-    holdWasSet: opts.holdWasSet ?? false,
-    prevImageRef,
-    currentImageRef: imageRef,
-    kgSidecarUrl: config.kgSidecarUrl,
-    commit: process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
-    now: Date.now(),
-  });
-
   // State advances even when nothing is posted, and even when the webhook is unset — otherwise
   // a run with notifications disabled would leave a stale ref and mis-classify the next boot.
   // Every write here stays above this function's first await: it is called fire-and-forget,
@@ -189,11 +214,47 @@ export async function postBootNotice(
   } catch (err) {
     console.error("[deploy-notify] failed to persist deploy state:", err);
   }
-  if (outcome) recordDeployOutcome(outcome);
 
   if (!decision || !config.notifyWebhookUrl) return;
   try {
-    await notifyDeploy(config.notifyType, config.notifyWebhookUrl, describe(decision.kind, imageRef, decision.downtimeMs));
+    const payload = describe(decision.kind, imageRef, decision.downtimeMs);
+    if (payload.kgUnavailable && warmup) {
+      let recordedHealth = sidecarHealthFields().sidecar;
+      const end = Date.now() + (warmup.deadlineMs ?? CANARY_DEADLINE_MS);
+      while (Date.now() < end) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(warmup.retryMs ?? CANARY_RETRY_MS, end - Date.now())));
+        const remaining = end - Date.now();
+        if (remaining <= 0) break;
+        const health = await warmup.probe(remaining);
+        recordedHealth = sidecarHealthFields().sidecar;
+        payload.kgUnavailable = health.lastError !== null;
+        payload.sidecarError = health.lastError;
+        if (!payload.kgUnavailable) break;
+      }
+      // A background or previously timed-out probe may finish during the final sleep.
+      // Only replace the injected probe result if the shared record changed afterward:
+      // injected probes need not update process-wide health.
+      const latest = sidecarHealthFields();
+      if (Object.keys(recordedHealth).some(key =>
+        latest.sidecar[key as keyof SidecarHealth] !== recordedHealth[key as keyof SidecarHealth])) {
+        payload.kgUnavailable = latest.kgUnavailable;
+        payload.sidecarError = latest.sidecar.lastError;
+      }
+    }
+    let delivered!: (ok: boolean) => void;
+    const pending = payload.kgUnavailable ? {
+      delivered: new Promise<boolean>(resolve => { delivered = resolve; }),
+      send: (signal: AbortSignal) => notifyKgRecovery(config.notifyWebhookUrl!, signal),
+    } : null;
+    recoveryNotice = pending;
+    try {
+      await notifyDeploy(config.notifyType, config.notifyWebhookUrl, payload);
+      delivered?.(true);
+    } catch (err) {
+      delivered?.(false);
+      if (recoveryNotice === pending) recoveryNotice = null;
+      throw err;
+    }
   } catch (err) {
     console.error("[deploy-notify] boot notice failed:", err);
   }
@@ -217,5 +278,29 @@ export async function postAvailableNotice(config: DeployNotifyConfig, commit: st
     });
   } catch (err) {
     console.error("[deploy-notify] availability notice failed:", err);
+  }
+}
+
+/**
+ * The SelfDeploy object's `onOutcome`: stores the outcome and announces an unsuccessful end. Runs in
+ * whichever process finishes the deploy (the new one, after a successful verify), so it reads only
+ * SQLite and env. It never throws — the object retries a throwing effect, which would repeat the notice.
+ */
+export async function onSelfDeployOutcome(config: DeployNotifyConfig, record: DeployRecordLike): Promise<void> {
+  const outcome = outcomeFromDeployRecord(record);
+  recordDeployOutcome(outcome);
+  console.log(`[self-deploy] ${record.deployId} outcome ${outcome.kind}${outcome.detail ? ` ${outcome.detail}` : ""}`);
+  if (record.phase === "succeeded" || !config.notifyWebhookUrl) return;
+  try {
+    await notifyDeploy(config.notifyType, config.notifyWebhookUrl, {
+      kind: outcome.kind === "deploy-cancelled" ? "deploy-cancelled" : "deploy-failed",
+      appName: process.env.FLY_APP_NAME || "orchestrator",
+      region: process.env.FLY_REGION || null,
+      imageRef: null,
+      commit: record.target.commit,
+      detail: outcome.detail ?? null,
+    });
+  } catch (err) {
+    console.error("[deploy-notify] deploy outcome notice failed:", err);
   }
 }

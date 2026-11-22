@@ -1,0 +1,427 @@
+/** Durable coordination for one already-admitted review-fix attempt (AII-796).
+ * SQLite and the worker/finalizer adapters own business state and external effects;
+ * Restate owns waits, replay, and stable step identities. This module is deliberately
+ * not registered at boot until AII-811 composes the production adapters. */
+import * as restate from "@restatedev/restate-sdk";
+import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
+import {
+  normalizeExecutionIdentity,
+  resultMatchesExecution,
+  sameExecution,
+  validateAttemptId,
+  validateReviewFixResultMetadata,
+  validateWorkerLaunchOutcome,
+  type AttemptId,
+  type ReviewFixResultMetadataV1,
+  type ResultIntakeOutcome,
+  type WorkerExecutionIdentity,
+  type WorkerLaunchOutcome,
+  type WorkerTerminalOutcome,
+} from "../review-fix-contract.js";
+import {
+  REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES,
+  type PreparedReviewFixAttempt,
+  type ReviewFixAttemptStorePort,
+  type ReviewFixFinalizerPort,
+  type ReviewFixFindingDisposition,
+  type ReviewFixWorkerPort,
+} from "../review-fix-ports.js";
+import { awaitOwnedRun } from "./owned-run-wait.js";
+import { recordUsage, type RecordedUsage } from "../agent-usage.js";
+import { acceptedReviewFixDispatchId } from "../review-fix-attempt-store.js";
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
+import { acceptOwnedRunReport, readOwnedRunStatus } from "./owned-run-lifecycle.js";
+import { reviewFixPRKey } from "./review-fix-pr.js";
+import { restateRetentionMs } from "./retention.js";
+
+const INSPECTION_INTERVAL_MS = 1_000;
+const RECONCILE_INTERVAL_MS = 1_000;
+const UNKNOWN_LAUNCH_GRACE_MS = 30 * 60_000;
+const POST_DEADLINE_RECONCILE_INTERVAL_MS = 5 * 60_000;
+const RUN_STATUS_TICK_MS = 60_000;
+
+/** The adapter supplying approval facts must read the current PR head and policy,
+ * including persisted result conflicts. None may be inferred from the runner result. */
+export interface ReviewFixApprovalEvidence {
+  currentPrHeadSha: string;
+  findingDispositions: readonly ReviewFixFindingDisposition[];
+  policyAllows: boolean;
+  /** Every required finding has a disposition. Kept apart from `policyAllows`, which is false while CI runs. */
+  dispositionsComplete: boolean;
+}
+
+export interface ReviewFixAttemptDependencies {
+  /** Test seam; production leaves it unset and reads `restate_retention_days` at build time. */
+  retentionMs?: number;
+  store: ReviewFixAttemptStorePort;
+  worker: ReviewFixWorkerPort;
+  finalizer: ReviewFixFinalizerPort;
+  loadApprovalEvidence(attempt: PreparedReviewFixAttempt, result: ReviewFixResultMetadataV1): Promise<ReviewFixApprovalEvidence>;
+  alert?(attemptId: AttemptId, reason: string): Promise<void>;
+  /** Production composition registers ReviewFixPR beside this workflow. Keep
+   * disabled for isolated workflow tests that register only ReviewFixAttempt. */
+  notifyPrOnCompletion?: boolean;
+  /** Overrides `REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES` (in milliseconds) for the
+   * uncertain-launch alert threshold. Production composition must leave this unset
+   * so the real two-minute threshold applies; a test exercising the alert
+   * deterministically (rather than waiting two real minutes) supplies a short
+   * value here, the same way a short `jobTimeoutMinutes` on an admission request
+   * shrinks `deadlineAt` without touching the production buffer constant. */
+  unknownLaunchAlertMs?: number;
+  /** Test timing overrides; production uses a fixed 30-minute grace and five-minute backoff.
+   * Scope callbacks must be pure: they are evaluated again on workflow replay. */
+  unknownLaunchGraceMs?: number | ((scope: PreparedReviewFixAttempt["scope"]) => number);
+  postDeadlineReconcileIntervalMs?: number | ((scope: PreparedReviewFixAttempt["scope"]) => number);
+  /** Test seam for how often the workflow reads the run's status while it waits; production leaves it unset (60 s). */
+  runStatusTickMs?: number;
+}
+
+type Wake =
+  | { kind: "result"; result: ReviewFixResultMetadataV1 }
+  | { kind: "cancel" }
+  | { kind: "conflict" };
+
+export type ReviewFixAttemptCompletion =
+  | { status: "finalized"; terminal: WorkerTerminalOutcome; approval: "applied" | "withheld" | "not_applicable"; approvalReason?: "terminal_result_head_mismatch" }
+  | { status: "launch_unresolved" }
+  | { status: "launch_rejected" }
+  | { status: "deadline_before_launch" }
+  | { status: "not_owner" };
+
+function validKey(key: string, attemptId: unknown): AttemptId {
+  const result = validateAttemptId(attemptId);
+  if (!result.ok || result.value !== key) {
+    throw new restate.TerminalError("review-fix attempt identity does not match workflow key");
+  }
+  return result.value;
+}
+
+function sameScope(a: PreparedReviewFixAttempt, b: ReviewFixResultMetadataV1): boolean {
+  return a.attemptId === b.attemptId && a.scope.installationId === b.installationId
+    && a.scope.repository === b.repository && a.scope.prNumber === b.prNumber;
+}
+
+/** Factory keeps tests' fake business state outside the endpoint. Recreating the
+ * endpoint with these same durable doubles must not erase the admitted attempt. */
+export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
+  const { store, worker, finalizer } = deps;
+  const retentionMs = deps.retentionMs ?? restateRetentionMs();
+  const unknownLaunchAlertMs = deps.unknownLaunchAlertMs ?? REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES * 60_000;
+
+  async function alert(ctx: WorkflowSharedContext, attemptId: AttemptId, reason: string, step: string): Promise<void> {
+    await ctx.run(step, async () => {
+      if (deps.alert) await deps.alert(attemptId, reason);
+      else console.warn(`[review-fix] ${attemptId}: ${reason}`);
+    });
+  }
+
+  async function runAttempt(ctx: WorkflowContext, input: { attemptId: string }): Promise<{ completion: ReviewFixAttemptCompletion; scope: PreparedReviewFixAttempt["scope"] }> {
+    const attemptId = validKey(ctx.key, input?.attemptId);
+    const attempt = await ctx.run("load-prepared-attempt", () => store.getPreparedAttempt(attemptId));
+    if (!attempt || attempt.attemptId !== attemptId || attempt.owner !== attemptId) {
+      throw new restate.TerminalError("review-fix attempt is not prepared under this workflow key");
+    }
+
+    const startedAt = await ctx.date.now();
+    if (startedAt >= attempt.deadlineAt) {
+      const revokedAt = startedAt;
+      await ctx.run("revoke-expired-before-launch", () => store.revokeAuthority(attemptId, revokedAt));
+      const recordedAt = await ctx.date.now();
+      await ctx.run("record-expired-before-launch", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal: { status: "cancelled" },
+      }, recordedAt));
+      await ctx.run("release-expired-before-launch", () => store.releaseOwner(attempt.owner, "deadline_exceeded"));
+      return { completion: { status: "deadline_before_launch" }, scope: attempt.scope };
+    }
+
+    // A cancellation or conflicting early result can revoke authority before run starts.
+    if (!await ctx.run("check-prelaunch-authority", () => store.hasCurrentAuthority(attemptId))) {
+      const recordedAt = await ctx.date.now();
+      await ctx.run("record-cancelled-before-launch", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal: { status: "cancelled" },
+      }, recordedAt));
+      await ctx.run("release-before-launch", () => store.releaseOwner(attempt.owner, "cancelled"));
+      return { completion: { status: "not_owner" }, scope: attempt.scope };
+    }
+
+    const plan = await worker.prepare(attempt); // pure, deterministic adapter obligation
+    if (plan.attemptId !== attemptId || plan.scope.installationId !== attempt.scope.installationId
+      || plan.scope.repository !== attempt.scope.repository || plan.scope.prNumber !== attempt.scope.prNumber
+      || (plan.executionBackend ?? "github-actions") !== (attempt.executionBackend ?? "github-actions")
+      || plan.deadlineAt !== attempt.deadlineAt || plan.taskText !== attempt.taskText) {
+      throw new restate.TerminalError("worker launch plan differs from immutable prepared attempt");
+    }
+
+    // Intent and dispatch MUST share a single ctx.run closure. If the external
+    // dispatch succeeded but the journal write or response was lost, re-execution
+    // sees already_recorded and reconciles; it never calls launch a second time.
+    const launch: WorkerLaunchOutcome = await ctx.run("launch-once", async () => {
+      const intent = await store.recordLaunchIntent(attemptId);
+      if (intent.status === "already_recorded") return { status: "unknown" };
+      try {
+        const raw = await worker.launch(plan);
+        const checked = validateWorkerLaunchOutcome(raw);
+        return checked.ok ? checked.value : { status: "unknown" };
+      } catch {
+        return { status: "unknown" };
+      }
+    });
+
+    if (launch.status === "rejected") {
+      const recordedAt = await ctx.date.now();
+      await ctx.run("record-rejected-outcome", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal: { status: "failed", reason: launch.reason },
+      }, recordedAt));
+      await ctx.run("release-rejected-launch", () => store.releaseOwner(attempt.owner, "launch_rejected"));
+      return { completion: { status: "launch_rejected" }, scope: attempt.scope };
+    }
+
+    let execution: WorkerExecutionIdentity;
+    if (launch.status === "accepted") {
+      execution = normalizeExecutionIdentity(launch.execution);
+    } else {
+      const unknownSince = await ctx.date.now();
+      const unknownLaunchGraceMs = typeof deps.unknownLaunchGraceMs === "function"
+        ? deps.unknownLaunchGraceMs(attempt.scope)
+        : deps.unknownLaunchGraceMs ?? UNKNOWN_LAUNCH_GRACE_MS;
+      const postDeadlineReconcileIntervalMs = typeof deps.postDeadlineReconcileIntervalMs === "function"
+        ? deps.postDeadlineReconcileIntervalMs(attempt.scope)
+        : deps.postDeadlineReconcileIntervalMs ?? POST_DEADLINE_RECONCILE_INTERVAL_MS;
+      const unresolvedUntil = attempt.deadlineAt + unknownLaunchGraceMs;
+      let revoked = false;
+      let warned = false;
+      let lookupIndex = 0;
+      for (;;) {
+        const checkedAt = await ctx.date.now();
+        if (await ctx.promise<boolean>("cancel").peek() || checkedAt >= unresolvedUntil) {
+          await ctx.run("revoke-terminal-unresolved-launch", () => store.revokeAuthority(attemptId, checkedAt));
+          await ctx.run("record-unresolved-launch", () => finalizer.recordOutcome({
+            attemptId, scope: attempt.scope, terminal: { status: "launch_unresolved" },
+          }, checkedAt));
+          // No execution identity means no proof of termination. Only an operator
+          // may release this reservation after checking GitHub.
+          return { completion: { status: "launch_unresolved" }, scope: attempt.scope };
+        }
+        const lookup = await ctx.run(`reconcile-${lookupIndex++}`, () => worker.reconcile(attemptId, attempt.scope));
+        if (lookup.status === "found") {
+          execution = normalizeExecutionIdentity(lookup.execution);
+          break;
+        }
+        // Even an empty exact search cannot prove the dispatch never started.
+        // A deadline or cancellation revokes authority, not occupancy.
+        const now = await ctx.date.now();
+        if (!warned && now - unknownSince >= unknownLaunchAlertMs) {
+          await alert(ctx, attemptId, "launch identity still unresolved; occupancy retained", "alert-unknown-launch");
+          warned = true;
+        }
+        if (now >= attempt.deadlineAt && !revoked) {
+          await ctx.run("revoke-unresolved-launch", () => store.revokeAuthority(attemptId, now));
+          revoked = true;
+        }
+        const interval = now >= attempt.deadlineAt
+          ? postDeadlineReconcileIntervalMs
+          : RECONCILE_INTERVAL_MS;
+        const boundary = now >= attempt.deadlineAt ? unresolvedUntil : attempt.deadlineAt;
+        await restate.RestatePromise.race([
+          ctx.promise<boolean>("cancel").get(),
+          ctx.sleep(Math.max(1, Math.min(interval, boundary - now))),
+        ]);
+      }
+    }
+
+    const boundAt = await ctx.date.now();
+    const bound = await ctx.run("bind-exact-execution", () => store.bindExecution(attemptId, execution, boundAt));
+    if (bound.status === "not_owner") return { completion: { status: "not_owner" }, scope: attempt.scope };
+    if (bound.status === "already_bound" && !sameExecution(normalizeExecutionIdentity(bound.execution), execution)) {
+      const revokedAt = await ctx.date.now();
+      await ctx.run("revoke-conflicting-execution", () => store.revokeAuthority(attemptId, revokedAt));
+      await alert(ctx, attemptId, "different execution already bound; occupancy retained", "alert-conflicting-execution");
+      throw new restate.TerminalError("attempt was already bound to a different execution");
+    }
+
+    let wake: Wake;
+    let readIndex = 0;
+    const event = await awaitOwnedRun(ctx, {
+      signals: ["wake"],
+      resultSignal: "wake",
+      totalDeadlineAt: attempt.deadlineAt,
+      tickMs: deps.runStatusTickMs ?? RUN_STATUS_TICK_MS,
+      readStatus: () => readOwnedRunStatus(ctx, `read-run-status-${readIndex++}`, async () => {
+        const inspection = await worker.inspectTerminal(execution);
+        return inspection.reached ? "ended" : "unknown";
+      }),
+    });
+    if (event.kind === "signal" && event.name === "wake") {
+      wake = event.value as Wake;
+    } else if (event.kind === "status" && event.status === "ended") {
+      // The run ended: a result that already arrived wins; otherwise take the stop-and-confirm path.
+      const peeked = await ctx.promise<Wake>("wake").peek();
+      wake = peeked ?? { kind: "cancel" };
+    } else if (event.kind === "total_timeout") {
+      wake = { kind: "cancel" }; // deadline follows the same stop-and-confirm path
+    } else {
+      throw new restate.TerminalError(`review-fix wait returned unexpected event: ${event.kind}`);
+    }
+
+    let validResult: ReviewFixResultMetadataV1 | null = null;
+    if (wake.kind === "result" && sameScope(attempt, wake.result)
+      && resultMatchesExecution(wake.result, execution)) {
+      validResult = wake.result;
+    } else {
+      const revokedAt = await ctx.date.now();
+      await ctx.run("revoke-after-cancel-or-invalid-result", () => store.revokeAuthority(attemptId, revokedAt));
+    }
+
+    // Cancellation can arrive after a valid result woke the main workflow. Its
+    // handler revokes authority immediately; this loop still requests stop and
+    // never releases capacity until the backend itself confirms terminal.
+    let cancelled = validResult === null;
+    let inspectionIndex = 0;
+    let warnedStop = false;
+    let terminal: WorkerTerminalOutcome;
+    for (;;) {
+      if (!cancelled && await ctx.promise<boolean>("cancel").peek()) {
+        cancelled = true;
+      }
+      const checkedAt = await ctx.date.now();
+      if (!cancelled && checkedAt >= attempt.deadlineAt) {
+        cancelled = true;
+        await ctx.run("revoke-at-deadline", () => store.revokeAuthority(attemptId, checkedAt));
+      }
+      if (cancelled) {
+        await ctx.run(`cancel-worker-${inspectionIndex}`, () => worker.cancel(attemptId, execution));
+      }
+      const inspection = await ctx.run(`inspect-terminal-${inspectionIndex++}`, () => worker.inspectTerminal(execution));
+      if (inspection.reached) {
+        terminal = inspection.outcome;
+        break;
+      }
+      if (!warnedStop && await ctx.date.now() >= attempt.deadlineAt) {
+        await alert(ctx, attemptId, "backend termination unconfirmed; occupancy retained", "alert-unconfirmed-stop");
+        warnedStop = true;
+      }
+      await ctx.sleep(INSPECTION_INTERVAL_MS);
+    }
+
+    let approval: Extract<ReviewFixAttemptCompletion, { status: "finalized" }>["approval"] = "not_applicable";
+    let approvalReason: Extract<ReviewFixAttemptCompletion, { status: "finalized" }>["approvalReason"];
+    if (terminal.status === "succeeded" && validResult && !cancelled
+      && terminal.outputCommit === validResult.outputCommit) {
+      const recordedAt = await ctx.date.now();
+      await ctx.run("record-success-outcome", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal,
+      }, recordedAt));
+      const currentAuthority = await ctx.run("check-final-authority", () => store.hasCurrentAuthority(attemptId));
+      if (currentAuthority) {
+        const evidence = await ctx.run("load-approval-evidence", () => deps.loadApprovalEvidence(attempt, validResult));
+        const effect = await ctx.run("apply-approval-once", () => finalizer.applyApproval({
+          attemptId, scope: attempt.scope, result: validResult,
+          currentAuthority,
+          currentPrHeadSha: evidence.currentPrHeadSha,
+          findingDispositions: evidence.findingDispositions,
+          policyAllows: evidence.policyAllows,
+          dispositionsComplete: evidence.dispositionsComplete,
+        }));
+        approval = effect.status === "applied" || effect.status === "already_applied" ? "applied" : "withheld";
+      } else {
+        approval = "withheld";
+      }
+    } else {
+      if (terminal.status === "succeeded" && validResult && !cancelled
+        && terminal.outputCommit !== validResult.outputCommit) {
+        // Preserve the backend fact and accepted callback separately. Neither
+        // head can authorize approval while these observations disagree.
+        approval = "withheld";
+        approvalReason = "terminal_result_head_mismatch";
+      }
+      const recordedAt = await ctx.date.now();
+      await ctx.run("record-terminal-outcome", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal,
+      }, recordedAt));
+    }
+
+    await ctx.run("release-confirmed-terminal", () => store.releaseOwner(
+      attempt.owner, cancelled ? "cancelled" : "finalized",
+    ));
+    return { completion: { status: "finalized", terminal, approval, ...(approvalReason ? { approvalReason } : {}) }, scope: attempt.scope };
+  }
+
+  async function run(ctx: WorkflowContext, input: { attemptId: string }): Promise<ReviewFixAttemptCompletion> {
+    const { completion, scope } = await runAttempt(ctx, input);
+    if (deps.notifyPrOnCompletion) {
+      // The durable send is recorded after the terminal business state. A
+      // replay cannot clear a successor: ReviewFixPR.completed compares IDs.
+      ctx.genericSend({
+        service: "ReviewFixPR", method: "completed", key: reviewFixPRKey(scope),
+        parameter: { attemptId: input.attemptId }, inputSerde: restate.serde.json,
+      });
+    }
+    return completion;
+  }
+
+  async function result(ctx: WorkflowSharedContext, raw: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }): Promise<ResultIntakeOutcome & { fingerprint: string }> {
+    const checked = validateReviewFixResultMetadata(raw);
+    // Validator details can contain an attacker-supplied field value. Keep the
+    // journal-visible error generic; authenticated callback logs can use a
+    // separate redacted diagnostic path at the adapter boundary.
+    if (!checked.ok) throw new restate.TerminalError("invalid review-fix result metadata");
+    const attemptId = validKey(ctx.key, checked.value.attemptId);
+    const receivedAt = await ctx.date.now();
+    const outcome = await ctx.run("store-result", () => store.recordResult(attemptId, checked.value, receivedAt));
+    if (outcome.status === "stored" || outcome.status === "duplicate") {
+      await acceptOwnedRunReport(ctx, "report", { ...(raw.usage ? { usage: raw.usage } : {}) }, (value) => {
+        if (!value.usage) return;
+        const dispatchId = acceptedReviewFixDispatchId(checked.value);
+        if (dispatchId) recordUsage(dispatchId, value.usage);
+      });
+      // The runner callback forwards here over the ingress and writes nothing itself, so
+      // `store-result` is the only writer of the accepted result. A first call stores; an
+      // identical retry (a fresh key past the idempotency retention) returns `duplicate`
+      // without a second write. Either way the workflow must wake.
+      const wake = ctx.promise<Wake>("wake");
+      if (await wake.peek() === undefined) await wake.resolve({ kind: "result", result: outcome.status === "stored" ? outcome.result : checked.value });
+    } else if (outcome.status === "conflict") {
+      const revokedAt = await ctx.date.now();
+      await ctx.run("revoke-conflicting-result", () => store.revokeAuthority(attemptId, revokedAt));
+      const cancellation = ctx.promise<boolean>("cancel");
+      if (await cancellation.peek() === undefined) await cancellation.resolve(true);
+      const wake = ctx.promise<Wake>("wake");
+      if (await wake.peek() === undefined) await wake.resolve({ kind: "conflict" });
+    } else if (outcome.status === "stale") {
+      // A stale result after the final outcome is already recorded (store.recordResult
+      // returns "stale" only once the dispatch is inactive or the row is already
+      // finalized) must never rewrite that outcome — this branch does nothing to
+      // durable state beyond the alert itself, which is the only required signal.
+      await alert(ctx, attemptId, `stale result rejected: ${outcome.reason}`, "alert-stale-result");
+    }
+    return { ...outcome, fingerprint: ownedRunReportFingerprint(raw) };
+  }
+
+  async function cancel(ctx: WorkflowSharedContext, raw: { attemptId: string }): Promise<void> {
+    const attemptId = validKey(ctx.key, raw?.attemptId);
+    const revokedAt = await ctx.date.now();
+    await ctx.run("revoke-cancelled-attempt", () => store.revokeAuthority(attemptId, revokedAt));
+    const cancellation = ctx.promise<boolean>("cancel");
+    if (await cancellation.peek() === undefined) await cancellation.resolve(true);
+    const wake = ctx.promise<Wake>("wake");
+    if (await wake.peek() === undefined) await wake.resolve({ kind: "cancel" });
+  }
+
+  return restate.workflow({
+    name: "ReviewFixAttempt",
+    handlers: {
+      run: restate.handlers.workflow.workflow({
+        journalRetention: retentionMs,
+      }, run),
+      result: restate.handlers.workflow.shared({
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
+      }, result),
+      cancel: restate.handlers.workflow.shared({
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
+      }, cancel),
+    },
+    options: { workflowRetention: retentionMs },
+  });
+}

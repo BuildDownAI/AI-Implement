@@ -1,37 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { readFileSync } from "node:fs";
+import type { ModelPrice } from "../restate/model-prices.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
-import type * as LogModule from "../log.js";
-import type * as StepLogModule from "../step-log.js";
-import type * as ReconModule from "../reconciliation.js";
 import type * as RcModule from "../report-card.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
-let log: typeof LogModule;
-let stepLog: typeof StepLogModule;
-let recon: typeof ReconModule;
 let rc: typeof RcModule;
 
 beforeEach(async () => {
-  const { vi } = await import("vitest");
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `rc-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  stepLog = await import("../step-log.js");
-  recon = await import("../reconciliation.js");
-  rc = await import("../report-card.js");
-
-  log.initLogTable();
-  stepLog.initStepLogTable();
-  recon.initReconciliationTable();
+  ({ dedup, rc } = (
+    await testDb({ modules: { dedup: () => import("../dedup.js"), rc: () => import("../report-card.js") } })
+  ).modules);
 
   // Initialise pr_merge_capture manually (normally lazy-init inside capturePrMerge)
   dedup.getDb().exec(`
@@ -53,11 +33,6 @@ beforeEach(async () => {
   `);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
-
 // ---- Helpers ----
 
 function insertDispatch(opts: {
@@ -69,14 +44,15 @@ function insertDispatch(opts: {
   conclusion?: string;
   prUrl?: string;
   dispatchedAt?: number;
+  dispatchId?: string;
 }): number {
   const db = dedup.getDb();
   const now = opts.dispatchedAt ?? Date.now();
   const result = db
     .prepare(
       `INSERT INTO dispatch_log
-         (issue_id, issue_identifier, repo, dispatched_at, phase, status, conclusion, pr_url)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (issue_id, issue_identifier, repo, dispatched_at, phase, status, conclusion, pr_url, dispatch_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       opts.issueId ?? "issue-default",
@@ -87,6 +63,7 @@ function insertDispatch(opts: {
       opts.status ?? "completed",
       opts.conclusion ?? null,
       opts.prUrl ?? null,
+      opts.dispatchId ?? null,
     );
   return Number(result.lastInsertRowid);
 }
@@ -97,7 +74,7 @@ function insertFeedbackLoopStep(
     approved: boolean;
     iterations: number;
     terminationReason: string;
-    passes: Array<{ iteration: number; costUsd: number | null; implementOutcome: string; reviewApproved: boolean | null }>;
+    passes: Array<{ iteration: number; costUsd: number | null; reviewCostUsd?: number | null; implementOutcome: string; reviewApproved: boolean | null }>;
   },
 ): void {
   dedup.getDb()
@@ -125,6 +102,72 @@ function insertSubStep(
 // ---- getIssueReportCard tests ----
 
 describe("getIssueReportCard", () => {
+  it("keeps reported totals separate from estimates across dispatches without storing estimates", () => {
+    const prices: ModelPrice[] = JSON.parse(readFileSync(new URL("./fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+    const first = insertDispatch({ issueIdentifier: "AII-EST", dispatchId: "estimate-first" });
+    insertDispatch({ issueIdentifier: "AII-EST", dispatchId: "estimate-second" });
+    insertFeedbackLoopStep(first, { approved: true, iterations: 1, terminationReason: "approved", passes: [
+      { iteration: 1, costUsd: 2, implementOutcome: "success", reviewApproved: true },
+    ] });
+    const db = dedup.getDb();
+    const insert = db.prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', ?, 'test', 'succeeded', 1, ?)`);
+    const usages = [
+      { tokensIn: 100, tokensOut: 10, costUsd: 2, costStatus: "reported" },
+      { tokensIn: 100, tokensOut: 10, costStatus: "unavailable" },
+      { tokensIn: 0, tokensOut: 0, costStatus: "unavailable" },
+      { tokensIn: 100, tokensOut: null, costStatus: "unavailable" },
+      { tokensIn: 100, tokensOut: 10, costStatus: "unavailable" },
+    ];
+    usages.forEach((usage, i) => insert.run(`est-${i}`, i < 2 ? "estimate-first" : "estimate-second", i === 4 ? "unknown" : "a-dated", JSON.stringify(usage)));
+    const before = db.prepare("SELECT * FROM model_invocation_attribution").all();
+    expect(rc.getIssueReportCard("AII-EST", prices)!.totals).toEqual({
+      dispatches: 2, passes: 1, costUsd: 2, estimatedCostUsd: 0.00031234567890123456789, unpricedCalls: 2,
+    });
+    expect(rc.getIssueReportCard("AII-EST")!.totals).toMatchObject({ costUsd: 2, estimatedCostUsd: null, unpricedCalls: 4 });
+    expect(db.prepare("SELECT * FROM model_invocation_attribution").all()).toEqual(before);
+    db.prepare("DELETE FROM model_invocation_attribution WHERE invocation_id != 'est-2'").run();
+    expect(rc.getIssueReportCard("AII-EST", prices)!.totals.estimatedCostUsd).toBe(0);
+    expect(before.map(row => (row as { usage_json: string }).usage_json)).toEqual(usages.map(usage => JSON.stringify(usage)));
+  });
+
+  describe("review-fix rounds", () => {
+    it.each([
+      { legacy: 0, restate: 2, expected: 2 },
+      { legacy: 1, restate: 1, expected: 2 },
+      { legacy: 2, restate: 0, expected: 2 },
+      { legacy: 0, restate: 0, expected: 0 },
+      { legacy: 2, restate: 3, expected: 5 },
+    ])("counts $legacy Legacy dispatches and $restate Restate attempts as $expected rounds", ({ legacy, restate, expected }) => {
+      insertDispatch({ issueIdentifier: "AII-ROUNDS" });
+      const db = dedup.getDb();
+      const queue = db.prepare(`INSERT INTO review_fix_queue
+        (issue_id, issue_identifier, repo, pr_number, reason, created_at, updated_at)
+        VALUES ('issue-rounds', ?, 'org/repo', ?, 'review', 1, 1)`);
+      const queueId = Number(queue.run("AII-ROUNDS", 1).lastInsertRowid);
+      const otherQueueId = Number(queue.run("AII-OTHER", 2).lastInsertRowid);
+      const dispatch = db.prepare(`INSERT INTO review_fix_dispatches
+        (queue_id, dispatch_id, repo, pr_number, created_at)
+        VALUES (?, ?, 'org/repo', 1, 1)`);
+      for (let i = 0; i < legacy; i++) dispatch.run(queueId, `legacy-${i}`);
+      const attempt = db.prepare(`INSERT INTO review_fix_attempts
+        (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+         issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+        VALUES (?, ?, 'mapping', '1', 'org/repo', 1, 'linear', 'issue-rounds', 'restate', 'created', 1, 2, ?, '[]')`);
+      const snapshots = [
+        ...Array.from({ length: restate }, () => ({ taskText: "Fix review", queueCursor: { queueId, eventId: 1 } })),
+        { taskText: "Fix review", queueCursor: null },
+        { taskText: "Fix review" },
+        { taskText: "Fix review", queueCursor: { queueId: otherQueueId, eventId: 2 } },
+        { taskText: "Fix review", queueCursor: { queueId: otherQueueId + 1, eventId: 3 } },
+      ];
+      snapshots.forEach((snapshot, i) => attempt.run(`attempt-${i}`, `restate-${i}`, JSON.stringify(snapshot)));
+
+      expect(rc.getIssueReportCard("AII-ROUNDS")!.reviewFixRounds).toBe(expected);
+    });
+  });
+
   it("returns null for unknown identifier", () => {
     expect(rc.getIssueReportCard("AII-999")).toBeNull();
   });
@@ -208,6 +251,60 @@ describe("getIssueReportCard", () => {
       const card = rc.getIssueReportCard("AII-2MX");
       expect(card!.runs[0]!.maxTurnsHits).toBe(2);
     });
+
+    it("excludes .retry rows from iterations and approval, but includes their cost (BAC-27201)", () => {
+      const jobId = insertDispatch({ issueId: "issue-2rt", issueIdentifier: "AII-2RT", repo: "org/repo" });
+      insertSubStep(jobId, "implement.1", "implement", {
+        telemetry: { costUsd: 0.10, numTurns: 20, outcome: "success" },
+      });
+      insertSubStep(jobId, "review.1.retry1", "review", { approved: false, telemetry: { costUsd: 1.00 } });
+      insertSubStep(jobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.05 } });
+
+      const card = rc.getIssueReportCard("AII-2RT");
+      // The retry row is a real, failed attempt — never a pass of its own and never the
+      // approval verdict, so iterations/passes/approved are unaffected by it.
+      expect(card!.runs[0]!.iterations).toBe(1);
+      expect(card!.totals.passes).toBe(1);
+      expect(card!.runs[0]!.approved).toBe(true);
+      expect(card!.approved).toBe(true);
+      // 0.10 (implement) + 1.00 (the retried, failed review.1 attempt) + 0.05 (review.1) —
+      // the retry row's cost is real spend and now sums in, unlike its pass/approval effect.
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(1.15);
+    });
+
+    it("includes post-push-review custom sub-step cost — review and fix passes — in the total (BAC-27201)", () => {
+      const jobId = insertDispatch({ issueId: "issue-2ppr", issueIdentifier: "AII-2PPR", repo: "org/repo" });
+      insertSubStep(jobId, "implement.1", "implement", {
+        telemetry: { costUsd: 0.10, numTurns: 20, outcome: "success" },
+      });
+      insertSubStep(jobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.05 } });
+      // The post-push reviewer's own review and fix sub-steps report as `custom`, never
+      // `implement`/`review` — they must not affect iterations/approval, only cost.
+      insertSubStep(jobId, "post-push-review.1", "custom", { approved: false, telemetry: { costUsd: 0.30 } });
+      insertSubStep(jobId, "post-push-review.fix-1", "custom", { telemetry: { costUsd: 0.15 } });
+
+      const card = rc.getIssueReportCard("AII-2PPR");
+      expect(card!.runs[0]!.iterations).toBe(1);
+      expect(card!.totals.passes).toBe(1);
+      expect(card!.runs[0]!.approved).toBe(true);
+      // 0.10 (implement) + 0.05 (in-loop review) + 0.30 (post-push review) + 0.15 (fix pass)
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.60);
+    });
+
+    it("includes post-mortem custom sub-step cost in the total (BAC-27201)", () => {
+      const jobId = insertDispatch({ issueId: "issue-2pm", issueIdentifier: "AII-2PM", repo: "org/repo" });
+      insertSubStep(jobId, "implement.1", "implement", {
+        telemetry: { costUsd: 0.10, numTurns: 50, outcome: "max_turns" },
+      });
+      // The post-mortem sub-step reports as `custom`, never `implement`/`review` — it must not
+      // affect iterations/approval, only cost.
+      insertSubStep(jobId, "post-mortem.1", "custom", { length: 500, telemetry: { costUsd: 0.42 } });
+
+      const card = rc.getIssueReportCard("AII-2PM");
+      expect(card!.runs[0]!.iterations).toBe(1);
+      // 0.10 (implement) + 0.42 (post-mortem)
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.52);
+    });
   });
 
   describe("era 3 — full feedback-loop outputs", () => {
@@ -228,6 +325,62 @@ describe("getIssueReportCard", () => {
       expect(card!.runs[0]!.terminationReason).toBe("approved");
       expect(card!.runs[0]!.costUsd).toBeCloseTo(0.20);
       expect(card!.runs[0]!.maxTurnsHits).toBe(0);
+    });
+
+    it("adds post-push-review sub-step cost on top of feedback-loop outputs (BAC-27201)", () => {
+      const jobId = insertDispatch({
+        issueId: "issue-3ppr", issueIdentifier: "AII-3PPR", repo: "org/repo", status: "completed",
+      });
+      insertFeedbackLoopStep(jobId, {
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.20, reviewCostUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+      });
+      // feedback-loop's own outputs.passes never carries the post-push reviewer's cost — that
+      // stage runs afterward, as its own step. Its custom sub-steps must still be added on top.
+      insertSubStep(jobId, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.40 } });
+
+      const card = rc.getIssueReportCard("AII-3PPR");
+      expect(card!.runs[0]!.iterations).toBe(1);
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.65);
+    });
+
+    it("agrees with formatRunStats' ticket-facing total for the same run (BAC-27201)", async () => {
+      const { formatRunStats } = await import("../run-autopsy.js");
+      const jobId = insertDispatch({
+        issueId: "issue-3parity", issueIdentifier: "AII-3PARITY", repo: "org/repo", status: "completed",
+      });
+      insertFeedbackLoopStep(jobId, {
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.20, reviewCostUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+      });
+      // A superseded review retry attempt — real spend feedback-loop's own outputs.passes
+      // never carries (BAC-27134/BAC-27201) — plus the post-push reviewer's review and fix
+      // sub-steps, which run as their own step entirely outside feedback-loop.
+      insertSubStep(jobId, "review.1.retry1", "review", { approved: false, telemetry: { costUsd: 0.10 } });
+      insertSubStep(jobId, "post-push-review.1", "custom", { approved: false, telemetry: { costUsd: 0.30 } });
+      insertSubStep(jobId, "post-push-review.fix-1", "custom", { telemetry: { costUsd: 0.15 } });
+
+      const card = rc.getIssueReportCard("AII-3PARITY");
+      // 0.20 + 0.05 (pass) + 0.10 (review retry) + 0.30 + 0.15 (post-push review + fix)
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.80);
+
+      // run-autonomous.ts derives the ticket-facing RunStats from the exact same sources: the
+      // feedback-loop pass, plus feedback-loop's own extraCostUsd (retry cost) and the
+      // post-push reviewer's own costUsd (review+fix cost) — see the wiring in run-autonomous.ts.
+      const md = formatRunStats({
+        issueIdentifier: "AII-3PARITY",
+        passes: [{ iteration: 1, implementTurns: 1, implementOutcome: "success", costUsd: 0.20, reviewCostUsd: 0.05, reviewApproved: true }],
+        plannedFiles: [],
+        filesChanged: null,
+        extraCostUsd: 0.10 + 0.30 + 0.15,
+      });
+      const totalLine = md.split("\n").find((l) => l.startsWith("**Total cost:**"));
+      const ticketTotal = Number(totalLine!.replace("**Total cost:** $", ""));
+      expect(ticketTotal).toBeCloseTo(card!.runs[0]!.costUsd!);
     });
 
     it("counts maxTurnsHits from passes with implementOutcome=max_turns", () => {
@@ -262,6 +415,37 @@ describe("getIssueReportCard", () => {
       const card = rc.getIssueReportCard("AII-3C");
       // Only the non-null pass contributes
       expect(card!.runs[0]!.costUsd).toBeCloseTo(0.30);
+    });
+
+    it("sums reviewCostUsd alongside costUsd per pass, matching the sub-step fallback for equivalent data", () => {
+      const jobId = insertDispatch({
+        issueId: "issue-3d", issueIdentifier: "AII-3D", repo: "org/rcost2", status: "completed",
+      });
+      insertFeedbackLoopStep(jobId, {
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.10, reviewCostUsd: 0.20, implementOutcome: "success", reviewApproved: true }],
+      });
+
+      const card = rc.getIssueReportCard("AII-3D");
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.30);
+      expect(card!.totals.costUsd).toBeCloseTo(0.30);
+
+      const report = rc.getFleetReport({ days: 365 });
+      const r = report.byRepo.find((x) => x.repo === "org/rcost2");
+      expect(r!.costUsd).toBeCloseTo(0.30);
+
+      // Equivalent sub-step rows for the same job shape must compute the same total —
+      // the fallback and the primary feedback-loop path must never disagree.
+      const fallbackJobId = insertDispatch({
+        issueId: "issue-3d-fallback", issueIdentifier: "AII-3D-FALLBACK", repo: "org/rcost2fb", status: "completed",
+      });
+      insertSubStep(fallbackJobId, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+      insertSubStep(fallbackJobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.20 } });
+      const fallbackReport = rc.getFleetReport({ days: 365 });
+      const fallbackR = fallbackReport.byRepo.find((x) => x.repo === "org/rcost2fb");
+      expect(fallbackR!.costUsd).toBeCloseTo(r!.costUsd!);
     });
   });
 
@@ -468,6 +652,88 @@ describe("getFleetReport", () => {
     expect(r!.issues).toBe(2);
     expect(r!.completed).toBe(1);
     expect(r!.failed).toBe(1);
+  });
+
+  it("sums review sub-step cost alongside implement cost in the per-repo total (sub-step fallback path)", () => {
+    const jobId = insertDispatch({
+      issueId: "issue-cost", issueIdentifier: "AII-COST", repo: "org/rcost", status: "completed",
+    });
+    insertSubStep(jobId, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+    insertSubStep(jobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.20 } });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rcost");
+    expect(r!.costUsd).toBeCloseTo(0.30);
+  });
+
+  it("includes post-push-review custom sub-step cost in the fleet total, unaffected pass count (BAC-27201)", () => {
+    const jobId = insertDispatch({
+      issueId: "issue-ppr-fleet", issueIdentifier: "AII-PPR-FLEET", repo: "org/rppr", status: "completed",
+    });
+    insertSubStep(jobId, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+    insertSubStep(jobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.05 } });
+    insertSubStep(jobId, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.40 } });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rppr");
+    expect(r!.costUsd).toBeCloseTo(0.55);
+    expect(r!.avgPasses).toBeCloseTo(1);
+  });
+
+  it("uses the final post-push aggregate row for approval while pricing per-reviewer rows once", () => {
+    const jobId = insertDispatch({
+      issueId: "issue-ppr-reviewers", issueIdentifier: "AII-PPR-REVIEWERS", repo: "org/rpprreviewers", status: "completed",
+    });
+    insertSubStep(jobId, "post-push-review.1.gap-analysis", "custom", { approved: true, telemetry: { costUsd: 0.10 } });
+    insertSubStep(jobId, "post-push-review.1.code-review", "custom", { approved: false, telemetry: { costUsd: 0.20 } });
+    insertSubStep(jobId, "post-push-review.1", "custom", { approved: true });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rpprreviewers");
+    expect(r!.costUsd).toBeCloseTo(0.30);
+    expect(report.eventualPct).toBeCloseTo(1.0);
+  });
+
+  it("counts a job with only post-push-review sub-steps (no feedback-loop or implement/review rows at all) toward the fleet cost total (BAC-27201)", () => {
+    const jobId = insertDispatch({
+      issueId: "issue-ppr-only", issueIdentifier: "AII-PPR-ONLY", repo: "org/rppronly", status: "completed",
+    });
+    // No feedback-loop row and no implement/review sub-steps — jobPassStats' sub-step
+    // fallback query returns zero rows. Its cost must still reach the fleet total instead of
+    // being dropped by an early `return null` that ran before `extra` was applied.
+    insertSubStep(jobId, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.40 } });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rppronly");
+    expect(r!.costUsd).toBeCloseTo(0.40);
+    // The synthetic fallback's placeholder `passes: 0` must not count toward avgPasses —
+    // with no other job in this repo, the denominator stays at zero (null), not 0 (BAC-27201 round 2).
+    expect(r!.avgPasses).toBeNull();
+  });
+
+  it("does not dilute avgPasses or undercount eventualPct with a post-push-review-only approved job alongside a normal 1-pass job (BAC-27201 round 2)", () => {
+    const normalJob = insertDispatch({
+      issueId: "issue-normal", issueIdentifier: "AII-NORMAL", repo: "org/rmixed", status: "completed",
+    });
+    insertFeedbackLoopStep(normalJob, {
+      approved: true,
+      iterations: 1,
+      terminationReason: "approved",
+      passes: [{ iteration: 1, costUsd: 0.10, reviewCostUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+    });
+
+    const pprOnlyJob = insertDispatch({
+      issueId: "issue-ppr-mixed", issueIdentifier: "AII-PPR-MIXED", repo: "org/rmixed", status: "completed",
+    });
+    // No feedback-loop row and no implement/review sub-steps — only a post-push-review pass
+    // that the reviewer itself approved. jobPassStats' synthetic fallback must not report this
+    // as 0 passes counted toward avgPasses, nor as unapproved for eventualPct.
+    insertSubStep(pprOnlyJob, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.40 } });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rmixed");
+    expect(r!.avgPasses).toBeCloseTo(1);
+    expect(report.eventualPct).toBeCloseTo(1.0);
   });
 
   describe("one-shot percentage", () => {
@@ -711,5 +977,141 @@ describe("getFleetReport", () => {
       const r = report.byRepo.find((x) => x.repo === "org/rfe");
       expect(r!.avgPasses).toBeCloseTo(1.0);
     });
+  });
+});
+
+describe("getIssueReportCard restate (AII-1129)", () => {
+  async function admitPlanning(dispatchId: string, lifecycleOwner: { kind: "legacy" } | { kind: "restate"; attemptId: string }) {
+    const admission = await import("../dispatch-admission.js");
+    const res = admission.acquire({
+      dispatchId,
+      mappingKey: "m",
+      scope: { kind: "issue", issueScope: "s", issueId: `issue-${dispatchId}` },
+      kind: "planning",
+      backend: "fly-machines",
+      lifecycleOwner,
+      cap: 5,
+    });
+    expect(res.ok).toBe(true);
+    return admission;
+  }
+
+  it("returns null for a planning row with a real Legacy admission (AII-1425)", async () => {
+    await admitPlanning("plan-legacy", { kind: "legacy" });
+    insertDispatch({ issueIdentifier: "AII-PL", phase: "planning", dispatchId: "plan-legacy" });
+    expect(rc.getIssueReportCard("AII-PL")!.runs[0].restate).toBeNull();
+  });
+
+  it("returns PlanningRun for a Restate-owned planning row, even after release (AII-1425)", async () => {
+    const admission = await admitPlanning("plan-rs", { kind: "restate", attemptId: "att-1" });
+    admission.releaseByDispatchId("plan-rs", "finalized");
+    insertDispatch({ issueIdentifier: "AII-PR", phase: "planning", dispatchId: "plan-rs", status: "completed", conclusion: "success" });
+    expect(rc.getIssueReportCard("AII-PR")!.runs[0].restate).toEqual({ service: "PlanningRun", key: "plan-rs" });
+  });
+
+  it("does not fabricate or throw when the admissions table is absent (AII-1425)", () => {
+    dedup.getDb().exec("DROP TABLE IF EXISTS dispatch_admissions");
+    insertDispatch({ issueIdentifier: "AII-NT", phase: "planning", dispatchId: "plan-x" });
+    expect(rc.getIssueReportCard("AII-NT")!.runs[0].restate).toBeNull();
+  });
+
+  it("returns null without a dispatch id", () => {
+    insertDispatch({ issueIdentifier: "AII-NO-ID", phase: "kg-refresh" });
+    expect(rc.getIssueReportCard("AII-NO-ID")!.runs[0].restate).toBeNull();
+  });
+
+  it("maps kg-refresh to KgRefresh without admissions", () => {
+    dedup.getDb().exec("DROP TABLE dispatch_admissions");
+    insertDispatch({ issueIdentifier: "AII-KG", phase: "kg-refresh", dispatchId: "kg-1" });
+    expect(rc.getIssueReportCard("AII-KG")!.runs[0].restate).toEqual({ service: "KgRefresh", key: "kg-1" });
+  });
+
+  it("maps a restate-owned implementation row to ImplementationRun and a legacy one to null", async () => {
+    const admission = await import("../dispatch-admission.js");
+    for (const [id, lifecycleOwner] of [["impl-r", { kind: "restate", attemptId: "att-ir" }], ["impl-l", { kind: "legacy" }]] as const) {
+      admission.acquire({
+        dispatchId: id,
+        mappingKey: "m",
+        scope: { kind: "issue", issueScope: "s", issueId: `issue-${id}` },
+        kind: "implementation",
+        backend: "github-actions",
+        lifecycleOwner,
+        cap: 5,
+      });
+    }
+    insertDispatch({ issueIdentifier: "AII-IR", phase: "implementation", dispatchId: "impl-r", dispatchedAt: 1 });
+    insertDispatch({ issueIdentifier: "AII-IR", phase: "implementation", dispatchId: "impl-l", dispatchedAt: 2 });
+    expect(rc.getIssueReportCard("AII-IR")!.runs.map((r) => r.restate)).toEqual([{ service: "ImplementationRun", key: "impl-r" }, null]);
+  });
+
+  it.each([
+    ["rf-1", "ReviewFixAttempt"],
+    ["impl-gap", "ImplementationRun"],
+  ])("maps Restate gap-analysis %s to %s by matching attempt dispatch id", async (dispatchId, service) => {
+    dedup.getDb().prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+      VALUES ('att-rf', 'rf-1', 'm', '1', 'org/repo', 1, 's', 'issue-default',
+              'restate', 'created', 1, 2, '{}', '[]')`).run();
+    const admission = await import("../dispatch-admission.js");
+    admission.acquire({
+      dispatchId,
+      mappingKey: "m",
+      scope: { kind: "issue", issueScope: "s", issueId: "issue-default" },
+      kind: "gap-fill",
+      backend: "fly-machines",
+      lifecycleOwner: { kind: "restate", attemptId: "att-rf" },
+      cap: 5,
+    });
+    insertDispatch({ issueIdentifier: "AII-RF", phase: "gap-analysis", dispatchId });
+    expect(rc.getIssueReportCard("AII-RF")!.runs[0].restate).toEqual({ service, key: dispatchId });
+  });
+});
+
+
+describe("getReviewerScorecard", () => {
+  it("returns zero fixed for a source containing only legacy resolved findings", () => {
+    const now = Date.now();
+    dedup.getDb().prepare(`INSERT INTO review_findings
+      (repo, pr_number, finding_key, source, severity, body, status, first_seen_at, last_seen_at)
+      VALUES ('org/legacy', 1, 'legacy', 'github-review', 'blocking', 'legacy', 'resolved', ?, ?)`).run(now, now);
+    expect(rc.getReviewerScorecard()).toEqual([{
+      source: "github-review", total: 1, fixed: 0, rejected: 0, deferred: 0, ignored: 1, rejectedRate: 0,
+    }]);
+  });
+
+  it("counts first-seen cohorts, explicit fixes and merged open rows across sources and repos", () => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const db = dedup.getDb();
+      const insert = db.prepare(`INSERT INTO review_findings
+        (repo, pr_number, finding_key, source, severity, body, status, disposition, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, 'blocking', 'finding', ?, ?, ?, ?)`);
+      let key = 0;
+      const sources = ["claude-review-summary", "github-review-thread", "ai-implement-internal"];
+      for (const source of sources) {
+        for (const repo of ["org/a", "org/b"]) {
+          for (const [status, disposition, pr] of [
+            ["resolved", "fixed", 1], ["resolved", null, 1], ["rejected", null, 1],
+            ["deferred", null, 1], ["open", null, 1], ["open", null, 2],
+          ] as const) insert.run(repo, pr, String(++key), source, status, disposition, now - 86_400_000, now);
+          insert.run(repo, 1, String(++key), source, "resolved", "fixed", now - 86_400_001, now);
+          insert.run(repo, 1, String(++key), source, "resolved", "fixed", now + 1, now);
+          db.prepare("INSERT OR IGNORE INTO pr_merge_capture (repo, pr_number, merged_at, captured_at) VALUES (?, 1, ?, ?)").run(repo, now, now);
+        }
+      }
+      expect(rc.getReviewerScorecard({ days: 1 })).toEqual([...sources].sort().map(source => ({
+        source, total: 12, fixed: 2, rejected: 2, deferred: 2, ignored: 4, rejectedRate: 1 / 6,
+      })));
+      expect(rc.getReviewerScorecard({ days: 1, repo: "org/a" })).toEqual([...sources].sort().map(source => ({
+        source, total: 6, fixed: 1, rejected: 1, deferred: 1, ignored: 2, rejectedRate: 1 / 6,
+      })));
+      expect(rc.getReviewerScorecard({ repo: "missing" })).toEqual([]);
+      db.exec("DROP TABLE pr_merge_capture");
+      expect(rc.getReviewerScorecard({ days: 1 })[0]!.ignored).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

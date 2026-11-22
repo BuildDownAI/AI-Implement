@@ -1,10 +1,17 @@
-import type { RepoMapping } from "./config.js";
+import type { ReviewerSelection, RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
-import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
+import { type ResolvedAgentSnapshotV1, type RunConfigV1, type RunCredentialsV1, buildRunConfig, encodeRunConfig, encodeTrustedRunConfig } from "./run-config.js";
+import type { RetryPolicy } from "./pipeline/retry-backoff.js";
+import { isChecksPermissionError } from "./checks-permission.js";
 
-interface DispatchInputs {
+export interface DispatchInputs {
   /** Legacy mode: per-field issue data. */
   issue_id?: string;
+  /**
+   * Legacy mode: authoritative issue identifier. Envelope mode: display-only duplicate of
+   * run_config.issue.identifier, read solely by the workflow's `run-name:` expression (which
+   * cannot decode run_config) to title the Actions run with the ticket key.
+   */
   issue_identifier?: string;
   issue_title?: string;
   issue_description?: string;
@@ -22,7 +29,9 @@ interface DispatchInputs {
    * In envelope mode this rides inside run_config.baseBranch instead.
    */
   base_branch?: string;
-  /** Explicit callback phase reported by the runner. In envelope mode rides inside run_config. */
+  /**
+   * Explicit callback phase reported by the runner. In envelope mode rides inside run_config.
+   */
   runner_phase?: "implementation" | "gap-analysis";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
@@ -57,12 +66,188 @@ interface DispatchInputs {
   runner_image?: string;
   /** Operator instruction forwarded from the /ai-implement PR comment. Legacy mode only; envelope mode carries this inside run_config. */
   comment_instruction?: string;
+  /**
+   * Secret-free Restate review-fix pilot attempt id (AII-782/AII-793), read by the workflow's
+   * `run-name:` before any step runs and cross-validated there against `run_config.reviewFix.attemptId`
+   * (`workflows/claude-implement.yml` "Validate attempt correlation" step). Must match exactly —
+   * absent on every non-pilot dispatch. See `src/workflow-probe.ts`'s `supportsAttemptCorrelation`
+   * for detecting whether a target repo's synced workflow declares this input.
+   */
+  run_attempt_token?: string;
 }
 
-interface DispatchResult {
+/**
+ * Identity-resolution confidence for a `workflow_dispatch` POST, populated only when the
+ * caller opts in via `returnRunDetails` (AII-778). `"accepted"` means GitHub started (or, on
+ * a plain 204, plausibly started) the run. `"rejected"` is a definite 4xx application-level
+ * refusal — safe to treat as "did not happen". `"unknown"` covers everything in between: a
+ * transport failure before any response arrived, an unparseable or repo-mismatched 200 body,
+ * or a 5xx — GitHub may or may not have started the run, so a caller must not blindly retry
+ * the same POST on this outcome.
+ */
+export type DispatchOutcome = "accepted" | "rejected" | "unknown";
+
+export interface DispatchResult {
   success: boolean;
   status: number;
   error?: string;
+  /** Only set when the dispatch was made with `returnRunDetails: true`. */
+  outcome?: DispatchOutcome;
+  /** Exact run id, populated only for a 200 response whose body validated against the requested repo. */
+  runId?: number;
+  /** Exact run URL, populated only for a 200 response whose body validated against the requested repo. */
+  runUrl?: string;
+}
+
+/**
+ * `workflow_dispatch` inputs that an older synced `claude-implement.yml` still declares but a
+ * newer template drops, because their values now ride inside `run_config` instead.
+ * Envelope builders omit the phase and callback URL inputs; KG dispatches still send
+ * the display-only `issue_identifier`. `postWorkflowDispatch` strips whichever of these a 422 names and
+ * retries — **at most once**, regardless of what the retry's own response says — so the
+ * orchestrator can serve both template generations until every target repo has re-synced.
+ * `issue_identifier` joined this list for the same reason (AII-656): on the envelope contract
+ * it is a display-only duplicate of `run_config.issue.identifier`, so a target repo that hasn't
+ * re-synced can drop it without losing anything; the `run_config` guard below keeps it
+ * authoritative on the legacy contract, where no duplicate exists.
+ */
+export const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url", "issue_identifier"] as const;
+
+/**
+ * Extracts the quoted input names from a GitHub "unexpected inputs" rejection so the caller can
+ * match them exactly — never by substring — against `ENVELOPE_OPTIONAL_INPUTS`. GitHub returns
+ * either the bare text `Unexpected inputs provided: ["runner_phase"]` or a JSON envelope
+ * `{"message":"Unexpected inputs provided: [\"runner_phase\"]","documentation_url":"..."}`; in
+ * the JSON case the message's escaped quotes must be decoded before scanning for quoted tokens,
+ * or every extracted name would carry a trailing backslash and never match. `JSON.parse` handles
+ * that decoding; the raw-text case is left as-is when parsing fails (it isn't JSON to begin with).
+ */
+function extractUnexpectedInputNames(body: string): Set<string> {
+  let text = body;
+  try {
+    const parsed = JSON.parse(body) as { message?: unknown };
+    if (typeof parsed.message === "string") text = parsed.message;
+  } catch {
+    // Not a JSON body — use the raw text as-is.
+  }
+  const names = new Set<string>();
+  for (const match of text.matchAll(/"([^"]*)"/g)) {
+    names.add(match[1]);
+  }
+  return names;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validates a parsed 200 run-details body against the repo the dispatch actually targeted,
+ * per the issue's "validate response IDs/URLs against requested repo" requirement. `html_url`
+ * must always match `https://github.com/{owner}/{repo}/actions/runs/{id}`; if the body also
+ * carries a `repository` field (string `"owner/repo"` or an object with `full_name`), that
+ * must agree too. GitHub documents `workflow_run_id` and `run_url` for dispatch responses;
+ * retain historical `id`/`run` payload support, but reject conflicting identity fields or URLs.
+ * https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event
+ */
+function extractDispatchRunIdentity(
+  body: unknown,
+  owner: string,
+  repo: string,
+): { runId: number; runUrl: string } | null {
+  if (!isPlainRecord(body)) return null;
+  const run = isPlainRecord(body.run) ? body.run : body;
+
+  const id = run.workflow_run_id !== undefined ? run.workflow_run_id : run.id;
+  const htmlUrl = run.html_url;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) return null;
+  if (run.id !== undefined && run.id !== id) return null;
+  if (typeof htmlUrl !== "string") return null;
+
+  const expectedRepo = `${owner}/${repo}`;
+  if (htmlUrl !== `https://github.com/${expectedRepo}/actions/runs/${id}`) return null;
+  if (run.run_url !== undefined && run.run_url !== `https://api.github.com/repos/${expectedRepo}/actions/runs/${id}`) return null;
+
+  const repository = run.repository;
+  if (repository !== undefined) {
+    const fullName = typeof repository === "string"
+      ? repository
+      : (isPlainRecord(repository) && typeof repository.full_name === "string" ? repository.full_name : undefined);
+    if (fullName !== expectedRepo) return null;
+  }
+
+  return { runId: id, runUrl: htmlUrl };
+}
+
+async function parseDispatchRunDetails(res: Response, owner: string, repo: string): Promise<DispatchResult> {
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    return { success: true, status: 200, outcome: "unknown" };
+  }
+  const identity = extractDispatchRunIdentity(body, owner, repo);
+  if (!identity) return { success: true, status: 200, outcome: "unknown" };
+  return { success: true, status: 200, outcome: "accepted", runId: identity.runId, runUrl: identity.runUrl };
+}
+
+/**
+ * Posts one `workflow_dispatch` request. `returnRunDetails` is opt-in (default off) so every
+ * existing caller of `dispatchWorkflow`/`postWorkflowDispatch` keeps its established
+ * `success`/`status`/`error` shape and throw-on-transport-failure behavior byte-for-byte
+ * (AII-778 constraint) — the new `return_run_details` body field and `outcome`/`runId`/`runUrl`
+ * fields only appear when a caller explicitly asks for them.
+ */
+async function postDispatchOnce(
+  token: string,
+  owner: string,
+  repo: string,
+  workflowFile: string,
+  ref: string,
+  inputs: DispatchInputs,
+  opts?: { returnRunDetails?: boolean },
+): Promise<DispatchResult> {
+  const returnRunDetails = opts?.returnRunDetails === true;
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/dispatches`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: ghHeaders(token),
+      body: JSON.stringify({ ref, inputs, ...(returnRunDetails ? { return_run_details: true } : {}) }),
+      signal: defaultFetchSignal(),
+    });
+  } catch (err) {
+    // Legacy callers (returnRunDetails unset) keep the established behavior of letting a
+    // transport failure propagate as a rejected promise. A pilot caller that opted into
+    // returnRunDetails gets it back as outcome: "unknown" instead — a lost response is not
+    // proof of rejection, so a caller guarding against a repeat POST must see "unknown", not
+    // a thrown error indistinguishable from any other failure.
+    if (!returnRunDetails) throw err;
+    return {
+      success: false,
+      status: 0,
+      error: err instanceof Error ? err.message : String(err),
+      outcome: "unknown",
+    };
+  }
+
+  if (res.status === 204) {
+    return returnRunDetails ? { success: true, status: 204, outcome: "accepted" } : { success: true, status: 204 };
+  }
+
+  if (res.status === 200) {
+    return returnRunDetails ? parseDispatchRunDetails(res, owner, repo) : { success: true, status: 200 };
+  }
+
+  const body = await res.text();
+  if (!returnRunDetails) return { success: false, status: res.status, error: body };
+  // A definite 4xx application rejection is "rejected" — safe to treat as "did not happen".
+  // Anything else (5xx, or an unrecognised status) is "unknown": GitHub may have started the
+  // run before failing to report it cleanly.
+  const outcome: DispatchOutcome = res.status >= 400 && res.status < 500 ? "rejected" : "unknown";
+  return { success: false, status: res.status, error: body, outcome };
 }
 
 const GH_HEADERS = {
@@ -73,6 +258,18 @@ const GH_HEADERS = {
 
 function ghHeaders(token: string): Record<string, string> {
   return { ...GH_HEADERS, Authorization: `Bearer ${token}` };
+}
+
+// Unauthenticated reads (token: null) are limited to 60 req/hour per IP by GitHub.
+// Use only for public source-repo reads where no App installation covers the owner.
+export function srcHeaders(token: string | null): Record<string, string> {
+  if (token === null) return { ...GH_HEADERS };
+  return { ...GH_HEADERS, Authorization: `Bearer ${token}` };
+}
+
+/** Returns a fresh AbortSignal that cancels after FETCH_TIMEOUT_MS (default 60 s). */
+export function defaultFetchSignal(): AbortSignal {
+  return AbortSignal.timeout(Number(process.env.FETCH_TIMEOUT_MS) || 60_000);
 }
 
 /**
@@ -184,8 +381,23 @@ export function profilesRunnerEnv(issue: { profiles?: string[] }): Record<string
     : {};
 }
 
+/**
+ * Assignee-name env var for the runner process (Fly/local execution modes),
+ * where the value arrives via container env rather than a workflow input.
+ * Envelope-only otherwise: `assignee` has never existed as a workflow_dispatch
+ * input in any synced version of claude-implement.yml (unlike `profiles`, which
+ * predates the envelope), so there is no legacy-contract dispatch field for it —
+ * adding one would 422 every legacy-contract dispatch for an assigned ticket,
+ * which is the common case.
+ */
+export function assigneeRunnerEnv(issue: { assigneeName?: string }): Record<string, string> {
+  return issue.assigneeName ? { AI_IMPLEMENT_ASSIGNEE_NAME: issue.assigneeName } : {};
+}
+
 export interface EnvelopeDispatchOpts {
-  runnerPhase: "implementation" | "gap-analysis" | "planning";
+  modelPrices?: RunConfigV1["modelPrices"];
+  modelFallbacks?: RunConfigV1["modelFallbacks"];
+  runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   baseBranch?: string;
   runnerCallbackUrl?: string;
   runToken?: string;
@@ -193,7 +405,20 @@ export interface EnvelopeDispatchOpts {
   runProgressToken?: string;
   /** Include only when the target workflow advertises publication-token support. */
   runPublicationToken?: string;
+  /** True only when the exact workflow/ref reported `supportsPrivateRunConfig === true` (AII-983).
+   *  The result/progress/publication bearers then ride inside `run_config.credentials` (trusted
+   *  encoder) and are NOT duplicated as top-level inputs; `run_token` is sent as "". Absent/false
+   *  keeps the generic envelope plus masked top-level token inputs. */
+  privateTransport?: boolean;
+  /** Extra typed private credentials. Only `modelAuthGrant`, `modelAuthContext`, `executionPolicy` and `attemptToken` are carried; supplied
+   *  result/progress/publication bearers are ignored in favour of the minted token options.
+   *  Requires `privateTransport: true`; supplying it without capability throws rather than
+   *  dropping or downgrading it. */
+  credentials?: RunCredentialsV1;
+  /** Frozen stage snapshot from a managed `launch` decision; rides in `run_config.agentConfig`. */
+  agentConfig?: ResolvedAgentSnapshotV1;
   runnerImage?: string | null;
+  reviewOnly?: { reviewers: ReviewerSelection[] };
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
   commentInstruction?: string;
@@ -201,6 +426,14 @@ export interface EnvelopeDispatchOpts {
   /** True when this is a grouping parent's own closing-work dispatch. Threads into the runner
    *  so push.ts can finalize cleanly when the agent produces no changes (Case B). */
   groupingParent?: boolean;
+  /** Global retry/backoff policy and reviewer turn cap. Passed explicitly by the caller
+   *  (getRetryPolicy()) rather than fetched here, so this function stays free of a
+   *  database import. Required (nullable) so every call site states its intent
+   *  rather than silently omitting it: planning and kg-refresh pass `null` and get
+   *  nothing stamped (neither has a retry loop); implementation/gap-analysis pass the
+   *  policy, falling back to DEFAULT_RETRY_POLICY only if that itself is null — the
+   *  GHA path agrees with Fly and local, which both require this field. */
+  retryPolicy: RetryPolicy | null;
 }
 
 /**
@@ -210,42 +443,79 @@ export interface EnvelopeDispatchOpts {
  * pass-through inputs (tokens, provider, image, timeout) stay top-level so
  * the GHA workflow can ::add-mask:: the tokens before unpacking the envelope.
  */
+/** Fail-closed guard for supplied private credentials (AII-983): protected transport must never be
+ *  dropped or downgraded, so an unsupported/unprobeable reader aborts the dispatch before launch. */
+export function assertPrivateTransportForCredentials(
+  credentials: RunCredentialsV1 | undefined,
+  capabilities: { supportsPrivateRunConfig?: boolean },
+  target: string,
+): void {
+  if (credentials !== undefined && capabilities.supportsPrivateRunConfig !== true) {
+    throw new Error(
+      `protected run transport requires supportsPrivateRunConfig on ${target}; refusing to drop or downgrade private credentials — re-sync workflows`,
+    );
+  }
+}
+
+/** Fail-closed guard for the ephemeral full-access policy (AII-1437): an old workflow's credentials validator would
+ *  drop or reject the unknown field, so a workflow without the capability marker aborts the dispatch before launch. */
+export function assertExecutionPolicyCapability(
+  credentials: RunCredentialsV1 | undefined,
+  capabilities: { supportsExecutionPolicy?: boolean },
+  target: string,
+): void {
+  if (credentials?.executionPolicy !== undefined && capabilities.supportsExecutionPolicy !== true) {
+    throw new Error(
+      `ephemeral execution policy requires the github-hosted-execution-policy-v2 capability on ${target}; refusing to launch without it — re-sync workflows`,
+    );
+  }
+}
+
+/** Only the non-callback private fields a caller may supply. Result/progress/publication bearers are
+ *  orchestrator-minted and phase-scoped, so a supplied copy is never carried over. */
+function suppliedNonBearerCredentials(credentials: RunCredentialsV1 | undefined): Partial<RunCredentialsV1> {
+  return {
+    ...(credentials?.attemptToken !== undefined ? { attemptToken: credentials.attemptToken } : {}),
+    ...(credentials?.modelAuthGrant !== undefined ? { modelAuthGrant: credentials.modelAuthGrant } : {}),
+    ...(credentials?.modelAuthContext !== undefined ? { modelAuthContext: credentials.modelAuthContext } : {}),
+    ...(credentials?.executionPolicy !== undefined ? { executionPolicy: credentials.executionPolicy } : {}),
+  };
+}
+
 export function buildEnvelopeDispatchInputs(
   mapping: RepoMapping,
-  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[] },
+  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string },
   opts: EnvelopeDispatchOpts,
 ): DispatchInputs {
-  const runConfig: RunConfigV1 = {
-    v: 1,
-    issue: {
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      description: issue.description || issue.title,
-    },
-    runnerPhase: opts.runnerPhase,
-    ...(opts.baseBranch ? { baseBranch: opts.baseBranch } : {}),
-    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-    ...(opts.runnerCallbackUrl ? { runnerCallbackUrl: opts.runnerCallbackUrl } : {}),
-    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-    ...(opts.prNumber ? { prNumber: opts.prNumber } : {}),
-    ...(opts.commentInstruction ? { commentInstruction: opts.commentInstruction } : {}),
-    ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
-      ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
-      : {}),
-    ...(mapping.dependencyTokenScope != null && opts.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-    ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
-    ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
-    ...(opts.groupingParent ? { groupingParent: true } : {}),
-  };
+  const isPrivate = opts.privateTransport === true;
+  if (opts.credentials !== undefined && !isPrivate) {
+    throw new Error(
+      "protected run transport requires supportsPrivateRunConfig on the target workflow; refusing to drop or downgrade private credentials",
+    );
+  }
+  const issuesPublication = opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh";
+  const credentials: RunCredentialsV1 | undefined = isPrivate
+    ? {
+        version: 1,
+        ...(opts.runToken ? { resultToken: opts.runToken } : {}),
+        ...(opts.runProgressToken ? { progressToken: opts.runProgressToken } : {}),
+        ...(issuesPublication && opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
+        ...suppliedNonBearerCredentials(opts.credentials),
+      }
+    : undefined;
+  const runConfig = buildRunConfig({ ...opts, issue, mapping, credentials });
 
   return {
-    run_config: encodeRunConfig(runConfig),
-    run_token: opts.runToken ?? "",
-    ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
-    ...(opts.runnerPhase !== "planning" && opts.runPublicationToken !== undefined
+    run_config: credentials !== undefined ? encodeTrustedRunConfig(runConfig) : encodeRunConfig(runConfig),
+    // Display-only duplicate: run-name: is evaluated before any step runs, so it cannot
+    // decode run_config. The shared 422 retry (ENVELOPE_OPTIONAL_INPUTS) strips this on a
+    // template that predates the declaration.
+    issue_identifier: issue.identifier,
+    // Private transport: bearers live only in run_config.credentials; "" keeps the (required)
+    // top-level input present for readers that predate the private namespace.
+    run_token: isPrivate ? "" : opts.runToken ?? "",
+    ...(!isPrivate && opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
+    ...(!isPrivate && issuesPublication && opts.runPublicationToken !== undefined
       ? { run_publication_token: opts.runPublicationToken }
       : {}),
     ...providerDispatchFields(mapping),
@@ -254,28 +524,89 @@ export function buildEnvelopeDispatchInputs(
   };
 }
 
+/**
+ * True when the encoded envelope carries a managed stage snapshot or model-auth grant. Raw
+ * parse only (no validation, nothing logged): an unparseable value is treated as legacy.
+ */
+function isManagedRunConfig(encoded: string): boolean {
+  try {
+    const parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8")) as Record<string, unknown> | null;
+    if (parsed === null || typeof parsed !== "object") return false;
+    const creds = parsed.credentials as Record<string, unknown> | null | undefined;
+    return parsed.agentConfig !== undefined || (creds !== null && typeof creds === "object" && creds.modelAuthGrant !== undefined);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Posts a `workflow_dispatch`, with a bounded strip-and-retry for older templates: **at most
+ * two requests, ever.** On a 422 whose body matches `/unexpected inputs/i` and names — by exact
+ * match, never substring — at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in
+ * `inputs`, and only when `inputs.run_config` is a non-empty string, it strips exactly the named
+ * members and posts once more. Whatever that second request returns — success, a different 422,
+ * the same 422 again — is returned as-is; there is no third request. A target repo whose 422
+ * keeps naming a *different* declared-but-unhandled input across requests would otherwise chain
+ * indefinitely, since each response only proves what the target rejected on that specific
+ * payload, not what it will accept next.
+ *
+ * The `run_config` guard matters: on the legacy contract `runner_phase`/`runner_callback_url`
+ * are authoritative issue data, not compatibility duplicates, so stripping them there would run
+ * a gap-fill as an implementation. The guard requires a non-empty string — `run_config: ""`
+ * must not count as "envelope present" and authorize a strip.
+ *
+ * Name matching is exact against the quoted tokens in the rejection body (via
+ * `extractUnexpectedInputNames`), not `body.includes(name)` — a rejection naming
+ * `runner_phase_extra` or `extra_runner_callback_url` must not be mistaken for a match on
+ * `runner_phase` or `runner_callback_url`.
+ */
+export async function postWorkflowDispatch(opts: {
+  token: string;
+  owner: string;
+  repo: string;
+  workflowFile: string;
+  ref: string;
+  inputs: DispatchInputs;
+  /** Opt-in: requests `return_run_details` and populates `outcome`/`runId`/`runUrl` (AII-778). */
+  returnRunDetails?: boolean;
+}): Promise<DispatchResult> {
+  const dispatchOnceOpts = { returnRunDetails: opts.returnRunDetails };
+  const first = await postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, opts.inputs, dispatchOnceOpts);
+  if (first.success) return first;
+  if (first.status !== 422 || !/unexpected inputs/i.test(first.error ?? "")) return first;
+  if (!opts.inputs.run_config) return first;
+  // A managed run never degrades to a legacy shape: a rejected input is a hard failure.
+  if (isManagedRunConfig(opts.inputs.run_config)) return first;
+
+  const rejectedNames = extractUnexpectedInputNames(first.error ?? "");
+  const namesToStrip = ENVELOPE_OPTIONAL_INPUTS.filter(
+    (name) => opts.inputs[name] !== undefined && rejectedNames.has(name),
+  );
+  if (namesToStrip.length === 0) return first;
+
+  const strippedInputs: DispatchInputs = { ...opts.inputs };
+  for (const name of namesToStrip) delete strippedInputs[name];
+  console.log(
+    `[dispatch] ${opts.owner}/${opts.repo}/${opts.workflowFile} does not declare ${namesToStrip.join(", ")} (re-sync workflows); retrying without`,
+  );
+  return postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, strippedInputs, dispatchOnceOpts);
+}
+
 export async function dispatchWorkflow(
   token: string,
   mapping: RepoMapping,
   inputs: DispatchInputs,
+  opts?: { returnRunDetails?: boolean },
 ): Promise<DispatchResult> {
-  const url = `https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/dispatches`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: ghHeaders(token),
-    body: JSON.stringify({
-      ref: mapping.defaultBranch,
-      inputs,
-    }),
+  return postWorkflowDispatch({
+    token,
+    owner: mapping.owner,
+    repo: mapping.repo,
+    workflowFile: mapping.workflowFile,
+    ref: mapping.defaultBranch,
+    inputs,
+    returnRunDetails: opts?.returnRunDetails,
   });
-
-  if (res.status === 204 || res.status === 200) {
-    return { success: true, status: res.status };
-  }
-
-  const body = await res.text();
-  return { success: false, status: res.status, error: body };
 }
 
 /**
@@ -294,11 +625,190 @@ export async function postPrComment(
     method: "POST",
     headers: ghHeaders(token),
     body: JSON.stringify({ body }),
+    signal: defaultFetchSignal(),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`postPrComment failed: HTTP ${res.status}: ${text}`);
   }
+}
+
+/** A PR/issue comment. Author and timestamps are optional: callers that only need `id`/`body` ignore them. */
+export interface PrComment {
+  id: number;
+  body: string;
+  user?: { login: string; type?: string };
+  htmlUrl?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/**
+ * Lists all comments on a PR/issue (unified GitHub comment API), paginated to
+ * completion via the response's `Link: rel="next"` header — a PR with more than
+ * 100 comments before the sticky one must still be found, or `postOrUpdateStickyComment`
+ * duplicates it instead of updating it in place. Used to find a previously-posted
+ * sticky comment to update in place. By default a non-OK page ends the walk and returns
+ * what was read so far; pass `{ strict: true }` when the caller must not mistake an
+ * unreadable page for an empty list (the call then throws so the step can retry).
+ */
+export async function listPrComments(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  options: { strict?: boolean } = {},
+): Promise<PrComment[]> {
+  const comments: PrComment[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    // Strict readers must not mistake an unreadable list for an empty one: throw so the caller retries.
+    if (!res.ok) {
+      if (options.strict) throw new Error(`listPrComments: ${owner}/${repo}#${prNumber} comments unreadable (HTTP ${res.status})`);
+      break;
+    }
+    const data = (await res.json()) as Array<{ id: number; body?: string; user?: { login?: string; type?: string } | null; html_url?: string; created_at?: string; updated_at?: string }>;
+    comments.push(...data.map((c) => ({
+      id: c.id,
+      body: c.body ?? "",
+      ...(c.user?.login ? { user: { login: c.user.login, ...(c.user.type ? { type: c.user.type } : {}) } } : {}),
+      ...(c.html_url ? { htmlUrl: c.html_url } : {}),
+      ...(c.created_at ? { createdAt: c.created_at } : {}),
+      ...(c.updated_at ? { updatedAt: c.updated_at } : {}),
+    })));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return comments;
+}
+
+/**
+ * Updates the body of an existing PR/issue comment.
+ */
+export async function updatePrComment(
+  token: string,
+  owner: string,
+  repo: string,
+  commentId: number,
+  body: string,
+): Promise<void> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/comments/${commentId}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ body }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`updatePrComment failed: HTTP ${res.status}: ${text}`);
+  }
+}
+
+/**
+ * Posts `body` as a new PR comment, or edits a prior one in place when a comment
+ * already starts with `markerPrefix` — e.g. a stable "## kg-refresh dry-run" heading
+ * whose trailing sha changes on every push, so the match is a prefix, not exact text.
+ */
+export async function postOrUpdateStickyComment(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  markerPrefix: string,
+  body: string,
+): Promise<void> {
+  const comments = await listPrComments(token, owner, repo, prNumber);
+  const existing = comments.find((c) => c.body.startsWith(markerPrefix));
+  if (existing) {
+    await updatePrComment(token, owner, repo, existing.id, body);
+  } else {
+    await postPrComment(token, owner, repo, prNumber, body);
+  }
+}
+
+/**
+ * Sets a commit status (the legacy Statuses API, not a check-run — no check-run
+ * creation exists in this codebase yet). Requires the App's `statuses: write`
+ * permission on the target repo; callers gate on that grant before calling.
+ */
+export async function setCommitStatus(
+  token: string,
+  owner: string,
+  repo: string,
+  sha: string,
+  opts: { state: "success" | "failure" | "pending" | "error"; context: string; description?: string; targetUrl?: string },
+): Promise<void> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/statuses/${sha}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({
+      state: opts.state,
+      context: opts.context,
+      ...(opts.description ? { description: opts.description } : {}),
+      ...(opts.targetUrl ? { target_url: opts.targetUrl } : {}),
+    }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`setCommitStatus failed: HTTP ${res.status}: ${text}`);
+  }
+}
+
+/**
+ * Lists the changed file paths of a PR, following `Link: rel="next"` across pages (AII-639)
+ * so a guard-relevant path past the first 100 files is still seen. Throws on a non-OK page so
+ * the webhook can report `files_fetch_failed` rather than treating it as "no change".
+ */
+export async function listPullRequestFiles(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  // Follows `Link: rel="next"` like listPrComments (AII-639): a guard-relevant file past the
+  // first 100 must not be treated as "no guard-relevant change".
+  const files: string[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`listPullRequestFiles failed: HTTP ${res.status}: ${text}`);
+    }
+    const data = (await res.json()) as Array<{ filename?: string }>;
+    files.push(...data.map((f) => f.filename).filter((f): f is string => typeof f === "string"));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return files;
+}
+
+/**
+ * SHAs of the commits on a PR, oldest first (the head is last). Follows `Link: rel="next"`;
+ * GitHub caps the list at 250 commits. Throws on a non-OK response so a caller never reads
+ * a failed call as "no commits".
+ */
+export async function listPullRequestCommits(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  const shas: string[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/commits?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`listPullRequestCommits failed: HTTP ${res.status}: ${text}`);
+    }
+    const data = (await res.json()) as Array<{ sha?: string }>;
+    shas.push(...data.map((c) => c.sha).filter((c): c is string => typeof c === "string"));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return shas;
 }
 
 /**
@@ -315,7 +825,7 @@ export async function getBranchSha(
   // the whole string would turn the slashes into %2F and the ref lookup would 404.
   const encodedBranch = branch.split("/").map(encodeURIComponent).join("/");
   const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodedBranch}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -338,13 +848,13 @@ export async function getBranchSha(
  * Downloads a repository tree at `ref` as a gzipped tarball.
  */
 export async function fetchRepoTarball(
-  token: string,
+  token: string | null,
   owner: string,
   repo: string,
   ref: string,
 ): Promise<Buffer> {
   const url = `https://api.github.com/repos/${owner}/${repo}/tarball/${ref}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: srcHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) {
     throw new Error(`fetchRepoTarball failed: HTTP ${res.status}`);
   }
@@ -375,6 +885,7 @@ export async function ensureBranchExists(
     method: "POST",
     headers: ghHeaders(token),
     body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: fromSha }),
+    signal: defaultFetchSignal(),
   });
   if (res.status === 201) return;
   const body = await res.text().catch(() => "");
@@ -396,6 +907,16 @@ export async function ensureBranchExists(
  * runs list for a recent run on the expected branch with a "workflow_dispatch" event.
  * We filter to runs created after `dispatchedAfter` to avoid matching old runs.
  */
+export const RUN_TITLE_PREFIX = "Claude AI Implementation — ";
+
+/**
+ * Finds the workflow run dispatched for a given job. Without `issueIdentifier`, the first
+ * unclaimed candidate created at or after `dispatchedAfter` wins (today's behavior). With
+ * `issueIdentifier`, `display_title` (the synced template's `run-name`, AII-656) disambiguates
+ * concurrent dispatches on one repo: a run titled for another issue is skipped, a run titled
+ * for this issue wins outright, and an old-template run with no key is kept only as a fallback
+ * returned when no run matches by key.
+ */
 export async function findWorkflowRunId(
   token: string,
   owner: string,
@@ -404,31 +925,97 @@ export async function findWorkflowRunId(
   branch: string,
   dispatchedAfter: Date,
   excludeRunIds?: Set<number>,
+  issueIdentifier?: string,
 ): Promise<number | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/runs` +
     `?branch=${encodeURIComponent(branch)}&event=workflow_dispatch&per_page=10`;
 
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
 
   const data = (await res.json()) as {
-    workflow_runs: Array<{ id: number; created_at: string }>;
+    workflow_runs: Array<{ id: number; created_at: string; display_title?: string }>;
   };
 
+  let fallback: number | null = null;
   for (const run of data.workflow_runs) {
-    if (new Date(run.created_at) >= dispatchedAfter) {
-      if (excludeRunIds && excludeRunIds.has(run.id)) continue;
-      return run.id;
-    }
+    if (new Date(run.created_at) < dispatchedAfter) continue;
+    if (excludeRunIds && excludeRunIds.has(run.id)) continue;
+
+    if (!issueIdentifier) return run.id;
+
+    const title = run.display_title ?? "";
+    if (title === `${RUN_TITLE_PREFIX}${issueIdentifier}`) return run.id;
+    if (title.startsWith(RUN_TITLE_PREFIX)) continue; // titled for another issue
+    if (fallback === null) fallback = run.id;
   }
-  return null;
+  return fallback;
+}
+
+/**
+ * Builds the `workflow_dispatch` inputs for a GHA-backed kg-refresh run, for use with
+ * `postWorkflowDispatch`. The envelope's `runnerCallbackUrl` is the bare base URL (AII-548);
+ * the phase and callback URL travel only in run_config. The optional top-level
+ * `issue_identifier` can be stripped by the poster on a 422 from older templates.
+ * `issueIdentifier` is the decoded run_config's `issue.identifier` — the
+ * caller (`createKgRefreshDispatch`) decodes run_config once and
+ * threads `issue.identifier` through here.
+ */
+export function buildKgRefreshGhaDispatchBody(opts: {
+  runConfig: string;
+  runToken: string;
+  runProgressToken: string;
+  runPublicationToken?: string;
+  runnerImage: string | undefined;
+  jobTimeoutMinutes?: string;
+  issueIdentifier?: string;
+}): DispatchInputs {
+  return {
+    run_config: opts.runConfig,
+    run_token: opts.runToken,
+    run_progress_token: opts.runProgressToken,
+    ...(opts.runPublicationToken !== undefined ? { run_publication_token: opts.runPublicationToken } : {}),
+    ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
+    ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
+    ...(opts.issueIdentifier ? { issue_identifier: opts.issueIdentifier } : {}),
+  };
+}
+
+/**
+ * Private-transport KG body (AII-983): re-encodes the decoded trusted config with the result and
+ * progress bearers inside `credentials` and omits them as top-level inputs. Publication
+ * authority comes only from the caller's minted token. Supplied bearers are discarded;
+ * only the model-auth grant and attempt token already on the config are kept.
+ */
+export function buildPrivateKgRefreshGhaDispatchBody(
+  opts: Parameters<typeof buildKgRefreshGhaDispatchBody>[0] & { trustedConfig: RunConfigV1 },
+): DispatchInputs {
+  const { trustedConfig, ...rest } = opts;
+  const credentials: RunCredentialsV1 = {
+    ...suppliedNonBearerCredentials(trustedConfig.credentials),
+    version: 1,
+    resultToken: opts.runToken,
+    progressToken: opts.runProgressToken,
+    ...(opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
+  };
+  const body = buildKgRefreshGhaDispatchBody({
+    ...rest,
+    runConfig: encodeTrustedRunConfig({ ...trustedConfig, credentials }),
+    runToken: "",
+  });
+  delete body.run_progress_token;
+  delete body.run_publication_token;
+  return body;
 }
 
 export interface WorkflowRunStatus {
   status: "queued" | "in_progress" | "completed" | string;
   conclusion: "success" | "failure" | "cancelled" | "timed_out" | string | null;
   html_url: string;
+  /** ISO timestamps from the API; `updated_at` can drift past the true end time. */
+  run_started_at?: string | null;
+  updated_at?: string | null;
 }
 
 /**
@@ -441,20 +1028,71 @@ export async function getWorkflowRunStatus(
   runId: number,
 ): Promise<WorkflowRunStatus | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
 
   const data = (await res.json()) as {
     status: string;
     conclusion: string | null;
     html_url: string;
+    run_started_at?: string | null;
+    updated_at?: string | null;
   };
 
   return {
     status: data.status,
     conclusion: data.conclusion,
     html_url: data.html_url,
+    run_started_at: data.run_started_at ?? null,
+    updated_at: data.updated_at ?? null,
   };
+}
+
+export interface FailedRunStepJob {
+  /** The job's name, or `"unknown"` when the API omitted it. */
+  jobName: string;
+  htmlUrl: string | null;
+}
+
+/** The step where GitHub pulls a job's container image, so a denied or missing runner image fails there. */
+export const CONTAINER_INIT_STEP = "Initialize containers";
+
+/** The synced templates' step that mints a run's GitHub App token from the AI_IMPLEMENT_APP_ID and AI_IMPLEMENT_PRIVATE_KEY secrets. */
+export const APP_TOKEN_STEP = "Generate GitHub App token";
+
+/**
+ * Finds a job of a run whose step named `stepName` failed, one of the steps above that fail before
+ * the runner starts. Returns null for any other shape, a non-OK response, or a thrown error: a lookup
+ * failure must never make a run less retryable.
+ */
+export async function getFailedRunStepJob(
+  token: string,
+  owner: string,
+  repo: string,
+  runId: number,
+  stepName: string,
+): Promise<FailedRunStepJob | null> {
+  try {
+    const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`;
+    const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      jobs?: Array<{
+        name?: string;
+        html_url?: string;
+        steps?: Array<{ name?: string; conclusion?: string | null }>;
+      }>;
+    };
+    for (const job of data.jobs ?? []) {
+      const failed = (job.steps ?? []).some(
+        (step) => step.name === stepName && step.conclusion === "failure",
+      );
+      if (failed) return { jobName: job.name || "unknown", htmlUrl: job.html_url || null };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -471,7 +1109,7 @@ export async function cancelWorkflowRun(
   runId: number,
 ): Promise<boolean> {
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/cancel`;
-  const res = await fetch(url, { method: "POST", headers: ghHeaders(token) });
+  const res = await fetch(url, { method: "POST", headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 202 || res.status === 409) return true;
   return false;
 }
@@ -488,14 +1126,14 @@ export async function findPrForRun(
 ): Promise<string | null> {
   // First get the run to find the head branch
   const runUrl = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`;
-  const runRes = await fetch(runUrl, { headers: ghHeaders(token) });
+  const runRes = await fetch(runUrl, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!runRes.ok) return null;
 
   const runData = (await runRes.json()) as { head_branch: string };
 
   // Then look for PRs from that branch
   const prUrl = `https://api.github.com/repos/${owner}/${repo}/pulls?head=${encodeURIComponent(`${owner}:${runData.head_branch}`)}&state=open&per_page=1`;
-  const prRes = await fetch(prUrl, { headers: ghHeaders(token) });
+  const prRes = await fetch(prUrl, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!prRes.ok) return null;
 
   const prs = (await prRes.json()) as Array<{ html_url: string }>;
@@ -507,15 +1145,63 @@ export async function getPullRequestState(
   owner: string,
   repo: string,
   prNumber: number,
-): Promise<{ merged: boolean; state: "open" | "closed" } | null> {
+): Promise<{ merged: boolean; state: "open" | "closed"; headRef: string | null; headSha: string | null } | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
-  const data = (await res.json()) as { merged?: boolean; state?: string };
+  const data = (await res.json()) as { merged?: boolean; state?: string; head?: { ref?: string; sha?: string } };
   return {
     merged: data.merged === true,
     state: data.state === "open" ? "open" : "closed",
+    headRef: typeof data.head?.ref === "string" ? data.head.ref : null,
+    headSha: typeof data.head?.sha === "string" ? data.head.sha : null,
   };
+}
+
+/**
+ * Returns the GitHub-reported author type ("Bot" or "User") of a commit, or
+ * `null` when the commit's author has no GitHub account (`author` is null —
+ * an email-only committer) or the request fails. `ref` accepts a SHA or a
+ * branch name (e.g. a PR's `headRef`). Never throws: a caller deciding
+ * whether a human or the bot last wrote to a branch must treat an
+ * indeterminate answer the same as "not the bot", not a fatal error.
+ */
+export async function getCommitAuthorType(
+  token: string,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<"Bot" | "User" | null> {
+  try {
+    const url = `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`;
+    const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { author?: { type?: string } | null };
+    return data.author?.type === "Bot" || data.author?.type === "User" ? data.author.type : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns the committer date of a commit as epoch milliseconds. Unlike `getCommitAuthorType`
+ * it throws on any failure (bad status, missing or invalid date, fetch error): a caller that
+ * compares against it must not read an unreadable commit as "nothing to compare".
+ */
+export async function getCommitTime(
+  token: string,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<number> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`;
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) throw new Error(`getCommitTime: ${owner}/${repo}@${ref} returned ${res.status}`);
+  const data = (await res.json()) as { commit?: { committer?: { date?: unknown } | null } | null };
+  const date = data.commit?.committer?.date;
+  const ms = typeof date === "string" ? Date.parse(date) : NaN;
+  if (!Number.isFinite(ms)) throw new Error(`getCommitTime: ${owner}/${repo}@${ref} has no valid committer date`);
+  return ms;
 }
 
 // ---------- Feature-branch roll-up (merge-up) helpers ----------
@@ -535,7 +1221,7 @@ export async function compareBranches(
   // basehead path segments may contain slashes (feature/ool-78); encode each segment.
   const enc = (b: string) => b.split("/").map(encodeURIComponent).join("/");
   const url = `https://api.github.com/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -561,7 +1247,7 @@ export async function findOpenPullRequest(
   const url =
     `https://api.github.com/repos/${owner}/${repo}/pulls` +
     `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&state=open&per_page=1`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
   const prs = (await res.json()) as Array<{ number: number; html_url: string }>;
   return prs.length > 0 ? { number: prs[0].number, url: prs[0].html_url } : null;
@@ -586,12 +1272,12 @@ export async function findPullRequestByBranches(
   repo: string,
   head: string,
   base: string,
-): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean } | null> {
+): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean; headSha: string } | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/pulls` +
     `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}` +
     `&state=all&sort=updated&direction=desc&per_page=10`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
   const prs = (await res.json()) as Array<{
     number: number;
@@ -599,6 +1285,7 @@ export async function findPullRequestByBranches(
     state: string;
     merged_at: string | null;
     updated_at: string;
+    head: { sha: string };
   }>;
   if (prs.length === 0) return null;
   const pr =
@@ -610,6 +1297,7 @@ export async function findPullRequestByBranches(
     url: pr.html_url,
     state: pr.state === "open" ? "open" : "closed",
     merged: pr.merged_at !== null,
+    headSha: pr.head.sha,
   };
 }
 
@@ -628,7 +1316,7 @@ export async function deleteBranch(
 ): Promise<boolean> {
   const enc = branch.split("/").map(encodeURIComponent).join("/");
   const url = `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${enc}`;
-  const res = await fetch(url, { method: "DELETE", headers: ghHeaders(token) });
+  const res = await fetch(url, { method: "DELETE", headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 204 || res.status === 404) return true;
   const body = await res.text().catch(() => "");
   if (res.status === 422 && body.includes("Reference does not exist")) return true;
@@ -654,6 +1342,7 @@ export async function createPullRequest(
     method: "POST",
     headers: ghHeaders(token),
     body: JSON.stringify({ head: opts.head, base: opts.base, title: opts.title, body: opts.body }),
+    signal: defaultFetchSignal(),
   });
   if (res.status === 201) {
     const data = (await res.json()) as { number: number; html_url: string };
@@ -699,6 +1388,7 @@ export async function mergeBranch(
     method: "POST",
     headers: ghHeaders(token),
     body: JSON.stringify({ base, head, commit_message: commitMessage }),
+    signal: defaultFetchSignal(),
   });
   if (res.status === 201) return "merged";
   if (res.status === 204) return "noop"; // already up to date
@@ -716,29 +1406,80 @@ export async function mergeBranch(
 
 export async function listOpenPullRequests(
   token: string, owner: string, repo: string,
-): Promise<Array<{ number: number; url: string; base: string; head: string; headSha: string; draft: boolean }>> {
+): Promise<Array<{ number: number; url: string; base: string; head: string; headSha: string; draft: boolean; title: string }>> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return [];
   const prs = (await res.json()) as Array<{
-    number: number; html_url: string; draft?: boolean;
+    number: number; html_url: string; draft?: boolean; title: string;
     base: { ref: string }; head: { ref: string; sha: string };
   }>;
   return prs.map((p) => ({
     number: p.number, url: p.html_url, base: p.base.ref,
-    head: p.head.ref, headSha: p.head.sha, draft: p.draft === true,
+    head: p.head.ref, headSha: p.head.sha, draft: p.draft === true, title: p.title,
   }));
 }
+
+export interface OpenPullRequest {
+  author: string | null;
+  number: number;
+  url: string;
+  base: string;
+  head: string;
+  headSha: string;
+  draft: boolean;
+  title: string;
+  createdAt: number; // Epoch milliseconds from GitHub's created_at.
+}
+
+/** Lists every open PR, rejecting incomplete reads (including the 50-page limit). */
+export async function listAllOpenPullRequests(
+  token: string, owner: string, repo: string,
+): Promise<OpenPullRequest[]> {
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=100`;
+  const pulls: OpenPullRequest[] = [];
+  for (let page = 0; page < 50; page++) {
+    const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      throw new Error(`Cannot list open pull requests for ${owner}/${repo}: HTTP ${res.status}`);
+    }
+    const data = (await res.json()) as Array<{
+      number: number; html_url: string; draft?: boolean; title: string; created_at: string;
+      user?: { login?: string | null } | null;
+      base: { ref: string }; head: { ref: string; sha: string };
+    }>;
+    for (const p of data) {
+      const createdAt = Date.parse(p.created_at);
+      if (Number.isNaN(createdAt)) {
+        throw new Error(`Invalid created_at for ${owner}/${repo} pull request #${p.number}`);
+      }
+      pulls.push({
+        number: p.number, url: p.html_url, base: p.base.ref,
+        head: p.head.ref, headSha: p.head.sha, draft: p.draft === true,
+        title: p.title, createdAt, author: p.user?.login ?? null,
+      });
+    }
+    url = parseLinkNext(res.headers.get("link"));
+    if (!url) return pulls;
+  }
+  throw new Error(`Cannot list all open pull requests for ${owner}/${repo}: exceeded 50 pages`);
+}
+
+/** Repos for which a check-runs permission denial has already been logged this process —
+ *  auto-merge polls every open PR on every tick, and a missing Checks: read grant does not
+ *  clear itself between polls, so an unconditional warn would repeat once per PR per tick. */
+const checksPermissionDeniedLogged = new Set<string>();
+export function resetChecksPermissionDeniedLogging(): void { checksPermissionDeniedLogged.clear(); }
 
 export async function getCombinedChecksState(
   token: string, owner: string, repo: string, sha: string,
 ): Promise<"success" | "pending" | "failure"> {
   const runsRes = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100`,
-    { headers: ghHeaders(token) });
+    { headers: ghHeaders(token), signal: defaultFetchSignal() });
   const statusRes = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/status`,
-    { headers: ghHeaders(token) });
+    { headers: ghHeaders(token), signal: defaultFetchSignal() });
   const FAIL = new Set(["failure", "timed_out", "cancelled", "action_required", "stale"]);
   if (runsRes.ok) {
     const data = (await runsRes.json()) as { check_runs?: Array<{ status: string; conclusion: string | null }> };
@@ -746,6 +1487,24 @@ export async function getCombinedChecksState(
       if (c.status !== "completed") return "pending";
       if (c.conclusion && FAIL.has(c.conclusion)) return "failure";
     }
+  } else {
+    // A check-runs read we could not do is not evidence the checks passed — falling through to
+    // the unconditional "success" below would let auto-merge merge a PR with red or running
+    // checks purely because the token could not read them (AII-736). "pending" holds the PR
+    // the same way an in-progress check would, via the existing auto-merge.ts:84 branch. This
+    // applies to every unreadable response, not only a permission denial: a transient 5xx is
+    // just as much "not evidence the checks passed" as a 403, and this call has no retry loop
+    // of its own to fall back on before auto-merge acts on its result.
+    const repoKey = `${owner}/${repo}`;
+    if (!checksPermissionDeniedLogged.has(repoKey)) {
+      checksPermissionDeniedLogged.add(repoKey);
+      console.warn(
+        isChecksPermissionError({ status: runsRes.status })
+          ? `[github] Cannot read check runs for ${repoKey}: the GitHub App lacks Checks: read, or the installation hasn't accepted updated permissions. Holding PRs on this repo as pending until it's granted.`
+          : `[github] Cannot read check runs for ${repoKey}: HTTP ${runsRes.status}. Holding PRs on this repo as pending until the read succeeds.`,
+      );
+    }
+    return "pending";
   }
   if (statusRes.ok) {
     const s = (await statusRes.json()) as { state?: string; total_count?: number };
@@ -755,12 +1514,24 @@ export async function getCombinedChecksState(
   return "success";
 }
 
+/** The check runs of `sha`. Throws on an unreadable response, so a caller never reads "no checks" from a failed read. */
+export async function listCheckRuns(
+  token: string, owner: string, repo: string, sha: string,
+): Promise<Array<{ name: string; appSlug: string; status: string; conclusion: string | null }>> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100`,
+    { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) throw new Error(`check-runs read failed: HTTP ${res.status}`);
+  const data = (await res.json()) as { check_runs?: Array<{ name: string; status: string; conclusion: string | null; app?: { slug?: string } | null }> };
+  return (data.check_runs ?? []).map((c) => ({ name: c.name, appSlug: c.app?.slug ?? "", status: c.status, conclusion: c.conclusion }));
+}
+
 export async function hasChangesRequestedReview(
   token: string, owner: string, repo: string, prNumber: number,
 ): Promise<boolean> {
   const res = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`,
-    { headers: ghHeaders(token) });
+    { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return false;
   const reviews = (await res.json()) as Array<{ user: { id: number } | null; state: string }>;
   const latest = new Map<number, string>();
@@ -771,6 +1542,86 @@ export async function hasChangesRequestedReview(
   return [...latest.values()].includes("CHANGES_REQUESTED");
 }
 
+export type PrReadinessReason =
+  | "clean" | "closed" | "draft" | "head_moved" | "dirty" | "behind" | "blocked" | "unstable"
+  | "unknown" | "unrecognized" | "changes_requested" | "error";
+
+export interface PrReadiness {
+  ready: boolean;
+  reason: PrReadinessReason;
+  headSha: string | null;
+  mergeableState: string | null;
+}
+
+/** The fields of a `GET /pulls/{n}` response that readiness reads. */
+export interface PullReadinessFields {
+  state?: string;
+  draft?: boolean;
+  merged?: boolean;
+  mergeable?: boolean | null;
+  mergeable_state?: string;
+  head?: { sha?: string };
+}
+
+/**
+ * The one rule for "GitHub reports this PR clean to merge at this head": open, not a draft,
+ * head equal to `expectedHeadSha` when given, `mergeable === true` and `mergeable_state === "clean"`.
+ * Pure; reviews are not read here. Shared by child auto-merge (via `getPrReadiness`) and the
+ * review-fix merge policy (`src/review-fix-github-adapter.ts`).
+ */
+export function classifyPullReadiness(pr: PullReadinessFields, expectedHeadSha?: string): PrReadiness {
+  const headSha = pr.head?.sha ?? null;
+  const mergeableState = pr.mergeable_state ?? null;
+  const result = (ready: boolean, reason: PrReadinessReason): PrReadiness => ({ ready, reason, headSha, mergeableState });
+  if (pr.state !== "open" || pr.merged) return result(false, "closed");
+  if (pr.draft) return result(false, "draft");
+  if (expectedHeadSha && headSha !== expectedHeadSha) return result(false, "head_moved");
+  if (pr.mergeable === null || pr.mergeable === undefined || mergeableState === "unknown") return result(false, "unknown");
+  if (mergeableState !== "clean" || pr.mergeable !== true) {
+    const known: PrReadinessReason[] = ["dirty", "behind", "blocked", "unstable"];
+    return result(false, known.find((k) => k === mergeableState) ?? "unrecognized");
+  }
+  return result(true, "clean");
+}
+
+export interface PrReadinessOpts {
+  sleep?: (ms: number) => Promise<void>;
+  retries?: number;
+  intervalMs?: number;
+}
+
+/**
+ * Whether GitHub reports the PR clean to merge at `expectedHeadSha` (see `classifyPullReadiness`),
+ * with no reviewer's latest review `CHANGES_REQUESTED`. `mergeable` is computed lazily, so an
+ * unknown state is re-read a few times before giving up (the caller's next tick tries again).
+ * Never throws; a failed read is `reason: "error"`.
+ */
+export async function getPrReadiness(
+  token: string, owner: string, repo: string, prNumber: number,
+  expectedHeadSha?: string, opts: PrReadinessOpts = {},
+): Promise<PrReadiness> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const retries = opts.retries ?? 3;
+  const intervalMs = opts.intervalMs ?? 2000;
+  const failed: PrReadiness = { ready: false, reason: "error", headSha: null, mergeableState: null };
+  try {
+    let verdict: PrReadiness = failed;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+        { headers: ghHeaders(token), signal: defaultFetchSignal() });
+      if (!res.ok) return failed;
+      verdict = classifyPullReadiness((await res.json()) as PullReadinessFields, expectedHeadSha);
+      if (verdict.reason !== "unknown") break;
+      if (attempt < retries) await sleep(intervalMs);
+    }
+    if (!verdict.ready) return verdict;
+    if (await hasChangesRequestedReview(token, owner, repo, prNumber)) return { ...verdict, ready: false, reason: "changes_requested" };
+    return verdict;
+  } catch {
+    return failed;
+  }
+}
+
 export async function mergePullRequest(
   token: string, owner: string, repo: string, prNumber: number, sha: string,
   method: "merge" | "squash" | "rebase",
@@ -778,6 +1629,7 @@ export async function mergePullRequest(
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
     method: "PUT", headers: ghHeaders(token),
     body: JSON.stringify({ merge_method: method, sha }),
+    signal: defaultFetchSignal(),
   });
   if (res.status === 200) return "merged";
   if (res.status === 405) return "blocked";
@@ -787,6 +1639,27 @@ export async function mergePullRequest(
     status: res.status, path: `/repos/${owner}/${repo}/pulls/${prNumber}/merge`,
     bodyText: body, message: `mergePullRequest(#${prNumber}) failed: HTTP ${res.status}: ${body}`,
   });
+}
+
+/**
+ * Closes an open PR without merging (state: "closed"). Used to close a kg-refresh
+ * snapshot PR whose callback reported failure, leaving a record of what was attempted.
+ */
+export async function closePullRequest(
+  token: string, owner: string, repo: string, prNumber: number,
+): Promise<void> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+    method: "PATCH", headers: ghHeaders(token),
+    body: JSON.stringify({ state: "closed" }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new GitHubApiError({
+      status: res.status, path: `/repos/${owner}/${repo}/pulls/${prNumber}`,
+      bodyText: body, message: `closePullRequest(#${prNumber}) failed: HTTP ${res.status}: ${body}`,
+    });
+  }
 }
 
 export async function addCommentReaction(
@@ -802,6 +1675,7 @@ export async function addCommentReaction(
       method: "POST",
       headers: { ...ghHeaders(token), "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
+      signal: defaultFetchSignal(),
     },
   );
   // Adding a reaction that already exists returns 200 (idempotent); 201 = created.
@@ -817,4 +1691,233 @@ export async function addCommentReaction(
     bodyText: body,
     message: `addCommentReaction(${commentId}, ${content}) failed: HTTP ${res.status}: ${body}`,
   });
+}
+
+/** Lists up to 100 branch names for a repo. Returns [] on error. */
+export async function listBranchNames(token: string, owner: string, repo: string): Promise<string[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`;
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) return [];
+  const data = (await res.json()) as Array<{ name?: unknown }>;
+  return data.flatMap((b) => (typeof b.name === "string" ? [b.name] : []));
+}
+
+/** Lists up to 100 tag names for a repo. Returns [] on error. */
+export async function listTagNames(token: string, owner: string, repo: string): Promise<string[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`;
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) return [];
+  const data = (await res.json()) as Array<{ name?: unknown }>;
+  return data.flatMap((t) => (typeof t.name === "string" ? [t.name] : []));
+}
+
+/** Extracts the next-page URL from a GitHub Link response header, or null if none. */
+export function parseLinkNext(header: string | null): string | null {
+  if (!header) return null;
+  for (const part of header.split(",")) {
+    const match = part.match(/<([^>]+)>;\s*rel="next"/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/** Lists branches and tags for a repo, throwing GitHubApiError on any non-200 response. */
+export async function listRepoBranchesAndTags(
+  token: string | null,
+  owner: string,
+  repo: string,
+): Promise<{ branches: string[]; tags: string[] }> {
+  async function fetchAllNames(initialUrl: string, path: string): Promise<string[]> {
+    const names: string[] = [];
+    let url: string | null = initialUrl;
+    while (url) {
+      const res = await fetch(url, { headers: srcHeaders(token), signal: defaultFetchSignal() });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new GitHubApiError({ status: res.status, path, bodyText: body });
+      }
+      const data = (await res.json()) as Array<{ name?: unknown }>;
+      names.push(...data.flatMap((item) => (typeof item.name === "string" ? [item.name] : [])));
+      url = parseLinkNext(res.headers.get("link"));
+    }
+    return names;
+  }
+
+  const [branches, tags] = await Promise.all([
+    fetchAllNames(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`, `/repos/${owner}/${repo}/branches`),
+    fetchAllNames(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, `/repos/${owner}/${repo}/tags`),
+  ]);
+  return { branches, tags };
+}
+
+/**
+ * Returns the default branch for a repository, or null if the request fails.
+ */
+export async function getRepoDefaultBranch(
+  token: string | null,
+  owner: string,
+  repo: string,
+): Promise<string | null> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: srcHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) return null;
+  const data = (await res.json()) as { default_branch?: unknown };
+  return typeof data.default_branch === "string" ? data.default_branch : null;
+}
+
+/**
+ * Resolves a branch name, tag name, or commit SHA to its commit SHA.
+ * Returns null when the ref does not exist or the lookup fails.
+ * Uses the commits list endpoint, which accepts branches, tags, and SHAs as `sha`.
+ */
+export async function getRefSha(token: string | null, owner: string, repo: string, ref: string): Promise<string | null> {
+  const url =
+    `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(ref)}&per_page=1`;
+  const res = await fetch(url, { headers: srcHeaders(token), signal: defaultFetchSignal() });
+  // 404 = repo not found, 422 = invalid ref
+  if (!res.ok) return null;
+  const data = (await res.json()) as Array<{ sha?: unknown }>;
+  const sha = data[0]?.sha;
+  return typeof sha === "string" ? sha : null;
+}
+
+/**
+ * Returns how many commits `head` is behind `base`. Null on 404 or other failure.
+ * Uses the GitHub compare API: `behind_by > 0` means head is missing commits from base.
+ */
+export async function compareCommits(
+  token: string | null,
+  owner: string,
+  repo: string,
+  base: string,
+  head: string,
+): Promise<{ behindBy: number } | null> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
+  const res = await fetch(url, { headers: srcHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) return null;
+  const data = (await res.json()) as { behind_by?: unknown };
+  return { behindBy: typeof data.behind_by === "number" ? data.behind_by : 0 };
+}
+
+/**
+ * A file's text from `ref` when given, else from the repository's GitHub default branch (no `ref` sent), or
+ * `null` when it does not exist.
+ * Any other failure throws, so a caller inside a retried step never reads "no file" from an outage.
+ */
+export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string, ref?: string): Promise<string | null> {
+  const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}${query}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`getDefaultBranchFileText ${path} failed: HTTP ${res.status}`);
+  const body = (await res.json()) as { content?: string; encoding?: string; type?: string };
+  if (body.type !== "file" || body.encoding !== "base64" || typeof body.content !== "string") return null;
+  return Buffer.from(body.content, "base64").toString("utf8");
+}
+
+/** What an unauthenticated read sees of a repository. */
+export interface PublicRepositoryRead {
+  /** The HTTP status of `GET /repos/{owner}/{repo}`: 200 for a public repository, 404 for a private or missing one. */
+  status: number;
+  /** Whether the requested ref resolves, or null when no ref was asked or the repository read failed. */
+  refExists: boolean | null;
+  /** When GitHub refused a read for its rate limit, the time it may be read again, in epoch milliseconds. */
+  rateLimitedUntil?: number;
+}
+
+/**
+ * When a refused response may be retried, by GitHub's rate-limit rules, or null when GitHub did not refuse it for a rate limit:
+ * `retry-after` seconds from now, else the primary limit's `x-ratelimit-reset` (UTC epoch seconds), else a minute.
+ */
+export function gitHubRateLimitedUntil(res: Response, now: number = Date.now()): number | null {
+  if (res.status !== 403 && res.status !== 429) return null;
+  const retryAfter = res.headers.get("retry-after");
+  if (retryAfter !== null && /^\d+$/.test(retryAfter)) return now + Number(retryAfter) * 1000;
+  if (res.headers.get("x-ratelimit-remaining") !== "0") return null;
+  const reset = Number(res.headers.get("x-ratelimit-reset"));
+  return reset > 0 ? reset * 1000 : now + 60_000;
+}
+
+/**
+ * Reads a repository without a token, as a run clones one on an owner the App is not installed on.
+ * GitHub limits unauthenticated reads to 60 an hour per IP, so a caller makes these only for such owners.
+ */
+export async function readPublicRepository(owner: string, repo: string, ref?: string): Promise<PublicRepositoryRead> {
+  const base = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const res = await fetch(base, { headers: srcHeaders(null), signal: defaultFetchSignal() });
+  const limited = gitHubRateLimitedUntil(res);
+  if (limited !== null) return { status: res.status, refExists: null, rateLimitedUntil: limited };
+  if (!res.ok || ref === undefined) return { status: res.status, refExists: null };
+  const commit = await fetch(`${base}/commits?sha=${encodeURIComponent(ref)}&per_page=1`, { headers: srcHeaders(null), signal: defaultFetchSignal() });
+  // getRefSha's reading: 404 is a missing repository and 422 an invalid ref. Anything else is not an answer about the ref.
+  if (commit.status === 404 || commit.status === 422) return { status: res.status, refExists: false };
+  const commitLimited = gitHubRateLimitedUntil(commit);
+  if (commitLimited !== null) return { status: res.status, refExists: null, rateLimitedUntil: commitLimited };
+  if (!commit.ok) throw new GitHubApiError({ status: commit.status, path: `/repos/${owner}/${repo}/commits`, bodyText: await commit.text() });
+  return { status: res.status, refExists: true };
+}
+
+/** One repository's reads for `readRepositoryFacts`. */
+export interface RepositoryFactsRequest {
+  repo: string;
+  /** Git revision expressions, as `git rev-parse` reads them: `HEAD:<path>` for a file on the default branch, `<ref>:<path>`, or a bare `<ref>`. */
+  expressions: string[];
+  /** Head branch names whose open pull request to look up. */
+  openPullRequestHeads: string[];
+}
+
+/** What a token sees of one repository. */
+export interface RepositoryFacts {
+  /** False when the token cannot see the repository or it does not exist, which GitHub answers alike. */
+  visible: boolean;
+  /** Whether a visible repository is private; false when it is not visible. */
+  private: boolean;
+  defaultBranch: string | null;
+  /** Whether each requested expression names an existing Git object. */
+  exists: Record<string, boolean>;
+  /** The newest open pull request from each requested head branch, as workflow sync picks its own, or null. */
+  openPullRequests: Record<string, { number: number; url: string } | null>;
+}
+
+/**
+ * Reads every requested repository of one owner in a single GraphQL query.
+ * Values travel as variables, never inside the query text. Throws on a failed request or any error other than an unseen repository.
+ */
+export async function readRepositoryFacts(token: string, owner: string, requests: RepositoryFactsRequest[]): Promise<Map<string, RepositoryFacts>> {
+  const variables: Record<string, string> = { owner };
+  const declarations = ["$owner: String!"];
+  const declare = (name: string, value: string) => {
+    variables[name] = value;
+    declarations.push(`$${name}: String!`);
+    return `$${name}`;
+  };
+  const selections = requests.map((request, r) => {
+    const objects = request.expressions.map((expression, e) => `e${e}: object(expression: ${declare(`r${r}e${e}`, expression)}) { __typename }`);
+    const pulls = request.openPullRequestHeads.map((head, p) =>
+      `p${p}: pullRequests(states: OPEN, headRefName: ${declare(`r${r}p${p}`, head)}, first: 1, orderBy: { field: CREATED_AT, direction: DESC }) { nodes { number url } }`);
+    return `r${r}: repository(owner: $owner, name: ${declare(`r${r}`, request.repo)}) { isPrivate defaultBranchRef { name } ${[...objects, ...pulls].join(" ")} }`;
+  });
+  const query = `query(${declarations.join(", ")}) { ${selections.join(" ")} }`;
+
+  const res = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: { ...ghHeaders(token), "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) throw new GitHubApiError({ status: res.status, path: "/graphql", bodyText: await res.text() });
+  const body = (await res.json()) as {
+    data?: Record<string, { isPrivate: boolean; defaultBranchRef: { name: string } | null; [alias: string]: unknown } | null>;
+    errors?: Array<{ type?: string; path?: string[]; message?: string }>;
+  };
+  const unseen = new Set((body.errors ?? []).filter((e) => e.type === "NOT_FOUND" && e.path?.length === 1).map((e) => e.path![0]));
+  const unexpected = (body.errors ?? []).filter((e) => !(e.type === "NOT_FOUND" && e.path?.length === 1));
+  if (unexpected.length > 0 || !body.data) throw new Error(`readRepositoryFacts ${owner} failed: ${unexpected.map((e) => e.message).join("; ") || "no data"}`);
+
+  return new Map(requests.map((request, r): [string, RepositoryFacts] => {
+    const node = body.data![`r${r}`];
+    if (!node || unseen.has(`r${r}`)) return [request.repo, { visible: false, private: false, defaultBranch: null, exists: {}, openPullRequests: {} }];
+    const exists = Object.fromEntries(request.expressions.map((expression, e) => [expression, node[`e${e}`] != null]));
+    const openPullRequests = Object.fromEntries(request.openPullRequestHeads.map((head, p) =>
+      [head, (node[`p${p}`] as { nodes: Array<{ number: number; url: string }> }).nodes[0] ?? null]));
+    return [request.repo, { visible: true, private: node.isPrivate === true, defaultBranch: node.defaultBranchRef?.name ?? null, exists, openPullRequests }];
+  }));
 }

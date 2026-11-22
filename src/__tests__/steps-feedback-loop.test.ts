@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
@@ -16,13 +18,32 @@ vi.mock("../pipeline/steps/review.js", async (importOriginal) => {
   };
 });
 
+// Wraps the real implementation so its RETURN VALUE stays authentic (backoff math,
+// jitter and all) while still being a spy — lets a test assert sleep() was invoked
+// with exactly what computeBackoffMs produced, without needing to know that value
+// in advance (BAC-27134).
+vi.mock("../pipeline/retry-backoff.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../pipeline/retry-backoff.js")>();
+  return { ...actual, computeBackoffMs: vi.fn(actual.computeBackoffMs) };
+});
+
 import { spawnSync } from "node:child_process";
 import { implementStep } from "../pipeline/steps/implement.js";
 import { reviewStep } from "../pipeline/steps/review.js";
-import { feedbackLoopStep } from "../pipeline/steps/feedback-loop.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
+import { feedbackLoopStep, projectStageReport } from "../pipeline/steps/feedback-loop.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { Step, StepReporter } from "../pipeline/types.js";
+import { DEFAULT_RETRY_POLICY, computeBackoffMs } from "../pipeline/retry-backoff.js";
+import type { FailureRecord } from "../pipeline/failure-classification.js";
+import type { LLMExecutor, RunTelemetry, Step, StepReporter } from "../pipeline/types.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { makeContext, makeExecutor } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
+
+/** No-op sleep so a retry test never actually waits out the real backoff delay. */
+const NO_SLEEP = async () => {};
+
+/** A message classifyThrown recognises as PROVIDER_OVERLOADED (transient). */
+const TRANSIENT_ERROR_MESSAGE = "upstream returned 529 overloaded_error";
 
 const APPROVED_REVIEW = {
   approved: true,
@@ -31,6 +52,7 @@ const APPROVED_REVIEW = {
   progressDelta: 100,
   feedback: "Looks good",
   tokensUsed: 0,
+  attempts: 1,
 };
 
 const REJECTED_REVIEW = {
@@ -40,6 +62,7 @@ const REJECTED_REVIEW = {
   progressDelta: 50,
   feedback: "Needs improvement",
   tokensUsed: 0,
+  attempts: 1,
 };
 
 const IMPLEMENT_OUTPUTS = {
@@ -47,36 +70,35 @@ const IMPLEMENT_OUTPUTS = {
   tokensUsed: 100,
   exitCode: 0,
   subagentCount: 0,
+  attempts: 1,
 };
 
-function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test",
-    issueDescription: "Description",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
-    ...overrides,
-  });
-}
-
-const BASE_INPUTS = {
-  workspaceDir: "/tmp/workspace",
+const BASE_ISSUE = {
   issueTitle: "Implement feature X",
   issueDescription: "Add feature X to the codebase",
 };
 
+// The step writes ai-output/ into its workspace, so every test gets a workspace of its own.
+let baseInputs: typeof BASE_ISSUE & { workspaceDir: string };
+beforeEach(() => {
+  baseInputs = { workspaceDir: testDir("feedback-loop"), ...BASE_ISSUE };
+});
+
+/** Every non-"status" git call returns `diff`; `git status --porcelain` always reports a
+ *  clean tree (BAC-27134: dirty tests override this to distinguish clean from dirty). */
 function mockDiff(diff = "diff --git a/foo.ts\n+added line") {
-  vi.mocked(spawnSync).mockReturnValue({
-    status: 0,
-    stdout: Buffer.from(diff),
-    stderr: Buffer.from(""),
-    pid: 0,
-    output: [],
-    signal: null,
-    error: undefined,
+  vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+    const argv = (args ?? []) as string[];
+    const isStatus = argv[0] === "status";
+    return {
+      status: 0,
+      stdout: Buffer.from(isStatus ? "" : diff),
+      stderr: Buffer.from(""),
+      pid: 0,
+      output: [],
+      signal: null,
+      error: undefined,
+    };
   });
 }
 
@@ -92,7 +114,7 @@ describe("feedbackLoopStep", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      BASE_INPUTS,
+      baseInputs,
       new NoopStepReporter(),
     );
 
@@ -103,12 +125,34 @@ describe("feedbackLoopStep", () => {
     expect(reviewStep.run).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps an implement invocation failure on the pass when review approves", async () => {
+    const failure: FailureRecord = {
+      category: "crash", code: "UNKNOWN", stage: "implement", attempt: 1, retryable: false,
+      message: "stream disconnected", evidence: { truncated: false },
+    };
+    vi.mocked(implementStep.run).mockResolvedValue({
+      ...IMPLEMENT_OUTPUTS,
+      telemetry: { outcome: "error", numTurns: 1, durationMs: 5, costUsd: null, tokensIn: null, tokensOut: null },
+      invocationFailure: failure,
+    });
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
+
+    expect(outputs.approved).toBe(true);
+    const pass = (outputs.passes as Array<Record<string, unknown>>)[0];
+    expect(pass.implementOutcome).toBe("error");
+    expect(pass.reviewApproved).toBe(true);
+    expect(pass.implementFailureCode).toBe("UNKNOWN");
+    expect(pass.implementFailureMessage).toBe("stream disconnected");
+  });
+
   it("uses implementationPrompt for the implement step", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, implementationPrompt: "Follow WORKFLOW.md instructions" },
+      { ...baseInputs, implementationPrompt: "Follow WORKFLOW.md instructions" },
       new NoopStepReporter(),
     );
 
@@ -123,7 +167,7 @@ describe("feedbackLoopStep", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 3 },
+      { ...baseInputs, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
@@ -138,7 +182,7 @@ describe("feedbackLoopStep", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 2 },
+      { ...baseInputs, maxIterations: 2 },
       new NoopStepReporter(),
     );
 
@@ -150,7 +194,7 @@ describe("feedbackLoopStep", () => {
   it("defaults to 3 maxIterations when not specified", async () => {
     vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.iterations).toBe(3);
   });
@@ -159,7 +203,7 @@ describe("feedbackLoopStep", () => {
     mockDiff("diff --git a/src/auth.ts\n+new line");
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
     expect(reviewCall[1]).toMatchObject({
@@ -174,7 +218,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 3 },
+      { ...baseInputs, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
@@ -195,7 +239,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 2 },
+      { ...baseInputs, maxIterations: 2 },
       new NoopStepReporter(),
     );
 
@@ -203,6 +247,82 @@ describe("feedbackLoopStep", () => {
     expect(secondImplementCall[1].prompt).toContain("Missing route matrix test");
     expect(secondImplementCall[1].prompt).toContain("Pagination can exceed page size");
     expect(secondImplementCall[1].prompt).toContain("The implementation is close");
+  });
+
+  it("includes the dependency install failure block, method, and error on the first iteration when installFailed is true", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      {
+        ...baseInputs,
+        installFailed: true,
+        installMethod: "npm ci",
+        installError: "npm ERR! could not resolve dependency",
+      },
+      new NoopStepReporter(),
+    );
+
+    const firstImplementCall = vi.mocked(implementStep.run).mock.calls[0];
+    expect(firstImplementCall[1].prompt).toContain("## Dependency install failed");
+    expect(firstImplementCall[1].prompt).toContain("npm ci");
+    expect(firstImplementCall[1].prompt).toContain("npm ERR! could not resolve dependency");
+  });
+
+  it("includes the dependency install failure block on a review-feedback iteration too", async () => {
+    vi.mocked(reviewStep.run)
+      .mockResolvedValueOnce(REJECTED_REVIEW)
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      {
+        ...baseInputs,
+        maxIterations: 3,
+        installFailed: true,
+        installMethod: "npm ci",
+        installError: "npm ERR! could not resolve dependency",
+      },
+      new NoopStepReporter(),
+    );
+
+    const secondImplementCall = vi.mocked(implementStep.run).mock.calls[1];
+    expect(secondImplementCall[1].prompt).toContain("## Dependency install failed");
+    expect(secondImplementCall[1].prompt).toContain("npm ci");
+    expect(secondImplementCall[1].prompt).toContain("npm ERR! could not resolve dependency");
+    // The review-feedback block must still be present alongside it.
+    expect(secondImplementCall[1].prompt).toContain("Needs improvement");
+  });
+
+  it("omits the dependency install failure block when installFailed is false or absent", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
+
+    const firstImplementCall = vi.mocked(implementStep.run).mock.calls[0];
+    expect(firstImplementCall[1].prompt).not.toContain("## Dependency install failed");
+  });
+
+  it("passes installFailed through to the in-loop reviewer", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, installFailed: true },
+      new NoopStepReporter(),
+    );
+
+    const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
+    expect(reviewCall[1]).toMatchObject({ installFailed: true });
+  });
+
+  it("does not pass installFailed to the in-loop reviewer when absent", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
+
+    const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
+    expect(reviewCall[1]).toMatchObject({ installFailed: false });
   });
 
   it("reports implement and review sub-steps via reporter", async () => {
@@ -215,7 +335,7 @@ describe("feedbackLoopStep", () => {
       }),
     };
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter);
+    await feedbackLoopStep.run(makeContext(), baseInputs, reporter);
 
     const types = reportedSteps.map((s) => s.type);
     expect(types).toContain("implement");
@@ -235,7 +355,7 @@ describe("feedbackLoopStep", () => {
     };
 
     await expect(
-      feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter),
+      feedbackLoopStep.run(makeContext(), baseInputs, reporter),
     ).rejects.toThrow("LLM timeout");
 
     const failedStep = reportedSteps.find((s) => s.status === "failed");
@@ -243,10 +363,133 @@ describe("feedbackLoopStep", () => {
     expect(failedStep?.type).toBe("implement");
   });
 
+  it("re-stamps the iteration-qualified stage on an already-classified implement failure", async () => {
+    // implementStep (the real module, not this mock) attaches err.failure with
+    // stage "implement". Passed through feedback-loop's classifyThrown as-is,
+    // that stage would never become the iteration-qualified
+    // "feedback-loop/implement-1" — this asserts the sub-step output and the
+    // rethrown error both carry the qualified stage instead.
+    const err = Object.assign(new Error("LLM invocation failed with exit code 1"), {
+      failure: {
+        category: "crash" as const,
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 1,
+        retryable: false,
+        message: "boom",
+        evidence: { truncated: false },
+      },
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(err);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    const thrown = await feedbackLoopStep
+      .run(makeContext(), baseInputs, reporter)
+      .catch((e: unknown) => e);
+
+    const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "implement");
+    expect(failedStep).toBeDefined();
+    expect((failedStep?.outputs as { failure?: { stage?: string } }).failure?.stage).toBe(
+      "feedback-loop/implement-1",
+    );
+    expect((thrown as Error & { failure?: { stage?: string } }).failure?.stage).toBe(
+      "feedback-loop/implement-1",
+    );
+  });
+
+  it("carries telemetry stamped on a rejected implement error onto the failed sub-step report (BAC-27136)", async () => {
+    // The executor (a spawn-level rejection where every attempt fails) and
+    // implement.ts (a settled-but-failing LLMResult) both stamp `err.telemetry`
+    // now — feedback-loop must surface it on the failed implement sub-step's
+    // outputs, not just the failure record, or the tokens/cost that attempt
+    // burned are lost from the run's evidence.
+    const telemetry = {
+      outcome: "unknown" as const,
+      numTurns: 3,
+      durationMs: 1500,
+      costUsd: 0.05,
+      tokensIn: 60,
+      tokensOut: 6,
+    };
+    const err = Object.assign(new Error("LLM invocation failed with exit code 1"), {
+      failure: {
+        category: "crash" as const,
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 3,
+        retryable: false,
+        message: "boom",
+        evidence: { truncated: false },
+      },
+      telemetry,
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(err);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    await feedbackLoopStep.run(makeContext(), baseInputs, reporter).catch((e: unknown) => e);
+
+    const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "implement");
+    expect(failedStep).toBeDefined();
+    expect((failedStep?.outputs as { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
+  });
+
+  it("carries telemetry stamped on a rejected review error onto the failed sub-step report (BAC-27136)", async () => {
+    // Mirrors the implement-side test above: the executor stamps `err.telemetry`
+    // on every give-up rejection, including a review call — feedback-loop must
+    // surface it on the failed review sub-step's outputs too.
+    const telemetry = {
+      outcome: "unknown" as const,
+      numTurns: 2,
+      durationMs: 900,
+      costUsd: 0.02,
+      tokensIn: 30,
+      tokensOut: 4,
+    };
+    const err = Object.assign(new Error("Prompt is too long"), { telemetry });
+    vi.mocked(reviewStep.run).mockRejectedValueOnce(err);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, reporter);
+
+    const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "review");
+    expect(failedStep).toBeDefined();
+    expect((failedStep?.outputs as { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
+    expect(outputs.passes[0]!.reviewCostUsd).toBe(0.02);
+  });
+
+  it("sets reviewCostUsd from the review outputs' telemetry on a successful pass", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce({
+      ...APPROVED_REVIEW,
+      telemetry: { outcome: "success", numTurns: 3, durationMs: 500, costUsd: 0.05, tokensIn: 10, tokensOut: 5 },
+    });
+
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
+
+    expect(outputs.passes[0]!.reviewCostUsd).toBe(0.05);
+  });
+
   it("does not throw when the review step fails, so the pipeline can still push", async () => {
     vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     // A review failure must not discard a successful implementation. The loop
     // ends, approved stays false, and the reason is surfaced in finalFeedback.
@@ -267,7 +510,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 3 },
+      { ...baseInputs, maxIterations: 3 },
       reporter,
     );
 
@@ -282,7 +525,7 @@ describe("feedbackLoopStep", () => {
   it("passes issueTitle and issueDescription to review step", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
     expect(reviewCall[1]).toMatchObject({
@@ -296,7 +539,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, planningContext: "Use factory pattern" },
+      { ...baseInputs, planningContext: "Use factory pattern" },
       new NoopStepReporter(),
     );
 
@@ -309,7 +552,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, model: "unified-model", repoImplementModel: "repo-impl-model", repoReviewModel: "repo-review-model" },
+      { ...baseInputs, model: "unified-model", repoImplementModel: "repo-impl-model", repoReviewModel: "repo-review-model" },
       new NoopStepReporter(),
     );
 
@@ -324,7 +567,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, model: "claude-opus-4-7" },
+      { ...baseInputs, model: "claude-opus-4-7" },
       new NoopStepReporter(),
     );
 
@@ -339,7 +582,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, implementModel: "claude-opus-4-7", reviewModel: "claude-haiku-4-5-20251001" },
+      { ...baseInputs, implementModel: "claude-opus-4-7", reviewModel: "claude-haiku-4-5-20251001" },
       new NoopStepReporter(),
     );
 
@@ -354,7 +597,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, repoImplementModel: "claude-opus-4-7", repoReviewModel: "claude-haiku-4-5-20251001" },
+      { ...baseInputs, repoImplementModel: "claude-opus-4-7", repoReviewModel: "claude-haiku-4-5-20251001" },
       new NoopStepReporter(),
     );
 
@@ -367,18 +610,9 @@ describe("feedbackLoopStep", () => {
   it("uses tenant model from ctx.data.model when no other model configured", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    const ctx = new DefaultPipelineContext({
-      jobId: 1,
-      issueId: "issue-1",
-      issueIdentifier: "ENG-1",
-      issueTitle: "Test",
-      issueDescription: "Description",
-      nonce: "nonce",
-      orchestratorUrl: "http://localhost:8080",
-      model: "claude-opus-4-7",
-    });
+    const ctx = makeContext({ model: "claude-opus-4-7" });
 
-    await feedbackLoopStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(ctx, baseInputs, new NoopStepReporter());
 
     const implementCall = vi.mocked(implementStep.run).mock.calls[0];
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
@@ -389,20 +623,11 @@ describe("feedbackLoopStep", () => {
   it("explicit implementModel takes precedence over repoImplementModel and tenant model", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    const ctx = new DefaultPipelineContext({
-      jobId: 1,
-      issueId: "issue-1",
-      issueIdentifier: "ENG-1",
-      issueTitle: "Test",
-      issueDescription: "Description",
-      nonce: "nonce",
-      orchestratorUrl: "http://localhost:8080",
-      model: "claude-sonnet-4-6",
-    });
+    const ctx = makeContext({ model: "claude-sonnet-4-6" });
 
     await feedbackLoopStep.run(
       ctx,
-      { ...BASE_INPUTS, implementModel: "claude-opus-4-7", repoImplementModel: "claude-haiku-4-5-20251001" },
+      { ...baseInputs, implementModel: "claude-opus-4-7", repoImplementModel: "claude-haiku-4-5-20251001" },
       new NoopStepReporter(),
     );
 
@@ -422,7 +647,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, implementModel: "claude-opus-4-7" },
+      { ...baseInputs, implementModel: "claude-opus-4-7" },
       reporter,
     );
 
@@ -442,7 +667,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, reviewModel: "claude-haiku-4-5-20251001" },
+      { ...baseInputs, reviewModel: "claude-haiku-4-5-20251001" },
       reporter,
     );
 
@@ -460,7 +685,7 @@ describe("feedbackLoopStep caps", () => {
   });
 
   it("passes maxTurns=50 by default to the implement invocation", async () => {
-    await feedbackLoopStep.run(makeContext(), { ...BASE_INPUTS }, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), { ...baseInputs }, new NoopStepReporter());
 
     const implementCall = vi.mocked(implementStep.run).mock.calls[0];
     expect(implementCall[1]).toMatchObject({ maxTurns: 50 });
@@ -469,7 +694,7 @@ describe("feedbackLoopStep caps", () => {
   it("honors an explicit maxTurns input", async () => {
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxTurns: 25 },
+      { ...baseInputs, maxTurns: 25 },
       new NoopStepReporter(),
     );
 
@@ -482,7 +707,7 @@ describe("feedbackLoopStep caps", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, provider: "bedrock" },
+      { ...baseInputs, provider: "bedrock" },
       new NoopStepReporter(),
     );
 
@@ -494,7 +719,7 @@ describe("feedbackLoopStep caps", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, provider: "anthropic" },
+      { ...baseInputs, provider: "anthropic" },
       new NoopStepReporter(),
     );
 
@@ -506,7 +731,7 @@ describe("feedbackLoopStep caps", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, provider: "bedrock", maxIterations: 5 },
+      { ...baseInputs, provider: "bedrock", maxIterations: 5 },
       new NoopStepReporter(),
     );
 
@@ -519,16 +744,6 @@ const MAX_TURNS_TELEMETRY = {
   costUsd: 2.5, tokensIn: 1000, tokensOut: 500,
   toolTrace: ["Bash npm test", "Read /src/app.ts"],
 };
-
-function makeContextWithExecutor(invoke: ReturnType<typeof vi.fn>): DefaultPipelineContext {
-  return new DefaultPipelineContext(
-    {
-      jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
-      issueDescription: "Description", nonce: "nonce", orchestratorUrl: "http://localhost:8080",
-    },
-    { invoke },
-  );
-}
 
 describe("feedbackLoopStep termination reasons", () => {
   beforeEach(() => {
@@ -544,18 +759,21 @@ describe("feedbackLoopStep termination reasons", () => {
     });
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.terminationReason).toBe("approved");
     expect(outputs.passes).toEqual([
-      { iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true, tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null },
+      {
+        iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewCostUsd: null, reviewApproved: true,
+        tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null, attempts: 1, reviewAttempts: 1,
+      },
     ]);
   });
 
   it("reports terminationReason=iterations_exhausted when all reviews reject", async () => {
     vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("iterations_exhausted");
@@ -566,7 +784,7 @@ describe("feedbackLoopStep termination reasons", () => {
   it("reports terminationReason=review_error when the review step throws", async () => {
     vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("review_error");
@@ -577,7 +795,7 @@ describe("feedbackLoopStep termination reasons", () => {
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
     const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nRan out of turns wiring X.", exitCode: 0, tokensUsed: 10 });
 
-    const outputs = await feedbackLoopStep.run(makeContextWithExecutor(invoke), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext({}, { invoke }), baseInputs, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("max_turns");
@@ -586,39 +804,1035 @@ describe("feedbackLoopStep termination reasons", () => {
     expect(outputs.postMortem).toContain("Ran out of turns");
     // Post-mortem is read-only and capped
     const call = invoke.mock.calls[0][0];
-    expect(call.tools).toEqual(["Read", "Glob", "Grep", "Bash(curl *)"]);
+    expect(call.tools).toEqual(["Read", "Glob", "Grep"]);
+    expect(call.builtinTools).toEqual(["Read", "Glob", "Grep"]);
+    expect(JSON.stringify(call)).not.toContain("curl");
     expect(call.maxTurns).toBe(15);
     expect(call.prompt).toContain("Bash npm test"); // tool trace embedded
   });
 
-  it("treats success telemetry above maxTurns as max_turns and skips review", async () => {
+  it("reports telemetry on the post-mortem sub-step so report-card can price it (BAC-27201)", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const postMortemTelemetry = { outcome: "success" as const, numTurns: 8, durationMs: 4000, costUsd: 0.42, tokensIn: 1, tokensOut: 1 };
+    const invoke = vi.fn().mockResolvedValue({
+      stdout: "## Post-mortem\nRan out of turns wiring X.",
+      exitCode: 0,
+      tokensUsed: 10,
+      telemetry: postMortemTelemetry,
+    });
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = { report: vi.fn(async (step) => { reportedSteps.push({ ...step }); }) };
+
+    await feedbackLoopStep.run(makeContext({}, { invoke }), baseInputs, reporter);
+
+    const postMortemStep = reportedSteps.find((s) => s.id === "post-mortem.1" && s.status === "passed");
+    expect(postMortemStep).toBeDefined();
+    expect((postMortemStep!.outputs as { telemetry?: unknown }).telemetry).toEqual(postMortemTelemetry);
+  });
+
+  it("proceeds to review when a SUCCESSFUL pass reports numTurns above the configured cap", async () => {
+    // result.num_turns counts conversation messages, not the agent turns
+    // --max-turns bounds — a real production run reported subtype "success" at
+    // num_turns 104 under the default 50 cap (7b74bf6). Success above the cap is
+    // a normal completed pass and must reach review, not fail as max_turns.
     vi.mocked(implementStep.run).mockResolvedValue({
       ...IMPLEMENT_OUTPUTS,
-      telemetry: { ...MAX_TURNS_TELEMETRY, outcome: "success", numTurns: 51 },
+      telemetry: { ...MAX_TURNS_TELEMETRY, outcome: "success", numTurns: 104 },
     });
-    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nExceeded configured turns.", exitCode: 0, tokensUsed: 10 });
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
     const outputs = await feedbackLoopStep.run(
-      makeContextWithExecutor(invoke),
-      { ...BASE_INPUTS, maxTurns: 50, maxIterations: 3 },
+      makeContext({}, { invoke: vi.fn() }),
+      { ...baseInputs, maxTurns: 50, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
-    expect(outputs.approved).toBe(false);
-    expect(outputs.terminationReason).toBe("max_turns");
-    expect(outputs.iterations).toBe(1);
-    expect(reviewStep.run).not.toHaveBeenCalled();
-    expect(implementStep.run).toHaveBeenCalledTimes(1);
-    expect(outputs.finalFeedback).toContain("51 turns used");
+    expect(reviewStep.run).toHaveBeenCalledTimes(1);
+    expect(outputs.terminationReason).not.toBe("max_turns");
+    expect(outputs.approved).toBe(true);
   });
 
   it("post-mortem failure is non-fatal", async () => {
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
     const invoke = vi.fn().mockRejectedValue(new Error("boom"));
 
-    const outputs = await feedbackLoopStep.run(makeContextWithExecutor(invoke), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext({}, { invoke }), baseInputs, new NoopStepReporter());
 
     expect(outputs.terminationReason).toBe("max_turns");
     expect(outputs.postMortem).toBeUndefined();
+  });
+});
+
+describe("feedbackLoopStep — cycle summaries (AII-801)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+    tmpDir = testDir("fl-cycle-summary");
+  });
+
+  function readCycleSummaries(): Array<{
+    id: string;
+    cycle: number;
+    verdict: { approved: boolean | null; reason: string };
+    tests: { name: string; status: string }[];
+    outputCommitStatus: string;
+  }> {
+    const filePath = join(tmpDir, "ai-output", "cycle-summaries.jsonl");
+    if (!existsSync(filePath)) return [];
+    return readFileSync(filePath, "utf-8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line));
+  }
+
+  it("emits one distinct, individually inspectable cycle summary per pass across a rejected-then-approved run", async () => {
+    vi.mocked(reviewStep.run)
+      .mockResolvedValueOnce(REJECTED_REVIEW)
+      .mockResolvedValueOnce(REJECTED_REVIEW)
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, workspaceDir: tmpDir, maxIterations: 3 },
+      new NoopStepReporter(),
+    );
+
+    const summaries = readCycleSummaries();
+    expect(summaries).toHaveLength(3);
+    expect(summaries.map((s) => s.id).sort()).toEqual(["feedback-loop.1", "feedback-loop.2", "feedback-loop.3"]);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: false, reason: "changes_requested" });
+    expect(summaries[1]!.verdict).toMatchObject({ approved: false, reason: "changes_requested" });
+    expect(summaries[2]!.verdict).toMatchObject({ approved: true, reason: "approved" });
+    expect(summaries.every((s) => s.outputCommitStatus === "pending_push")).toBe(true);
+  });
+
+  it("records an explicit non-passed test status and a null verdict on a max_turns pass, without changing loop control flow", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem", exitCode: 0, tokensUsed: 10 });
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({}, { invoke }),
+      { ...baseInputs, workspaceDir: tmpDir },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.terminationReason).toBe("max_turns");
+    expect(reviewStep.run).not.toHaveBeenCalled();
+    const summaries = readCycleSummaries();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "max_turns" });
+    expect(summaries[0]!.tests.length).toBeGreaterThan(0);
+    expect(summaries[0]!.tests.every((t) => t.status !== "passed")).toBe(true);
+  });
+
+  it("records an explicit missing test status and a provider_unavailable verdict when implement is exhausted with a dirty tree", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      const isStatus = argv[0] === "status";
+      const stdout = isStatus ? "M src/foo.ts\n" : "diff --git a/foo.ts\n+added line";
+      return {
+        status: 0,
+        stdout: Buffer.from(stdout),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      { ...baseInputs, workspaceDir: tmpDir, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    const summaries = readCycleSummaries();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "provider_unavailable" });
+    expect(summaries[0]!.tests).toEqual([{ name: "test execution", status: "missing" }]);
+  });
+
+  it("records review_error with a null verdict when the review step fails non-transiently", async () => {
+    vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, workspaceDir: tmpDir },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.terminationReason).toBe("review_error");
+    const summaries = readCycleSummaries();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "review_error" });
+  });
+});
+
+describe("feedbackLoopStep — reviewer feedback file", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+    tmpDir = testDir("fl-feedback");
+  });
+
+  it("writes finalFeedback to ai-output/comments/80-reviewer-feedback.md on approval", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce({
+      ...APPROVED_REVIEW,
+      feedback: "All checks pass. Great ingest.",
+    });
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, workspaceDir: tmpDir },
+      new NoopStepReporter(),
+    );
+
+    const feedbackFile = join(tmpDir, "ai-output", "comments", "80-reviewer-feedback.md");
+    expect(existsSync(feedbackFile)).toBe(true);
+    expect(readFileSync(feedbackFile, "utf-8")).toContain("All checks pass. Great ingest.");
+  });
+
+  it("writes finalFeedback to the feedback file even when loop ends unapproved", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValue({
+      ...REJECTED_REVIEW,
+      feedback: "Missing embeddings.stamp file.",
+    });
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, workspaceDir: tmpDir, maxIterations: 1 },
+      new NoopStepReporter(),
+    );
+
+    const feedbackFile = join(tmpDir, "ai-output", "comments", "80-reviewer-feedback.md");
+    expect(existsSync(feedbackFile)).toBe(true);
+    expect(readFileSync(feedbackFile, "utf-8")).toContain("Missing embeddings.stamp file.");
+  });
+
+  it("does not throw when the feedback file write fails", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    // Use a path where mkdirSync will fail (a file in the way)
+    const { writeFileSync: realWriteFileSync } = await import("node:fs");
+    realWriteFileSync(join(tmpDir, "ai-output"), "NOT A DIR");
+
+    await expect(
+      feedbackLoopStep.run(
+        makeContext(),
+        { ...baseInputs, workspaceDir: tmpDir },
+        new NoopStepReporter(),
+      ),
+    ).resolves.toBeDefined();
+  });
+});
+
+describe("feedbackLoopStep — reviewRubric forwarding", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it("forwards reviewRubric to the review step", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, reviewRubric: "Only approve if snapshot/embeddings.stamp exists." },
+      new NoopStepReporter(),
+    );
+
+    const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
+    expect(reviewCall[1]).toMatchObject({
+      reviewRubric: "Only approve if snapshot/embeddings.stamp exists.",
+    });
+  });
+
+  it("does not pass reviewRubric to review step when not set", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
+
+    const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
+    expect(reviewCall[1].reviewRubric).toBeUndefined();
+  });
+});
+
+describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it.each([
+    ["implementation", 0], ["implementation", 1], ["review", 0], ["review", 1],
+  ] as const)("guarantees one fallback attempt after retries are spent: %s, budget=%s", async (stage, stageRetries) => {
+    const failure: FailureRecord = { category: "transient", code: "PROVIDER_OVERLOADED", stage, attempt: 1, retryable: false, message: "capacity", evidence: { truncated: false }, modelFallback: { stage, from: "primary", to: "fallback" } };
+    const run = vi.mocked(stage === "implementation" ? implementStep.run : reviewStep.run);
+    if (stageRetries) run.mockRejectedValueOnce(Object.assign(new Error("capacity"), { failure: { ...failure, modelFallback: undefined } }));
+    run.mockRejectedValueOnce(Object.assign(new Error("capacity"), { failure }))
+      .mockRejectedValueOnce(Object.assign(new Error("capacity"), { failure: { ...failure, modelFallback: undefined } }));
+    const result = feedbackLoopStep.run(makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries } }), { ...baseInputs, sleep: NO_SLEEP }, new NoopStepReporter());
+    if (stage === "implementation") {
+      await expect(result).rejects.toMatchObject({ failure: { code: "PROVIDER_UNAVAILABLE" } });
+      expect(run).toHaveBeenCalledTimes(stageRetries + 2);
+      return;
+    }
+    const outputs = await result;
+    expect(run).toHaveBeenCalledTimes(stageRetries + 2);
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+  });
+
+  it.each(["implementation", "review"] as const)("keeps %s fallback origin across passes without renewing its extra retry", async stage => {
+    const failure: FailureRecord = { category: "transient", code: "PROVIDER_OVERLOADED", stage, attempt: 1, retryable: false, message: "capacity", evidence: { truncated: false }, modelFallback: { stage, from: "primary", to: "fallback" } };
+    const telemetry: RunTelemetry = { outcome: "error", numTurns: 3, durationMs: 100, costUsd: 0.75, tokensIn: 200, tokensOut: 30 };
+    const capacityError = () => Object.assign(new Error("capacity"), { failure, telemetry });
+    // Replay the marker on iteration 3 to prove the loop's allowance itself is run-local.
+    if (stage === "implementation") {
+      vi.mocked(implementStep.run).mockRejectedValueOnce(capacityError())
+        .mockResolvedValueOnce(IMPLEMENT_OUTPUTS).mockResolvedValueOnce(IMPLEMENT_OUTPUTS)
+        .mockRejectedValueOnce(capacityError());
+    } else {
+      vi.mocked(reviewStep.run).mockRejectedValueOnce(capacityError())
+        .mockResolvedValueOnce(REJECTED_REVIEW).mockResolvedValueOnce(REJECTED_REVIEW)
+        .mockRejectedValueOnce(capacityError());
+    }
+    if (stage === "implementation") vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
+    // Dirty work makes a terminal implement failure return the preserved passes.
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/foo.ts\n"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const reports: Step[] = [];
+    const outputs = await feedbackLoopStep.run(makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), { ...baseInputs, maxIterations: 4, sleep: NO_SLEEP }, { report: async step => { reports.push(structuredClone(step)); } });
+    const retryId = `${stage === "implementation" ? "implement" : "review"}.1.retry1`;
+    expect(reports.find(step => step.id === retryId && step.status === "failed")?.outputs).toMatchObject({ failure: { modelFallback: failure.modelFallback }, telemetry });
+    expect(outputs.extraCostUsd).toBeCloseTo(0.75);
+    expect(outputs.extraCostUnreported).toBe(0);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.passes).toHaveLength(3);
+    const origin = stage === "implementation" ? "implementFallbackFrom" : "reviewFallbackFrom";
+    expect(outputs.passes.map(pass => pass[origin])).toEqual(["primary", "primary", "primary"]);
+    expect(stage === "implementation" ? implementStep.run : reviewStep.run).toHaveBeenCalledTimes(4);
+    expect(stage === "implementation" ? reviewStep.run : implementStep.run).toHaveBeenCalledTimes(stage === "implementation" ? 2 : 3);
+  });
+
+  it("retries a settled capacity failure with continuation, preserving retry evidence", async () => {
+    const failure: FailureRecord = { category: "transient", code: "PROVIDER_OVERLOADED", stage: "implementation", attempt: 1, retryable: false, message: "capacity", evidence: { truncated: false }, modelFallback: { stage: "implementation", from: "primary", to: "fallback" } };
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/foo.ts\n"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const telemetry: RunTelemetry = { outcome: "error", numTurns: 2, durationMs: 100, costUsd: 1.23, tokensIn: 150, tokensOut: 25 };
+    vi.mocked(implementStep.run).mockResolvedValueOnce({ ...IMPLEMENT_OUTPUTS, invocationFailure: failure, telemetry });
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const reports: Step[] = [];
+    const reporter: StepReporter = { report: async step => { reports.push(structuredClone(step)); } };
+    const outputs = await feedbackLoopStep.run(makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), { ...baseInputs, sleep: NO_SLEEP }, reporter);
+    expect(outputs.approved).toBe(true);
+    expect(outputs.passes[0]?.implementFallbackFrom).toBe("primary");
+    expect(vi.mocked(implementStep.run).mock.calls[1]?.[1].prompt).toContain("Continue from the current state; do not revert it.");
+    expect(reports.find(step => step.id === "implement.1.retry1" && step.status === "failed")?.outputs).toMatchObject({ failure: { modelFallback: failure.modelFallback }, telemetry });
+    expect(outputs.extraCostUsd).toBeCloseTo(1.23);
+    expect(outputs.extraCostUnreported).toBe(0);
+    expect(outputs.passes[0]?.costUsd).toBeNull();
+  });
+
+  it("implement succeeds, review transient once then approves: one PR, reviewAttempts=2, implement ran once", async () => {
+    vi.mocked(reviewStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(true);
+    expect(outputs.terminationReason).toBe("approved");
+    expect(outputs.passes[0]!.reviewAttempts).toBe(2);
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("review transient on every attempt with stageRetries=1: two review attempts, terminationReason=provider_unavailable", async () => {
+    vi.mocked(reviewStep.run).mockRejectedValue(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      { ...baseInputs, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.finalFeedback).toBe("Tried 2 time(s). upstream returned 529 overloaded_error");
+    expect(outputs.failure?.stage).toBe("review");
+    expect(outputs.failure?.retryable).toBe(false);
+    expect(reviewStep.run).toHaveBeenCalledTimes(2);
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("implement transient after partial edits: the second attempt receives the continuation prefix", async () => {
+    // git status --porcelain reports the partial edit the interrupted run left behind
+    // for the whole run (BAC-27134: dirty is evaluated against runStartHead, not a
+    // per-pass snapshot) — every other git call returns diff content.
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      const isStatus = argv[0] === "status";
+      const stdout = isStatus ? "M src/foo.ts\n" : "diff --git a/foo.ts\n+added line";
+      return {
+        status: 0,
+        stdout: Buffer.from(stdout),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(implementStep.run).toHaveBeenCalledTimes(2);
+    const secondCall = vi.mocked(implementStep.run).mock.calls[1];
+    expect(secondCall[1].prompt).toContain(
+      "A previous attempt was interrupted by a provider error. The working tree contains its partial changes. Continue from the current state; do not revert it.",
+    );
+    // No reset/checkout/clean was ever issued — the partial edit is never discarded.
+    const destructiveGitCalls = vi.mocked(spawnSync).mock.calls.filter(([cmd, args]) => {
+      const argv = (args ?? []) as string[];
+      return cmd === "git" && ["reset", "checkout", "clean"].includes(argv[0]);
+    });
+    expect(destructiveGitCalls).toHaveLength(0);
+  });
+
+  it("implement transient with stageRetries left and a clean tree: retries with the same prompt, no continuation note", async () => {
+    // git status --porcelain is empty on every read — the failed attempt left
+    // nothing behind, so the retry must reuse the original prompt verbatim.
+    mockDiff();
+
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...baseInputs, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(implementStep.run).toHaveBeenCalledTimes(2);
+    const firstCall = vi.mocked(implementStep.run).mock.calls[0];
+    const secondCall = vi.mocked(implementStep.run).mock.calls[1];
+    expect(secondCall[1].prompt).toBe(firstCall[1].prompt);
+    expect(secondCall[1].prompt).not.toContain("A previous attempt was interrupted");
+  });
+
+  it("implement transient, exhausted, dirty tree: stops without throwing, terminationReason=provider_unavailable, draft-eligible", async () => {
+    // git status --porcelain reports the partial edit the interrupted run left behind —
+    // with stageRetries=0 there is no retry left, so the loop must preserve it rather
+    // than throw (the BAC-26878 scenario).
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      const isStatus = argv[0] === "status";
+      const stdout = isStatus ? "M src/foo.ts\n" : "diff --git a/foo.ts\n+added line";
+      return {
+        status: 0,
+        stdout: Buffer.from(stdout),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    vi.mocked(implementStep.run).mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      { ...baseInputs, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.finalFeedback).toBe("Tried 1 time(s); partial changes were kept. upstream returned 529 overloaded_error");
+    expect(outputs.failure?.stage).toBe("implement");
+    expect(outputs.failure?.retryable).toBe(false);
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+    // No reset/checkout/clean was ever issued — the partial edit is never discarded.
+    const destructiveGitCalls = vi.mocked(spawnSync).mock.calls.filter(([cmd, args]) => {
+      const argv = (args ?? []) as string[];
+      return cmd === "git" && ["reset", "checkout", "clean"].includes(argv[0]);
+    });
+    expect(destructiveGitCalls).toHaveLength(0);
+  });
+
+  it("implement transient with a clean tree and stageRetries=0: PROVIDER_UNAVAILABLE, no PR", async () => {
+    vi.mocked(implementStep.run).mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const thrown = await feedbackLoopStep
+      .run(
+        makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+        { ...baseInputs, sleep: NO_SLEEP },
+        new NoopStepReporter(),
+      )
+      .catch((e: unknown) => e);
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error & { failure?: { code?: string; stage?: string } }).failure?.code).toBe(
+      "PROVIDER_UNAVAILABLE",
+    );
+    expect((thrown as Error & { failure?: { code?: string; stage?: string } }).failure?.stage).toBe("implement");
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+  });
+
+  it("iteration-2 transient failure with no new edits but iteration-1 work present: draft PR with PROVIDER_UNAVAILABLE (BAC-27134)", async () => {
+    // git status --porcelain reports iteration 1's leftover uncommitted changes for the
+    // WHOLE run — iteration 2's implement call fails before making any edit of its own.
+    // A per-pass snapshot would compare this reading against itself (captured fresh at the
+    // top of iteration 2, already showing iteration 1's files) and see no difference,
+    // misreading the tree as clean and discarding iteration 1's work; the whole-run
+    // runStartHead comparison must not make that mistake.
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      const isStatus = argv[0] === "status";
+      return {
+        status: 0,
+        stdout: Buffer.from(isStatus ? "M src/foo.ts\n" : "diff --git a/foo.ts\n+added line"),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    vi.mocked(implementStep.run)
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(REJECTED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      { ...baseInputs, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.failure?.stage).toBe("implement");
+    expect(implementStep.run).toHaveBeenCalledTimes(2);
+    expect(reviewStep.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("agent-committed work with a clean tree: draft PR (HEAD moved past runStartHead) (BAC-27134)", async () => {
+    // git status --porcelain is clean throughout, but git rev-parse HEAD reports a
+    // different SHA once the agent's own commit (e.g. a hook or the agent itself)
+    // has landed — a hook/template committing on its own must not be misread as "no
+    // work to preserve" just because the working tree itself is clean.
+    let headCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      if (argv[0] === "status") {
+        return {
+          status: 0,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(""),
+          pid: 0,
+          output: [],
+          signal: null,
+          error: undefined,
+        };
+      }
+      if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
+        headCalls++;
+        return {
+          status: 0,
+          stdout: Buffer.from(headCalls === 1 ? "sha1\n" : "sha2\n"),
+          stderr: Buffer.from(""),
+          pid: 0,
+          output: [],
+          signal: null,
+          error: undefined,
+        };
+      }
+      return {
+        status: 0,
+        stdout: Buffer.from("diff --git a/foo.ts\n+added line"),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    vi.mocked(implementStep.run).mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      { ...baseInputs, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.failure?.stage).toBe("implement");
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+  });
+
+  it("keeps every attempt's evidence: a retried attempt reports under its own id, not the canonical row (BAC-27134)", async () => {
+    mockDiff();
+    const transientErrWithTelemetry = Object.assign(new Error(TRANSIENT_ERROR_MESSAGE), {
+      telemetry: { outcome: "error", numTurns: 5, costUsd: 1.23 },
+    });
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(transientErrWithTelemetry)
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      { ...baseInputs, sleep: NO_SLEEP },
+      reporter,
+    );
+
+    const implementSteps = reportedSteps.filter((s) => s.type === "implement");
+    const ids = new Set(implementSteps.map((s) => s.id));
+    expect(ids).toEqual(new Set(["implement.1", "implement.1.retry1"]));
+
+    const retryRow = implementSteps.find((s) => s.id === "implement.1.retry1");
+    expect(retryRow?.status).toBe("failed");
+    expect((retryRow?.outputs as { failure?: { category?: string } }).failure?.category).toBe("transient");
+    expect((retryRow?.outputs as { telemetry?: unknown }).telemetry).toEqual(transientErrWithTelemetry.telemetry);
+
+    // The canonical row's only terminal report is the final, successful attempt.
+    const canonicalTerminal = implementSteps.filter((s) => s.id === "implement.1" && s.status !== "running");
+    expect(canonicalTerminal).toHaveLength(1);
+    expect(canonicalTerminal[0]!.status).toBe("passed");
+  });
+
+  it("sums a superseded retry attempt's cost into extraCostUsd, not into the pass itself (BAC-27201)", async () => {
+    mockDiff();
+    const transientErrWithTelemetry = Object.assign(new Error(TRANSIENT_ERROR_MESSAGE), {
+      telemetry: { outcome: "error", numTurns: 5, costUsd: 1.23 },
+    });
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(transientErrWithTelemetry)
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      { ...baseInputs, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.extraCostUsd).toBeCloseTo(1.23);
+    // The pass itself only ever reflects the attempt that actually succeeded.
+    expect(outputs.passes[0]!.costUsd).toBeNull();
+  });
+
+  it("calls the injected sleep with exactly the value computeBackoffMs returns", async () => {
+    mockDiff();
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const sleep = vi.fn(async () => {});
+
+    await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      { ...baseInputs, sleep },
+      new NoopStepReporter(),
+    );
+
+    expect(computeBackoffMs).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(vi.mocked(computeBackoffMs).mock.results[0]!.value);
+  });
+
+  it("a non-transient implement failure is not retried, even with stage retries available", async () => {
+    mockDiff();
+    const nonTransientErr = Object.assign(new Error("boom"), {
+      failure: {
+        category: "crash" as const,
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 1,
+        retryable: false,
+        message: "boom",
+        evidence: { truncated: false },
+      },
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(nonTransientErr);
+
+    const thrown = await feedbackLoopStep
+      .run(
+        makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+        { ...baseInputs, sleep: NO_SLEEP },
+        new NoopStepReporter(),
+      )
+      .catch((e: unknown) => e);
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe("boom");
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+  });
+});
+
+describe("feedback-loop core isolation (AII-626)", () => {
+  const pipelineDir = join(__dirname, "..", "pipeline");
+  const sources = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) return sources(path);
+      return entry.name.endsWith(".ts") ? [path] : [];
+    });
+
+  it("pipeline imports no Restate code", () => {
+    const importRe = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g;
+    const offenders: string[] = [];
+    for (const file of sources(pipelineDir)) {
+      const source = readFileSync(file, "utf-8");
+      for (const match of source.matchAll(importRe)) {
+        if (match[1].startsWith("@restatedev/") || /(^|\/)restate\//.test(match[1])) offenders.push(`${file}: ${match[1]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("the extracted core does no I/O of its own", () => {
+    const core = readFileSync(join(pipelineDir, "feedback-loop-core.ts"), "utf-8");
+    expect(core).not.toMatch(/from\s+["']node:/);
+    expect(core).not.toMatch(/new Date\(|Date\.now|setTimeout|console\./);
+  });
+});
+
+describe("feedbackLoopStep — configured stage reports (AII-964)", () => {
+  // implementation = codex (timeout 2000), review = claude (timeout 3000)
+  const snapshot = makeSnapshot();
+  const configured = (invoke: LLMExecutor["invoke"] = makeExecutor().invoke) => makeContext({ agentConfig: snapshot }, { invoke });
+  const collect = () => {
+    const steps: Step[] = [];
+    const reporter: StepReporter = { report: vi.fn(async (step) => { steps.push(structuredClone(step)); }) };
+    return { steps, reporter };
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it("projects the Codex implement row to the snapshot model and timeout with no maxTurns, and the Claude review row keeps maxTurns", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+
+    const outputs = await feedbackLoopStep.run(configured(), { ...baseInputs, maxTurns: 40 }, reporter);
+
+    expect(outputs.terminationReason).toBe("approved");
+    const impl = steps.filter((s) => s.id === "implement.1");
+    expect(impl.map((s) => s.status)).toEqual(["running", "passed"]);
+    for (const s of impl) {
+      expect(s.inputs.model).toBe("gpt-impl");
+      expect(s.inputs.invocationTimeoutMs).toBe(2000);
+      expect("maxTurns" in s.inputs).toBe(false);
+      expect(s.inputs.prompt).toBeDefined();
+    }
+    const review = steps.filter((s) => s.id === "review.1");
+    expect(review.map((s) => s.status)).toEqual(["running", "passed"]);
+    for (const s of review) {
+      expect(s.inputs.model).toBe("claude-review");
+      expect(s.inputs.invocationTimeoutMs).toBe(3000);
+      expect(s.inputs.maxTurns).toBeUndefined();
+    }
+  });
+
+  it("keeps maxTurns on a configured Claude implementation row", async () => {
+    const claudeImpl = makeSnapshot();
+    claudeImpl.stages.implementation = { ...claudeImpl.stages.implementation, agent: "claude", provider: "anthropic", model: "claude-impl" };
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+    const ctx = makeContext({ agentConfig: claudeImpl }, makeExecutor());
+
+    await feedbackLoopStep.run(ctx, { ...baseInputs, maxTurns: 40 }, reporter);
+
+    const running = steps.find((s) => s.id === "implement.1" && s.status === "running")!;
+    expect(running.inputs.model).toBe("claude-impl");
+    expect(running.inputs.maxTurns).toBe(40);
+    expect(running.inputs.invocationTimeoutMs).toBe(2000);
+  });
+
+  it("projects failed and retry rows and leaves legacy shape untouched", async () => {
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+
+    await feedbackLoopStep.run(configured(), { ...baseInputs, sleep: NO_SLEEP }, reporter);
+
+    const retry = steps.find((s) => s.id === "implement.1.retry1")!;
+    expect(retry.status).toBe("failed");
+    expect(retry.inputs.model).toBe("gpt-impl");
+    expect("maxTurns" in retry.inputs).toBe(false);
+
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const legacy = collect();
+    await feedbackLoopStep.run(makeContext(), { ...baseInputs, maxTurns: 40, model: "m-1" }, legacy.reporter);
+    const row = legacy.steps.find((s) => s.id === "implement.1" && s.status === "running")!;
+    expect(row.inputs.model).toBe("m-1");
+    expect(row.inputs.maxTurns).toBe(40);
+    expect("invocationTimeoutMs" in row.inputs).toBe(false);
+  });
+
+  it("runs the post-mortem with the review selection, agentStage review, and reports its own cap", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const { invoke } = makeExecutor({ stdout: "## Post-mortem\nout of turns", tokensUsed: 1 });
+    const { steps, reporter } = collect();
+
+    const outputs = await feedbackLoopStep.run(configured(invoke), { ...baseInputs, maxTurns: 40 }, reporter);
+
+    expect(outputs.terminationReason).toBe("max_turns");
+    const call = vi.mocked(invoke).mock.calls[0][0];
+    expect(call.agentStage).toBe("review");
+    expect(call.stage).toBe("feedback-loop/post-mortem-1");
+    expect(call.expectsStructuredOutput).toBe(false);
+    expect(call.tools).toEqual(["Read", "Glob", "Grep"]);
+    const pm = steps.filter((s) => s.id === "post-mortem.1");
+    expect(pm.map((s) => s.status)).toEqual(["running", "passed"]);
+    expect(pm[0].inputs).toMatchObject({ model: "claude-review", maxTurns: 15, invocationTimeoutMs: 3000 });
+  });
+
+  it("post-mortem stays non-fatal and reports the failed row when the review executor throws", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockRejectedValue(new Error("boom"));
+    const { steps, reporter } = collect();
+
+    const outputs = await feedbackLoopStep.run(configured(invoke), baseInputs, reporter);
+
+    expect(outputs.terminationReason).toBe("max_turns");
+    expect(outputs.postMortem).toBeUndefined();
+    expect(steps.filter((s) => s.id === "post-mortem.1").map((s) => s.status)).toEqual(["running", "failed"]);
+  });
+
+  it("legacy post-mortem sends agentStage review and keeps the existing report shape", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const executor = makeExecutor({ stdout: "pm", tokensUsed: 1 });
+    const { steps, reporter } = collect();
+
+    await feedbackLoopStep.run(makeContext({}, executor), { ...baseInputs, maxTurns: 40 }, reporter);
+
+    expect(vi.mocked(executor.invoke).mock.calls[0][0].agentStage).toBe("review");
+    expect(steps.find((s) => s.id === "post-mortem.1")!.inputs).toEqual({ iteration: 1, maxTurns: 40 });
+  });
+});
+
+describe("feedbackLoopStep — configured stage reports, coverage (AII-964)", () => {
+  const snapshot = makeSnapshot();
+  const configured = (invoke: LLMExecutor["invoke"] = makeExecutor().invoke) => makeContext({ agentConfig: snapshot }, { invoke });
+  const collect = () => {
+    const steps: Step[] = [];
+    const reporter: StepReporter = { report: vi.fn(async (step) => { steps.push(structuredClone(step)); }) };
+    return { steps, reporter };
+  };
+  const sequence = (steps: Step[]) => steps.map((s) => `${s.id}:${s.status}`);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it("projectStageReport clones: a deep-frozen core step is untouched and the result is a distinct object", () => {
+    const original: Step = {
+      id: "implement.1", type: "custom", status: "running", started_at: "t", ended_at: null,
+      parent_step_id: null, inputs: { model: "legacy-model", maxTurns: 40, prompt: "p" }, outputs: {}, logs_url: null,
+    };
+    const deepFreeze = (o: unknown): void => {
+      if (o && typeof o === "object") { Object.freeze(o); Object.values(o).forEach(deepFreeze); }
+    };
+    deepFreeze(original);
+    const before = structuredClone(original);
+
+    const projected = projectStageReport(original, snapshot);
+
+    expect(projected).not.toBe(original);
+    expect(projected.inputs).not.toBe(original.inputs);
+    expect(original).toEqual(before);
+    expect(original.inputs).toEqual({ model: "legacy-model", maxTurns: 40, prompt: "p" });
+    expect(projected.inputs).toEqual({ model: "gpt-impl", invocationTimeoutMs: 2000, prompt: "p" });
+    expect(() => { (original.inputs as Record<string, unknown>).model = "x"; }).toThrow();
+    // Legacy and unrelated ids pass through by identity.
+    expect(projectStageReport(original, undefined)).toBe(original);
+    expect(projectStageReport({ ...original, id: "other.1" }, snapshot).inputs).toEqual(original.inputs);
+  });
+
+  it("hands the reporter clones: a received row keeps its status after the core mutates its own step", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const received: Step[] = [];
+    const reporter: StepReporter = { report: vi.fn(async (step) => { received.push(step); }) };
+
+    await feedbackLoopStep.run(configured(), baseInputs, reporter);
+
+    const implRows = received.filter((s) => s.id === "implement.1");
+    expect(implRows.map((s) => s.status)).toEqual(["running", "passed"]);
+    expect(implRows[0]).not.toBe(implRows[1]);
+    expect(implRows[0].inputs).not.toBe(implRows[1].inputs);
+  });
+
+  it("legacy implement and review rows deep-equal the existing shape", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(REJECTED_REVIEW).mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+
+    await feedbackLoopStep.run(makeContext(), { ...baseInputs, maxTurns: 40, model: "m-1", reviewModel: "r-1" }, reporter);
+
+    const impl = steps.find((s) => s.id === "implement.1" && s.status === "running")!;
+    expect(impl.inputs).toEqual({ ...impl.inputs, model: "m-1", maxTurns: 40 });
+    expect(Object.keys(impl.inputs).sort()).not.toContain("invocationTimeoutMs");
+    const rev = steps.find((s) => s.id === "review.1" && s.status === "running")!;
+    expect(Object.keys(rev.inputs).sort()).toEqual(
+      ["acceptanceBar", "diff", "installFailed", "issueDescription", "issueTitle", "iteration", "model"].sort(),
+    );
+    expect(rev.inputs.model).toBe("r-1");
+  });
+
+  async function runBoth(setup: () => void, inputs: Record<string, unknown> = {}) {
+    setup();
+    const legacy = collect();
+    const legacyOut = await feedbackLoopStep.run(makeContext(), { ...baseInputs, sleep: NO_SLEEP, ...inputs }, legacy.reporter);
+    vi.mocked(implementStep.run).mockReset();
+    vi.mocked(reviewStep.run).mockReset();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    setup();
+    const mixed = collect();
+    const mixedOut = await feedbackLoopStep.run(configured(), { ...baseInputs, sleep: NO_SLEEP, ...inputs }, mixed.reporter);
+    return { legacy, legacyOut, mixed, mixedOut };
+  }
+
+  it("iterations_exhausted under a mixed snapshot matches legacy outputs and report sequence", async () => {
+    const { legacy, legacyOut, mixed, mixedOut } = await runBoth(() => {
+      vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
+    });
+    expect(mixedOut.terminationReason).toBe("iterations_exhausted");
+    expect(mixedOut).toEqual(legacyOut);
+    expect(sequence(mixed.steps)).toEqual(sequence(legacy.steps));
+  });
+
+  it("review_error under a mixed snapshot matches legacy outputs and reports a projected failed review row", async () => {
+    const { legacy, legacyOut, mixed, mixedOut } = await runBoth(() => {
+      vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
+    });
+    expect(mixedOut.terminationReason).toBe("review_error");
+    expect(mixedOut).toEqual(legacyOut);
+    expect(sequence(mixed.steps)).toEqual(sequence(legacy.steps));
+    const failed = mixed.steps.find((s) => s.id === "review.1" && s.status === "failed")!;
+    expect(failed.inputs.model).toBe("claude-review");
+    expect(failed.inputs.invocationTimeoutMs).toBe(3000);
+  });
+
+  it("projects a review retry row", async () => {
+    vi.mocked(reviewStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+
+    const out = await feedbackLoopStep.run(configured(), { ...baseInputs, sleep: NO_SLEEP }, reporter);
+
+    expect(out.terminationReason).toBe("approved");
+    const retry = steps.find((s) => s.id === "review.1.retry1");
+    expect(retry).toBeDefined();
+    expect(retry!.status).toBe("failed");
+    expect(retry!.inputs.model).toBe("claude-review");
+    expect(retry!.inputs.invocationTimeoutMs).toBe(3000);
+  });
+
+  it("surfaces a Codex implementation timeout with its own code, never max_turns, and the failed row has no maxTurns", async () => {
+    const timeout = Object.assign(new Error("Codex invocation exceeded its time limit"), {
+      failure: {
+        category: "crash", code: "INVOCATION_TIMEOUT", stage: "feedback-loop/implement-1", attempt: 1,
+        retryable: false, exitCode: null, signal: null, message: "Codex invocation exceeded its time limit",
+        evidence: { truncated: false, llmSubtype: null, llmIsError: null },
+      },
+    });
+    vi.mocked(implementStep.run).mockRejectedValue(timeout);
+    const { steps, reporter } = collect();
+
+    const err = await feedbackLoopStep.run(configured(), { ...baseInputs, maxTurns: 40 }, reporter).then(
+      () => undefined,
+      (e) => e as { failure?: { code?: string } },
+    );
+
+    expect(err).toBeDefined();
+    expect(err!.failure!.code).toBe("INVOCATION_TIMEOUT");
+    const failed = steps.find((s) => s.id === "implement.1" && s.status === "failed")!;
+    expect((failed.outputs.failure as { code: string }).code).toBe("INVOCATION_TIMEOUT");
+    expect(failed.inputs.invocationTimeoutMs).toBe(2000);
+    expect("maxTurns" in failed.inputs).toBe(false);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+  });
+
+  it("projects the failed post-mortem row inputs from the review selection", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockRejectedValue(new Error("boom"));
+    const { steps, reporter } = collect();
+
+    await feedbackLoopStep.run(configured(invoke), { ...baseInputs, maxTurns: 40 }, reporter);
+
+    const failed = steps.find((s) => s.id === "post-mortem.1" && s.status === "failed")!;
+    expect(failed.inputs).toEqual({ iteration: 1, model: "claude-review", invocationTimeoutMs: 3000, maxTurns: 15 });
+  });
+
+  it("a Codex review post-mortem reports its timeout and no maxTurns", async () => {
+    const codexReview = makeSnapshot();
+    codexReview.stages.review = { ...codexReview.stages.review, agent: "codex", provider: "openai", model: "gpt-rev" };
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const executor = makeExecutor({ stdout: "pm", tokensUsed: 1 });
+    const { steps, reporter } = collect();
+    const ctx = makeContext({ agentConfig: codexReview }, executor);
+
+    await feedbackLoopStep.run(ctx, baseInputs, reporter);
+
+    expect(vi.mocked(executor.invoke).mock.calls[0][0].agentStage).toBe("review");
+    for (const pm of steps.filter((s) => s.id === "post-mortem.1")) {
+      expect(pm.inputs).toEqual({ iteration: 1, model: "gpt-rev", invocationTimeoutMs: 3000 });
+    }
   });
 });

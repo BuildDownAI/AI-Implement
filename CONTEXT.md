@@ -1,0 +1,225 @@
+# AI-Implement Glossary
+
+## Developer harness
+
+The developer harness runs AI-Implement against a live, bind-mounted checkout for maintainer testing. It can change that checkout and never publishes its changes.
+
+**Not to be confused with:** A local run, which uses an isolated copy and leaves the source checkout unchanged.
+
+## Local run
+
+A local run processes one Markdown task in an isolated copy of a clean local checkout. It returns local artifacts and does not require a tracker or GitHub App.
+
+**Not to be confused with:** The developer harness or GitHub publication.
+
+## Local artifact
+
+A local artifact is a reviewable result from a local run, including the patch, changed-file list, test summary, run summary, and logs.
+
+**Not to be confused with:** A GitHub branch or pull request.
+
+## Task document
+
+A task document is a Markdown file that states one product outcome, its acceptance criteria, and optional run limits. It contains no repository path, credential, publication setting, or queue dependency.
+
+**Not to be confused with:** A generated implementation plan or a tracker issue.
+
+## Demo run
+
+A demo run is a local run against the bundled disposable repository and task. It lets a user inspect AI-Implement without mounting a repository from the host.
+
+**Not to be confused with:** A local run against the user's own repository.
+
+## Managed run
+
+A managed run starts through the always-on orchestrator and reports its lifecycle through configured external services. It can publish a branch and pull request.
+
+**Not to be confused with:** A local run, which needs no orchestrator, tracker, or GitHub identity.
+
+## Selected repository
+
+The selected repository is the host Git repository that the user mounts read-only at `/repo` and names with `--repo /repo`. AI-Implement prints its resolved Git root before the run starts.
+
+**Not to be confused with:** The isolated working copy where the pipeline makes changes.
+
+## Local run success
+
+A local run succeeds only when the full plan, implement, test, review, and summary loop completes with approval. Starting or completing the Docker container is not enough.
+
+**Not to be confused with:** A partial run, which preserves artifacts but returns a nonzero exit code.
+
+## Trusted repository
+
+A trusted repository is source code that the user permits Claude Code to inspect, change in an isolated copy, and execute with network access. AI-Implement removes the model credential from setup and test processes that it starts, but commands started by Claude Code may inherit that credential.
+
+**Not to be confused with:** A sandbox for hostile code. The first local release does not provide that guarantee.
+
+## Recipe
+
+A recipe is a file in the target repository that describes one integration test in a form an agent can execute against a deployed environment. A recipe states the target, the steps, and the pass/fail assertions.
+
+**Not to be confused with:** An in-repo test-suite test, which runs against code, not against a deployed environment.
+
+## Test target
+
+A test target is the deployed environment a recipe runs against. The first test target is the AII testing orchestrator. A preview environment and an external system are also test targets.
+
+**Not to be confused with:** The target repository, which is the codebase a pipeline run implements issues in.
+
+## Preview environment
+
+A preview environment is a deployment of one PR branch, reachable before merge, used as a test target and torn down after use. In AI-Implement a preview environment is one Fly machine in the standing previews app (ADR 012).
+
+**Not to be confused with:** The testing orchestrator, which is the standing post-merge environment.
+
+## Reference repository
+
+A reference repository is a second repository that a run clones read-only at dispatch, so the agent can check a claim against real source. A project mapping declares each one with a workspace path and an optional ref.
+
+**Not to be confused with:** The knowledge graph, which serves prose — issues, decisions, and documentation — and holds no source code. Also not a sibling repository, which Dependency Token Scope makes readable so a dependency install can resolve private packages.
+
+## Run record
+
+The run record is the orchestrator's row for one dispatched run of one issue. It holds the run's status and its conclusion. The orchestrator writes it, and the runner reports into it through authenticated callbacks.
+
+**Not to be confused with:** The GitHub Actions run or the Fly machine, which are execution-layer records that the run record points to.
+
+## Approval mark
+
+The approval mark is the conclusion the runner's result callback writes on the run record when the post-push review approved the PR. The auto-merge gate merges a child PR only when the approval mark is present and no run for the issue is still in flight.
+
+**Not to be confused with:** A GitHub review approval, which the runner cannot submit on its own PR.
+
+## Benign terminal
+
+A benign terminal is an end of a run that is not a failure of the run: the PR was merged, or an operator closed it. The runner reports it as its own outcome, and the orchestrator does not retry or alert.
+
+**Not to be confused with:** A review failure or a crash, which stay failures even when the PR is closed afterwards.
+
+## Reviewer
+
+A reviewer is one named definition that asks one question about a PR. It supplies an id, a prompt, an output schema, and optional model and turn-cap overrides. Project selection determines whether it gates. The review step runs it; the reviewer owns no machinery of its own.
+
+A gating config reviewer uses its trusted default-branch definition. A changed branch definition runs separately as an advisory preview; identical definitions run once. Preview findings cannot inherit gating authority merely by sharing the selected reviewer's id.
+
+**Not to be confused with:** The review step, which invokes every selected reviewer and owns retry, parsing, and reporting. Also not a person reviewing on the forge.
+
+## Review finding
+
+A review finding is one defect or one missing requirement that a reviewer reports about a PR. It carries a source, a severity, a body, and an optional file and line.
+
+**Not to be confused with:** The reviewer's summary prose, which explains the findings and is never itself a finding.
+
+## Gating finding
+
+A gating finding is a review finding that holds the merge. By default, structured sources produce one: the review-findings contract, a formal changes-requested review, or an internal reviewer. Project settings may opt scraped-prose findings into gating.
+
+**Not to be confused with:** An advisory finding.
+
+## Advisory finding
+
+An advisory finding is a review finding that the run shows to people and never acts on. Prose parsed out of a comment body produces advisory findings by default; project settings may instead opt that source into gating.
+
+**Not to be confused with:** A gating finding. The difference is the source, never the severity.
+
+## Review verdict
+
+The review verdict is the conclusion one reviewer states about a PR: approve, changes requested, or incomplete.
+
+**Not to be confused with:** Merge readiness, which is the run's own decision over every reviewer's findings and verdicts together.
+
+## Review-fix run
+
+A review-fix run is a gap-fill run that the orchestrator starts on an open PR because review feedback arrived after the PR's last run ended. It reads the open findings, changes the PR branch, and never opens a new PR.
+
+**Not to be confused with:** The in-run fix pass, which post-push review runs inside the initial run before that run ends. Also not a fresh implementation, which an issue with an open PR never gets (ADR 026).
+
+## Finding disposition
+
+A finding disposition is the fixing agent's decision about one review finding: `fixed`, `follow-up`, or `invalid`, with a one-sentence reason. A defect in lines the PR changed can only be `fixed` or `invalid` (ADR 028).
+
+**Not to be confused with:** A review verdict, which a reviewer states about the whole PR.
+
+## Deferred finding
+
+A deferred finding is a review finding that the fixing agent gave the `follow-up` disposition. It stays in the ledger, it no longer gates the merge, and the orchestrator lists it on the issue for a human to triage.
+
+**Not to be confused with:** A resolved finding, which a run fixed. Also not an advisory finding, which never gated because of its source.
+
+## PR dispatch budget
+
+The PR dispatch budget is the number of gap-fill runs the orchestrator may start on one PR in a rolling 24 hours. The default is 4, and it is set per project. At the budget, the orchestrator parks the PR and asks for a human. A human `/ai-implement` comment still dispatches and still counts.
+
+**Not to be confused with:** Max Iterations, which caps implement and review cycles inside one run.
+
+## Pickup label
+
+The pickup label is the one Linear label whose presence makes an issue a dispatch candidate for an orchestrator. It defaults to `AI-Implement` and is set once per orchestrator.
+
+**Not to be confused with:** The lifecycle labels (`AI-Planning`, `AI-Working`, `Plan-Complete`, `Ready for Review`), which the orchestrator writes to record run state and which are not configurable.
+
+## Review-fix attempt
+
+A review-fix attempt is one authorized runner execution that addresses review feedback on an existing PR. An infrastructure retry keeps the attempt's identity; a replacement runner starts a new attempt.
+
+**Not to be confused with:** A review-fix run, which is the orchestrator dispatch that may contain a Restate-tracked attempt; or an internal review/fix cycle within the runner.
+
+## Implementation attempt
+
+An implementation attempt is one dispatch of one issue for implementation: one dispatch id, one reservation, and, on a `restate` project, one `ImplementationRun`. A stuck attempt is stopped; a retry is a new attempt with a new dispatch id.
+
+**Not to be confused with:** An implementation pass, which is one implement-and-review cycle inside the runner; or a gap-fill run, which is dispatched from a PR comment.
+
+## Lifecycle owner
+
+The lifecycle owner is the system responsible for coordinating one attempt from admission to its final outcome. An attempt keeps its owner when an operator changes the setting for future attempts.
+
+**Not to be confused with:** The execution backend that runs the code-changing process.
+
+## Coordinator object
+
+A coordinator object is the Restate virtual object that holds the single in-flight marker for one resource of a run kind and starts that run kind's workflow. Its exclusive handler is the lock: a second trigger while the marker is live is refused, and the workflow's last step releases it.
+
+**Not to be confused with:** The workflow itself, which owns one run's position and never holds the lock; or the `Operator` object, which issues and refreshes credentials.
+
+## Rail gate
+
+A rail gate is one journaled step of the kg-refresh rail (fetch, stage, swap, verify) that either passes or fails the refresh. A failed gate triggers the `revert` compensation, and `status` names the gate that did not finish.
+
+**Not to be confused with:** The auto-merge gate, which decides whether a child PR merges; or the review gate, which is the check that holds a PR until review approves.
+
+## ChatGPT plan account
+
+A ChatGPT plan account is an account profile whose `codex-subscription` credential is a ChatGPT plan record from "Sign in with ChatGPT". Its refresh token is held by one refresher.
+
+**Not to be confused with:** A Claude subscription account, which keeps reservations and recovery holds; or an OpenAI API key account.
+
+## Refresher
+
+The refresher is the single holder of a ChatGPT plan account's refresh token: the host-side credential port on a local run, one Restate Virtual Object per account profile on a hosted run. It serializes refreshes and saves each rotated token before it hands out an access token.
+
+**Not to be confused with:** A runner, which never sees the refresh token; or the `Operator` object, which refreshes other credentials.
+
+## Access-token grant
+
+An access-token grant is one checkout of the `chatgpt-access-token` secret kind: an access token and its expiry, valid for about an hour. Renewing is another checkout.
+
+**Not to be confused with:** The refresh token, which stays with the refresher; or a reservation, which hosted ChatGPT plan accounts do not take.
+
+## Self-deploy
+
+A self-deploy is the orchestrator moving itself to a newer build of its watched branch. It drains work, changes the image of its own machine, and checks after the restart that it runs the target commit.
+
+**Not to be confused with:** A KG refresh, which changes the knowledge graph and not the orchestrator's code.
+
+## Deploy hold
+
+The deploy hold is the flag that stops new work while a self-deploy drains. The self-deploy sets it at the start and clears it when the deploy ends, whether it succeeds, fails, or is cancelled.
+
+**Not to be confused with:** A KG hold, which pauses one KG refresh for an operator decision.
+
+## Pull request link
+
+The pull request link is the stored record that a pull request belongs to one issue. It holds the pull request's role (implementation or roll-up) and its outcome (open, merged, or closed without a merge). The orchestrator writes it when the pull request opens, and never prunes it.
+
+**Not to be confused with:** The run record, which is the row for one dispatched run. Run records are pruned; a pull request link is not.

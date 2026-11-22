@@ -1,0 +1,824 @@
+import { randomUUID } from "node:crypto";
+import {
+  access,
+  open,
+  constants,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  stat,
+  lstat,
+  writeFile,
+  unlink,
+  link,
+} from "node:fs/promises";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import type { RepoMapping } from "../config.js";
+import { assemblePlanningContext } from "../planning-context-assembly.js";
+import { parseTaskDocument } from "../task-document.js";
+import type {
+  FilesystemSetupFacts,
+  AIImplementSnapshot,
+  FeatureNodeRollUp,
+  IssueLifecycleState,
+  IssueStatusRecord,
+  TicketIssue,
+  TicketingProvider,
+  TrackerIssuePage,
+} from "./types.js";
+import { ISSUE_STATUS_RECENT_MS } from "./types.js";
+
+export type FilesystemStatus =
+  | "ready"
+  | "planning"
+  | "plan-approved"
+  | "implementing"
+  | "pr-ready"
+  | "failed"
+  | "completed"
+  | "cancelled";
+
+export interface FilesystemState {
+  version: 1;
+  status: FilesystemStatus;
+  comments: Array<{ body: string; createdAt: string }>;
+  prUrls: string[];
+  parentRef?: { identifier: string };
+  failurePhase?: "planning" | "implementation";
+  updatedAt: string;
+}
+
+type StatusState = Omit<FilesystemState, "status"> & { status: string };
+
+interface FilesystemTask<S = FilesystemState> {
+  issue: TicketIssue;
+  taskPath: string;
+  statePath: string;
+  markdown: string;
+  state: S | null;
+  ticketPath: string;
+  location: FilesystemIssueLocation;
+}
+
+export type FilesystemIssueLocation = "active" | "completed" | "failed";
+
+export interface FilesystemIssueDetails {
+  issue: TicketIssue;
+  markdown: string;
+  state: FilesystemState | null;
+  statePath: string;
+  ticketPath: string;
+  location: FilesystemIssueLocation;
+}
+
+const IDENTIFIER_RE = /^[A-Z][A-Z0-9_]*-\d+$/;
+const SAFE_SEGMENT_RE = /^[A-Za-z0-9_.-]+$/;
+const TERMINAL = new Set<FilesystemStatus>(["completed", "cancelled"]);
+// Registry invalidation can replace a provider while an old callback is still writing.
+const issueLocks = new Map<string, Promise<unknown>>();
+const PLANNING_PREFIXES = [
+  "## 🏗️ AI Planning: Architecture Analysis",
+  "## 🧪 AI Planning: Test Plan",
+  "## 🔗 AI Planning: Cross-Story Context",
+  "## 🗺 AI Planning: Implementation Map",
+  "## ✅ AI Planning: Acceptance Bar",
+  "## ⚠️ AI Planning: Risks & Open Questions",
+];
+
+export class FilesystemProvider implements TicketingProvider {
+  readonly id = "filesystem";
+  private readonly getMappings: () => Record<string, RepoMapping>;
+
+  constructor(getMappings: () => Record<string, RepoMapping>) {
+    this.getMappings = getMappings;
+  }
+
+  async fetchSetupFacts(projectKeys: string[]): Promise<FilesystemSetupFacts> {
+    const directories: FilesystemSetupFacts["directories"] = {};
+    for (const key of projectKeys) {
+      const cfg = this.getMappings()[key]?.ticketingConfig;
+      if (cfg?.kind !== "filesystem") continue;
+      // Resolved as the poll resolves it, so the two agree on symlinks.
+      const root = await existingRealDirectory(cfg.directory);
+      directories[key] = { directory: cfg.directory, fault: root === null ? "missing" : await accessFault(root) };
+    }
+    return { kind: "filesystem", directories };
+  }
+
+  async fetchAIImplementSnapshot(): Promise<AIImplementSnapshot> {
+    const needsPlanning: TicketIssue[] = [];
+    const readyForImplementation: TicketIssue[] = [];
+    const inProgressCountsByScope: Record<string, number> = {};
+
+    const tasks = await this.scanTasks();
+    for (const task of tasks.values()) {
+      if (task.state?.status === "completed") {
+        await this.withIssueLock(task.issue.id, async () => {
+          const current = (await this.scanTasks()).get(task.issue.id);
+          if (current) await this.archiveCompletedTask(current);
+        });
+        continue;
+      }
+      if (task.location !== "active") continue;
+      const mapping = this.mappingForScope(task.issue.scopeKey);
+      if (!mapping) continue;
+      const status = task.state?.status ?? (mapping.planningEnabled ? "ready" : "plan-approved");
+      task.issue.nativeStatus = status;
+
+      if (status === "planning" || status === "implementing") {
+        inProgressCountsByScope[task.issue.scopeKey] =
+          (inProgressCountsByScope[task.issue.scopeKey] ?? 0) + 1;
+        continue;
+      }
+      if (status === "ready") {
+        needsPlanning.push(task.issue);
+      } else if (status === "plan-approved") {
+        readyForImplementation.push(task.issue);
+      }
+    }
+
+    return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize: [] };
+  }
+
+  async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {
+    const tasks = await this.scanTasks(mapping);
+    const cutoff = Date.now() - ISSUE_STATUS_RECENT_MS;
+    const records: IssueStatusRecord[] = [];
+    for (const { issue, state, location } of tasks.values()) {
+      const status = state?.status ?? (mapping.planningEnabled ? "ready" : "plan-approved");
+      const parsedUpdatedAt = state ? Date.parse(state.updatedAt) : NaN;
+      const updatedAt = Number.isFinite(parsedUpdatedAt) ? parsedUpdatedAt : null;
+      if (status === "cancelled") continue;
+      if (location !== "active" && (updatedAt === null || !(updatedAt >= cutoff))) continue;
+      const normalized = status === "completed" ? "merged"
+        : isFilesystemStatus(status) && status !== "completed" && status !== "cancelled" ? status : "unknown";
+      records.push({
+        id: issue.id, identifier: issue.identifier, title: issue.title,
+        url: this.issueUrl(issue), state: normalized,
+        phase: status === "failed" ? state?.failurePhase ?? null : null,
+        labels: [], workflowState: status, updatedAt,
+      });
+    }
+    return records;
+  }
+
+  async listIssuesPage(mapping: RepoMapping, _cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
+    const tasks = [...(await this.scanTasks()).values()].filter(task =>
+      task.issue.scopeKey === mapping.teamKey && (!filter || task.issue.title.startsWith(filter.titlePrefix)));
+    return {
+      issues: tasks.map(({ issue, state }) => ({
+        id: issue.id, identifier: issue.identifier, title: issue.title,
+        description: issue.description ?? null,
+        parent: state?.parentRef ?? null,
+        state: { name: issue.nativeStatus ?? "ready", type: state && TERMINAL.has(state.status) ? "completed" : "unstarted" },
+        labels: { nodes: [] }, project: null, relations: { nodes: [] },
+        comments: { nodes: (state?.comments ?? []).map(comment => ({ ...comment, user: null })) },
+      })),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    };
+  }
+
+  async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {
+    const tasks = await this.scanTasks();
+    const result = new Map<string, IssueLifecycleState>();
+    for (const id of issueIds) {
+      const task = tasks.get(id);
+      if (!task) continue;
+      const status = task.state?.status;
+      if (status === "completed") result.set(id, "completed");
+      else if (status === "cancelled") result.set(id, "cancelled");
+      else result.set(id, "active");
+    }
+    return result;
+  }
+
+  async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {
+    return [];
+  }
+
+  async createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    const parent = (await this.scanTasks()).get(parentId);
+    const mapping = this.mappingForScope(scopeKey);
+    if (!parent || parent.issue.scopeKey !== scopeKey || !mapping || mapping.ticketingConfig.kind !== "filesystem") {
+      throw new Error("Filesystem parent not found in scope");
+    }
+    const directory = await existingRealDirectory(mapping.ticketingConfig.directory);
+    if (!directory) throw new Error("Filesystem ticket directory is unavailable");
+    const identifier = `CHILD-${BigInt("0x" + randomUUID().replaceAll("-", "")).toString()}`;
+    const id = `filesystem:${scopeKey}:${identifier}`;
+    const taskPath = join(directory, `${identifier}.md`);
+    const statePath = join(directory, ".state", scopeKey, `${identifier}.json`);
+    // Publish the task only after its parent metadata is durable.
+    await checkStateDirectories(dirname(statePath));
+    await mkdir(dirname(statePath), { recursive: true });
+    await checkStateDirectories(dirname(statePath));
+    const temporaryPath = join(directory, `.${identifier}.${randomUUID()}.tmp`);
+    let stateCreated = false;
+    try {
+      // Reserve state exclusively, but keep partial state writes inside the cleanup boundary.
+      const stateFile = await open(statePath, "wx", 0o600);
+      stateCreated = true;
+      try {
+        await stateFile.writeFile(JSON.stringify({ ...defaultState(mapping.planningEnabled),
+          parentRef: { identifier: parent.issue.identifier } }));
+      } finally {
+        await stateFile.close();
+      }
+      await writeFile(temporaryPath, `---\ntitle: ${JSON.stringify(content.title)}\nid: ${identifier}\n---\n${content.body}`, { flag: "wx" });
+      // link publishes the complete document atomically and refuses an existing destination.
+      await link(temporaryPath, taskPath);
+    } catch (err) {
+      if (stateCreated) await unlink(statePath);
+      throw err;
+    } finally {
+      await unlink(temporaryPath).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+    }
+    return { id, identifier };
+  }
+
+  async markPlanningStarted(issueId: string, scopeKey: string): Promise<void> {
+    await this.updateTask(issueId, scopeKey, (state) => (
+      isCallbackTerminal(state.status) || state.status === "implementing" || state.status === "plan-approved"
+        ? null : { ...state, status: "planning" }
+    ), { activeOnly: true });
+  }
+
+  async markPlanComplete(issueId: string, scopeKey: string, _opts: { awaitApproval: boolean }): Promise<void> {
+    await this.updateTask(issueId, scopeKey, (state) => (
+      isCallbackTerminal(state.status) || state.status === "implementing"
+        ? null : { ...state, status: "plan-approved" }
+    ), { activeOnly: true });
+  }
+
+  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (isCallbackTerminal(state.status) || state.status === "implementing") return null;
+      return appendComment(
+        { ...state, status: "failed", failurePhase: "planning" },
+        `⚠️ Planning failed: ${reason}`,
+      );
+    }, { activeOnly: true });
+  }
+
+  async markImplementing(issueId: string, scopeKey: string): Promise<void> {
+    await this.updateTask(issueId, scopeKey, (state) => (
+      isCallbackTerminal(state.status) ? null : { ...state, status: "implementing" }
+    ), { activeOnly: true });
+  }
+
+  async markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (isCallbackTerminal(state.status)) return null;
+      return appendComment(
+        { ...state, status: "pr-ready", prUrls: unique([...state.prUrls, prUrl]) },
+        `🚀 PR ready for review: ${prUrl}`,
+      );
+    }, { activeOnly: true });
+  }
+
+  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (isCallbackTerminal(state.status)) return null;
+      return appendComment(
+        { ...state, status: "failed", failurePhase: "implementation" },
+        `⚠️ Implementation failed: ${reason}`,
+      );
+    }, { activeOnly: true });
+  }
+
+  // The task's own state already records which phase failed, so `_phase` is not needed here.
+  async clearWorkingState(issueId: string, scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
+    const mapping = this.mappingForScope(scopeKey);
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (isCallbackTerminal(state.status)) return null;
+      const nextStatus =
+        state.failurePhase === "implementation" || state.status === "implementing" || state.status === "plan-approved"
+          ? "plan-approved"
+          : mapping?.planningEnabled
+            ? "ready"
+            : "plan-approved";
+      const { failurePhase: _failurePhase, ...rest } = state;
+      return { ...rest, status: nextStatus };
+    }, { activeOnly: true });
+  }
+
+  async parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (isCallbackTerminal(state.status)) return null;
+      return { ...state, status: "failed", failurePhase: phase };
+    }, { activeOnly: true });
+  }
+
+  async markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (state.status === "completed" || state.status === "cancelled") return null;
+      return appendComment(
+        { ...state, status: "cancelled" },
+        `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the task status to its pickup value.`,
+      );
+    }, { activeOnly: true });
+  }
+
+  async markMerged(issueId: string, scopeKey: string): Promise<void> {
+    const updated = await this.updateTask(issueId, scopeKey, (state) => (
+      state.status === "cancelled" ? state : { ...state, status: "completed" }
+    ));
+    if (updated) {
+      await this.withIssueLock(issueId, async () => {
+        const task = (await this.scanTasks()).get(issueId);
+        if (task?.state?.status === "completed") await this.archiveCompletedTask(task);
+      });
+    }
+  }
+
+  async postComment(issueId: string, body: string): Promise<void> {
+    const scopeKey = scopeFromIssueId(issueId);
+    await this.updateTask(issueId, scopeKey, (state) => appendComment(state, body));
+  }
+
+  async fetchPlanningContext(issueId: string): Promise<string> {
+    try {
+      const task = (await this.scanTasks()).get(issueId);
+      if (!task?.state) return "";
+      return assemblePlanningContext(task.state.comments, PLANNING_PREFIXES);
+    } catch (err) {
+      console.warn(`[filesystem] Failed to fetch planning context for ${issueId}:`, err);
+      return "";
+    }
+  }
+
+  issueUrl(issue: TicketIssue): string {
+    const issueId = issue.id?.startsWith("filesystem:")
+      ? issue.id
+      : issue.scopeKey
+        ? `filesystem:${issue.scopeKey}:${issue.identifier}`
+        : null;
+    return issueId ? `/admin?filesystemIssue=${encodeURIComponent(issueId)}` : `/admin`;
+  }
+
+  async readIssueDetails(issueId: string): Promise<FilesystemIssueDetails | null> {
+    const parsed = parseFilesystemIssueId(issueId);
+    const task = (await this.scanTasks()).get(issueId);
+    if (!task) return null;
+    return {
+      issue: task.issue,
+      markdown: task.markdown,
+      state: task.state,
+      statePath: `.state/${parsed.scopeKey}/${parsed.identifier}.json`,
+      ticketPath: task.ticketPath,
+      location: task.location,
+    };
+  }
+
+  async findByKey(key: string): Promise<TicketIssue | null> {
+    if (!IDENTIFIER_RE.test(key)) return null;
+    const matches = [...(await this.scanTasks()).values()].filter((task) => task.issue.identifier === key);
+    return matches.length === 1 ? matches[0].issue : null;
+  }
+
+  async archiveFailed(
+    issueId: string,
+    scopeKey: string,
+    phase: "planning" | "implementation",
+  ): Promise<boolean> {
+    validateSafeSegment(scopeKey, "scopeKey");
+    if (!issueId.startsWith(`filesystem:${scopeKey}:`)) {
+      throw new Error(`Filesystem issueId ${JSON.stringify(issueId)} does not belong to scopeKey ${JSON.stringify(scopeKey)}`);
+    }
+    return this.withIssueLock(issueId, async () => {
+      const task = (await this.scanTasks()).get(issueId);
+      if (!task || task.location !== "active") return false;
+      const current = task.state ?? defaultState(this.mappingForScope(scopeKey)?.planningEnabled ?? true);
+      if (isCallbackTerminal(current.status) || current.prUrls.length > 0) {
+        return false;
+      }
+      await writeStateAtomic(task.statePath, {
+        ...current,
+        status: "failed",
+        failurePhase: phase,
+        version: 1,
+        updatedAt: new Date().toISOString(),
+      });
+      const refreshed = (await this.scanTasks()).get(issueId);
+      if (!refreshed || refreshed.location !== "active" || refreshed.state?.status !== "failed") return false;
+      return this.moveTaskToArchive(task, "failed");
+    });
+  }
+
+  async retryFailed(issueId: string, scopeKey: string): Promise<boolean> {
+    validateSafeSegment(scopeKey, "scopeKey");
+    if (!issueId.startsWith(`filesystem:${scopeKey}:`)) {
+      throw new Error(`Filesystem issueId ${JSON.stringify(issueId)} does not belong to scopeKey ${JSON.stringify(scopeKey)}`);
+    }
+    return this.withIssueLock(issueId, async () => {
+      const task = (await this.scanTasks()).get(issueId);
+      if (!task || (task.location !== "failed" && task.location !== "active") || !task.state) return false;
+      if (task.state.status !== "failed" || task.state.prUrls.length > 0) return false;
+      const mapping = this.mappingForScope(scopeKey);
+      if (!mapping) return false;
+      if (task.location === "failed" && !(await this.restoreFailedTask(task))) return false;
+      const { failurePhase: _failurePhase, ...rest } = task.state;
+      const status = task.state.failurePhase === "implementation"
+        ? "plan-approved"
+        : mapping.planningEnabled
+          ? "ready"
+          : "plan-approved";
+      await writeStateAtomic(task.statePath, {
+        ...rest,
+        status,
+        version: 1,
+        updatedAt: new Date().toISOString(),
+      });
+      return true;
+    });
+  }
+
+  private async updateTask(
+    issueId: string,
+    scopeKey: string,
+    update: (state: FilesystemState) => FilesystemState | null,
+    options: { activeOnly?: boolean } = {},
+  ): Promise<boolean> {
+    validateSafeSegment(scopeKey, "scopeKey");
+    if (!issueId.startsWith(`filesystem:${scopeKey}:`)) {
+      throw new Error(`Filesystem issueId ${JSON.stringify(issueId)} does not belong to scopeKey ${JSON.stringify(scopeKey)}`);
+    }
+    return this.withIssueLock(issueId, async () => {
+      const task = (await this.scanTasks()).get(issueId);
+      if (!task) throw new Error(`Unknown filesystem issue: ${issueId}`);
+      if (options.activeOnly && task.location !== "active") return false;
+      const current = task.state ?? defaultState(this.mappingForScope(scopeKey)?.planningEnabled ?? true);
+      const next = update(current);
+      if (next === null) return false;
+      await writeStateAtomic(task.statePath, { ...next, version: 1, updatedAt: new Date().toISOString() });
+      return true;
+    });
+  }
+
+  private async withIssueLock<T>(issueId: string, fn: () => Promise<T>): Promise<T> {
+    const prior = issueLocks.get(issueId) ?? Promise.resolve();
+    const next = prior.then(fn, fn);
+    const tail = next.catch(() => undefined);
+    issueLocks.set(issueId, tail);
+    try {
+      return await next;
+    } finally {
+      if (issueLocks.get(issueId) === tail) issueLocks.delete(issueId);
+    }
+  }
+
+  private scanTasks(): Promise<Map<string, FilesystemTask>>;
+  private scanTasks(mapping: RepoMapping): Promise<Map<string, FilesystemTask<StatusState>>>;
+  private async scanTasks(statusMapping?: RepoMapping): Promise<Map<string, FilesystemTask<StatusState>>> {
+    const tasks: FilesystemTask<StatusState>[] = [];
+    const strict = statusMapping !== undefined;
+    if (statusMapping && !statusMapping.teamKey) throw new Error("Filesystem mapping carries no team key");
+    const mappings = statusMapping ? { [statusMapping.teamKey!]: statusMapping } : this.getMappings();
+    for (const [scopeKey, mapping] of Object.entries(mappings)) {
+      if (mapping.ticketingConfig.kind !== "filesystem") continue;
+      validateSafeSegment(scopeKey, "scopeKey");
+      const directory = await existingRealDirectory(mapping.ticketingConfig.directory, strict);
+      if (!directory) continue;
+      const stateRoot = join(directory, ".state", scopeKey);
+      for (const location of ["active", "completed", "failed"] as const) {
+        const scanDirectory = location === "active" ? directory : join(directory, location);
+        const entries = await readTaskDirectory(scanDirectory, location === "active", strict);
+        for (const entry of entries) {
+          const taskPath = join(scanDirectory, entry);
+          const fallbackIdentifier = basename(entry, ".md");
+          try {
+            const content = await readFile(taskPath, "utf8");
+            const parsed = parseTaskDocument(content, `filesystem:${scopeKey}:${fallbackIdentifier}`, fallbackIdentifier);
+            const identifier = parsed.issue.identifier;
+            if (!IDENTIFIER_RE.test(identifier)) throw new Error("Ticket id must have the form REVIEW-001 (or use that filename when id is omitted)");
+            const statePath = join(stateRoot, `${identifier}.json`);
+            await checkStateDirectories(stateRoot);
+            const state = strict ? await readState(statePath, true) : await readState(statePath);
+            if (state === "corrupt") throw new Error(`Invalid state in ${statePath}; refusing to redispatch`);
+            tasks.push({
+              taskPath,
+              statePath,
+              markdown: content,
+              state,
+              ticketPath: relative(directory, taskPath),
+              location,
+              issue: {
+                id: `filesystem:${scopeKey}:${identifier}`,
+                identifier,
+                title: parsed.issue.title,
+                description: parsed.issue.description,
+                scopeKey,
+                ...(state?.parentRef ? { parentRef: state.parentRef } : {}),
+                nativeStatus: state?.status ?? (mapping.planningEnabled ? "ready" : "plan-approved"),
+                ...(parsed.baseBranch ? { baseBranch: parsed.baseBranch } : {}),
+                ...(parsed.profiles ? { profiles: parsed.profiles } : {}),
+                ...(parsed.maxTurns ? { maxTurns: parsed.maxTurns } : {}),
+                ...(parsed.maxIterations ? { maxIterations: parsed.maxIterations } : {}),
+              },
+            });
+          } catch (err) {
+            if (strict) throw err;
+            console.warn(`[filesystem] Skipping malformed task ${taskPath}: ${(err as Error).message}`);
+          }
+        }
+      }
+    }
+
+    const byId = new Map<string, FilesystemTask<StatusState>>();
+    const duplicates = new Set<string>();
+    for (const task of tasks) {
+      if (byId.has(task.issue.id)) duplicates.add(task.issue.id);
+      else byId.set(task.issue.id, task);
+    }
+    for (const id of duplicates) {
+      byId.delete(id);
+      console.warn(`[filesystem] Duplicate ticket id ${id}; refusing to dispatch either file`);
+    }
+    return byId;
+  }
+
+  private mappingForScope(scopeKey: string): RepoMapping | null {
+    const mapping = this.getMappings()[scopeKey];
+    return mapping?.ticketingConfig.kind === "filesystem" ? mapping : null;
+  }
+
+  private async archiveCompletedTask(task: FilesystemTask): Promise<boolean> {
+    if (task.location === "completed") return true;
+    if (task.state?.status !== "completed") return false;
+    return this.moveTaskToArchive(task, "completed");
+  }
+
+  private async moveTaskToArchive(task: FilesystemTask, archive: "completed" | "failed"): Promise<boolean> {
+    if (task.location !== "active" && !(archive === "completed" && task.location === "failed")) return false;
+    const root = task.location === "active" ? dirname(task.taskPath) : dirname(dirname(task.taskPath));
+    if (await isSharedFilesystemRoot(root, this.getMappings())) {
+      console.warn(`[filesystem] Skipping ${archive} archive for ${task.issue.id}; directory is shared by multiple filesystem mappings`);
+      return false;
+    }
+    const archiveDir = join(root, archive);
+    const target = join(archiveDir, basename(task.taskPath));
+    if (await pathExists(target)) return false;
+    await mkdir(archiveDir, { recursive: true });
+    if (!(await isSafeArchiveDirectory(archiveDir))) return false;
+    return moveWithoutOverwrite(task.taskPath, target);
+  }
+
+  private async restoreFailedTask(task: FilesystemTask): Promise<boolean> {
+    if (task.location !== "failed") return false;
+    const root = dirname(dirname(task.taskPath));
+    const target = join(root, basename(task.taskPath));
+    if (await pathExists(target)) return false;
+    return moveWithoutOverwrite(task.taskPath, target);
+  }
+}
+
+async function moveWithoutOverwrite(source: string, target: string): Promise<boolean> {
+  // link creates the destination exclusively; rename would overwrite a file
+  // created after the preflight collision check. Both paths share one volume.
+  try {
+    await link(source, target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+  try {
+    await unlink(source);
+  } catch (err) {
+    // Roll back our extra link when the original could not be removed. Leave
+    // both copies untouched if another process replaced either path.
+    const [original, linked] = await Promise.all([lstat(source), lstat(target)]);
+    if (original.dev === linked.dev && original.ino === linked.ino) await unlink(target);
+    throw err;
+  }
+  return true;
+}
+
+function defaultState(planningEnabled: boolean): FilesystemState {
+  return {
+    version: 1,
+    status: planningEnabled ? "ready" : "plan-approved",
+    comments: [],
+    prUrls: [],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function appendComment(state: FilesystemState, body: string): FilesystemState {
+  return {
+    ...state,
+    comments: [...state.comments, { body, createdAt: new Date().toISOString() }],
+  };
+}
+
+async function existingRealDirectory(path: string, strict = false): Promise<string | null> {
+  try {
+    const resolved = resolve(path);
+    const info = await stat(resolved);
+    if (!info.isDirectory()) {
+      if (strict) throw new Error(`Configured filesystem task root is not a directory: ${resolved}`);
+      return null;
+    }
+    return await realpath(resolved);
+  } catch (err) {
+    if (strict) throw err;
+    return null;
+  }
+}
+
+/** Whether the orchestrator can create entries in `directory`, which needs search access as well as write, asked without writing. */
+async function accessFault(directory: string): Promise<"not-writable" | null> {
+  try {
+    await access(directory, constants.W_OK | constants.X_OK);
+    return null;
+  } catch {
+    return "not-writable";
+  }
+}
+
+async function readTaskDirectory(directory: string, isRoot: boolean, strict = false): Promise<string[]> {
+  if (!(await isSafeScanDirectory(directory))) return [];
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch (err) {
+    if (strict) throw err;
+    return [];
+  }
+  const result: string[] = [];
+  for (const entry of entries.sort()) {
+    if (isRoot && (entry === ".state" || entry === "completed" || entry === "failed")) continue;
+    if (extname(entry) !== ".md") continue;
+    if (!SAFE_SEGMENT_RE.test(entry)) continue;
+    const taskPath = join(directory, entry);
+    try {
+      const fileStat = await lstat(taskPath);
+      if (fileStat.isFile() && !fileStat.isSymbolicLink()) result.push(entry);
+    } catch (err) {
+      if (strict) throw err;
+      continue;
+    }
+  }
+  return result;
+}
+
+async function isSafeScanDirectory(directory: string): Promise<boolean> {
+  try {
+    const info = await lstat(directory);
+    return info.isDirectory() && !info.isSymbolicLink();
+  } catch (err) {
+    if (isMissing(err)) return false;
+    throw err;
+  }
+}
+
+async function isSafeArchiveDirectory(directory: string): Promise<boolean> {
+  try {
+    const info = await lstat(directory);
+    return info.isDirectory() && !info.isSymbolicLink();
+  } catch (err) {
+    if (isMissing(err)) return true;
+    throw err;
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (err) {
+    if (isMissing(err)) return false;
+    throw err;
+  }
+}
+
+async function isSharedFilesystemRoot(root: string, mappings: Record<string, RepoMapping>): Promise<boolean> {
+  let matches = 0;
+  for (const mapping of Object.values(mappings)) {
+    if (mapping.ticketingConfig.kind !== "filesystem") continue;
+    const directory = await existingRealDirectory(mapping.ticketingConfig.directory);
+    if (directory === root) matches += 1;
+  }
+  return matches > 1;
+}
+
+function readState(path: string): Promise<FilesystemState | null | "corrupt">;
+function readState(path: string, allowUnknown: true): Promise<StatusState | null | "corrupt">;
+async function readState(path: string, allowUnknown = false): Promise<StatusState | null | "corrupt"> {
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error(`State must be a regular file: ${path}`);
+  } catch (err) {
+    if (isMissing(err)) return null;
+    throw err;
+  }
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<StatusState>;
+    if (parsed.version !== 1 || (allowUnknown ? typeof parsed.status !== "string" : !isFilesystemStatus(parsed.status)) ||
+        !Array.isArray(parsed.comments) || !parsed.comments.every(isComment) ||
+        !Array.isArray(parsed.prUrls) || !parsed.prUrls.every((url) => typeof url === "string") ||
+        typeof parsed.updatedAt !== "string") return "corrupt";
+    return {
+      version: 1,
+      ...(parsed.parentRef && typeof parsed.parentRef.identifier === "string" ? { parentRef: parsed.parentRef } : {}),
+      status: parsed.status!,
+      comments: Array.isArray(parsed.comments)
+        ? parsed.comments.filter(isComment)
+        : [],
+      prUrls: Array.isArray(parsed.prUrls)
+        ? parsed.prUrls.filter((url): url is string => typeof url === "string")
+        : [],
+      failurePhase: parsed.failurePhase === "planning" || parsed.failurePhase === "implementation"
+        ? parsed.failurePhase
+        : undefined,
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
+    };
+  } catch {
+    return "corrupt";
+  }
+}
+
+async function writeStateAtomic(path: string, state: FilesystemState): Promise<void> {
+  await checkStateDirectories(dirname(path));
+  await mkdir(dirname(path), { recursive: true });
+  await checkStateDirectories(dirname(path));
+  const tmp = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    await rename(tmp, path);
+  } finally {
+    await unlink(tmp).catch((err: unknown) => { if (!isMissing(err)) throw err; });
+  }
+}
+
+/** The configured root is canonicalized; neither .state nor its scope may redirect writes. */
+async function checkStateDirectories(scopeDirectory: string): Promise<void> {
+  for (const path of [dirname(scopeDirectory), scopeDirectory]) {
+    try {
+      const info = await lstat(path);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`State directory must not be a symlink: ${path}`);
+    } catch (err) {
+      if (!isMissing(err)) throw err;
+    }
+  }
+}
+
+function isMissing(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException)?.code === "ENOENT";
+}
+
+function isFilesystemStatus(value: unknown): value is FilesystemStatus {
+  return typeof value === "string" && (
+    value === "ready" ||
+    value === "planning" ||
+    value === "plan-approved" ||
+    value === "implementing" ||
+    value === "pr-ready" ||
+    value === "failed" ||
+    value === "completed" ||
+    value === "cancelled"
+  );
+}
+
+function isCallbackTerminal(status: FilesystemStatus): boolean {
+  return TERMINAL.has(status) || status === "pr-ready";
+}
+
+function isComment(value: unknown): value is { body: string; createdAt: string } {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    typeof (value as { body?: unknown }).body === "string" &&
+    typeof (value as { createdAt?: unknown }).createdAt === "string",
+  );
+}
+
+function validateSafeSegment(value: string, label: string): void {
+  if (!SAFE_SEGMENT_RE.test(value) || value === "." || value === "..") {
+    throw new Error(`Invalid filesystem ${label}: ${JSON.stringify(value)}`);
+  }
+}
+
+function scopeFromIssueId(issueId: string): string {
+  const parsed = parseFilesystemIssueId(issueId);
+  if (!parsed) throw new Error(`Invalid filesystem issueId: ${JSON.stringify(issueId)}`);
+  return parsed.scopeKey;
+}
+
+function parseFilesystemIssueId(issueId: string): { scopeKey: string; identifier: string } {
+  const match = /^filesystem:([^:]+):([^:]+)$/.exec(issueId);
+  if (!match) throw new Error(`Invalid filesystem issueId: ${JSON.stringify(issueId)}`);
+  const [, scopeKey, identifier] = match;
+  validateSafeSegment(scopeKey, "scopeKey");
+  if (!IDENTIFIER_RE.test(identifier)) {
+    throw new Error(`Invalid filesystem issue identifier: ${JSON.stringify(identifier)}`);
+  }
+  return { scopeKey, identifier };
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
+}

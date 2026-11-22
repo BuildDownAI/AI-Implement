@@ -1,4 +1,9 @@
-# Synced to target repos by sync-workflow.yml.
+# Synced to target repos by the orchestrator's workflow sync.
+# ai-implement-capability: private-run-config-v1
+# ai-implement-capability: stage-agent-config-v1
+# ai-implement-capability: stage-agent-launch-context-v1
+# ai-implement-capability: openrouter-accounts-v1
+# ai-implement-capability: github-hosted-execution-policy-v2
 # All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
 #
@@ -11,8 +16,20 @@
 # Additional secret (Bedrock provider):
 #   AWS_BEDROCK_ROLE_ARN     - IAM role ARN trusted to GitHub OIDC; needs bedrock:InvokeModel
 #
-# Required repo setting:
-#   Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests" → ENABLED
+# Optional secret (forwarded hook environment):
+#   AI_IMPLEMENT_FORWARDED_ENV - KEY=VALUE lines (one per line) exposed to setup/verify hooks.
+#                                Read as ONE literal secret. Never serialize the whole secrets
+#                                context: that trips GitHub's malicious-workflow scanner and
+#                                gates every dispatch behind manual approval (AII-502).
+#                                Values reach hooks only; the runner strips them from the model process.
+#
+# Optional variables (private npm registry, read by the built-in install step):
+#   AI_IMPLEMENT_NPM_REGISTRY  - Registry URL, e.g. https://your.registry.example/path/
+#   AI_IMPLEMENT_NPM_SCOPE     - Optional comma-separated npm scope(s) mapped to that registry, e.g. "@acme".
+#   The registry token is NOT a separate secret: put an NPM_TOKEN=<token> line in
+#   AI_IMPLEMENT_FORWARDED_ENV above. When NPM_TOKEN and the registry are both present the
+#   runner writes a per-run npm user config for the install command only, then removes it —
+#   no target-repo .npmrc needed, and the token never reaches the model process.
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
@@ -32,14 +49,30 @@
 #   runner image is only usable in this GitHub Actions execution mode.
 
 name: Claude AI Implementation
+# Display-only: the ticket key and pilot attempt ID also ride inside run_config.
+# GitHub evaluates this before a step can decode or validate the envelope.
+run-name: ${{ inputs.run_attempt_token && format('Claude AI Implementation — {0} · attempt {1}', inputs.issue_identifier || 'review-fix', inputs.run_attempt_token) || inputs.issue_identifier && format('Claude AI Implementation — {0}', inputs.issue_identifier) || 'Claude AI Implementation' }}
 
 on:
   workflow_dispatch:
+    # A top-level input is only for a value GitHub must evaluate before any step
+    # runs (routing, image selection, timeout) or a secret this workflow masks.
+    # Everything else rides inside run_config — see docs/workflow-envelope.md.
     inputs:
       run_config:
         description: "base64 JSON RunConfig envelope — see docs/workflow-envelope.md"
         required: true
         type: string
+      issue_identifier:
+        description: "Ticket key for the run title; display only — run_config is authoritative"
+        required: false
+        type: string
+        default: ""
+      run_attempt_token:
+        description: "Secret-free pilot attempt ID for exact run correlation; must match run_config.reviewFix.attemptId"
+        required: false
+        type: string
+        default: ""
       runner_image:
         description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
@@ -165,6 +198,7 @@ jobs:
           fi
 
           echo "runner_image=$runner_image" >> "$GITHUB_OUTPUT"
+          echo "[dispatch-inputs] resolved runner_image: $runner_image"
 
   implement:
     needs: validate-runner-image
@@ -182,13 +216,290 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      # Docker's built-in init reaps orphaned grandchildren; without it a native
+      # Codex run leaves a zombie and the process-group stop check correctly
+      # demands recovery (AII-1437). Adds no privilege or capability.
+      options: --init
     steps:
+      # Read the event file without exposing token-valued env/script metadata: GitHub
+      # prints those headers before executing the first add-mask command (AII-676).
+      - name: Mask runner callback tokens
+        id: bootstrap
+        env:
+          # GitHub supplies the actual runner class; project env and run_config cannot assert it.
+          AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set +x
+          jq -r '
+            .inputs // {}
+            | [.run_token, .run_progress_token, .run_publication_token]
+            | if all(.[]; . == null or type == "string") then .[]
+              else error("Callback tokens must be strings") end
+            | select(. != null and . != "")
+            | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")
+            | "::add-mask::" + .
+          ' "$GITHUB_EVENT_PATH"
+
+          # Private envelope (AII-982): mask the whole encoded run_config, then every
+          # extracted credential, before any step prints metadata or output. Failures
+          # print fixed text only; jq stderr is discarded because it can echo input.
+          jq -r '
+            (.inputs // {}).run_config
+            | if . == null then "" else . end
+            | if type == "string" then . else error("x") end
+            | select(. != "")
+            | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")
+            | "::add-mask::" + .
+          ' "$GITHUB_EVENT_PATH" 2>/dev/null || {
+            echo "::error::Private run_config bootstrap failed" >&2
+            exit 1
+          }
+          bootstrap="$(jq -r '
+            def mask: gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A") | "::add-mask::" + .;
+            def isobj: type == "object";
+            def only($k): ((keys - $k) | length) == 0;
+            def idstr: type == "string" and length >= 1 and length <= 128 and test("\\A[A-Za-z0-9][A-Za-z0-9._-]*\\z");
+            def posint: type == "number" and . > 0 and . <= 9007199254740991 and . == floor;
+            def b64u($min; $max): type == "string" and length >= $min and length <= $max and test("\\A[A-Za-z0-9_-]+\\z");
+            def token: type == "string" and length >= 1 and length <= 4096 and (test("\\s") | not);
+            def modes: ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription", "openrouter-api-key"];
+            def stage_names: ["planning", "implementation", "review"];
+            def binding:
+              isobj and only(["stage", "profileId", "profileRevision", "authMode", "ownerGeneration"])
+              and (.stage | IN(stage_names[])) and (.profileId | idstr) and (.profileRevision | posint)
+              and (.authMode | IN(modes[]))
+              and (has("ownerGeneration") | not);
+            def plain_grant:
+              isobj and only(["version", "audience", "grantId", "dispatchId", "snapshotId", "projectKey", "backend", "expiresAt", "bearer", "bindings"])
+              and .version == 1 and .audience == "model-auth"
+              and (.grantId | idstr) and (.dispatchId | idstr) and (.snapshotId | idstr) and (.projectKey | idstr)
+              and (.backend | IN("fly", "gha", "local")) and (.expiresAt | posint)
+              and (.bearer | b64u(32; 256))
+              and (.bindings | type == "array" and length >= 1 and length <= 16 and all(.[]; binding)
+                   and (group_by(.profileId) | all(.[]; ((map(.stage) | unique | length) == length)
+                        and ((map([.profileRevision, .authMode, .ownerGeneration]) | unique | length) <= 1))));
+            def sealed_grant:
+              isobj and only(["version", "algorithm", "dispatchId", "backend", "nonce", "ciphertext", "tag"])
+              and .version == 1 and .algorithm == "aes-256-gcm" and (.dispatchId | idstr) and .backend == "fly"
+              and (.nonce | b64u(16; 16)) and (.ciphertext | b64u(1; 65536)) and (.tag | b64u(22; 22));
+            def grant: if isobj and has("algorithm") then sealed_grant else plain_grant end;
+            def ctx:
+              isobj and only(["version", "dispatchId", "projectKey", "backend", "modelAuthUrl"])
+              and .version == 1 and (.dispatchId | idstr) and (.projectKey | idstr) and .backend == "gha"
+              and (.modelAuthUrl | type == "string" and length <= 2048
+                   and test("\\Ahttps://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?\\z")
+                   and (capture("\\Ahttps://(?<host>[^:/]+)(:(?<port>[0-9]{1,5}))?") as $m
+                        | (($m.port // "1") | tonumber) as $p
+                        | $p >= 1 and $p <= 65535
+                          and ($m.host | if test("\\A[0-9.]+\\z")
+                                         then (split(".") | length == 4 and all(.[]; test("\\A[0-9]{1,3}\\z") and tonumber <= 255))
+                                         else true end)));
+            def policy:
+              isobj and only(["version", "implementationSandbox", "dispatchId", "projectKey", "backend", "ephemeralRunnerAsserted"])
+              and .version == 1 and .implementationSandbox == "ephemeral-full-access"
+              and (.dispatchId | idstr) and (.projectKey | idstr) and .backend == "gha"
+              and .ephemeralRunnerAsserted == true;
+            def creds:
+              isobj and only(["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant", "modelAuthContext", "executionPolicy"])
+              and .version == 1
+              and (. as $c | all("resultToken", "progressToken", "publicationToken", "attemptToken";
+                     . as $f | ($c | has($f) | not) or ($c[$f] | token)))
+              and (if has("modelAuthGrant") then (.modelAuthGrant | grant) and has("modelAuthContext") else true end)
+              and (if has("modelAuthContext") then (.modelAuthContext | ctx) else true end)
+              and (if has("executionPolicy")
+                   then (.executionPolicy | policy) and has("modelAuthContext")
+                        and .executionPolicy.dispatchId == .modelAuthContext.dispatchId
+                        and .executionPolicy.projectKey == .modelAuthContext.projectKey
+                   else true end);
+            def snapstr: type == "string" and test("\\S") and length <= 256;
+            def revref: isobj and only(["configRevisionId", "revision"]) and (.configRevisionId | snapstr) and (.revision | posint);
+            def sel:
+              isobj and only(["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"])
+              and (.agent | IN("claude", "codex")) and (.provider | IN("anthropic", "bedrock", "openai", "openrouter"))
+              and (.model | snapstr) and (.accountProfileId | snapstr) and (.invocationTimeoutMs | posint);
+            def src:
+              isobj and only(["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"])
+              and (. as $o | all("agent", "provider", "model", "accountProfileId", "invocationTimeoutMs";
+                     . as $f | $o[$f] | IN("orchestrator-default", "project", "job-deadline")));
+            def prof:
+              isobj and only(["id", "identity", "revision", "agent", "provider", "authMode"])
+              and (.id | snapstr) and (.identity | snapstr) and (.revision | posint)
+              and (.agent | IN("claude", "codex")) and (.provider | IN("anthropic", "bedrock", "openai", "openrouter"))
+              and (.authMode | IN(modes[]));
+            def combo($a; $p; $m):
+              if $p == "openrouter" then $m == "openrouter-api-key"
+              elif $a == "claude"
+              then ($p == "anthropic" and ($m == "anthropic-api-key" or $m == "claude-subscription"))
+                   or ($p == "bedrock" and $m == "bedrock")
+              else $p == "openai" and ($m == "openai-api-key" or $m == "codex-subscription") end;
+            def snapshot:
+              isobj and only(["version", "snapshotId", "configRevisions", "stages", "sources", "profiles"])
+              and .version == 1 and (.snapshotId | snapstr)
+              and (.configRevisions | isobj and only(["orchestratorDefault", "project"])
+                   and (.orchestratorDefault | revref) and (.project | revref))
+              and ([.stages, .sources, .profiles] | all(.[]; isobj and (keys == (stage_names | sort))))
+              and (. as $r | all(stage_names[]; . as $s
+                   | $r.stages[$s] as $a | $r.sources[$s] as $b | $r.profiles[$s] as $p
+                   | ($a | sel) and ($b | src) and ($p | prof)
+                     and $p.id == $a.accountProfileId and $p.agent == $a.agent and $p.provider == $a.provider
+                     and combo($p.agent; $p.provider; $p.authMode)));
+            (.inputs // {}).run_config
+            | if . == null then "" else . end
+            | if type == "string" then . else error("x") end
+            | select(. != "")
+            | (try (@base64d | fromjson) catch error("x"))
+            | if type == "object" then . else error("x") end
+            | if (has("agentConfig") | not) or (.agentConfig | snapshot) then . else error("x") end
+            | if has("credentials") then .credentials else empty end
+            | if creds then . else error("x") end
+            | . as $c
+            | ([ (.resultToken, .progressToken, .publicationToken, .attemptToken | select(. != null)),
+                (.modelAuthGrant // empty
+                  | if has("algorithm") then (.nonce, .ciphertext, .tag | select(length >= 8)) else .bearer end),
+                (.modelAuthContext // empty | .dispatchId, .projectKey, .modelAuthUrl) ]
+            | unique | .[] | mask),
+              ("RUN_TOKEN=" + ($c.resultToken // "")),
+              ("RUN_PROGRESS_TOKEN=" + ($c.progressToken // "")),
+              ("RUN_PUBLICATION_TOKEN=" + ($c.publicationToken // "")),
+              ("RUN_MODEL_AUTH_DISPATCH_ID=" + ($c.modelAuthContext.dispatchId // "")),
+              ("RUN_MODEL_AUTH_PROJECT_KEY=" + ($c.modelAuthContext.projectKey // "")),
+              ("RUN_MODEL_AUTH_BACKEND=" + ($c.modelAuthContext.backend // "")),
+              ("RUN_MODEL_AUTH_URL=" + ($c.modelAuthContext.modelAuthUrl // "")),
+              ("RUN_EXECUTION_POLICY=" + (if $c.executionPolicy
+                 then "v1:ephemeral-full-access:gha:" + $c.executionPolicy.dispatchId + ":" + $c.executionPolicy.projectKey
+                 else "" end))
+          ' "$GITHUB_EVENT_PATH" 2>/dev/null)" || {
+            echo "::error::Private run_config bootstrap failed" >&2
+            exit 1
+          }
+
+          # Full access is the default only on disposable GitHub-hosted jobs. A runner label override
+          # must not silently move this authority onto a persistent self-hosted machine.
+          if printf '%s\n' "$bootstrap" | grep -q '^RUN_EXECUTION_POLICY=v1:'; then
+            if [ "${AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+              echo "::error::Codex full access requires a github-hosted runner; refusing this job" >&2
+              exit 1
+            fi
+          fi
+
+          # Deliver the validated credentials as step outputs (AII-1000), mapped into the Run step's env only, never $GITHUB_ENV, so no other step sees them. A private
+          # namespace is the single authority: a field it omits stays empty and is never
+          # backfilled from the public inputs. Without one, the legacy inputs are
+          # exported unchanged. Values travel through $GITHUB_OUTPUT only, under a random
+          # delimiter, and are never echoed or placed in command text.
+          printf '%s\n' "$bootstrap" | sed -n '/^::add-mask::/p'
+          export_env() {
+            case "$2" in
+              *"$3"*) echo "::error::Private run_config bootstrap failed" >&2; exit 1 ;;
+            esac
+            printf '%s<<%s\n%s\n%s\n' "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" "$3" "$2" "$3" >> "${GITHUB_OUTPUT:-/dev/null}"
+          }
+          delim="$(openssl rand -hex 16)"
+          private="$(printf '%s\n' "$bootstrap" | sed -n '/^RUN_/p')"
+          if [ -n "$private" ]; then
+            # Tokens hold no whitespace, so newline splitting is exact; globbing stays off.
+            set -f
+            IFS="$(printf '\n_')"
+            IFS="${IFS%_}"
+            for line in $private; do
+              export_env "${line%%=*}" "${line#*=}" "$delim"
+            done
+            unset IFS
+            set +f
+          else
+            for pair in RUN_TOKEN:run_token RUN_PROGRESS_TOKEN:run_progress_token RUN_PUBLICATION_TOKEN:run_publication_token; do
+              val="$(jq -r --arg k "${pair#*:}" '(.inputs // {})[$k] // ""' "$GITHUB_EVENT_PATH")"
+              if [ -n "$val" ]; then export_env "${pair%%:*}" "$val" "$delim"; fi
+            done
+          fi
+
+      - name: Validate attempt correlation
+        env:
+          RUN_CONFIG: ${{ inputs.run_config }}
+          RUN_ATTEMPT_TOKEN: ${{ inputs.run_attempt_token }}
+        run: |
+          # Keep all untrusted data in env/quoted variables, never in script text.
+          # The runner repeats full contract validation; this gate prevents a malformed
+          # pilot marker from reaching subsequent steps or silently running as Legacy.
+          decoded="$(printf '%s' "$RUN_CONFIG" | base64 -d)" || {
+            echo "::error::run_config is not valid base64" >&2
+            exit 1
+          }
+          if ! printf '%s' "$decoded" | jq -e --arg marker "$RUN_ATTEMPT_TOKEN" '
+            def id: type == "string" and length > 0 and length <= 128
+              and test("^[A-Za-z0-9][A-Za-z0-9._-]*$");
+            def positive_int: type == "number" and . > 0 and . <= 9007199254740991 and floor == .;
+            .v == 1 and (.issue | type == "object") and
+            (if has("reviewFix") then
+              ($marker | id) and (.reviewFix | type == "object") and
+              (.reviewFix.version == 1) and
+              (.reviewFix.attemptId == $marker) and
+              (.reviewFix.installationId | positive_int) and
+              (.reviewFix.repository | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+              (.reviewFix.prNumber | positive_int) and
+              (.reviewFix.deadlineAt | positive_int)
+            else $marker == "" end)
+          ' >/dev/null 2>&1; then
+            echo "::error::run_config reviewFix metadata and run_attempt_token must form one valid, matching pilot identity (or both be absent for Legacy)" >&2
+            exit 1
+          fi
+
+      - name: Print dispatch inputs
+        env:
+          RUN_CONFIG: ${{ inputs.run_config }}
+          PROVIDER: ${{ inputs.provider }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}
+          RUNNER_IMAGE: ${{ inputs.runner_image }}
+          HAS_RUN_TOKEN: "${{ inputs.run_token != '' }}"
+          HAS_RUN_PROGRESS_TOKEN: "${{ inputs.run_progress_token != '' }}"
+          HAS_PUBLICATION_TOKEN: "${{ inputs.run_publication_token != '' }}"
+        run: |
+          echo "[dispatch-inputs] provider: $PROVIDER"
+          echo "[dispatch-inputs] aws_region: $AWS_REGION"
+          echo "[dispatch-inputs] job_timeout_minutes: $JOB_TIMEOUT_MINUTES"
+          echo "[dispatch-inputs] runner_image: $RUNNER_IMAGE"
+          echo "[dispatch-inputs] run_token: $( [ "$HAS_RUN_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
+          echo "[dispatch-inputs] run_progress_token: $( [ "$HAS_RUN_PROGRESS_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
+          echo "[dispatch-inputs] run_publication_token: $( [ "$HAS_PUBLICATION_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
+          # Diagnostic projection only (AII-982): known envelope keys, credentials
+          # replaced by field names, agentConfig omitted. The raw and decoded envelope are never printed.
+          # jq quotes and indents every value, so no decoded line can begin with
+          # "::" and forge a workflow command.
+          echo "[dispatch-inputs] run_config:"
+          printf '%s' "$RUN_CONFIG" | base64 -d 2>/dev/null | jq '
+            (.credentials // null) as $c
+            | has("agentConfig") as $hasAgent
+            | with_entries(select(.key | IN("v", "issue", "prNumber", "baseBranch", "runnerPhase",
+                "branchPrefix", "skillsRepo", "runnerCallbackUrl", "maxTurns", "maxIterations",
+                "commentInstruction", "sensitiveFiles", "profiles", "assigneeName", "planningContext",
+                "groupingParent", "dependencyTokenScope", "kgSourceRepo", "kgDryRun", "kgSourceRef",
+                "kgAcceptNewBaseline", "kgBaselineActor", "referenceRepos", "reviewers",
+                "retryPolicy", "reviewFix")))
+            | if $hasAgent then . + {agentConfig: "<omitted>"} else . end
+            | if ($c | type) == "object"
+              then . + {credentialFields: [$c | keys_unsorted[]
+                  | select(. as $k | ["resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant"] | index($k))]}
+              else . end
+          ' 2>/dev/null \
+            || echo "[dispatch-inputs] run_config could not be decoded"
+
       - name: Generate GitHub App token
         id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
+          # Explicit permissions (AII-450). Implicit mode inherits "all installation
+          # permissions", which made a missing scope a push-time mystery — two runs
+          # died pushing a workflow file with a buried remote-rejected error while
+          # every permission surface CLAIMED workflows:write. Explicit scopes make
+          # the mint fail loudly, by name, at mint time instead.
+          permission-contents: write
+          permission-workflows: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-metadata: read
 
       - name: Validate Bedrock inputs
         if: inputs.provider == 'bedrock'
@@ -209,32 +520,89 @@ jobs:
 
       - name: Configure AWS credentials (Bedrock)
         if: inputs.provider == 'bedrock'
-        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
           role-session-duration: 14400
 
-      - name: Mask runner callback tokens
+      # Container jobs default to sh -e; this step uses bash syntax and requires shell: bash.
+      # Reads ONE literal repository secret. Never serialize the whole secrets context: that
+      # pattern trips GitHub's malicious-workflow scanner and gates every dispatch (AII-502).
+      - name: Forward repository secrets
+        env:
+          FORWARDED_ENV: ${{ secrets.AI_IMPLEMENT_FORWARDED_ENV }}
+        shell: bash
         run: |
-          if [ -n "${{ inputs.run_token }}" ]; then
-            echo "::add-mask::${{ inputs.run_token }}"
+          set -euo pipefail
+          if [ -z "${FORWARDED_ENV:-}" ]; then
+            exit 0
           fi
-          if [ -n "${{ inputs.run_progress_token }}" ]; then
-            echo "::add-mask::${{ inputs.run_progress_token }}"
-          fi
-          if [ -n "${{ inputs.run_publication_token }}" ]; then
-            echo "::add-mask::${{ inputs.run_publication_token }}"
+          reserved="GITHUB_TOKEN AI_IMPLEMENT_APP_ID AI_IMPLEMENT_PRIVATE_KEY ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN AWS_BEDROCK_ROLE_ARN GH_TOKEN GITHUB_ENTERPRISE_TOKEN GH_ENTERPRISE_TOKEN GIT_PASSWORD"
+          validated=""
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            if [[ "$line" != *=* ]]; then
+              echo "::error::AI_IMPLEMENT_FORWARDED_ENV: a line has no '=' separator (expected KEY=VALUE)."
+              exit 1
+            fi
+            name="${line%%=*}"
+            val="${line#*=}"
+            if ! [[ "$name" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+              echo "::error::AI_IMPLEMENT_FORWARDED_ENV: \"$name\" does not match the required format ^[A-Z][A-Z0-9_]*\$."
+              exit 1
+            fi
+            for r in $reserved; do
+              if [ "$name" = "$r" ]; then
+                echo "::error::AI_IMPLEMENT_FORWARDED_ENV: \"$name\" is a reserved name and cannot be forwarded."
+                exit 1
+              fi
+            done
+            if [[ "$name" == RUN_* ]] || [[ "$name" == AI_IMPLEMENT_* ]]; then
+              echo "::error::AI_IMPLEMENT_FORWARDED_ENV: \"$name\" uses a reserved prefix (RUN_ or AI_IMPLEMENT_) and cannot be forwarded."
+              exit 1
+            fi
+            if [ -z "$val" ]; then
+              echo "::error::AI_IMPLEMENT_FORWARDED_ENV: \"$name\" has an empty value."
+              exit 1
+            fi
+            echo "::add-mask::$val"
+            delim="$(openssl rand -hex 16)"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$val" "$delim" >> "$GITHUB_ENV"
+            validated="${validated:+${validated},}${name}"
+          done <<< "$FORWARDED_ENV"
+          if [ -n "$validated" ]; then
+            echo "AI_IMPLEMENT_FORWARDED_SECRETS=${validated}" >> "$GITHUB_ENV"
+            echo "::notice::Forwarding repository secrets to runner environment: ${validated}"
           fi
 
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # provider/aws_region stayed TOP-LEVEL inputs under the envelope (they gate the
+          # OIDC credentials step, which runs before run_config is decoded), so the runner
+          # still reads them from env: run-autonomous.ts does `env.PROVIDER || "anthropic"`,
+          # which means a missing PROVIDER silently downgrades every Bedrock repo.
+          PROVIDER: ${{ inputs.provider }}
+          AWS_REGION: ${{ inputs.aws_region }}
           AI_IMPLEMENT_RUN_CONFIG: ${{ inputs.run_config }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          RUN_TOKEN: ${{ inputs.run_token }}
-          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
-          RUN_PUBLICATION_TOKEN: ${{ inputs.run_publication_token }}
+          # Private credentials arrive as masked outputs of the bootstrap step.
+          RUN_TOKEN: ${{ steps.bootstrap.outputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ steps.bootstrap.outputs.run_progress_token }}
+          # Independent trusted model-auth context (AII-1427): masked bootstrap outputs, Run step only.
+          AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID: ${{ steps.bootstrap.outputs.run_model_auth_dispatch_id }}
+          AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: ${{ steps.bootstrap.outputs.run_model_auth_project_key }}
+          AI_IMPLEMENT_MODEL_AUTH_BACKEND: ${{ steps.bootstrap.outputs.run_model_auth_backend }}
+          AI_IMPLEMENT_MODEL_AUTH_URL: ${{ steps.bootstrap.outputs.run_model_auth_url }}
+          # Default eligible Codex implementation policy: validated github-hosted bootstrap output only; the
+          # dispatcher projected it. The runner re-checks it against the model-auth dispatch id and project key.
+          AI_IMPLEMENT_EXECUTION_POLICY: ${{ steps.bootstrap.outputs.run_execution_policy }}
+          RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
+          AI_IMPLEMENT_NPM_REGISTRY: ${{ vars.AI_IMPLEMENT_NPM_REGISTRY }}
+          AI_IMPLEMENT_NPM_SCOPE: ${{ vars.AI_IMPLEMENT_NPM_SCOPE }}
         run: /opt/ai-implement/entrypoint.sh

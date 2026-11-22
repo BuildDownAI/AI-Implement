@@ -1,5 +1,7 @@
 import { getDb } from "./dedup.js";
 import type { ProviderId } from "./providers/types.js";
+import type { ReferenceRepo } from "./reference-repos.js";
+import { resolveReviewProcess, type ReviewProcessId } from "./review-process.js";
 import {
   type TicketingMappingConfig,
   validateTicketingConfig,
@@ -14,6 +16,7 @@ export const DEFAULT_PLANNING_ENABLED = true;
 export const DEFAULT_PLANNING_WORKFLOW_FILE = "claude-plan.yml";
 export const DEFAULT_AUTO_APPROVE_PLANS = true;
 export const DEFAULT_AUTO_MERGE = false;
+export const DEFAULT_PR_DISPATCH_BUDGET = 4;
 
 export type ExecutionMode = "github-actions" | "fly-machines";
 export type SessionMode = "autonomous" | "interactive" | "hybrid";
@@ -23,6 +26,8 @@ export const DEFAULT_PROVIDER: ClaudeProvider = "anthropic";
 const DEFAULT_TICKETING_PROVIDER: ProviderId = "linear";
 
 export interface RepoMapping {
+  /** The mapping's key in `getMappings()`. Not stored or populated by `getMappings()`; `TrackerExport` stamps it so a provider's `listIssuesPage` can name the team without a second lookup. */
+  teamKey?: string;
   owner: string;
   repo: string;
   workflowFile: string;
@@ -30,6 +35,7 @@ export interface RepoMapping {
   maxInProgressAiIssues: number;
   executionMode: ExecutionMode;
   sessionMode: SessionMode;
+  machineCpuKind: "shared" | "performance";
   machineCpus: number;
   machineMemoryMb: number;
   /** Whether to run the planning phase before implementation. Default true. */
@@ -47,9 +53,9 @@ export interface RepoMapping {
   extraEnv: Record<string, string>;
   /** Claude provider used by the dispatched workflow. Default 'anthropic'. */
   provider: ClaudeProvider;
-  /** Ticketing provider this mapping uses (Linear or Jira). Default 'linear'. */
+  /** Ticketing provider this mapping uses. Filesystem is available in local runner mode. Default 'linear'. */
   ticketingProvider: ProviderId;
-  /** Per-mapping ticketing config (Linear is trivial; Jira carries jql, repoFieldValue, optional overrides). */
+  /** Per-mapping ticketing config (Linear is trivial; Jira carries jql, an optional repoFieldValue and optional overrides). */
   ticketingConfig: TicketingMappingConfig;
   /** AWS region for Bedrock. Required when provider='bedrock'. */
   awsRegion: string | null;
@@ -65,12 +71,77 @@ export interface RepoMapping {
   branchPrefix: string | null;
   /** Optional skills repo (owner/repo shorthand or git URL) to clone for per-project skills. NULL means no skills repo. */
   skillsRepo: string | null;
+  /** Repositories cloned read-only into the workspace as reference source. NULL means none. */
+  referenceRepos: ReferenceRepo[] | null;
   /** Glob patterns to add to the sensitive-files list for this project. NULL means unset. */
   sensitiveAddPatterns: string[] | null;
   /** Glob patterns that are explicitly allowed (not sensitive) for this project. NULL means unset. */
   sensitiveAllowPatterns: string[] | null;
   /** Token scope for dependency access. NULL means off (default); "installation" grants read access to all repos the App can see. */
   dependencyTokenScope: "installation" | null;
+  /**
+   * Historical lifecycle metadata retained for deploy rollback. Mapping saves ignore
+   * this input and preserve the stored value; every mapped run uses Restate.
+   * An attempt already in flight keeps its recorded owner.
+   */
+  reviewFixLifecycle: "legacy" | "restate" | null;
+  /** Memory provider ID for this mapping. NULL means use the orchestrator default (sidecar). JSON-ready text column. */
+  memoryProviderId: string | null;
+  /**
+   * Which reviewers run on this project's PRs. NULL means the default,
+   * and the default is not an empty list — see resolveReviewerSelection().
+   * An empty array is a distinct, deliberate choice to run no reviewers.
+   */
+  reviewers: ReviewerSelection[] | null;
+  /** Max gap-fill runs the orchestrator may start on one PR in 24 hours. NULL means use DEFAULT_PR_DISPATCH_BUDGET. Enforced by `canDispatch` (src/dispatch-gate.ts): at the limit the PR is parked and a human is notified — see [AII-757](https://linear.app/eudoxus/issue/AII-757/park-a-pr-at-its-dispatch-budget-and-ask-for-a-human). */
+  prDispatchBudget?: number | null;
+  /** Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (`ai-implement`, `ai-implement[bot]`, and the Claude logins — `github-actions[bot]` is trusted separately). NULL means built-ins only. */
+  trustedReviewAuthors?: string[] | null;
+  /** The project's review process (ADR 038). NULL means `ai-implement`; read it through resolveReviewProcessId(). Applies to every project; Restate coordinates AI-Implement fix attempts on every backend. */
+  reviewProcess?: ReviewProcessId | null;
+}
+
+/** Which reviewers run on this project's PRs, and which of them may hold a merge. */
+export interface ReviewerSelection {
+  /** Reviewer id. Built-ins are "gap-analysis", "code-review", and "integration-review". */
+  id: string;
+  /** false runs the reviewer and shows its findings without ever blocking a merge. */
+  gates: boolean;
+  /** Optional per-reviewer turn cap. Omitted means inherit the global reviewer limit. */
+  maxTurns?: number;
+}
+
+/**
+ * The default reviewer selection used when a mapping's `reviewers` column is
+ * NULL. NULL means this default, never an empty list — resolving it to []
+ * would silently remove the review gate from every existing project on deploy.
+ */
+export const DEFAULT_REVIEWER_SELECTION: ReviewerSelection[] = Object.freeze([
+  Object.freeze({ id: "gap-analysis", gates: true }),
+  Object.freeze({ id: "code-review", gates: true }),
+]) as ReviewerSelection[];
+
+/**
+ * Resolves a mapping's stored reviewer selection, applying the NULL-means-default
+ * rule: NULL resolves to DEFAULT_REVIEWER_SELECTION, not an empty list.
+ */
+export function resolveReviewerSelection(mapping: Pick<RepoMapping, "reviewers">): ReviewerSelection[] {
+  return mapping.reviewers ?? DEFAULT_REVIEWER_SELECTION;
+}
+
+/**
+ * Resolves a mapping's stored PR dispatch budget (max gap-fill runs per PR
+ * per 24 hours). NULL/undefined resolves to DEFAULT_PR_DISPATCH_BUDGET.
+ */
+export function resolvePrDispatchBudget(mapping: { prDispatchBudget?: number | null }): number {
+  return mapping.prDispatchBudget ?? DEFAULT_PR_DISPATCH_BUDGET;
+}
+
+/** Resolves a mapping's stored review process id; NULL or an unknown value resolves to `ai-implement`. */
+export function resolveReviewProcessId(
+  mapping: Pick<RepoMapping, "reviewProcess">,
+): ReviewProcessId {
+  return resolveReviewProcess(mapping.reviewProcess).id;
 }
 
 // Seed mappings are only applied on first run (empty DB).
@@ -96,6 +167,9 @@ function ensureMappingsColumns(): void {
   }
   if (!names.has("session_mode")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN session_mode TEXT NOT NULL DEFAULT '${DEFAULT_SESSION_MODE}'`);
+  }
+  if (!names.has("machine_cpu_kind")) {
+    db.exec("ALTER TABLE mappings ADD COLUMN machine_cpu_kind TEXT NOT NULL DEFAULT 'shared'");
   }
   if (!names.has("machine_cpus")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN machine_cpus INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_CPUS}`);
@@ -151,6 +225,9 @@ function ensureMappingsColumns(): void {
   if (!names.has("skills_repo")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN skills_repo TEXT`);
   }
+  if (!names.has("reference_repos")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN reference_repos TEXT`);
+  }
   if (!names.has("sensitive_add_patterns")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN sensitive_add_patterns TEXT`);
   }
@@ -159,6 +236,30 @@ function ensureMappingsColumns(): void {
   }
   if (!names.has("dependency_token_scope")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN dependency_token_scope TEXT`);
+  }
+  if (!names.has("memory_provider_id")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN memory_provider_id TEXT`);
+  }
+  if (!names.has("reviewers")) {
+    // NULL means the default selection (gap-analysis + code-review, both
+    // gating), not an empty list — see resolveReviewerSelection().
+    db.exec(`ALTER TABLE mappings ADD COLUMN reviewers TEXT`);
+  }
+  if (!names.has("pr_dispatch_budget")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN pr_dispatch_budget INTEGER`);
+  }
+  if (!names.has("review_fix_lifecycle")) {
+    db.exec("ALTER TABLE mappings ADD COLUMN review_fix_lifecycle TEXT");
+  }
+  if (!names.has("trusted_review_authors")) {
+    // NULL means built-ins only (ai-implement, ai-implement[bot], and the Claude
+    // logins — github-actions[bot] is trusted separately) — this list is additive,
+    // not a replacement.
+    db.exec(`ALTER TABLE mappings ADD COLUMN trusted_review_authors TEXT`);
+  }
+  if (!names.has("review_process")) {
+    // NULL means `ai-implement` (the default process); no backfill.
+    db.exec(`ALTER TABLE mappings ADD COLUMN review_process TEXT`);
   }
 }
 
@@ -174,6 +275,7 @@ export function initMappingsTable(): void {
       max_in_progress_ai_issues INTEGER NOT NULL DEFAULT ${DEFAULT_MAX_IN_PROGRESS_AI_ISSUES},
       execution_mode TEXT NOT NULL DEFAULT '${DEFAULT_EXECUTION_MODE}',
       session_mode TEXT NOT NULL DEFAULT '${DEFAULT_SESSION_MODE}',
+      machine_cpu_kind TEXT NOT NULL DEFAULT 'shared',
       machine_cpus INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_CPUS},
       machine_memory_mb INTEGER NOT NULL DEFAULT ${DEFAULT_MACHINE_MEMORY_MB},
       planning_enabled INTEGER NOT NULL DEFAULT 1,
@@ -191,9 +293,21 @@ export function initMappingsTable(): void {
       max_job_minutes INTEGER,
       branch_prefix TEXT,
       skills_repo TEXT,
+      reference_repos TEXT,
       sensitive_add_patterns TEXT,
       sensitive_allow_patterns TEXT,
-      dependency_token_scope TEXT
+      dependency_token_scope TEXT,
+      memory_provider_id TEXT,
+      -- NULL means the default selection (gap-analysis + code-review, both
+      -- gating), not an empty list — see resolveReviewerSelection().
+      reviewers TEXT,
+      pr_dispatch_budget INTEGER,
+      review_fix_lifecycle TEXT,
+      -- NULL means built-ins only (ai-implement, ai-implement[bot], and the
+      -- Claude logins — github-actions[bot] is trusted separately) — this
+      -- list is additive, not a replacement.
+      trusted_review_authors TEXT,
+      review_process TEXT
     )
   `);
   ensureMappingsColumns();
@@ -202,10 +316,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpuKind, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId, m.reviewers ? JSON.stringify(m.reviewers) : null, m.prDispatchBudget ?? null, m.reviewFixLifecycle, m.trustedReviewAuthors ? JSON.stringify(m.trustedReviewAuthors) : null, m.reviewProcess ?? null);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -214,7 +328,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -225,6 +339,7 @@ export function getMappings(): Record<string, RepoMapping> {
       max_in_progress_ai_issues: number;
       execution_mode: string;
       session_mode: string;
+      machine_cpu_kind: "shared" | "performance";
       machine_cpus: number;
       machine_memory_mb: number;
       planning_enabled: number;
@@ -242,9 +357,16 @@ export function getMappings(): Record<string, RepoMapping> {
       max_job_minutes: number | null;
       branch_prefix: string | null;
       skills_repo: string | null;
+      reference_repos: string | null;
       sensitive_add_patterns: string | null;
       sensitive_allow_patterns: string | null;
       dependency_token_scope: string | null;
+      memory_provider_id: string | null;
+      reviewers: string | null;
+      pr_dispatch_budget: number | null;
+      review_fix_lifecycle: string | null;
+      trusted_review_authors: string | null;
+      review_process: string | null;
     }>;
 
   const result: Record<string, RepoMapping> = {};
@@ -267,6 +389,7 @@ export function getMappings(): Record<string, RepoMapping> {
       maxInProgressAiIssues: row.max_in_progress_ai_issues ?? DEFAULT_MAX_IN_PROGRESS_AI_ISSUES,
       executionMode: (row.execution_mode as ExecutionMode) ?? DEFAULT_EXECUTION_MODE,
       sessionMode: (row.session_mode as SessionMode) ?? DEFAULT_SESSION_MODE,
+      machineCpuKind: row.machine_cpu_kind ?? "shared",
       machineCpus: row.machine_cpus ?? DEFAULT_MACHINE_CPUS,
       machineMemoryMb: row.machine_memory_mb ?? DEFAULT_MACHINE_MEMORY_MB,
       planningEnabled: Boolean(row.planning_enabled ?? DEFAULT_PLANNING_ENABLED),
@@ -284,9 +407,16 @@ export function getMappings(): Record<string, RepoMapping> {
       maxJobMinutes: row.max_job_minutes,
       branchPrefix: row.branch_prefix,
       skillsRepo: row.skills_repo,
+      referenceRepos: (() => { try { return row.reference_repos ? JSON.parse(row.reference_repos) as ReferenceRepo[] : null; } catch { return null; } })(),
       sensitiveAddPatterns: (() => { try { return row.sensitive_add_patterns ? JSON.parse(row.sensitive_add_patterns) as string[] : null; } catch { return null; } })(),
       sensitiveAllowPatterns: (() => { try { return row.sensitive_allow_patterns ? JSON.parse(row.sensitive_allow_patterns) as string[] : null; } catch { return null; } })(),
       dependencyTokenScope: row.dependency_token_scope as "installation" | null,
+      memoryProviderId: row.memory_provider_id ?? null,
+      reviewers: (() => { try { return row.reviewers ? JSON.parse(row.reviewers) as ReviewerSelection[] : null; } catch { return null; } })(),
+      prDispatchBudget: row.pr_dispatch_budget,
+      reviewFixLifecycle: row.review_fix_lifecycle as "legacy" | "restate" | null,
+      trustedReviewAuthors: (() => { try { return row.trusted_review_authors ? JSON.parse(row.trusted_review_authors) as string[] : null; } catch { return null; } })(),
+      reviewProcess: row.review_process as ReviewProcessId | null,
     };
   }
   return result;
@@ -295,7 +425,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpu_kind, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, review_fix_lifecycle, trusted_review_authors, review_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -306,6 +436,7 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.maxInProgressAiIssues,
       mapping.executionMode,
       mapping.sessionMode,
+      mapping.machineCpuKind,
       mapping.machineCpus,
       mapping.machineMemoryMb,
       mapping.planningEnabled ? 1 : 0,
@@ -323,9 +454,16 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.maxJobMinutes,
       mapping.branchPrefix,
       mapping.skillsRepo,
+      mapping.referenceRepos ? JSON.stringify(mapping.referenceRepos) : null,
       mapping.sensitiveAddPatterns ? JSON.stringify(mapping.sensitiveAddPatterns) : null,
       mapping.sensitiveAllowPatterns ? JSON.stringify(mapping.sensitiveAllowPatterns) : null,
       mapping.dependencyTokenScope,
+      mapping.memoryProviderId,
+      mapping.reviewers ? JSON.stringify(mapping.reviewers) : null,
+      mapping.prDispatchBudget ?? null,
+      mapping.reviewFixLifecycle,
+      mapping.trustedReviewAuthors ? JSON.stringify(mapping.trustedReviewAuthors) : null,
+      mapping.reviewProcess ?? null,
     );
 }
 

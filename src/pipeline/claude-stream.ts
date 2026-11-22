@@ -1,4 +1,4 @@
-import type { RunTelemetry } from "./types.js";
+import type { LLMTerminalStatus, RunTelemetry } from "./types.js";
 
 export interface StreamEvent {
   type?: string;
@@ -39,6 +39,129 @@ export function finalText(events: StreamEvent[]): string {
   return texts.join("\n");
 }
 
+export function finalStructuredOutput(events: StreamEvent[]): unknown {
+  return lastResult(events)?.structured_output;
+}
+
+const MAX_TOOL_USE_SCAN_DEPTH = 8;
+
+/** Built-in tools proven read-only; the only tool_use a retry may replay past. */
+const PROVEN_READ_ONLY_TOOLS: ReadonlySet<string> = new Set(["Read", "Glob", "Grep"]);
+
+/**
+ * Visits every `tool_use` block reachable from an `assistant` event's message,
+ * at any nesting depth, so malformed or unexpected CLI telemetry cannot hide one
+ * behind a non-array `content` or a wrapper object. A structure deeper than the
+ * scan limit is reported as an anonymous tool_use rather than trusted.
+ */
+function someToolUse(events: StreamEvent[], predicate: (block: Record<string, unknown>) => boolean): boolean {
+  const visit = (node: unknown, depth: number): boolean => {
+    if (node == null || typeof node !== "object") return false;
+    if (depth > MAX_TOOL_USE_SCAN_DEPTH) return predicate({ type: "tool_use" });
+    if (Array.isArray(node)) return node.some((child) => visit(child, depth + 1));
+    const obj = node as Record<string, unknown>;
+    if (obj.type === "tool_use" && predicate(obj)) return true;
+    return Object.values(obj).some((child) => visit(child, depth + 1));
+  };
+  return events.some((e) => e.type === "assistant" && visit(e.message, 0));
+}
+
+/**
+ * Whether any `assistant` event in this attempt carried a `tool_use` block.
+ * A re-spawn is a fresh session with no memory of the first attempt, so once
+ * a tool has run the agent may have already edited the workspace — retrying
+ * from scratch on a dirty tree could duplicate or undo that work. This is the
+ * gate that makes a request-level retry safe for implementation sessions.
+ */
+export function sawToolUse(events: StreamEvent[]): boolean {
+  return someToolUse(events, () => true);
+}
+
+/**
+ * Whether any `assistant` event in this attempt carried a `tool_use` block that
+ * is not a proven read-only built-in (Read, Glob, Grep). An allowlist: Edit,
+ * Write, Bash, MCP, unknown, nameless or nested tool use all count as unsafe,
+ * so a `toolUseIsSafe` (review) session only replays past known read-only use.
+ */
+export function sawUnsafeToolUse(events: StreamEvent[]): boolean {
+  return someToolUse(events, (b) => typeof b.name !== "string" || !PROVEN_READ_ONLY_TOOLS.has(b.name));
+}
+
+export interface DerivedToolStart {
+  readonly id?: string;
+  readonly action: string;
+  readonly detail?: unknown;
+}
+
+export interface DerivedToolResult {
+  readonly toolUseId?: string;
+  readonly action: string;
+  readonly output: string;
+  readonly isError: boolean;
+}
+
+/**
+ * Observable `tool_use` blocks in one `assistant` event, for runner-activity reporting
+ * (AII-798). An event with no `tool_use` block yields an empty array — never derived
+ * from a `text` block, which is what keeps absent tool activity absent rather than
+ * synthesized from the model's response text.
+ */
+export function extractToolStarts(event: StreamEvent): DerivedToolStart[] {
+  if (event.type !== "assistant") return [];
+  const msg = event.message as { content?: Array<Record<string, unknown>> } | undefined;
+  const out: DerivedToolStart[] = [];
+  for (const block of msg?.content ?? []) {
+    if (block.type !== "tool_use") continue;
+    out.push({
+      id: typeof block.id === "string" ? block.id : undefined,
+      action: typeof block.name === "string" ? block.name : "tool",
+      detail: block.input,
+    });
+  }
+  return out;
+}
+
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block) =>
+        block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string"
+          ? (block as { text: string }).text
+          : "",
+      )
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content == null) return "";
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return "[unserializable tool_result]";
+  }
+}
+
+/**
+ * Observable `tool_result` blocks in one `user` event, for runner-activity reporting
+ * (AII-798). Mirrors `formatEvent`'s own `hasToolResult` check so the initial prompt
+ * turn (plain text, no `tool_use_id`) is never misread as a tool result.
+ */
+export function extractToolResults(event: StreamEvent): DerivedToolResult[] {
+  if (event.type !== "user") return [];
+  const msg = event.message as { content?: Array<Record<string, unknown>> } | undefined;
+  const out: DerivedToolResult[] = [];
+  for (const block of msg?.content ?? []) {
+    if (block.type !== "tool_result" && typeof block.tool_use_id !== "string") continue;
+    out.push({
+      toolUseId: typeof block.tool_use_id === "string" ? block.tool_use_id : undefined,
+      action: "tool_result",
+      output: toolResultText(block.content),
+      isError: block.is_error === true,
+    });
+  }
+  return out;
+}
+
 function num(v: unknown): number | null {
   return typeof v === "number" ? v : null;
 }
@@ -50,8 +173,18 @@ function mapOutcome(subtype: unknown): RunTelemetry["outcome"] {
   return "unknown";
 }
 
+export function extractTerminalStatus(events: StreamEvent[]): LLMTerminalStatus | undefined {
+  const result = lastResult(events);
+  if (!result) return undefined;
+  return {
+    subtype: typeof result.subtype === "string" ? result.subtype : null,
+    isError: typeof result.is_error === "boolean" ? result.is_error : null,
+  };
+}
+
 export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
   const result = lastResult(events);
+  const executedCommands = extractExecutedCommands(events);
   if (!result) {
     return {
       outcome: "unknown",
@@ -63,6 +196,7 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
       cacheReadTokens: null,
       cacheCreationTokens: null,
       toolTrace: extractToolTrace(events),
+      ...(executedCommands.length > 0 ? { executedCommands } : {}),
     };
   }
   const usage = (result.usage ?? {}) as {
@@ -78,7 +212,7 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
   const cacheRead = num(usage.cache_read_input_tokens);
   const inParts = [uncachedIn, cacheCreation, cacheRead].filter((v): v is number => v != null);
   return {
-    outcome: mapOutcome(result.subtype),
+    outcome: result.subtype === "error_max_turns" ? "max_turns" : result.is_error === true ? "error" : mapOutcome(result.subtype),
     numTurns: num(result.num_turns),
     durationMs: num(result.duration_ms),
     costUsd: num(result.total_cost_usd),
@@ -87,7 +221,29 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
     cacheReadTokens: cacheRead,
     cacheCreationTokens: cacheCreation,
     toolTrace: extractToolTrace(events),
+    ...(executedCommands.length > 0 ? { executedCommands } : {}),
   };
+}
+
+export function extractExecutedCommands(events: StreamEvent[]): Array<{ command: string; failed: boolean }> {
+  const pending = new Map<string, string>();
+  const observed: Array<{ command: string; failed: boolean }> = [];
+  for (const event of events) {
+    for (const start of extractToolStarts(event)) {
+      if (!start.id || start.action !== "Bash") continue;
+      const input = start.detail;
+      if (input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string") {
+        pending.set(start.id, (input as { command: string }).command);
+      }
+    }
+    for (const result of extractToolResults(event)) {
+      const command = result.toolUseId ? pending.get(result.toolUseId) : undefined;
+      if (!command) continue;
+      observed.push({ command, failed: result.isError });
+      pending.delete(result.toolUseId!);
+    }
+  }
+  return observed;
 }
 
 const TOOL_INPUT_MAX = 160;

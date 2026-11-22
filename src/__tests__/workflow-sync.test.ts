@@ -1,51 +1,21 @@
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
-import type { RepoMapping } from "../config.js";
-import { syncWorkflowTemplates, classifySyncError } from "../workflow-sync.js";
+import { describe, expect, it } from "vitest";
+import { syncWorkflowTemplates, classifySyncError, isBareWorkflowFileName, workflowFileNamesCollide } from "../workflow-sync.js";
 import { GitHubApiError } from "../github-errors.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
-const mapping: RepoMapping = {
-  owner: "acme",
-  repo: "app",
-  workflowFile: "claude-implement.yml",
-  defaultBranch: "main",
-  maxInProgressAiIssues: 3,
-  executionMode: "github-actions",
-  sessionMode: "autonomous",
-  machineCpus: 2,
-  machineMemoryMb: 4096,
-  planningEnabled: true,
-  planningWorkflowFile: "claude-plan.yml",
-  autoApprovePlans: true,
-  extraEnv: {},
-  provider: "anthropic",
-  ticketingProvider: "linear",
-  ticketingConfig: { kind: "linear" },
-  awsRegion: null,
-  paused: false,
-  maxTurns: null,
-  maxIterations: null,
-  maxJobMinutes: null,
-  branchPrefix: null,
-};
-
-let tempRoot: string | null = null;
-
-afterEach(() => {
-  if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
-  tempRoot = null;
-});
+const mapping = makeMapping({ owner: "acme", repo: "app" });
 
 function makeTemplatesRoot(): string {
-  tempRoot = mkdtempSync(join(tmpdir(), "workflow-sync-"));
-  mkdirSync(join(tempRoot, "workflows"), { recursive: true });
-  writeFileSync(join(tempRoot, "workflows/claude-implement.yml"), "implement-yml\n");
-  writeFileSync(join(tempRoot, "workflows/claude-plan.yml"), "plan-yml\n");
-  writeFileSync(join(tempRoot, "workflows/WORKFLOW.md"), "workflow-md\n");
-  writeFileSync(join(tempRoot, "workflows/PLANNING.md"), "planning-md\n");
-  return tempRoot;
+  const root = testDir("workflow-sync");
+  mkdirSync(join(root, "workflows"), { recursive: true });
+  writeFileSync(join(root, "workflows/claude-implement.yml"), "implement-yml\n");
+  writeFileSync(join(root, "workflows/claude-plan.yml"), "plan-yml\n");
+  writeFileSync(join(root, "workflows/WORKFLOW.md"), "workflow-md\n");
+  writeFileSync(join(root, "workflows/PLANNING.md"), "planning-md\n");
+  return root;
 }
 
 interface FakePull {
@@ -555,6 +525,214 @@ describe("syncWorkflowTemplates", () => {
     expect(result.changedFiles).toEqual([".github/workflows/comment-trigger.yml"]);
   });
 
+  it("REMOVE_FILES: removes claude-kg-refresh.yml when present in target repo", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      ".github/workflows/claude-kg-refresh.yml": "old-kg-refresh\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.changedFiles).toContain(".github/workflows/claude-kg-refresh.yml");
+    expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-kg-refresh.yml"]).toBeUndefined();
+    expect(fake.calls.some((call) => call.method === "DELETE" && call.path.includes("claude-kg-refresh.yml"))).toBe(true);
+  });
+
+  it("REMOVE_FILES: no-ops when claude-kg-refresh.yml is absent from target repo", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.changedFiles).not.toContain(".github/workflows/claude-kg-refresh.yml");
+    expect(fake.calls.every((call) => !(call.method === "DELETE" && call.path.includes("claude-kg-refresh.yml")))).toBe(true);
+  });
+
+  describe("custom workflow file names (AII-739)", () => {
+    const customMapping = {
+      ...mapping,
+      workflowFile: "claude-implement-2.yml",
+      planningWorkflowFile: "claude-plan-2.yml",
+    };
+
+    it("syncs the mapping's custom-named files with the standard template content", async () => {
+      const templatesRoot = makeTemplatesRoot();
+      const fake = makeGithubFetch();
+
+      const result = await syncWorkflowTemplates({
+        mapping: customMapping,
+        githubAppId: "app-id",
+        githubAppPrivateKey: "private-key",
+        templatesRoot,
+        fetchImpl: fake.fetchImpl,
+        getInstallationTokenImpl: async () => "token",
+      });
+
+      expect(result.changedFiles).toContain(".github/workflows/claude-implement-2.yml");
+      expect(result.changedFiles).toContain(".github/workflows/claude-plan-2.yml");
+      expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-implement-2.yml"]).toBe("implement-yml\n");
+      expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-plan-2.yml"]).toBe("plan-yml\n");
+    });
+
+    it("leaves the default-named files byte-for-byte unchanged when custom names are configured", async () => {
+      const templatesRoot = makeTemplatesRoot();
+      const mainFiles = {
+        ".github/workflows/claude-implement.yml": "old-orchestrator implement\n",
+        ".github/workflows/claude-plan.yml": "old-orchestrator plan\n",
+      };
+      const fake = makeGithubFetch({ mainFiles });
+
+      const result = await syncWorkflowTemplates({
+        mapping: customMapping,
+        githubAppId: "app-id",
+        githubAppPrivateKey: "private-key",
+        templatesRoot,
+        fetchImpl: fake.fetchImpl,
+        getInstallationTokenImpl: async () => "token",
+      });
+
+      expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-implement.yml"]).toBe("old-orchestrator implement\n");
+      expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-plan.yml"]).toBe("old-orchestrator plan\n");
+      expect(result.changedFiles).not.toContain(".github/workflows/claude-implement.yml");
+      expect(result.changedFiles).not.toContain(".github/workflows/claude-plan.yml");
+      expect(fake.calls.some((call) =>
+        (call.method === "PUT" || call.method === "DELETE") &&
+        (call.path.includes("claude-implement.yml") && !call.path.includes("claude-implement-2.yml")),
+      )).toBe(false);
+      expect(fake.calls.some((call) =>
+        (call.method === "PUT" || call.method === "DELETE") &&
+        (call.path.includes("claude-plan.yml") && !call.path.includes("claude-plan-2.yml")),
+      )).toBe(false);
+    });
+
+    it("lists the custom-named paths in the PR body", async () => {
+      const templatesRoot = makeTemplatesRoot();
+      const fake = makeGithubFetch();
+
+      await syncWorkflowTemplates({
+        mapping: customMapping,
+        githubAppId: "app-id",
+        githubAppPrivateKey: "private-key",
+        templatesRoot,
+        fetchImpl: fake.fetchImpl,
+        getInstallationTokenImpl: async () => "token",
+      });
+
+      const createCall = fake.calls.find((call) => call.method === "POST" && call.path === "/repos/acme/app/pulls");
+      expect(createCall).toBeDefined();
+      const body = (createCall!.body as { body: string }).body;
+      expect(body).toContain(".github/workflows/claude-implement-2.yml");
+      expect(body).toContain(".github/workflows/claude-plan-2.yml");
+      expect(body).not.toContain(".github/workflows/claude-implement.yml\n");
+      expect(body).not.toContain(".github/workflows/claude-plan.yml\n");
+    });
+
+    it.each([
+      ["../x.yml"],
+      ["dir/x.yml"],
+      ["x.txt"],
+    ])("throws before any write when workflowFile is %s", async (badName) => {
+      const templatesRoot = makeTemplatesRoot();
+      const fake = makeGithubFetch();
+
+      await expect(syncWorkflowTemplates({
+        mapping: { ...mapping, workflowFile: badName },
+        githubAppId: "app-id",
+        githubAppPrivateKey: "private-key",
+        templatesRoot,
+        fetchImpl: fake.fetchImpl,
+        getInstallationTokenImpl: async () => "token",
+      })).rejects.toThrow(/bare|file name/i);
+
+      expect(fake.calls.some((call) => call.method === "PUT" && call.path.includes("/contents/"))).toBe(false);
+    });
+
+    it.each([
+      ["../x.yml"],
+      ["dir/x.yml"],
+      ["x.txt"],
+    ])("throws before any write when planningWorkflowFile is %s", async (badName) => {
+      const templatesRoot = makeTemplatesRoot();
+      const fake = makeGithubFetch();
+
+      await expect(syncWorkflowTemplates({
+        mapping: { ...mapping, planningWorkflowFile: badName },
+        githubAppId: "app-id",
+        githubAppPrivateKey: "private-key",
+        templatesRoot,
+        fetchImpl: fake.fetchImpl,
+        getInstallationTokenImpl: async () => "token",
+      })).rejects.toThrow(/bare|file name/i);
+
+      expect(fake.calls.some((call) => call.method === "PUT" && call.path.includes("/contents/"))).toBe(false);
+    });
+
+    it("throws before any write when workflowFile equals planningWorkflowFile", async () => {
+      const templatesRoot = makeTemplatesRoot();
+      const fake = makeGithubFetch();
+
+      await expect(syncWorkflowTemplates({
+        mapping: { ...mapping, workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-implement.yml" },
+        githubAppId: "app-id",
+        githubAppPrivateKey: "private-key",
+        templatesRoot,
+        fetchImpl: fake.fetchImpl,
+        getInstallationTokenImpl: async () => "token",
+      })).rejects.toThrow(/workflowFile and planningWorkflowFile/i);
+
+      expect(fake.calls.some((call) => call.method === "PUT" && call.path.includes("/contents/"))).toBe(false);
+    });
+  });
+});
+
+describe("isBareWorkflowFileName", () => {
+  it("accepts bare .yml and .yaml names", () => {
+    expect(isBareWorkflowFileName("claude-implement.yml")).toBe(true);
+    expect(isBareWorkflowFileName("claude-implement.yaml")).toBe(true);
+  });
+
+  it("rejects names with path separators, traversal, or the wrong extension", () => {
+    expect(isBareWorkflowFileName("../x.yml")).toBe(false);
+    expect(isBareWorkflowFileName("dir/x.yml")).toBe(false);
+    expect(isBareWorkflowFileName("dir\\x.yml")).toBe(false);
+    expect(isBareWorkflowFileName("x.txt")).toBe(false);
+    expect(isBareWorkflowFileName("..yml")).toBe(false);
+  });
+});
+
+describe("workflowFileNamesCollide", () => {
+  it("is true when the two names are equal", () => {
+    expect(workflowFileNamesCollide("claude-implement.yml", "claude-implement.yml")).toBe(true);
+  });
+
+  it("is false when the two names differ", () => {
+    expect(workflowFileNamesCollide("claude-implement.yml", "claude-plan.yml")).toBe(false);
+  });
 });
 
 describe("classifySyncError", () => {

@@ -1,14 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as ConfigModule from "../config.js";
 import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import type * as WorkflowSyncModule from "../workflow-sync.js";
 import type * as DeployHoldModule from "../deploy-hold.js";
-import type * as RunnerModeModule from "../runner-mode.js";
-import { DEFAULT_TICKETING_CONFIG } from "../providers/ticketing-config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
+import { testDb } from "./helpers/test-db.js";
 
 // runWorkflowSync (the executor) imports syncWorkflowTemplates from this module; mock it so the
 // executor tests below are deterministic and never reach GitHub. classifySyncError mirrors the real
@@ -21,7 +19,6 @@ vi.mock("../workflow-sync.js", () => ({
   }),
 }));
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let queue: typeof WorkflowSyncQueueModule;
@@ -32,70 +29,37 @@ const CREDS = { githubAppId: "test-app-id", githubAppPrivateKey: "test-key" };
 
 const RESULT: WorkflowSyncModule.WorkflowSyncResult = {
   status: "pr-opened",
-  targetRepo: "org/app",
+  targetRepo: "test-org/test-repo",
   baseBranch: "main",
   syncBranch: "sync/ai-implement",
   changedFiles: [".github/workflows/claude-implement.yml"],
   prNumber: 42,
-  prUrl: "https://github.com/org/app/pull/42",
+  prUrl: "https://github.com/test-org/test-repo/pull/42",
 };
 
 beforeEach(async () => {
-  vi.resetModules();
   vi.clearAllMocks(); // the factory's vi.fn() persists across tests; clear its call history each test
-  dbPath = path.join(
-    os.tmpdir(),
-    `workflow-sync-queue-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  config = await import("../config.js");
-  queue = await import("../workflow-sync-queue.js");
-  workflowSync = await import("../workflow-sync.js");
-  deployHold = await import("../deploy-hold.js");
-  dedup.getDb(); // creates workflow_sync_queue (its DDL lives in getDb)
-  config.initMappingsTable(); // executor tests seed a mapping
-  const runnerMode: typeof RunnerModeModule = await import("../runner-mode.js");
-  runnerMode.initSettingsTable(); // the deploy hold is a `settings` row; runner-mode owns that DDL
+  ({ dedup, config, queue, workflowSync, deployHold } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        config: () => import("../config.js"),
+        queue: () => import("../workflow-sync-queue.js"),
+        workflowSync: () => import("../workflow-sync.js"),
+        deployHold: () => import("../deploy-hold.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
   vi.restoreAllMocks();
 });
 
-// runWorkflowSync reads the mapping back via getMappings(); seed a complete, valid one so the row
-// isn't dropped on read (getMappings discards rows whose ticketing_config fails to parse).
+// runWorkflowSync reads the mapping back via getMappings(), which drops a row whose ticketing_config
+// fails to parse; the shared builder's mapping survives that round trip.
 function seedMapping(teamKey: string): void {
-  config.upsertMapping(teamKey, {
-    owner: "org",
-    repo: "app",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: DEFAULT_TICKETING_CONFIG,
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-  });
+  config.upsertMapping(teamKey, makeMapping());
 }
 
 describe("workflow sync queue — lifecycle & dedup", () => {
@@ -180,6 +144,39 @@ describe("workflow sync queue — lifecycle & dedup", () => {
   });
 });
 
+describe("a project's sync, as the setup checks read it", () => {
+  const setRow = (teamKey: string, status: string, updatedAt: number) =>
+    dedup.getDb().prepare("UPDATE workflow_sync_queue SET status = ?, updated_at = ? WHERE team_key = ?").run(status, updatedAt, teamKey);
+
+  it("reads a project's row by its key, or null when it was never queued", () => {
+    expect(queue.getWorkflowSyncByTeam("ENG")).toBeNull();
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    expect(queue.getWorkflowSyncByTeam("ENG")).toMatchObject({ id, teamKey: "ENG", status: "pending" });
+  });
+
+  it("is in progress while queued, or running inside the stale window, and not once stale or finished", () => {
+    const now = 1_000_000_000;
+    const at = (updatedAt: number, status: "pending" | "running" | "completed" | "failed") => queue.isWorkflowSyncInProgress({ status, updatedAt }, now);
+
+    expect(at(0, "pending")).toBe(true);
+    expect(at(now - queue.STALE_RUNNING_MS + 1, "running")).toBe(true);
+    expect(at(now - queue.STALE_RUNNING_MS, "running")).toBe(false);
+    expect(at(now, "completed")).toBe(false);
+    expect(at(now, "failed")).toBe(false);
+  });
+
+  it("agrees with enqueue's own rule for a live run", () => {
+    queue.enqueueWorkflowSync("ENG");
+    setRow("ENG", "running", Date.now() - queue.STALE_RUNNING_MS - 1);
+    expect(queue.isWorkflowSyncInProgress(queue.getWorkflowSyncByTeam("ENG")!)).toBe(false);
+    expect(queue.enqueueWorkflowSync("ENG").deduped).toBe(false);
+
+    setRow("ENG", "running", Date.now());
+    expect(queue.isWorkflowSyncInProgress(queue.getWorkflowSyncByTeam("ENG")!)).toBe(true);
+    expect(queue.enqueueWorkflowSync("ENG").deduped).toBe(true);
+  });
+});
+
 describe("runWorkflowSync executor", () => {
   it("marks the job completed with the sync result on success", async () => {
     seedMapping("ENG");
@@ -202,6 +199,37 @@ describe("runWorkflowSync executor", () => {
     const job = queue.getWorkflowSyncById(id);
     expect(job?.status).toBe("failed");
     expect(job?.error?.message).toBe("App not installed");
+  });
+
+  describe("a failed sync names the setup checks that explain it and asks for them to run again for the project", () => {
+    let send: Awaited<ReturnType<typeof recordRechecks>>;
+    let errorLine: () => string | undefined;
+    beforeEach(async () => {
+      send = await recordRechecks();
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorLine = () => error.mock.calls.map(([line]) => String(line)).find((line) => line.startsWith("[workflow-sync] sync failed for ENG"));
+    });
+
+    it("a GitHub App error, by its status and path", async () => {
+      // The same instance the queue's classification checks for, after testDb's reset.
+      const { GitHubApiError } = await import("../github-errors.js");
+      seedMapping("ENG");
+      const { id } = queue.enqueueWorkflowSync("ENG");
+      vi.mocked(workflowSync.syncWorkflowTemplates).mockRejectedValueOnce(new GitHubApiError({ status: 403, path: "/repos/acme/widgets/contents/.github/workflows/claude-implement.yml" }));
+      await queue.runWorkflowSync(id, CREDS);
+      expect(send.mock.calls).toEqual([[{ id: "github.permissions", project: "ENG", cause: "workflow-sync" }]]);
+      expect(errorLine()).toContain("github.permissions");
+      expect(queue.getWorkflowSyncById(id)?.status).toBe("failed");
+    });
+
+    it("an error no setup fault explains keeps its line and asks for nothing", async () => {
+      seedMapping("ENG");
+      const { id } = queue.enqueueWorkflowSync("ENG");
+      vi.mocked(workflowSync.syncWorkflowTemplates).mockRejectedValueOnce(new Error("socket hang up"));
+      await queue.runWorkflowSync(id, CREDS);
+      expect(send).not.toHaveBeenCalled();
+      expect(errorLine()).toBe("[workflow-sync] sync failed for ENG:");
+    });
   });
 
   it("fails the job without calling sync when the mapping was deleted before the run", async () => {

@@ -1,0 +1,470 @@
+import http from "node:http";
+import path from "node:path";
+import os from "node:os";
+import { createRequire } from "node:module";
+import { createPrivateKey, createPublicKey, generateKeyPairSync } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { stopChildWithBackstop } from "../process-stop.js";
+import { setRestateStatus } from "./status.js";
+
+const require = createRequire(import.meta.url);
+
+/**
+ * Admin API and ingress bind targets are fixed constants, not admin-UI settings — there
+ * is no operator knob for them (ADR 023). endpoint.ts imports RESTATE_ADMIN_BASE_URL to
+ * reach POST /deployments; tools-client.ts (AII-710) imports both RESTATE_ADMIN_BASE_URL
+ * and RESTATE_INGRESS_BASE_URL to discover and call tools through the same sidecar.
+ */
+export const RESTATE_ADMIN_BASE_URL = "http://127.0.0.1:9070";
+export const RESTATE_INGRESS_BIND_ADDRESS = "127.0.0.1:8081";
+export const RESTATE_INGRESS_BASE_URL = `http://${RESTATE_INGRESS_BIND_ADDRESS}`;
+
+/** Path on the orchestrator origin that forwards to the ingress for admins (src/restate/ui-proxy.ts). */
+export const RESTATE_UI_INGRESS_PREFIX = "/admin/restate/ingress";
+
+const RESTATE_ADMIN_BIND_ADDRESS = new URL(RESTATE_ADMIN_BASE_URL).host; // "127.0.0.1:9070"
+const RESTATE_HEALTH_URL = `${RESTATE_ADMIN_BASE_URL}/health`;
+
+// Restate's node/fabric port (`bind-address`) — defaults to 0.0.0.0:5122, the one listener not on loopback.
+export const RESTATE_BIND_ADDRESS = "127.0.0.1:5122";
+// Default 24 partitions cost ~766 MiB resident at idle vs. ~365 MiB for 4; fixed at first data-dir provisioning.
+export const RESTATE_DEFAULT_NUM_PARTITIONS = "4";
+// Default is 2 GiB; format is `^\d+(\.\d+)? ?[KMG]B$`.
+export const RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE = "256 MB";
+
+/**
+ * Data directory for the Restate sidecar's embedded store: RESTATE_DATA_DIR when set,
+ * else the dedup DB's directory plus /restate. Mirrors DEDUP_DB_PATH's own default
+ * (src/dedup.ts's resolveDbPath) from the configured value, without resolving the
+ * database path, which creates its directory and may fall back to /tmp.
+ */
+export function restateDataDir(
+  dedupDbPath: string = process.env.DEDUP_DB_PATH || "/data/dedup.sqlite",
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const override = env.RESTATE_DATA_DIR;
+  if (override) return override;
+  return path.join(path.dirname(dedupDbPath), "restate");
+}
+
+/**
+ * Every operator-set `RESTATE_*` key in the given environment, forwarded by prefix match so
+ * a future override (not one of the fixed constants below) still reaches the child. Callers
+ * apply this first, then overwrite with the fixed constants so those always win on collision.
+ */
+function restateEnvOverrides(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const overrides: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith("RESTATE_") && value !== undefined) overrides[key] = value;
+  }
+  return overrides;
+}
+
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58Encode(bytes: Buffer): string {
+  let n = BigInt(`0x${bytes.toString("hex") || "0"}`);
+  let out = "";
+  while (n > 0n) {
+    out = BASE58_ALPHABET[Number(n % 58n)] + out;
+    n /= 58n;
+  }
+  for (const b of bytes) {
+    if (b !== 0) break;
+    out = `1${out}`;
+  }
+  return out;
+}
+
+/** The compact `publickeyv1_<base58>` form the SDK takes as an identity key, derived from an ED25519 private-key PEM. */
+export function identityKeyFromPem(privatePem: string): string {
+  const jwk = createPublicKey(createPrivateKey(privatePem)).export({ format: "jwk" });
+  return `publickeyv1_${base58Encode(Buffer.from(jwk.x ?? "", "base64url"))}`;
+}
+
+/**
+ * Ensures an ED25519 request-identity key pair exists under `dataDir` (private PEM, mode
+ * 0600, written once and reused on later boots) and returns the private key's path with
+ * the public key in the SDK's compact format. A file that exists but cannot be read or
+ * parsed as an ED25519 private key is deleted and replaced with a new pair (one warning):
+ * the key has no consumer outside this process tree, both halves being read at boot.
+ */
+export function ensureRequestIdentityKey(dataDir: string): { privateKeyPath: string; publicKey: string } {
+  const privateKeyPath = path.join(dataDir, "request-identity-private.pem");
+  if (existsSync(privateKeyPath)) {
+    try {
+      return { privateKeyPath, publicKey: identityKeyFromPem(readFileSync(privateKeyPath, "utf8")) };
+    } catch (err) {
+      console.error(
+        `[restate] request identity key at ${privateKeyPath} is unreadable (${err instanceof Error ? err.message : String(err)}) — regenerated`,
+      );
+      rmSync(privateKeyPath, { force: true });
+    }
+  }
+  mkdirSync(dataDir, { recursive: true });
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" });
+  writeFileSync(privateKeyPath, pem, { mode: 0o600, flag: "wx" });
+  return { privateKeyPath, publicKey: identityKeyFromPem(pem.toString()) };
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/** For testing: override internal I/O without touching the real filesystem, process table, or network. */
+interface RestateSidecarDeps {
+  platform?: NodeJS.Platform;
+  hostname?: string;
+  httpGet?: (url: string) => Promise<boolean>;
+  spawn?: (cmd: string, args: string[], opts: object) => ChildProcess;
+  resolveBinary?: () => string | null;
+}
+
+export interface RestateSidecarOptions {
+  onUnexpectedExit?: (info: { code: number | null; signal: string | null }) => void;
+  /** Base directory for the embedded store (defaults to restateDataDir()). */
+  dataDir?: string;
+  /** How long to wait for the child to exit gracefully before SIGKILLing (ms). */
+  stopTimeoutMs?: number;
+  /** How long to poll for readiness before giving up (ms). */
+  pollTimeoutMs?: number;
+  /** Interval between readiness poll attempts (ms). */
+  pollIntervalMs?: number;
+}
+
+/**
+ * Owns the Restate hard dependency: spawn, readiness polling, and bounded stop.
+ * main() holds boot until readiness, registration, and the registered hook succeed;
+ * fatal boot failures exit 1. Unexpected child errors/exits notify main() once per
+ * child so a running orchestrator shuts down with exit 1 and Fly restarts the machine.
+ * stop()/restart() suppress that notification for intentional teardown.
+ *
+ * A readiness timeout keeps polling the same child via whenReady() while main()
+ * enforces its boot deadline. restart() is the only in-process re-spawn path;
+ * unattended exits recover through a fresh orchestrator boot.
+ */
+export class RestateSidecar {
+  private readonly _onUnexpectedExit: RestateSidecarOptions["onUnexpectedExit"];
+  private readonly _dataDir: string;
+  private readonly _platform: NodeJS.Platform;
+  private readonly _hostname: string;
+  private readonly _stopTimeoutMs: number;
+  private readonly _pollTimeoutMs: number;
+  private readonly _pollIntervalMs: number;
+  private readonly _httpGet: (url: string) => Promise<boolean>;
+  private readonly _spawn: (cmd: string, args: string[], opts: object) => ChildProcess;
+  private readonly _resolveBinary: () => string | null;
+  private _child: ChildProcess | null = null;
+  private _stopPromise: Promise<void> | null = null;
+  private _readyDeferred: Deferred<boolean> | null = null;
+  private _backgroundPollTimer: ReturnType<typeof setTimeout> | null = null;
+  private _identityKey: string | undefined;
+
+  constructor(opts?: RestateSidecarOptions, _deps?: RestateSidecarDeps) {
+    this._onUnexpectedExit = opts?.onUnexpectedExit;
+    this._dataDir = opts?.dataDir ?? restateDataDir();
+    this._platform = _deps?.platform ?? process.platform;
+    this._hostname = _deps?.hostname ?? os.hostname();
+    this._stopTimeoutMs = opts?.stopTimeoutMs ?? 5_000;
+    this._pollTimeoutMs = opts?.pollTimeoutMs ?? 30_000;
+    this._pollIntervalMs = opts?.pollIntervalMs ?? 1_000;
+    this._httpGet = _deps?.httpGet ?? defaultHttpGet;
+    this._spawn = _deps?.spawn ?? ((cmd, args, spawnOpts) => spawn(cmd, args, spawnOpts as Parameters<typeof spawn>[2]));
+    this._resolveBinary = _deps?.resolveBinary ?? resolvePlatformBinary;
+  }
+
+  /**
+   * Public half (`publickeyv1_…`) of the request-identity key the server signs with, for the
+   * SDK endpoint's `identityKeys`. Undefined until start() has generated or loaded it; a key
+   * that cannot be prepared keeps the sidecar down, so there is no unsigned sidecar.
+   */
+  get identityKey(): string | undefined {
+    return this._identityKey;
+  }
+
+  /**
+   * Resolves once the sidecar spawned by the most recent start() either becomes ready
+   * (immediately, or later via background polling after a readiness timeout) or exits.
+   * Resolves false if start() has never been called.
+   */
+  whenReady(): Promise<boolean> {
+    return this._readyDeferred ? this._readyDeferred.promise : Promise.resolve(false);
+  }
+
+  /**
+   * Spawns the sidecar and polls its admin API for up to pollTimeoutMs. Resolves to
+   * whether the sidecar is ready by that deadline. All failure modes (missing binary,
+   * early exit, readiness timeout) are reported to main() for boot gating. A readiness timeout
+   * does not stop the sidecar — polling continues in the background; see whenReady().
+   */
+  async start(): Promise<boolean> {
+    const deferred = createDeferred<boolean>();
+    this._readyDeferred = deferred;
+    setRestateStatus({ sidecar: { state: "starting" } });
+
+    const bin = this._resolveBinary();
+    if (!bin) {
+      console.error(
+        `[restate] no @restatedev/restate-server platform binary for ${os.platform()}-${os.arch()} — orchestrator will exit`,
+      );
+      setRestateStatus({ sidecar: { state: "missing-binary" } });
+      deferred.resolve(false);
+      return false;
+    }
+
+    // Config keys verified against the installed @restatedev/restate-server version with
+    // --dump-config (spike unknown, AII-627): the ingress and admin listeners are the
+    // `ingress.bind-address` / `admin.bind-address` TOML keys, set here through the
+    // server's config-rs double-underscore env convention (RESTATE_INGRESS__BIND_ADDRESS /
+    // RESTATE_ADMIN__BIND_ADDRESS); the embedded store's location is the top-level
+    // `base-dir` key, RESTATE_BASE_DIR.
+    //
+    // childEnv is an explicit allowlist (AII-728), never `...process.env`: the sidecar is a
+    // separate binary that has no business seeing the orchestrator's full environment (GitHub
+    // App keys, ticketing tokens, etc). PATH/HOME/TMPDIR/TZ are the process-hygiene basics a
+    // spawned binary needs; every RESTATE_* key already set as a fixed constant below is
+    // forwarded explicitly, and any operator-set RESTATE_* override in process.env (for
+    // example a future knob) is forwarded by prefix match, with the fixed constants winning
+    // on key collision.
+    const childEnv: NodeJS.ProcessEnv = { ...restateEnvOverrides(process.env) };
+    for (const key of ["PATH", "HOME", "TMPDIR", "TZ"] as const) {
+      const value = process.env[key];
+      if (value !== undefined) childEnv[key] = value;
+    }
+    // Request identity (AII-976): the server signs every call to the endpoint with this key;
+    // the endpoint verifies with the public half. The sidecar never runs unsigned: a key that
+    // cannot be prepared is a sidecar start failure, same degraded state as a dead child.
+    this._identityKey = undefined;
+    try {
+      const { privateKeyPath, publicKey } = ensureRequestIdentityKey(this._dataDir);
+      childEnv.RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE = privateKeyPath;
+      this._identityKey = publicKey;
+      console.error(`[restate] request identity key ${publicKey}`);
+    } catch (err) {
+      console.error(
+        `[restate] could not prepare the request identity key (${err instanceof Error ? err.message : String(err)}) — not starting the sidecar; restate-dependent routes answer 503`,
+      );
+      setRestateStatus({ sidecar: { state: "exited", code: null, signal: null } });
+      deferred.resolve(false);
+      return false;
+    }
+    Object.assign(childEnv, {
+      RESTATE_INGRESS__BIND_ADDRESS: RESTATE_INGRESS_BIND_ADDRESS,
+      RESTATE_ADMIN__BIND_ADDRESS: RESTATE_ADMIN_BIND_ADDRESS,
+      RESTATE_BASE_DIR: this._dataDir,
+      RESTATE_BIND_ADDRESS: RESTATE_BIND_ADDRESS,
+      RESTATE_DEFAULT_NUM_PARTITIONS: RESTATE_DEFAULT_NUM_PARTITIONS,
+      RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
+    });
+    // Unix socket limits count bytes, including the absolute base dir and node hostname.
+    const socketPathBytes = Buffer.byteLength(path.join(path.resolve(this._dataDir), this._hostname, "ingress.sock"), "utf8");
+    const tcpReason = this._platform === "darwin" ? "darwin"
+      : socketPathBytes > 100 ? `socket path ${socketPathBytes} bytes` : undefined;
+    if (tcpReason) {
+      childEnv.RESTATE_LISTEN_MODE = "tcp";
+      console.error(`[restate] listen mode tcp (${tcpReason})`);
+    }
+    // The address the UI playground calls (AII-1261, ADR 040). Unset leaves the loopback default for local dev.
+    const publicBase = process.env.OAUTH_REDIRECT_BASE_URL?.trim().replace(/\/+$/, "");
+    if (publicBase) childEnv.RESTATE_INGRESS__ADVERTISED_ADDRESS = `${publicBase}${RESTATE_UI_INGRESS_PREFIX}/`;
+
+    const child = this._spawn(bin, ["--no-logo"], {
+      stdio: ["ignore", "inherit", "inherit"],
+      env: childEnv,
+    });
+    this._child = child;
+
+    let childDead = false;
+    let exitLogged = false;
+    let exitReported = false;
+    const reportUnexpectedExit = (code: number | null, signal: string | null): void => {
+      if (exitReported) return;
+      exitReported = true;
+      if (this._stopPromise === null) this._onUnexpectedExit?.({ code, signal });
+    };
+    child.on("error", (err) => {
+      console.error(`[restate] sidecar process error: ${err.message}`);
+      childDead = true;
+      if (this._child === child) this._child = null;
+      setRestateStatus({ sidecar: { state: "exited", code: null, signal: null } });
+      deferred.resolve(false);
+      reportUnexpectedExit(null, null);
+    });
+    child.on("exit", (code, signal) => {
+      childDead = true;
+      if (exitLogged) return;
+      exitLogged = true;
+      console.error(`[restate] sidecar exited (code=${code ?? "null"}, signal=${signal ?? "null"})`);
+      setRestateStatus({ sidecar: { state: "exited", code, signal } });
+      deferred.resolve(false);
+      reportUnexpectedExit(code, signal);
+    });
+    child.on("close", () => {
+      childDead = true;
+      if (this._child === child) this._child = null;
+    });
+
+    const ready = await this._pollReadiness(child, () => childDead, deferred);
+
+    if (ready) {
+      setRestateStatus({ sidecar: { state: "ready" } });
+      deferred.resolve(true);
+    } else {
+      console.error("[restate] orchestrator will exit; restate-dependent routes answer 503");
+    }
+
+    return ready;
+  }
+
+  /**
+   * Stops the sidecar with a bounded wait.
+   * Re-entrant: concurrent calls return the same in-flight promise.
+   * A child that does not exit within stopTimeoutMs is SIGKILLed.
+   * Clears any background readiness polling and settles a pending whenReady() to false.
+   */
+  stop(): Promise<void> {
+    if (this._backgroundPollTimer !== null) {
+      clearTimeout(this._backgroundPollTimer);
+      this._backgroundPollTimer = null;
+    }
+    this._readyDeferred?.resolve(false);
+
+    if (this._stopPromise !== null) return this._stopPromise;
+    if (this._child === null) return Promise.resolve();
+    // Install the latch before kill() can synchronously emit child events.
+    this._stopPromise = Promise.resolve().then(() => this._doStop()).finally(() => {
+      this._stopPromise = null;
+    });
+    return this._stopPromise;
+  }
+
+  /**
+   * Stops then starts the sidecar — the only re-spawn path. Mirrors KgSidecar.restart()
+   * (src/kg-sidecar.ts); there is no automatic restart when the child exits unexpectedly.
+   */
+  async restart(): Promise<boolean> {
+    await this.stop();
+    return this.start();
+  }
+
+  private async _pollReadiness(
+    child: ChildProcess,
+    isDead: () => boolean,
+    deferred: Deferred<boolean>,
+  ): Promise<boolean> {
+    const deadline = Date.now() + this._pollTimeoutMs;
+
+    console.error(`[restate] sidecar starting (pid ${child.pid ?? "?"}) — polling ${RESTATE_HEALTH_URL}`);
+
+    while (Date.now() < deadline) {
+      if (isDead()) {
+        console.error("[restate] sidecar exited during startup — orchestrator boot will fail");
+        return false;
+      }
+
+      const ready = await this._httpGet(RESTATE_HEALTH_URL);
+      if (ready && !isDead()) {
+        console.error(`[restate] sidecar ready (pid ${child.pid ?? "?"})`);
+        return true;
+      }
+
+      if (isDead()) {
+        console.error("[restate] sidecar exited during startup — orchestrator boot will fail");
+        return false;
+      }
+
+      await sleep(this._pollIntervalMs);
+    }
+
+    console.error(
+      `[restate] sidecar readiness timeout after ${this._pollTimeoutMs / 1_000} s — boot remains gated`,
+    );
+
+    // The child may have died in the instant between the loop's last check and the
+    // deadline; if so its own "exit" handler already logged and settled whenReady().
+    if (!isDead()) {
+      setRestateStatus({ sidecar: { state: "timeout" } });
+      this._pollInBackground(child, isDead, deferred);
+    }
+
+    return false;
+  }
+
+  /**
+   * Continues polling the same child after a readiness timeout, resolving `deferred`
+   * true the first time it answers healthy. Self-terminates — without touching
+   * `deferred` — once `child` is no longer the current child (stop()/restart() swapped
+   * it out) or it has exited (its own "exit" handler already settled `deferred`).
+   */
+  private _pollInBackground(child: ChildProcess, isDead: () => boolean, deferred: Deferred<boolean>): void {
+    const attempt = async (): Promise<void> => {
+      this._backgroundPollTimer = null;
+
+      if (this._child !== child || isDead()) return;
+
+      const ready = await this._httpGet(RESTATE_HEALTH_URL);
+
+      if (this._child !== child || isDead()) return;
+
+      if (ready && !isDead()) {
+        console.error(`[restate] sidecar ready after degraded period (pid ${child.pid ?? "?"})`);
+        setRestateStatus({ sidecar: { state: "ready" } });
+        deferred.resolve(true);
+        return;
+      }
+
+      this._backgroundPollTimer = setTimeout(() => {
+        void attempt();
+      }, this._pollIntervalMs);
+    };
+
+    void attempt();
+  }
+
+  private async _doStop(): Promise<void> {
+    const child = this._child;
+    if (!child) return;
+    this._child = null;
+    await stopChildWithBackstop(child, this._stopTimeoutMs);
+  }
+}
+
+/** Resolves the platform-specific @restatedev/restate-server-<os>-<arch> optional dependency's binary, if installed. */
+export function resolvePlatformBinary(): string | null {
+  const platformPackage = `@restatedev/restate-server-${os.platform()}-${os.arch()}`;
+  try {
+    return require.resolve(`${platformPackage}/bin/restate-server`);
+  } catch {
+    return null;
+  }
+}
+
+function defaultHttpGet(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = http.get(url, { timeout: 2_000 }, (res) => {
+      res.resume(); // consume body to avoid memory leaks
+      resolve((res.statusCode ?? 500) < 400);
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

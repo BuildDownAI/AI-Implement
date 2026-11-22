@@ -1,59 +1,33 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import {
+  assertPrivateTransportForCredentials,
   buildEnvelopeDispatchInputs,
+  buildPrivateKgRefreshGhaDispatchBody,
   providerDispatchFields,
   capDispatchFields,
   branchPrefixDispatchFields,
   skillsRepoDispatchFields,
   profilesDispatchFields,
+  postWorkflowDispatch,
+  buildKgRefreshGhaDispatchBody,
+  ENVELOPE_OPTIONAL_INPUTS,
 } from "../github.js";
-import { decodeRunConfig } from "../run-config.js";
-import { surfaceDispatchFailure } from "../dispatch-failure.js";
+import { decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { dispatchFailureConclusion, surfaceDispatchFailure } from "../dispatch-failure.js";
 import { notify } from "../notify.js";
-import type { RepoMapping } from "../config.js";
 import { closeDb } from "../dedup.js";
 import { initLogTable, appendLog, listLog, getJobById } from "../log.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
+import { githubError } from "./helpers/replies/github.js";
 
 // Mock notify so surfaceDispatchFailure doesn't make real HTTP calls.
 vi.mock("../notify.js", () => ({
   notify: vi.fn().mockResolvedValue(undefined),
 }));
-
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "test-org",
-    repo: "test-repo",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    autoMerge: false,
-    dependencyTokenScope: null,
-    ...overrides,
-  };
-}
 
 const baseIssue = {
   id: "issue-uuid-1",
@@ -68,6 +42,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("contains run_config + run_token + run_progress_token and no legacy fields", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "tok-abc",
       runProgressToken: "prog-xyz",
@@ -79,9 +54,12 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     expect(inputs.run_progress_token).toBe("prog-xyz");
     expect("run_publication_token" in inputs).toBe(false);
 
+    // issue_identifier is a display-only duplicate of run_config.issue.identifier,
+    // present on every envelope dispatch for run-name: to read (AII-656).
+    expect(inputs.issue_identifier).toBe(baseIssue.identifier);
+
     // Legacy per-field keys must be absent
     expect("issue_id" in inputs).toBe(false);
-    expect("issue_identifier" in inputs).toBe(false);
     expect("issue_title" in inputs).toBe(false);
     expect("issue_description" in inputs).toBe(false);
     expect("base_branch" in inputs).toBe(false);
@@ -98,8 +76,21 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     expect("aws_region" in inputs).toBe(false);
   });
 
+  it("carries issue_identifier for a gap-analysis dispatch", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "gap-analysis",
+      prNumber: "42",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    expect(inputs.issue_identifier).toBe(baseIssue.identifier);
+  });
+
   it("includes a dedicated publication token only when explicitly provided", () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "result-token",
       runProgressToken: "progress-token",
@@ -112,6 +103,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("decodes run_config back to original issue fields and runnerPhase", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "tok-abc",
       runProgressToken: "prog-xyz",
@@ -136,6 +128,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
       skillsRepo: "org/skills",
     });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -161,6 +154,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("puts baseBranch inside run_config (not as base_branch top-level input)", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       baseBranch: "ai-implement/feature/eng-42",
       runToken: "",
@@ -175,6 +169,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("includes provider + aws_region for bedrock mappings", () => {
     const mapping = makeMapping({ provider: "bedrock", awsRegion: "us-east-1" });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -187,6 +182,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("includes runner_image when provided", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -199,6 +195,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("omits runner_image when not provided", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -210,6 +207,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("includes prNumber inside run_config when provided", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "gap-analysis",
       prNumber: "42",
       runToken: "",
@@ -219,6 +217,35 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     const decoded = decodeRunConfig(inputs.run_config!);
     expect(decoded.prNumber).toBe("42");
     expect("pr_number" in inputs).toBe(false);
+  });
+
+  it("carries mapping reviewers inside run_config when set", () => {
+    const reviewers = [
+      { id: "gap-analysis", gates: true },
+      { id: "code-review", gates: false },
+    ];
+    const mapping = makeMapping({ reviewers });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    expect(decodeRunConfig(inputs.run_config!).reviewers).toEqual(reviewers);
+  });
+
+  it("carries reviewProcess and trustedReviewAuthors inside run_config when set", () => {
+    const mapping = makeMapping({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["review-bot"] });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.reviewProcess).toBe("claude-code-review");
+    expect(decoded.trustedReviewAuthors).toEqual(["review-bot"]);
   });
 });
 
@@ -271,6 +298,36 @@ describe("legacy dispatch shape regression pin (case b)", () => {
     expect("profiles" in legacyInputs).toBe(false);
   });
 
+  it("never forwards assignee on the legacy contract, even for an assigned issue", () => {
+    // Regression pin: `assignee` has never existed as a workflow_dispatch input in any
+    // synced version of claude-implement.yml (unlike `profiles`, which predates the
+    // envelope) — see docs/workflow-envelope.md. Forwarding it on the legacy contract
+    // would 422 every dispatch for an assigned ticket, the common case. Mirrors the
+    // inline assembly in dispatchGitHubActions for legacy mode.
+    const mapping = makeMapping();
+    const issue = { ...baseIssue, profiles: [] as string[], assigneeName: "Paz" };
+    const baseBranch = "main"; // same as defaultBranch
+
+    const legacyInputs = {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      issue_title: issue.title,
+      issue_description: issue.description || issue.title,
+      runner_phase: "implementation" as const,
+      ...providerDispatchFields(mapping),
+      ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
+      ...capDispatchFields(mapping),
+      ...branchPrefixDispatchFields(mapping),
+      ...skillsRepoDispatchFields(mapping),
+      ...profilesDispatchFields(issue),
+      runner_callback_url: "",
+      run_token: "",
+      run_progress_token: "",
+    };
+
+    expect("assignee" in legacyInputs).toBe(false);
+  });
+
   it("conditionally includes base_branch only when it differs from defaultBranch", () => {
     const mapping = makeMapping();
     const featureBranch = "ai-implement/feature/AII-5";
@@ -307,6 +364,7 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
   it("sets runnerPhase to planning inside run_config", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-tok",
     });
@@ -318,6 +376,7 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
   it("does not include run_progress_token (planning has no progress token)", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-tok",
       // runProgressToken deliberately omitted
@@ -328,6 +387,7 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
 
   it("never includes a publication token for planning", () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-token",
       runPublicationToken: "must-not-leak",
@@ -339,11 +399,23 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
   it("still includes run_token for callback auth", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-tok",
     });
 
     expect(inputs.run_token).toBe("plan-tok");
+  });
+
+  it("carries issue_identifier for a planning dispatch", () => {
+    const mapping = makeMapping();
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "planning",
+      runToken: "plan-tok",
+    });
+
+    expect(inputs.issue_identifier).toBe(baseIssue.identifier);
   });
 });
 
@@ -353,6 +425,7 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   it("stamps dependencyTokenScope in run_config when mapping enables it", () => {
     const mapping = makeMapping({ dependencyTokenScope: "installation" });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -365,6 +438,7 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   it("omits dependencyTokenScope from run_config when mapping has null", () => {
     const mapping = makeMapping({ dependencyTokenScope: null });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -378,6 +452,7 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   it("does not stamp dependencyTokenScope for planning dispatch", () => {
     const mapping = makeMapping({ dependencyTokenScope: "installation" });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-tok",
     });
@@ -390,6 +465,7 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   it("stamps dependencyTokenScope for gap-analysis dispatch", () => {
     const mapping = makeMapping({ dependencyTokenScope: "installation" });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "gap-analysis",
       prNumber: "99",
       runToken: "",
@@ -401,31 +477,115 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   });
 });
 
+// ---------- Case (c3): retryPolicy dispatch stamping (BAC-27113) ----------
+
+describe("buildEnvelopeDispatchInputs — retryPolicy stamping", () => {
+  it("stamps retryPolicy in run_config when the caller passes it (GHA path)", () => {
+    const mapping = makeMapping();
+    const retryPolicy = {
+      requestRetries: 2,
+      stageRetries: 1,
+      pushRetries: 2,
+      backoffInitialMs: 30_000,
+      backoffMaxMs: 300_000,
+      backoffJitter: 0.2,
+      reviewMaxTurns: 30,
+    };
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+      retryPolicy,
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toEqual(retryPolicy);
+  });
+
+  it("falls back to DEFAULT_RETRY_POLICY when the caller passes null (implementation/gap-analysis always carry it)", () => {
+    const mapping = makeMapping();
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("stamps DEFAULT_RETRY_POLICY for gap-analysis when the caller passes null", () => {
+    const mapping = makeMapping();
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "gap-analysis",
+      prNumber: "99",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("stamps a custom retryPolicy for the review-fix re-dispatch shape (gap-analysis + prNumber, BAC-27135)", () => {
+    const mapping = makeMapping();
+    const retryPolicy = { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 77 };
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "gap-analysis",
+      prNumber: "42",
+      runToken: "",
+      runProgressToken: "",
+      retryPolicy,
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toEqual(retryPolicy);
+  });
+
+  it("never stamps retryPolicy for planning (no retry loop)", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "planning",
+      runToken: "plan-tok",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toBeUndefined();
+    expect("retryPolicy" in decoded).toBe(false);
+  });
+
+  it("never stamps retryPolicy for kg-refresh, even when a policy is passed (no retry loop)", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 77 },
+      runnerPhase: "kg-refresh",
+      runToken: "kg-tok",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toBeUndefined();
+    expect("retryPolicy" in decoded).toBe(false);
+  });
+});
+
 // ---------- Case (d): 422 surfacing ----------
 // Uses a real SQLite DB (dedup singleton) and a mocked notify so we can
 // assert on calls without making real HTTP requests.
 //
-// DB_PATH in dedup.ts is a module-level constant computed at import time, so
-// env-var changes per-test have no effect. All tests in this file write to the
-// same DB. We use a run-level random ID so issueIds are unique per execution
-// and filter-based assertions never see entries from previous runs.
+// Vitest sets an in-memory database before imports. Closing it between cases
+// provides a fresh database; changing DEDUP_DB_PATH after import would not.
 
 const SURF_RUN = Math.random().toString(36).slice(2, 10);
-
-let dbPath: string;
-
-function freshDb(label: string): string {
-  return path.join(
-    os.tmpdir(),
-    `gh-dispatch-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-}
 
 describe("surfaceDispatchFailure — 422 surfacing (case d)", () => {
   beforeEach(() => {
     vi.mocked(notify).mockClear();
+    closeDb();
     initLogTable();
   });
+
+  afterEach(() => closeDb());
 
   it("writes a dispatch-failed log entry with contract when dispatch returns 422", async () => {
     const issueId = `${SURF_RUN}-d1`;
@@ -546,19 +706,58 @@ describe("surfaceDispatchFailure — 422 surfacing (case d)", () => {
   });
 });
 
+describe("surfaceDispatchFailure — the setup checks behind a refused dispatch (AII-1546)", () => {
+  let send: Awaited<ReturnType<typeof recordRechecks>>;
+  const sent = () => send.mock.calls.map(([request]) => request);
+  beforeEach(async () => {
+    closeDb();
+    initLogTable();
+    send = await recordRechecks();
+  });
+  afterEach(() => {
+    closeDb();
+  });
+
+  const surface = (status: number) => surfaceDispatchFailure({ status, error: "refused" }, "slack", null, {
+    site: "poll", issueId: `${SURF_RUN}-s${status}`, issueIdentifier: "ENG-1", teamKey: "ENG",
+    repo: "acme/widgets", workflowFile: "claude-implement.yml", contract: "envelope",
+  });
+
+  it.each([
+    [404, ["github.installation", "github.workflow-default-branch", "github.workflow-mapping-branch"], "dispatch-404"],
+    [403, ["github.permissions"], "dispatch-refused"],
+  ] as const)("names the checks behind a %i in its log line and rechecks each for the project", async (status, checks, cause) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await surface(status);
+    expect(sent()).toEqual(checks.map((id) => ({ id, project: "ENG", cause })));
+    const line = String(error.mock.calls.at(-1)![0]);
+    for (const id of checks) expect(line).toContain(id);
+    expect(line).toContain("/admin#setup");
+  });
+
+  it.each([422, 500, 0])("names no check and rechecks nothing for a %i", async (status) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await surface(status);
+    expect(sent()).toEqual([]);
+    expect(error.mock.calls.at(-1)![0]).not.toContain("/admin#setup");
+  });
+
+  it("records a 404 as the setup problem it is, and keeps every other status's conclusion", () => {
+    expect(dispatchFailureConclusion(404)).toBe("workflow_dispatch_not_found");
+    for (const status of [403, 422, 500, 0]) expect(dispatchFailureConclusion(status)).toBe("workflow_dispatch_failed");
+  });
+});
+
 // ---------- appendLog: contract + status persistence ----------
 
 describe("appendLog with status and contract fields", () => {
   beforeEach(() => {
-    closeDb(); // ensure previous connection closed before switching DB path
-    dbPath = freshDb("log");
-    process.env.DEDUP_DB_PATH = dbPath;
+    closeDb();
     initLogTable();
   });
 
   afterEach(() => {
     closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
   it("stores status='dispatch-failed' and contract='legacy' when explicitly set", () => {
@@ -592,5 +791,579 @@ describe("appendLog with status and contract fields", () => {
     expect(() => initLogTable()).not.toThrow();
     const id = appendLog({ issueId: "i5", contract: "envelope" });
     expect(getJobById(id)?.contract).toBe("envelope");
+  });
+});
+
+// ---------- Case (e): postWorkflowDispatch — 422 strip-and-retry (AII-654) ----------
+// Pattern anchor: Cloudshare fork commits 31f3979 and dfb461d (dispatchWorkflow 422 retry
+// for issue_identifier); the existing base_branch 422 attribution in src/index.ts:985-996.
+
+describe("postWorkflowDispatch — 422 strip-and-retry", () => {
+  /** The dispatch endpoint of acme/`repo`, answering each request with the next reply in order;
+   *  a request past the last reply fails the test. */
+  function dispatches(repo: string, ...replies: Reply[]): FakeFetch {
+    return fakeFetch({ [`POST /repos/acme/${repo}/actions/workflows/claude-implement.yml/dispatches` as const]: replies }).install();
+  }
+
+  it("exposes exactly runner_phase, runner_callback_url, and issue_identifier as the optional-input list", () => {
+    expect(ENVELOPE_OPTIONAL_INPUTS).toEqual(["runner_phase", "runner_callback_url", "issue_identifier"]);
+  });
+
+  it.each([
+    ["agentConfig", { agentConfig: { v: 1 } }],
+    ["credentials.modelAuthGrant", { credentials: { version: 1, modelAuthGrant: {} } }],
+  ])("does not downgrade a managed run (%s) on a rejected input", async (_name, extra) => {
+    const github = dispatches("r", githubError(422, 'Unexpected inputs provided: ["runner_phase"]'));
+    const runConfig = Buffer.from(JSON.stringify({ v: 1, ...extra }), "utf-8").toString("base64");
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: runConfig, run_token: "", runner_phase: "implementation" },
+    });
+
+    expect(github.calls).toHaveLength(1);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(422);
+  });
+
+  it("strips a single optional input named in the 422 body and retries once", async () => {
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' }, { status: 204 });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+    });
+
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect(secondBody.inputs.run_config).toBe("cfg");
+    expect(result).toEqual({ success: true, status: 204 });
+  });
+
+  it("strips issue_identifier alone when the 422 names it on the envelope contract", async () => {
+    const github = dispatches("impl-repo", { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' }, { status: 204 });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "impl-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
+    });
+
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
+    expect("issue_identifier" in secondBody.inputs).toBe(false);
+    expect(secondBody.inputs.run_config).toBe("cfg");
+    expect(result).toEqual({ success: true, status: 204 });
+  });
+
+  it("does not retry on the legacy contract (no run_config) when the 422 names issue_identifier", async () => {
+    // issue_identifier is authoritative issue data on the legacy contract, not a
+    // compatibility duplicate, so stripping it there must not happen.
+    const github = dispatches("legacy-repo", { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "legacy-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        issue_id: "1",
+        issue_identifier: "AII-1",
+        issue_title: "t",
+        issue_description: "d",
+        runner_phase: "implementation",
+      },
+    });
+
+    expect(github.calls).toHaveLength(1);
+    expect(result.success).toBe(false);
+  });
+
+  it("strips both runner_phase and runner_callback_url when the 422 names both", async () => {
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]' },
+      { status: 204 },
+    );
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        run_config: "cfg",
+        run_token: "rt",
+        runner_phase: "implementation",
+        runner_callback_url: "https://orch.example",
+      },
+    });
+
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(false);
+    expect(result.success).toBe(true);
+  });
+
+  it("does not retry when the 422 names an input outside ENVELOPE_OPTIONAL_INPUTS", async () => {
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["base_branch"]' });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", base_branch: "main" },
+    });
+
+    expect(github.calls).toHaveLength(1);
+    expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["base_branch"]' });
+  });
+
+  it("does not retry on the legacy contract (no run_config), even when the 422 names runner_phase", async () => {
+    // Mirrors src/index.ts:985-996's guard: runner_phase is authoritative issue data on the
+    // legacy contract, not a compatibility duplicate, so stripping it there must not happen.
+    const github = dispatches("legacy-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "legacy-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        issue_id: "1",
+        issue_identifier: "AII-1",
+        issue_title: "t",
+        issue_description: "d",
+        runner_phase: "implementation",
+      },
+    });
+
+    expect(github.calls).toHaveLength(1);
+    expect(result.success).toBe(false);
+  });
+
+  it("a retry that 422s again returns failure with exactly 2 fetches (no loop)", async () => {
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+    );
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+    });
+
+    expect(github.calls).toHaveLength(2);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(422);
+  });
+
+  it("a second 422 naming a *different* optional input still returns failure with exactly 2 fetches (no third request)", async () => {
+    // Reproduces the bug the "repeats the already-removed name" test above cannot catch:
+    // the first 422 names runner_phase, the retry's own 422 names the *other* optional input,
+    // runner_callback_url (still present in the stripped payload). The retry must be returned
+    // as failure unconditionally rather than triggering a third request.
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+      { status: 422, text: 'Unexpected inputs provided: ["runner_callback_url"]' },
+    );
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        run_config: "cfg",
+        run_token: "rt",
+        runner_phase: "implementation",
+        runner_callback_url: "https://orch.example",
+      },
+    });
+
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(true);
+    expect(result).toEqual({
+      success: false,
+      status: 422,
+      error: 'Unexpected inputs provided: ["runner_callback_url"]',
+    });
+  });
+
+  it("does not strip on a prefix collision (rejected name is a superstring of an optional input)", async () => {
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase_extra"]' });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+    });
+
+    expect(github.calls).toHaveLength(1);
+    expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["runner_phase_extra"]' });
+  });
+
+  it("does not strip on a suffix collision (rejected name is a superstring of an optional input)", async () => {
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["extra_runner_callback_url"]' });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        run_config: "cfg",
+        run_token: "rt",
+        runner_callback_url: "https://orch.example",
+      },
+    });
+
+    expect(github.calls).toHaveLength(1);
+    expect(result).toEqual({
+      success: false,
+      status: 422,
+      error: 'Unexpected inputs provided: ["extra_runner_callback_url"]',
+    });
+  });
+
+  it("still matches a fully-qualified input name inside a rejection naming several other inputs", async () => {
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["base_branch", "runner_phase", "issue_identifier"]' },
+      { status: 204 },
+    );
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+    });
+
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect(result.success).toBe(true);
+  });
+
+  it("parses GitHub's actual JSON error response (escaped quotes in the message field)", async () => {
+    const ghJsonBody = JSON.stringify({
+      message: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]',
+      documentation_url: "https://docs.github.com/rest/actions/workflows#create-a-workflow-dispatch-event",
+    });
+    const github = dispatches("kg-repo", { status: 422, text: ghJsonBody }, { status: 204 });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        run_config: "cfg",
+        run_token: "rt",
+        runner_phase: "implementation",
+        runner_callback_url: "https://orch.example",
+      },
+    });
+
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(false);
+    expect(result).toEqual({ success: true, status: 204 });
+  });
+
+  it("matches the unexpected-inputs marker case-insensitively", async () => {
+    const github = dispatches("kg-repo", { status: 422, text: 'UNEXPECTED INPUTS PROVIDED: ["runner_phase"]' }, { status: 204 });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+    });
+
+    expect(github.calls).toHaveLength(2);
+    expect(result.success).toBe(true);
+  });
+
+  it("does not retry when run_config is an empty string (legacy-shaped envelope guard)", async () => {
+    // run_config: "" must not satisfy the envelope guard — an empty string is falsy data,
+    // not evidence the caller is on the envelope contract, and runner_phase must stay
+    // authoritative for whatever contract actually sent an empty run_config.
+    const github = dispatches("legacy-ish-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "legacy-ish-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "", run_token: "rt", runner_phase: "implementation" },
+    });
+
+    expect(github.calls).toHaveLength(1);
+    expect(result.success).toBe(false);
+  });
+
+  it("does not retry on a non-422 failure", async () => {
+    const github = dispatches("kg-repo", { status: 500, text: "Internal Server Error" });
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+    });
+
+    expect(github.calls).toHaveLength(1);
+    expect(result).toEqual({ success: false, status: 500, error: "Internal Server Error" });
+  });
+
+  it("the kg-refresh dispatch path (buildKgRefreshGhaDispatchBody + postWorkflowDispatch) retries on 422", async () => {
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' },
+      { status: 204 },
+    );
+
+    const inputs = buildKgRefreshGhaDispatchBody({
+      runConfig: "b64cfg",
+      runToken: "run-tok",
+      runProgressToken: "prog-tok",
+      runnerImage: undefined,
+      jobTimeoutMinutes: "240",
+      issueIdentifier: "AII-656",
+    });
+
+    expect(inputs.issue_identifier).toBe("AII-656");
+
+    const result = await postWorkflowDispatch({
+      token: "gh-tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs,
+    });
+
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(false);
+    expect(secondBody.inputs.run_config).toBe("b64cfg");
+    expect(secondBody.inputs.job_timeout_minutes).toBe("240");
+    expect(secondBody.inputs).not.toHaveProperty("issue_identifier");
+    expect(result).toEqual({ success: true, status: 204 });
+  });
+});
+
+describe("buildEnvelopeDispatchInputs — private transport (AII-983)", () => {
+  const impl = { runnerPhase: "implementation" as const, runToken: "rt", runProgressToken: "rp", runPublicationToken: "rpub", retryPolicy: null };
+
+  it("legacy (no capability): generic envelope, masked top-level tokens, no credentials", () => {
+    for (const privateTransport of [undefined, false]) {
+      const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, privateTransport });
+      expect(Buffer.from(inputs.run_config!, "base64").toString()).not.toContain("credentials");
+      expect(inputs).toMatchObject({ run_token: "rt", run_progress_token: "rp", run_publication_token: "rpub" });
+    }
+  });
+
+  it("private: exact audiences in credentials, no top-level bearer duplicates", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, privateTransport: true });
+    const creds = decodeTrustedRunConfig(inputs.run_config!).credentials;
+    expect(creds).toEqual({ version: 1, resultToken: "rt", progressToken: "rp", publicationToken: "rpub" });
+    expect(creds?.attemptToken).toBeUndefined();
+    expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(inputs.run_token).toBe("");
+    expect("run_progress_token" in inputs).toBe(false);
+    expect("run_publication_token" in inputs).toBe(false);
+    expect(JSON.stringify(inputs).match(/"rt"|"rp"|"rpub"/g)).toBeNull();
+  });
+
+  it.each(["planning", "kg-refresh"] as const)("%s never carries publication authority on either path", (runnerPhase) => {
+    const o = { runnerPhase, runToken: "rt", runPublicationToken: "rpub", retryPolicy: null };
+    const priv = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...o, privateTransport: true });
+    expect(decodeTrustedRunConfig(priv.run_config!).credentials).toEqual({ version: 1, resultToken: "rt" });
+    expect("run_publication_token" in priv).toBe(false);
+    const legacy = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, o);
+    expect("run_publication_token" in legacy).toBe(false);
+  });
+
+  it("explicit private credentials without capability throw instead of being dropped", () => {
+    expect(() => buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      ...impl, credentials: { version: 1, resultToken: "x" },
+    })).toThrow(/supportsPrivateRunConfig/);
+  });
+
+  it("explicit credentials merge over derived bearers on the private path", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      ...impl, privateTransport: true, credentials: { version: 1, attemptToken: "at" },
+    });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toMatchObject({ resultToken: "rt", attemptToken: "at" });
+  });
+
+  it.each(["planning", "kg-refresh"] as const)("%s drops a supplied publicationToken and supplied bearers", (runnerPhase) => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase, runToken: "rt", retryPolicy: null, privateTransport: true,
+      credentials: { version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog", attemptToken: "at" },
+    });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({ version: 1, resultToken: "rt", attemptToken: "at" });
+    expect(JSON.stringify(inputs)).not.toMatch(/supplied-/);
+  });
+
+  it("implementation: minted bearers stay authoritative over supplied ones", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      ...impl, privateTransport: true,
+      credentials: { version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog" },
+    });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({ version: 1, resultToken: "rt", progressToken: "rp", publicationToken: "rpub" });
+  });
+
+  it("private retry sends two requests with byte-identical run_config and no bearer inputs", async () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, privateTransport: true });
+    const github = fakeFetch({
+      "POST /repos/o/r/actions/workflows/w.yml/dispatches": [
+        githubError(422, 'Unexpected inputs provided: ["issue_identifier"]'),
+        githubError(422, 'Unexpected inputs provided: ["runner_phase"]'),
+      ],
+    }).install();
+    await postWorkflowDispatch({ token: "t", owner: "o", repo: "r", workflowFile: "w.yml", ref: "main", inputs });
+    expect(github.calls).toHaveLength(2);
+    const first = JSON.parse(github.calls[0].body).inputs;
+    const second = JSON.parse(github.calls[1].body).inputs;
+    expect(second.run_config).toBe(first.run_config);
+    expect(second.run_token).toBe("");
+    expect("issue_identifier" in second).toBe(false);
+  });
+});
+
+describe("assertPrivateTransportForCredentials — mixed-version matrix (AII-680)", () => {
+  const creds = { version: 1 as const, resultToken: "rt" };
+
+  it.each([[{}], [{ supportsPrivateRunConfig: false }]])("refuses to send credentials to an unsupported or unprobed template (%j)", (caps) => {
+    expect(() => assertPrivateTransportForCredentials(creds, caps, "o/r claude-implement.yml")).toThrow(/refusing to drop or downgrade/);
+  });
+
+  it("allows a private-capable template, and legacy dispatch with no credentials", () => {
+    expect(() => assertPrivateTransportForCredentials(creds, { supportsPrivateRunConfig: true }, "t")).not.toThrow();
+    expect(() => assertPrivateTransportForCredentials(undefined, {}, "t")).not.toThrow();
+  });
+});
+
+describe("buildPrivateKgRefreshGhaDispatchBody (AII-983)", () => {
+  it("moves result/progress into credentials, keeps config, omits top-level bearers", () => {
+    const trustedConfig = { v: 1 as const, issue: { id: "i", identifier: "KG-1", title: "t", description: "d" }, runnerPhase: "kg-refresh" as const };
+    const body = buildPrivateKgRefreshGhaDispatchBody({
+      trustedConfig, runConfig: "ignored", runToken: "rt", runProgressToken: "rp", runnerImage: undefined, issueIdentifier: "KG-1",
+    });
+    expect(decodeTrustedRunConfig(body.run_config!).credentials).toEqual({ version: 1, resultToken: "rt", progressToken: "rp" });
+    expect(decodeRunConfig(body.run_config!).issue.identifier).toBe("KG-1");
+    expect(body.run_token).toBe("");
+    expect("run_progress_token" in body).toBe(false);
+  });
+
+  it("discards supplied publication/result/progress tokens, keeping grant-class fields and minted bearers", () => {
+    const trustedConfig = {
+      v: 1 as const, issue: { id: "i", identifier: "KG-1", title: "t", description: "d" }, runnerPhase: "kg-refresh" as const,
+      credentials: { version: 1 as const, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog", attemptToken: "at" },
+    };
+    const body = buildPrivateKgRefreshGhaDispatchBody({
+      trustedConfig, runConfig: "ignored", runToken: "rt", runProgressToken: "rp", runnerImage: undefined, issueIdentifier: "KG-1",
+    });
+    expect(decodeTrustedRunConfig(body.run_config!).credentials).toEqual({ version: 1, attemptToken: "at", resultToken: "rt", progressToken: "rp" });
+    expect(JSON.stringify(body)).not.toMatch(/supplied-/);
+  });
+});
+
+describe("managed credentials on the GitHub Actions envelope (AII-1420)", () => {
+  const BEARER = "SENTINEL-BEARER-" + "B".repeat(40);
+  // A GitHub Actions grant for the issue's project; the dispatch carries it without reading its expiry.
+  const grant = makeGrant(makeSnapshot(), { projectKey: "AII", backend: "gha", bearer: BEARER });
+  // GitHub refusing the dispatch with the 422 it sends for an input the workflow does not declare.
+  const refusedDispatch = (input: string) => fakeFetch({
+    "POST /repos/o/r/actions/workflows/claude-implement.yml/dispatches": githubError(422, `Unexpected inputs provided: ["${input}"]`),
+  }).install();
+  const managedInputs = () => buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+    runnerPhase: "implementation",
+    runnerCallbackUrl: "https://orch.example",
+    runToken: "RESULT-TOKEN-1",
+    runProgressToken: "PROGRESS-TOKEN-1",
+    privateTransport: true,
+    credentials: { version: 1, modelAuthGrant: grant },
+    retryPolicy: DEFAULT_RETRY_POLICY,
+  });
+
+  it("carries the grant only inside run_config.credentials and blanks the top-level run_token", () => {
+    const inputs = managedInputs();
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials?.modelAuthGrant).toMatchObject({ bearer: BEARER, backend: "gha" });
+    expect(inputs.run_token).toBe("");
+    for (const [k, v] of Object.entries(inputs)) {
+      if (k !== "run_config") expect(String(v)).not.toContain(BEARER);
+    }
+    expect(JSON.stringify(decodeRunConfig(inputs.run_config!))).not.toContain(BEARER);
+  });
+
+  it("refuses a managed grant on a reader without private transport rather than dropping it", () => {
+    expect(() => buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase: "implementation", runToken: "t", privateTransport: false,
+      credentials: { version: 1, modelAuthGrant: grant }, retryPolicy: DEFAULT_RETRY_POLICY,
+    })).toThrow(/protected run transport/);
+  });
+
+  it("never retries a 422 that names run_config, and the failure text carries no bearer", async () => {
+    const github = refusedDispatch("run_config");
+    const result = await postWorkflowDispatch({ token: "tok", owner: "o", repo: "r", workflowFile: "claude-implement.yml", ref: "main", inputs: managedInputs() });
+    expect(github.calls).toHaveLength(1);
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toContain(BEARER);
+  });
+
+  it("never strips and retries a managed 422 naming an optional input, and the failure carries no bearer", async () => {
+    const github = refusedDispatch("runner_phase");
+    const inputs = { ...managedInputs(), runner_phase: "implementation" as const };
+    const result = await postWorkflowDispatch({ token: "tok", owner: "o", repo: "r", workflowFile: "claude-implement.yml", ref: "main", inputs });
+    expect(github.calls).toHaveLength(1);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(422);
+    expect(JSON.stringify(result)).not.toContain(BEARER);
   });
 });

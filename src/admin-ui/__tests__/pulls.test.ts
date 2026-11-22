@@ -20,6 +20,11 @@ describe("pulls page", () => {
     expect(stripped).not.toMatch(/\bapi\(/);
     expect(stripped).not.toMatch(/\besc\(/);
   });
+  it("links issues through the provider-resolved issueUrl, never a hardcoded tracker host", () => {
+    expect(pullsScript).toContain("window.safeUrl(issueUrl)");
+    expect(pullsScript).not.toContain("linear.app");
+  });
+
   it("uses const/let, not var", () => {
     expect(pullsScript).not.toMatch(/\bvar\s+\w/);
   });
@@ -27,5 +32,8 @@ describe("pulls page", () => {
     expect(pullsScript).toContain("s === 'review_failed'");
     expect(pullsScript).toContain("jobStatus === 'review_failed'");
     expect(pullsScript).toContain("review failed");
+    expect(pullsScript).toContain("review incomplete");
+    expect(pullsScript).toContain("REVIEWER_TURNS_EXHAUSTED");
+    expect(pullsScript).toContain("PROVIDER_UNAVAILABLE");
   });
 });

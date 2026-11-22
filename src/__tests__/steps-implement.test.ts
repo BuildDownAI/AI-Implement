@@ -1,47 +1,31 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { implementStep } from "../pipeline/steps/implement.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
-
-function makeExecutor(overrides: Partial<LLMResult> = {}): LLMExecutor {
-  return {
-    invoke: vi.fn().mockResolvedValue({
-      stdout: "",
-      exitCode: 0,
-      tokensUsed: 100,
-      ...overrides,
-    }),
-  };
-}
-
-function makeContext(executor?: LLMExecutor): DefaultPipelineContext {
-  return new DefaultPipelineContext(
-    {
-      jobId: 1,
-      issueId: "issue-1",
-      issueIdentifier: "ENG-1",
-      issueTitle: "Test",
-      issueDescription: "Description",
-      nonce: "nonce",
-      orchestratorUrl: "http://localhost:8080",
-    },
-    executor ?? makeExecutor(),
-  );
-}
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import type { LLMExecutor } from "../pipeline/types.js";
+import { DEFAULT_MODEL } from "../pipeline/default-model.js";
+import { parseCodexStream } from "../pipeline/codex-stream.js";
+import type { FailureRecord } from "../pipeline/failure-classification.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
+import { makeContext, makeExecutor } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 describe("implementStep", () => {
+  // The step reads changed files with `git diff` in the workspace; an empty directory reports none.
+  let workspaceDir: string;
+
   beforeEach(() => {
+    workspaceDir = testDir("implement");
     vi.clearAllMocks();
   });
 
   it("invokes executor with provided prompt and model", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Implement feature X", model: "claude-sonnet-4-5" },
+      { workspaceDir, prompt: "Implement feature X", model: "claude-sonnet-4-5" },
       new NoopStepReporter(),
     );
 
@@ -50,28 +34,38 @@ describe("implementStep", () => {
     );
   });
 
-  it("defaults model to claude-sonnet-4-6 when not specified", async () => {
+  it("stamps agentStage implementation while keeping the diagnostic stage", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+
+    await implementStep.run(makeContext({}, executor),{ workspaceDir: "/tmp/test", prompt: "Do it", maxTurns: 7 }, new NoopStepReporter());
+
+    expect(executor.invoke).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: "implement", agentStage: "implementation", maxTurns: 7 }),
+    );
+  });
+
+  it("defaults model to DEFAULT_MODEL when not specified", async () => {
+    const executor = makeExecutor();
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      { workspaceDir, prompt: "Do it" },
       new NoopStepReporter(),
     );
 
     expect(executor.invoke).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "claude-sonnet-4-6" }),
+      expect.objectContaining({ model: DEFAULT_MODEL }),
     );
   });
 
   it("appends planning context to prompt when provided", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it", planningContext: "Use factory pattern" },
+      { workspaceDir, prompt: "Do it", planningContext: "Use factory pattern" },
       new NoopStepReporter(),
     );
 
@@ -82,11 +76,11 @@ describe("implementStep", () => {
 
   it("returns tokensUsed from executor result", async () => {
     const executor = makeExecutor({ tokensUsed: 500 });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const outputs = await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      { workspaceDir, prompt: "Do it" },
       new NoopStepReporter(),
     );
 
@@ -97,31 +91,192 @@ describe("implementStep", () => {
 
   it("throws when executor returns non-zero exit code", async () => {
     const executor = makeExecutor({ exitCode: 1 });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await expect(
-      implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter()),
+      implementStep.run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter()),
     ).rejects.toThrow("exit code 1");
+  });
+
+  it("falls back to classifying the failure itself when a custom executor's non-zero exit carries no pre-computed failure record", async () => {
+    // Round-four review follow-up (BAC-27114): a custom LLMExecutor (this test's
+    // own opts.llmExecutor-style seam) may settle a non-zero exit without ever
+    // attaching `result.failure` — implementStep must not leave failure_json empty
+    // in that case, so it derives one via classifyLlmResult itself.
+    const executor = makeExecutor({ exitCode: 1, stderr: "boom, nothing recognisable here" });
+    const ctx = makeContext({}, executor);
+
+    const err = await implementStep
+      .run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const failure = (err as Error & { failure?: { category?: string; code?: string; stage?: string } }).failure;
+    expect(failure?.category).toBe("crash");
+    expect(failure?.code).toBe("PROCESS_EXIT_NONZERO");
+    expect(failure?.stage).toBe("implement");
+  });
+
+  it("surfaces the executor's pre-computed failure record on the thrown error (crash, not invalid_output)", async () => {
+    // The executor — not implementStep — classifies the failure now (BAC-27114
+    // follow-up): implement never requests structured output, so a plain crash
+    // must not be misclassified as invalid_output/LLM_NO_STRUCTURED_OUTPUT just
+    // because structuredOutput happens to be undefined. That classification logic
+    // is covered directly in failure-classification.test.ts and executor.test.ts;
+    // this only checks that implementStep passes `result.failure` through as-is.
+    const executor = makeExecutor({
+      exitCode: 1,
+      stderr: "boom, nothing recognisable here",
+      failure: {
+        category: "crash",
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 1,
+        retryable: false,
+        message: "boom, nothing recognisable here",
+        evidence: { truncated: false },
+      },
+    });
+    const ctx = makeContext({}, executor);
+
+    const err = await implementStep
+      .run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const failure = (err as Error & { failure?: { category?: string; code?: string } }).failure;
+    expect(failure?.category).toBe("crash");
+    expect(failure?.code).toBe("PROCESS_EXIT_NONZERO");
+  });
+
+  it("classifies an exit-0 Codex stream that errored mid-turn and keeps the real outcome", async () => {
+    const lines = [
+      { type: "turn.started" },
+      { type: "error", message: "stream disconnected before completion" },
+      { type: "item.completed", item: { id: "m1", type: "agent_message", text: "done" } },
+      { type: "turn.completed", usage: { input_tokens: 5, output_tokens: 2 } },
+    ].map((e) => JSON.stringify(e)).join("\n");
+    const parsed = parseCodexStream(lines).toResult({ exitCode: 0 });
+    parsed.telemetry = { ...parsed.telemetry!, durationMs: 1234 };
+    parsed.attempts = 2;
+    const out = await implementStep.run(makeContext({}, makeExecutor(parsed)),{ workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+    expect(out.exitCode).toBe(0);
+    expect(out.telemetry?.outcome).toBe("error");
+    expect(out.invocationFailure).toMatchObject({
+      stage: "implement",
+      code: "LLM_TERMINAL_ERROR",
+      category: "invalid_output",
+      attempt: 2,
+      elapsedMs: 1234,
+      retryable: false,
+    });
+    expect(out.invocationFailure?.message).toContain("stream disconnected before completion");
+  });
+
+  it("preserves an executor-supplied failure on an exit-0 fatal result", async () => {
+    const failure: FailureRecord = {
+      category: "invalid_output", code: "EXECUTOR_SUPPLIED", stage: "implement", attempt: 3, retryable: false,
+      elapsedMs: 77, message: "from executor", evidence: { truncated: false },
+    };
+    const executor = makeExecutor({
+      exitCode: 0,
+      terminalStatus: { subtype: "error", isError: true },
+      telemetry: { outcome: "error", numTurns: 1, durationMs: 10, costUsd: null, tokensIn: null, tokensOut: null },
+      failure,
+      attempts: 3,
+    });
+    const out = await implementStep.run(makeContext({}, executor),{ workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+    expect(out.invocationFailure).toEqual(failure);
+  });
+
+  it("does not flag a clean exit-0 Codex result", async () => {
+    const parsed = parseCodexStream(
+      [{ type: "turn.started" }, { type: "turn.completed" }].map((e) => JSON.stringify(e)).join("\n"),
+    ).toResult({ exitCode: 0 });
+    const out = await implementStep.run(makeContext({}, makeExecutor(parsed)),{ workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+    expect(out.telemetry?.outcome).toBe("success");
+    expect(out.invocationFailure).toBeUndefined();
+  });
+
+  it("still throws for a non-zero exit even when the stream is fatal", async () => {
+    const executor = makeExecutor({ exitCode: 1, terminalStatus: { subtype: "error", isError: true } });
+    await expect(
+      implementStep.run(makeContext({}, executor),{ workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter()),
+    ).rejects.toThrow(/exit code 1/);
+  });
+
+  it("surfaces the executor's failure.elapsedMs on the thrown error", async () => {
+    const executor = makeExecutor({
+      exitCode: 1,
+      stderr: "boom",
+      telemetry: { outcome: "error", numTurns: 2, durationMs: 4200, costUsd: null, tokensIn: null, tokensOut: null },
+      failure: {
+        category: "crash",
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 1,
+        retryable: false,
+        elapsedMs: 4200,
+        message: "boom",
+        evidence: { truncated: false },
+      },
+    });
+    const ctx = makeContext({}, executor);
+
+    const err = await implementStep
+      .run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    const failure = (err as Error & { failure?: { elapsedMs?: number } }).failure;
+    expect(failure?.elapsedMs).toBe(4200);
+  });
+
+  it("forwards context.data.retryPolicy as retry with the implement-specific flags", async () => {
+    const executor = makeExecutor();
+    const ctx = makeContext({ retryPolicy: DEFAULT_RETRY_POLICY }, executor);
+
+    await implementStep.run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter());
+
+    expect(executor.invoke).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: "implement",
+        expectsStructuredOutput: false,
+        retry: {
+          policy: DEFAULT_RETRY_POLICY,
+          toolUseIsSafe: false,
+        },
+      }),
+    );
+  });
+
+  it("omits retry when context.data.retryPolicy is absent", async () => {
+    const executor = makeExecutor();
+    const ctx = makeContext({}, executor);
+
+    await implementStep.run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.retry).toBeUndefined();
   });
 
   it("propagates executor rejection", async () => {
     const executor: LLMExecutor = {
       invoke: vi.fn().mockRejectedValue(new Error("network error")),
     };
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await expect(
-      implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter()),
+      implementStep.run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter()),
     ).rejects.toThrow("network error");
   });
 
   it("passes maxTurns to executor", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it", maxTurns: 5 },
+      { workspaceDir, prompt: "Do it", maxTurns: 5 },
       new NoopStepReporter(),
     );
 
@@ -141,15 +296,126 @@ describe("implementStep", () => {
       toolTrace: ["Bash npm test"],
     };
     const executor = makeExecutor({ stdout: "done", exitCode: 0, tokensUsed: 150, telemetry });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const outputs = await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      { workspaceDir, prompt: "Do it" },
       new NoopStepReporter(),
     );
 
     expect(outputs.telemetry).toEqual(telemetry);
+  });
+
+  describe("reference repositories section", () => {
+    it("appends section with arrived repo and path when entry arrived", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext({}, executor);
+      const referenceRepoResults: ReferenceRepoResult[] = [
+        { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+      ];
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir, prompt: "Do it", referenceRepoResults },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).toContain("## Reference Repositories");
+      expect(call.prompt).toContain("https://github.com/a/b");
+      expect(call.prompt).toContain("refs/b");
+      expect(call.prompt).toContain("read-only reference material");
+    });
+
+    it("appends section with cause phrase when entry did not arrive", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext({}, executor);
+      const referenceRepoResults: ReferenceRepoResult[] = [
+        { repo: "https://github.com/a/b", path: "refs/b", ref: "main", arrived: false, cause: "no-auth" },
+      ];
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir, prompt: "Do it", referenceRepoResults },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).toContain("## Reference Repositories");
+      expect(call.prompt).toContain("https://github.com/a/b");
+      expect(call.prompt).toContain("GitHub App is not installed");
+      expect(call.prompt).toContain("Do not assert anything");
+    });
+
+    it("includes both arrived and missed repos in section", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext({}, executor);
+      const referenceRepoResults: ReferenceRepoResult[] = [
+        { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+        { repo: "https://github.com/c/d", path: "refs/d", ref: "main", arrived: false, cause: "ref-not-found" },
+      ];
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir, prompt: "Do it", referenceRepoResults },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).toContain("https://github.com/a/b");
+      expect(call.prompt).toContain("refs/b");
+      expect(call.prompt).toContain("https://github.com/c/d");
+      expect(call.prompt).toContain("does not exist");
+    });
+
+    it("does not append section when array is empty", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext({}, executor);
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir, prompt: "Do it", referenceRepoResults: [] },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).not.toContain("## Reference Repositories");
+    });
+
+    it("does not append section when referenceRepoResults is absent", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext({}, executor);
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir, prompt: "Do it" },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).not.toContain("## Reference Repositories");
+    });
+
+    it("appends planning context before reference repositories section", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext({}, executor);
+      const referenceRepoResults: ReferenceRepoResult[] = [
+        { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+      ];
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir, prompt: "Do it", planningContext: "Use factory pattern", referenceRepoResults },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      const planningIdx = call.prompt.indexOf("## Planning Context");
+      const refIdx = call.prompt.indexOf("## Reference Repositories");
+      expect(planningIdx).toBeGreaterThanOrEqual(0);
+      expect(refIdx).toBeGreaterThan(planningIdx);
+    });
   });
 
   it("does not throw on non-zero exit when the outcome is max_turns", async () => {
@@ -163,11 +429,11 @@ describe("implementStep", () => {
       toolTrace: [],
     };
     const executor = makeExecutor({ stdout: "", exitCode: 1, tokensUsed: 0, telemetry });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const outputs = await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      { workspaceDir, prompt: "Do it" },
       new NoopStepReporter(),
     );
 

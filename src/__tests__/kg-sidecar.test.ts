@@ -1,0 +1,807 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  writeFileSync,
+  chmodSync,
+} from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import { spawn as realSpawn } from "node:child_process";
+import { join } from "node:path";
+import { checkDegraded, COMPLETION_MARKER, getServedNamespace, isRemoteKgStore, KgSidecar } from "../kg-sidecar.js";
+import { testDir } from "./helpers/test-dir.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => ({
+  ...await importOriginal<typeof import("node:fs/promises")>(),
+  readFile: vi.fn((await importOriginal<typeof import("node:fs/promises")>()).readFile),
+}));
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function touch(filePath: string): void {
+  closeSync(openSync(filePath, "w"));
+}
+
+function makeKgDir(): string {
+  const dir = testDir("kg-sidecar");
+  mkdirSync(join(dir, "out"));
+  return dir;
+}
+
+/** Write a shell script to path and make it executable. */
+function writeScript(path: string, body: string): void {
+  writeFileSync(path, `#!/bin/sh\n${body}\n`);
+  chmodSync(path, 0o755);
+}
+
+/** Spawn with stdio: 'ignore' to avoid open file-handle leaks in the test process. */
+function testSpawn(cmd: string, args: string[], opts: object) {
+  return realSpawn(cmd, args, { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+}
+
+afterEach(() => {
+  delete process.env.KG_SIDECAR_URL;
+  delete process.env.KG_EMBEDDINGS_DEGRADED;
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
+
+// ---------------------------------------------------------------------------
+// 1. Degraded detection (ported from entrypoint-kg-degraded.test.ts)
+// ---------------------------------------------------------------------------
+
+describe("checkDegraded", () => {
+  it("detects degraded when marker present, npz present (marker wins)", () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, ".embeddings-failed"));
+    touch(join(kgDir, "out", "embeddings.npz"));
+    expect(checkDegraded(kgDir)).toBe(true);
+  });
+
+  it("detects degraded when marker absent, npz absent (belt-and-suspenders fires)", () => {
+    const kgDir = makeKgDir();
+    // out/ dir exists but embeddings.npz was never written
+    expect(checkDegraded(kgDir)).toBe(true);
+  });
+
+  it("detects NOT degraded when marker absent, npz present (clean build)", () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    expect(checkDegraded(kgDir)).toBe(false);
+  });
+
+  it("detects degraded when marker present, npz absent", () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, ".embeddings-failed"));
+    expect(checkDegraded(kgDir)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getServedNamespace (AII-650 refinement #5) — overlay-vs-baked selection, the
+// namespace: regex, and missing/malformed sources.yml.
+// ---------------------------------------------------------------------------
+
+describe("getServedNamespace", () => {
+  it("prefers the runtime overlay's namespace when a runtime sources.yml exists", async () => {
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/\n");
+    const runtimeDir = testDir("kg-sidecar");
+    writeFileSync(join(runtimeDir, "sources.yml"), "namespace: http://overlay.example/kg/\n");
+
+    const ns = await getServedNamespace(kgDir, runtimeDir);
+    expect(ns).toBe("http://overlay.example/kg/");
+  });
+
+  it("falls back to the baked kgDir sources.yml when no runtime overlay is present", async () => {
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/\n");
+    const runtimeDir = testDir("kg-sidecar"); // exists, but has no sources.yml of its own
+
+    const ns = await getServedNamespace(kgDir, runtimeDir);
+    expect(ns).toBe("http://baked.example/kg/");
+  });
+
+  it("parses the namespace: line even with trailing whitespace", async () => {
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/   \n");
+    const runtimeDir = testDir("kg-sidecar");
+
+    const ns = await getServedNamespace(kgDir, runtimeDir);
+    expect(ns).toBe("http://baked.example/kg/");
+  });
+
+  it("returns null when sources.yml is missing from both locations", async () => {
+    const kgDir = makeKgDir();
+    const runtimeDir = testDir("kg-sidecar");
+
+    expect(await getServedNamespace(kgDir, runtimeDir)).toBeNull();
+  });
+
+  it("returns null for a malformed sources.yml with no namespace: line, rather than throwing", async () => {
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "other: value\nunrelated content\n");
+    const runtimeDir = testDir("kg-sidecar");
+
+    expect(await getServedNamespace(kgDir, runtimeDir)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2. COMPLETION_MARKER constant is exported
+// ---------------------------------------------------------------------------
+
+it("exports COMPLETION_MARKER as a non-empty string", () => {
+  expect(typeof COMPLETION_MARKER).toBe("string");
+  expect(COMPLETION_MARKER.length).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// 3. Entry-point resolution
+// ---------------------------------------------------------------------------
+
+describe("entry-point resolution", () => {
+  it("start.sh present → spawns sh start.sh (preferred path)", async () => {
+    const kgDir = makeKgDir();
+    // start.sh sleeps indefinitely; httpGet immediately returns ready
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    try {
+      expect(process.env.KG_SIDECAR_URL).toBe("http://127.0.0.1:8765/mcp");
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("start.sh absent, server.py present, .venv present → spawns .venv/bin/python server.py", async () => {
+    const kgDir = makeKgDir();
+    // No start.sh
+    touch(join(kgDir, "server.py"));
+    mkdirSync(join(kgDir, ".venv", "bin"), { recursive: true });
+    // Fake python: just sleeps
+    writeScript(join(kgDir, ".venv", "bin", "python"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    try {
+      expect(process.env.KG_SIDECAR_URL).toBe("http://127.0.0.1:8765/mcp");
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("start.sh absent, server.py present, .venv absent → non-fatal: KG_SIDECAR_URL not set", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "server.py"));
+    // No .venv/bin/python
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 500, pollIntervalMs: 50 },
+      { httpGet: async () => true },
+    );
+    await sidecar.start();
+
+    expect(process.env.KG_SIDECAR_URL).toBeUndefined();
+  });
+
+  it("both absent → non-fatal: KG_SIDECAR_URL not set", async () => {
+    const kgDir = makeKgDir();
+    // Neither start.sh nor server.py
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 500, pollIntervalMs: 50 },
+      { httpGet: async () => true },
+    );
+    await sidecar.start();
+
+    expect(process.env.KG_SIDECAR_URL).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. Readiness polling
+// ---------------------------------------------------------------------------
+
+describe("readiness polling", () => {
+  it("sidecar answers on first poll → KG_SIDECAR_URL set", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz")); // not degraded
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    try {
+      expect(process.env.KG_SIDECAR_URL).toBe("http://127.0.0.1:8765/mcp");
+      expect(process.env.KG_EMBEDDINGS_DEGRADED).toBeUndefined();
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("sidecar answers on 5th poll → KG_SIDECAR_URL set", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    let calls = 0;
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => ++calls >= 5, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    try {
+      expect(process.env.KG_SIDECAR_URL).toBe("http://127.0.0.1:8765/mcp");
+      expect(calls).toBeGreaterThanOrEqual(5);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("sidecar answers with a 4xx → still counted as ready (any HTTP response = ready)", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    // The httpGet injection returns a boolean — true = any response received.
+    // The real defaultHttpGet resolves true on any HTTP status (inc. 4xx).
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn }, // simulates a 4xx response (still "ready")
+    );
+    await sidecar.start();
+
+    try {
+      expect(process.env.KG_SIDECAR_URL).toBe("http://127.0.0.1:8765/mcp");
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("child exits before readiness timeout → non-fatal: KG_SIDECAR_URL not set", async () => {
+    const kgDir = makeKgDir();
+    // start.sh exits immediately
+    writeScript(join(kgDir, "start.sh"), "exit 0");
+
+    // httpGet always fails (not reachable)
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 3_000, pollIntervalMs: 50 },
+      { httpGet: async () => false, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    expect(process.env.KG_SIDECAR_URL).toBeUndefined();
+  });
+
+  it("readiness timeout → non-fatal: KG_SIDECAR_URL not set", async () => {
+    const kgDir = makeKgDir();
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 200, pollIntervalMs: 50 },
+      { httpGet: async () => false, spawn: testSpawn }, // never ready
+    );
+    await sidecar.start();
+
+    try {
+      expect(process.env.KG_SIDECAR_URL).toBeUndefined();
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("sets KG_EMBEDDINGS_DEGRADED when embeddings marker present", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, ".embeddings-failed"));
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    try {
+      expect(process.env.KG_SIDECAR_URL).toBe("http://127.0.0.1:8765/mcp");
+      expect(process.env.KG_EMBEDDINGS_DEGRADED).toBe("1");
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Runtime data directory overlay
+// ---------------------------------------------------------------------------
+
+describe("runtime data directory overlay", () => {
+  it("current dir present with completion marker → child receives KG_DATA_DIR", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+
+    const runtimeDir = testDir("kg-sidecar");
+    touch(join(runtimeDir, COMPLETION_MARKER));
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+
+    try {
+      expect(capturedEnv?.KG_DATA_DIR).toBe(runtimeDir);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("current dir absent → child receives no KG_DATA_DIR", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    const runtimeDir = join(testDir("kg-sidecar"), "nonexistent-subdir");
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+
+    try {
+      expect(capturedEnv?.KG_DATA_DIR).toBeUndefined();
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("current dir present WITHOUT completion marker → non-fatal: no KG_DATA_DIR, baked copy used", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    const runtimeDir = testDir("kg-sidecar"); // exists but no COMPLETION_MARKER
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const stderrOutput: string[] = [];
+    const originalError = console.error.bind(console);
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+      originalError(...args);
+    });
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+
+    try {
+      expect(capturedEnv?.KG_DATA_DIR).toBeUndefined();
+      expect(stderrOutput.some((line) => line.includes("completion marker"))).toBe(true);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5b. Direct-materialize serving backend (AII-599)
+// ---------------------------------------------------------------------------
+
+describe("nt_parts backend selection", () => {
+  it("current dir has completion marker + parts/ → child receives KG_BACKEND=nt_parts and KG_PARTS_DIR", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+
+    const runtimeDir = testDir("kg-sidecar");
+    touch(join(runtimeDir, COMPLETION_MARKER));
+    mkdirSync(join(runtimeDir, "parts"));
+    touch(join(runtimeDir, "parts", "issue.nt"));
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+
+    try {
+      expect(capturedEnv?.KG_DATA_DIR).toBe(runtimeDir);
+      expect(capturedEnv?.KG_BACKEND).toBe("nt_parts");
+      expect(capturedEnv?.KG_PARTS_DIR).toBe(join(runtimeDir, "parts"));
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("current dir has completion marker but no parts/ → KG_BACKEND left unset (start.sh's own rdflib default applies)", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+
+    const runtimeDir = testDir("kg-sidecar");
+    touch(join(runtimeDir, COMPLETION_MARKER));
+    touch(join(runtimeDir, "graph.trig"));
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+
+    try {
+      expect(capturedEnv?.KG_DATA_DIR).toBe(runtimeDir);
+      expect(capturedEnv?.KG_BACKEND).toBeUndefined();
+      expect(capturedEnv?.KG_PARTS_DIR).toBeUndefined();
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("restart() after a direct-mode refresh re-spawns with KG_BACKEND=nt_parts in the child env", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+
+    const runtimeDir = testDir("kg-sidecar");
+    touch(join(runtimeDir, COMPLETION_MARKER));
+    mkdirSync(join(runtimeDir, "parts"));
+
+    const capturedEnvs: Array<NodeJS.ProcessEnv | undefined> = [];
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
+      capturedEnvs.push((opts as { env?: NodeJS.ProcessEnv }).env);
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+    await sidecar.restart();
+
+    try {
+      expect(capturedEnvs).toHaveLength(2);
+      expect(capturedEnvs[1]?.KG_BACKEND).toBe("nt_parts");
+      expect(capturedEnvs[1]?.KG_PARTS_DIR).toBe(join(runtimeDir, "parts"));
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Stop / shutdown behaviour
+// ---------------------------------------------------------------------------
+
+describe("stop / shutdown", () => {
+  it("stop() sends SIGTERM to child", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    const pid = (sidecar as unknown as { _child: { pid?: number } })._child?.pid;
+    expect(pid).toBeTypeOf("number");
+
+    await sidecar.stop();
+
+    // After stop() resolves, the process must be gone (no orphan).
+    expect(() => process.kill(pid!, 0)).toThrow();
+  });
+
+  it("stop() when child already exited → resolves immediately without error", async () => {
+    const kgDir = makeKgDir();
+    // start.sh exits immediately — child is dead before stop() is called
+    writeScript(join(kgDir, "start.sh"), "exit 0");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 3_000, pollIntervalMs: 50 },
+      { httpGet: async () => false, spawn: testSpawn },
+    );
+    await sidecar.start(); // child dies during poll; KG_SIDECAR_URL not set
+
+    // stop() on a dead / absent child must not throw
+    await expect(sidecar.stop()).resolves.toBeUndefined();
+  });
+
+  it("stop() when no sidecar running → resolves immediately", async () => {
+    const kgDir = makeKgDir();
+    // Never call start()
+    const sidecar = new KgSidecar({ kgDir });
+    await expect(sidecar.stop()).resolves.toBeUndefined();
+  });
+
+  it("no orphan after stop() resolves (SIGKILL backstop integration test)", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    // Use a script that ignores SIGTERM so the SIGKILL backstop fires
+    writeScript(join(kgDir, "start.sh"), "trap '' TERM; sleep 60");
+
+    const sidecar = new KgSidecar(
+      {
+        kgDir,
+        runtimeDataDir: testDir("kg-sidecar"),
+        pollTimeoutMs: 5_000,
+        pollIntervalMs: 10,
+        stopTimeoutMs: 200, // short timeout so SIGKILL fires quickly
+      },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    const pid = (sidecar as unknown as { _child: { pid?: number } })._child?.pid;
+    expect(pid).toBeTypeOf("number");
+
+    await sidecar.stop();
+
+    // No orphan: SIGKILL must have reaped the process
+    expect(() => process.kill(pid!, 0)).toThrow();
+  }, 10_000);
+
+  it("concurrent stop() calls run the sequence once (re-entrancy latch)", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    const child = (sidecar as unknown as { _child: { pid?: number; kill: (sig: string) => boolean } })._child;
+    expect(child).not.toBeNull();
+    const killSpy = vi.spyOn(child!, "kill");
+
+    // Two concurrent stop() calls
+    const [p1, p2] = [sidecar.stop(), sidecar.stop()];
+    await Promise.all([p1, p2]);
+
+    // SIGTERM must be sent exactly once
+    const sigtermCalls = killSpy.mock.calls.filter(([sig]) => sig === "SIGTERM").length;
+    expect(sigtermCalls).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. restart()
+// ---------------------------------------------------------------------------
+
+describe("restart()", () => {
+  it("stops old process and starts new one: new PID differs, KG_SIDECAR_URL remains set", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    const firstPid = (sidecar as unknown as { _child: { pid?: number } })._child?.pid;
+    expect(firstPid).toBeTypeOf("number");
+
+    await sidecar.restart();
+
+    try {
+      const secondPid = (sidecar as unknown as { _child: { pid?: number } })._child?.pid;
+      expect(secondPid).toBeTypeOf("number");
+      expect(secondPid).not.toBe(firstPid);
+      // First process must be gone
+      expect(() => process.kill(firstPid!, 0)).toThrow();
+      // KG_SIDECAR_URL is still set after restart
+      expect(process.env.KG_SIDECAR_URL).toBe("http://127.0.0.1:8765/mcp");
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Shutdown re-entrancy (AII-353 defect class)
+// ---------------------------------------------------------------------------
+
+describe("shutdown re-entrancy", () => {
+  it("concurrent shutdown signals run stop sequence once", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+
+    const child = (sidecar as unknown as { _child: { pid?: number; kill: (sig: string) => boolean } })._child;
+    expect(child).not.toBeNull();
+    const killSpy = vi.spyOn(child!, "kill");
+
+    // Simulate rapid double shutdown signal (mirrors the AII-353 defect class)
+    let resolvedCount = 0;
+    const p1 = sidecar.stop().then(() => { resolvedCount++; });
+    const p2 = sidecar.stop().then(() => { resolvedCount++; });
+    await Promise.all([p1, p2]);
+
+    expect(resolvedCount).toBe(2); // both callers resolved
+    const sigtermCalls = killSpy.mock.calls.filter(([sig]) => sig === "SIGTERM").length;
+    expect(sigtermCalls).toBe(1); // sequence ran exactly once
+  });
+
+  it("stop() is idempotent: second call after completion resolves immediately", async () => {
+    const kgDir = makeKgDir();
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: testDir("kg-sidecar"), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn },
+    );
+    await sidecar.start();
+    await sidecar.stop(); // first stop
+
+    // Second stop should be a no-op (child is null)
+    await expect(sidecar.stop()).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. start() clears env vars on restart
+// ---------------------------------------------------------------------------
+
+describe("env var cleanup", () => {
+  it("start() clears KG_SIDECAR_URL and KG_EMBEDDINGS_DEGRADED before launching", async () => {
+    // Pre-seed stale env vars from a previous start
+    process.env.KG_SIDECAR_URL = "http://stale-url/mcp";
+    process.env.KG_EMBEDDINGS_DEGRADED = "1";
+
+    const kgDir = makeKgDir(); // no start.sh or server.py
+    const sidecar = new KgSidecar({ kgDir, runtimeDataDir: testDir("kg-sidecar") });
+    await sidecar.start(); // no entry point → returns early
+
+    // Both must be cleared, even though start returned without setting them
+    expect(process.env.KG_SIDECAR_URL).toBeUndefined();
+    expect(process.env.KG_EMBEDDINGS_DEGRADED).toBeUndefined();
+  });
+});
+
+
+describe("remote store selection", () => {
+  it.each([undefined, "", "stardog", "STARDOG_RUN", "stardog_run ", "nt_parts", "stardog_run"])(
+    "recognizes only the exact remote backend: %s", (backend) => {
+      expect(isRemoteKgStore({ KG_BACKEND: backend })).toBe(backend === "stardog_run");
+      vi.stubEnv("KG_BACKEND", backend);
+      expect(isRemoteKgStore()).toBe(backend === "stardog_run");
+    },
+  );
+
+  it.each([
+    [undefined, false], [undefined, true],
+    ["stardog_run", false], ["stardog_run", true],
+    ["other", false], ["other", true],
+  ] as const)("backend %s, staged parts %s", async (backend, parts) => {
+    vi.stubEnv("KG_BACKEND", backend);
+    vi.stubEnv("KG_DATA_DIR", undefined);
+    vi.stubEnv("KG_PARTS_DIR", undefined);
+    vi.stubEnv("KG_EMBEDDINGS_DEGRADED", "1");
+    const remote = backend === "stardog_run";
+    if (remote) {
+      vi.stubEnv("KG_DATA_DIR", "/stale/data");
+      vi.stubEnv("KG_PARTS_DIR", "/stale/parts");
+    }
+    const values = {
+      KG_STARDOG_RUN_TOKEN: "sentinel-token",
+      KG_STARDOG_DB: "sentinel-db",
+      KG_STARDOG_RUN_ENDPOINT: "sentinel-endpoint",
+      KG_STARDOG_DATASET: "sentinel-dataset",
+      KG_STARDOG_RUN_CONSOLE: "sentinel-console",
+      KG_NAMESPACE: "https://sentinel.example/",
+    };
+    for (const [key, value] of Object.entries(values)) vi.stubEnv(key, value);
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    const kgDir = makeKgDir(); // No embeddings; remote searches run in the database.
+    if (parts) touch(join(kgDir, ".embeddings-failed"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+    const runtimeDir = join(testDir("kg-sidecar"), "current");
+    if (parts) {
+      mkdirSync(join(runtimeDir, "parts"), { recursive: true });
+      touch(join(runtimeDir, COMPLETION_MARKER));
+    }
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    const sidecar = new KgSidecar({ kgDir, runtimeDataDir: runtimeDir }, {
+      httpGet: async () => true,
+      spawn: (cmd, args, opts) => {
+        childEnv = (opts as { env: NodeJS.ProcessEnv }).env;
+        return testSpawn(cmd, args, opts);
+      },
+    });
+    try {
+      await sidecar.start();
+      expect(childEnv?.KG_BACKEND).toBe(remote ? backend : parts ? "nt_parts" : backend);
+      expect(childEnv?.KG_DATA_DIR).toBe(!remote && parts ? runtimeDir : undefined);
+      expect(childEnv?.KG_PARTS_DIR).toBe(!remote && parts ? join(runtimeDir, "parts") : undefined);
+      expect(childEnv?.KG_EMBEDDINGS_DEGRADED).toBeUndefined();
+      expect(process.env.KG_EMBEDDINGS_DEGRADED).toBe(remote ? undefined : "1");
+      expect(childEnv).toMatchObject(values);
+      const lines = logs.mock.calls.map((args) => args.join(" "));
+      expect(lines.filter((line) => line === "[kg] serving remote store stardog_run")).toHaveLength(remote ? 1 : 0);
+      for (const value of Object.values(values)) expect(lines.join("\n")).not.toContain(value);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+it("uses KG_NAMESPACE before reading sources.yml", async () => {
+  vi.stubEnv("KG_NAMESPACE", "https://kg.builddown.dev/");
+  const read = vi.mocked(fsPromises.readFile);
+  read.mockClear();
+  expect(await getServedNamespace("/unused/baked", "/unused/runtime")).toBe("https://kg.builddown.dev/");
+  expect(read).not.toHaveBeenCalled();
+});
+
+it("falls back to sources.yml for an empty KG_NAMESPACE", async () => {
+  vi.stubEnv("KG_NAMESPACE", "");
+  const kgDir = makeKgDir();
+  writeFileSync(join(kgDir, "sources.yml"), "namespace: https://baked.example/\n");
+  expect(await getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://baked.example/");
+});

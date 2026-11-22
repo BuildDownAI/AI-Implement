@@ -3,7 +3,10 @@ import { componentsCss } from "./components.js";
 import { sidebarHtml } from "./sidebar.js";
 import { themeJs } from "./theme.js";
 import { routerJs } from "./router.js";
+import { helpersJs } from "./helpers.js";
 import { authJs } from "./auth.js";
+import { accessHtml, accessScript } from "./pages/access.js";
+import { setupHtml, setupScript } from "./pages/setup.js";
 import { overviewHtml, overviewScript } from "./pages/overview.js";
 import { settingsHtml, settingsScript } from "./pages/settings.js";
 import { projectsHtml, projectsScript } from "./pages/projects.js";
@@ -19,10 +22,14 @@ import { pipelinesAndStepsHtml, pipelinesAndStepsScript } from "./pages/pipeline
 import { modelsAndProvidersHtml, modelsAndProvidersScript } from "./pages/models-and-providers.js";
 import { runnersHtml, runnersScript } from "./pages/runners.js";
 import { reportsHtml, reportsScript } from "./pages/reports.js";
+import { kgPipelinesHtml, kgPipelinesScript } from "./pages/kg-pipelines.js";
 import { deploymentsHtml, deploymentsScript } from "./pages/deployments.js";
 import { stubsHtml } from "./pages/stubs.js";
+import { noAccessHtml } from "./pages/no-access.js";
 import { drawerHtml, drawerScript } from "./drawer.js";
-import { stepperHtml, stepperScript } from "./stepper.js";
+import { filesystemIssueHtml, filesystemIssueScript } from "./filesystem-issue.js";
+import { localJobLogsHtml, localJobLogsScript } from "./local-job-logs.js";
+import { stepperScript } from "./stepper.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -54,10 +61,19 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${modelsAndProvidersHtml}
     ${runnersHtml}
     ${reportsHtml}
+    ${kgPipelinesHtml}
     ${deploymentsHtml}
+    ${accessHtml}
+    ${setupHtml}
     ${stubsHtml}
+    ${noAccessHtml}
   </main>
 </div>`;
+
+function pageScript(name: string, src: string): string {
+  const n = JSON.stringify(name);
+  return `<script>try{${src}}catch(_e){window.markPageFailed&&window.markPageFailed(${n},_e);console.error('[admin-ui] page '+${n}+' failed to register',_e);}</script>`;
+}
 
 const body = `<body>
 <div id="login-page" class="login-wrap">
@@ -65,6 +81,11 @@ const body = `<body>
     <h1 class="login-title">Admin Access</h1>
     <div class="login-box card">
       <div id="auth-error" class="error hidden"></div>
+      <div id="no-admin-notice" class="warning hidden">
+        Nobody can administer this orchestrator. You can sign in, but every admin page will be unavailable.<br>
+        Only a listed <strong>email address</strong> can be an admin &#x2014; a domain admits its members as users.
+        Add one to <span class="mono">OAUTH_ALLOWED_EMAILS</span> and restart.
+      </div>
       <div id="sso-label" class="sso-label hidden">Sign in with your provider</div>
       <div id="sso-buttons"></div>
       <div id="login-divider" class="divider-labeled hidden"><span>or use an access code</span></div>
@@ -84,8 +105,35 @@ const body = `<body>
 </div>
 ${shell}
 ${drawerHtml}
-${stepperHtml}
-<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${issuesScript}${pullsScript}${blockersScript}${customizationsScript}${pipelinesAndStepsScript}${modelsAndProvidersScript}${runnersScript}${reportsScript}${deploymentsScript}${drawerScript}${stepperScript}</script>
+${filesystemIssueHtml}
+${localJobLogsHtml}
+<script>${themeJs}</script>
+<script>${helpersJs}</script>
+<script>${authJs}</script>
+<script>${routerJs}</script>
+${pageScript('overview', overviewScript)}
+${pageScript('settings', settingsScript)}
+${pageScript('projects', projectsScript)}
+${pageScript('jobs', pipelinesScript)}
+${pageScript('reaper', reaperScript)}
+${pageScript('sessions', sessionsScript)}
+${pageScript('audit', auditScript)}
+${pageScript('issues', issuesScript)}
+${pageScript('pulls', pullsScript)}
+${pageScript('blockers', blockersScript)}
+${pageScript('customizations', customizationsScript)}
+${pageScript('pipelines', pipelinesAndStepsScript)}
+${pageScript('models', modelsAndProvidersScript)}
+${pageScript('runners', runnersScript)}
+${pageScript('reports', reportsScript)}
+${pageScript('kg-pipelines', kgPipelinesScript)}
+${pageScript('deployments', deploymentsScript)}
+${pageScript('access', accessScript)}
+${pageScript('setup', setupScript)}
+${pageScript('drawer', drawerScript)}
+${pageScript('filesystem-issue', filesystemIssueScript)}
+${pageScript('local-job-logs', localJobLogsScript)}
+${pageScript('stepper', stepperScript)}
 </body></html>`;
 
 export const adminHtml = head + body;

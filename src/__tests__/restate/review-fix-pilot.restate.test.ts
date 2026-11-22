@@ -1,0 +1,1836 @@
+// Fault-injection matrix for the Restate review-fix pilot (AII-769/AII-813), against real
+// Restate 1.7.10 and the *production* PR coordinator, attempt workflow, SQLite repository,
+// finalizer, and worker adapter. Only external GitHub/tracker edges are faked — the
+// worker's transport, the GitHub adapter's fetch, and the PR coordinator's admission
+// eligibility/pending-feedback reads (the same seams `review-fix-production.ts` itself calls
+// out to GitHub for) — plus explicit fault controls built from `harness.ts#crashAfterFirstCall`.
+// `review-fix-attempt.restate.test.ts` (AII-796) and `review-fix-pr.restate.test.ts` (AII-800)
+// are untouched and keep proving the workflow/coordinator against fully in-memory doubles,
+// including the fixed 5s coalescing window's exact timing — this file does not re-prove that
+// here (see docs/restate-testing.md's coverage table for the split).
+//
+// It runs on the `restate-server` binary (AII-1195), the runtime production uses; that is
+// engine evidence, not live-pilot evidence.
+import { randomUUID, createHash, createHmac } from "node:crypto";
+import { EventEmitter } from "node:events";
+import type { RestateEnvironment } from "./harness.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { getDb } from "../../dedup.js";
+import * as githubAuth from "../../github-app-auth.js";
+import * as githubApi from "../../github.js";
+import * as workflowProbe from "../../workflow-probe.js";
+import * as managedAuth from "../../managed-dispatch-auth.js";
+import { makeSnapshot } from "../helpers/fixtures/configured-run.js";
+import { makeMapping } from "../helpers/builders.js";
+import { initMappingsTable, upsertMapping, deleteMapping, type RepoMapping } from "../../config.js";
+import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
+import {
+  type AttemptId,
+  type ReviewFixResultMetadataV1,
+  type ResultIntakeOutcome,
+  type ScopedPrIdentity,
+} from "../../review-fix-contract.js";
+import {
+  REVIEW_FIX_DEADLINE_BUFFER_MINUTES,
+  type PreparedReviewFixAttempt,
+  type ReviewFixAdmissionOutcome,
+  type ReviewFixAdmissionRequest,
+  type ReviewFixAttemptStorePort,
+  type ReviewFixPendingFeedback,
+} from "../../review-fix-ports.js";
+import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
+import { upsertReviewFinding } from "../../review-ledger-store.js";
+import { acceptReviewFixWebhookEvent, enqueueReviewFix, updateReviewFixStatus } from "../../review-fix-queue.js";
+import { REVIEW_PROCESSES, resolveReviewProcess } from "../../review-process.js";
+import { inspectPendingReviewFixFeedback, loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
+import { ContainerReviewFixWorker } from "../../review-fix-container-worker.js";
+import { ReviewFixWorker } from "../../review-fix-worker.js";
+import { admitReviewFix, createProductionFinalizer, withReviewFixCleanup } from "../../restate/review-fix-production.js";
+import { createReviewFixFinalizer } from "../../review-fix-finalize.js";
+import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
+import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
+import {
+  GithubReviewFixWorker,
+  reviewFixAttemptStoreScopeStore,
+  type ReviewFixWorkerCredentialResolver,
+  type ReviewFixWorkerTransport,
+} from "../../review-fix-worker.js";
+import { queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
+import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
+import { appendReviewFixActivityBatch, getReviewFixActivityGaps, getReviewFixCycleSummary, listReviewFixActivity, recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
+import { handleRunnerActivity, handleRunnerResult, ReviewFixIntakeUnavailableError, type RunnerActivityBody } from "../../runner-callback.js";
+import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
+import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
+import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
+import { handleGitHubWebhook } from "../../webhook.js";
+import { appendLog, initLogTable, updateJobStatus } from "../../log.js";
+import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
+import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
+import { createReviewFixPR, reviewFixPRKey } from "../../restate/review-fix-pr.js";
+import {
+  VARIANTS,
+  attachWorkflow,
+  callObject,
+  callWorkflow,
+  crashAfterFirstCall,
+  eventually,
+  journalEntries,
+  journaledRunResult,
+  journalText,
+  queryInvocations,
+  settle,
+  replaceEndpoint,
+  startRetryEnabled,
+  startVariants,
+  stopAll,
+} from "./harness.js";
+
+// ---------------------------------------------------------------------------
+// Deadline arithmetic: a short-but-real admission deadline without touching
+// production's fixed 30-minute buffer (REVIEW_FIX_DEADLINE_BUFFER_MINUTES).
+// jobTimeoutMinutes is only ever plumbed straight into `now + (jobTimeoutMinutes
+// + buffer) * 60_000` — nothing validates it as a positive integer of minutes —
+// so a negative fractional value is the only way to get a deadline seconds, not
+// tens of minutes, away without editing the production constant.
+// ---------------------------------------------------------------------------
+const SHORT_DEADLINE_MS = 3_000;
+const SHORT_DEADLINE_JOB_TIMEOUT_MINUTES = SHORT_DEADLINE_MS / 60_000 - REVIEW_FIX_DEADLINE_BUFFER_MINUTES;
+const LONG_DEADLINE_JOB_TIMEOUT_MINUTES = 90;
+
+// The deadline for the "GitHub success without a stored result" scenario. The attempt ends
+// at its first status read that sees the run ended (AII-1273), or at this deadline.
+const SUCCESS_NO_RESULT_DEADLINE_MS = 6_000;
+const SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES = SUCCESS_NO_RESULT_DEADLINE_MS / 60_000 - REVIEW_FIX_DEADLINE_BUFFER_MINUTES;
+
+// The uncertain-launch alert threshold defaults to a real two minutes
+// (REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES) — this suite's shared attemptWorkflow
+// overrides it via the same `unknownLaunchAlertMs` seam production leaves unset,
+// so the alert fires deterministically inside the short waits used below instead
+// of requiring a real two-minute test. Only one scenario (the uncertain-launch
+// one) ever leaves the reconcile-empty-search loop running long enough to matter.
+const SHORT_UNKNOWN_LAUNCH_ALERT_MS = 1_000;
+// Leave a partial final backoff so the completion bound detects an uncapped sleep.
+const SHORT_UNKNOWN_LAUNCH_GRACE_MS = 6_500;
+const SHORT_POST_DEADLINE_RECONCILE_MS = 5_000;
+
+function sha(seed: string): string {
+  return createHash("sha256").update(seed).digest("hex").slice(0, 40);
+}
+
+/** A stable ingress idempotency key for one PR's Nth feedback signal, deterministic per
+ *  (scope, n) so a retried forward (the "lost acknowledgement" crash window) is absorbed. */
+function feedbackDeliveryId(scope: ScopedPrIdentity, n: number): string {
+  return `feedback-${sha(`${reviewFixPRKey(scope)}#${n}`)}`;
+}
+
+// ---------------------------------------------------------------------------
+// One controllable GitHub-side fixture per scenario's PR (always prNumber 1,
+// under a uniquely owned repo — see freshScope). Every field here stands in for
+// an external GitHub fact or a fault-injection knob; nothing here replaces
+// SQLite admission or finalization logic, which all run for real.
+// ---------------------------------------------------------------------------
+interface GithubFixture {
+  scope: ScopedPrIdentity;
+  attemptId: string | null;
+  open: boolean;
+  draft: boolean;
+  merged: boolean;
+  mergeable: boolean | null;
+  mergeableState: string;
+  headSha: string;
+  checks: Array<{ status: string; conclusion: string | null }>;
+  statusState: string;
+  statusCount: number;
+  reviews: Array<{ userId: number; state: string }>;
+  comments: string[];
+  commentPosts: number;
+  pending: ReviewFixPendingFeedback | null;
+  /** When true, `load()` ignores `pending` above and derives it from the real
+   *  `review_fix_queue`/`review_findings` tables via `loadPendingReviewFixFeedback`
+   *  (including its `queueCursor`), instead of the hand-supplied fixture value. */
+  useProductionPending: boolean;
+  /** Incomplete-feedback outcomes the production-shaped `load()` resolved as pending:null. */
+  incompleteLoads: Array<{ category: string; reason: string }>;
+  windowMs: number;
+  unknownLaunchGraceMs: number;
+  postDeadlineReconcileIntervalMs: number;
+  jobTimeoutMinutes: number;
+  reviewProcess: string | null;
+  blockAdmission: "paused" | "occupied" | "at_capacity" | "budget_exhausted" | null;
+  admitOverride: ((request: ReviewFixAdmissionRequest) => Promise<ReviewFixAdmissionOutcome>) | null;
+  recordResultOverride: ((id: AttemptId, result: ReviewFixResultMetadataV1, now: number) => Promise<ResultIntakeOutcome>) | null;
+  applyApprovalEffectOverride: ReviewFixGitHubAdapter["applyApprovalEffect"] | null;
+  dispatchImpl: (input: Parameters<ReviewFixWorkerTransport["dispatch"]>[0]) => ReturnType<ReviewFixWorkerTransport["dispatch"]>;
+  dispatchCalls: number;
+  listRunsVisible: boolean;
+  lookupTimes: number[];
+  runId: number | null;
+  runAttempt: number;
+  runDetail: { status: string; conclusion: string | null; runAttempt: number } | null;
+  cancelCalls: number;
+  cancelImpl: (input: Parameters<ReviewFixWorkerTransport["cancelRun"]>[0]) => ReturnType<ReviewFixWorkerTransport["cancelRun"]>;
+}
+
+// External container edges only: the real container worker owns launch bookkeeping and terminal inspection.
+const resources = new Map<string, { fixture: GithubFixture; name: string }>();
+const containerEdges = vi.hoisted(() => ({
+  launch: undefined as unknown as (input: any) => Promise<any>,
+  read: undefined as unknown as (id: string) => any,
+  remove: undefined as unknown as (id: string) => Promise<void>,
+  stop: undefined as unknown as (id: string) => Promise<boolean>,
+  list: undefined as unknown as () => any[],
+}));
+vi.mock("../../gapfill-launch.js", () => ({ dispatchFlyGapfill: (input: any) => containerEdges.launch(input) }));
+vi.mock("../../local-gapfill.js", () => ({ dispatchLocalGapfill: (input: any) => containerEdges.launch(input) }));
+vi.mock("../../backend-run.js", async (original) => ({ ...await original<typeof import("../../backend-run.js")>(),
+  readBackendRun: async (_config: unknown, _backend: unknown, id: string) => containerEdges.read(id),
+  stopBackendRun: async (_config: unknown, _backend: unknown, id: string) => containerEdges.stop(id),
+  destroyMachineRecorded: async (_config: unknown, id: string) => containerEdges.remove(id),
+}));
+vi.mock("../../fly-machines.js", async (original) => ({ ...await original<typeof import("../../fly-machines.js")>(),
+  listMachines: async () => containerEdges.list(),
+}));
+vi.mock("../../local-docker.js", async (original) => ({ ...await original<typeof import("../../local-docker.js")>(),
+  inspectLocalContainer: async (id: string) => {
+    const read = containerEdges.read(id);
+    return { running: read.state !== "ended", status: read.state === "ended" ? "exited" : "running", exitCode: read.exit?.exitCode ?? null };
+  },
+  removeLocalContainer: async (id: string) => containerEdges.remove(id),
+}));
+containerEdges.launch = async (input) => {
+  const fixture = findFixture(input.reviewFix.repository);
+  // Mirror each transport's before-launch callback without changing worker bookkeeping.
+  if (input.flySessionsApp !== undefined) {
+    expect(input.implementationSandbox).toEqual(input.decision.kind !== "launch" ? { sandbox: "agent-default", reason: "unprotected" } : process.env.FLY_PROCESS_LEVEL_SECRETS === "false" ? { sandbox: "agent-default", reason: "process-secrets-off" } : { sandbox: "runner-isolated" });
+    input.onBeforeLaunch(undefined, "container-nonce");
+  }
+  else input.onBeforeLaunch("container-nonce");
+  try { await fixture.dispatchImpl({} as never); }
+  finally {
+    if (fixture.runId !== null) resources.set(String(fixture.runId), { fixture, name: input.runName });
+  }
+  return { machine: { id: String(fixture.runId) }, containerId: String(fixture.runId) };
+};
+containerEdges.list = () => [...resources].map(([id, r]) => ({ id, name: r.name }));
+containerEdges.read = (id) => {
+  const fixture = resources.get(id)?.fixture;
+  if (!fixture) return { state: "ended", exit: null };
+  return { state: fixture.runDetail?.status === "completed" ? "ended" : "started",
+    exit: fixture.runDetail?.status === "completed" ? { exitCode: fixture.runDetail.conclusion === "success" ? 0 : 1 } : null };
+};
+containerEdges.stop = async (id) => {
+  const fixture = resources.get(id)!.fixture;
+  fixture.cancelCalls++;
+  return fixture.cancelImpl({} as never);
+};
+containerEdges.remove = async (id) => { resources.delete(id); };
+
+let ownerSeq = 0;
+const fixturesByRepo = new Map<string, GithubFixture>();
+const fixtureByAttempt = new Map<string, GithubFixture>();
+const runIndex = new Map<number, GithubFixture>();
+/** The run tokens each attempt's launch received, as the workflow dispatch inputs carry them. */
+const launchTokensByAttempt = new Map<string, string[]>();
+let nextRunId = 9_000;
+
+function repoKey(repository: string): string {
+  return repository;
+}
+
+/** Fresh mapping row (its own team_key/owner, so team capacity/budget never leak across
+ *  scenarios) plus a default-happy GitHub fixture: open, mergeable, no checks/reviews. */
+function freshScenario(prefix: string, opts: { cap?: number; budget?: number; paused?: boolean } = {}): GithubFixture {
+  const owner = `${prefix}-${ownerSeq++}`;
+  getDb().prepare(`
+    INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, pr_dispatch_budget, paused)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(owner, owner, "target", "claude-implement.yml", "main", opts.cap ?? 5, opts.budget ?? 30, opts.paused ? 1 : 0);
+  const scope: ScopedPrIdentity = { installationId: 7, repository: `${owner}/target`, prNumber: 1 };
+  const fixture: GithubFixture = {
+    scope, attemptId: null,
+    open: true, draft: false, merged: false, mergeable: true, mergeableState: "clean",
+    headSha: sha(`${owner}-initial`),
+    checks: [], statusState: "success", statusCount: 0, reviews: [], comments: [], commentPosts: 0,
+    pending: null, useProductionPending: false, incompleteLoads: [], windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
+    unknownLaunchGraceMs: SHORT_UNKNOWN_LAUNCH_GRACE_MS,
+    postDeadlineReconcileIntervalMs: SHORT_POST_DEADLINE_RECONCILE_MS,
+    reviewProcess: null, blockAdmission: null, admitOverride: null, recordResultOverride: null, applyApprovalEffectOverride: null,
+    dispatchImpl: () => { throw new Error("unset"); },
+    dispatchCalls: 0, lookupTimes: [], listRunsVisible: true, runId: null, runAttempt: 1, runDetail: null,
+    cancelCalls: 0, cancelImpl: async () => true,
+  };
+  fixture.dispatchImpl = async () => {
+    const runId = nextRunId++;
+    fixture.runId = runId;
+    fixture.dispatchCalls++;
+    runIndex.set(runId, fixture);
+    return { success: true, status: 200, outcome: "accepted" as const, runId };
+  };
+  fixturesByRepo.set(repoKey(scope.repository), fixture);
+  return fixture;
+}
+
+function findFixture(repository: string): GithubFixture {
+  const fixture = fixturesByRepo.get(repoKey(repository));
+  if (!fixture) throw new Error(`test bug: no fixture registered for ${repository}`);
+  return fixture;
+}
+
+function latestAttemptRow(scope: ScopedPrIdentity): { attemptId: string } | undefined {
+  const row = getDb().prepare(
+    `SELECT attempt_id AS attemptId FROM review_fix_attempts WHERE repository = ? AND pr_number = ? ORDER BY created_at DESC LIMIT 1`,
+  ).get(scope.repository, scope.prNumber) as { attemptId: string } | undefined;
+  return row;
+}
+
+function activeAdmissionCount(mappingKey: string): number {
+  const row = getDb().prepare(
+    `SELECT COUNT(*) AS n FROM dispatch_admissions WHERE mapping_key = ? AND released_at IS NULL AND phase != 'kg-refresh'`,
+  ).get(mappingKey) as { n: number };
+  return row.n;
+}
+
+function budgetEntryCount(repository: string, prNumber: number): number {
+  const row = getDb().prepare(
+    `SELECT COUNT(*) AS n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ?`,
+  ).get(repository, prNumber) as { n: number };
+  return row.n;
+}
+
+function resultOf(fixture: GithubFixture, prepared: PreparedReviewFixAttempt, overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
+  if (fixture.runId === null) throw new Error("test bug: no bound run id yet");
+  return {
+    version: 1, attemptId: prepared.attemptId, ...prepared.scope, deadlineAt: prepared.deadlineAt,
+    githubRunId: fixture.runId, githubRunAttempt: fixture.runAttempt, outputCommit: fixture.headSha, ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fake GitHub HTTP surface for createReviewFixGithubAdapter (approval gates and
+// the approval comment effect). All PRs in this suite are prNumber 1 under a
+// uniquely owned repo, so owner/repo alone identifies the fixture.
+// ---------------------------------------------------------------------------
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+const fakeGithubFetch: typeof fetch = async (input, init) => {
+  const url = new URL(String(input));
+  const method = (init?.method ?? "GET").toUpperCase();
+  let m: RegExpExecArray | null;
+  if ((m = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/\d+$/.exec(url.pathname))) {
+    const fixture = findFixture(`${m[1]}/${m[2]}`);
+    return jsonResponse(200, {
+      state: fixture.merged || !fixture.open ? "closed" : "open",
+      draft: fixture.draft, merged: fixture.merged,
+      mergeable: fixture.mergeable, mergeable_state: fixture.mergeableState,
+      head: { sha: fixture.headSha },
+    });
+  }
+  if ((m = /^\/repos\/([^/]+)\/([^/]+)\/issues\/\d+\/comments$/.exec(url.pathname))) {
+    const fixture = findFixture(`${m[1]}/${m[2]}`);
+    if (method === "POST") {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { body: string };
+      fixture.comments.push(body.body);
+      fixture.commentPosts++;
+      return jsonResponse(201, {});
+    }
+    return jsonResponse(200, fixture.comments.map((body) => ({ body })));
+  }
+  if ((m = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/\d+\/reviews$/.exec(url.pathname))) {
+    const fixture = findFixture(`${m[1]}/${m[2]}`);
+    return jsonResponse(200, fixture.reviews.map((r) => ({ user: { id: r.userId }, state: r.state })));
+  }
+  if ((m = /^\/repos\/([^/]+)\/([^/]+)\/commits\/[0-9a-f]{40}\/check-runs$/.exec(url.pathname))) {
+    const fixture = findFixture(`${m[1]}/${m[2]}`);
+    return jsonResponse(200, { total_count: fixture.checks.length, check_runs: fixture.checks });
+  }
+  if ((m = /^\/repos\/([^/]+)\/([^/]+)\/commits\/[0-9a-f]{40}\/status$/.exec(url.pathname))) {
+    const fixture = findFixture(`${m[1]}/${m[2]}`);
+    return jsonResponse(200, { state: fixture.statusState, total_count: fixture.statusCount });
+  }
+  throw new Error(`unhandled fake GitHub request: ${method} ${url.pathname}`);
+};
+
+const fakeCredentials: ReviewFixWorkerCredentialResolver = {
+  async resolve(scope) {
+    return { token: "fake-installation-token", installationId: scope.installationId };
+  },
+};
+
+const transport: ReviewFixWorkerTransport = {
+  async dispatch(input) {
+    const attemptId = input.inputs.run_attempt_token;
+    if (!attemptId) throw new Error("test bug: dispatch without run_attempt_token");
+    // Restate can launch the attempt as soon as SQLite admission commits, before
+    // the test's polling helper observes the row and records fixtureByAttempt.
+    const prepared = await sqliteStore.getPreparedAttempt(attemptId);
+    const fixture = fixtureByAttempt.get(attemptId)
+      ?? (prepared ? findFixture(prepared.scope.repository) : undefined);
+    if (!fixture) throw new Error(`test bug: no fixture registered for attempt ${attemptId}`);
+    fixture.attemptId = attemptId;
+    fixtureByAttempt.set(attemptId, fixture);
+    launchTokensByAttempt.set(attemptId, [input.inputs.run_token, input.inputs.run_progress_token, input.inputs.run_publication_token]
+      .filter((t): t is string => typeof t === "string" && t.length > 0));
+    return fixture.dispatchImpl(input);
+  },
+  async listRuns(input) {
+    findFixture(`${input.owner}/${input.repo}`).lookupTimes.push(Date.now());
+    return [...runIndex.entries()]
+      .filter(([, fixture]) => fixture.listRunsVisible && fixture.attemptId !== null
+        && fixture.scope.repository === `${input.owner}/${input.repo}`)
+      .map(([runId, fixture]) => ({
+        runId, runAttempt: fixture.runAttempt,
+        displayTitle: `Review-fix for ${fixture.scope.repository}#${fixture.scope.prNumber} · attempt ${fixture.attemptId}`,
+        headBranch: input.branch,
+      }));
+  },
+  async getRun(input) {
+    const fixture = runIndex.get(input.runId);
+    return fixture?.runDetail ?? null;
+  },
+  async cancelRun(input) {
+    const fixture = runIndex.get(input.runId);
+    if (!fixture) return false;
+    fixture.cancelCalls++;
+    return fixture.cancelImpl(input);
+  },
+  async getPullRequestHeadSha(input) {
+    const fixture = findFixture(`${input.owner}/${input.repo}`);
+    return fixture.headSha;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Production composition: real store, real GitHub adapter (fake fetch), real
+// worker adapter (fake transport), real finalizer (with the same
+// applyApproval wrapper review-fix-production.ts wires), real PR coordinator and attempt workflow. Per-attempt override hooks
+// (never touched by a scenario that doesn't need them) are the only seam this
+// file adds beyond what review-fix-production.ts itself composes.
+// ---------------------------------------------------------------------------
+const sqliteStore = new SqliteReviewFixAttemptStore();
+
+const rawGithub = createReviewFixGithubAdapter({ credentials: fakeCredentials, fetchImpl: fakeGithubFetch });
+const github: ReviewFixGitHubAdapter = {
+  getPrHeadSha: (scope) => rawGithub.getPrHeadSha(scope),
+  evaluateMergePolicy: (scope, dispositions) => rawGithub.evaluateMergePolicy(scope, dispositions),
+  applyApprovalEffect: (scope, attemptId, result, dispositions) => {
+    const fixture = findFixture(scope.repository);
+    const impl = fixture.applyApprovalEffectOverride ?? rawGithub.applyApprovalEffect;
+    return impl(scope, attemptId, result, dispositions);
+  },
+};
+
+const LAUNCH_TOKEN_SECRET = "review-fix-launch-token-secret";
+const ghaWorker = new GithubReviewFixWorker({
+  credentials: fakeCredentials, transport, scopeStore: reviewFixAttemptStoreScopeStore(sqliteStore),
+  // The same shape as `createProductionReviewFixServices`: the launch itself receives the three attempt tokens.
+  callbackInputs: async (attemptId) => ({
+    run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: LAUNCH_TOKEN_SECRET }).token,
+    run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: LAUNCH_TOKEN_SECRET }).token,
+    run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: LAUNCH_TOKEN_SECRET }).token,
+    runner_callback_url: "https://orchestrator.test",
+  }),
+});
+
+const containerWorker = new ContainerReviewFixWorker({ modelAuthRuntime: {} as never, credentials: fakeCredentials,
+  scopeStore: reviewFixAttemptStoreScopeStore(sqliteStore),
+  callbackInputs: async () => ({ runner_callback_url: "https://orchestrator.test", run_token: "result" }),
+  fly: { flySessionsToken: "fly", flySessionsApp: "sessions", flySessionsRegion: null, flyOrchestratorApp: null,
+    sessionImage: "runner", runnerCallbackBaseUrl: "https://orchestrator.test", tenantId: null, anthropicApiKey: null, claudeOAuthToken: null },
+  local: { image: "runner", orchestratorUrl: "https://orchestrator.test" },
+  localCandidates: async (name) => containerEdges.list().filter(r => r.name === name).map(r => r.id),
+  getPullRequestHeadSha: async ({ owner, repo }) => findFixture(`${owner}/${repo}`).headSha,
+});
+const worker = new ReviewFixWorker({ "github-actions": ghaWorker, "fly-machines": containerWorker, "local-docker": containerWorker }, sqliteStore);
+const cleanupConfig = { githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: null,
+  runnerTokenSecret: null, sessionImage: "runner", runnerImageExplicit: false, flySessionsToken: "fly", flySessionsApp: "sessions" };
+const baseFinalizer = createReviewFixFinalizer({ attemptStore: sqliteStore, github });
+// The production wrapper itself (review-fix-production.ts), with no late-review submit wired.
+const lateReviews: Array<{ dispatchId: string; prUrl: string; gapFill?: boolean; attemptId?: string }> = [];
+const finalizer = withReviewFixCleanup(cleanupConfig, sqliteStore, createProductionFinalizer({ store: sqliteStore, github, baseFinalizer,
+  submitLateExternalReview: async (input) => { lateReviews.push(input); return true; } }));
+
+const alerts: Array<{ attemptId: string; reason: string }> = [];
+
+const attemptStore: ReviewFixAttemptStorePort = {
+  admit: (request) => sqliteStore.admit(request),
+  getPreparedAttempt: (id) => sqliteStore.getPreparedAttempt(id),
+  recordLaunchIntent: (id) => sqliteStore.recordLaunchIntent(id),
+  bindExecution: (id, execution, now) => sqliteStore.bindExecution(id, execution, now),
+  revokeAuthority: (id, now) => sqliteStore.revokeAuthority(id, now),
+  hasCurrentAuthority: (id) => sqliteStore.hasCurrentAuthority(id),
+  recordResult: (id, result, now) => {
+    const fixture = fixtureByAttempt.get(id);
+    const impl = fixture?.recordResultOverride ?? sqliteStore.recordResult.bind(sqliteStore);
+    return impl(id, result, now);
+  },
+  releaseOwner: (owner, reason) => sqliteStore.releaseOwner(owner, reason),
+};
+
+const pr = createReviewFixPR({
+  recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
+  attempts: {
+    admit: async (request) => {
+      const fixture = findFixture(request.scope.repository);
+      if (fixture.blockAdmission) return { status: "deferred", reason: fixture.blockAdmission };
+      const impl = fixture.admitOverride ?? sqliteStore.admit.bind(sqliteStore);
+      return impl(request);
+    },
+  },
+  load: async (scope) => {
+    const fixture = findFixture(scope.repository);
+    // Mirrors review-fix-production.ts load(): over-budget feedback resolves as pending:null
+    // (a non-launch outcome) instead of throwing into Restate's unbounded journaled retry.
+    let pending = fixture.pending;
+    if (fixture.useProductionPending) {
+      const inspected = inspectPendingReviewFixFeedback(scope, null);
+      if (inspected.status === "incomplete") fixture.incompleteLoads.push({ category: inspected.category, reason: inspected.reason });
+      pending = inspected.status === "ready" ? inspected.feedback : null;
+    }
+    return { closed: fixture.merged || !fixture.open, jobTimeoutMinutes: fixture.jobTimeoutMinutes, pending,
+      fixer: resolveReviewProcess(fixture.reviewProcess).fixer };
+  },
+  recordDelegated: async (_scope, cursor) => { if (cursor) updateReviewFixStatus(cursor.queueId, "skipped"); },
+  collectionWindowMs: async (scope) => findFixture(scope.repository).windowMs,
+});
+
+const attemptWorkflow = createReviewFixAttempt({
+  store: attemptStore, worker, finalizer, notifyPrOnCompletion: true,
+  unknownLaunchAlertMs: SHORT_UNKNOWN_LAUNCH_ALERT_MS,
+  unknownLaunchGraceMs: (scope) => findFixture(scope.repository).unknownLaunchGraceMs,
+  postDeadlineReconcileIntervalMs: (scope) => findFixture(scope.repository).postDeadlineReconcileIntervalMs,
+  alert: async (attemptId, reason) => { alerts.push({ attemptId, reason }); },
+  loadApprovalEvidence: async (attempt, _result) => {
+    const currentPrHeadSha = (await github.getPrHeadSha(attempt.scope)) ?? "";
+    const findingDispositions = attempt.findings.map((finding) => ({ findingKey: finding.findingKey, disposition: "addressed" as const }));
+    const policyAllows = await github.evaluateMergePolicy(attempt.scope, findingDispositions);
+    return { currentPrHeadSha, findingDispositions, policyAllows, dispositionsComplete: true };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Delivery helper: forwards an external event through the real ingress client, the
+// same path the webhook route uses, rather than calling a Restate handler directly.
+// ---------------------------------------------------------------------------
+describe("Restate review-fix pilot: production-composition fault matrix", () => {
+  let environments: Map<string, RestateEnvironment>;
+  beforeAll(async () => {
+    getDb();
+    initMappingsTable();
+    initDispatchBreakerTable();
+    initLogTable();
+    environments = await startVariants([pr, attemptWorkflow]);
+  }, 60_000);
+  afterAll(async () => { if (environments) await stopAll(environments); });
+
+  it.each([
+    ["default", "fly-machines", {}, false, "admit"],
+    ["fly", "github-actions", {}, false, "admit"],
+    ["local", "github-actions", {}, false, "admit"],
+    ["fly", "github-actions", { flySessionsToken: null }, false, "fly_sessions_token_or_app_missing"],
+    ["fly", "github-actions", { flySessionsApp: null }, false, "fly_sessions_token_or_app_missing"],
+    ["local", "github-actions", { localRunnerImage: "" }, false, "local_runner_image_missing"],
+    ["fly", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["fly", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["local", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["local", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["default", "fly-machines", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["default", "fly-machines", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["fly", "github-actions", {}, true, "model_auth_unavailable"],
+    ["local", "github-actions", {}, true, "model_auth_unavailable"],
+    ["fly", "github-actions", {}, false, "provider=bedrock", { provider: "bedrock" }],
+    ["local", "github-actions", {}, false, "provider=bedrock", { provider: "bedrock" }],
+    ["gha", "github-actions", {}, false, "Filesystem project admission-test requires local runner mode", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["fly", "github-actions", {}, false, "Filesystem project admission-test requires local runner mode", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["local", "github-actions", {}, false, "admit", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["local", "github-actions", {}, false, "not_selected", { paused: true }],
+    ["gha", "github-actions", {}, false, "admit", { reviewFixLifecycle: "legacy" }],
+    ["local", "github-actions", { runnerTokenSecret: null }, false, "callback_unavailable"],
+    ["local", "github-actions", { runnerCallbackBaseUrl: null }, false, "callback_unavailable"],
+    ["fly", "github-actions", {}, false, "installation_mismatch"],
+    ["local", "github-actions", {}, false, "pr_not_open"],
+    ["fly", "github-actions", {}, false, "contract_unverified"],
+    ["gha", "github-actions", {}, false, "admit", { reviewFixLifecycle: null }],
+    ["gha", "github-actions", {}, false, "admit"],
+    ["shadow", "fly-machines", {}, false, "admit"],
+  ] as const)("production admission: %s/%s %j managed=%s => %s", async (mode, executionMode, overrides, managed, expected, mappingOverrides: Partial<RepoMapping> = {}) => {
+    vi.stubEnv("RUNNER_MODE", mode);
+    upsertMapping("admission-test", makeMapping({ owner: "admission-test", repo: "repo", reviewFixLifecycle: "restate", executionMode, ...(mappingOverrides ?? {}) }));
+    const token = vi.spyOn(githubAuth, "getInstallationToken").mockResolvedValue("token");
+    const installation = vi.spyOn(githubAuth, "getInstallationId").mockResolvedValue(123);
+    const prState = vi.spyOn(githubApi, "getPullRequestState").mockResolvedValue({ state: "open", merged: false } as never);
+    const probe = vi.spyOn(workflowProbe, "resolveWorkflowCapabilities").mockResolvedValue({ contract: "envelope",
+      supportsAttemptCorrelation: true, supportsRunPublicationToken: true } as never);
+    if (expected === "installation_mismatch") installation.mockResolvedValue(999);
+    if (expected === "pr_not_open") prState.mockResolvedValue({ state: "closed", merged: false } as never);
+    if (expected === "contract_unverified") token.mockRejectedValue(new Error("GitHub unavailable"));
+    const optIn = vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(managed);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const queueId = enqueueReviewFix({ issueId: "admission-test", issueIdentifier: "AII-1336", repo: "admission-test/repo",
+        prNumber: 1, reason: "changes_requested", sourceEventId: randomUUID() });
+      const request: ReviewFixAdmissionRequest = { scope: { installationId: 123, repository: "admission-test/repo", prNumber: 1 },
+        feedback: { taskText: "fix", findings: [], queueCursor: { queueId, eventId: 1 } }, jobTimeoutMinutes: 90 };
+      const store = { admit: vi.fn().mockResolvedValue({ status: "prepared" }) };
+      await admitReviewFix(request, { githubAppId: "1", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "https://callback",
+        runnerTokenSecret: "secret", sessionImage: "runner", runnerImageExplicit: false,
+        flySessionsApp: "sessions", flySessionsToken: "fly-token", localRunnerImage: "runner", ...overrides }, store);
+      expect(store.admit).toHaveBeenCalledTimes(expected === "admit" ? 1 : 0);
+      expect(probe).toHaveBeenCalledTimes(expected === "admit" && (mode === "gha" || mode === "shadow") ? 1 : 0);
+      if (expected !== "admit") {
+        expect(warning).toHaveBeenCalledTimes(expected === "not_selected" ? 0 : 1);
+        if (expected !== "not_selected") expect(warning).toHaveBeenCalledWith(expect.stringContaining(expected));
+        expect(getDb().prepare("SELECT status FROM review_fix_queue WHERE id = ?").get(queueId)).toEqual({ status: expected.startsWith("Filesystem") ? "skipped" : "pending" });
+      }
+    } finally {
+      token.mockRestore(); installation.mockRestore(); prState.mockRestore(); probe.mockRestore(); optIn.mockRestore(); warning.mockRestore();
+      deleteMapping("admission-test"); vi.unstubAllEnvs();
+    }
+  });
+
+  function envFor(label: string): RestateEnvironment {
+    const env = environments.get(label);
+    if (!env) throw new Error(`missing Restate variant ${label}`);
+    return env;
+  }
+
+  async function triggerFeedback(env: RestateEnvironment, scope: ScopedPrIdentity, n = 1): Promise<void> {
+    const out = await createReviewFixIngressClient(env.baseUrl()).feedback(scope, undefined, { idempotencyKey: feedbackDeliveryId(scope, n) });
+    expect(out.status).toBe("accepted");
+  }
+
+  async function admitOne(env: RestateEnvironment, fixture: GithubFixture, findings: Array<{ findingKey: string; version: number }>): Promise<void> {
+    fixture.pending = { taskText: `Fix ${findings.length} finding versions`, findings };
+    await triggerFeedback(env, fixture.scope);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
+    const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
+    fixture.attemptId = attemptId;
+    fixtureByAttempt.set(attemptId, fixture);
+  }
+
+  /** Seeds one real, open `review_findings` row for `fixture`'s scope — a distinct
+   *  `body` per call so each gets its own content-addressed `finding_key`
+   *  (`stableReviewFindingKey`, hashed from source/path/line/body). */
+  function seedOpenFinding(fixture: GithubFixture, body: string): number {
+    return upsertReviewFinding({
+      repo: fixture.scope.repository, prNumber: fixture.scope.prNumber,
+      source: "review-contract", severity: "medium", body,
+    });
+  }
+
+  let queueEventSeq = 0;
+  /** Enqueues one real `review_fix_queue`/`review_fix_events` row referencing the
+   *  given finding ids — what moves `loadPendingReviewFixFeedback`'s queue lookup
+   *  from "no pending queue entry" to a fresh `queueCursor`, exactly as the
+   *  production webhook-driven path does via `acceptReviewFixWebhookEvent`. */
+  function seedQueueEvent(fixture: GithubFixture, reason: string, findingIds: number[]): void {
+    enqueueReviewFix({
+      issueId: `${fixture.scope.repository}#${fixture.scope.prNumber}`, issueIdentifier: null,
+      repo: fixture.scope.repository, prNumber: fixture.scope.prNumber, reason, findingIds,
+      sourceEventId: `seed-${queueEventSeq++}`,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Admission: capacity, budget, pause, overflow, occupancy, re-reported
+  // findings — all real store.admit()/acquireDispatchAdmission() SQLite logic.
+  // -------------------------------------------------------------------------
+
+  it.each((["fly-machines", "local-docker"] as const).flatMap(backend =>
+    ["removed", "gone", "failure"].map(cleanup => ({ backend, cleanup }))))(
+    "$backend outcome cleanup: $cleanup is idempotent and preserves callback status", async ({ backend, cleanup }) => {
+      const fixture = freshScenario("cleanup");
+      getDb().prepare("UPDATE mappings SET execution_mode = ? WHERE owner = ?").run(backend, fixture.scope.repository.split("/")[0]);
+      const admitted = await sqliteStore.admit({ scope: fixture.scope, feedback: { taskText: "fix", findings: [] }, jobTimeoutMinutes: 90 });
+      if (admitted.status !== "prepared") throw new Error("admission failed");
+      const attemptId = admitted.attempt.attemptId;
+      const generation = (getDb().prepare("SELECT generation FROM dispatch_admissions WHERE dispatch_id = ?").get(attemptId) as { generation: number }).generation;
+      const id = `cleanup-${attemptId}`;
+      const jobId = appendLog({ issueId: attemptId, dispatchId: attemptId, admissionGeneration: generation,
+        machineId: id, machineNonce: "nonce", executionMode: backend });
+      await sqliteStore.bindExecution(attemptId, { backend, runRef: id }, Date.now());
+      updateJobStatus(jobId, "completed", "success", undefined, { skipAdmissionRelease: true });
+      const outcome = { attemptId, scope: fixture.scope, terminal: { status: "succeeded" as const, outputCommit: fixture.headSha } };
+      const original = containerEdges.remove;
+      let calls = 0;
+      containerEdges.remove = async () => {
+        calls++;
+        const row = getDb().prepare("SELECT machine_nonce FROM dispatch_log WHERE id = ?").get(jobId) as { machine_nonce: string | null };
+        expect(row.machine_nonce).toBeNull();
+        if (calls === 1 && cleanup === "failure") throw new Error("backend unavailable");
+        if (cleanup === "gone" || calls > 1) throw new Error(backend === "fly-machines" ? "Fly destroy (404)" : "No such container");
+      };
+      try {
+        if (cleanup === "failure") {
+          await expect(finalizer.recordOutcome(outcome, Date.now())).rejects.toThrow("backend unavailable");
+          expect(await sqliteStore.getRecordedOutcome(attemptId)).toBeNull();
+        }
+        await finalizer.recordOutcome(outcome, Date.now());
+        // Detect any second bookkeeping write, even one that leaves the same values.
+        getDb().exec(`CREATE TEMP TRIGGER no_cleanup_rewrite BEFORE UPDATE ON dispatch_log
+          WHEN OLD.id = ${jobId} BEGIN SELECT RAISE(ABORT, 'duplicate dispatch row write'); END`);
+        try { expect(await finalizer.recordOutcome(outcome, Date.now())).toMatchObject({ status: "already_recorded" }); }
+        finally { getDb().exec("DROP TRIGGER no_cleanup_rewrite"); }
+        const row = getDb().prepare("SELECT status, conclusion FROM dispatch_log WHERE id = ?").get(jobId);
+        expect(row).toMatchObject({ status: "completed", conclusion: "success" });
+        expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(1);
+      } finally {
+        containerEdges.remove = original;
+        await sqliteStore.releaseOwner(attemptId, "finalized");
+      }
+    });
+
+  it.each(["fly-machines", "local-docker"] as const)(
+    "%s: cancellation before reconciliation retains an unbound persisted resource", async (backend) => {
+      const fixture = freshScenario("unbound-container");
+      getDb().prepare("UPDATE mappings SET execution_mode = ? WHERE owner = ?")
+        .run(backend, fixture.scope.repository.split("/")[0]);
+      let finishLaunch!: () => void;
+      const launchPending = new Promise<void>(resolve => { finishLaunch = resolve; });
+      fixture.dispatchImpl = async () => {
+        fixture.dispatchCalls++;
+        fixture.runId = 990000 + ownerSeq;
+        // The transport persisted the resource ID, but its acknowledgement is lost.
+        getDb().prepare("UPDATE dispatch_log SET machine_id = ? WHERE repo = ?")
+          .run(String(fixture.runId), fixture.scope.repository);
+        await launchPending;
+        throw new Error("lost launch response");
+      };
+      const env = await startRetryEnabled([pr, attemptWorkflow]);
+      try {
+        await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+        await eventually(() => fixture.dispatchCalls, calls => calls === 1,
+          { timeoutMs: 8000, label: "persisted unbound launch" });
+        const attemptId = fixture.attemptId!;
+        await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+        finishLaunch();
+        expect(await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId))
+          .toMatchObject({ status: "launch_unresolved" });
+        expect(await sqliteStore.findPreparedAttemptByExecution({ backend, runRef: String(fixture.runId) })).toBeNull();
+        expect((await sqliteStore.getRecordedOutcome(attemptId))?.terminal.status).toBe("launch_unresolved");
+        expect(resources.has(String(fixture.runId))).toBe(true);
+        expect(getDb().prepare("SELECT completed_at, machine_nonce FROM dispatch_log WHERE dispatch_id = ?")
+          .get(attemptId)).toMatchObject({ completed_at: null, machine_nonce: "container-nonce" });
+        expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(1);
+        expect(fixture.cancelCalls).toBe(0);
+      } finally { finishLaunch(); await env.stop(); }
+    }, 30000);
+
+  it.each((["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend =>
+    ["accepted", "unknown-reconciled", "lost-cancel-ack", "restart", "approved"].map(scenario => ({ backend, scenario }))))(
+    "$backend: $scenario leaves no execution or in-flight row", async ({ backend, scenario }) => {
+      const fixture = freshScenario("backend-matrix");
+      getDb().prepare("UPDATE mappings SET execution_mode = ? WHERE owner = ?")
+        .run(backend, fixture.scope.repository.split("/")[0]);
+      const env = await startRetryEnabled([pr, attemptWorkflow]);
+      let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+      try {
+        if (scenario === "unknown-reconciled") fixture.dispatchImpl = crashAfterFirstCall(fixture.dispatchImpl);
+        if (scenario === "lost-cancel-ack") fixture.cancelImpl = async () => { throw new Error("lost cancel acknowledgement"); };
+        await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+        await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8000, label: "backend launch" });
+        const attemptId = fixture.attemptId!;
+        if (backend !== "github-actions") await eventually(() =>
+          (getDb().prepare("SELECT execution_ref FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { execution_ref: string | null }).execution_ref,
+          ref => ref !== null, { timeoutMs: 8000, label: "container execution binding" });
+        if (scenario === "lost-cancel-ack") {
+          await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+          await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 8000, label: "cancel request" });
+          expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(1);
+          expect(await sqliteStore.getRecordedOutcome(attemptId)).toBeNull();
+        }
+        if (scenario === "restart") {
+          replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
+          await env.startedRestateServer.restart();
+          expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(1);
+        }
+        if (scenario !== "lost-cancel-ack") {
+          const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+          const result = backend === "github-actions" ? resultOf(fixture, prepared) : {
+            version: 1 as const, attemptId, ...prepared.scope, deadlineAt: prepared.deadlineAt,
+            executionBackend: backend, outputCommit: fixture.headSha,
+          };
+          expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result)).toMatchObject({ status: "stored" });
+        }
+        fixture.runDetail = { status: "completed", conclusion: scenario === "lost-cancel-ack" ? "cancelled" : "success", runAttempt: 1 };
+        expect(await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId)).toMatchObject({
+          status: "finalized", approval: scenario === "lost-cancel-ack" ? "not_applicable" : "applied",
+        });
+        expect(fixture.dispatchCalls).toBe(1);
+        expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(0);
+        if (backend !== "github-actions") {
+          expect(resources.has(String(fixture.runId))).toBe(false);
+          const row = getDb().prepare("SELECT completed_at, machine_nonce FROM dispatch_log WHERE dispatch_id = ?").get(attemptId) as { completed_at: number | null; machine_nonce: string | null };
+          expect(row.completed_at).not.toBeNull();
+          expect(row.machine_nonce).toBeNull();
+        }
+      } finally { replacement?.close(); await env.stop(); }
+    }, 60000);
+
+  it.each(VARIANTS.flatMap(([label]) => [true, false].flatMap(protectedLaunch => [true, false].map(secrets => ({ label, protectedLaunch, secrets })))))("Fly sandbox $label protected=$protectedLaunch secrets=$secrets stays inside launch-once", async ({ label, protectedLaunch, secrets }) => {
+    const env = envFor(label);
+    const fixture = freshScenario("sandbox");
+    getDb().prepare("UPDATE mappings SET execution_mode = ? WHERE owner = ?").run("fly-machines", fixture.scope.repository.split("/")[0]);
+    vi.stubEnv("FLY_PROCESS_LEVEL_SECRETS", String(secrets));
+    const managed = vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(protectedLaunch);
+    const prepare = vi.spyOn(managedAuth, "prepareManagedDispatch").mockResolvedValue({ kind: "launch", dispatchId: "private", projectKey: "sandbox", backend: "fly-machines", snapshot: makeSnapshot(), fallbackModels: {}, grant: {} as never, takeBootstrap: () => undefined });
+    const settleLaunch = vi.spyOn(managedAuth, "settleLaunch").mockImplementation(() => ({ revoked: false }));
+    try {
+      await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+      await eventually(() => fixture.runId !== null, Boolean, { label: "sandbox launch" });
+      const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+      fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
+      await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId);
+      expect(fixture.dispatchCalls).toBe(1);
+      const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+      const text = journalText(await journalEntries(env.adminAPIBaseUrl(), String(rows[0]!.id)));
+      for (const secret of ["container-nonce", "executionPolicy", "ephemeral-full-access"]) expect(text).not.toContain(secret);
+    } finally {
+      managed.mockRestore(); prepare.mockRestore(); settleLaunch.mockRestore(); vi.unstubAllEnvs();
+    }
+  }, 60_000);
+
+  it.each(VARIANTS.map(([label]) => label))("mixed Legacy/Restate team capacity defers a Restate admission and release wakes it (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("capacity", { cap: 1 });
+    const mapping = getDb().prepare("SELECT team_key FROM mappings WHERE owner = ?").get(fixture.scope.repository.split("/")[0]) as { team_key: string };
+    // Occupy the team's one slot with a Legacy-owned reservation before any Restate admission is offered.
+    const legacyDecision = acquireDispatchAdmission({
+      dispatchId: `legacy-${randomUUID()}`, mappingKey: mapping.team_key,
+      scope: { kind: "issue", issueScope: "legacy-test", issueId: `legacy-${randomUUID()}` },
+      kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1,
+    });
+    expect(legacyDecision.ok).toBe(true);
+
+    fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
+    await triggerFeedback(env, fixture.scope);
+    // The coordinator's check() timer fires after windowMs; give it real time to run and
+    // observe at_capacity before asserting the negative (that admission count stays 1 — the
+    // legacy reservation alone — is never enough on its own, since it starts at 1 already).
+    await settle(fixture.windowMs + 400);
+    expect(latestAttemptRow(fixture.scope)).toBeUndefined();
+    expect(activeAdmissionCount(mapping.team_key)).toBe(1);
+
+    if (!legacyDecision.ok) throw new Error("unreachable");
+    expect(releaseDispatchAdmission(legacyDecision.record.dispatchId, { kind: "legacy" }, legacyDecision.record.generation, "finalized")).toEqual({ status: "released" });
+    await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(fixture.scope), "capacityAvailable", {});
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
+    expect(activeAdmissionCount(mapping.team_key)).toBe(1);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("PR dispatch budget exhaustion defers admission without a reservation, retaining budget history (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("budget", { budget: 1 });
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(1);
+    // Release the only budget slot's occupancy so a second admission attempt fails on
+    // budget specifically, not merely because the PR is still occupied.
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
+
+    // A second, content-distinct feedback batch on the same, now-unoccupied PR must still
+    // defer: the budget ledger counts every entry in the window regardless of release.
+    fixture.pending = { taskText: "Fix 1 finding version (second)", findings: [{ findingKey: "f2", version: 1 }] };
+    await triggerFeedback(env, fixture.scope, 2);
+    await settle(fixture.windowMs + 300);
+    const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+    expect(rows.n).toBe(1);
+    expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(1);
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a paused mapping defers admission indefinitely with no reservation (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("paused", { paused: true });
+    fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
+    await triggerFeedback(env, fixture.scope);
+    await settle(fixture.windowMs + 300);
+    expect(latestAttemptRow(fixture.scope)).toBeUndefined();
+    expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a repository fixer is handed the feedback: queue row skipped, findings open, no attempt (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("delegated");
+    fixture.useProductionPending = true;
+    fixture.reviewProcess = "claude-code-review";
+    const findingId = seedOpenFinding(fixture, "Delegated finding");
+    seedQueueEvent(fixture, "automatic review-fix finding", [findingId]);
+    const original = REVIEW_PROCESSES["claude-code-review"].fixer;
+    REVIEW_PROCESSES["claude-code-review"].fixer = "repository";
+    try {
+      await triggerFeedback(env, fixture.scope);
+      const queueStatus = () => (getDb().prepare(`SELECT status FROM review_fix_queue WHERE repo = ? AND pr_number = ?`)
+        .get(fixture.scope.repository, fixture.scope.prNumber) as { status: string }).status;
+      await eventually(queueStatus, (status) => status === "skipped", { timeoutMs: 8_000, label: "queue row skipped" });
+      await settle(fixture.windowMs + 300);
+      const finding = getDb().prepare(`SELECT status FROM review_findings WHERE id = ?`).get(findingId) as { status: string };
+      expect(finding.status).toBe("open");
+      expect(latestAttemptRow(fixture.scope)).toBeUndefined();
+      expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
+    } finally { REVIEW_PROCESSES["claude-code-review"].fixer = original; }
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("more than 30 finding versions is rejected whole and every version stays pending, per the production non-launch adapter (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("overflow");
+    fixture.useProductionPending = true;
+    // Real review_findings rows (distinct body per finding, so each gets its own
+    // content-addressed finding_key) plus one real review_fix_queue/events row —
+    // the exact tables the production pending-feedback projection reads.
+    const findingIds = Array.from({ length: 35 }, (_, i) => seedOpenFinding(fixture, `Overflow finding number ${i}`));
+    seedQueueEvent(fixture, "automatic review-fix findings", findingIds);
+    expect(() => loadPendingReviewFixFeedback(fixture.scope, null)).toThrow(/count|30/);
+    const inspected = inspectPendingReviewFixFeedback(fixture.scope, null);
+    expect(inspected).toMatchObject({ status: "incomplete", category: "count" });
+    fixture.incompleteLoads.length = 0;
+
+    await triggerFeedback(env, fixture.scope);
+    await eventually(() => fixture.incompleteLoads.length > 0, Boolean, { timeoutMs: 8_000, label: "incomplete feedback detected" });
+    await settle(fixture.windowMs + 300);
+
+    // The coordinator resolved the journaled load as pending:null (no throw), so Restate
+    // does not retry the deterministic failure: a bounded number of loads, one category.
+    expect(fixture.incompleteLoads.length).toBeLessThanOrEqual(3);
+    expect(new Set(fixture.incompleteLoads.map((load) => load.category))).toEqual(new Set(["count"]));
+    expect(fixture.incompleteLoads[0].reason).toContain("35 findings exceed the 30-finding limit");
+    expect(fixture.incompleteLoads[0].reason).not.toContain("Overflow finding number");
+
+    // Nothing admitted, no budget consumed, no worker dispatch.
+    const teamKey = fixture.scope.repository.split("/")[0];
+    expect(latestAttemptRow(fixture.scope)).toBeUndefined();
+    expect(activeAdmissionCount(teamKey)).toBe(0);
+    expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
+    expect(fixture.dispatchCalls).toBe(0);
+
+    // All 35 finding versions remain open, unattempted, and in the pending queue row.
+    const open = getDb().prepare(`SELECT COUNT(*) AS n FROM review_findings WHERE repo = ? AND pr_number = ? AND status = 'open'`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+    expect(open.n).toBe(35);
+    const queued = getDb().prepare(`SELECT status FROM review_fix_queue WHERE repo = ? AND pr_number = ?`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { status: string };
+    expect(queued.status).toBe("pending");
+    expect(inspectPendingReviewFixFeedback(fixture.scope, null)).toMatchObject({ status: "incomplete", category: "count" });
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a new/re-reported finding after a snapshot stays open for the next attempt, per the production pending-feedback projection (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("snapshot");
+    fixture.useProductionPending = true;
+    const findingId = seedOpenFinding(fixture, "Snapshot finding f1");
+    seedQueueEvent(fixture, "automatic review-fix finding", [findingId]);
+
+    await triggerFeedback(env, fixture.scope);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
+    const attemptId1 = latestAttemptRow(fixture.scope)!.attemptId;
+    fixture.attemptId = attemptId1;
+    fixtureByAttempt.set(attemptId1, fixture);
+
+    // Complete the first attempt so the PR is unoccupied again.
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared1 = (await sqliteStore.getPreparedAttempt(attemptId1))!;
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId1, "result", resultOf(fixture, prepared1));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId1)).status).toBe("finalized");
+
+    // Finalizing the first attempt never touches review_findings — resolution is a
+    // separate concern this pilot does not own — so the snapshotted finding is
+    // still open, at its original revision, and still unprocessed (its only
+    // recorded attempt used revision 1).
+    const afterFinalization = getDb().prepare(`SELECT status, revision, finding_key FROM review_findings WHERE id = ?`)
+      .get(findingId) as { status: string; revision: number; finding_key: string };
+    expect(afterFinalization.status).toBe("open");
+    expect(afterFinalization.revision).toBe(1);
+
+    // The same finding, re-reported: upsertReviewFinding bumps its revision (same
+    // content-derived finding_key) and a fresh queue event re-opens the queue row —
+    // the store derives a fresh content-addressed dispatch id from the version
+    // bump, so this is a genuinely new admission rather than a silently dropped
+    // repeat of one already in a completed snapshot.
+    upsertReviewFinding({
+      repo: fixture.scope.repository, prNumber: fixture.scope.prNumber,
+      source: "review-contract", severity: "medium", body: "Snapshot finding f1",
+    });
+    seedQueueEvent(fixture, "automatic review-fix finding (re-reported)", [findingId]);
+    const rereported = getDb().prepare(`SELECT status, revision FROM review_findings WHERE id = ?`)
+      .get(findingId) as { status: string; revision: number };
+    expect(rereported).toEqual({ status: "open", revision: 2 });
+    const pendingAfterRereport = loadPendingReviewFixFeedback(fixture.scope, null);
+    expect(pendingAfterRereport?.findings).toEqual([{ findingKey: afterFinalization.finding_key, version: 2 }]);
+    expect(pendingAfterRereport?.queueCursor).toMatchObject({ queueId: expect.any(Number), eventId: expect.any(Number) });
+
+    await triggerFeedback(env, fixture.scope, 2);
+    await eventually(() => {
+      const row = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
+        .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+      return row.n === 2;
+    }, Boolean, { timeoutMs: 8_000, label: "durable effect" });
+    const rows = getDb().prepare(`SELECT finding_versions_json FROM review_fix_attempts WHERE repository = ? AND pr_number = ? ORDER BY created_at ASC`)
+      .all(fixture.scope.repository, fixture.scope.prNumber) as Array<{ finding_versions_json: string }>;
+    expect(JSON.parse(rows[1].finding_versions_json)).toEqual([{ findingKey: afterFinalization.finding_key, version: 2 }]);
+  }, 20_000);
+
+  // -------------------------------------------------------------------------
+  // Crash window #2 (admission commit before journal) — alwaysReplay only: the
+  // crash is a raw throw out of ctx.run("admit-pending", ...) with no internal
+  // catch in review-fix-pr.ts, so recovery depends on the engine retrying the
+  // step. disableRetries would fail the whole invocation instead of retrying it.
+  // -------------------------------------------------------------------------
+  it("admission commit before journal: an engine retry of a crashed admit converges on one reservation (alwaysReplay)", async () => {
+    const env = envFor("alwaysReplay");
+    const fixture = freshScenario("admit-crash");
+    fixture.admitOverride = crashAfterFirstCall((request: ReviewFixAdmissionRequest) => sqliteStore.admit(request));
+    fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
+    await triggerFeedback(env, fixture.scope);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
+    const mappingKey = getDb().prepare("SELECT team_key FROM mappings WHERE owner = ?").get(fixture.scope.repository.split("/")[0]) as { team_key: string };
+    expect(activeAdmissionCount(mappingKey.team_key)).toBe(1);
+    const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+    expect(rows.n).toBe(1);
+  }, 20_000);
+
+  // -------------------------------------------------------------------------
+  // Crash window #1 (acknowledgement lost), via the real ingress client with the
+  // sender's event id as the idempotency key.
+  // -------------------------------------------------------------------------
+  it.each(VARIANTS.map(([label]) => label))("lost acknowledgement: a feedback forward whose HTTP acknowledgement is lost still becomes exactly one admitted attempt (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("ack-lost");
+    fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
+    const idempotencyKey = feedbackDeliveryId(fixture.scope, 1);
+    // The first call really reaches the Restate ingress and the real feedback() handler
+    // really runs, then the local process "crashes" before observing the 2xx, so the client
+    // reports unavailable. The sender retries under the same key and Restate absorbs it.
+    const ingress = createReviewFixIngressClient(env.baseUrl(), { fetchImpl: crashAfterFirstCall(fetch) });
+    expect(await ingress.feedback(fixture.scope, undefined, { idempotencyKey })).toEqual({ status: "unavailable" });
+    expect(await ingress.feedback(fixture.scope, undefined, { idempotencyKey })).toEqual({ status: "accepted" });
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
+    const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+    expect(rows.n).toBe(1);
+  }, 20_000);
+
+  // -------------------------------------------------------------------------
+  // Launch: response loss, uncertain reconciliation, definitive rejection.
+  // -------------------------------------------------------------------------
+
+  it.each(VARIANTS.map(([label]) => label))("launch accepted before response is observed: reconciles to one execution and one dispatch effect (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("launch-lost");
+    // GithubReviewFixWorker.launch() catches any transport.dispatch() throw internally and
+    // returns { status: "unknown" } — no engine-level retry is involved here, matching the
+    // existing AII-796 "response loss" scenario's own shape.
+    const realDispatch = fixture.dispatchImpl;
+    fixture.dispatchImpl = crashAfterFirstCall(realDispatch);
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    const done = await callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    expect(done).toMatchObject({ status: "stored" });
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
+    expect(fixture.dispatchCalls).toBe(1);
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("an uncertain launch with an empty reconcile search ends, retains occupancy, and never redispatches (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("uncertain-launch");
+    fixture.jobTimeoutMinutes = SHORT_DEADLINE_JOB_TIMEOUT_MINUTES;
+    fixture.dispatchImpl = async () => { fixture.dispatchCalls++; throw new Error("network dropped before the accept/reject was observed"); };
+    fixture.listRunsVisible = false; // an exact reconcile search can never find this dispatch
+    fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
+    const before = alerts.length;
+    await triggerFeedback(env, fixture.scope);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
+    const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
+    fixture.attemptId = attemptId;
+    fixtureByAttempt.set(attemptId, fixture);
+    // The PR coordinator's own check() handler already sent "run" via genericSend the
+    // moment admission was recorded — no separate invocation needed here.
+    // The suite's shared attemptWorkflow overrides the alert threshold to
+    // SHORT_UNKNOWN_LAUNCH_ALERT_MS (see its definition above), so this same wait
+    // — already long enough to clear the admission deadline — also clears the
+    // (shortened) alert threshold, proving both halves of the "uncertain launch"
+    // row: no blind redispatch, and the two-minute-equivalent alert actually fires.
+    await eventually(
+      () => alerts.slice(before).some((a) => a.attemptId === attemptId && a.reason.includes("launch identity still unresolved")),
+      Boolean,
+      { timeoutMs: SHORT_DEADLINE_MS + 10_000, label: "the launch-identity-unresolved alert" },
+    );
+    await eventually(async () => {
+      const facade = createReviewFixAdminFacade(sqliteStore, { reconcile: async () => ({ status: "unknown" }) }, createReviewFixIngressClient(env.baseUrl()));
+      const view = await facade.getAttempt(attemptId, { role: "admin", email: "operator@example.com" });
+      return view.status === "ok" ? view.attempt.state : null;
+    }, (state) => state === "launch_unresolved", { timeoutMs: 12_000, label: "unknown launch completes" });
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+    const completedAt = (getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(attemptId) as { completed_at: number }).completed_at;
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const graceBoundary = prepared.deadlineAt + SHORT_UNKNOWN_LAUNCH_GRACE_MS;
+    expect(completedAt).toBeGreaterThanOrEqual(graceBoundary);
+    // Use the durable outcome timestamp, not when polling/attach observes it.
+    // A five-second uncapped final wait would overshoot by about 3.5s;
+    // allow 2s of durable-call/scheduler overhead while still detecting that bug.
+    expect(completedAt).toBeLessThan(graceBoundary + 2_000);
+    const active = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+      .get(attemptId) as { released_at: number | null };
+    expect(active.released_at).toBeNull();
+    expect(fixture.dispatchCalls).toBe(1);
+    // Restate's journal records when each timer was scheduled and its requested
+    // wake-up time. RPC/polling latency between observed listRuns calls is not
+    // part of the requested cadence. Appending may shorten the remaining delay,
+    // so require a full tick in each phase, rather than a lower bound on every
+    // journal append. The partial ticks end at the deadline and grace boundary.
+    const sleeps = entries.filter((entry) => entry.entry_type === "Command: Sleep").map((entry) => {
+      const command = JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
+      const scheduledAt = Date.parse(String(entry.appended_at));
+      const wakeAt = command.Command.Sleep.wake_up_time;
+      return { scheduledAt, wakeAt, remaining: wakeAt - scheduledAt };
+    });
+    const preDeadline = sleeps.filter((sleep) => sleep.scheduledAt < prepared.deadlineAt);
+    expect(preDeadline.length).toBeGreaterThanOrEqual(2);
+    expect(preDeadline.some((sleep) => sleep.remaining >= 900)).toBe(true);
+    for (const sleep of preDeadline) expect(sleep.remaining).toBeLessThanOrEqual(1_100);
+    const postDeadline = sleeps.filter((sleep) => sleep.scheduledAt >= prepared.deadlineAt);
+    expect(postDeadline.length).toBeGreaterThanOrEqual(2);
+    expect(postDeadline.some((sleep) => sleep.remaining >= SHORT_POST_DEADLINE_RECONCILE_MS - 100)).toBe(true);
+    for (const sleep of postDeadline) expect(sleep.remaining).toBeLessThanOrEqual(SHORT_POST_DEADLINE_RECONCILE_MS + 100);
+    const finalSleep = postDeadline.at(-1)!;
+    expect(finalSleep.wakeAt).toBeGreaterThanOrEqual(graceBoundary);
+    expect(finalSleep.wakeAt).toBeLessThan(graceBoundary + 2_000);
+    expect(finalSleep.remaining).toBeLessThan(SHORT_POST_DEADLINE_RECONCILE_MS - 2_000);
+    // Keep the external lookup evidence too: waits actually space the searches
+    // out, and neither phase degenerates into a busy loop.
+    const preLookups = fixture.lookupTimes.filter((time) => time < prepared.deadlineAt);
+    expect(preLookups.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < preLookups.length; i++) expect(preLookups[i]! - preLookups[i - 1]!).toBeGreaterThanOrEqual(900);
+    // A lookup may begin just before the deadline and finish after it. Count
+    // the backed-off gap itself instead of assigning that lookup to a phase
+    // by its external observation time.
+    expect(fixture.lookupTimes.some((time, i, times) =>
+      i > 0 && time - times[i - 1]! >= SHORT_POST_DEADLINE_RECONCILE_MS - 100)).toBe(true);
+    const lookups = fixture.lookupTimes.length;
+    await settle(SHORT_POST_DEADLINE_RECONCILE_MS + 200);
+    expect(fixture.lookupTimes).toHaveLength(lookups);
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
+    const facade = createReviewFixAdminFacade(sqliteStore, { reconcile: async () => ({ status: "unknown" }) }, createReviewFixIngressClient(env.baseUrl()));
+    const view = await facade.getAttempt(attemptId, { role: "admin", email: "operator@example.com" });
+    expect(view).toMatchObject({ status: "ok", attempt: { state: "launch_unresolved", terminationConfirmed: false } });
+    expect(await sqliteStore.hasCurrentAuthority(attemptId)).toBe(false);
+    const outcomeBefore = await sqliteStore.getRecordedOutcome(attemptId);
+    const late = await callWorkflow<ResultIntakeOutcome>(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", {
+      version: 1, attemptId, ...prepared.scope, deadlineAt: prepared.deadlineAt,
+      githubRunId: 999_999, githubRunAttempt: 1, outputCommit: fixture.headSha,
+    });
+    expect(late.status).toBe("stale");
+    expect(await sqliteStore.getRecordedOutcome(attemptId)).toEqual(outcomeBefore);
+    expect(fixture.commentPosts).toBe(0);
+    expect(alerts.slice(before).some((a) =>
+      a.attemptId === attemptId && a.reason.includes("launch identity still unresolved"))).toBe(true);
+  }, 30_000);
+
+  it.each(VARIANTS.flatMap(([label]) => (["cancel", "closed", "merged"] as const).map((event) => ({ label, event }))))("$event ends an unknown launch during its backed-off wait ($label)", async ({ label, event }) => {
+    const env = envFor(label);
+    const fixture = freshScenario(`unknown-${event}`);
+    fixture.unknownLaunchGraceMs = 10 * 60_000;
+    fixture.postDeadlineReconcileIntervalMs = 10 * 60_000;
+    fixture.jobTimeoutMinutes = SHORT_DEADLINE_JOB_TIMEOUT_MINUTES;
+    fixture.dispatchImpl = async () => { fixture.dispatchCalls++; throw new Error("lost launch response"); };
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    const attemptId = fixture.attemptId!;
+    await eventually(() => sqliteStore.hasCurrentAuthority(attemptId), (authority) => !authority,
+      { timeoutMs: 6_000, label: "deadline revokes unknown launch" });
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const runRows = await eventually(() => queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`),
+      (found) => found.length === 1, { label: "unknown launch run invocation" });
+    // Authority can expire before the workflow starts its backed-off sleep.
+    // Wait for that durable command so cancellation exercises the intended wait.
+    const minimumWakeAt = prepared.deadlineAt + 5 * 60_000;
+    const backedOffSleep = await eventually(async () =>
+      (await journalEntries(env.adminAPIBaseUrl(), runRows[0].id as string))
+        .find((entry) => entry.entry_type === "Command: Sleep"
+          && (JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } })
+            .Command.Sleep.wake_up_time >= minimumWakeAt),
+      (entry) => entry !== undefined,
+      { label: "unknown launch backed-off sleep" });
+    if (event === "cancel") {
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+    } else {
+      fixture.open = false;
+      fixture.merged = event === "merged";
+      expect(await queueReviewFixCancellationForClosedPr(fixture.scope.repository, fixture.scope.prNumber,
+        createReviewFixIngressClient(env.baseUrl()))).toBe(true);
+    }
+    await eventually(async () => (await sqliteStore.getRecordedOutcome(attemptId))?.terminal.status,
+      (status) => status === "launch_unresolved", { label: "cancel interrupts backoff" });
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    expect(rows).toHaveLength(1);
+    expect(Number.isFinite(Number(backedOffSleep!.index))).toBe(true);
+    const command = JSON.parse(String(backedOffSleep!.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
+    const completedAt = (getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(attemptId) as { completed_at: number | null }).completed_at;
+    expect(typeof completedAt).toBe("number");
+    expect(Number.isFinite(command.Command.Sleep.wake_up_time)).toBe(true);
+    // Timer completion would put checkedAt at or after wake_up_time. The durable
+    // outcome preceding it proves cancellation interrupted this attempt's wait,
+    // regardless of when polling observes the outcome.
+    expect(command.Command.Sleep.wake_up_time).toBeGreaterThanOrEqual(minimumWakeAt);
+    expect(completedAt).toBeLessThan(command.Command.Sleep.wake_up_time);
+    expect(fixture.dispatchCalls).toBe(1);
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a definitively rejected launch records failure, releases capacity, and retains budget history (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("rejected-launch");
+    fixture.dispatchImpl = async () => ({ success: false, status: 422, outcome: "rejected" as const, error: "workflow file not found" });
+    // Use the production queue projection here. A hand-supplied pending fixture
+    // would keep offering the same finding after admission and correctly cause
+    // another attempt, inflating the budget ledger before this assertion runs.
+    fixture.useProductionPending = true;
+    const findingId = seedOpenFinding(fixture, "Rejected-launch finding");
+    seedQueueEvent(fixture, "automatic review-fix finding", [findingId]);
+    await triggerFeedback(env, fixture.scope);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
+    const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
+    fixture.attemptId = attemptId;
+    fixtureByAttempt.set(attemptId, fixture);
+    // Rejection can finish before this test observes the committed admission;
+    // Restate no longer has an attachable invocation then. The recorded terminal
+    // result and released reservation are the durable effects that matter here.
+    await eventually(() => {
+      const row = getDb().prepare(`SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?`)
+        .get(attemptId) as { terminal_outcome_json: string | null };
+      return row.terminal_outcome_json !== null;
+    }, Boolean, { timeoutMs: 8_000, label: "durable effect" });
+    const terminal = getDb().prepare(`SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { terminal_outcome_json: string };
+    expect(JSON.parse(terminal.terminal_outcome_json)).toMatchObject({
+      terminal: { status: "failed", reason: "workflow file not found" },
+    });
+    await eventually(() => {
+      const row = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      return row.released_at !== null;
+    }, Boolean, { timeoutMs: 8_000, label: "durable effect" });
+    const released = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(attemptId) as { released_at: number | null };
+    expect(released.released_at).not.toBeNull();
+    expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(1);
+  }, 20_000);
+
+  // -------------------------------------------------------------------------
+  // Result intake: duplicate, conflict, GitHub-success-without-result.
+  // -------------------------------------------------------------------------
+
+  it.each(VARIANTS.map(([label]) => label))("a duplicate result returns the stored acknowledgement without a repeated approval effect (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("duplicate-result");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    const result = resultOf(fixture, prepared);
+    const first = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    expect(first).toMatchObject({ status: "stored", result });
+    const second = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    expect(second).toMatchObject({ status: "duplicate", attemptId: fixture.attemptId });
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
+    expect(fixture.commentPosts).toBe(1);
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("authenticated result callback persists conflicts through dispatch-keyed ingress and prevents approval (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("result-ingress");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const attemptId = fixture.attemptId!;
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const result = resultOf(fixture, prepared);
+    const secret = "result-ingress-secret";
+    const token = mintPreparedReviewFixToken({ attemptId, audience: "result", secret }).token;
+    let legacyProviderLookups = 0;
+    // Same forward as `onReviewFixResult` in src/index.ts: key, client call and shared outcome mapping.
+    const forwardTo = (baseUrl: string) => {
+      const ingress = createReviewFixIngressClient(baseUrl);
+      return async (validated: ReviewFixResultMetadataV1, opts: { idempotencyKey: string }): Promise<ResultIntakeOutcome> => {
+        const out = await ingress.result(validated.attemptId, validated, opts);
+        const outcome = reviewFixResultIntakeFromForward(validated.attemptId, out);
+        if (!outcome) throw new ReviewFixIntakeUnavailableError();
+        return outcome;
+      };
+    };
+    const intake = (candidate: ReviewFixResultMetadataV1, baseUrl = env.baseUrl()) => handleRunnerResult({
+      authorization: `Bearer ${token}`, secret,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: candidate },
+      resolveProvider: async () => { legacyProviderLookups++; return null; },
+      onReviewFixResult: forwardTo(baseUrl),
+    });
+    const rowOf = () => getDb().prepare(`SELECT accepted_result_json, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { accepted_result_json: string | null; result_conflict_at: number | null };
+
+    // Restate unreachable: 503, nothing written.
+    expect(await intake(result, "http://127.0.0.1:1")).toMatchObject({ status: 503 });
+    expect(rowOf().accepted_result_json).toBeNull();
+
+    // A later retry of the same body succeeds, and store-result is the writer.
+    expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "stored" } });
+    const stored = rowOf().accepted_result_json;
+    expect(stored).not.toBeNull();
+
+    // Identical retry: same acknowledgement, row unchanged.
+    expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "stored" } });
+    expect(rowOf().accepted_result_json).toBe(stored);
+
+    expect(await intake(resultOf(fixture, prepared, { outputCommit: sha("callback-conflict") })))
+      .toMatchObject({ status: 409, body: { outcome: "conflict" } });
+    expect(legacyProviderLookups).toBe(0);
+    // The production forwarding path persists the conflict before answering 409.
+    expect(rowOf().result_conflict_at).not.toBeNull();
+
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: fixture.runAttempt };
+    // The conflicting result reached the handler, which revoked authority: approval never applies.
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "not_applicable" });
+    expect(fixture.commentPosts).toBe(0);
+    expect(fixture.dispatchCalls).toBe(1);
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a conflicting result before the final outcome persists conflict and blocks approval (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("conflict-result");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    const first = resultOf(fixture, prepared);
+    expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", first)).toMatchObject({ status: "stored", result: first });
+    const conflicting = resultOf(fixture, prepared, { outputCommit: sha("conflicting-commit") });
+    const conflictOutcome = await callWorkflow<ResultIntakeOutcome>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", conflicting);
+    expect(conflictOutcome).toMatchObject({ status: "conflict" });
+    // recordResult's conflict branch writes result_conflict_at synchronously inside the
+    // same HTTP call that just returned — no polling needed to observe it.
+    const row = getDb().prepare(`SELECT result_conflict_at, authority_revoked_at FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(fixture.attemptId!) as { result_conflict_at: number | null; authority_revoked_at: number | null };
+    expect(row.result_conflict_at).not.toBeNull();
+    expect(row.authority_revoked_at).not.toBeNull();
+    await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    const completion = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
+    expect(completion).toMatchObject({ approval: "not_applicable" });
+    expect(fixture.commentPosts).toBe(0);
+  }, 25_000);
+
+  // GitHub reports the run completed but no result is ever delivered. The attempt ends at its
+  // first status read that sees the run ended (AII-1273), or at the short deadline above.
+  // Either way it finalizes without approval and releases the slot.
+  it.each(VARIANTS.map(([label]) => label))("GitHub success without a stored result never approves and releases when the run ends (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("success-no-result");
+    fixture.jobTimeoutMinutes = SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES;
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    // No "result" is ever delivered for this attempt. GitHub's success must never become an
+    // approval, but the run having ended releases the slot at once (AII-1273) rather than at
+    // the deadline.
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
+    expect(done).toEqual({ status: "finalized", terminal: { status: "succeeded", outputCommit: fixture.headSha }, approval: "not_applicable" });
+    const admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+      .get(fixture.attemptId!) as { released_at: number | null };
+    expect(admission.released_at).not.toBeNull();
+    const stored = getDb().prepare(`SELECT accepted_result_json FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(fixture.attemptId!) as { accepted_result_json: string | null };
+    expect(stored.accepted_result_json).toBeNull();
+    expect(fixture.commentPosts).toBe(0);
+  }, 20_000);
+
+  // -------------------------------------------------------------------------
+  // Result intake, continued: a result delivered after the final outcome.
+  // -------------------------------------------------------------------------
+
+  it.each(VARIANTS.map(([label]) => label))("a result delivered after the final outcome is stale, alerts, and never rewrites the recorded outcome (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("stale-after-final");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    const result = resultOf(fixture, prepared);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
+    expect(done).toMatchObject({ status: "finalized", approval: "applied" });
+    const outcomeBefore = await sqliteStore.getRecordedOutcome(fixture.attemptId!);
+    expect(outcomeBefore).not.toBeNull();
+
+    const before = alerts.length;
+    // release-confirmed-terminal already ran as part of the same workflow execution
+    // that attachWorkflow just observed finalize, so recordResult's isDispatchActive
+    // check (not its terminal_outcome_json check) is what actually fires here — both
+    // paths return the same `stale` status this required-outcome row asks for.
+    const stale = await callWorkflow<ResultIntakeOutcome>(
+      env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result",
+      resultOf(fixture, prepared, { outputCommit: sha("late-conflicting-commit") }),
+    );
+    expect(stale.status).toBe("stale");
+
+    const outcomeAfter = await sqliteStore.getRecordedOutcome(fixture.attemptId!);
+    expect(outcomeAfter).toEqual(outcomeBefore); // the final outcome is byte-identical — never rewritten
+    const reattached = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
+    expect(reattached).toEqual(done); // the cached workflow completion is unchanged too
+    expect(fixture.commentPosts).toBe(1); // no second approval effect from the stale delivery
+    expect(alerts.slice(before).some((a) =>
+      a.attemptId === fixture.attemptId && a.reason.includes("stale result rejected"))).toBe(true);
+  }, 25_000);
+
+  // -------------------------------------------------------------------------
+  // Crash window #4 (result commit before ACK) — alwaysReplay only, same
+  // reasoning as window #2: recordResult's ctx.run has no internal catch.
+  // -------------------------------------------------------------------------
+  it("result commit before ACK: an engine retry of a crashed result intake converges on one stored result (alwaysReplay)", async () => {
+    const env = envFor("alwaysReplay");
+    const fixture = freshScenario("result-crash");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    fixture.recordResultOverride = crashAfterFirstCall((id: AttemptId, result: ReviewFixResultMetadataV1, now: number) => sqliteStore.recordResult(id, result, now));
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    const result = resultOf(fixture, prepared);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
+    const stored = await sqliteStore.getAcceptedResult(fixture.attemptId!);
+    expect(stored?.result).toEqual(result);
+    expect(fixture.commentPosts).toBe(1);
+  }, 25_000);
+
+  // -------------------------------------------------------------------------
+  // Crash window #5 (final effect before acknowledgement) — alwaysReplay only:
+  // the GitHub write inside ctx.run("apply-approval-once") lands, then the step
+  // crashes. The engine retries the step, and the adapter's upsert makes the
+  // repeat write a no-op (AII-1186).
+  // -------------------------------------------------------------------------
+  it("a crash after the approval write is retried by the engine and leaves exactly one approval (alwaysReplay)", async () => {
+    const env = envFor("alwaysReplay");
+    const fixture = freshScenario("effect-crash");
+    fixture.applyApprovalEffectOverride = crashAfterFirstCall(rawGithub.applyApprovalEffect.bind(rawGithub));
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    const result = resultOf(fixture, prepared);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
+    expect(done).toMatchObject({ status: "finalized", approval: "applied" });
+    expect(fixture.commentPosts).toBe(1); // the crashed call's write landed; the retry's upsert did not post a second comment
+  }, 25_000);
+
+  // AII-1414: the push starts CI on the pushed head, so the merge policy is false at finalize; the late review
+  // (which does the waiting) must still be submitted, and the approval comment must not be posted.
+  it("a succeeded attempt whose checks are still running at finalize submits the late review once and posts no approval", async () => {
+    const env = envFor("alwaysReplay");
+    const fixture = freshScenario("checks-running");
+    fixture.checks = [{ status: "in_progress", conclusion: null }];
+    const jobId = appendLog({ issueId: "issue-checks-running", repo: fixture.scope.repository, dispatchId: "d-checks-running" });
+    updateJobStatus(jobId, "completed", "success", `https://github.com/${fixture.scope.repository}/pull/1`);
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    const attemptId = fixture.attemptId!;
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const result = resultOf(fixture, prepared);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "withheld" });
+    const mine = () => lateReviews.filter((review) => review.attemptId === attemptId);
+    expect(mine()).toEqual([expect.objectContaining({ dispatchId: "d-checks-running", gapFill: true, attemptId })]);
+    expect(fixture.commentPosts).toBe(0);
+    // A repeated finalize (re-attach, repeated result delivery) adds no submit.
+    await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
+    expect(mine()).toHaveLength(1);
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("completed_at is the timestamp the record-success-outcome step journaled, and the journal holds no secret (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("journal-projection");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    // Pin the attempt now: `fixture.attemptId` is reassigned by every launch, and the fixture's pending
+    // feedback never clears, so once this attempt releases, the PR admits an identical-content `-1` attempt
+    // whose dispatch overwrites it. The journal and row below must be this attempt's, not that one's.
+    const attemptId = fixture.attemptId!;
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const result = resultOf(fixture, prepared);
+    const secret = "journal-projection-secret";
+    // The launch's own tokens, read from the journal while the attempt waits for its result: Restate trims the
+    // launch entry once the attempt finishes, so a later read would find no token for any reason.
+    const launchTokens = launchTokensByAttempt.get(attemptId) ?? [];
+    expect(launchTokens).toHaveLength(3);
+    const waiting = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    const launchJournal = await eventually(
+      async () => {
+        const journal = await journalEntries(env.adminAPIBaseUrl(), waiting[0].id as string);
+        try {
+          journaledRunResult(journal, "launch-once");
+          return journal;
+        } catch {
+          return undefined;
+        }
+      },
+      (journal) => journal !== undefined,
+      { timeoutMs: 8_000, label: "launch-once journaled result" },
+    );
+    const launchText = journalText(launchJournal!);
+    for (const token of [...launchTokens, "container-nonce", "executionPolicy", "ephemeral-full-access"]) expect(launchText).not.toContain(token);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "applied" });
+
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    expect(rows).toHaveLength(1);
+    const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+
+    const journaled = journaledRunResult(entries, "record-success-outcome") as { status: string; completedAt: number };
+    expect(journaled.status).toBe("recorded");
+    // Wait for the projection rather than reading once: the journaled step is the authority, the row follows it.
+    const readCompletedAt = () => (getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(attemptId) as { completed_at: number | null } | undefined)?.completed_at ?? null;
+    const completedAt = await eventually(readCompletedAt, (v) => v !== null, { timeoutMs: 5_000, label: "review_fix_attempts.completed_at !== null" });
+    expect(completedAt).toBe(journaled.completedAt);
+
+    expect(journalText(entries)).not.toContain(secret);
+  }, 25_000);
+
+  // -------------------------------------------------------------------------
+  // Cancel, closed PR, and termination that cannot be verified.
+  // -------------------------------------------------------------------------
+
+  it.each(VARIANTS.map(([label]) => label))("cancellation revokes authority and requests a stop while occupancy is retained until confirmed termination (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("cancel");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "cancel", { attemptId: fixture.attemptId });
+    await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
+    let row = getDb().prepare(`SELECT authority_revoked_at FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(fixture.attemptId!) as { authority_revoked_at: number | null };
+    expect(row.authority_revoked_at).not.toBeNull();
+    let admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(fixture.attemptId!) as { released_at: number | null };
+    expect(admission.released_at).toBeNull(); // still occupied — the backend has not confirmed terminal yet
+    fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
+    admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(fixture.attemptId!) as { released_at: number | null };
+    expect(admission.released_at).not.toBeNull();
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a closed PR revokes authority and forwards cancel under <attemptId>.closed through the ingress client (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("closed-forward");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const attemptId = fixture.attemptId!;
+    const ingress = createReviewFixIngressClient(env.baseUrl());
+    expect(await queueReviewFixCancellationForClosedPr(fixture.scope.repository, fixture.scope.prNumber, ingress)).toBe(true);
+    await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
+    const row = getDb().prepare(`SELECT authority_revoked_at FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { authority_revoked_at: number | null };
+    expect(row.authority_revoked_at).not.toBeNull();
+    fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("finalized");
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("an operator cancel forwards under <attemptId>.cancel and a repeat with the same key is absorbed (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("operator-forward");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const attemptId = fixture.attemptId!;
+    const ingress = createReviewFixIngressClient(env.baseUrl());
+    const facade = createReviewFixAdminFacade(sqliteStore, { reconcile: async () => ({ status: "unknown" }) }, ingress);
+    const admin = { role: "admin" as const, email: "operator@example.com" };
+    expect(await facade.revokeAuthority(attemptId, admin)).toEqual({ status: "accepted" });
+    expect(await facade.requestCancellation(attemptId, admin)).toEqual({ status: "accepted" });
+    expect(await facade.requestCancellation(attemptId, admin)).toEqual({ status: "accepted" });
+    await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'cancel'`);
+    expect(rows).toHaveLength(1);
+    fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("finalized");
+  }, 25_000);
+
+  it("authenticated activity intake preserves gaps, enforces both byte caps, and leaves cycle evidence independent", async () => {
+    const env = envFor("alwaysReplay");
+    const secret = "activity-fault-matrix-secret";
+    const producerId = "runner-tools";
+    const overhead = Buffer.byteLength(JSON.stringify({ payload: "", truncated: false }), "utf8");
+    const remaining = 16 * 1024 - overhead;
+    const maxPayload = "€".repeat(Math.floor(remaining / 3)) + "a".repeat(remaining % 3);
+    const event = (attemptId: string, sequence: number, payload: string): ReviewFixActivityEvent => ({
+      version: 1, attemptId, producerId, sequence, cycle: 1, kind: "tool_result",
+      timestamp: Date.now(), payload, truncated: false,
+    });
+    const post = async (attemptId: string, events: ReviewFixActivityEvent[], finalSequence?: number) => {
+      const token = mintPreparedReviewFixToken({ attemptId, audience: "progress", secret }).token;
+      const response = await handleRunnerActivity({
+        authorization: `Bearer ${token}`, secret,
+        body: { version: 1, attemptId, producerId, events, finalSequence },
+        onReviewFixActivity: (batch: RunnerActivityBody) => {
+          const stored = appendReviewFixActivityBatch(batch);
+          if (stored.rejectedInvalid.length > 0) throw new Error("validated activity was rejected by SQLite");
+          return { status: "accepted", attemptId: batch.attemptId };
+        },
+      });
+      expect(response.status).toBe(200);
+    };
+
+    const gapFixture = freshScenario("activity-gaps");
+    await admitOne(env, gapFixture, [{ findingKey: "f1", version: 1 }]);
+    const gapAttemptId = gapFixture.attemptId!;
+    await post(gapAttemptId, [event(gapAttemptId, 0, "first"), event(gapAttemptId, 2, maxPayload + "a")], 4);
+    expect(getReviewFixActivityGaps(gapAttemptId, producerId)).toMatchObject({
+      ranges: [{ from: 1, to: 1 }, { from: 3, to: 4 }], finalSequence: 4, tailComplete: false,
+    });
+    const truncated = listReviewFixActivity(gapAttemptId, { pageSize: 10 }).events.find((row) => row.sequence === 2);
+    expect(truncated).toMatchObject({ truncated: true, payload: null });
+    await post(gapAttemptId, [1, 3, 4].map((sequence) => event(gapAttemptId, sequence, `event-${sequence}`)));
+    expect(getReviewFixActivityGaps(gapAttemptId, producerId)).toMatchObject({
+      ranges: [], finalSequence: 4, tailComplete: true,
+    });
+
+    const capFixture = freshScenario("activity-cap");
+    await admitOne(env, capFixture, [{ findingKey: "f1", version: 1 }]);
+    const capAttemptId = capFixture.attemptId!;
+    for (let start = 0; start < 640; start += 64) {
+      await post(capAttemptId, Array.from({ length: 64 }, (_, i) => event(capAttemptId, start + i, maxPayload)));
+    }
+    const beforeLimit = getDb().prepare(`SELECT accepted_bytes, limit_reached_at FROM review_fix_activity_streams WHERE attempt_id = ?`)
+      .get(capAttemptId) as { accepted_bytes: number; limit_reached_at: number | null };
+    expect(beforeLimit).toMatchObject({ accepted_bytes: 10 * 1024 * 1024, limit_reached_at: null });
+    await post(capAttemptId, [event(capAttemptId, 640, "over the attempt cap")]);
+    const afterLimit = getDb().prepare(`SELECT accepted_bytes, limit_reached_at FROM review_fix_activity_streams WHERE attempt_id = ?`)
+      .get(capAttemptId) as { accepted_bytes: number; limit_reached_at: number | null };
+    expect(afterLimit.accepted_bytes).toBe(10 * 1024 * 1024);
+    expect(afterLimit.limit_reached_at).not.toBeNull();
+    const storedCount = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_activity WHERE attempt_id = ?`)
+      .get(capAttemptId) as { n: number };
+    expect(storedCount.n).toBe(640);
+    const summary = recordReviewFixCycleSummary({
+      attemptId: capAttemptId, cycle: 1, inputCommit: capFixture.headSha, outputCommit: capFixture.headSha,
+      dispositions: [], tests: { passed: 1 }, verdict: "passed", usage: { tokens: 10 }, completedAt: Date.now(),
+    });
+    expect(summary.status).toBe("recorded");
+    expect(getReviewFixCycleSummary(capAttemptId, 1)).toMatchObject({ verdict: "passed" });
+  }, 40_000);
+
+  it("a lost cancellation acknowledgement and endpoint restart retain occupancy until the exact run stops", async () => {
+    const fixture = freshScenario("cancel-lost-ack");
+    const acceptedCancel = fixture.cancelImpl;
+    fixture.cancelImpl = crashAfterFirstCall(
+      (input: Parameters<ReviewFixWorkerTransport["cancelRun"]>[0]) => acceptedCancel(input),
+    );
+    const env = await startRetryEnabled([pr, attemptWorkflow]);
+    let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+    try {
+      await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+      await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+      const attemptId = fixture.attemptId!;
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+      await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
+
+      const state = getDb().prepare(`SELECT authority_revoked_at, terminal_outcome_json
+        FROM review_fix_attempts WHERE attempt_id = ?`).get(attemptId) as
+        { authority_revoked_at: number | null; terminal_outcome_json: string | null };
+      expect(state.authority_revoked_at).not.toBeNull();
+      expect(state.terminal_outcome_json).toBeNull();
+      let admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).toBeNull();
+      expect(fixture.commentPosts).toBe(0);
+
+      replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
+      await env.startedRestateServer.restart();
+      await eventually(() => fixture.cancelCalls > 1, Boolean, { timeoutMs: 10_000, label: "fixture.cancelCalls > 1" });
+      admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).toBeNull();
+      expect(fixture.dispatchCalls).toBe(1);
+
+      fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: fixture.runAttempt };
+      const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+      expect(done).toMatchObject({ status: "finalized", approval: "not_applicable" });
+      admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).not.toBeNull();
+      expect(fixture.dispatchCalls).toBe(1);
+      expect(fixture.commentPosts).toBe(0);
+      const attempts = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts
+        WHERE repository = ? AND pr_number = ?`)
+        .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+      expect(attempts.n).toBe(1);
+    } finally {
+      replacement?.close();
+      await env.stop();
+    }
+  }, 60_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a closed PR blocks further automatic admission once it is unoccupied, specifically because load() reports it closed (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("closed-pr");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
+    // The PR is now unoccupied — a normal feedback nudge here would admit a second attempt
+    // (proven by the overflow/re-report scenarios above). Marking it closed is what must be
+    // the reason nothing new is admitted, not lingering occupancy.
+    fixture.open = false; // simulates queueReviewFixCancellationForClosedPr's precondition
+    fixture.pending = { taskText: "Fix 1 finding version (post-close)", findings: [{ findingKey: "f2", version: 1 }] };
+    await triggerFeedback(env, fixture.scope, 2);
+    await settle(fixture.windowMs + 300);
+    const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+    expect(rows.n).toBe(1); // no second attempt was admitted for the closed, unoccupied PR
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("backend termination that cannot be verified keeps occupancy and alerts that operator action is required (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("unverified-terminal");
+    fixture.jobTimeoutMinutes = SHORT_DEADLINE_JOB_TIMEOUT_MINUTES;
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    fixture.runDetail = null; // getRun keeps returning null — inspectTerminal can never confirm reached:true
+    const before = alerts.length;
+    void callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "cancel", { attemptId: fixture.attemptId }).catch(() => undefined);
+    await eventually(
+      () => alerts.slice(before).some((a) => a.attemptId === fixture.attemptId && a.reason.includes("unconfirmed")),
+      Boolean,
+      { timeoutMs: SHORT_DEADLINE_MS + 10_000, label: "the unconfirmed-termination alert" },
+    );
+    expect(alerts.slice(before).some((a) => a.attemptId === fixture.attemptId && a.reason.includes("unconfirmed"))).toBe(true);
+    const admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(fixture.attemptId!) as { released_at: number | null };
+    expect(admission.released_at).toBeNull();
+  }, 30_000);
+
+  // -------------------------------------------------------------------------
+  // Restart/retention: the same SQLite row and the same Restate journal, at the
+  // full production-composition level (not the in-memory doubles AII-796 uses).
+  // -------------------------------------------------------------------------
+  it("a restart preserves the same SQLite row and Restate journal for an in-flight production-composed attempt", async () => {
+    const fixture = freshScenario("restart");
+    const env = await startRetryEnabled([pr, attemptWorkflow]);
+    let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+    try {
+      fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
+      await triggerFeedback(env, fixture.scope);
+      await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
+      const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
+      fixture.attemptId = attemptId;
+      fixtureByAttempt.set(attemptId, fixture);
+      // The coordinator's own check() handler already sent "run" via genericSend.
+      await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 10_000, label: "fixture.runId !== null" });
+
+      replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
+      await env.startedRestateServer.restart(); // same disk-backed server/journal
+
+      const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", resultOf(fixture, prepared));
+      fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+      const attached = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+      expect(attached).toMatchObject({ status: "finalized", approval: "applied" });
+      expect(fixture.dispatchCalls).toBe(1);
+      expect(fixture.commentPosts).toBe(1);
+      const released = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(attemptId) as { released_at: number | null };
+      expect(released.released_at).not.toBeNull();
+    } finally {
+      replacement?.close();
+      await env.stop();
+    }
+  }, 60_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a feedback event projects one finding and one queue row, once per event (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("intake", { paused: true });
+    const event = {
+      eventId: `evt-${randomUUID()}`, deliveryId: `delivery-${randomUUID()}`, issueId: "issue-1", issueIdentifier: "AII-1",
+      repo: fixture.scope.repository, prNumber: fixture.scope.prNumber, reason: "claude review requested changes",
+      findings: [{ source: "github-review" as const, severity: "medium" as const, body: "unchecked null in parser" }],
+    };
+    const key = reviewFixPRKey(fixture.scope);
+    await callObject(env.baseUrl(), "ReviewFixPR", key, "feedback", event);
+    await callObject(env.baseUrl(), "ReviewFixPR", key, "feedback", event);
+    const findings = getDb().prepare("SELECT body, severity FROM review_findings WHERE repo = ? AND pr_number = ?")
+      .all(fixture.scope.repository, fixture.scope.prNumber);
+    expect(findings).toEqual([{ body: "unchecked null in parser", severity: "medium" }]);
+    const queue = getDb().prepare("SELECT reason, issue_identifier FROM review_fix_queue WHERE repo = ? AND pr_number = ?")
+      .all(fixture.scope.repository, fixture.scope.prNumber);
+    expect(queue).toEqual([{ reason: event.reason, issue_identifier: "AII-1" }]);
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixPR' AND target_service_key = '${key}' AND target_handler_name = 'feedback'`);
+    expect(journalText(await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string))).toContain(event.deliveryId);
+  }, 20_000);
+  it.each(VARIANTS.map(([label]) => label))("a signed review comment webhook forwards through the ingress client to one finding and one queue row, once per delivery id (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("webhook-forward", { paused: true });
+    const [owner, repo] = fixture.scope.repository.split("/") as [string, string];
+    getDb().prepare("UPDATE mappings SET review_fix_lifecycle = 'restate' WHERE team_key = ?").run(owner);
+    const jobId = appendLog({ issueId: "issue-wh", issueIdentifier: "AII-9", repo: fixture.scope.repository });
+    updateJobStatus(jobId, "completed", "success", `https://github.com/${owner}/${repo}/pull/1`);
+
+    const secret = "webhook-forward-secret";
+    const ingress = createReviewFixIngressClient(env.baseUrl());
+    // Only a trusted review bot's inline comment is forwarded. A human's is recorded and waits for a
+    // Request changes review, so the forward path is driven by `claude[bot]` here.
+    const payloadFor = (user: { login: string; type: string }, commentBody: string) => JSON.stringify({
+      action: "created",
+      installation: { id: fixture.scope.installationId },
+      comment: { id: 99, body: commentBody, html_url: "https://github.com/x/c", path: "a.ts", line: 4,
+        user, commit_id: "sha-1", created_at: new Date().toISOString() },
+      pull_request: { number: 1, html_url: `https://github.com/${owner}/${repo}/pull/1`, head: { ref: "ai-implement/AII-9-fix", sha: "sha-1" } },
+      repository: { full_name: fixture.scope.repository },
+    });
+    let body = payloadFor({ login: "claude[bot]", type: "Bot" }, "unchecked null in parser");
+    const deliver = async (deliveryId: string) => {
+      const req = Object.assign(new EventEmitter(), { headers: {
+        "x-hub-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+        "x-github-event": "pull_request_review_comment", "x-github-delivery": deliveryId,
+      } });
+      process.nextTick(() => { req.emit("data", Buffer.from(body)); req.emit("end"); });
+      let status = 0;
+      let text = "";
+      const res = { writeHead: (code: number) => { status = code; }, end: (chunk?: string) => { text = chunk ?? ""; } };
+      await handleGitHubWebhook(req as never, res as never, secret, undefined, undefined, undefined, undefined, undefined, ingress);
+      return { status, body: JSON.parse(text) as unknown };
+    };
+    const counts = () => ({
+      findings: (getDb().prepare("SELECT COUNT(*) AS n FROM review_findings WHERE repo = ?").get(fixture.scope.repository) as { n: number }).n,
+      queue: (getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_queue WHERE repo = ?").get(fixture.scope.repository) as { n: number }).n,
+    });
+
+    const deliveryId = `wh-${randomUUID()}`;
+    expect(await deliver(deliveryId)).toEqual({ status: 202, body: { forwarded: true } });
+    expect(counts()).toEqual({ findings: 1, queue: 1 });
+    expect(await deliver(deliveryId)).toEqual({ status: 202, body: { forwarded: true } });
+    expect(counts()).toEqual({ findings: 1, queue: 1 });
+
+    body = payloadFor({ login: "reviewer", type: "User" }, "rename this variable");
+    expect(await deliver(`wh-${randomUUID()}`)).toEqual({
+      status: 200, body: { recorded: true, reason: "awaiting_changes_requested", findingId: expect.any(Number) },
+    });
+    expect(counts()).toEqual({ findings: 2, queue: 1 });
+  }, 20_000);
+});

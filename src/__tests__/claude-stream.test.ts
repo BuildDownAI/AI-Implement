@@ -6,6 +6,8 @@ import {
   extractToolTrace,
   formatEvent,
   summaryLine,
+  sawToolUse,
+  sawUnsafeToolUse,
   type StreamEvent,
 } from "../pipeline/claude-stream.js";
 
@@ -64,6 +66,15 @@ describe("finalText", () => {
 });
 
 describe("extractTelemetry", () => {
+  it("correlates Bash calls with structured results and ignores unmatched mentions", () => {
+    const events: StreamEvent[] = [
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "npm test" } }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: "failed" }] } },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "t2", name: "Bash", input: { command: "npm run typecheck" } }] } },
+      { type: "assistant", message: { content: [{ type: "text", text: "npm test passed" }] } },
+    ];
+    expect(extractTelemetry(events).executedCommands).toEqual([{ command: "npm test", failed: true }]);
+  });
   it("extracts metrics from a success result", () => {
     const t = extractTelemetry([initEvent, toolEvent, resultSuccess]);
     expect(t).toEqual({
@@ -79,7 +90,7 @@ describe("extractTelemetry", () => {
     });
   });
   it("maps error_max_turns to outcome=max_turns", () => {
-    const t = extractTelemetry([{ type: "result", subtype: "error_max_turns", num_turns: 50 }]);
+    const t = extractTelemetry([{ type: "result", subtype: "error_max_turns", is_error: true, num_turns: 50 }]);
     expect(t.outcome).toBe("max_turns");
     expect(t.numTurns).toBe(50);
   });
@@ -240,5 +251,74 @@ describe("extractTelemetry toolTrace", () => {
       { type: "result", subtype: "success", num_turns: 3 },
     ];
     expect(extractTelemetry(events).toolTrace).toEqual(["Read /a"]);
+  });
+});
+
+describe("sawToolUse", () => {
+  it("returns true when an assistant event carries a tool_use block", () => {
+    expect(sawToolUse([initEvent, toolEvent])).toBe(true);
+  });
+
+  it("returns false for text-only assistant events", () => {
+    expect(sawToolUse([initEvent, textEvent])).toBe(false);
+  });
+
+  it("returns false for a user event echoing a tool_result (not an assistant tool_use)", () => {
+    const userToolResult: StreamEvent = {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+    };
+    expect(sawToolUse([initEvent, userToolResult])).toBe(false);
+  });
+
+  it("returns false for an empty event list", () => {
+    expect(sawToolUse([])).toBe(false);
+  });
+});
+
+describe("sawUnsafeToolUse", () => {
+  const asst = (content: unknown): StreamEvent => ({ type: "assistant", message: { content } });
+  const use = (name?: unknown) => ({ type: "tool_use", ...(name === undefined ? {} : { name }), input: {} });
+
+  it.each(["Read", "Glob", "Grep"])("returns false for a proven read-only %s tool_use", (name) => {
+    expect(sawUnsafeToolUse([initEvent, asst([use(name)])])).toBe(false);
+  });
+
+  it.each(["Bash", "Bash(curl *)", "Edit", "Write", "NotebookEdit", "Task", "Agent", "Skill", "mcp__srv__tool", "Mystery", "read"])(
+    "returns true for %s tool_use",
+    (name) => {
+      expect(sawUnsafeToolUse([initEvent, asst([use(name)])])).toBe(true);
+    },
+  );
+
+  it("returns true for a nameless or non-string-named tool_use", () => {
+    expect(sawUnsafeToolUse([asst([use()])])).toBe(true);
+    expect(sawUnsafeToolUse([asst([use(42)])])).toBe(true);
+  });
+
+  it("returns true when an unsafe tool_use is mixed with a safe one", () => {
+    expect(sawUnsafeToolUse([asst([use("Read"), use("Write")])])).toBe(true);
+  });
+
+  it("finds tool_use nested inside non-top-level content or a non-array content", () => {
+    expect(sawUnsafeToolUse([asst([{ type: "wrapper", content: [use("Bash")] }])])).toBe(true);
+    expect(sawUnsafeToolUse([asst({ nested: use("Edit") })])).toBe(true);
+    expect(sawUnsafeToolUse([asst({ type: "tool_use", name: "Write" })])).toBe(true);
+  });
+
+  it("treats structure too deep to scan as unsafe", () => {
+    let deep: unknown = use("Read");
+    for (let i = 0; i < 20; i++) deep = { next: deep };
+    expect(sawUnsafeToolUse([asst([deep])])).toBe(true);
+  });
+
+  it("returns false for text-only, string-content and empty events", () => {
+    expect(sawUnsafeToolUse([initEvent, textEvent])).toBe(false);
+    expect(sawUnsafeToolUse([asst("just a string")])).toBe(false);
+    expect(sawUnsafeToolUse([])).toBe(false);
+  });
+
+  it("sawToolUse also sees nested tool_use", () => {
+    expect(sawToolUse([asst([{ type: "wrapper", content: [use("Read")] }])])).toBe(true);
   });
 });

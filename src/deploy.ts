@@ -5,33 +5,21 @@ import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { clearDeployHold, isDeployHeld, setDeployHold } from "./deploy-hold.js";
-import { getScopedInstallationToken } from "./github-app-auth.js";
-import { fetchRepoTarball, getBranchSha } from "./github.js";
-import { getInFlightWork } from "./in-flight-work.js";
+import { mintSourceTokenOrJwt } from "./github-app-auth.js";
+import { fetchRepoTarball } from "./github.js";
+import { getDb } from "./dedup.js";
+import type { RestateDrainProbes } from "./restate/drain.js";
+import { queryNonCompletedInvocations, restateBindAddress } from "./restate/endpoint.js";
+import { RESTATE_ADMIN_BASE_URL } from "./restate/server.js";
 import type { SelfDeployTarget } from "./deploy-availability.js";
 
 export interface DeployArgsInput {
   app: string;
-  kgToken: string;
-  kgSourceRepo: string;
+  kgToken: string | null;
+  kgSourceRepo: string | null;
   sourceCommit: string;
   sourceRepo: string;
   sourceBranch: string;
-}
-
-export interface RunDeployInput {
-  app: string;
-  flyDeployToken: string;
-  owner: string;
-  repo: string;
-  branch: string;
-  /** The commit to deploy — resolved by the caller, not the branch tip. */
-  commit: string;
-  githubAppId: string;
-  githubAppPrivateKey: string;
-  kgSourceRepo: string;
-  pollIntervalMs: number;
 }
 
 const execFile = promisify(nodeExecFile);
@@ -46,10 +34,6 @@ const FLYCTL_SHA256: Record<string, string> = {
 // Only the tail of flyctl's output is kept: flyctl's errors land at the end, the head is apt output.
 const FLYCTL_LOG_TAIL_BYTES = 64 * 1024;
 
-// The KG repository the image clones at build time unless a deployment overrides it.
-// The Dockerfile holds the same default. Keep them in sync.
-export const DEFAULT_KG_SOURCE_REPO = "BuildDownAI/knowledge-graph-ai-implement";
-
 export interface KgSourceRepo {
   owner: string;
   repo: string;
@@ -60,7 +44,10 @@ const GITHUB_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const GITHUB_REPO_RE = /^[A-Za-z0-9._-]+$/;
 
 export function parseKgSourceRepo(value: string | null | undefined): KgSourceRepo {
-  const raw = (value || DEFAULT_KG_SOURCE_REPO).trim();
+  if (!value?.trim()) {
+    throw new Error(`[deploy] KG_SOURCE_REPO must be an owner/repo GitHub repository, got ""`);
+  }
+  const raw = value.trim();
   const parts = raw.split("/");
   if (parts.length !== 2) {
     throw new Error(`[deploy] KG_SOURCE_REPO must be an owner/repo GitHub repository, got "${raw}"`);
@@ -76,13 +63,14 @@ export function parseKgSourceRepo(value: string | null | undefined): KgSourceRep
 
 /**
  * Resolve the configured KG repository without making a typo fatal to the
- * orchestrator. An invalid explicit value disables self-deploy rather than
- * silently switching a project instance back to the default graph.
+ * orchestrator. An absent value returns null (sidecar-less deployment, no warning);
+ * a set-but-malformed value warns and disables self-deploy.
  */
 export function readKgSourceRepo(
   value: string | null | undefined,
   warn: (message: string) => void = console.warn,
 ): string | null {
+  if (!value?.trim()) return null;
   try {
     return parseKgSourceRepo(value).fullName;
   } catch {
@@ -91,107 +79,25 @@ export function readKgSourceRepo(
   }
 }
 
-const DEPLOY_TIMEOUT_MS = 20 * 60 * 1000;
-// A runner job is force-terminated 60 minutes after its dispatch,
-// so with new dispatches paused the in-flight set always drains.
-// this bounds a monitor that has itself stopped working, not the normal case.
-const DRAIN_TIMEOUT_MS = 75 * 60 * 1000;
-
-/**
- * Builds and releases a new version of this orchestrator.
-*
-* On success this never returns: the release replaces the machine, so the process is
-* SIGINTed inside the flyctl await and no catch or finally runs. The hold is
-* therefore released at boot, not here. Only a failure — which happens before the
-* machine is touched — comes back to this function.
-*/
-export async function runDeploy(input: RunDeployInput): Promise<void> {
-  const { app, flyDeployToken, owner, repo, branch, commit, githubAppId, githubAppPrivateKey, kgSourceRepo, pollIntervalMs } = input;
-  const kgSource = parseKgSourceRepo(kgSourceRepo);
-  
-  setDeployHold();
-  try {
-    // Setting the hold above is what makes this terminate: new dispatches have stopped,
-    // so the in-flight set only shrinks from here.
-    await waitForQuiet(DRAIN_TIMEOUT_MS, drainPollMs(pollIntervalMs));
-    
-    const scratch = await deployScratch();
-    const flyctl = await resolveFlyctl(scratch);
-    
-    const source = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, owner, {
-      permissions: { contents: "read" },
-      repositories: [repo],
-    });
-    const context = await extractSource(
-      await fetchRepoTarball(source.token, owner, repo, commit),
-      scratch,
-    );
-    
-    const kg = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, kgSource.owner, {
-      permissions: { contents: "read" },
-      repositories: [kgSource.repo],
-    });
-    
-    console.log(`[deploy] deploying ${owner}/${repo}@${commit.slice(0, 7)} to ${app}`);
-    await runFlyctl(
-      flyctl,
-      deployArgs({
-        app,
-        kgToken: kg.token,
-        kgSourceRepo: kgSource.fullName,
-        sourceCommit: commit,
-        sourceRepo: `${owner}/${repo}`,
-        sourceBranch: branch,
-      }),
-      {
-        cwd: context,
-        // A deliberate allowlist, not process.env: the orchestrator's environment
-        // holds every credential it has, and none of them belong in a build.
-        env: { PATH: process.env.PATH ?? "", HOME: scratch, FLY_API_TOKEN: flyDeployToken },
-        timeoutMs: DEPLOY_TIMEOUT_MS,
-      },
-    );
-    
-    // Reached only when the release did not replace its own process: a different app, or a local run.
-    // A self-deploy is SIGINTed inside the await above and relies on the
-    // boot clear instead — which is why this cannot be a finally.
-    console.log(`[deploy] ${app} released; this process was not replaced`);
-    clearDeployHold();
-  } catch (err) {
-    clearDeployHold();
-    throw err;
-  }
-}
-
-/** Holds until nothing is executing. Logs only when the blocking set changes. */
-async function waitForQuiet(timeoutMs: number, pollMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let reported = "";
-
-  for (;;) {
-    const blocking = getInFlightWork();
-    if (blocking.length === 0) return;
-
-    const summary = blocking.map((w) => `${w.count} ${w.kind}`).join(", ");
-    if (summary !== reported) {
-      console.log(`[deploy] waiting for work to drain — ${summary}`);
-      reported = summary;
-    }
-
-    if (Date.now() >= deadline) {
-      throw new Error(`[deploy] work did not drain within ${Math.round(timeoutMs / 60000)}m — ${summary}`);
-    }
-    await sleep(pollMs);
-  }
-}
-
-/**
- * How often to re-check the in-flight set. The set is mutated by the poll loop, so
- * checking faster than it runs observes nothing new; half an interval bounds how long
- * a drain sits on stale state. The floor protects a very short configured interval.
- */
-export function drainPollMs(pollIntervalMs: number): number {
-  return Math.max(5_000, Math.floor(pollIntervalMs / 2));
+/** Restate invocation state is independent of dispatch_log and reservations. All
+ * four probes must prove zero before a replacement can begin. */
+export function createRestateDrainProbes(excludeInvocationId?: string): RestateDrainProbes {
+  const { host, port } = restateBindAddress();
+  const endpointUri = `http://${host}:${port}`;
+  const count = (sql: string): number => {
+    const row = getDb().prepare(sql).get() as { n: number };
+    return row.n;
+  };
+  return {
+    oldDeploymentInvocations: () => queryNonCompletedInvocations(fetch, RESTATE_ADMIN_BASE_URL, endpointUri, excludeInvocationId),
+    unresolvedLaunches: async () => count(`SELECT COUNT(*) AS n FROM review_fix_attempts a
+      JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
+      WHERE d.released_at IS NULL AND a.state = 'launch_intent' AND (a.github_run_id IS NULL AND a.execution_ref IS NULL)`),
+    unresolvedTerminations: async () => count(`SELECT COUNT(*) AS n FROM review_fix_attempts a
+      JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
+      WHERE d.released_at IS NULL AND a.authority_revoked_at IS NOT NULL AND a.completed_at IS NULL`),
+    activeOwners: async () => count("SELECT COUNT(*) AS n FROM dispatch_admissions WHERE released_at IS NULL AND lifecycle_owner LIKE 'restate:%'"),
+  };
 }
 
 /**
@@ -203,10 +109,10 @@ export function drainPollMs(pollIntervalMs: number): number {
 function runFlyctl(
   binary: string,
   args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
+  opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(binary, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"], signal: opts.signal });
     
     // Chunks with a running total, not string concat: re-slicing a 64 KB string on
     // every chunk would allocate hundreds of megabytes across one build.
@@ -242,25 +148,33 @@ function runFlyctl(
 }
 
 export function deployArgs(input: DeployArgsInput): string[] {
-  // An empty value is the failure this function exists to prevent: an empty build
-  // secret fail-softs to a sidecar-less image, and an empty stamp leaves the next
-  // version unable to tell what it is running. Fail before flyctl is invoked.
-  for (const [key, value] of Object.entries(input)) {
-    if (!value) throw new Error(`[deploy] refusing to deploy with an empty ${key}`);
+  // An empty stamp leaves the next version unable to tell what it is running.
+  // Fail before flyctl is invoked. KG fields are optional — null means sidecar-less build.
+  for (const key of ["app", "sourceCommit", "sourceRepo", "sourceBranch"] as const) {
+    if (!input[key]) throw new Error(`[deploy] refusing to deploy with an empty ${key}`);
   }
-  
-  return [
-    "deploy",
-    "--remote-only",
-    "--no-cache",
+
+  const args = ["deploy", "--remote-only", "--no-cache"];
+
+  const hasToken = Boolean(input.kgToken);
+  const hasRepo = Boolean(input.kgSourceRepo);
+  if (hasToken !== hasRepo) {
+    throw new Error(`[deploy] kgToken and kgSourceRepo must both be set or both be absent (got token=${hasToken}, repo=${hasRepo})`);
+  }
+  if (input.kgToken && input.kgSourceRepo) {
     // --build-secret takes only NAME=VALUE, so the token rides in argv; execFile runs flyctl without a shell.
-    "--build-secret", `kg_token=${input.kgToken}`,
-    "--build-arg", `KG_SOURCE_REPO=${parseKgSourceRepo(input.kgSourceRepo).fullName}`,
+    args.push("--build-secret", `kg_token=${input.kgToken}`);
+    args.push("--build-arg", `KG_SOURCE_REPO=${parseKgSourceRepo(input.kgSourceRepo).fullName}`);
+  }
+
+  args.push(
     "--build-arg", `SOURCE_COMMIT=${input.sourceCommit}`,
     "--build-arg", `SOURCE_REPO=${input.sourceRepo}`,
     "--build-arg", `SOURCE_BRANCH=${input.sourceBranch}`,
     "--app", input.app,
-  ];
+  );
+
+  return args;
 }
 
 /** flyctl's release assets use `x86_64` where Node reports `x64`. */
@@ -322,14 +236,6 @@ export async function extractSource(tarball: Buffer, dir: string): Promise<strin
   return context;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export type DeployStart =
-  | { started: true; commit: string }
-  | { started: false; reason: "deploy-in-progress" | "head-unknown" };
-
 /**
  * The configuration a deploy needs. Narrow by design: AppConfig satisfies it
  * structurally, so this module never imports the orchestrator's config type.
@@ -338,83 +244,65 @@ export interface StartDeployConfig {
   flyDeployToken: string | null;
   flyOrchestratorApp: string | null;
   selfDeployTarget: SelfDeployTarget | null;
-  pollIntervalMs: number;
-  githubAppId: string;
-  githubAppPrivateKey: string;
-  kgSourceRepo: string | null;
-  /** Called when the build or release step fails, so the caller can record the outcome. */
-  onBuildFailure?: (commit: string, err: unknown) => void;
-}
-
-/** `StartDeployConfig` with every optional deploy prerequisite proven present. */
-type SelfDeployReady = StartDeployConfig & {
-  flyDeployToken: string;
-  flyOrchestratorApp: string;
-  selfDeployTarget: SelfDeployTarget;
-  kgSourceRepo: string;
-};
-
-/**
- * Builds the trigger's entry point, or undefined when this orchestrator cannot deploy
- * itself — which is what lets the route answer 501 rather than failing partway.
- */
-export function makeStartDeploy(
-  config: StartDeployConfig,
-): (() => Promise<DeployStart>) | undefined {
-  if (!canSelfDeploy(config)) return undefined;
-
-  const target = config.selfDeployTarget;
-  const app = config.flyOrchestratorApp;
-  const flyDeployToken = config.flyDeployToken;
-
-  return async () => {
-    // Claim before any await: the check and the set have to be atomic. With the awaits
-    // below sitting between them, two triggers arriving together would both pass the
-    // check, and the loser's cleanup would clear the hold out from under the winner.
-    if (isDeployHeld()) return { started: false, reason: "deploy-in-progress" };
-    setDeployHold();
-
-    try {
-      const source = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, target.owner, {
-        permissions: { contents: "read" },
-        repositories: [target.repo],
-      });
-      const head = await getBranchSha(source.token, target.owner, target.repo, target.branch);
-      if (!head) {
-        clearDeployHold();
-        return { started: false, reason: "head-unknown" };
-      }
-
-      void runDeploy({
-        app,
-        flyDeployToken,
-        owner: target.owner,
-        repo: target.repo,
-        branch: target.branch,
-        commit: head,
-        pollIntervalMs: config.pollIntervalMs,
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
-        kgSourceRepo: config.kgSourceRepo,
-      }).catch((err) => {
-        console.error("[deploy] failed:", err);
-        config.onBuildFailure?.(head, err);
-      });
-
-      return { started: true, commit: head };
-    } catch (err) {
-      // Only a 404 is soft here,
-      // both calls throw on any other non-OK response, and a hold claimed above would otherwise outlive the request that took it.
-      clearDeployHold();
-      throw err;
-    }
-  };
 }
 
 /**
  * Whether this orchestrator can deploy itself: a token with deploy rights, an app to
- * deploy, build stamps naming what to build, and a validated KG source repository.
+ * deploy, and build stamps naming what to build. KG is optional — null means sidecar-less.
  */
-export function canSelfDeploy(config: StartDeployConfig): config is SelfDeployReady {
-  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget && config.kgSourceRepo);
+export function canSelfDeploy(config: StartDeployConfig): config is StartDeployConfig & { flyDeployToken: string; flyOrchestratorApp: string; selfDeployTarget: SelfDeployTarget } {
+  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget);
+}
+
+const FLYCTL_TIMEOUT_MS = 20 * 60 * 1000;
+
+export interface FlyctlRunInput {
+  owner: string;
+  repo: string;
+  /** The commit the build context is extracted from — never the branch tip. */
+  commit: string;
+  githubAppId: string;
+  githubAppPrivateKey: string;
+  args: string[];
+  flyDeployToken: string;
+  signal: AbortSignal;
+}
+
+/**
+ * Runs flyctl against the source tarball at `commit`. The `SelfDeploy` object's `flyctl` dependency:
+ * the object owns the deadline and aborts `signal`, which kills the subprocess. Never logs argv, which
+ * can carry the KG build secret.
+ */
+export async function runSelfDeployFlyctl(input: FlyctlRunInput): Promise<void> {
+  const { owner, repo, commit } = input;
+  // Mint and fetch the source before downloading flyctl: auth failures and
+  // inaccessible repos surface here with an actionable message, not after 100 MB of I/O.
+  const { token: sourceToken, authMode } = await mintSourceTokenOrJwt(
+    input.githubAppId, input.githubAppPrivateKey, owner,
+    { permissions: { contents: "read" }, repositories: [repo] },
+  );
+  let tarball: Buffer;
+  try {
+    tarball = await fetchRepoTarball(sourceToken, owner, repo, commit);
+  } catch (err) {
+    if (authMode === "public") {
+      // Public (unauthenticated) path means the App is not installed on the owner.
+      throw new Error(
+        `Source repo '${owner}/${repo}' is not accessible. It may be private and the GitHub App is not installed on '${owner}'. Install the App on that org, or add the repository to the existing installation.`,
+      );
+    }
+    throw err;
+  }
+  const scratch = await deployScratch();
+  const flyctl = await resolveFlyctl(scratch);
+  const context = await extractSource(tarball, scratch);
+  console.log(`[deploy] running flyctl for ${owner}/${repo}@${commit.slice(0, 7)}`);
+  await runFlyctl(flyctl, input.args, {
+    cwd: context,
+    // A deliberate allowlist, not process.env: the orchestrator's environment
+    // holds every credential it has, and none of them belong in a build.
+    env: { PATH: process.env.PATH ?? "", HOME: scratch, FLY_API_TOKEN: input.flyDeployToken },
+    timeoutMs: FLYCTL_TIMEOUT_MS,
+    signal: input.signal,
+  });
 }

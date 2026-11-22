@@ -1,61 +1,25 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { implementStep } from "./implement.js";
+import type { ReferenceRepoResult } from "../../reference-repos.js";
 import { reviewStep } from "./review.js";
-import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { READ_ONLY_TOOL_PARAMS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
-import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
+import { normalizeRetryPolicy } from "../retry-backoff.js";
+import { writeCycleSummary } from "../cycle-summary.js";
+import { runFeedbackLoop, splitPlanningContext, type FeedbackLoopOutputs, type PassStat, type TerminationReason } from "../feedback-loop-core.js";
+import { DEFAULT_MODEL } from "../default-model.js";
+import { hookOutputTail, runHookScript } from "./hooks.js";
+import { neutralizeFences } from "../../completion-classification.js";
+import { restoreWorkspace, snapshotWorkspace } from "../workspace-guard.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
-const DEFAULT_MODEL = "claude-sonnet-4-6";
 
-const ACCEPTANCE_BAR_HEADER = "## ✅ AI Planning: Acceptance Bar";
-const MAP_HEADER = "## 🗺 AI Planning: Implementation Map";
-
-// All recognised planning-section headers. A section ends only when one of
-// these appears, so internal subheadings (e.g. "## Files" inside the Map) do
-// not split the section prematurely.
-const PLANNING_HEADERS = [
-  "## 🏗️ AI Planning: Architecture Analysis",
-  "## 🧪 AI Planning: Test Plan",
-  "## 🔗 AI Planning: Cross-Story Context",
-  "## 🗺 AI Planning: Implementation Map",
-  "## ✅ AI Planning: Acceptance Bar",
-  "## ⚠️ AI Planning: Risks & Open Questions",
-];
-
-function extractSection(text: string, header: string): string | undefined {
-  const startIdx = text.indexOf(header);
-  if (startIdx === -1) return undefined;
-  const afterStart = startIdx + header.length;
-  let sectionEnd = text.length;
-  for (const h of PLANNING_HEADERS) {
-    if (h === header) continue;
-    const idx = text.indexOf(h, afterStart);
-    if (idx !== -1 && idx < sectionEnd) sectionEnd = idx;
-  }
-  // Strip planning_context wrapper tags that appear when this is the last section,
-  // then strip the trailing "---" separator from the "\n\n---\n\n" join format.
-  return text
-    .slice(startIdx, sectionEnd)
-    .replace(/<\s*\/?\s*planning_context\s*>/gi, "")
-    .trim()
-    .replace(/\n\n---\s*$/, "")
-    .trim();
-}
-
-export function splitPlanningContext(planningContext: string): {
-  acceptanceBar: string | undefined;
-  mapSection: string | undefined;
-} {
-  return {
-    acceptanceBar: extractSection(planningContext, ACCEPTANCE_BAR_HEADER),
-    mapSection: extractSection(planningContext, MAP_HEADER),
-  };
-}
+export { splitPlanningContext };
+export type { PassStat, TerminationReason };
 
 interface FeedbackLoopInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -75,59 +39,24 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   maxTurns?: number;
   provider?: string;
   planningContext?: string;
+  referenceRepoResults?: ReferenceRepoResult[];
   implementationPrompt?: string;
   parentStepId?: string;
+  /** Optional reviewer rubric appended to review prompts (e.g. kg-refresh-specific approval criteria). */
+  reviewRubric?: string;
+  /** Injectable backoff sleep for tests; defaults to a real timer-based wait. */
+  sleep?: (ms: number) => Promise<void>;
+  /** True when the first install attempt failed (`install` step output). */
+  installFailed?: boolean;
+  /** `hooks.verify` script path. When set (and the install succeeded), the hook runs after every
+   *  implement pass that ends normally, before that pass's review. */
+  verifyScriptPath?: string;
+  /** The install command that failed (`install` step output). */
+  installMethod?: string;
+  /** Redacted tail of the failed install's output (`install` step output). */
+  installError?: string;
 }
 
-export type TerminationReason = "approved" | "iterations_exhausted" | "review_error" | "max_turns";
-
-export interface PassStat extends Record<string, unknown> {
-  iteration: number;
-  implementTurns: number | null;
-  implementOutcome: string;   // RunTelemetry outcome or "unknown"
-  costUsd: number | null;
-  reviewApproved: boolean | null; // null when review never ran on this pass
-  tokensIn?: number | null;
-  tokensOut?: number | null;
-  cacheReadTokens?: number | null;
-  cacheCreationTokens?: number | null;
-}
-
-interface FeedbackLoopOutputs extends Record<string, unknown> {
-  approved: boolean;
-  iterations: number;
-  finalFeedback: string;
-  terminationReason: TerminationReason;
-  passes: PassStat[];
-  postMortem?: string;
-}
-
-function buildImplementPrompt(
-  issueTitle: string,
-  issueDescription: string,
-  reviewFeedback: string | undefined,
-  reviewIssues: string[],
-  issueIdentifier: string,
-  implementationPrompt?: string,
-): string {
-  const basePrompt =
-    implementationPrompt && implementationPrompt.trim()
-      ? implementationPrompt
-      : `Implement the following issue.\n\nTitle: ${issueTitle}\n\nDescription:\n${issueDescription}`;
-
-  if (reviewFeedback || reviewIssues.length > 0) {
-    const issueBlock =
-      reviewIssues.length > 0
-        ? `\n\nReviewer issues:\n${reviewIssues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")}`
-        : "";
-    return `${basePrompt}\n\n## Reviewer Feedback\n\nYou previously attempted to implement ${issueIdentifier}: ${issueTitle}.${issueBlock}\n\nReviewer feedback:\n${reviewFeedback ?? "(none)"}\n\nPlease address every listed issue and use the feedback for context.`;
-  }
-  return basePrompt;
-}
-
-function exceededConfiguredMaxTurns(telemetry: RunTelemetry | undefined, maxTurns: number): boolean {
-  return typeof telemetry?.numTurns === "number" && telemetry.numTurns > maxTurns;
-}
 
 /**
  * Pathspecs excluded from the review diff. Generated artifacts (relay
@@ -236,7 +165,84 @@ export function getDiff(workspaceDir: string): string {
   }
 }
 
+/**
+ * `git status --porcelain` snapshot, used by `isRunDirty` to detect uncommitted
+ * changes (BAC-27134). Returns "" on a spawn failure — the same fail-safe
+ * getDiff uses — since misreading a dirty tree as clean (the exhausted-and-throw
+ * path) is the safer misclassification than fabricating a dirty tree that isn't there.
+ */
+function gitStatusSnapshot(workspaceDir: string): string {
+  const result = spawnSync("git", ["status", "--porcelain"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 ? result.stdout.toString() : "";
+}
+
+/** `git rev-parse HEAD`, used by `isRunDirty` to detect a hook/template commit
+ *  (BAC-27134). Returns "" on a spawn failure, the same fail-safe as gitStatusSnapshot. */
+function resolveHeadSha(workspaceDir: string): string {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 ? result.stdout.toString().trim() : "";
+}
+
+/**
+ * True when the working tree has uncommitted changes, OR HEAD has moved since
+ * `runStartHead` was captured at the start of the run (BAC-27134): a hook or
+ * template that commits on its own leaves a clean tree with real work behind it.
+ * Evaluated against the WHOLE run rather than a per-pass snapshot — comparing
+ * against a per-pass snapshot let iteration 2's provider failure (before any
+ * edit of its own) match a snapshot that already listed iteration 1's files,
+ * silently losing iteration 1's work. Lockfile-only churn counting as dirty is
+ * acceptable.
+ */
+function isRunDirty(workspaceDir: string, runStartHead: string): boolean {
+  if (gitStatusSnapshot(workspaceDir).trim().length > 0) return true;
+  return resolveHeadSha(workspaceDir) !== runStartHead;
+}
+
+
 const POST_MORTEM_MAX_TURNS = 15;
+
+type AgentSnapshot = NonNullable<PipelineContext["data"]["agentConfig"]>;
+
+/**
+ * Configured-run projection of a sub-step's limit/model inputs from the frozen snapshot, so reports
+ * describe the actual invocation (the selector overwrites model/timeout and drops Codex maxTurns).
+ * Returns a clone; the original (core-owned) step and its inputs are never touched. Legacy runs
+ * (no snapshot) and unrelated step ids pass through unchanged.
+ */
+export function projectStageReport(step: Step, snapshot: AgentSnapshot | undefined): Step {
+  if (!snapshot) return step;
+  const stage = /^implement\.\d+(\.retry\d+)?$/.test(step.id)
+    ? "implementation"
+    : /^review\.\d+(\.retry\d+)?$/.test(step.id)
+      ? "review"
+      : undefined;
+  if (!stage) return step;
+  return { ...step, inputs: projectStageInputs(step.inputs, snapshot, stage) };
+}
+
+function projectStageInputs(
+  inputs: Record<string, unknown>,
+  snapshot: AgentSnapshot,
+  stage: "implementation" | "review",
+  claudeMaxTurns?: number,
+): Record<string, unknown> {
+  const selection = snapshot.stages[stage];
+  const { maxTurns, ...rest } = inputs;
+  return {
+    ...rest,
+    model: selection.model,
+    invocationTimeoutMs: selection.invocationTimeoutMs,
+    ...(selection.agent === "claude" && (claudeMaxTurns ?? maxTurns) !== undefined
+      ? { maxTurns: claudeMaxTurns ?? maxTurns }
+      : {}),
+  };
+}
 
 function buildPostMortemPrompt(params: {
   issueTitle: string;
@@ -275,6 +281,7 @@ async function runPostMortem(
   params: { issueTitle: string; issueDescription: string; diff: string; telemetry: RunTelemetry; maxTurns: number; model: string; iteration: number; parentStepId: string },
   reporter: StepReporter,
 ): Promise<string | null> {
+  const snapshot = context.data.agentConfig;
   const subStep: Step = {
     id: `post-mortem.${params.iteration}`,
     type: "custom",
@@ -282,30 +289,43 @@ async function runPostMortem(
     started_at: new Date().toISOString(),
     ended_at: null,
     parent_step_id: params.parentStepId,
-    inputs: { iteration: params.iteration, maxTurns: params.maxTurns },
+    inputs: snapshot
+      ? projectStageInputs({ iteration: params.iteration }, snapshot, "review", POST_MORTEM_MAX_TURNS)
+      : { iteration: params.iteration, maxTurns: params.maxTurns },
     outputs: {},
     logs_url: null,
   };
   await reporter.report(subStep);
+  let result: Awaited<ReturnType<typeof context.llmExecutor.invoke>> | undefined;
   try {
-    const result = await context.llmExecutor.invoke({
+    result = await context.llmExecutor.invoke({
       prompt: buildPostMortemPrompt(params),
       model: params.model,
       maxTurns: POST_MORTEM_MAX_TURNS,
-      tools: READ_ONLY_ALLOWED_TOOLS,
+      ...READ_ONLY_TOOL_PARAMS,
+      stage: `feedback-loop/post-mortem-${params.iteration}`,
+      agentStage: "review",
+      expectsStructuredOutput: false,
+      cycle: params.iteration,
     });
     if (result.exitCode !== 0 || !result.stdout.trim()) {
       throw new Error(`post-mortem invocation exited ${result.exitCode}`);
     }
     subStep.status = "passed";
     subStep.ended_at = new Date().toISOString();
-    subStep.outputs = { length: result.stdout.length };
+    // telemetry (BAC-27201): this is real spend against a turn cap — report-card.ts's
+    // extraCostUsd must be able to price it the same way it prices a retry attempt or a
+    // post-push-review sub-step.
+    subStep.outputs = { length: result.stdout.length, telemetry: result.telemetry };
     await reporter.report(subStep);
     return result.stdout.trim();
   } catch (err) {
     subStep.status = "failed";
     subStep.ended_at = new Date().toISOString();
-    subStep.outputs = { error: String(err) };
+    // A spawn-level rejection never reaches the `result =` assignment above, so telemetry may
+    // genuinely be unavailable here — but when invoke() DID settle (e.g. the exitCode/empty-
+    // stdout throw just above), its cost must not be lost from the failed report.
+    subStep.outputs = { error: String(err), ...(result?.telemetry ? { telemetry: result.telemetry } : {}) };
     await reporter.report(subStep);
     console.warn(`[feedback-loop] post-mortem failed (non-fatal): ${String(err)}`);
     return null;
@@ -323,6 +343,10 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     inputs: FeedbackLoopInputs,
     reporter: StepReporter,
   ): Promise<FeedbackLoopOutputs> {
+    if (context.data.reviewOnly) {
+      const { runReviewOnly } = await import("./post-push-review.js");
+      return runReviewOnly(context, inputs.workspaceDir, reporter);
+    }
     const parentStepId =
       typeof inputs.parentStepId === "string" ? inputs.parentStepId : "feedback-loop";
     const effectiveMaxIterations =
@@ -344,200 +368,144 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       tenantModel ??
       DEFAULT_MODEL;
 
-    let iteration = 0;
-    let approved = false;
-    let feedback = "";
-    let reviewIssues: string[] = [];
-    let terminationReason: TerminationReason = "iterations_exhausted";
-    const passes: PassStat[] = [];
-    let postMortem: string | undefined;
+    const verifyScriptPath =
+      typeof inputs.verifyScriptPath === "string" && inputs.verifyScriptPath ? inputs.verifyScriptPath : undefined;
+    // The loop only knows the first install result (install-retry runs after it); a failed first
+    // install skips the hook, as `dependenciesMissing` skipped the old post-push step.
+    const verifyEnabled = verifyScriptPath !== undefined && inputs.installFailed !== true;
 
     const rawPlanningContext =
       inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined;
-    const { acceptanceBar, mapSection } = splitPlanningContext(rawPlanningContext ?? "");
-    const isNewFormatContext = acceptanceBar !== undefined || mapSection !== undefined;
+    const workspaceDir = String(inputs.workspaceDir);
+    const sleep =
+      inputs.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    // Captured once for the whole run (BAC-27134), not per-pass — see isRunDirty.
+    const runStartHead = resolveHeadSha(workspaceDir);
 
-    while (iteration < effectiveMaxIterations && !approved) {
-      iteration++;
-
-      // On retries with new-format context, send only the map section — but
-      // re-wrap it with the untrusted-data guard so the security preamble is
-      // never dropped. Fall back to the full rawPlanningContext when mapSection
-      // is absent (partial planning output) rather than sending undefined.
-      const implementPlanningContext =
-        isNewFormatContext && iteration > 1
-          ? mapSection !== undefined
-            ? wrapWithPlanningGuard(mapSection)
-            : rawPlanningContext
-          : rawPlanningContext;
-
-      const implementPrompt = buildImplementPrompt(
-        String(inputs.issueTitle),
-        String(inputs.issueDescription),
-        feedback || undefined,
-        reviewIssues,
-        context.data.issueIdentifier,
-        inputs.implementationPrompt !== undefined ? String(inputs.implementationPrompt) : undefined,
-      );
-
-      // --- implement sub-step ---
-      const implementSubStep: Step = {
-        id: `implement.${iteration}`,
-        type: "implement",
-        status: "running",
-        started_at: new Date().toISOString(),
-        ended_at: null,
-        parent_step_id: parentStepId,
-        inputs: {
-          workspaceDir: inputs.workspaceDir,
-          prompt: implementPrompt,
-          model: resolvedImplementModel,
-          maxTurns: effectiveMaxTurns,
-          planningContext: implementPlanningContext,
-        },
-        outputs: {},
-        logs_url: null,
-      };
-      await reporter.report(implementSubStep);
-
-      let implementOutputs: Awaited<ReturnType<typeof implementStep.run>>;
-      try {
-        implementOutputs = await implementStep.run(
-          context,
-          {
-            workspaceDir: String(inputs.workspaceDir),
-            prompt: implementPrompt,
-            model: resolvedImplementModel,
-            maxTurns: effectiveMaxTurns,
-            planningContext: implementPlanningContext,
-          },
-          reporter,
-        );
-        implementSubStep.status = "passed";
-        implementSubStep.ended_at = new Date().toISOString();
-        implementSubStep.outputs = implementOutputs;
-        await reporter.report(implementSubStep);
-      } catch (err) {
-        implementSubStep.status = "failed";
-        implementSubStep.ended_at = new Date().toISOString();
-        implementSubStep.outputs = { error: String(err) };
-        await reporter.report(implementSubStep);
-        throw err;
-      }
-
-      const implementTelemetry = implementOutputs.telemetry as RunTelemetry | undefined;
-      const pass: PassStat = {
-        iteration,
-        implementTurns: implementTelemetry?.numTurns ?? null,
-        implementOutcome: implementTelemetry?.outcome ?? "unknown",
-        costUsd: implementTelemetry?.costUsd ?? null,
-        reviewApproved: null,
-        tokensIn: implementTelemetry?.tokensIn ?? null,
-        tokensOut: implementTelemetry?.tokensOut ?? null,
-        cacheReadTokens: implementTelemetry?.cacheReadTokens ?? null,
-        cacheCreationTokens: implementTelemetry?.cacheCreationTokens ?? null,
-      };
-      passes.push(pass);
-
-      const diff = getDiff(String(inputs.workspaceDir));
-
-      // Hard max_turns: the pass ran out of budget mid-work. Reviewing or
-      // re-implementing an over-scoped task just burns more passes — stop,
-      // post-mortem where the turns went, and let the pipeline open a draft PR.
-      if (
-        implementTelemetry &&
-        (implementTelemetry.outcome === "max_turns" || exceededConfiguredMaxTurns(implementTelemetry, effectiveMaxTurns))
-      ) {
-        terminationReason = "max_turns";
-        feedback = `Implementation hit the ${effectiveMaxTurns}-turn cap before completing (${implementTelemetry.numTurns ?? "?"} turns used).`;
-        postMortem =
-          (await runPostMortem(
+    const result = await runFeedbackLoop(
+      {
+        workspaceDir,
+        issueTitle: String(inputs.issueTitle),
+        issueDescription: String(inputs.issueDescription),
+        issueIdentifier: context.data.issueIdentifier,
+        implementationPrompt:
+          inputs.implementationPrompt !== undefined ? String(inputs.implementationPrompt) : undefined,
+        planningContext: rawPlanningContext,
+        referenceRepoResults: inputs.referenceRepoResults,
+        reviewRubric: inputs.reviewRubric !== undefined ? String(inputs.reviewRubric) : undefined,
+        installFailed: inputs.installFailed === true,
+        installMethod: inputs.installMethod !== undefined ? String(inputs.installMethod) : undefined,
+        installError: inputs.installError !== undefined ? String(inputs.installError) : undefined,
+        maxIterations: effectiveMaxIterations,
+        maxTurns: effectiveMaxTurns,
+        implementModel: resolvedImplementModel,
+        reviewModel: resolvedReviewModel,
+        retryPolicy: normalizeRetryPolicy(context.data.retryPolicy),
+        runStartHead,
+        parentStepId,
+        verifyEnabled,
+      },
+      {
+        implement: (args) =>
+          implementStep.run(
+            context,
+            {
+              workspaceDir,
+              prompt: args.prompt,
+              model: resolvedImplementModel,
+              maxTurns: effectiveMaxTurns,
+              planningContext: args.planningContext,
+              referenceRepoResults: inputs.referenceRepoResults,
+              iteration: args.iteration,
+            },
+            reporter,
+          ),
+        review: (args) =>
+          reviewStep.run(
+            context,
+            {
+              model: resolvedReviewModel,
+              diff: args.diff,
+              iteration: args.iteration,
+              issueTitle: inputs.issueTitle !== undefined ? String(inputs.issueTitle) : undefined,
+              issueDescription:
+                inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
+              acceptanceBar: args.acceptanceBar,
+              reviewRubric: args.reviewRubric,
+              installFailed: inputs.installFailed === true,
+            },
+            reporter,
+          ),
+        postMortem: (args) =>
+          runPostMortem(
             context,
             {
               issueTitle: String(inputs.issueTitle),
               issueDescription: String(inputs.issueDescription),
-              diff,
-              telemetry: implementTelemetry,
+              diff: args.diff,
+              telemetry: args.telemetry,
               maxTurns: effectiveMaxTurns,
               model: resolvedReviewModel,
-              iteration,
+              iteration: args.iteration,
               parentStepId,
             },
             reporter,
-          )) ?? undefined;
-        break;
-      }
-
-      // --- review sub-step ---
-      const reviewSubStep: Step = {
-        id: `review.${iteration}`,
-        type: "review",
-        status: "running",
-        started_at: new Date().toISOString(),
-        ended_at: null,
-        parent_step_id: parentStepId,
-        inputs: {
-          model: resolvedReviewModel,
-          diff,
-          iteration,
-          issueTitle: inputs.issueTitle,
-          issueDescription: inputs.issueDescription,
-          acceptanceBar,
+          ),
+        getDiff: () => getDiff(workspaceDir),
+        isRunDirty: () => isRunDirty(workspaceDir, runStartHead),
+        writeCycleSummary: (input) => {
+          writeCycleSummary(workspaceDir, input);
         },
-        outputs: {},
-        logs_url: null,
-      };
-      await reporter.report(reviewSubStep);
+        report: (step) => reporter.report(projectStageReport(step, context.data.agentConfig)),
+        sleep,
+        now: () => new Date().toISOString(),
+        warn: (message) => console.warn(message),
+        ...(verifyScriptPath
+          ? {
+              runVerifyHook: async () => {
+                const hookStarted = Date.now();
+                let exitCode: number;
+                let hookOutput: string;
+                let hookSecrets: string[] | undefined;
+                // The hook runs before push, which stages with `git add -A`: whatever it changes in
+                // the tree would ship. Snapshot first and restore after, pass or fail.
+                const workspaceSnapshot = snapshotWorkspace(workspaceDir);
+                let guarded = workspaceSnapshot !== null;
+                try {
+                  const result = await runHookScript("verify", verifyScriptPath, workspaceDir);
+                  exitCode = result.exitCode;
+                  hookOutput = result.output;
+                  hookSecrets = result.secrets;
+                } catch (err) {
+                  // A missing script or spawn failure is a hook failure the agent can act on, not a crash.
+                  exitCode = 1;
+                  hookOutput = String(err instanceof Error ? err.message : err);
+                } finally {
+                  if (!restoreWorkspace(workspaceSnapshot)) guarded = false;
+                }
+                return {
+                  exitCode,
+                  output: neutralizeFences(hookOutputTail(hookOutput, hookSecrets)),
+                  guarded,
+                  durationMs: Date.now() - hookStarted,
+                };
+              },
+            }
+          : {}),
+      },
+    );
+    const feedback = result.finalFeedback;
 
+    if (feedback) {
       try {
-        const reviewOutputs = await reviewStep.run(
-          context,
-          {
-            model: resolvedReviewModel,
-            diff,
-            iteration,
-            issueTitle: inputs.issueTitle !== undefined ? String(inputs.issueTitle) : undefined,
-            issueDescription:
-              inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
-            acceptanceBar,
-          },
-          reporter,
-        );
-        reviewSubStep.status = "passed";
-        reviewSubStep.ended_at = new Date().toISOString();
-        reviewSubStep.outputs = reviewOutputs;
-        await reporter.report(reviewSubStep);
-
-        approved = reviewOutputs.approved;
-        feedback = reviewOutputs.feedback;
-        reviewIssues = [...reviewOutputs.issues];
-        pass.reviewApproved = reviewOutputs.approved;
-        if (approved) terminationReason = "approved";
+        const feedbackDir = join(String(inputs.workspaceDir), "ai-output", "comments");
+        mkdirSync(feedbackDir, { recursive: true });
+        writeFileSync(join(feedbackDir, "80-reviewer-feedback.md"), feedback, "utf-8");
       } catch (err) {
-        // A review failure (e.g. "Prompt is too long", a transient API error)
-        // is NOT actionable feedback and must not discard a successful
-        // implementation. Record the failure, stop the loop, and let the
-        // pipeline push the working tree — retrying implementation would only
-        // burn another pass producing the same un-reviewable diff.
-        reviewSubStep.status = "failed";
-        reviewSubStep.ended_at = new Date().toISOString();
-        reviewSubStep.outputs = { error: String(err) };
-        await reporter.report(reviewSubStep);
-        console.warn(
-          `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
-        );
-        approved = false;
-        feedback = `Review step failed and was skipped: ${String(err)}`;
-        terminationReason = "review_error";
-        break;
+        console.warn(`[feedback-loop] could not write reviewer feedback file (non-fatal): ${String(err)}`);
       }
     }
 
-    if (!approved) {
-      console.warn(
-        `[feedback-loop] exited without approval (${terminationReason}) after ${iteration}/${effectiveMaxIterations} iteration(s). Final feedback: ${feedback || "(none)"}`,
-      );
-    }
-    return { approved, iterations: iteration, finalFeedback: feedback, terminationReason, passes, ...(postMortem ? { postMortem } : {}) };
+    return result;
   },
 };

@@ -1,10 +1,27 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { JiraProvider, createJiraProviderFromConfig } from "../../providers/jira.js";
-import { JiraClient } from "../../providers/jira-client.js";
-import { MissingProviderConfigError, type TicketingProvider } from "../../providers/types.js";
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
+import Database from "better-sqlite3";
+import type * as ConfigModule from "../../config.js";
+import type * as IssueStatusesModule from "../../issue-statuses.js";
+import type * as MergeUpModule from "../../merge-up.js";
+import { JiraProvider, adfToPlainText, createJiraProviderFromConfig } from "../../providers/jira.js";
+import { JiraApiError, JiraClient, type JiraIssue } from "../../providers/jira-client.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
-import { resolveRepoFieldValue, validateTicketingConfig } from "../../providers/ticketing-config.js";
+import { validateTicketingConfig } from "../../providers/ticketing-config.js";
+import { validateIssueBaseBranch } from "../../base-branch.js";
 import type { RepoMapping } from "../../config.js";
+import { makeIssue, makeMapping } from "../helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Reply, type ReplyInit, type Routes } from "../helpers/fake-fetch.js";
+import { testDb } from "../helpers/test-db.js";
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
+
+// The client reaches Jira through the OAuth gateway for cloud id "c", so every request path starts here.
+const API = "/ex/jira/c/rest/api/3";
+const FIELDS = `GET ${API}/field` as const;
+const SEARCH = `POST ${API}/search/jql` as const;
+const STATUS_READ = `GET ${API}/issue/10001` as const;
+const STATUS_WRITE = `PUT ${API}/issue/10001` as const;
+const COMMENT = `POST ${API}/issue/10001/comment` as const;
 
 const stubClient = () => new JiraClient({ token: "t", cloudId: "c" });
 const noMappings = () => ({});
@@ -38,11 +55,7 @@ describe("JiraProvider", () => {
       siteUrl: "https://acme.atlassian.net",
       getMappings: noMappings,
     });
-    const issue = {
-      id: "10001", identifier: "PROJ-123", title: "x", description: null,
-      scopeKey: "mapping-1", nativeStatus: "Ready",
-    };
-    expect(p.issueUrl(issue)).toBe("https://acme.atlassian.net/browse/PROJ-123");
+    expect(p.issueUrl(makeIssue({ identifier: "PROJ-123" }))).toBe("https://acme.atlassian.net/browse/PROJ-123");
   });
 });
 
@@ -84,56 +97,8 @@ describe("createJiraProviderFromConfig", () => {
   });
 });
 
-describe("JiraProvider.postComment", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
-  it("posts a comment with ADF-formatted body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ id: "comment-1" }),
-    } as Response);
-
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c" }),
-      cacheScope: "c", siteUrl: "https://x", getMappings: () => ({}),
-    });
-    await p.postComment("10001", "Hello world");
-
-    expect(fetch).toHaveBeenCalledWith(
-      expect.stringMatching(/\/rest\/api\/3\/issue\/10001\/comment$/),
-      expect.objectContaining({
-        method: "POST",
-      }),
-    );
-    const callArgs = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(callArgs[1]?.body as string);
-    expect(body.body.type).toBe("doc");
-    expect(body.body.content[0].type).toBe("paragraph");
-  });
-});
-
-// --- Lifecycle status setters ---
-
-const baseMapping: Omit<RepoMapping, "ticketingProvider" | "ticketingConfig"> = {
-  owner: "acme",
-  repo: "x",
-  workflowFile: "claude-implement.yml",
-  defaultBranch: "main",
-  maxInProgressAiIssues: 3,
-  executionMode: "github-actions",
-  sessionMode: "autonomous",
-  machineCpus: 2,
-  machineMemoryMb: 4096,
-  planningEnabled: true,
-  planningWorkflowFile: "claude-plan.yml",
-  autoApprovePlans: true,
-  extraEnv: {},
-  provider: "anthropic",
-  awsRegion: null,
-  paused: false,
-};
-
+// A Jira mapping as the store reads one back: validation stores every field override as a string or null,
+// and the repo field value names the mapping's own repository.
 const jiraMapping = (
   overrides: Partial<{
     jql: string;
@@ -141,155 +106,362 @@ const jiraMapping = (
     statusFieldOverride: string | null;
     repoFieldOverride: string | null;
     profilesFieldOverride: string | null;
+    baseBranchFieldOverride: string | null;
   }> = {},
-): RepoMapping => ({
-  ...baseMapping,
-  ticketingProvider: "jira",
-  ticketingConfig: {
-    kind: "jira",
-    jql: overrides.jql ?? "project = TEST",
-    repoFieldValue: overrides.repoFieldValue ?? "acme/x",
-    statusFieldOverride: overrides.statusFieldOverride,
-    repoFieldOverride: overrides.repoFieldOverride,
-    profilesFieldOverride: overrides.profilesFieldOverride,
-  },
+): RepoMapping => {
+  const repoFieldValue = overrides.repoFieldValue ?? "acme/x";
+  const [owner, repo] = repoFieldValue.split("/");
+  return makeMapping({
+    owner,
+    repo,
+    ticketingProvider: "jira",
+    ticketingConfig: {
+      kind: "jira",
+      jql: overrides.jql ?? "project = P",
+      repoFieldValue,
+      statusFieldOverride: overrides.statusFieldOverride ?? null,
+      repoFieldOverride: overrides.repoFieldOverride ?? null,
+      profilesFieldOverride: overrides.profilesFieldOverride ?? null,
+      baseBranchFieldOverride: overrides.baseBranchFieldOverride ?? null,
+    },
+  });
+};
+
+// All four field ids set by override, so the provider never lists the instance's fields.
+const ALL_OVERRIDES = {
+  statusFieldOverride: "customfield_10100",
+  repoFieldOverride: "customfield_10101",
+  profilesFieldOverride: "customfield_10200",
+  baseBranchFieldOverride: "customfield_10300",
+};
+
+// The field list's entries for the two single-select fields, with the schema Jira gives a custom select.
+const selectField = (id: string, name: string) => ({
+  id, name, custom: true,
+  schema: { type: "option", custom: "com.atlassian.jira.plugin.system.customfieldtypes:select", customId: Number(id.replace("customfield_", "")) },
 });
 
-const FIELDS_RESPONSE = {
-  ok: true,
-  json: async () => [
-    { id: "customfield_10100", name: "AI-Implement Status", custom: true, schema: {} },
-    { id: "customfield_10101", name: "AI-Implement Repo", custom: true, schema: {} },
-  ],
-} as Response;
+const FIELDS_REPLY: ReplyInit = {
+  json: [selectField("customfield_10100", "AI-Implement Status"), selectField("customfield_10101", "AI-Implement Repo")],
+};
 
-const okEmpty = () => ({ ok: true, json: async () => ({}) }) as Response;
+// A description as REST API v3 sends it: an Atlassian Document Format document, one paragraph per argument.
+const adfDoc = (...paragraphs: string[]) => ({
+  type: "doc",
+  version: 1,
+  content: paragraphs.map((text) => ({ type: "paragraph", content: [{ type: "text", text }] })),
+});
+
+// Jira's error body for a failed request.
+const jiraError = (status: number, message: string): ReplyInit => ({ status, json: { errorMessages: [message], errors: {} } });
 
 function makeProvider(opts: {
   cacheScope: string;
   mappings: Record<string, RepoMapping>;
+  onRepoFieldMismatch?: (mappingId: string, issueKey: string, actual: string) => void;
+  oauth?: boolean;
 }): JiraProvider {
   return new JiraProvider({
     client: new JiraClient({ token: "t", cloudId: "c" }),
     cacheScope: opts.cacheScope,
     siteUrl: "https://x",
     getMappings: () => opts.mappings,
+    onRepoFieldMismatch: opts.onRepoFieldMismatch,
+    oauth: opts.oauth,
   });
 }
+
+type SearchRoute = { when: RegExp; issues?: JiraIssue[]; status?: number };
+
+// Answers Jira's JQL search by the JQL each request carries, returning only the fields the
+// request names, as Jira does. A search no route matches fails the test, even when the
+// provider catches the error.
+function jqlSearch(...routes: SearchRoute[]): Reply {
+  const unmatched: string[] = [];
+  onTestFinished(() => {
+    if (unmatched.length > 0) throw new Error(`jqlSearch: no route for ${unmatched.join(" | ")}`);
+  });
+  return (call) => {
+    const { jql, fields } = JSON.parse(call.body) as { jql: string; fields: string[] };
+    const route = routes.find((r) => r.when.test(jql));
+    if (!route) {
+      unmatched.push(jql);
+      throw new Error(`jqlSearch: no route for ${jql}`);
+    }
+    if (route.status) return jiraError(route.status, "Error in the JQL Query");
+    const issues = (route.issues ?? []).map((issue) => ({
+      ...issue,
+      fields: Object.fromEntries(Object.entries(issue.fields).filter(([name]) => fields.includes(name))),
+    }));
+    return { json: { issues, isLast: true } };
+  };
+}
+
+// The searches the provider runs, by the shape of their JQL.
+const ready = (...issues: JiraIssue[]): SearchRoute => ({ when: /in \(Ready/, issues });
+const inFlight = (...issues: JiraIssue[]): SearchRoute => ({ when: /in \(Planning/, issues });
+const children = (...issues: JiraIssue[]): SearchRoute => ({ when: /parent in/, issues });
+const keyIn = (...issues: JiraIssue[]): SearchRoute => ({ when: /^key in/, issues });
+const completed = (...issues: JiraIssue[]): SearchRoute => ({ when: /statusCategory = Done/, issues });
+
+const searchBodies = (fake: FakeFetch): Array<{ jql: string; fields: string[] }> =>
+  fake.calls.filter((c) => c.path === `${API}/search/jql`).map((c) => JSON.parse(c.body));
+
+describe("JiraProvider.postComment", () => {
+  it("posts a comment with ADF-formatted body", async () => {
+    const fake = fakeFetch({ [COMMENT]: { status: 201, json: { id: "10000" } } }).install();
+
+    const p = makeProvider({ cacheScope: "c", mappings: {} });
+    await p.postComment("10001", "Hello world");
+
+    expect(fake.calls[0].url.href).toMatch(/\/rest\/api\/3\/issue\/10001\/comment$/);
+    const body = JSON.parse(fake.calls[0].body);
+    expect(body.body.type).toBe("doc");
+    expect(body.body.content[0].type).toBe("paragraph");
+  });
+});
+
+// --- Lifecycle status setters ---
 
 describe("JiraProvider lifecycle status setters", () => {
   beforeEach(() => {
     clearFieldCache();
-    vi.stubGlobal("fetch", vi.fn());
-  });
-  afterEach(() => {
-    vi.restoreAllMocks();
   });
 
-  function expectStatusBody(call: [string | URL | Request, RequestInit | undefined], expected: string) {
-    const body = JSON.parse(call[1]?.body as string);
+  // setStatus pre-reads the current status before every non-Merged write (the
+  // never-regress-Merged guard); this is that read's response for an issue at `value`.
+  const statusRead = (value: string): ReplyInit => ({
+    json: { id: "10001", key: "P-1", fields: { customfield_10100: { value } } },
+  });
+  const written: ReplyInit = { status: 204 };
+  const commented: ReplyInit = { status: 201, json: { id: "10000" } };
+
+  const methods = (fake: FakeFetch) => fake.calls.map((c) => c.method);
+  const commentText = (fake: FakeFetch) =>
+    JSON.parse(fake.calls.find((c) => c.method === "POST")!.body).body.content[0].content[0].text;
+  function expectStatusBody(fake: FakeFetch, expected: string) {
+    const body = JSON.parse(fake.calls.find((c) => c.method === "PUT")!.body);
     expect(body.fields.customfield_10100).toEqual({ value: expected });
   }
 
   it("markPlanningStarted sets status to Planning", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty());
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c1", mappings: { "acme/x": jiraMapping() } });
     await p.markPlanningStarted("10001", "acme/x");
-    expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Planning");
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
+    expectStatusBody(fake, "Planning");
   });
 
   it("markPlanComplete sets status to Plan Approved (single-mapping shortcut)", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty());
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c2", mappings: { "acme/x": jiraMapping() } });
-    await p.markPlanComplete("10001", "acme/x");
-    expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Plan Approved");
+    await p.markPlanComplete("10001", "acme/x", { awaitApproval: false });
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
+    expectStatusBody(fake, "Plan Approved");
+  });
+
+  it("markPlanComplete with awaitApproval writes Awaiting Approval", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Planning"), [STATUS_WRITE]: written }).install();
+    const p = makeProvider({ cacheScope: "c2a", mappings: { "acme/x": jiraMapping() } });
+    await p.markPlanComplete("10001", "acme/x", { awaitApproval: true });
+    expectStatusBody(fake, "Awaiting Approval");
   });
 
   it("markPlanningFailed sets Planning Failed and posts a comment", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty()) // setField PUT
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response); // comment POST
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: statusRead("Implementing"),
+      [STATUS_WRITE]: written,
+      [COMMENT]: commented,
+    }).install();
     const p = makeProvider({ cacheScope: "c3", mappings: { "acme/x": jiraMapping() } });
-    await p.markPlanningFailed("10001", "acme/x", "boom");
+    const result = await p.markPlanningFailed("10001", "acme/x", "boom");
+    expect(result).toBe(true);
 
-    const calls = vi.mocked(fetch).mock.calls;
-    expectStatusBody(calls[1], "Planning Failed");
-    const commentCall = calls[2];
-    expect(commentCall[0]).toEqual(expect.stringMatching(/\/comment$/));
-    const commentBody = JSON.parse(commentCall[1]?.body as string);
-    expect(commentBody.body.content[0].content[0].text).toContain("boom");
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT", "POST"]);
+    expectStatusBody(fake, "Planning Failed");
+    expect(fake.calls[3].url.href).toMatch(/\/comment$/);
+    expect(commentText(fake)).toContain("boom");
   });
 
   it("markImplementing sets status to Implementing", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty());
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c4", mappings: { "acme/x": jiraMapping() } });
     await p.markImplementing("10001", "acme/x");
-    expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Implementing");
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
+    expectStatusBody(fake, "Implementing");
   });
 
   it("markPrReady sets PR Ready and posts a comment with the PR URL", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty())
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response);
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: statusRead("Implementing"), // current-status pre-read (Merged guard)
+      [STATUS_WRITE]: written,
+      [COMMENT]: commented,
+    }).install();
     const p = makeProvider({ cacheScope: "c5", mappings: { "acme/x": jiraMapping() } });
     await p.markPrReady("10001", "acme/x", "https://github.com/acme/x/pull/42");
 
-    const calls = vi.mocked(fetch).mock.calls;
-    expectStatusBody(calls[1], "PR Ready");
-    const commentBody = JSON.parse(calls[2][1]?.body as string);
-    expect(commentBody.body.content[0].content[0].text).toContain(
-      "https://github.com/acme/x/pull/42",
-    );
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT", "POST"]);
+    expectStatusBody(fake, "PR Ready");
+    expect(commentText(fake)).toContain("https://github.com/acme/x/pull/42");
+  });
+
+  it("markPlanningFailed skips its failure comment when the issue is already Merged", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Merged") }).install(); // guard pre-read
+    const p = makeProvider({ cacheScope: "c3-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.markPlanningFailed("10001", "acme/x", "late boom");
+
+    // Pre-read is the last request: no setField PUT, no "Planning failed" comment.
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("clearWorkingState refuses to reset an already-Merged issue (reaper max-age sweep)", async () => {
+    // The reaper's resetTicket path also clears dedup; with the status write refused
+    // the issue stays out of the Ready/"Plan Approved" dispatch bucket, so cleared
+    // dedup cannot re-dispatch already-merged work.
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Merged") }).install(); // guard pre-read
+    const p = makeProvider({ cacheScope: "c7-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.clearWorkingState("10001", "acme/x", "implementation");
+    // Pre-read is the last request: no setField PUT happened.
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("markPrReady leaves an already-Merged issue at Merged (late success report)", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Merged") }).install(); // current-status pre-read
+    const p = makeProvider({ cacheScope: "c5-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.markPrReady("10001", "acme/x", "https://github.com/acme/x/pull/42");
+
+    // No status write, no comment: the pre-read is the last request.
+    expect(fake.calls).toHaveLength(2);
   });
 
   it("markImplementationFailed sets Implementation Failed and posts a comment", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty())
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response);
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: statusRead("Implementing"), // current-status pre-read (Merged guard)
+      [STATUS_WRITE]: written,
+      [COMMENT]: commented,
+    }).install();
     const p = makeProvider({ cacheScope: "c6", mappings: { "acme/x": jiraMapping() } });
+    const result = await p.markImplementationFailed("10001", "acme/x", "kaboom");
+    expect(result).toBe(true);
+
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT", "POST"]);
+    expectStatusBody(fake, "Implementation Failed");
+    expect(commentText(fake)).toContain("kaboom");
+  });
+
+  it("markImplementationFailed leaves an already-Merged issue at Merged (late failure report)", async () => {
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: statusRead("Merged"), // current-status pre-read
+      [COMMENT]: commented,
+    }).install();
+    const p = makeProvider({ cacheScope: "c6-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.markImplementationFailed("10001", "acme/x", "late kaboom");
+
+    // No setField PUT: the third request is the comment, and no request carries a status write.
+    expect(methods(fake)).toEqual(["GET", "GET", "POST"]);
+    for (const call of fake.calls) {
+      const body = call.body ? JSON.parse(call.body) : {};
+      expect(body?.fields?.customfield_10100).toBeUndefined();
+    }
+    expect(commentText(fake)).toContain("already merged");
+    expect(commentText(fake)).toContain("late kaboom");
+  });
+
+  it("markImplementationFailed proceeds to mark failed when the status pre-read errors", async () => {
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: jiraError(500, "Internal server error"), // pre-read fails
+      [STATUS_WRITE]: written,
+      [COMMENT]: commented,
+    }).install();
+    const p = makeProvider({ cacheScope: "c6-readfail", mappings: { "acme/x": jiraMapping() } });
     await p.markImplementationFailed("10001", "acme/x", "kaboom");
 
-    const calls = vi.mocked(fetch).mock.calls;
-    expectStatusBody(calls[1], "Implementation Failed");
-    const commentBody = JSON.parse(calls[2][1]?.body as string);
-    expect(commentBody.body.content[0].content[0].text).toContain("kaboom");
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT", "POST"]);
+    expectStatusBody(fake, "Implementation Failed");
+  });
+
+  // A failure classification always reaches the ticket, even when Jira refuses the status write (AII-1546).
+  it.each([
+    ["markPlanningFailed", "Planning failed"],
+    ["markImplementationFailed", "Implementation failed"],
+  ] as const)("%s still posts its failure comment when the status write is refused", async (method, phrase) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: statusRead("Implementing"),
+      [STATUS_WRITE]: jiraError(400, "Option id 'x' is not valid"),
+      [COMMENT]: commented,
+    }).install();
+    const p = makeProvider({ cacheScope: `c-refused-${method}`, mappings: { "acme/x": jiraMapping() } });
+    expect(await p[method]("10001", "acme/x", "boom")).toBe(true);
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT", "POST"]);
+    expect(commentText(fake)).toContain(`${phrase}: boom`);
   });
 
   it("clearWorkingState resets status to Plan Approved", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty());
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c7", mappings: { "acme/x": jiraMapping() } });
-    await p.clearWorkingState("10001", "acme/x");
-    expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Plan Approved");
+    await p.clearWorkingState("10001", "acme/x", "implementation");
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
+    expectStatusBody(fake, "Plan Approved");
+  });
+
+  it("clearWorkingState resets a failed planning run to Ready, not Plan Approved", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Planning"), [STATUS_WRITE]: written }).install();
+    const p = makeProvider({ cacheScope: "c7-planning", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.clearWorkingState("10001", "acme/x", "planning")).resolves.toBe(true);
+    expectStatusBody(fake, "Ready");
+  });
+
+  it("clearWorkingState leaves an already-Merged issue at Merged for the planning phase too", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Merged") }).install();
+    const p = makeProvider({ cacheScope: "c7-merged-planning", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.clearWorkingState("10001", "acme/x", "planning")).resolves.toBe(false);
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it.each([
+    ["planning", "Planning Failed"],
+    ["implementation", "Implementation Failed"],
+  ] as const)("parkForHuman for %s sets %s and posts no comment", async (phase, status) => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
+    const p = makeProvider({ cacheScope: `c-park-${phase}`, mappings: { "acme/x": jiraMapping() } });
+    await expect(p.parkForHuman("10001", "acme/x", phase)).resolves.toBe(true);
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
+    expectStatusBody(fake, status);
+  });
+
+  it("parkForHuman returns false and writes nothing on an already-Merged issue", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Merged") }).install();
+    const p = makeProvider({ cacheScope: "c-park-merged", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.parkForHuman("10001", "acme/x", "implementation")).resolves.toBe(false);
+    expect(fake.calls).toHaveLength(2);
   });
 
   it("markMerged sets status to Merged using the supplied scopeKey", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty());
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c-merged", mappings: { "acme/x": jiraMapping() } });
     await p.markMerged("10001", "acme/x");
-    // The last fetch must be a PUT to the issue's field with value "Merged"
-    expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Merged");
+    // The last request must be a PUT to the issue's field with value "Merged"
+    expect(methods(fake)).toEqual(["GET", "PUT"]);
+    expectStatusBody(fake, "Merged");
   });
 
   it("multi-mapping markPlanComplete uses the supplied scopeKey directly (no repo-field read-back)", async () => {
-    // Only the field-resolution fetch and the setField PUT should happen — the
-    // provider must NOT fetch the issue to re-derive its scope. Supplying a
-    // getIssue mock would go unused; omitting it proves no read-back occurs.
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields (resolve field ids for "acme/y")
-      .mockResolvedValueOnce(okEmpty()); // setField
+    // The provider must NOT fetch the issue to re-derive its scope. The one issue
+    // read that DOES happen is setStatus's never-regress-Merged pre-read — a GET of
+    // the status field only, requesting no repo field. Exactly three requests: field
+    // resolution, the guard pre-read, and the setField PUT.
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [STATUS_READ]: statusRead("Implementing"), // guard pre-read
+      [STATUS_WRITE]: written,
+    }).install();
     const p = makeProvider({
       cacheScope: "c8",
       mappings: {
@@ -297,13 +469,12 @@ describe("JiraProvider lifecycle status setters", () => {
         "acme/y": jiraMapping({ repoFieldValue: "acme/y" }),
       },
     });
-    await p.markPlanComplete("10001", "acme/y");
-    const calls = vi.mocked(fetch).mock.calls;
-    // Exactly two fetches: field resolution + setField. No getIssue read-back.
-    expect(calls.length).toBe(2);
-    const lastCall = calls.at(-1)!;
-    expect(String(lastCall[0])).toMatch(/\/issue\/10001/);
-    expectStatusBody(lastCall, "Plan Approved");
+    await p.markPlanComplete("10001", "acme/y", { awaitApproval: false });
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
+    // The guard pre-read asks for the status field only — no repo-field read-back.
+    expect(fake.calls[1].url.searchParams.get("fields")).toBe("customfield_10100");
+    expect(fake.calls[2].url.href).toMatch(/\/issue\/10001/);
+    expectStatusBody(fake, "Plan Approved");
   });
 
   it("multi-mapping markPlanComplete succeeds even when the issue's repo field would read back empty", async () => {
@@ -311,9 +482,7 @@ describe("JiraProvider lifecycle status setters", () => {
     // issue's repo field back from Jira; an empty/unreadable field threw
     // "No Jira mapping matched repoFieldValue=". With the scopeKey carried
     // through end-to-end, the read-back is gone and the call just succeeds.
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty());
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({
       cacheScope: "c-empty-field",
       mappings: {
@@ -321,48 +490,65 @@ describe("JiraProvider lifecycle status setters", () => {
         "acme/y": jiraMapping({ repoFieldValue: "acme/y" }),
       },
     });
-    await p.markPlanComplete("10001", "acme/x");
-    expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Plan Approved");
+    await p.markPlanComplete("10001", "acme/x", { awaitApproval: false });
+    expectStatusBody(fake, "Plan Approved");
   });
 });
 
 describe("JiraProvider.fetchAIImplementSnapshot", () => {
   beforeEach(() => {
-    vi.stubGlobal("fetch", vi.fn());
     clearFieldCache();
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
+  // An issue as the bucket search returns it: every field it requests, links and assignee included.
   const issue = (
     id: string, key: string, status: string, repo: string,
     desc: unknown = null, summary = `summary-${key}`,
-  ) => ({
+  ): JiraIssue => ({
     id, key,
     fields: {
       summary, description: desc,
       customfield_10100: { value: status },
       customfield_10101: { value: repo },
+      issuelinks: [],
+      assignee: null,
     },
   });
 
-  const searchOk = (issues: unknown[]): Response =>
-    ({ ok: true, json: async () => ({ issues }) }) as Response;
+  it("refuses an invalid branch from the Jira snapshot instead of falling back to the default", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const raw = issue("10001", "P-1", "Ready", "acme/x");
+    fakeFetch({
+      [SEARCH]: jqlSearch(ready({ ...raw, fields: { ...raw.fields, customfield_10300: "release..bad" } }), children(), inFlight()),
+    }).install();
+    const p = makeProvider({ cacheScope: "invalid-base", mappings: { "acme/x": jiraMapping(ALL_OVERRIDES) } });
+    const snap = await p.fetchAIImplementSnapshot();
+    const markFailed = vi.fn(async () => true);
+    const lookup = vi.fn(async () => null);
+    const result = await validateIssueBaseBranch({
+      ghToken: "test", owner: "acme", repo: "x", issue: snap.needsPlanning[0],
+      markFailed, getBranchShaImpl: lookup,
+    });
+    expect(result).toEqual({ refused: true });
+    expect(markFailed).toHaveBeenCalledWith("10001", "acme/x", expect.stringContaining("invalid"));
+    expect(lookup).not.toHaveBeenCalled();
+  });
 
   it("buckets issues by status field value", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([
-        issue("10001", "P-1", "Ready", "acme/x"),
-        issue("10002", "P-2", "Plan Approved", "acme/x", "desc"),
-      ]))
-      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(
+          issue("10001", "P-1", "Ready", "acme/x"),
+          issue("10002", "P-2", "Plan Approved", "acme/x", adfDoc("desc")),
+        ),
+        children(),
+        inFlight(),
+      ),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-snap-bucket" }),
-      cacheScope: "c-snap-bucket", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-snap-bucket", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-1"]);
@@ -373,22 +559,24 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     expect(snap.needsPlanning[0].scopeKey).toBe("acme/x");
   });
 
-  it("references custom fields with cf[n] syntax in the JQL wrapper", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([]));
+  it("searches with the one bucket query the setup check also runs, from the shared builder", async () => {
+    const fields = await import("../../providers/jira-fields.js");
+    const shared = vi.spyOn(fields, "buildBucketQuery").mockReturnValue("the poll's query");
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [SEARCH]: jqlSearch({ when: /^the poll's query$/ }, inFlight()) }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-jql-cf" }),
-      cacheScope: "c-jql-cf", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    await makeProvider({ cacheScope: "c-shared-bucket", mappings: { "acme/x": jiraMapping() } }).fetchAIImplementSnapshot();
+
+    expect(shared).toHaveBeenCalledWith(expect.any(String), "customfield_10100");
+    expect(searchBodies(fake)[0].jql).toBe("the poll's query");
+  });
+
+  it("references custom fields with cf[n] syntax in the JQL wrapper", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [SEARCH]: jqlSearch(ready(), inFlight()) }).install();
+
+    const p = makeProvider({ cacheScope: "c-jql-cf", mappings: { "acme/x": jiraMapping() } });
     await p.fetchAIImplementSnapshot();
 
-    // Search calls are the 2nd and 3rd fetches; listFields is the 1st.
-    const bucketBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
-    const capacityBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
+    const [bucketBody, capacityBody] = searchBodies(fake);
     expect(bucketBody.jql).toContain("cf[10100]");
     expect(bucketBody.jql).not.toContain("customfield_10100");
     expect(bucketBody.jql).not.toContain('"AI-Implement Status"');
@@ -398,44 +586,33 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
   });
 
   it("leaves non-customfield status overrides unchanged in the JQL wrapper", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([]));
+    const fake = fakeFetch({ [SEARCH]: jqlSearch(ready(), inFlight()) }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-jql-passthrough" }),
-      cacheScope: "c-jql-passthrough", siteUrl: "https://x",
-      getMappings: () => ({
-        "acme/x": jiraMapping({
-          statusFieldOverride: "status",
-          repoFieldOverride: "customfield_10101",
-          profilesFieldOverride: "customfield_10200",
-        }),
-      }),
+    const p = makeProvider({
+      cacheScope: "c-jql-passthrough",
+      mappings: { "acme/x": jiraMapping({ ...ALL_OVERRIDES, statusFieldOverride: "status" }) },
     });
     await p.fetchAIImplementSnapshot();
 
-    const bucketBody = JSON.parse(vi.mocked(fetch).mock.calls[0][1]?.body as string);
-    const capacityBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
+    const [bucketBody, capacityBody] = searchBodies(fake);
     expect(bucketBody.jql).toContain("status in (Ready");
     expect(capacityBody.jql).toContain("status in (Planning");
   });
 
   it("counts capacity from the in-flight query", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([
-        issue("20001", "P-10", "Planning", "acme/x"),
-        issue("20002", "P-11", "Implementing", "acme/x"),
-        issue("20003", "P-12", "Planning", "acme/x"),
-      ]));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(),
+        inFlight(
+          issue("20001", "P-10", "Planning", "acme/x"),
+          issue("20002", "P-11", "Implementing", "acme/x"),
+          issue("20003", "P-12", "Planning", "acme/x"),
+        ),
+      ),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-cap" }),
-      cacheScope: "c-cap", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-cap", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.inProgressCountsByScope).toEqual({ "acme/x": 3 });
@@ -444,22 +621,20 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
   });
 
   it("filters out issues whose repo field doesn't match and fires onRepoFieldMismatch", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([
-        issue("30001", "P-20", "Ready", "acme/x"),
-        issue("30002", "P-21", "Ready", "acme/wrong"),
-      ]))
-      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(
+          issue("30001", "P-20", "Ready", "acme/x"),
+          issue("30002", "P-21", "Ready", "acme/wrong"),
+        ),
+        children(),
+        inFlight(),
+      ),
+    }).install();
 
     const onRepoFieldMismatch = vi.fn();
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-mis" }),
-      cacheScope: "c-mis", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-      onRepoFieldMismatch,
-    });
+    const p = makeProvider({ cacheScope: "c-mis", mappings: { "acme/x": jiraMapping() }, onRepoFieldMismatch });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-20"]);
@@ -470,7 +645,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
   it("matches a plain-text repo field that serializes as a bare string (not an option object)", async () => {
     // Text custom fields come back as a bare string, unlike single-select
     // option fields which come back as { value: string }.
-    const textIssue = (id: string, key: string, status: string, repo: string) => ({
+    const textIssue = (id: string, key: string, status: string, repo: string): JiraIssue => ({
       id, key,
       fields: {
         summary: `summary-${key}`, description: null,
@@ -478,19 +653,21 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
         customfield_10101: repo,
       },
     });
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([textIssue("50001", "P-40", "Ready", "acme/x")]))
-      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: {
+        json: [
+          selectField("customfield_10100", "AI-Implement Status"),
+          {
+            id: "customfield_10101", name: "AI-Implement Repo", custom: true,
+            schema: { type: "string", custom: "com.atlassian.jira.plugin.system.customfieldtypes:textfield", customId: 10101 },
+          },
+        ],
+      },
+      [SEARCH]: jqlSearch(ready(textIssue("50001", "P-40", "Ready", "acme/x")), children(), inFlight()),
+    }).install();
 
     const onRepoFieldMismatch = vi.fn();
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-text" }),
-      cacheScope: "c-text", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-      onRepoFieldMismatch,
-    });
+    const p = makeProvider({ cacheScope: "c-text", mappings: { "acme/x": jiraMapping() }, onRepoFieldMismatch });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-40"]);
@@ -498,21 +675,14 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
   });
 
   it("does not double-fire onRepoFieldMismatch on second snapshot for the same issue", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([issue("40001", "P-30", "Ready", "acme/wrong")]))
-      .mockResolvedValueOnce(searchOk([]))
-      // Second snapshot — fields cache still warm; bucket + capacity again.
-      .mockResolvedValueOnce(searchOk([issue("40001", "P-30", "Ready", "acme/wrong")]))
-      .mockResolvedValueOnce(searchOk([]));
+    // Both snapshots run the bucket and capacity searches; the field cache stays warm for the second.
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(ready(issue("40001", "P-30", "Ready", "acme/wrong")), inFlight()),
+    }).install();
 
     const onRepoFieldMismatch = vi.fn();
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-dedup" }),
-      cacheScope: "c-dedup", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-      onRepoFieldMismatch,
-    });
+    const p = makeProvider({ cacheScope: "c-dedup", mappings: { "acme/x": jiraMapping() }, onRepoFieldMismatch });
     await p.fetchAIImplementSnapshot();
     await p.fetchAIImplementSnapshot();
 
@@ -523,9 +693,9 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
 
   // A Jira "Blocks" issue link, as it appears in the blocked issue's `issuelinks`:
   // `inwardIssue` present ⇒ this issue "is blocked by" that issue.
-  const blockedByLink = (statusCategoryKey: string) => ({
+  const blockedByLink = (statusCategoryKey: string, key = "BLK-1") => ({
     type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
-    inwardIssue: { key: "BLK-1", fields: { status: { statusCategory: { key: statusCategoryKey } } } },
+    inwardIssue: { key, fields: { status: { statusCategory: { key: statusCategoryKey } } } },
   });
 
   // The other direction: this issue blocks something else (it is not itself blocked).
@@ -534,119 +704,135 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     outwardIssue: { key: "OTH-1", fields: { status: { statusCategory: { key: "new" } } } },
   });
 
-  const withLinks = (
-    iss: ReturnType<typeof issue>,
-    links: unknown[],
-  ) => ({ ...iss, fields: { ...iss.fields, issuelinks: links } });
+  const withLinks = (iss: JiraIssue, links: unknown[]): JiraIssue => ({ ...iss, fields: { ...iss.fields, issuelinks: links } });
 
   it("requests the issuelinks field in the bucket search", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([]));
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [SEARCH]: jqlSearch(ready(), inFlight()) }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-links-field" }),
-      cacheScope: "c-links-field", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-links-field", mappings: { "acme/x": jiraMapping() } });
     await p.fetchAIImplementSnapshot();
 
-    const bucketBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
+    const [bucketBody] = searchBodies(fake);
     expect(bucketBody.fields).toContain("issuelinks");
   });
 
   it("skips an issue blocked by an incomplete issue", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([
-        withLinks(issue("50001", "P-40", "Ready", "acme/x"), [blockedByLink("indeterminate")]),
-        issue("50002", "P-41", "Ready", "acme/x"),
-      ]))
-      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(
+          withLinks(issue("50001", "P-40", "Ready", "acme/x"), [blockedByLink("indeterminate")]),
+          issue("50002", "P-41", "Ready", "acme/x"),
+        ),
+        keyIn(issue("60001", "BLK-1", "Implementing", "acme/x")), // merged-blocker lookup
+        children(),
+        inFlight(),
+      ),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-blocked" }),
-      cacheScope: "c-blocked", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-blocked", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-41"]);
   });
 
   it("includes an issue whose blocker is already done", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([
-        withLinks(issue("50003", "P-42", "Ready", "acme/x"), [blockedByLink("done")]),
-      ]))
-      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
-      .mockResolvedValueOnce(searchOk([]));
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(withLinks(issue("50003", "P-42", "Ready", "acme/x"), [blockedByLink("done")])),
+        children(),
+        inFlight(),
+      ),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-blk-done" }),
-      cacheScope: "c-blk-done", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-blk-done", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-42"]);
+    // Nothing is gated (the only blocker is natively done), so the merged-blocker
+    // lookup must not run: fields, bucket, children, capacity — exactly four requests.
+    expect(fake.calls).toHaveLength(4);
   });
 
   it("includes an issue that blocks others but is not itself blocked", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([
-        withLinks(issue("50004", "P-43", "Ready", "acme/x"), [blocksOtherLink()]),
-      ]))
-      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(withLinks(issue("50004", "P-43", "Ready", "acme/x"), [blocksOtherLink()])),
+        children(),
+        inFlight(),
+      ),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-blocks-other" }),
-      cacheScope: "c-blocks-other", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-blocks-other", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-43"]);
   });
 
   it("includes an issue with no issuelinks field", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([issue("50005", "P-44", "Ready", "acme/x")]))
-      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
-      .mockResolvedValueOnce(searchOk([]));
+    const { issuelinks: _omitted, ...fields } = issue("50005", "P-44", "Ready", "acme/x").fields;
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(ready({ id: "50005", key: "P-44", fields }), children(), inFlight()),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-no-links" }),
-      cacheScope: "c-no-links", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-no-links", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-44"]);
   });
 
   it("skips an issue with a mix of done and incomplete blockers", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([
-        withLinks(issue("50006", "P-45", "Ready", "acme/x"), [
-          blockedByLink("done"),
-          blockedByLink("indeterminate"),
-        ]),
-      ]))
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(withLinks(issue("50006", "P-45", "Ready", "acme/x"), [blockedByLink("done", "BLK-1"), blockedByLink("indeterminate", "BLK-2")])),
+        keyIn(issue("60003", "BLK-2", "Implementing", "acme/x")), // merged-blocker lookup: BLK-2 is not Merged
+        inFlight(),
+      ),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-blk-mix" }),
-      cacheScope: "c-blk-mix", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-blk-mix", mappings: { "acme/x": jiraMapping() } });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning).toEqual([]);
+  });
+
+  it("dispatches an issue whose blocker is natively unfinished but has AI-Implement Status = Merged", async () => {
+    // markMerged sets only the custom field; the blocker's native status stays To Do.
+    // The gate must treat such a blocker as complete or the cascade stalls forever.
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(withLinks(issue("50007", "P-46", "Ready", "acme/x"), [blockedByLink("new")])),
+        keyIn(issue("60002", "BLK-1", "Merged", "acme/x")), // merged-blocker lookup
+        children(),
+        inFlight(),
+      ),
+    }).install();
+
+    const p = makeProvider({ cacheScope: "c-blk-merged", mappings: { "acme/x": jiraMapping() } });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-46"]);
+    // The lookup queried exactly the natively-unfinished blocker keys.
+    const lookupBody = searchBodies(fake).find((b) => b.jql.startsWith("key in"))!;
+    expect(lookupBody.jql).toBe('key in ("BLK-1")');
+  });
+
+  it("keeps blocking when the merged-blocker lookup fails", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(withLinks(issue("50008", "P-47", "Ready", "acme/x"), [blockedByLink("new")])),
+        { when: /^key in/, status: 400 }, // lookup fails: Jira refuses JQL naming a deleted or unbrowsable key
+        inFlight(), // no candidates → no children query
+      ),
+    }).install();
+
+    const p = makeProvider({ cacheScope: "c-blk-lookup-fail", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning).toEqual([]);
@@ -654,25 +840,21 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
 });
 
 describe("JiraProvider.fetchLifecycleStates", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); clearFieldCache(); });
-  afterEach(() => { vi.restoreAllMocks(); });
+  beforeEach(() => { clearFieldCache(); });
 
   it("maps Jira resolution + status category to IssueLifecycleState", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
+    fakeFetch({
+      [SEARCH]: jqlSearch({
+        when: /^id in/,
         issues: [
           { id: "10001", key: "P-1", fields: { resolution: { name: "Done" }, status: { statusCategory: { key: "done" } } } },
           { id: "10002", key: "P-2", fields: { resolution: { name: "Won't Do" }, status: { statusCategory: { key: "done" } } } },
           { id: "10003", key: "P-3", fields: { resolution: null, status: { statusCategory: { key: "indeterminate" } } } },
         ],
       }),
-    } as Response);
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-lf" }),
-      cacheScope: "c-lf", siteUrl: "https://x", getMappings: () => ({}),
-    });
+    const p = makeProvider({ cacheScope: "c-lf", mappings: {} });
     const states = await p.fetchLifecycleStates(["10001", "10002", "10003"]);
     expect(states.get("10001")).toBe("completed");
     expect(states.get("10002")).toBe("cancelled");
@@ -680,18 +862,15 @@ describe("JiraProvider.fetchLifecycleStates", () => {
   });
 
   it("returns empty map for empty input without making a fetch", async () => {
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-lf2" }),
-      cacheScope: "c-lf2", siteUrl: "https://x", getMappings: () => ({}),
-    });
+    const fake = fakeFetch({}).install();
+    const p = makeProvider({ cacheScope: "c-lf2", mappings: {} });
     const states = await p.fetchLifecycleStates([]);
     expect(states.size).toBe(0);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
 });
 
 // --- Feature-branch grouping (mirrors linear.test.ts) ---
-import { JiraProvider as JiraProviderFB } from "../../providers/jira.js";
 
 describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
   // Build a JiraIssue with the overridden status (10100) + repo (10101) custom fields.
@@ -700,7 +879,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     status: string,
     repo: string,
     extra: { parentKey?: string | null; statusCategory?: string } = {},
-  ) => ({
+  ): JiraIssue => ({
     id: `id-${key}`,
     key,
     fields: {
@@ -714,105 +893,105 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     },
   });
 
-  // Fake JiraClient: matches each searchJql call by a substring of its JQL.
-  const fakeClient = (routes: Array<{ when: RegExp; issues: unknown[] }>) =>
-    ({
-      async searchJql(jql: string, fields: string[]) {
-        const issues = (routes.find((x) => x.when.test(jql))?.issues ?? []) as Array<{
-          id: string;
-          key: string;
-          fields: Record<string, unknown>;
-        }>;
-        // Simulate Jira REST field projection: a query that does not request
-        // "parent" gets no parent in its results.
-        if (fields && !fields.includes("parent")) {
-          return issues.map((i) => ({ ...i, fields: { ...i.fields, parent: undefined } }));
-        }
-        return issues;
-      },
-    }) as unknown as import("../../providers/jira-client.js").JiraClient;
-
-  const makeProvider = (client: import("../../providers/jira-client.js").JiraClient) =>
-    new JiraProviderFB({
-      client,
-      cacheScope: "c",
-      siteUrl: "https://x",
-      getMappings: () => ({
-        m1: jiraMapping({
-          repoFieldValue: "acme/x",
-          statusFieldOverride: "customfield_10100",
-          repoFieldOverride: "customfield_10101",
-          profilesFieldOverride: "customfield_10200",
-        }),
-      }),
-    });
+  const provider = () =>
+    makeProvider({ cacheScope: "c", mappings: { m1: jiraMapping({ jql: "project = OOL", ...ALL_OVERRIDES }) } });
 
   it("a leaf under a designated parent targets the parent's feature-branch chain", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })] },
-      { when: /parent in/, issues: [] }, // OOL-96 has no children → leaf
-      { when: /key in/, issues: [issue("OOL-78", "Implementing", "acme/x", { parentKey: null })] }, // ancestor is designated
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })),
+        children(), // OOL-96 has no children → leaf
+        keyIn(issue("OOL-78", "Implementing", "acme/x", { parentKey: null })), // ancestor is designated
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-96")!;
     expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
     expect(leaf.parentRef).toEqual({ identifier: "OOL-78" });
   });
 
   it("a leaf under an UNdesignated parent gets no chain (PRs to base)", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-50", "Ready", "acme/x", { parentKey: "OOL-40" })] },
-      { when: /parent in/, issues: [] },
-      { when: /key in/, issues: [issue("OOL-40", "", "acme/x")] }, // status unset → not designated
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-50", "Ready", "acme/x", { parentKey: "OOL-40" })),
+        children(),
+        keyIn(issue("OOL-40", "", "acme/x")), // status unset → not designated
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const leaf = snap.needsPlanning.find((i) => i.identifier === "OOL-50")!;
     expect(leaf.featureBranchChain).toBeUndefined();
   });
 
   it("cascades the chain through designated grandparents (base-most first)", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-99", "Ready", "acme/x", { parentKey: "OOL-96" })] },
-      { when: /parent in/, issues: [] },
-      // ancestor walk: level 1 returns OOL-96 (parent OOL-78); level 2 returns OOL-78 (no parent)
-      { when: /key in \("OOL-96"\)/, issues: [issue("OOL-96", "Ready", "acme/x", { parentKey: "OOL-78" })] },
-      { when: /key in \("OOL-78"\)/, issues: [issue("OOL-78", "Ready", "acme/x", { parentKey: null })] },
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-99", "Ready", "acme/x", { parentKey: "OOL-96" })),
+        children(),
+        // ancestor walk: level 1 returns OOL-96 (parent OOL-78); level 2 returns OOL-78 (no parent)
+        { when: /key in \("OOL-96"\)/, issues: [issue("OOL-96", "Ready", "acme/x", { parentKey: "OOL-78" })] },
+        { when: /key in \("OOL-78"\)/, issues: [issue("OOL-78", "Ready", "acme/x", { parentKey: null })] },
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const leaf = snap.needsPlanning.find((i) => i.identifier === "OOL-99")!;
     expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]);
   });
 
   it("skips a feature-node parent while any designated child is in flight", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
-      {
-        when: /parent in/,
-        issues: [
-          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
-          issue("OOL-78-c1", "Implementing", "acme/x", { parentKey: "OOL-78", statusCategory: "indeterminate" }),
-        ],
-      },
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-78", "Ready", "acme/x")),
+        children(
+          issue("OOL-79", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
+          issue("OOL-80", "Implementing", "acme/x", { parentKey: "OOL-78", statusCategory: "indeterminate" }),
+        ),
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     expect(snap.needsPlanning).toEqual([]);
     expect(snap.readyForImplementation).toEqual([]);
   });
 
+  // AII-609: the dispatch-gate skip log must name the specific non-terminal child so a
+  // stuck Jira feature node is as diagnosable as a stuck Linear one.
+  it("names the blocking child in the skip log for a feature-node parent with an in-flight child", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-604", "Ready", "acme/x")),
+        children(
+          issue("OOL-607", "PR Ready", "acme/x", { parentKey: "OOL-604", statusCategory: "done" }),
+          issue("OOL-608", "Implementing", "acme/x", { parentKey: "OOL-604", statusCategory: "indeterminate" }),
+        ),
+        inFlight(),
+      ),
+    }).install();
+    await provider().fetchAIImplementSnapshot();
+    expect(logSpy.mock.calls.map((c) => c[0])).toContainEqual(
+      expect.stringContaining("Skipping OOL-604: grouping parent waiting on in-flight AI-Implement children: OOL-608"),
+    );
+    logSpy.mockRestore();
+  });
+
   it("dispatches a feature-node parent once all designated children are terminal, onto its own branch", async () => {
-    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [parentWithSpec] },
-      {
-        when: /parent in/,
-        issues: [
-          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
-          issue("OOL-78-c1", "", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }), // undesignated but terminal → no gate (AII-349: only active undesignated block)
-        ],
-      },
-      { when: /key in/, issues: [] }, // OOL-78 has no parent
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: adfDoc("Closing work spec.") } };
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(parentWithSpec),
+        children(
+          issue("OOL-79", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
+          issue("OOL-80", "", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }), // undesignated but terminal → no gate (AII-349: only active undesignated block)
+        ),
+        keyIn(), // OOL-78 has no parent
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
     expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
   });
@@ -821,74 +1000,73 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     // markMerged only sets the AI-Implement Status custom field — native status
     // stays untouched. The gating check must accept that as terminal or the
     // feature-node parent would stay blocked forever after a normal merge.
-    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [parentWithSpec] },
-      {
-        when: /parent in/,
-        issues: [
-          issue("OOL-78-c0", "Merged", "acme/x", { parentKey: "OOL-78", statusCategory: "indeterminate" }),
-        ],
-      },
-      { when: /key in/, issues: [] }, // OOL-78 has no parent
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: adfDoc("Closing work spec.") } };
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(parentWithSpec),
+        children(issue("OOL-79", "Merged", "acme/x", { parentKey: "OOL-78", statusCategory: "indeterminate" })),
+        keyIn(), // OOL-78 has no parent
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
     expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
   });
 
   it("skips a parent whose children are not yet designated (race guard)", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
-      { when: /parent in/, issues: [issue("OOL-78-c0", "", "acme/x", { parentKey: "OOL-78" })] },
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-78", "Ready", "acme/x")),
+        children(issue("OOL-79", "", "acme/x", { parentKey: "OOL-78" })),
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     expect(snap.needsPlanning).toEqual([]);
     expect(snap.readyForImplementation).toEqual([]);
   });
 
   it("fails closed when the children (gating) query errors: candidates are deferred, not dispatched", async () => {
-    const client = {
-      async searchJql(jql: string) {
-        if (/parent in/.test(jql)) throw new Error("Jira unavailable");
-        if (/in \(Ready/.test(jql)) return [issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })];
-        return [];
-      },
-    } as unknown as import("../../providers/jira-client.js").JiraClient;
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })),
+        { when: /parent in/, status: 500 },
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     // Can't tell a leaf from a feature-node parent once gating failed → defer everything.
     expect(snap.needsPlanning).toEqual([]);
     expect(snap.readyForImplementation).toEqual([]);
   });
 
   it("fails open when only the ancestor walk errors: candidate dispatches as a leaf targeting base", async () => {
-    const client = {
-      async searchJql(jql: string) {
-        if (/key in/.test(jql)) throw new Error("Jira unavailable");
-        if (/parent in/.test(jql)) return []; // OOL-96 has no children → leaf
-        if (/in \(Ready/.test(jql)) return [issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })];
-        return [];
-      },
-    } as unknown as import("../../providers/jira-client.js").JiraClient;
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })),
+        children(), // OOL-96 has no children → leaf
+        { when: /^key in/, status: 500 },
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-96")!;
     expect(leaf).toBeDefined();
     expect(leaf.featureBranchChain).toBeUndefined();
   });
 
   it("finalizes an empty-spec feature-node-ready parent instead of dispatching", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
-      {
-        when: /parent in/,
-        issues: [
-          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
-        ],
-      },
-      { when: /key in/, issues: [] }, // OOL-78 has no parent
-    ]);
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-78", "Ready", "acme/x")),
+        children(issue("OOL-79", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" })),
+        keyIn(), // OOL-78 has no parent
+        inFlight(),
+      ),
+    }).install();
     // OOL-78's description is null (blank spec) in the default issue() helper
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const snap = await provider().fetchAIImplementSnapshot();
     expect(snap.needsPlanning).toEqual([]);
     expect(snap.readyForImplementation).toEqual([]);
     expect(snap.parentsToFinalize).toEqual([
@@ -897,18 +1075,24 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
   });
 
   it("dispatches a non-empty-spec feature-node-ready parent normally (no regression)", async () => {
-    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "## Do the work\n\nActual spec here." } };
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [parentWithSpec] },
-      {
-        when: /parent in/,
-        issues: [
-          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
-        ],
-      },
-      { when: /key in/, issues: [] },
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const spec = {
+      type: "doc",
+      version: 1,
+      content: [
+        { type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: "Do the work" }] },
+        { type: "paragraph", content: [{ type: "text", text: "Actual spec here." }] },
+      ],
+    };
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: spec } };
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(parentWithSpec),
+        children(issue("OOL-79", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" })),
+        keyIn(),
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
     expect(parent).toBeDefined();
     expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
@@ -920,11 +1104,13 @@ describe("JiraProvider.fetchAIImplementSnapshot — Epic Link hierarchy (classic
   beforeEach(() => { clearFieldCache(); });
   afterEach(() => { clearFieldCache(); });
 
-  const FIELDS = [
-    { id: "customfield_10100", name: "AI-Implement Status", custom: true },
-    { id: "customfield_10101", name: "AI-Implement Repo", custom: true },
-    { id: "customfield_10014", name: "Epic Link", custom: true },
-  ];
+  const EPIC_FIELDS: ReplyInit = {
+    json: [
+      { id: "customfield_10100", name: "AI-Implement Status", custom: true },
+      { id: "customfield_10101", name: "AI-Implement Repo", custom: true },
+      { id: "customfield_10014", name: "Epic Link", custom: true },
+    ],
+  };
 
   // Issue with an optional native `parent` and an optional classic Epic Link (cf 10014).
   const issue = (
@@ -932,7 +1118,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — Epic Link hierarchy (classic
     status: string,
     repo: string,
     extra: { parentKey?: string | null; epicLink?: string | null; statusCategory?: string } = {},
-  ) => ({
+  ): JiraIssue => ({
     id: `id-${key}`,
     key,
     fields: {
@@ -947,69 +1133,57 @@ describe("JiraProvider.fetchAIImplementSnapshot — Epic Link hierarchy (classic
     },
   });
 
-  const client = (routes: Array<{ when: RegExp; issues: unknown[] }>) =>
-    ({
-      async listFields() { return FIELDS; },
-      async searchJql(jql: string, fields: string[]) {
-        const issues = (routes.find((x) => x.when.test(jql))?.issues ?? []) as Array<{
-          id: string;
-          key: string;
-          fields: Record<string, unknown>;
-        }>;
-        if (fields && !fields.includes("parent")) {
-          return issues.map((i) => ({ ...i, fields: { ...i.fields, parent: undefined } }));
-        }
-        return issues;
-      },
-    }) as unknown as import("../../providers/jira-client.js").JiraClient;
-
-  // No status/repo overrides → fields() calls listFields and resolves the Epic Link field id.
-  const provider = (c: import("../../providers/jira-client.js").JiraClient) =>
-    new JiraProviderFB({
-      client: c,
-      cacheScope: "epic-scope",
-      siteUrl: "https://x",
-      getMappings: () => ({ m1: jiraMapping({ repoFieldValue: "acme/x" }) }),
-    });
+  // No status/repo overrides → the provider lists the fields and resolves the Epic Link field id.
+  const provider = () =>
+    makeProvider({ cacheScope: "epic-scope", mappings: { m1: jiraMapping({ jql: "project = OOL", repoFieldValue: "acme/x" }) } });
 
   it("attributes an Epic-Link child to its epic and blocks the epic while that child is in flight", async () => {
-    const c = client([
-      { when: /in \(Ready/, issues: [issue("OOL-EP", "Ready", "acme/x")] }, // epic, no native parent
-      {
-        when: /parent in/, // childrenJql ORs the Epic Link clause; the in-flight child is linked via Epic Link only
-        issues: [issue("OOL-S", "Implementing", "acme/x", { epicLink: "OOL-EP", statusCategory: "indeterminate" })],
-      },
-    ]);
-    const snap = await provider(c).fetchAIImplementSnapshot();
+    fakeFetch({
+      [FIELDS]: EPIC_FIELDS,
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-200", "Ready", "acme/x")), // epic, no native parent
+        // childrenJql ORs the Epic Link clause; the in-flight child is linked via Epic Link only
+        children(issue("OOL-201", "Implementing", "acme/x", { epicLink: "OOL-200", statusCategory: "indeterminate" })),
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     // Pre-fix this epic looked like a leaf (epic-link child dropped) and dispatched prematurely.
     expect(snap.needsPlanning).toEqual([]);
     expect(snap.readyForImplementation).toEqual([]);
   });
 
   it("an Epic-Link leaf targets its epic's feature branch", async () => {
-    const c = client([
-      { when: /in \(Ready/, issues: [issue("OOL-S", "Plan Approved", "acme/x", { epicLink: "OOL-EP" })] },
-      { when: /parent in/, issues: [] }, // story has no children → leaf
-      { when: /key in/, issues: [issue("OOL-EP", "Implementing", "acme/x")] }, // epic is designated
-    ]);
-    const snap = await provider(c).fetchAIImplementSnapshot();
-    const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-S")!;
-    expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-EP", mode: "feature" }]);
-    expect(leaf.parentRef).toEqual({ identifier: "OOL-EP" });
+    fakeFetch({
+      [FIELDS]: EPIC_FIELDS,
+      [SEARCH]: jqlSearch(
+        ready(issue("OOL-201", "Plan Approved", "acme/x", { epicLink: "OOL-200" })),
+        children(), // story has no children → leaf
+        keyIn(issue("OOL-200", "Implementing", "acme/x")), // epic is designated
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
+    const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-201")!;
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-200", mode: "feature" }]);
+    expect(leaf.parentRef).toEqual({ identifier: "OOL-200" });
   });
 
   it("rolls up an Epic-Link feature node (child attributed via Epic Link)", async () => {
-    const c = client([
-      { when: /statusCategory = Done/, issues: [issue("OOL-EP", "PR Ready", "acme/x", { statusCategory: "done" })] },
-      { when: /parent in/, issues: [issue("OOL-S", "PR Ready", "acme/x", { epicLink: "OOL-EP", statusCategory: "done" })] },
-    ]);
-    const rollUps = await provider(c).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-EP", identifier: "OOL-EP", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-S"] }]);
+    fakeFetch({
+      [FIELDS]: EPIC_FIELDS,
+      [SEARCH]: jqlSearch(
+        completed(issue("OOL-200", "PR Ready", "acme/x", { statusCategory: "done" })),
+        children(issue("OOL-201", "PR Ready", "acme/x", { epicLink: "OOL-200", statusCategory: "done" })),
+      ),
+    }).install();
+    const rollUps = await provider().fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([{ issueId: "id-OOL-200", identifier: "OOL-200", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-201"] }]);
   });
 });
 
 describe("JiraProvider.fetchFeatureNodeRollUps", () => {
-  const issue = (key: string, status: string, repo: string, parentKey: string | null = null) => ({
+  const issue = (key: string, status: string, repo: string, parentKey: string | null = null): JiraIssue => ({
     id: `id-${key}`, key,
     fields: {
       parent: parentKey ? { key: parentKey } : null,
@@ -1017,73 +1191,77 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
       customfield_10101: { value: repo },
     },
   });
-  const fakeClient = (routes: Array<{ when: RegExp; issues: unknown[] }>) =>
-    ({
-      async searchJql(jql: string, fields: string[]) {
-        const issues = (routes.find((x) => x.when.test(jql))?.issues ?? []) as Array<{
-          id: string;
-          key: string;
-          fields: Record<string, unknown>;
-        }>;
-        // Simulate Jira REST field projection: a query that does not request
-        // "parent" gets no parent in its results.
-        if (fields && !fields.includes("parent")) {
-          return issues.map((i) => ({ ...i, fields: { ...i.fields, parent: undefined } }));
-        }
-        return issues;
-      },
-    }) as unknown as import("../../providers/jira-client.js").JiraClient;
-  const makeProvider = (client: import("../../providers/jira-client.js").JiraClient) =>
-    new JiraProvider({
-      client, cacheScope: "c", siteUrl: "https://x",
-      getMappings: () => ({
-        m1: jiraMapping({ repoFieldValue: "acme/x", statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101", profilesFieldOverride: "customfield_10200" }),
-      }),
-    });
+  const provider = () =>
+    makeProvider({ cacheScope: "c", mappings: { m1: jiraMapping({ jql: "project = OOL", repoFieldValue: "acme/x", ...ALL_OVERRIDES }) } });
 
   it("rolls a completed feature node into its designated parent (auto-merge → parentIdentifier set)", async () => {
-    const client = fakeClient([
-      { when: /statusCategory = Done/, issues: [issue("OOL-90", "PR Ready", "acme/x", "OOL-78")] }, // completed node w/ parent
-      { when: /parent in/, issues: [issue("OOL-90-c", "PR Ready", "acme/x", "OOL-90")] },           // it has a designated child → feature node
-      { when: /key in/, issues: [issue("OOL-78", "Ready", "acme/x", null)] },                       // parent is designated
-    ]);
-    const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: { identifier: "OOL-78", mode: "feature" }, childIdentifiers: ["OOL-90-c"] }]);
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        completed(issue("OOL-90", "PR Ready", "acme/x", "OOL-78")), // completed node w/ parent
+        children(issue("OOL-91", "Merged", "acme/x", "OOL-90")),     // designated child, terminal → feature node
+        keyIn(issue("OOL-78", "Ready", "acme/x", null)),             // parent is designated
+      ),
+    }).install();
+    const rollUps = await provider().fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: { identifier: "OOL-78", mode: "feature" }, childIdentifiers: ["OOL-91"] }]);
   });
 
   it("top-of-tree feature node → parentIdentifier null (human feature→base PR)", async () => {
-    const client = fakeClient([
-      { when: /statusCategory = Done/, issues: [issue("OOL-78", "PR Ready", "acme/x", null)] },
-      { when: /parent in/, issues: [issue("OOL-78-c", "PR Ready", "acme/x", "OOL-78")] },
-    ]);
-    const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-78-c"] }]);
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        completed(issue("OOL-78", "PR Ready", "acme/x", null)),
+        children(issue("OOL-79", "Merged", "acme/x", "OOL-78")),
+      ),
+    }).install();
+    const rollUps = await provider().fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([{ issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-79"] }]);
   });
 
   it("excludes completed issues that are not feature nodes (no designated children)", async () => {
-    const client = fakeClient([
-      { when: /statusCategory = Done/, issues: [issue("OOL-1", "PR Ready", "acme/x", null)] },
-      { when: /parent in/, issues: [] }, // no children → not a feature node
-    ]);
-    expect(await makeProvider(client).fetchFeatureNodeRollUps()).toEqual([]);
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        completed(issue("OOL-1", "PR Ready", "acme/x", null)),
+        children(), // no children → not a feature node
+      ),
+    }).install();
+    expect(await provider().fetchFeatureNodeRollUps()).toEqual([]);
   });
 
   it("excludes a completed issue whose own AI-Implement Status is unset (not a designated node)", async () => {
-    const client = fakeClient([
-      { when: /statusCategory = Done/, issues: [issue("OOL-5", "", "acme/x", null)] },
-      { when: /parent in/, issues: [issue("OOL-5-c", "PR Ready", "acme/x", "OOL-5")] },
-    ]);
-    expect(await makeProvider(client).fetchFeatureNodeRollUps()).toEqual([]);
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        completed(issue("OOL-5", "", "acme/x", null)),
+        children(issue("OOL-6", "Merged", "acme/x", "OOL-5")),
+      ),
+    }).install();
+    expect(await provider().fetchFeatureNodeRollUps()).toEqual([]);
   });
 
   it("sets parentIdentifier null when the parent exists but is not itself designated", async () => {
-    const client = fakeClient([
-      { when: /statusCategory = Done/, issues: [issue("OOL-90", "PR Ready", "acme/x", "OOL-70")] },
-      { when: /parent in/, issues: [issue("OOL-90-c", "PR Ready", "acme/x", "OOL-90")] },
-      { when: /key in/, issues: [issue("OOL-70", "", "acme/x", null)] },
-    ]);
-    const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-90-c"] }]);
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        completed(issue("OOL-90", "PR Ready", "acme/x", "OOL-70")),
+        children(issue("OOL-91", "Merged", "acme/x", "OOL-90")),
+        keyIn(issue("OOL-70", "", "acme/x", null)),
+      ),
+    }).install();
+    const rollUps = await provider().fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-91"] }]);
+  });
+
+  // AII-609: the parent's own status reaching Done is not a proxy for its children's —
+  // a designated child still short of a terminal status must defer the roll-up.
+  it("defers the roll-up while a designated child is not yet terminal (AII-609)", async () => {
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        completed(issue("OOL-604", "PR Ready", "acme/x", null)),
+        children(
+          issue("OOL-607", "Merged", "acme/x", "OOL-604"),
+          issue("OOL-608", "Implementing", "acme/x", "OOL-604"), // still in flight
+        ),
+      ),
+    }).install();
+    expect(await provider().fetchFeatureNodeRollUps()).toEqual([]);
   });
 });
 
@@ -1115,7 +1293,7 @@ describe("JiraProvider — grouping mode from ai-implement.yml", () => {
       statusCategory?: string;
       description?: unknown;
     } = {},
-  ) => ({
+  ): JiraIssue => ({
     id: `id-${key}`,
     key,
     fields: {
@@ -1129,97 +1307,76 @@ describe("JiraProvider — grouping mode from ai-implement.yml", () => {
     },
   });
 
-  const fakeClient = (routes: Array<{ when: RegExp; issues: unknown[] }>) =>
-    ({
-      async searchJql(jql: string, fields: string[]) {
-        const issues = (routes.find((x) => x.when.test(jql))?.issues ?? []) as Array<{
-          id: string;
-          key: string;
-          fields: Record<string, unknown>;
-        }>;
-        if (fields && !fields.includes("parent")) {
-          return issues.map((i) => ({ ...i, fields: { ...i.fields, parent: undefined } }));
-        }
-        return issues;
-      },
-    }) as unknown as import("../../providers/jira-client.js").JiraClient;
-
-  const makeProvider = (client: import("../../providers/jira-client.js").JiraClient) =>
-    new JiraProviderFB({
-      client,
-      cacheScope: "c-mode",
-      siteUrl: "https://x",
-      getMappings: () => ({
-        m1: jiraMapping({
-          repoFieldValue: "acme/x",
-          statusFieldOverride: "customfield_10100",
-          repoFieldOverride: "customfield_10101",
-          profilesFieldOverride: "customfield_10200",
-        }),
-      }),
-    });
+  const provider = () =>
+    makeProvider({ cacheScope: "c-mode", mappings: { m1: jiraMapping({ jql: "project = BAC", repoFieldValue: "acme/x", ...ALL_OVERRIDES }) } });
 
   it("reads multi-issue mode from an ADF code block", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })] },
-      { when: /parent in/, issues: [] },
-      { when: /key in/, issues: [issue("BAC-1", "Implementing", "acme/x", { description: ADF_MULTI })] },
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })),
+        children(),
+        keyIn(issue("BAC-1", "Implementing", "acme/x", { description: ADF_MULTI })),
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const leaf = snap.needsPlanning.find((i) => i.identifier === "BAC-2")!;
     expect(leaf.featureBranchChain).toEqual([{ identifier: "BAC-1", mode: "multi-issue" }]);
   });
 
   it("reads multi-issue mode from a plain-string description", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })] },
-      { when: /parent in/, issues: [] },
-      { when: /key in/, issues: [issue("BAC-1", "Implementing", "acme/x", { description: PLAIN_MULTI })] },
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })),
+        children(),
+        keyIn(issue("BAC-1", "Implementing", "acme/x", { description: PLAIN_MULTI })),
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const leaf = snap.needsPlanning.find((i) => i.identifier === "BAC-2")!;
     expect(leaf.featureBranchChain).toEqual([{ identifier: "BAC-1", mode: "multi-issue" }]);
   });
 
   it("leaves feature-node behaviour unchanged with no ai-implement.yml", async () => {
-    const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })] },
-      { when: /parent in/, issues: [] },
-      { when: /key in/, issues: [issue("BAC-1", "Implementing", "acme/x")] },
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })),
+        children(),
+        keyIn(issue("BAC-1", "Implementing", "acme/x")),
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const leaf = snap.needsPlanning.find((i) => i.identifier === "BAC-2")!;
     expect(leaf.featureBranchChain).toEqual([{ identifier: "BAC-1", mode: "feature" }]);
   });
 
   it("strips the config block from the description handed to the runner", async () => {
-    const client = fakeClient([
-      {
-        when: /in \(Ready/,
-        issues: [issue("BAC-1", "Ready", "acme/x", { description: ADF_MULTI })],
-      },
-      {
-        when: /parent in/,
-        issues: [issue("BAC-1-c", "Merged", "acme/x", { parentKey: "BAC-1", statusCategory: "indeterminate" })],
-      },
-      { when: /key in/, issues: [] },
-    ]);
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("BAC-1", "Ready", "acme/x", { description: ADF_MULTI })),
+        children(issue("BAC-3", "Merged", "acme/x", { parentKey: "BAC-1", statusCategory: "indeterminate" })),
+        keyIn(),
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "BAC-1")!;
     expect(parent.description).toBe("Group of unrelated work.");
     expect(parent.description).not.toContain("feature_branch");
   });
 
   it("defaults ancestor modes to feature when the ancestor walk fails (fails open)", async () => {
-    const client = {
-      async searchJql(jql: string) {
-        if (/key in/.test(jql)) throw new Error("Jira unavailable");
-        if (/parent in/.test(jql)) return [];
-        if (/in \(Ready/.test(jql)) return [issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })];
-        return [];
-      },
-    } as unknown as import("../../providers/jira-client.js").JiraClient;
-    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready(issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })),
+        children(),
+        { when: /^key in/, status: 500 },
+        inFlight(),
+      ),
+    }).install();
+    const snap = await provider().fetchAIImplementSnapshot();
     const leaf = snap.needsPlanning.find((i) => i.identifier === "BAC-2")!;
     expect(leaf).toBeDefined();
     expect(leaf.featureBranchChain).toBeUndefined();
@@ -1232,7 +1389,7 @@ describe("JiraProvider — grouping mode from ai-implement.yml", () => {
       repo: string,
       parentKey: string | null = null,
       description: unknown = null,
-    ) => ({
+    ): JiraIssue => ({
       id: `id-${key}`,
       key,
       fields: {
@@ -1243,18 +1400,13 @@ describe("JiraProvider — grouping mode from ai-implement.yml", () => {
       },
     });
 
-    const client = fakeClient([
-      {
-        when: /statusCategory = Done/,
-        issues: [rollupIssue("BAC-1", "PR Ready", "acme/x", null, ADF_MULTI)],
-      },
-      {
-        when: /parent in/,
-        issues: [rollupIssue("BAC-2", "PR Ready", "acme/x", "BAC-1")],
-      },
-    ]);
-    const provider = makeProvider(client);
-    const rollUps = await provider.fetchFeatureNodeRollUps();
+    fakeFetch({
+      [SEARCH]: jqlSearch(
+        completed(rollupIssue("BAC-1", "PR Ready", "acme/x", null, ADF_MULTI)),
+        children(rollupIssue("BAC-2", "Merged", "acme/x", "BAC-1")),
+      ),
+    }).install();
+    const rollUps = await provider().fetchFeatureNodeRollUps();
     expect(rollUps).toHaveLength(1);
     expect(rollUps[0].mode).toBe("multi-issue");
     expect(rollUps[0].parent).toBeNull();
@@ -1294,21 +1446,13 @@ describe("JiraProvider.childrenJql (Epic Link fallback)", () => {
 
 
 describe("JiraProvider.findByKey", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns the issue when found", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        id: "10001", key: "PROJ-1",
-        fields: { summary: "Hello", description: "World", status: { name: "In Progress" } },
-      }),
-    } as Response);
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-fbk" }),
-      cacheScope: "c-fbk", siteUrl: "https://x", getMappings: () => ({}),
-    });
+    fakeFetch({
+      [`GET ${API}/issue/PROJ-1` as const]: {
+        json: { id: "10001", key: "PROJ-1", fields: { summary: "Hello", description: "World", status: { name: "In Progress" } } },
+      },
+    }).install();
+    const p = makeProvider({ cacheScope: "c-fbk", mappings: {} });
     const issue = await p.findByKey("PROJ-1");
     expect(issue).toEqual({
       id: "10001", identifier: "PROJ-1", title: "Hello", description: "World",
@@ -1317,37 +1461,80 @@ describe("JiraProvider.findByKey", () => {
   });
 
   it("returns null on 404", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false, status: 404, statusText: "Not Found", text: async () => "missing",
-    } as Response);
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-fbk2" }),
-      cacheScope: "c-fbk2", siteUrl: "https://x", getMappings: () => ({}),
-    });
+    fakeFetch({ [`GET ${API}/issue/MISS-1` as const]: jiraError(404, "Issue does not exist or you do not have permission to see it.") }).install();
+    const p = makeProvider({ cacheScope: "c-fbk2", mappings: {} });
     expect(await p.findByKey("MISS-1")).toBeNull();
+  });
+
+  it("converts an ADF description to text without a scope key", async () => {
+    // API v3 returns the description as ADF; reading only strings made it always null.
+    fakeFetch({
+      [`GET ${API}/issue/PROJ-1` as const]: {
+        json: { id: "10001", key: "PROJ-1", fields: { summary: "Hello", description: adfDoc("World"), status: { name: "In Progress" } } },
+      },
+    }).install();
+    const p = makeProvider({ cacheScope: "c-fbk-adf", mappings: {} });
+    expect((await p.findByKey("PROJ-1"))?.description).toBe("World");
+  });
+
+  it("with a scope key, returns the issue the poll builds for that mapping", async () => {
+    // Restate planning and implementation runs rebuild their issue here; it must match the poll's copy.
+    clearFieldCache();
+    const fake = fakeFetch({
+      [FIELDS]: {
+        json: [
+          selectField("customfield_10100", "AI-Implement Status"),
+          selectField("customfield_10101", "AI-Implement Repo"),
+          { id: "customfield_10200", name: "AI-Implement Profiles", custom: true, schema: {} },
+          { id: "customfield_10300", name: "AI-Implement Base Branch", custom: true, schema: { type: "string" } },
+        ],
+      },
+      [`GET ${API}/issue/PROJ-1` as const]: {
+        json: {
+          id: "10001", key: "PROJ-1",
+          fields: {
+            summary: "Hello",
+            description: adfDoc("World"),
+            assignee: { displayName: "Ada Lovelace" },
+            customfield_10100: { value: "Ready" },
+            customfield_10200: [{ value: "backend" }],
+            customfield_10300: "release/1",
+          },
+        },
+      },
+    }).install();
+    const p = makeProvider({ cacheScope: "c-fbk-scoped", mappings: { "acme/x": jiraMapping() } });
+    const issue = await p.findByKey("PROJ-1", "acme/x");
+    expect(issue).toEqual({
+      id: "10001", identifier: "PROJ-1", title: "Hello", description: "World",
+      scopeKey: "acme/x", nativeStatus: "Ready", profiles: ["backend"], baseBranch: "release/1",
+      assigneeName: "Ada Lovelace",
+    });
+    const issueUrl = fake.calls.find((c) => c.path === `${API}/issue/PROJ-1`)!.url.href;
+    expect(issueUrl).toContain("customfield_10200");
+    expect(issueUrl).toContain("customfield_10300");
+    expect(issueUrl).toContain("assignee");
   });
 });
 
 describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
   beforeEach(() => {
-    vi.stubGlobal("fetch", vi.fn());
     clearFieldCache();
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  const FIELDS_WITH_PROFILES = {
-    ok: true,
-    json: async () => [
-      { id: "customfield_10100", name: "AI-Implement Status", custom: true, schema: {} },
-      { id: "customfield_10101", name: "AI-Implement Repo", custom: true, schema: {} },
-      { id: "customfield_10200", name: "AI-Implement Profiles", custom: true, schema: {} },
+  const FIELDS_WITH_PROFILES: ReplyInit = {
+    json: [
+      selectField("customfield_10100", "AI-Implement Status"),
+      selectField("customfield_10101", "AI-Implement Repo"),
+      {
+        id: "customfield_10200", name: "AI-Implement Profiles", custom: true,
+        schema: { type: "array", items: "option", custom: "com.atlassian.jira.plugin.system.customfieldtypes:multiselect", customId: 10200 },
+      },
     ],
-  } as Response;
+  };
 
-  const searchOk = (issues: unknown[]): Response =>
-    ({ ok: true, json: async () => ({ issues }) }) as Response;
-
-  const profilesIssue = (profiles: unknown) => ({
+  const profilesIssue = (profiles: unknown): JiraIssue => ({
     id: "10001", key: "P-1",
     fields: {
       summary: "P-1",
@@ -1355,122 +1542,136 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
       customfield_10100: { value: "Ready" },
       customfield_10101: { value: "acme/x" },
       customfield_10200: profiles,
+      issuelinks: [],
+      assignee: null,
     },
   });
 
   it("maps multi-select profile values to issue.profiles", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_WITH_PROFILES)
-      .mockResolvedValueOnce(searchOk([profilesIssue([{ value: "backend" }, { value: "webapp" }])]))
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_WITH_PROFILES,
+      [SEARCH]: jqlSearch(ready(profilesIssue([{ value: "backend" }, { value: "webapp" }])), children(), inFlight()),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-prof-multi" }),
-      cacheScope: "c-prof-multi", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-prof-multi", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
     expect(snap.needsPlanning[0].profiles).toEqual(["backend", "webapp"]);
   });
 
   it("leaves profiles absent when the multi-select is empty", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_WITH_PROFILES)
-      .mockResolvedValueOnce(searchOk([profilesIssue([])]))
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_WITH_PROFILES,
+      [SEARCH]: jqlSearch(ready(profilesIssue([])), children(), inFlight()),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-prof-empty" }),
-      cacheScope: "c-prof-empty", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-prof-empty", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
     expect(snap.needsPlanning[0].profiles).toBeUndefined();
   });
 
   it("leaves profiles absent when the field value is null", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_WITH_PROFILES)
-      .mockResolvedValueOnce(searchOk([profilesIssue(null)]))
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_WITH_PROFILES,
+      [SEARCH]: jqlSearch(ready(profilesIssue(null)), children(), inFlight()),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-prof-null" }),
-      cacheScope: "c-prof-null", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-prof-null", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
     expect(snap.needsPlanning[0].profiles).toBeUndefined();
   });
 
   it("leaves profiles absent when the profiles field is not present in Jira (profilesFieldId null)", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([{
-        id: "10001", key: "P-1",
-        fields: {
-          summary: "P-1",
-          description: null,
-          customfield_10100: { value: "Ready" },
-          customfield_10101: { value: "acme/x" },
-        },
-      }]))
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([]));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready({
+          id: "10001", key: "P-1",
+          fields: {
+            summary: "P-1",
+            description: null,
+            customfield_10100: { value: "Ready" },
+            customfield_10101: { value: "acme/x" },
+            issuelinks: [],
+            assignee: null,
+          },
+        }),
+        children(),
+        inFlight(),
+      ),
+    }).install();
 
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-prof-no-field" }),
-      cacheScope: "c-prof-no-field", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": jiraMapping() }),
-    });
+    const p = makeProvider({ cacheScope: "c-prof-no-field", mappings: { "acme/x": jiraMapping() } });
     const snap = await p.fetchAIImplementSnapshot();
     expect(snap.needsPlanning[0].profiles).toBeUndefined();
     warnSpy.mockRestore();
   });
 
-  it("uses profilesFieldOverride to resolve profiles without calling listFields for all three overrides", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(searchOk([{
-        id: "10001", key: "P-1",
-        fields: {
-          summary: "P-1",
-          description: null,
-          customfield_10100: { value: "Ready" },
-          customfield_10101: { value: "acme/x" },
-          customfield_10200: [{ value: "mobile" }],
-        },
-      }]))
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([]));
+  it("uses profilesFieldOverride to resolve profiles without calling listFields when all four overrides are set", async () => {
+    const fake = fakeFetch({
+      [SEARCH]: jqlSearch(
+        ready({
+          id: "10001", key: "P-1",
+          fields: {
+            summary: "P-1",
+            description: null,
+            customfield_10100: { value: "Ready" },
+            customfield_10101: { value: "acme/x" },
+            customfield_10200: [{ value: "mobile" }],
+            issuelinks: [],
+            assignee: null,
+          },
+        }),
+        children(),
+        inFlight(),
+      ),
+    }).install();
 
-    const mappingWithOverrides: RepoMapping = {
-      ...jiraMapping({
-        statusFieldOverride: "customfield_10100",
-        repoFieldOverride: "customfield_10101",
-      }),
-      ticketingConfig: {
-        kind: "jira",
-        jql: "project = TEST",
-        repoFieldValue: "acme/x",
-        statusFieldOverride: "customfield_10100",
-        repoFieldOverride: "customfield_10101",
-        profilesFieldOverride: "customfield_10200",
-      },
-    };
-
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-prof-override" }),
-      cacheScope: "c-prof-override", siteUrl: "https://x",
-      getMappings: () => ({ "acme/x": mappingWithOverrides }),
-    });
+    const p = makeProvider({ cacheScope: "c-prof-override", mappings: { "acme/x": jiraMapping(ALL_OVERRIDES) } });
     const snap = await p.fetchAIImplementSnapshot();
-    // 3 fetches total: bucket search + children query + capacity search (no listFields call)
-    expect(vi.mocked(fetch).mock.calls).toHaveLength(3);
+    // 3 requests total: bucket search + children query + capacity search (no listFields call)
+    expect(fake.calls).toHaveLength(3);
     expect(snap.needsPlanning[0].profiles).toEqual(["mobile"]);
+  });
+});
+
+describe("JiraProvider.fetchAIImplementSnapshot — assignee field", () => {
+  beforeEach(() => {
+    clearFieldCache();
+  });
+
+  const assigneeIssue = (assignee: unknown): JiraIssue => ({
+    id: "10001", key: "P-1",
+    fields: {
+      summary: "P-1",
+      description: null,
+      customfield_10100: { value: "Ready" },
+      customfield_10101: { value: "acme/x" },
+      issuelinks: [],
+      assignee,
+    },
+  });
+
+  it("maps the assignee displayName to issue.assigneeName", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(ready(assigneeIssue({ displayName: "Paz" })), children(), inFlight()),
+    }).install();
+
+    const p = makeProvider({ cacheScope: "c-assignee", mappings: { "acme/x": jiraMapping() } });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].assigneeName).toBe("Paz");
+  });
+
+  it("leaves assigneeName absent when the issue is unassigned", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(ready(assigneeIssue(null)), children(), inFlight()),
+    }).install();
+
+    const p = makeProvider({ cacheScope: "c-assignee-null", mappings: { "acme/x": jiraMapping() } });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].assigneeName).toBeUndefined();
   });
 });
 
@@ -1508,153 +1709,783 @@ describe("validateTicketingConfig — profilesFieldOverride passthrough", () => 
   });
 });
 
-describe("resolveRepoFieldValue", () => {
-  const mapping = (repoFieldValue: string | null) => ({
-    owner: "acme",
-    repo: "backend",
-    ticketingConfig: validateTicketingConfig("jira", {
-      kind: "jira",
-      jql: "project = TEST",
-      repoFieldValue,
-    }),
+describe("JiraProvider.listIssuesPage", () => {
+  beforeEach(() => {
+    clearFieldCache();
+    // A request no test routes fails it, even when the provider catches the error.
+    fakeFetch({}).install();
   });
 
-  it("derives owner/repo when repoFieldValue is absent", () => {
-    const cfg = validateTicketingConfig("jira", { kind: "jira", jql: "project = TEST" });
-    expect(resolveRepoFieldValue({ owner: "acme", repo: "backend", ticketingConfig: cfg }))
-      .toBe("acme/backend");
+  const FIELDS_WITH_EPIC: ReplyInit = {
+    json: [
+      { id: "customfield_10100", name: "AI-Implement Status", custom: true, schema: {} },
+      { id: "customfield_10101", name: "AI-Implement Repo", custom: true, schema: {} },
+      { id: "customfield_10014", name: "Epic Link", custom: true, schema: {} },
+    ],
+  };
+
+  const page = (issues: unknown[], nextPageToken?: string): ReplyInit => ({ json: { issues, nextPageToken } });
+  /** The field list, then one search reply per page in order, plus any route a test adds. */
+  const jira = (pages: ReplyInit[], extra: Routes = {}) =>
+    fakeFetch({ [FIELDS]: FIELDS_WITH_EPIC, [SEARCH]: pages, ...extra }).install();
+  const mapping = (): RepoMapping => ({ ...jiraMapping(), teamKey: "acme/x" });
+  const provider = (scope: string) =>
+    makeProvider({ cacheScope: scope, mappings: { "acme/x": jiraMapping() } });
+
+  it("filters review-child searches on the server", async () => {
+    const fake = jira([page([])]);
+    await provider("lip-filter").listIssuesPage(mapping(), null, { titlePrefix: "[roll-up-review]" });
+    const search = fake.calls.find(call => call.url.pathname.includes("search/jql"));
+    expect(JSON.parse(search!.body).jql).toContain('AND summary ~ "roll-up-review"');
   });
 
-  it("derives owner/repo when repoFieldValue is blank or whitespace", () => {
-    expect(resolveRepoFieldValue(mapping(""))).toBe("acme/backend");
-    expect(resolveRepoFieldValue(mapping("   "))).toBe("acme/backend");
+  const full = {
+    id: "10001",
+    key: "P-1",
+    fields: {
+      summary: "Full issue",
+      description: adfDoc("Body text"),
+      status: { name: "In Progress", statusCategory: { key: "indeterminate" } },
+      labels: ["a", "b"],
+      project: { name: "Proj" },
+      parent: { key: "P-0" },
+      customfield_10101: { value: "acme/x" },
+      issuelinks: [
+        { type: { name: "Blocks" }, outwardIssue: { key: "P-2" } },
+        { type: { name: "Duplicate" }, outwardIssue: { key: "P-3" } },
+        { type: { name: "Relates" }, outwardIssue: { key: "P-4" } },
+        { type: { name: "Blocks" }, inwardIssue: { key: "P-5" } },
+      ],
+      comment: {
+        total: 1,
+        comments: [{ id: "c1", body: adfDoc("A comment"), created: "2026-01-02T00:00:00.000Z", author: { displayName: "Ada" } }],
+      },
+    },
+  };
+
+  it("maps an issue to the tracker record shape and omits branchName, sourceSystem and team", async () => {
+    const fake = jira([page([full])]);
+    const res = await provider("lip-map").listIssuesPage(mapping(), null);
+
+    expect(res.pageInfo).toEqual({ hasNextPage: false, endCursor: null });
+    const rec = res.issues[0];
+    expect(rec).toEqual({
+      id: "10001",
+      identifier: "P-1",
+      title: "Full issue",
+      description: "Body text",
+      state: { name: "In Progress", type: "indeterminate" },
+      labels: { nodes: [{ name: "a" }, { name: "b" }] },
+      project: { name: "Proj" },
+      parent: { identifier: "P-0" },
+      comments: { nodes: [{ body: "A comment", user: { name: "Ada" }, createdAt: "2026-01-02T00:00:00.000Z" }] },
+      relations: {
+        nodes: [
+          { type: "blocks", relatedIssue: { identifier: "P-2" } },
+          { type: "duplicate", relatedIssue: { identifier: "P-3" } },
+          { type: "related", relatedIssue: { identifier: "P-4" } },
+          { type: "related", relatedIssue: { identifier: "P-5" } },
+        ],
+      },
+    });
+    const body = JSON.parse(fake.calls[1].body);
+    expect(body.jql).toBe("(project = P)");
+    expect(body.fields).toEqual(expect.arrayContaining(["comment", "issuelinks", "customfield_10101", "customfield_10014"]));
   });
 
-  it("prefers an explicit repoFieldValue over the derived one", () => {
-    expect(resolveRepoFieldValue(mapping("Backend Service"))).toBe("Backend Service");
+  it("takes the parent from Epic Link when there is no native parent", async () => {
+    const epicChild = { id: "2", key: "P-6", fields: { summary: "c", customfield_10101: "acme/x", customfield_10014: "P-EPIC" } };
+    jira([page([epicChild])]);
+    const res = await provider("lip-epic").listIssuesPage(mapping(), null);
+    expect(res.issues[0].parent).toEqual({ identifier: "P-EPIC" });
   });
 
-  it("trims an explicit repoFieldValue", () => {
-    expect(resolveRepoFieldValue(mapping("  acme/other  "))).toBe("acme/other");
+  it("yields nulls and empty arrays for a sparse issue", async () => {
+    const sparse = { id: "3", key: "P-7", fields: { summary: "s", customfield_10101: { value: "acme/x" }, comment: null } };
+    jira([page([sparse])]);
+    const rec = (await provider("lip-sparse").listIssuesPage(mapping(), null)).issues[0];
+    expect(rec).toMatchObject({
+      description: null, state: null, project: null, parent: null,
+      labels: { nodes: [] }, comments: { nodes: [] }, relations: { nodes: [] },
+    });
   });
 
-  it("normalizes a blank stored repoFieldValue to null so it derives", () => {
-    const cfg = validateTicketingConfig("jira", { kind: "jira", jql: "project = T", repoFieldValue: "" });
-    if (cfg.kind !== "jira") throw new Error("expected jira");
-    expect(cfg.repoFieldValue).toBeNull();
+  it("drops an issue whose repo field is another repo, for option and plain-string fields", async () => {
+    const other = { id: "4", key: "P-8", fields: { summary: "o", customfield_10101: { value: "acme/other" } } };
+    const otherText = { id: "5", key: "P-9", fields: { summary: "o", customfield_10101: "acme/other" } };
+    const textMatch = { id: "6", key: "P-10", fields: { summary: "t", customfield_10101: "acme/x" } };
+    jira([page([other, otherText, textMatch])]);
+    const res = await provider("lip-drop").listIssuesPage(mapping(), null);
+    expect(res.issues.map((i) => i.identifier)).toEqual(["P-10"]);
   });
 
-  it("no longer throws when repoFieldValue is omitted", () => {
-    expect(() => validateTicketingConfig("jira", { kind: "jira", jql: "project = T" })).not.toThrow();
+  it("chains two pages through the cursor", async () => {
+    const a = { id: "7", key: "P-11", fields: { summary: "a", customfield_10101: "acme/x" } };
+    const b = { id: "8", key: "P-12", fields: { summary: "b", customfield_10101: "acme/x" } };
+    const fake = jira([page([a], "tok-2"), page([b])]);
+    const p = provider("lip-chain");
+    const first = await p.listIssuesPage(mapping(), null);
+    expect(first.pageInfo).toEqual({ hasNextPage: true, endCursor: "tok-2" });
+    const second = await p.listIssuesPage(mapping(), first.pageInfo.endCursor);
+    expect(second.pageInfo).toEqual({ hasNextPage: false, endCursor: null });
+    expect(second.issues.map((i) => i.identifier)).toEqual(["P-12"]);
+    expect(JSON.parse(fake.calls[1].body)).not.toHaveProperty("nextPageToken");
+    expect(JSON.parse(fake.calls[2].body).nextPageToken).toBe("tok-2");
   });
 
-  it("still throws when jql is omitted", () => {
-    expect(() => validateTicketingConfig("jira", { kind: "jira", repoFieldValue: "acme/x" })).toThrow();
+  it("completes a truncated embedded comment list with listComments, capped at 100", async () => {
+    const many = Array.from({ length: 150 }, (_, i) => ({
+      id: `c${i}`, body: adfDoc(`n${i}`), created: "2026-01-01T00:00:00.000Z", author: null,
+    }));
+    const trunc = {
+      id: "9", key: "P-13",
+      fields: { summary: "t", customfield_10101: "acme/x", comment: { total: 150, comments: many.slice(0, 20) } },
+    };
+    jira([page([trunc])], {
+      [`GET ${API}/issue/P-13/comment`]: [
+        { json: { comments: many.slice(0, 100), total: 150 } },
+        { json: { comments: many.slice(100), total: 150 } },
+      ],
+    });
+    const rec = (await provider("lip-trunc").listIssuesPage(mapping(), null)).issues[0];
+    expect(rec.comments.nodes).toHaveLength(100);
+    expect(rec.comments.nodes[0]).toEqual({ body: "n0", user: null, createdAt: "2026-01-01T00:00:00.000Z" });
+  });
+
+  it("keeps the newest 100 of 101 embedded comments, newest first, without listComments", async () => {
+    const embedded = Array.from({ length: 101 }, (_, i) => ({
+      id: `c${i}`, body: adfDoc(`n${i}`), created: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), author: null,
+    }));
+    const full = {
+      id: "10", key: "P-14",
+      fields: { summary: "t", customfield_10101: "acme/x", comment: { total: 101, comments: embedded } },
+    };
+    const fake = jira([page([full])]);
+    const rec = (await provider("lip-101").listIssuesPage(mapping(), null)).issues[0];
+    expect(fake.calls).toHaveLength(2);
+    expect(rec.comments.nodes).toHaveLength(100);
+    expect(rec.comments.nodes[0].body).toBe("n100");
+    expect(rec.comments.nodes.map((c) => c.body)).not.toContain("n0");
+  });
+
+  it("throws TrackerUnavailableError for a mapping without Jira config or team key", async () => {
+    const p = provider("lip-unavail");
+    await expect(p.listIssuesPage({ ...jiraMapping(), teamKey: undefined }, null)).rejects.toBeInstanceOf(TrackerUnavailableError);
+    await expect(
+      p.listIssuesPage(makeMapping({ teamKey: "X" }), null),
+    ).rejects.toBeInstanceOf(TrackerUnavailableError);
+  });
+
+  it("propagates a Jira API error so Restate retries it", async () => {
+    jira([jiraError(500, "boom")]);
+    await expect(provider("lip-err").listIssuesPage(mapping(), null)).rejects.toBeInstanceOf(JiraApiError);
   });
 });
 
-describe("JiraProvider repo matching without an explicit repoFieldValue", () => {
-  beforeEach(() => {
-    vi.stubGlobal("fetch", vi.fn());
+describe("JiraProvider.fetchSetupFacts", () => {
+  const CREDENTIALS = `GET ${API}/resolution/search` as const;
+  const STATUS_CONTEXTS = `GET ${API}/field/customfield_10100/context` as const;
+  const REPO_CONTEXTS = `GET ${API}/field/customfield_10101/context` as const;
+  const STATUS_OPTIONS = `GET ${API}/field/customfield_10100/context/1/option` as const;
+  // The four overrides as the poll's field cache keys them.
+  const CACHE_OVERRIDES = {
+    statusOverride: ALL_OVERRIDES.statusFieldOverride,
+    repoOverride: ALL_OVERRIDES.repoFieldOverride,
+    profilesOverride: ALL_OVERRIDES.profilesFieldOverride,
+    baseBranchOverride: ALL_OVERRIDES.baseBranchFieldOverride,
+  };
+  // A project whose four fields are overridden, so its reads skip the field list: the status field has
+  // one context holding Ready, the repo field is text, and its JQL is accepted.
+  const readableProject = (): Routes => ({
+    [CREDENTIALS]: { json: { values: [{ id: "1" }] } },
+    [STATUS_CONTEXTS]: { json: { values: [{ id: "1" }], isLast: true } },
+    [STATUS_OPTIONS]: { json: { values: [{ id: "a", value: "Ready" }], isLast: true } },
+    [REPO_CONTEXTS]: { status: 404 },
+    [SEARCH]: { json: { issues: [] } },
+  });
+
+  beforeEach(() => clearFieldCache());
+
+  it("proves the credentials first, then reads each project with GETs and the poll's own search, leaving the cache empty", async () => {
+    const fields = await import("../../providers/jira-fields.js");
+    const shared = vi.spyOn(fields, "buildBucketQuery").mockReturnValue("the poll's query");
+    onTestFinished(() => shared.mockRestore());
+    const fake = fakeFetch(readableProject()).install();
+
+    const facts = await makeProvider({ cacheScope: "setup", mappings: { X: jiraMapping({ ...ALL_OVERRIDES, jql: "project = X" }) } }).fetchSetupFacts(["X"]);
+
+    expect(facts).toEqual({
+      kind: "jira",
+      credentials: "accepted",
+      oauth: false,
+      projects: {
+        X: {
+          fields: "resolved",
+          ids: { statusFieldId: "customfield_10100", repoFieldId: "customfield_10101", profilesFieldId: "customfield_10200", baseBranchFieldId: "customfield_10300" },
+          cachedIds: null,
+          ambiguousOptional: [],
+          statusOptions: { read: "options", values: ["Ready"] },
+          repoOptions: { read: "not-select" },
+          jql: { accepted: true },
+        },
+      },
+    });
+    expect(fake.calls[0].path).toBe(`${API}/resolution/search`);
+    expect(shared).toHaveBeenCalledWith("project = X", "customfield_10100");
+    expect(JSON.parse(fake.calls.find((call) => call.method === "POST")!.body)).toMatchObject({ jql: "the poll's query", maxResults: 1 });
+    for (const call of fake.calls) expect(call.method === "GET" || call.path === `${API}/search/jql`).toBe(true);
+    expect(fields.peekCachedFieldIds("setup", CACHE_OVERRIDES)).toBeUndefined();
+  });
+
+  it("records refused credentials with Jira's status, and reads nothing else", async () => {
+    const fake = fakeFetch({ [CREDENTIALS]: jiraError(401, "Client must be authenticated to access this resource.") }).install();
+    const facts = await makeProvider({ cacheScope: "refused", mappings: { X: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["X"]);
+    expect(facts).toMatchObject({ kind: "jira", credentials: "refused", status: 401 });
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  it("records a Jira it cannot reach with a null status", async () => {
+    fakeFetch({ [CREDENTIALS]: () => { throw new TypeError("fetch failed"); } }).install();
+    const facts = await makeProvider({ cacheScope: "unreachable", mappings: {} }).fetchSetupFacts([]);
+    expect(facts).toMatchObject({ kind: "jira", credentials: "refused", status: null });
+  });
+
+  it("records OAuth mode, whose access token the client never refreshes", async () => {
+    fakeFetch({ [CREDENTIALS]: readableProject()[CREDENTIALS] }).install();
+    const facts = await makeProvider({ cacheScope: "oauth", mappings: {}, oauth: true }).fetchSetupFacts([]);
+    expect(facts).toEqual({ kind: "jira", credentials: "accepted", oauth: true, projects: {} });
+  });
+
+  it("compares the fresh field IDs with the ones the poll cached before the fields changed", async () => {
+    const { getCachedFieldIds } = await import("../../providers/jira-fields.js");
+    const overrides = { statusOverride: null, repoOverride: "customfield_10101", profilesOverride: "customfield_10200", baseBranchOverride: "customfield_10300" };
+    fakeFetch({ [FIELDS]: { json: [selectField("customfield_1", "AI-Implement Status")] } }).install();
+    await getCachedFieldIds("drift", stubClient(), overrides);
+    fakeFetch({
+      ...readableProject(),
+      [FIELDS]: { json: [selectField("customfield_10100", "AI-Implement Status")] },
+    }).install();
+
+    const facts = await makeProvider({ cacheScope: "drift", mappings: {
+      X: jiraMapping({ repoFieldOverride: "customfield_10101", profilesFieldOverride: "customfield_10200", baseBranchFieldOverride: "customfield_10300" }),
+    } }).fetchSetupFacts(["X"]);
+
+    expect(facts).toMatchObject({ projects: { X: { fields: "resolved", ids: { statusFieldId: "customfield_10100" }, cachedIds: { statusFieldId: "customfield_1" } } } });
+  });
+
+  it.each([
+    ["AI-Implement Status", "missing"],
+    ["AI-Implement Status", "duplicate"],
+    ["AI-Implement Repo", "missing"],
+    ["AI-Implement Repo", "duplicate"],
+  ] as const)("records %s %s by name, and still reads a project that overrides it", async (name, fault) => {
+    const other = name === "AI-Implement Status" ? "AI-Implement Repo" : "AI-Implement Status";
+    const listed = [selectField("customfield_9", other), ...(fault === "duplicate" ? [selectField("customfield_7", name), selectField("customfield_8", name)] : [])];
+    fakeFetch({ ...readableProject(), [FIELDS]: { json: listed } }).install();
+
+    const facts = await makeProvider({ cacheScope: "isolation", mappings: { BAD: jiraMapping(), GOOD: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["BAD", "GOOD"]);
+
+    expect(facts).toMatchObject({ projects: { BAD: { fields: "unresolved", field: name, fault }, GOOD: { fields: "resolved", jql: { accepted: true } } } });
+  });
+
+  it("records a field list Jira refuses as unreadable, which a project with every field overridden never asks for", async () => {
+    fakeFetch({ ...readableProject(), [FIELDS]: jiraError(403, "forbidden") }).install();
+    const facts = await makeProvider({ cacheScope: "unreadable", mappings: { LISTS: jiraMapping(), OVERRIDES: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["LISTS", "OVERRIDES"]);
+    expect(facts).toMatchObject({ projects: { LISTS: { fields: "unreadable", failure: { status: 403 } }, OVERRIDES: { fields: "resolved" } } });
+  });
+
+  it.each([
+    ["AI-Implement Profiles", "profilesFieldId"],
+    ["AI-Implement Base Branch", "baseBranchFieldId"],
+  ] as const)("records an optional field named %s twice, leaving it off", async (name, fieldId) => {
+    fakeFetch({
+      ...readableProject(),
+      [FIELDS]: { json: [
+        selectField("customfield_10100", "AI-Implement Status"), selectField("customfield_10101", "AI-Implement Repo"),
+        selectField("customfield_1", name), selectField("customfield_2", name),
+      ] },
+    }).install();
+    const facts = await makeProvider({ cacheScope: "ambiguous", mappings: { X: jiraMapping() } }).fetchSetupFacts(["X"]);
+    expect(facts).toMatchObject({ projects: { X: { fields: "resolved", ambiguousOptional: [name], ids: { [fieldId]: null } } } });
+  });
+
+  it("records an optional field as ambiguous only when several fields share its name and no override picks one", async () => {
+    fakeFetch({
+      ...readableProject(),
+      [FIELDS]: { json: [
+        selectField("customfield_10100", "AI-Implement Status"), selectField("customfield_10101", "AI-Implement Repo"),
+        selectField("customfield_1", "AI-Implement Profiles"), selectField("customfield_2", "AI-Implement Profiles"),
+        selectField("customfield_3", "AI-Implement Base Branch"),
+      ] },
+    }).install();
+
+    const facts = await makeProvider({ cacheScope: "optional", mappings: {
+      NAMES: jiraMapping(),
+      PICKED: jiraMapping({ profilesFieldOverride: "customfield_2" }),
+    } }).fetchSetupFacts(["NAMES", "PICKED"]);
+
+    expect(facts).toMatchObject({ projects: {
+      NAMES: { ambiguousOptional: ["AI-Implement Profiles"], ids: { baseBranchFieldId: "customfield_3" } },
+      PICKED: { ambiguousOptional: [], ids: { profilesFieldId: "customfield_2" } },
+    } });
+  });
+
+  it("throws an error that is neither a refused field list nor a field fault, so the run reports it", async () => {
+    const fields = await import("../../providers/jira-fields.js");
+    const resolve = vi.spyOn(fields, "resolveCustomFieldIds").mockRejectedValue(new TypeError("unexpected"));
+    onTestFinished(() => resolve.mockRestore());
+    fakeFetch({ [CREDENTIALS]: readableProject()[CREDENTIALS] }).install();
+
+    await expect(makeProvider({ cacheScope: "unexpected", mappings: { X: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["X"]))
+      .rejects.toThrow("unexpected");
+  });
+
+  it("records an option read Jira refuses, and the JQL it refuses, each with Jira's status", async () => {
+    fakeFetch({
+      ...readableProject(),
+      [STATUS_CONTEXTS]: jiraError(403, "forbidden"),
+      [SEARCH]: jiraError(400, "Error in the JQL Query"),
+    }).install();
+    const facts = await makeProvider({ cacheScope: "refusals", mappings: { X: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["X"]);
+    expect(facts).toMatchObject({ projects: { X: {
+      statusOptions: { read: "failed", failure: { status: 403 } },
+      jql: { accepted: false, failure: { status: 400 } },
+    } } });
+  });
+
+  it("reads only the Jira projects it is asked for", async () => {
+    fakeFetch(readableProject()).install();
+    const facts = await makeProvider({ cacheScope: "scope", mappings: { X: jiraMapping(ALL_OVERRIDES), L: makeMapping({ ticketingProvider: "linear" }) } }).fetchSetupFacts(["X", "L"]);
+    expect(facts).toMatchObject({ credentials: "accepted" });
+    expect(facts.credentials === "accepted" && Object.keys(facts.projects)).toEqual(["X"]);
+  });
+});
+
+for (const repo of ["acme/x", { id: "option", value: "acme/x" }]) {
+  runChildIssueContract(`JiraProvider Repo=${typeof repo}`, async () => {
+    const client = stubClient();
+    const fake = fakeFetch({
+      [`GET ${API}/issue/parent`]: { json: { id: "parent", key: "P-1", fields: {
+        project: { id: "project" }, issuetype: { hierarchyLevel: 0 }, customfield_10101: repo,
+      } } },
+      [`GET ${API}/issue/createmeta/project/issuetypes`]: { json: { values: [
+        { id: "task", subtask: false }, { id: "subtask", subtask: true },
+      ] } },
+      [`POST ${API}/issue`]: { json: { id: "child", key: "P-2" } },
+    }).install();
+    const p = new JiraProvider({ client, cacheScope: "child-contract", siteUrl: "https://x",
+      getMappings: () => ({ TEAM: jiraMapping(ALL_OVERRIDES), OTHER: jiraMapping({ ...ALL_OVERRIDES, repoFieldValue: "other/repo" }) }) });
+    return { provider: p, parentId: "parent", scopeKey: "TEAM", inspect: async () => {
+      const fields = JSON.parse(fake.calls[2].body).fields;
+      expect(fields.issuetype).toEqual({ id: "subtask" });
+      expect(fields.customfield_10101).toEqual(typeof repo === "string" ? repo : { value: "acme/x" });
+      expect(fields.labels).toBeUndefined();
+      return { title: fields.summary, body: adfToPlainText(fields.description), parentId: fields.parent.id,
+        scopeKey: fields.project.id === "project" ? "TEAM" : "", pickupReady: fields.customfield_10100.value === "Ready" };
+    } };
+  });
+}
+
+describe("JiraProvider.createChildIssue failures", () => {
+  for (const failure of ["subtask-parent", "no-child-type", "repo-mismatch", "create-refused"]) {
+    it(`propagates ${failure} without returning success`, async () => {
+      const fake = fakeFetch({
+        [`GET ${API}/issue/parent`]: { json: { id: "parent", key: "P-1", fields: {
+          project: { id: "p" }, issuetype: { subtask: failure === "subtask-parent", hierarchyLevel: 0 },
+          customfield_10101: failure === "repo-mismatch" ? "wrong/repo" : "acme/x",
+        } } },
+        [`GET ${API}/issue/createmeta/p/issuetypes`]: { json: { issueTypes: failure === "no-child-type" ? [] : [{ id: "s", subtask: true }], total: 1 } },
+        [`POST ${API}/issue`]: { status: 400, text: "Required field missing" },
+      }).install();
+      const p = new JiraProvider({ client: stubClient(), cacheScope: "child-failure", siteUrl: "https://x",
+        getMappings: () => ({ TEAM: jiraMapping(ALL_OVERRIDES) }) });
+      await expect(p.createChildIssue("parent", "TEAM", { title: "Title", body: "Body" })).rejects.toThrow();
+      expect(fake.calls.filter((c) => c.method === "POST")).toHaveLength(failure === "create-refused" ? 1 : 0);
+    });
+  }
+});
+
+describe("JiraProvider creates children above the subtask level", () => {
+  for (const simplified of [false, true]) {
+    it(`links a Story to an Epic in a ${simplified ? "team" : "company"}-managed project`, async () => {
+      const fake = fakeFetch({
+        [FIELDS]: { json: [
+          { id: "customfield_10100", name: "AI-Implement Status", custom: true },
+          { id: "customfield_10101", name: "AI-Implement Repo", custom: true },
+          { id: "customfield_10014", name: "Epic Link", custom: true },
+        ] },
+        [`GET ${API}/issue/parent`]: { json: { id: "parent", key: "P-1", fields: {
+          project: { id: "p" }, issuetype: { hierarchyLevel: 1 }, customfield_10101: "acme/x",
+        } } },
+        // Jira create metadata need not include hierarchyLevel.
+        [`GET ${API}/issue/createmeta/p/issuetypes`]: { json: { values: [
+          { id: "epic", subtask: false }, { id: "story", subtask: false }, { id: "sub", subtask: true },
+        ] } },
+        [`GET ${API}/issuetype/project`]: { json: [
+          { id: "epic", hierarchyLevel: 1 }, { id: "story", hierarchyLevel: 0 }, { id: "sub", hierarchyLevel: -1 },
+        ] },
+        [`GET ${API}/project/p`]: { json: { simplified } },
+        [`POST ${API}/issue`]: { json: { id: "child", key: "P-2" } },
+      }).install();
+      const p = new JiraProvider({ client: stubClient(), cacheScope: `epic-child-${simplified}`, siteUrl: "https://x",
+        getMappings: () => ({ TEAM: jiraMapping(ALL_OVERRIDES) }) });
+      await expect(p.createChildIssue("parent", "TEAM", { title: "Child", body: "Body" }))
+        .resolves.toEqual({ id: "child", identifier: "P-2" });
+      const fields = JSON.parse(fake.calls.find((c) => c.method === "POST")!.body).fields;
+      expect(fields).toMatchObject({ project: { id: "p" }, issuetype: { id: "story" },
+        customfield_10100: { value: "Ready" }, customfield_10101: "acme/x" });
+      expect(fields.parent).toEqual(simplified ? { id: "parent" } : undefined);
+      expect(fields.customfield_10014).toBe(simplified ? undefined : "P-1");
+    });
+  }
+});
+
+describe("JiraProvider.listIssueStatuses", () => {
+  beforeEach(() => clearFieldCache());
+
+  const mapping = (): RepoMapping => ({
+    ...jiraMapping({ ...ALL_OVERRIDES, jql: 'project = P OR project = Q' }),
+    teamKey: "status-team",
+  });
+  const provider = () => makeProvider({ cacheScope: "statuses", mappings: { "status-team": mapping() } });
+  const updated = "2026-11-15T12:00:00.000Z";
+  const issue = (status = "Ready", repo: unknown = { value: "acme/x" }): JiraIssue => ({
+    id: "10001", key: "P-1",
+    fields: { summary: "A task", updated, customfield_10100: { value: status }, customfield_10101: repo },
+  });
+
+  it.each([
+    ["Ready", "ready", null],
+    ["Planning", "planning", null],
+    ["Awaiting Approval", "awaiting-approval", null],
+    ["Plan Approved", "plan-approved", null],
+    ["Implementing", "implementing", null],
+    ["PR Ready", "pr-ready", null],
+    ["Merged", "merged", null],
+    ["Planning Failed", "failed", "planning"],
+    ["Implementation Failed", "failed", "implementation"],
+    ["Unexpected", "unknown", null],
+  ])("normalizes %s", async (status, state, phase) => {
+    fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [issue(status!)] }) }).install();
+    expect(await provider().listIssueStatuses(mapping())).toEqual([{
+      id: "10001", identifier: "P-1", title: "A task", url: "https://x/browse/P-1",
+      state, phase, labels: [], workflowState: status, updatedAt: Date.parse(updated),
+    }]);
+  });
+
+  it("uses scoped field overrides and the mapping JQL with recent terminal statuses", async () => {
+    const fake = fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/ }) }).install();
+    await provider().listIssueStatuses(mapping());
+    expect(searchBodies(fake)[0]).toEqual({
+      jql: `(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`,
+      fields: ["summary", "updated", "customfield_10100", "customfield_10101"],
+      maxResults: 100,
+    });
+  });
+
+  it("keeps string and select repo values and excludes another repository", async () => {
+    fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [
+      issue("Ready", " acme/x "), issue("Ready"), issue("Ready", { value: "acme/other" }),
+    ] }) }).install();
+    expect(await provider().listIssueStatuses(mapping())).toHaveLength(2);
+  });
+
+  it.each(["Won't Do", "Cancelled", "CANCELED", "Duplicate"])("keeps custom-status state and phase for native resolution %s", async (resolution) => {
+    const nativeIssue = (category: string, name: string | null, customStatus = "Ready"): JiraIssue => {
+      const raw = issue(customStatus);
+      return { ...raw, fields: { ...raw.fields,
+        status: { statusCategory: { key: category } },
+        resolution: name === null ? null : { name },
+      } };
+    };
+    fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [
+      nativeIssue("done", resolution),
+      nativeIssue("done", resolution, "Merged"),
+      nativeIssue("done", resolution, "Planning Failed"),
+      nativeIssue("done", resolution, "Implementation Failed"),
+      nativeIssue("done", "Done", "Merged"),
+      nativeIssue("indeterminate", resolution),
+      nativeIssue("done", null),
+    ] }) }).install();
+    expect((await provider().listIssueStatuses(mapping())).map(({ workflowState, state, phase }) => ({ workflowState, state, phase })))
+      .toEqual([
+        { workflowState: "Ready", state: "ready", phase: null },
+        { workflowState: "Merged", state: "merged", phase: null },
+        { workflowState: "Planning Failed", state: "failed", phase: "planning" },
+        { workflowState: "Implementation Failed", state: "failed", phase: "implementation" },
+        { workflowState: "Merged", state: "merged", phase: null },
+        { workflowState: "Ready", state: "ready", phase: null },
+        { workflowState: "Ready", state: "ready", phase: null },
+      ]);
+  });
+
+  it("accumulates pages and forwards tokens through an empty page", async () => {
+    const fake = fakeFetch({ [SEARCH]: [
+      { json: { issues: [issue()], nextPageToken: "second" } },
+      { json: { issues: [], nextPageToken: "third" } },
+      { json: { issues: [issue("Planning")] } },
+    ] }).install();
+    expect((await provider().listIssueStatuses(mapping())).map((record) => record.state)).toEqual(["ready", "planning"]);
+    expect(fake.calls.map((call) => JSON.parse(call.body).nextPageToken)).toEqual([undefined, "second", "third"]);
+  });
+
+  it.each([false, true])("enforces the 20-page ceiling (has more: %s)", async (hasMore) => {
+    const fake = fakeFetch({ [SEARCH]: Array.from({ length: 21 }, (_, page) => ({
+      json: { issues: [issue()], nextPageToken: page < 19 || hasMore ? `page-${page + 2}` : undefined },
+    })) }).install();
+    const result = provider().listIssueStatuses(mapping());
+    if (hasMore) await expect(result).rejects.toThrow(TrackerUnavailableError);
+    else await expect(result).resolves.toHaveLength(20);
+    expect(fake.calls).toHaveLength(20);
+  });
+
+  it.each([401, 500])("propagates Jira %s after a successful page", async (status) => {
+    fakeFetch({ [SEARCH]: [
+      { json: { issues: [issue()], nextPageToken: "second" } },
+      jiraError(status, "Search failed"),
+    ] }).install();
+    await expect(provider().listIssueStatuses(mapping())).rejects.toBeInstanceOf(JiraApiError);
+  });
+
+  it("rejects missing Jira config or mapping key", async () => {
+    fakeFetch({}).install();
+    await expect(provider().listIssueStatuses(makeMapping())).rejects.toBeInstanceOf(TrackerUnavailableError);
+    await expect(provider().listIssueStatuses({ ...mapping(), teamKey: undefined })).rejects.toBeInstanceOf(TrackerUnavailableError);
+  });
+});
+
+runPrClosedUnmergedContract("JiraProvider", async (terminal) => {
+  clearFieldCache();
+  const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY,
+    [STATUS_READ]: { json: { id: "10001", key: "P-1", fields: { customfield_10100: { value: terminal ? "Merged" : "PR Ready" } } } },
+    [STATUS_WRITE]: { status: 204 }, [COMMENT]: { status: 201, json: { id: "comment" } },
+  }).install();
+  return { provider: makeProvider({ cacheScope: "close", mappings: { "acme/x": jiraMapping() } }), issueId: "10001", scopeKey: "acme/x",
+    restartSentence: "To run it again, set the AI-Implement status to its pickup value.",
+    verify: async (terminal, comment) => {
+      expect(fake.calls.map((c) => c.method)).toEqual(terminal ? ["GET", "GET"] : ["GET", "GET", "PUT", "POST"]);
+      if (!terminal) {
+        expect(JSON.parse(fake.calls[2].body).fields.customfield_10100).toEqual({ value: "Implementation Failed" });
+        expect(adfToPlainText(JSON.parse(fake.calls[3].body).body)).toBe(comment);
+      }
+    } };
+});
+describe("JiraProvider unmerged close guards", () => {
+  it("refuses native terminal issues", async () => {
     clearFieldCache();
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: { json: { id: "10001", key: "P-1", fields: { status: { statusCategory: { key: "done" } } } } } }).install();
+    const p = makeProvider({ cacheScope: "close-native", mappings: { "acme/x": jiraMapping() } });
+    expect(await p.markPrClosedUnmerged("10001", "acme/x", "url")).toBe(false);
+    expect(fake.calls.map((c) => c.method)).toEqual(["GET", "GET"]);
+  });
+  it("does not write when the terminal-state read fails", async () => {
+    clearFieldCache();
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: { status: 403, json: {} } }).install();
+    const p = makeProvider({ cacheScope: "close-error", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.markPrClosedUnmerged("10001", "acme/x", "url")).rejects.toThrow();
+    expect(fake.calls.map((c) => c.method)).toEqual(["GET", "GET"]);
+  });
+});
+
+// Every read of a project's Repo field value, from the projects as the store reads them back:
+// acme/backend as main stores a project saved without a Repo Field Value (#336), which matches its owner/repo,
+// and acme/frontend saved with an explicit value unlike its owner/repo. Both share one JQL, as sibling repositories do.
+describe("JiraProvider reads for a project saved without a Repo Field Value", () => {
+  const MAIN_ROW = '{"kind":"jira","jql":"project = P","repoFieldValue":null,"statusFieldOverride":null,"repoFieldOverride":null,"profilesFieldOverride":null}';
+
+  let config: typeof ConfigModule;
+  let issueStatuses: typeof IssueStatusesModule;
+  let mergeUp: typeof MergeUpModule;
+
+  beforeEach(async () => {
+    clearFieldCache();
+    const db = await testDb({ modules: {
+      config: () => import("../../config.js"),
+      issueStatuses: () => import("../../issue-statuses.js"),
+      mergeUp: () => import("../../merge-up.js"),
+    } });
+    ({ config, issueStatuses, mergeUp } = db.modules);
+    config.upsertMapping("acme/backend", makeMapping({ owner: "acme", repo: "backend" }));
+    const raw = new Database(db.path);
+    raw.prepare("UPDATE mappings SET ticketing_provider = 'jira', ticketing_config = ? WHERE team_key = ?").run(MAIN_ROW, "acme/backend");
+    raw.close();
+    config.upsertMapping("acme/frontend", makeMapping({
+      owner: "acme",
+      repo: "frontend",
+      ticketingProvider: "jira",
+      ticketingConfig: validateTicketingConfig("jira", { kind: "jira", jql: "project = P", repoFieldValue: "Frontend Service" }),
+    }));
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  const issue = (id: string, key: string, status: string, repo: string) => ({
-    id, key,
+  const provider = (cacheScope: string, onRepoFieldMismatch = vi.fn()) => new JiraProvider({
+    client: stubClient(), cacheScope, siteUrl: "https://x", getMappings: () => config.getMappings(), onRepoFieldMismatch,
+  });
+
+  // An issue with every field any of these reads requests. Jira sends an unset custom field as null.
+  const issue = (key: string, repo: { value: string } | null, extra: { status?: string; parentKey?: string; summary?: string } = {}): JiraIssue => ({
+    id: `id-${key}`,
+    key,
     fields: {
-      summary: `summary-${key}`, description: null,
-      customfield_10100: { value: status },
-      customfield_10101: { value: repo },
+      summary: extra.summary ?? key,
+      description: null,
+      updated: "2026-11-15T12:00:00.000Z",
+      status: { name: "To Do", statusCategory: { key: "indeterminate" } },
+      labels: [],
+      project: { name: "P" },
+      parent: extra.parentKey ? { key: extra.parentKey } : null,
+      issuelinks: [],
+      assignee: null,
+      comment: { total: 0, comments: [] },
+      customfield_10100: { value: extra.status ?? "Ready" },
+      customfield_10101: repo,
     },
   });
-  const searchOk = (issues: unknown[]): Response =>
-    ({ ok: true, json: async () => ({ issues }) }) as Response;
 
-  const derivedMapping = (owner: string, repo: string): RepoMapping => ({
-    ...baseMapping,
-    owner,
-    repo,
-    ticketingProvider: "jira",
-    ticketingConfig: { kind: "jira", jql: "project = TEST", repoFieldValue: null },
-  });
-
-  it("matches issues on the derived owner/repo when repoFieldValue is null", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([
-        issue("10001", "P-1", "Ready", "acme/backend"),
-        issue("10002", "P-2", "Ready", "acme/frontend"),
-      ]))
-      .mockResolvedValueOnce(searchOk([])) // children query
-      .mockResolvedValueOnce(searchOk([]));
-
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-derive" }),
-      cacheScope: "c-derive", siteUrl: "https://x",
-      getMappings: () => ({ "acme/backend": derivedMapping("acme", "backend") }),
-    });
-    const snap = await p.fetchAIImplementSnapshot();
-
-    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-1"]);
-  });
-
-  it("stays quiet when the unmatched repo value belongs to another mapping", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([issue("10002", "P-2", "Ready", "acme/frontend")]))
-      .mockResolvedValueOnce(searchOk([]))
-      .mockResolvedValueOnce(searchOk([])) // bucket, mapping acme/frontend
-      .mockResolvedValueOnce(searchOk([]));
-
+  it("the poll matches each project on its own value, and reports only a value no Jira project matches", async () => {
+    // A Linear project whose owner/repo is the typo claims nothing on Jira.
+    config.upsertMapping("LIN", makeMapping({ owner: "acme", repo: "typo" }));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(issue("P-1", { value: "acme/backend" }), issue("P-2", { value: "Frontend Service" }), issue("P-3", { value: "acme/typo" }), issue("P-4", null)),
+        children(),
+        inFlight(),
+      ),
+    }).install();
     const onRepoFieldMismatch = vi.fn();
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-quiet-sibling" }),
-      cacheScope: "c-quiet-sibling", siteUrl: "https://x",
-      getMappings: () => ({
-        "acme/backend": derivedMapping("acme", "backend"),
-        "acme/frontend": derivedMapping("acme", "frontend"),
-      }),
-      onRepoFieldMismatch,
-    });
-    await p.fetchAIImplementSnapshot();
 
+    const snap = await provider("reads-poll", onRepoFieldMismatch).fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => [i.scopeKey, i.identifier]).sort()).toEqual([["acme/backend", "P-1"], ["acme/frontend", "P-2"]]);
+    expect(onRepoFieldMismatch.mock.calls.sort()).toEqual([
+      ["acme/backend", "P-3", "acme/typo"],
+      ["acme/backend", "P-4", ""],
+      ["acme/frontend", "P-3", "acme/typo"],
+      ["acme/frontend", "P-4", ""],
+    ]);
+  });
+
+  it("logs an unmatched value with the value each project matches, derived or explicit", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fakeFetch({ [FIELDS]: FIELDS_REPLY, [SEARCH]: jqlSearch(ready(issue("P-3", { value: "acme/typo" })), inFlight()) }).install();
+
+    await createJiraProviderFromConfig({ jiraToken: "t", jiraCloudId: "c", jiraSiteUrl: "https://x" }, () => config.getMappings())
+      .fetchAIImplementSnapshot();
+
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((line) => line.includes("P-3"));
+    expect(lines).toHaveLength(2);
+    for (const [project, expected] of [["acme/backend", "acme/backend"], ["acme/frontend", "Frontend Service"]]) {
+      expect(lines.filter((line) => line.includes('"acme/typo"') && line.includes(`project ${project} `) && line.includes(`"${expected}"`)))
+        .toHaveLength(1);
+    }
+  });
+
+  // The in-progress count (the Issues page, the poll's diagnostic line) runs the shared JQL too, so it matches as the poll does.
+  it("the in-progress count counts only each project's own issues, and reports none", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(),
+        inFlight(
+          issue("P-50", { value: "acme/backend" }, { status: "Implementing" }),
+          issue("P-51", { value: "acme/backend" }, { status: "Planning" }),
+          issue("P-52", { value: "Frontend Service" }, { status: "Implementing" }),
+          issue("P-53", { value: "acme/typo" }, { status: "Planning" }),
+          issue("P-54", null, { status: "Implementing" }),
+        ),
+      ),
+    }).install();
+    const onRepoFieldMismatch = vi.fn();
+
+    const snap = await provider("reads-in-progress", onRepoFieldMismatch).fetchAIImplementSnapshot();
+
+    expect(snap.inProgressCountsByScope).toEqual({ "acme/backend": 2, "acme/frontend": 1 });
     expect(onRepoFieldMismatch).not.toHaveBeenCalled();
   });
 
-  it("still reports a repo value no mapping claims", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([issue("10003", "P-3", "Ready", "acme/typo")]))
-      .mockResolvedValueOnce(searchOk([]));
+  it("feature-branch enrichment holds a parent whose in-flight child carries the derived value", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(issue("P-10", { value: "acme/backend" })),
+        children(issue("P-11", { value: "acme/backend" }, { status: "Implementing", parentKey: "P-10" })),
+        inFlight(),
+      ),
+    }).install();
 
-    const onRepoFieldMismatch = vi.fn();
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-report-typo" }),
-      cacheScope: "c-report-typo", siteUrl: "https://x",
-      getMappings: () => ({ "acme/backend": derivedMapping("acme", "backend") }),
-      onRepoFieldMismatch,
-    });
-    await p.fetchAIImplementSnapshot();
+    const snap = await provider("reads-enrichment").fetchAIImplementSnapshot();
 
-    expect(onRepoFieldMismatch).toHaveBeenCalledWith("acme/backend", "P-3", "acme/typo");
+    expect(snap.needsPlanning).toEqual([]);
+    expect(log.mock.calls.map((c) => c[0])).toContainEqual(
+      expect.stringContaining("Skipping P-10: grouping parent waiting on in-flight AI-Implement children: P-11"),
+    );
   });
 
-  it("still reports an empty repo field", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(searchOk([issue("10004", "P-4", "Ready", "")]))
-      .mockResolvedValueOnce(searchOk([]));
+  it("roll-up discovery finds a completed feature node by the derived value", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        completed(issue("P-20", { value: "acme/backend" }, { status: "PR Ready" })),
+        children(issue("P-21", { value: "acme/backend" }, { status: "Merged", parentKey: "P-20" })),
+      ),
+    }).install();
 
+    expect(await provider("reads-rollups").fetchFeatureNodeRollUps()).toEqual([
+      { issueId: "id-P-20", identifier: "P-20", scopeKey: "acme/backend", mode: "feature", parent: null, childIdentifiers: ["P-21"] },
+    ]);
+  });
+
+  // The knowledge-graph export (TrackerExport) and the poll's roll-up review reconciliation both pass the stored mapping with its team key.
+  it("the knowledge-graph export and roll-up review children list the project's issues by the derived value", async () => {
+    const reviewChild = issue("P-30", { value: "acme/backend" }, { parentKey: "P-29", summary: "[roll-up-review] acme/backend#5 abc123" });
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        { when: /summary ~ "roll-up-review"/, issues: [reviewChild] },
+        { when: /^\(project = P\)$/, issues: [reviewChild, issue("P-31", { value: "Frontend Service" }), issue("P-32", { value: "acme/typo" })] },
+      ),
+    }).install();
     const onRepoFieldMismatch = vi.fn();
-    const p = new JiraProvider({
-      client: new JiraClient({ token: "t", cloudId: "c-report-empty" }),
-      cacheScope: "c-report-empty", siteUrl: "https://x",
-      getMappings: () => ({ "acme/backend": derivedMapping("acme", "backend") }),
-      onRepoFieldMismatch,
-    });
-    await p.fetchAIImplementSnapshot();
+    const p = provider("reads-pages", onRepoFieldMismatch);
+    const mapping = { ...config.getMappings()["acme/backend"], teamKey: "acme/backend" };
 
-    expect(onRepoFieldMismatch).toHaveBeenCalledWith("acme/backend", "P-4", "");
+    expect((await p.listIssuesPage(mapping, null)).issues.map((i) => i.identifier)).toEqual(["P-30"]);
+    expect((await mergeUp.listRollupReviewChildren(p, mapping)).map((i) => i.identifier)).toEqual(["P-30"]);
+    expect(onRepoFieldMismatch.mock.calls).toEqual([["acme/backend", "P-32", "acme/typo"]]);
+  });
+
+  it("list_issue_statuses lists each project's issues by its own value", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [issue("P-40", { value: "acme/backend" }), issue("P-41", { value: "Frontend Service" })] }),
+    }).install();
+    const p = provider("reads-statuses");
+
+    const entries = await issueStatuses.listIssueStatuses({ providerFor: async () => p, now: () => Date.parse("2026-11-16T00:00:00.000Z") });
+
+    expect(entries.map((e) => [e.teamKey, e.issue.identifier])).toEqual([["acme/backend", "P-40"], ["acme/frontend", "P-41"]]);
+  });
+
+  it.each([
+    ["acme/backend", "acme/backend", true],
+    ["acme/frontend", "Frontend Service", true],
+    ["acme/frontend", "acme/frontend", false],
+  ])("a roll-up review child under project %s, whose parent's Repo is %s, is created: %s", async (scopeKey, parentRepo, created) => {
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [`GET ${API}/issue/parent`]: { json: { id: "parent", key: "P-1", fields: {
+        project: { id: "p" }, issuetype: { subtask: false, hierarchyLevel: 0 }, customfield_10101: { value: parentRepo },
+      } } },
+      [`GET ${API}/issue/createmeta/p/issuetypes`]: { json: { issueTypes: [{ id: "s", subtask: true }], total: 1 } },
+      [`POST ${API}/issue`]: { json: { id: "child", key: "P-2" } },
+    }).install();
+
+    const result = provider(`reads-child-${scopeKey}-${parentRepo}`).createChildIssue("parent", scopeKey, { title: "Child", body: "Body" });
+
+    if (created) await expect(result).resolves.toEqual({ id: "child", identifier: "P-2" });
+    else await expect(result).rejects.toThrow("Jira parent Repo does not match the mapping");
+    expect(fake.calls.filter((c) => c.method === "POST")).toHaveLength(created ? 1 : 0);
   });
 });

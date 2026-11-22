@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { notify, notifyCompletion, notifyDeploy } from "../notify.js";
+import { notify, notifyStuckGiveUp, notifyCompletion, notifyDeploy, notifyKgRefreshOutcome } from "../notify.js";
 import type { DeployNotification, Notification } from "../notify.js";
+import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 
 const notification: Notification = {
   issueIdentifier: "TEST-5",
@@ -10,20 +11,35 @@ const notification: Notification = {
   phase: "implementation",
 };
 
-describe("notify (dispatch)", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+const OK: Reply = { status: 200 };
+const SERVER_ERROR: Reply = { status: 500, text: "err" };
 
+// Every webhook path this file posts to.
+const WEBHOOK_PATHS = ["/", "/slack", "/teams", "/hook", "/other"] as const;
+
+let fake: FakeFetch;
+
+// Installs a webhook that serves the replies in order at each of those paths; a request past them fails the test.
+function webhook(...replies: Reply[]): FakeFetch {
+  const routes: Routes = {};
+  for (const path of WEBHOOK_PATHS) routes[`POST ${path}`] = replies;
+  fake = fakeFetch(routes);
+  fake.install();
+  return fake;
+}
+
+const sentBody = () => JSON.parse(fake.calls.at(-1)!.body);
+
+describe("notify (dispatch)", () => {
   describe("slack", () => {
     it("sends a blocks message to the webhook URL", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      webhook(OK);
 
       await notify("slack", "https://webhook.example.com/slack", notification);
 
-      expect(fetch).toHaveBeenCalledOnce();
-      const [url, opts] = vi.mocked(fetch).mock.calls[0];
-      expect(url).toBe("https://webhook.example.com/slack");
-      const body = JSON.parse((opts as RequestInit).body as string);
+      expect(fake.calls).toHaveLength(1);
+      expect(fake.calls[0].url.href).toBe("https://webhook.example.com/slack");
+      const body = sentBody();
       expect(body.blocks).toBeDefined();
       expect(body.blocks[0].text.text).toContain("TEST-5");
       expect(body.blocks[0].text.text).toContain("Fix the thing");
@@ -31,28 +47,26 @@ describe("notify (dispatch)", () => {
     });
 
     it("uses slack by default when type is unrecognised", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      webhook(OK);
       await notify("unknown-type", "https://webhook.example.com/hook", notification);
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
-      expect(body.blocks).toBeDefined();
+      expect(sentBody().blocks).toBeDefined();
     });
 
     it("throws on non-ok response", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "Server Error" } as Response);
+      webhook(SERVER_ERROR);
       await expect(notify("slack", "https://webhook.example.com/slack", notification)).rejects.toThrow("500");
     });
   });
 
   describe("teams", () => {
     it("sends an Adaptive Card to the webhook URL", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      webhook(OK);
 
       await notify("teams", "https://webhook.example.com/teams", notification);
 
-      expect(fetch).toHaveBeenCalledOnce();
-      const [url, opts] = vi.mocked(fetch).mock.calls[0];
-      expect(url).toBe("https://webhook.example.com/teams");
-      const body = JSON.parse((opts as RequestInit).body as string);
+      expect(fake.calls).toHaveLength(1);
+      expect(fake.calls[0].url.href).toBe("https://webhook.example.com/teams");
+      const body = sentBody();
       expect(body.type).toBe("message");
       expect(body.attachments).toHaveLength(1);
       const card = body.attachments[0].content;
@@ -63,14 +77,13 @@ describe("notify (dispatch)", () => {
     });
 
     it("is case-insensitive for the type parameter", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      webhook(OK);
       await notify("Teams", "https://webhook.example.com/teams", notification);
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
-      expect(body.type).toBe("message");
+      expect(sentBody().type).toBe("message");
     });
 
     it("throws on non-ok response", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "Server Error" } as Response);
+      webhook(SERVER_ERROR);
       await expect(notify("teams", "https://webhook.example.com/teams", notification)).rejects.toThrow("500");
     });
   });
@@ -81,9 +94,9 @@ describe("notify (dispatch)", () => {
     // Returns the dispatch title for a given provider + phase: the slack mrkdwn line
     // (title embedded in a larger string) or the teams TextBlock text (the title alone).
     async function dispatchTitle(type: "slack" | "teams", phase: Notification["phase"]): Promise<string> {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      webhook(OK);
       await notify(type, "https://webhook.example.com/hook", { ...notification, phase });
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+      const body = sentBody();
       return type === "slack" ? body.blocks[0].text.text : body.attachments[0].content.body[0].text;
     }
 
@@ -103,8 +116,9 @@ describe("notify (dispatch)", () => {
 });
 
 describe("notifyCompletion", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+  beforeEach(() => {
+    webhook(OK);
+  });
 
   const completionBase = {
     issueIdentifier: "TEST-5",
@@ -119,15 +133,12 @@ describe("notifyCompletion", () => {
 
   describe("slack", () => {
     it("sends a completion message with PR and run links", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
-
       await notifyCompletion("slack", "https://webhook.example.com/slack", {
         ...completionBase,
         status: "completed",
       });
 
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
-      const text = body.blocks[0].text.text;
+      const text = sentBody().blocks[0].text.text;
       expect(text).toContain("Completed");
       expect(text).toContain("TEST-5");
       expect(text).toContain("pull/42");
@@ -135,8 +146,6 @@ describe("notifyCompletion", () => {
     });
 
     it("sends a failure message", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
-
       await notifyCompletion("slack", "https://webhook.example.com/slack", {
         ...completionBase,
         status: "failed",
@@ -144,15 +153,12 @@ describe("notifyCompletion", () => {
         prUrl: null,
       });
 
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
-      const text = body.blocks[0].text.text;
+      const text = sentBody().blocks[0].text.text;
       expect(text).toContain("Failed");
       expect(text).not.toContain("Pull Request");
     });
 
     it("sends a timeout message", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
-
       await notifyCompletion("slack", "https://webhook.example.com/slack", {
         ...completionBase,
         status: "timed_out",
@@ -160,36 +166,29 @@ describe("notifyCompletion", () => {
         prUrl: null,
       });
 
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
-      expect(body.blocks[0].text.text).toContain("Timed Out");
+      expect(sentBody().blocks[0].text.text).toContain("Timed Out");
     });
 
     it("sends a review-failed message with the PR link", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
-
       await notifyCompletion("slack", "https://webhook.example.com/slack", {
         ...completionBase,
         status: "review_failed",
         conclusion: "post_push_review_not_approved",
       });
 
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
-      const text = body.blocks[0].text.text;
+      const text = sentBody().blocks[0].text.text;
       expect(text).toContain("Needs Review");
       expect(text).toContain("pull/42");
     });
 
     it("labels the phase — planning vs implementation", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
       await notifyCompletion("slack", "https://webhook.example.com/slack", {
         ...completionBase, status: "completed", phase: "planning",
       });
-      const text = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).blocks[0].text.text;
-      expect(text).toContain("AI Planning Completed");
+      expect(sentBody().blocks[0].text.text).toContain("AI Planning Completed");
     });
 
     it("renders the classification (summary, remediation, docs link) on failure", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
       await notifyCompletion("slack", "https://webhook.example.com/slack", {
         ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
         summary: "Implementation failed.",
@@ -197,7 +196,7 @@ describe("notifyCompletion", () => {
         remediation: "Check the run logs, then re-dispatch once fixed.",
         docsUrl: "https://docs.builddown.ai/reference/troubleshooting",
       });
-      const text = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).blocks[0].text.text;
+      const text = sentBody().blocks[0].text.text;
       expect(text).toContain("Implementation failed.");
       expect(text).toContain("*Next step:* Check the run logs");
       expect(text).toContain("<https://docs.builddown.ai/reference/troubleshooting|Troubleshooting guide>");
@@ -205,24 +204,72 @@ describe("notifyCompletion", () => {
 
 
     it("throws on non-ok response", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "err" } as Response);
+      webhook(SERVER_ERROR); // replaces the beforeEach's webhook for this test
       await expect(
         notifyCompletion("slack", "https://hook.example.com", { ...completionBase, status: "completed" }),
       ).rejects.toThrow("500");
+    });
+
+    it("caps an oversized detail at 1500 characters before it enters the payload (BAC-27112 follow-up)", async () => {
+      const detail = "x".repeat(2000);
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+      });
+      const text = sentBody().blocks[0].text.text;
+      expect(text).not.toContain(detail);
+      expect(text).toContain(`${"x".repeat(1500)}…`);
+    });
+
+    it("does not split a UTF-16 surrogate pair straddling the 1500-char cap (BAC-27112 follow-up)", async () => {
+      const emoji = "\u{1F600}"; // surrogate pair (U+D83D U+DE00) straddling index 1499/1500
+      const detail = `${"x".repeat(1499)}${emoji}${"y".repeat(50)}`;
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+      });
+      const text = sentBody().blocks[0].text.text;
+      // A naive slice(0, 1500) would keep the emoji's lone high surrogate and drop its
+      // low surrogate — the cut must instead drop the whole emoji.
+      expect(text).not.toContain("\ud83d");
+      expect(text).toContain(`${"x".repeat(1499)}…`);
+    });
+
+    it("closes a code fence the 1500-char cap would otherwise cut through (BAC-27112 gap-fill)", async () => {
+      // Mirrors classificationForFailure's shape: status line + PR line + a fenced evidence
+      // excerpt long enough that the flat 1500-char cap lands inside the fence, not after it.
+      const evidence = "error output line\n".repeat(120);
+      const detail =
+        "Failing stage ran for 12m 34s. Last successful stage: `install`.\n\n" +
+        "No PR was opened.\n\n" +
+        `\`\`\`\n${evidence}\`\`\``;
+      expect(detail.length).toBeGreaterThan(1500);
+
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+        remediation: "Check the run logs, then re-dispatch once fixed.",
+        docsUrl: "https://docs.builddown.ai/reference/troubleshooting",
+      });
+      const text = sentBody().blocks[0].text.text;
+
+      expect((text.match(/```/g) || []).length % 2).toBe(0);
+      expect(text).toContain("*Next step:* Check the run logs, then re-dispatch once fixed.");
+      expect(text).toContain("<https://docs.builddown.ai/reference/troubleshooting|Troubleshooting guide>");
     });
   });
 
   describe("teams", () => {
     it("sends an Adaptive Card with completion status and facts", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
-
       await notifyCompletion("teams", "https://webhook.example.com/teams", {
         ...completionBase,
         status: "completed",
       });
 
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
-      const card = body.attachments[0].content;
+      const card = sentBody().attachments[0].content;
       expect(card.body[0].text).toContain("Completed");
       const facts = card.body[1].facts;
       expect(facts.some((f: { title: string }) => f.title === "PR")).toBe(true);
@@ -230,37 +277,32 @@ describe("notifyCompletion", () => {
     });
 
     it("omits PR fact when prUrl is null", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
-
       await notifyCompletion("teams", "https://webhook.example.com/teams", {
         ...completionBase,
         status: "failed",
         prUrl: null,
       });
 
-      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
-      const facts = body.attachments[0].content.body[1].facts;
+      const facts = sentBody().attachments[0].content.body[1].facts;
       expect(facts.some((f: { title: string }) => f.title === "PR")).toBe(false);
     });
 
     it("labels the phase in the card title", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
       await notifyCompletion("teams", "https://webhook.example.com/teams", {
         ...completionBase, status: "completed", phase: "planning",
       });
-      const card = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).attachments[0].content;
+      const card = sentBody().attachments[0].content;
       expect(card.body[0].text).toContain("AI Planning Completed");
     });
 
     it("adds a classification TextBlock with the docs link on failure", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
       await notifyCompletion("teams", "https://webhook.example.com/teams", {
         ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
         summary: "Implementation failed.",
         remediation: "Check the run logs, then re-dispatch once fixed.",
         docsUrl: "https://docs.builddown.ai/reference/troubleshooting",
       });
-      const card = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).attachments[0].content;
+      const card = sentBody().attachments[0].content;
       const textBlocks = card.body.filter((b: { type: string }) => b.type === "TextBlock");
       const classification = textBlocks[textBlocks.length - 1].text;
       expect(classification).toContain("Implementation failed.");
@@ -268,10 +310,48 @@ describe("notifyCompletion", () => {
     });
 
     it("throws on non-ok response", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "err" } as Response);
+      webhook(SERVER_ERROR); // replaces the beforeEach's webhook for this test
       await expect(
         notifyCompletion("teams", "https://hook.example.com", { ...completionBase, status: "completed" }),
       ).rejects.toThrow("500");
+    });
+
+    it("caps an oversized detail at 1500 characters before it enters the payload (BAC-27112 follow-up)", async () => {
+      const detail = "x".repeat(2000);
+      await notifyCompletion("teams", "https://webhook.example.com/teams", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+      });
+      const card = sentBody().attachments[0].content;
+      const textBlocks = card.body.filter((b: { type: string }) => b.type === "TextBlock");
+      const classification = textBlocks[textBlocks.length - 1].text;
+      expect(classification).not.toContain(detail);
+      expect(classification).toContain(`${"x".repeat(1500)}…`);
+    });
+
+    it("closes a code fence the 1500-char cap would otherwise cut through (BAC-27112 gap-fill)", async () => {
+      const evidence = "error output line\n".repeat(120);
+      const detail =
+        "Failing stage ran for 12m 34s. Last successful stage: `install`.\n\n" +
+        "No PR was opened.\n\n" +
+        `\`\`\`\n${evidence}\`\`\``;
+      expect(detail.length).toBeGreaterThan(1500);
+
+      await notifyCompletion("teams", "https://webhook.example.com/teams", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+        remediation: "Check the run logs, then re-dispatch once fixed.",
+        docsUrl: "https://docs.builddown.ai/reference/troubleshooting",
+      });
+      const card = sentBody().attachments[0].content;
+      const textBlocks = card.body.filter((b: { type: string }) => b.type === "TextBlock");
+      const classification = textBlocks[textBlocks.length - 1].text;
+
+      expect((classification.match(/```/g) || []).length % 2).toBe(0);
+      expect(classification).toContain("**Next step:** Check the run logs, then re-dispatch once fixed.");
+      expect(classification).toContain("[Troubleshooting guide](https://docs.builddown.ai/reference/troubleshooting)");
     });
   });
 });
@@ -285,16 +365,13 @@ describe("notifyDeploy", () => {
     downtimeMs: 42_000,
   };
 
-  const sentBody = () => JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
   const slackText = (): string => sentBody().blocks[0].text.text;
   const teamsFacts = (): Array<{ title: string; value: string }> =>
     sentBody().attachments[0].content.body.find((b: { type: string }) => b.type === "FactSet").facts;
 
   beforeEach(() => {
-    vi.stubGlobal("fetch", vi.fn());
-    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+    webhook(OK);
   });
-  afterEach(() => { vi.restoreAllMocks(); });
 
   describe("slack", () => {
     // The broadcast is the whole point of AII-255: the team must be pinged that dispatches are
@@ -313,12 +390,12 @@ describe("notifyDeploy", () => {
     });
 
     it("omits the version on shutdown and shows it once back up", async () => {
+      webhook(OK, OK); // two notices; replaces the beforeEach's webhook for this test
       await notifyDeploy("slack", "https://webhook.example.com/slack", {
         ...deployBase, kind: "shutdown", downtimeMs: null,
       });
       expect(slackText()).not.toContain("Version:");
 
-      vi.mocked(fetch).mockClear();
       await notifyDeploy("slack", "https://webhook.example.com/slack", deployBase);
       expect(slackText()).toContain("Version:");
     });
@@ -360,7 +437,7 @@ describe("notifyDeploy", () => {
     });
 
     it("throws on non-ok response", async () => {
-      vi.mocked(fetch).mockResolvedValue({ ok: false, status: 500, text: async () => "err" } as Response);
+      webhook(SERVER_ERROR); // replaces the beforeEach's webhook for this test
       await expect(
         notifyDeploy("slack", "https://webhook.example.com/slack", deployBase),
       ).rejects.toThrow("500");
@@ -396,14 +473,67 @@ describe("notifyDeploy", () => {
       await notifyDeploy("teams", "https://webhook.example.com/teams", {
         ...deployBase, kind: "shutdown", downtimeMs: null,
       });
-      expect((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).not.toContain("<!channel>");
+      expect(fake.calls[0].body).not.toContain("<!channel>");
     });
 
     it("throws on non-ok response", async () => {
-      vi.mocked(fetch).mockResolvedValue({ ok: false, status: 500, text: async () => "err" } as Response);
+      webhook(SERVER_ERROR); // replaces the beforeEach's webhook for this test
       await expect(
         notifyDeploy("teams", "https://webhook.example.com/teams", deployBase),
       ).rejects.toThrow("500");
+    });
+  });
+
+  describe("kgUnavailable", () => {
+    it("slack / kgUnavailable=true shows the sidecar warning line with the error text", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", {
+        ...deployBase, kgUnavailable: true, sidecarError: "tools/list failed: ECONNREFUSED",
+      });
+      expect(slackText()).toContain("⚠️ KG sidecar not serving — tools/list failed: ECONNREFUSED");
+    });
+
+    it("slack / kgUnavailable=true with no sidecarError falls back to 'unknown error'", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kgUnavailable: true });
+      expect(slackText()).toContain("⚠️ KG sidecar not serving — unknown error");
+    });
+
+    it("slack / kgUnavailable=false emits no sidecar warning", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kgUnavailable: false, sidecarError: null });
+      expect(slackText()).not.toContain("KG sidecar not serving");
+    });
+
+    it("slack / kgUnavailable absent emits no sidecar warning", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", deployBase);
+      expect(slackText()).not.toContain("KG sidecar not serving");
+    });
+
+    // The two failure modes are independent — both warnings appear together when both are true.
+    it("slack / kgDegraded and kgUnavailable both true show both warning lines", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", {
+        ...deployBase, kgDegraded: true, kgUnavailable: true, sidecarError: "boom",
+      });
+      expect(slackText()).toContain("⚠️ KG embeddings missing — /mcp is lexical-only");
+      expect(slackText()).toContain("⚠️ KG sidecar not serving — boom");
+    });
+
+    it("teams / kgUnavailable=true shows the sidecar warning TextBlock in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", {
+        ...deployBase, kgUnavailable: true, sidecarError: "tools/list failed: ECONNREFUSED",
+      });
+      const cardBody: Array<{ type: string; text?: string }> = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).toContain("KG sidecar not serving — tools/list failed: ECONNREFUSED");
+    });
+
+    it("teams / kgUnavailable=false emits no sidecar warning in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", { ...deployBase, kgUnavailable: false });
+      const cardBody = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).not.toContain("KG sidecar not serving");
+    });
+
+    it("teams / kgUnavailable absent emits no sidecar warning in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", deployBase);
+      const cardBody = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).not.toContain("KG sidecar not serving");
     });
   });
 
@@ -490,5 +620,148 @@ describe("notifyDeploy", () => {
       });
       expect(teamsFacts().map((f) => f.title)).not.toContain("Version");
     });
+  });
+});
+
+describe("notifyKgRefreshOutcome", () => {
+  beforeEach(() => {
+    webhook(OK);
+  });
+
+  const slackText = (): string => sentBody().blocks[0].text.text;
+  const teamsBody = (): Array<{ type: string; text?: string }> => sentBody().attachments[0].content.body;
+
+  describe("slack", () => {
+    it("sends a success message with check-mark emoji", async () => {
+      await notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", { outcome: "success" });
+      expect(slackText()).toContain(":white_check_mark:");
+      expect(slackText()).toContain("KG Refresh succeeded");
+    });
+
+    it("sends a no-new-data message noting graph is current", async () => {
+      await notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", { outcome: "no-new-data" });
+      expect(slackText()).toContain("KG Refresh: graph is current");
+      expect(slackText()).toContain("no new data to ingest");
+    });
+
+    it("sends a failure message with x emoji", async () => {
+      await notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", { outcome: "failure" });
+      expect(slackText()).toContain(":x:");
+      expect(slackText()).toContain("KG Refresh failed");
+    });
+
+    it("includes summary and detail when provided on failure", async () => {
+      await notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", {
+        outcome: "failure",
+        summary: "KG Refresh hit the time limit.",
+        detail: "Failure code: TIMEOUT",
+      });
+      expect(slackText()).toContain("KG Refresh hit the time limit.");
+      expect(slackText()).toContain("Failure code: TIMEOUT");
+    });
+
+    it("uses slack by default for unrecognised type", async () => {
+      await notifyKgRefreshOutcome("other", "https://hook.example.com/other", { outcome: "success" });
+      expect(sentBody().blocks).toBeDefined();
+    });
+
+    it("throws on non-ok response", async () => {
+      webhook(SERVER_ERROR); // replaces the beforeEach's webhook for this test
+      await expect(
+        notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", { outcome: "success" }),
+      ).rejects.toThrow("500");
+    });
+  });
+
+  describe("teams", () => {
+    it("sends an Adaptive Card with success title", async () => {
+      await notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "success" });
+      const body = teamsBody();
+      expect(body[0].text).toContain("KG Refresh succeeded");
+      expect(body[0].text).toContain("&#x2705;");
+    });
+
+    it("sends a no-new-data card with descriptive TextBlock", async () => {
+      await notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "no-new-data" });
+      const body = teamsBody();
+      expect(body[0].text).toContain("KG Refresh: graph is current");
+      expect(JSON.stringify(body)).toContain("No new data to ingest");
+    });
+
+    it("sends a failure card with failure icon", async () => {
+      await notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "failure" });
+      const body = teamsBody();
+      expect(body[0].text).toContain("&#x274C;");
+      expect(body[0].text).toContain("KG Refresh failed");
+    });
+
+    it("includes summary and detail in failure card body", async () => {
+      await notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", {
+        outcome: "failure",
+        summary: "KG Refresh hit the time limit.",
+        detail: "Failure code: TIMEOUT",
+      });
+      const bodyText = JSON.stringify(teamsBody());
+      expect(bodyText).toContain("KG Refresh hit the time limit.");
+      expect(bodyText).toContain("Failure code: TIMEOUT");
+    });
+
+    it("is case-insensitive for the type parameter", async () => {
+      await notifyKgRefreshOutcome("Teams", "https://hook.example.com/teams", { outcome: "success" });
+      expect(sentBody().type).toBe("message");
+    });
+
+    it("throws on non-ok response", async () => {
+      webhook(SERVER_ERROR); // replaces the beforeEach's webhook for this test
+      await expect(
+        notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "failure" }),
+      ).rejects.toThrow("500");
+    });
+  });
+});
+
+describe("notifyStuckGiveUp", () => {
+  const base = {
+    issueIdentifier: "TEST-5",
+    issueTitle: "Fix the thing",
+    issueUrl: "https://linear.app/issue/TEST-5",
+    repoFullName: "org/repo",
+    runUrl: null,
+    attempts: 3,
+    lastRunStatus: "in_progress",
+  };
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200 } as Response)); });
+  afterEach(() => { vi.restoreAllMocks(); });
+  const body = () => (vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string;
+
+  it.each(["slack", "teams", "other"])("titles an image-pull give-up after the image pull (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", { ...base, lastRunStatus: "runner_image_pull_failed" });
+    expect(body()).toContain("AI Implementation could not pull the runner image");
+    expect(body()).not.toContain("AI Implementation Stuck");
+  });
+
+  it.each(["slack", "teams"])("keeps the give-up alert with its attempt count (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", base);
+    expect(body()).toContain("AI Implementation Stuck");
+    expect(body()).toContain("Attempts");
+    expect(body()).not.toContain("/ai-implement");
+  });
+
+  it.each(["slack", "teams"])("names the fix run and next step, with no attempt count (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", { ...base, attempts: undefined, fixRun: true });
+    expect(body()).toContain("AI Fix Run Stopped");
+    expect(body()).toContain("/ai-implement");
+    expect(body()).toContain("pull request");
+    expect(body()).not.toContain("Attempts");
+  });
+
+  it.each(["slack", "teams"])("includes the pull request URL in the fix-run alert when known (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", {
+      ...base,
+      attempts: undefined,
+      fixRun: true,
+      prUrl: "https://github.com/org/repo/pull/9",
+    });
+    expect(body()).toContain("https://github.com/org/repo/pull/9");
   });
 });

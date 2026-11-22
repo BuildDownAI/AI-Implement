@@ -18,11 +18,16 @@
 
 import crypto from "node:crypto";
 import type http from "node:http";
-import { isIP } from "node:net";
 import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
+import { getEffectiveAllowlist, hasOrgClaimRole, isBoundTo, matchAccessEntryOrOrgClaim, ORG_CLAIM_ROLE_TTL_MS } from "./access-entries.js";
+import { bindAccessIdentity, clearClaimRoleViaObject, recordClaimRoleViaObject } from "./restate/access-binding.js";
+import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
+import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
+import { RestateRefreshAuthority } from "./restate/operator-object.js";
+export { resolveClientPath } from "./mcp-auth-events.js";
 
 // Token and state lifetimes
 export const MCP_TOKEN_TTL_MS: number = (() => {
@@ -101,6 +106,11 @@ export function initMcpOAuthTables(): void {
       expires_at INTEGER NOT NULL
     )
   `);
+  const tokenColumns = db.prepare("PRAGMA table_info(mcp_tokens)").all() as Array<{ name: string }>;
+  if (!tokenColumns.some((column) => column.name === "client_id")) {
+    // Pre-existing tokens predate client attribution; NULL resolves to clientPath "unknown".
+    db.exec("ALTER TABLE mcp_tokens ADD COLUMN client_id TEXT");
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS mcp_refresh_tokens (
       token_hash TEXT PRIMARY KEY,
@@ -136,15 +146,10 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
     return false;
   }
 
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (parsed.protocol === "http:") {
     // RFC 8252 §7.3 prefers loopback IP literals, but real MCP clients
     // (Claude Code included) register http://localhost:<port> — accept both.
-    if (host === "localhost") {
-      return true;
-    }
-    const ipVersion = isIP(host);
-    return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
+    return isLoopbackHost(parsed.hostname);
   }
 
   if (parsed.protocol !== "https:") {
@@ -169,24 +174,50 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
 // ---------- Token verification ----------
 
 export interface McpTokenIdentity {
+  kind: "human";
   email: string;
   sub: string;
   provider: string;
+  clientId: string | null;
 }
 
-/** Verify an MCP access token; returns the identity on success, null on any failure. */
-export function verifyMcpToken(token: string): McpTokenIdentity | null {
-  if (!token) return null;
+/** Auth health for the token that resolved the current request (AII-714): beside the identity, so a skill can warn before a call fails rather than learning about expiry from a 401. */
+export interface McpTokenInfo {
+  issuedAt: number;
+  expiresAt: number;
+  clientId: string | null;
+  clientPath: ClientPath;
+}
+
+/** Why `verifyMcpToken` did not return an identity — lets the caller record a 401 cause without a second query. */
+export type McpTokenVerification =
+  | { ok: true; identity: McpTokenIdentity; token: McpTokenInfo }
+  | { ok: false; reason: "invalid" | "expired"; clientId: string | null };
+
+/** Verify an MCP access token; returns the identity on success, the failure reason and client on any failure. */
+export function verifyMcpToken(token: string): McpTokenVerification {
+  if (!token) return { ok: false, reason: "invalid", clientId: null };
   const db = getDb();
   const row = db
-    .prepare("SELECT email, sub, provider, expires_at FROM mcp_tokens WHERE token = ?")
-    .get(token) as { email: string; sub: string; provider: string; expires_at: number } | undefined;
-  if (!row) return null;
+    .prepare("SELECT email, sub, provider, created_at, expires_at, client_id FROM mcp_tokens WHERE token = ?")
+    .get(token) as
+    | { email: string; sub: string; provider: string; created_at: number; expires_at: number; client_id: string | null }
+    | undefined;
+  if (!row) return { ok: false, reason: "invalid", clientId: null };
   if (Date.now() > row.expires_at) {
     db.prepare("DELETE FROM mcp_tokens WHERE token = ?").run(token);
-    return null;
+    return { ok: false, reason: "expired", clientId: row.client_id };
   }
-  return { email: row.email, sub: row.sub, provider: row.provider };
+  return {
+    ok: true,
+    identity: { kind: "human", email: row.email, sub: row.sub, provider: row.provider, clientId: row.client_id },
+    token: {
+      issuedAt: row.created_at,
+      expiresAt: row.expires_at,
+      clientId: row.client_id,
+      clientPath: resolveClientPath(row.client_id),
+    },
+  };
 }
 
 // ---------- Well-known endpoints ----------
@@ -418,10 +449,51 @@ export async function handleMcpOidcCallback(
   }
 
   // Fail-closed allowlist check
-  const decision = authorize(identity);
+  const allowlist = getEffectiveAllowlist();
+  if (!allowlist) {
+    console.error(`[mcp-oauth] ${providerId} sign-in denied: the access list could not be loaded`);
+    return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+  }
+
+  const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
+    // Best-effort: the denial stands either way, and an unreachable ingress leaves a row that expires.
+    if (identity.provider === "builddown" && identity.email && hasOrgClaimRole(identity)) {
+      await clearClaimRoleViaObject(identity.email, identity.provider);
+    }
     console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
+  }
+
+  // Fail closed: an identity is never admitted without a recorded binding.
+  console.log(`[mcp-oauth] admitting ${identity.email} via ${providerId} as ${decision.entry.role} (source: ${decision.source})`);
+  if (decision.entry.kind === "address" && !isBoundTo(decision.entry, identity)) {
+    const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
+    if (bound === "conflict") {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: subject mismatch for ${providerId}`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
+    }
+    if (bound === "unavailable") {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: binding unavailable`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+    }
+  }
+
+  // The claim-role row is written through the AccessBinding object; fail closed when it cannot be.
+  if (identity.provider === "builddown") {
+    const recorded =
+      decision.source === "org-claim"
+        ? await recordClaimRoleViaObject(identity.email!, {
+            provider: identity.provider,
+            subject: identity.sub,
+            role: decision.entry.role,
+            expiresAt: Date.now() + ORG_CLAIM_ROLE_TTL_MS,
+          })
+        : !hasOrgClaimRole(identity) || (await clearClaimRoleViaObject(identity.email!, identity.provider));
+    if (!recorded) {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: claim role unavailable`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+    }
   }
 
   db.prepare("UPDATE mcp_clients SET used_at = ? WHERE client_id = ?").run(Date.now(), stateRow.client_id);
@@ -468,18 +540,18 @@ export async function handleMcpTokenRequest(
   const { grant_type } = params;
 
   if (grant_type === "authorization_code") {
-    return handleAuthorizationCodeGrant(params, res);
+    return await handleAuthorizationCodeGrant(params, res);
   }
   if (grant_type === "refresh_token") {
-    return handleRefreshTokenGrant(params, res);
+    return await handleRefreshTokenGrant(params, res);
   }
   return json(res, 400, { error: "unsupported_grant_type" });
 }
 
-function handleAuthorizationCodeGrant(
+async function handleAuthorizationCodeGrant(
   params: Record<string, string>,
   res: http.ServerResponse,
-): void {
+): Promise<void> {
   const { code, redirect_uri, client_id, code_verifier } = params;
 
   if (!code || !redirect_uri || !client_id || !code_verifier) {
@@ -519,114 +591,223 @@ function handleAuthorizationCodeGrant(
     return json(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
   }
 
-  const now = Date.now();
+  // Issue the refresh-token family first: on `unavailable`, nothing else is committed —
+  // no orphaned access token left behind for a grant that overall failed.
+  const issued = await refreshAuthority.issue({
+    clientId: client_id,
+    email: codeRow.email,
+    sub: codeRow.sub,
+    provider: codeRow.provider,
+  });
+  if (issued.status === "unavailable") {
+    return json(res, 503, { error: "restate-unavailable" });
+  }
 
-  // Mint access token
+  const now = Date.now();
   const accessToken = crypto.randomBytes(32).toString("hex");
   db.prepare(
-    "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(accessToken, codeRow.email, codeRow.sub, codeRow.provider, now, now + MCP_TOKEN_TTL_MS);
-
-  // Mint refresh token
-  const refreshToken = crypto.randomBytes(32).toString("hex");
-  const familyId = crypto.randomBytes(16).toString("hex");
-  db.prepare(
-    "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-  ).run(
-    hashToken(refreshToken), client_id, codeRow.email, codeRow.sub, codeRow.provider,
-    familyId, now, now + MCP_REFRESH_TOKEN_TTL_MS,
-  );
+    "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at, client_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).run(accessToken, codeRow.email, codeRow.sub, codeRow.provider, now, now + MCP_TOKEN_TTL_MS, client_id);
 
   json(res, 200, {
     access_token: accessToken,
     token_type: "Bearer",
     expires_in: Math.floor(MCP_TOKEN_TTL_MS / 1000),
-    refresh_token: refreshToken,
+    refresh_token: issued.refreshToken,
   });
 }
 
-function handleRefreshTokenGrant(
+/**
+ * SQLite-backed `RefreshAuthority` (AII-707): the rotation, reuse-detection, and
+ * allowlist re-check that `handleRefreshTokenGrant` used to run inline, unchanged
+ * byte-for-byte and now reachable through the `RefreshAuthority` seam. `RestateRefreshAuthority`
+ * (AII-709) is the default as of this release; this class is kept for one release as the
+ * rollback path (flip the default back, the table is untouched) and dropped in a later cleanup.
+ */
+export class SqliteRefreshAuthority implements RefreshAuthority {
+  async issue(input: IssueInput): Promise<IssueOutcome> {
+    const now = Date.now();
+    const refreshToken = crypto.randomBytes(32).toString("hex");
+    const familyId = crypto.randomBytes(16).toString("hex");
+    getDb()
+      .prepare(
+        "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        hashToken(refreshToken), input.clientId, input.email, input.sub, input.provider,
+        familyId, now, now + MCP_REFRESH_TOKEN_TTL_MS,
+      );
+    return { status: "ok", refreshToken };
+  }
+
+  async revokeFamily(familyId: string): Promise<void> {
+    getDb().prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(familyId);
+  }
+
+  async describe(clientId: string): Promise<DescribeOutcome> {
+    const row = getDb()
+      .prepare(
+        "SELECT expires_at FROM mcp_refresh_tokens WHERE client_id = ? AND used_at IS NULL ORDER BY created_at DESC LIMIT 1",
+      )
+      .get(clientId) as { expires_at: number } | undefined;
+    return { status: "ok", expiresAt: row?.expires_at ?? null };
+  }
+
+  async rotate(input: RefreshInput): Promise<RefreshOutcome> {
+    const { refreshToken, clientId } = input;
+    const start = Date.now();
+    const db = getDb();
+    const tokenHash = hashToken(refreshToken);
+    const row = db.prepare("SELECT * FROM mcp_refresh_tokens WHERE token_hash = ?").get(tokenHash) as {
+      client_id: string;
+      email: string;
+      sub: string;
+      provider: string;
+      family_id: string;
+      expires_at: number;
+      used_at: number | null;
+    } | undefined;
+
+    // One event per call, on every return path — never carries the refresh token itself.
+    const emit = (cause: AuthEventCause): void => {
+      recordAuthEvent({
+        at: Date.now(),
+        kind: "refresh",
+        cause,
+        clientId,
+        clientPath: resolveClientPath(clientId),
+        identityKind: row ? "human" : null,
+        email: row?.email ?? null,
+        familyId: row?.family_id ?? null,
+        latencyMs: Date.now() - start,
+      });
+    };
+
+    if (!row) {
+      emit("invalid");
+      return { status: "denied", description: "Invalid refresh token" };
+    }
+    if (Date.now() > row.expires_at) {
+      db.prepare("DELETE FROM mcp_refresh_tokens WHERE token_hash = ?").run(tokenHash);
+      emit("expired");
+      return { status: "expired" };
+    }
+    if (row.client_id !== clientId) {
+      emit("invalid");
+      return { status: "denied", description: "client_id mismatch" };
+    }
+    if (row.used_at !== null) {
+      // Replay attack — revoke entire rotation chain
+      await this.revokeFamily(row.family_id);
+      console.warn(`[mcp-oauth] refresh token replay detected — family ${row.family_id} revoked`);
+      emit("replay");
+      return { status: "replay" };
+    }
+
+    // Allowlist re-check (fail-closed: a removed user must not outlive their access token)
+    const allowlist = getEffectiveAllowlist();
+    if (!allowlist) {
+      // Do NOT revoke the chain here — a transient read failure is not a removal.
+      console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
+      emit("unavailable");
+      return { status: "unavailable", cause: "allowlist" };
+    }
+    if (!matchAccessEntryOrOrgClaim(row, allowlist.entries)) {
+      await this.revokeFamily(row.family_id);
+      console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
+      emit("allowlist");
+      return { status: "denied", description: "Identity no longer authorized" };
+    }
+
+    const now = Date.now();
+
+    // Mark old token as used (kept until expiry for replay detection)
+    db.prepare("UPDATE mcp_refresh_tokens SET used_at = ? WHERE token_hash = ?").run(now, tokenHash);
+
+    // Mint new access token
+    const accessToken = crypto.randomBytes(32).toString("hex");
+    db.prepare(
+      "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at, client_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run(accessToken, row.email, row.sub, row.provider, now, now + MCP_TOKEN_TTL_MS, clientId);
+
+    // Mint new refresh token in the same rotation chain
+    const newRefreshToken = crypto.randomBytes(32).toString("hex");
+    db.prepare(
+      "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      hashToken(newRefreshToken), clientId, row.email, row.sub, row.provider,
+      row.family_id, now, now + MCP_REFRESH_TOKEN_TTL_MS,
+    );
+
+    emit("ok");
+    return {
+      status: "ok",
+      accessToken,
+      refreshToken: newRefreshToken,
+      expiresInSeconds: Math.floor(MCP_TOKEN_TTL_MS / 1000),
+    };
+  }
+}
+
+let refreshAuthority: RefreshAuthority = new RestateRefreshAuthority({ accessTokenTtlMs: MCP_TOKEN_TTL_MS });
+
+/**
+ * Swap the refresh-grant authority (step 5 of AII-687's plan). `RestateRefreshAuthority`
+ * is the default with no configuration; decisions 2 and 4 of AII-687 rule out a shadow
+ * mode, a switch, or a fallback authority — this setter exists for tests and for the
+ * one-release rollback to `SqliteRefreshAuthority` (AII-709).
+ */
+export function setRefreshAuthority(authority: RefreshAuthority): void {
+  refreshAuthority = authority;
+}
+
+/**
+ * The live refresh-token expiry for a client id, sourced from the active `RefreshAuthority`'s
+ * `describe` (AII-714) — the `Operator` object's `describe()` handler when `RestateRefreshAuthority`
+ * is the default. Collapses "no clientId", "no live refresh token", and "authority unavailable"
+ * all to `null`: `get_session_identity` must answer during a Restate outage, never error.
+ */
+export async function getRefreshExpiry(clientId: string | null): Promise<number | null> {
+  if (!clientId) return null;
+  const outcome = await refreshAuthority.describe(clientId);
+  return outcome.status === "ok" ? outcome.expiresAt : null;
+}
+
+async function handleRefreshTokenGrant(
   params: Record<string, string>,
   res: http.ServerResponse,
-): void {
+): Promise<void> {
   const { refresh_token, client_id } = params;
 
   if (!refresh_token || !client_id) {
     return json(res, 400, { error: "invalid_request", error_description: "Missing required parameters" });
   }
 
-  const db = getDb();
-  const tokenHash = hashToken(refresh_token);
-  const row = db.prepare("SELECT * FROM mcp_refresh_tokens WHERE token_hash = ?").get(tokenHash) as {
-    client_id: string;
-    email: string;
-    sub: string;
-    provider: string;
-    family_id: string;
-    expires_at: number;
-    used_at: number | null;
-  } | undefined;
+  const outcome = await refreshAuthority.rotate({ refreshToken: refresh_token, clientId: client_id });
 
-  if (!row) {
-    return json(res, 400, { error: "invalid_grant", error_description: "Invalid refresh token" });
+  switch (outcome.status) {
+    case "ok":
+      return json(res, 200, {
+        access_token: outcome.accessToken,
+        token_type: "Bearer",
+        expires_in: outcome.expiresInSeconds,
+        refresh_token: outcome.refreshToken,
+      });
+    case "replay":
+      return json(res, 400, { error: "invalid_grant", error_description: "Refresh token already used" });
+    case "expired":
+      return json(res, 400, { error: "invalid_grant", error_description: "Refresh token expired" });
+    case "denied":
+      return json(res, 400, { error: "invalid_grant", error_description: outcome.description });
+    case "unavailable":
+      // Two distinct outages share this status: the refresh authority itself unreachable
+      // (Restate down, or SqliteRefreshAuthority has no such case), and the allowlist
+      // re-check unreadable while the authority answered fine. Only the former is a
+      // Restate problem — the SQLite path answered the latter with `temporarily_unavailable`.
+      return outcome.cause === "allowlist"
+        ? json(res, 503, { error: "temporarily_unavailable", error_description: "Access control is unavailable" })
+        : json(res, 503, { error: "restate-unavailable" });
   }
-  if (Date.now() > row.expires_at) {
-    db.prepare("DELETE FROM mcp_refresh_tokens WHERE token_hash = ?").run(tokenHash);
-    return json(res, 400, { error: "invalid_grant", error_description: "Refresh token expired" });
-  }
-  if (row.client_id !== client_id) {
-    return json(res, 400, { error: "invalid_grant", error_description: "client_id mismatch" });
-  }
-  if (row.used_at !== null) {
-    // Replay attack — revoke entire rotation chain
-    db.prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(row.family_id);
-    console.warn(`[mcp-oauth] refresh token replay detected — family ${row.family_id} revoked`);
-    return json(res, 400, { error: "invalid_grant", error_description: "Refresh token already used" });
-  }
-
-  // Allowlist re-check (fail-closed: user removed from allowlist must not outlive their access token)
-  const decision = authorize({
-    provider: row.provider,
-    sub: row.sub,
-    email: row.email,
-    emailVerified: true,
-    name: null,
-    hd: null,
-    tid: null,
-    rawClaims: {},
-  });
-  if (!decision.ok) {
-    db.prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(row.family_id);
-    console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
-    return json(res, 400, { error: "invalid_grant", error_description: "Identity no longer authorized" });
-  }
-
-  const now = Date.now();
-
-  // Mark old token as used (kept until expiry for replay detection)
-  db.prepare("UPDATE mcp_refresh_tokens SET used_at = ? WHERE token_hash = ?").run(now, tokenHash);
-
-  // Mint new access token
-  const accessToken = crypto.randomBytes(32).toString("hex");
-  db.prepare(
-    "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(accessToken, row.email, row.sub, row.provider, now, now + MCP_TOKEN_TTL_MS);
-
-  // Mint new refresh token in the same rotation chain
-  const newRefreshToken = crypto.randomBytes(32).toString("hex");
-  db.prepare(
-    "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-  ).run(
-    hashToken(newRefreshToken), client_id, row.email, row.sub, row.provider,
-    row.family_id, now, now + MCP_REFRESH_TOKEN_TTL_MS,
-  );
-
-  json(res, 200, {
-    access_token: accessToken,
-    token_type: "Bearer",
-    expires_in: Math.floor(MCP_TOKEN_TTL_MS / 1000),
-    refresh_token: newRefreshToken,
-  });
 }
 
 // ---------- Helpers ----------
@@ -704,4 +885,62 @@ function redirectWithError(
   if (clientState) url.searchParams.set("state", clientState);
   res.writeHead(302, { Location: url.href });
   res.end();
+}
+
+// ---------- Routing ----------
+
+/**
+ * Routes the well-known metadata documents and every `/mcp/*` OAuth route. Returns false for
+ * any other path, including `/mcp` itself, which `handleMcpRequest` serves.
+ *
+ * Gated on the redirect base URL alone, the same as `handleMcpRequest`. These routes used to
+ * 503 without a KG memory provider too — a leftover from when `/mcp` was only a sidecar proxy —
+ * which on a sidecar-less deploy locked every client out of the non-`kg_*` tools.
+ */
+export function routeMcpOAuth(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  baseUrl: string | null,
+): boolean {
+  const isWellKnown =
+    pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-authorization-server";
+  if (!isWellKnown && !pathname.startsWith("/mcp/")) return false;
+  if (isWellKnown && req.method !== "GET") return false;
+
+  if (!baseUrl) {
+    json(res, 503, { error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" });
+    return true;
+  }
+  if (pathname === "/.well-known/oauth-protected-resource") {
+    handleMcpProtectedResourceMetadata(res, baseUrl);
+    return true;
+  }
+  if (pathname === "/.well-known/oauth-authorization-server") {
+    handleMcpAuthorizationServerMetadata(res, baseUrl);
+    return true;
+  }
+
+  const run = (label: string, handler: () => Promise<void>): true => {
+    handler().catch((err) => {
+      console.error(`[mcp-oauth] ${label} error:`, err);
+      if (!res.headersSent) json(res, 500, { error: "Internal server error" });
+    });
+    return true;
+  };
+  if (pathname === "/mcp/register" && req.method === "POST") {
+    return run("register", () => handleMcpClientRegistration(req, res));
+  }
+  if (pathname === "/mcp/authorize" && req.method === "GET") {
+    return run("authorize", () => handleMcpAuthorize(req, res, baseUrl));
+  }
+  const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
+  if (callbackMatch && req.method === "GET") {
+    const [, providerId] = callbackMatch;
+    return run("callback", () => handleMcpOidcCallback(req, res, providerId, baseUrl));
+  }
+  if (pathname === "/mcp/token" && req.method === "POST") {
+    return run("token", () => handleMcpTokenRequest(req, res));
+  }
+  return false;
 }

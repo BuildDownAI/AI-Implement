@@ -1,39 +1,15 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState } from "../github.js";
+import { describe, it, expect, onTestFinished, vi } from "vitest";
+import { listAllOpenPullRequests, dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedRunStepJob, CONTAINER_INIT_STEP, APP_TOKEN_STEP, readPublicRepository, readRepositoryFacts } from "../github.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { decodeRunConfig } from "../run-config.js";
-import type { RepoMapping } from "../config.js";
+import { buildIssueBranchName } from "../pipeline/branch-name.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
+import { githubError, githubFile } from "./helpers/replies/github.js";
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "test-org",
-    repo: "test-repo",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    autoMerge: false,
-    ...overrides,
-  };
-}
-
-const mockMapping: RepoMapping = makeMapping();
+const mockMapping = makeMapping();
 
 const mockInputs = {
   issue_id: "id-123",
@@ -43,35 +19,29 @@ const mockInputs = {
 };
 
 describe("dispatchWorkflow", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+  const DISPATCHES = "POST /repos/test-org/test-repo/actions/workflows/claude-implement.yml/dispatches";
 
   it("returns success on 204 response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
 
     const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs);
     expect(result).toEqual({ success: true, status: 204 });
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.github.com/repos/test-org/test-repo/actions/workflows/claude-implement.yml/dispatches");
-    const body = JSON.parse((opts as RequestInit).body as string);
+    expect(fake.calls[0].url.href).toBe("https://api.github.com/repos/test-org/test-repo/actions/workflows/claude-implement.yml/dispatches");
+    const body = JSON.parse(fake.calls[0].body);
     expect(body.ref).toBe("main");
     expect(body.inputs.issue_identifier).toBe("TEST-1");
     expect(body.inputs.issue_id).toBe("id-123");
   });
 
   it("returns success on 200 response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 200, ok: true } as Response);
+    fakeFetch({ [DISPATCHES]: { status: 200 } }).install();
     const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs);
     expect(result).toEqual({ success: true, status: 200 });
   });
 
   it("returns failure with error body on non-success status", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      status: 422,
-      ok: false,
-      text: async () => "Unprocessable Entity",
-    } as Response);
+    fakeFetch({ [DISPATCHES]: { status: 422, text: "Unprocessable Entity" } }).install();
 
     const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs);
     expect(result.success).toBe(false);
@@ -80,130 +50,368 @@ describe("dispatchWorkflow", () => {
   });
 
   it("sends correct auth header", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
     await dispatchWorkflow("my-token", mockMapping, mockInputs);
-    const opts = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
-    expect((opts.headers as Record<string, string>)["Authorization"]).toBe("Bearer my-token");
+    expect(fake.calls[0].headers.get("Authorization")).toBe("Bearer my-token");
   });
 
   it("does not include provider or aws_region in inputs for anthropic mappings", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
     await dispatchWorkflow("gh-token", mockMapping, {
       ...mockInputs,
       ...providerDispatchFields(mockMapping),
     });
-    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    const body = JSON.parse(fake.calls[0].body);
     expect(body.inputs.provider).toBeUndefined();
     expect(body.inputs.aws_region).toBeUndefined();
   });
 
   it("forwards runner_image when present in inputs", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
     await dispatchWorkflow("gh-token", mockMapping, {
       ...mockInputs,
       runner_image: "ghcr.io/builddownai/ai-implement-runner:next",
     });
-    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    const body = JSON.parse(fake.calls[0].body);
     expect(body.inputs.runner_image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
   });
 
   it("omits runner_image when not provided", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
     await dispatchWorkflow("gh-token", mockMapping, mockInputs);
-    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    const body = JSON.parse(fake.calls[0].body);
     expect(body.inputs.runner_image).toBeUndefined();
   });
 
   it("forwards provider and aws_region in inputs for bedrock mappings", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
     const bedrockMapping = makeMapping({ provider: "bedrock", awsRegion: "us-west-2" });
     await dispatchWorkflow("gh-token", bedrockMapping, {
       ...mockInputs,
       ...providerDispatchFields(bedrockMapping),
     });
-    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    const body = JSON.parse(fake.calls[0].body);
     expect(body.inputs.provider).toBe("bedrock");
     expect(body.inputs.aws_region).toBe("us-west-2");
   });
 
   it("forwards base_branch in inputs while ref stays the workflow default branch", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
     await dispatchWorkflow("gh-token", mockMapping, {
       ...mockInputs,
       base_branch: "ai-implement/feature/eng-1",
     });
-    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    const body = JSON.parse(fake.calls[0].body);
     expect(body.ref).toBe("main");
     expect(body.inputs.base_branch).toBe("ai-implement/feature/eng-1");
   });
 
   it("omits base_branch from inputs when it is not provided (non-grouped path)", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
     await dispatchWorkflow("gh-token", mockMapping, mockInputs);
-    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    const body = JSON.parse(fake.calls[0].body);
     expect("base_branch" in body.inputs).toBe(false);
   });
 });
 
-describe("ensureBranchExists", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+// ---------- postWorkflowDispatch — returnRunDetails (AII-778) ----------
 
-  function refResponse(sha: string) {
-    return { ok: true, status: 200, json: async () => ({ object: { sha } }) } as Response;
-  }
-  const notFound = { ok: false, status: 404 } as Response;
+describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
+  const DISPATCHES = "POST /repos/acme/widgets/actions/workflows/claude-implement.yml/dispatches";
+
+  const baseOpts = {
+    token: "tok",
+    owner: "acme",
+    repo: "widgets",
+    workflowFile: "claude-implement.yml",
+    ref: "main",
+    inputs: { run_config: "cfg", run_token: "rt" },
+  };
+
+  it("sends return_run_details: true in the POST body when opted in", async () => {
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
+
+    await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    const body = JSON.parse(fake.calls[0].body);
+    expect(body.return_run_details).toBe(true);
+  });
+
+  it("omits return_run_details from the POST body when not opted in (legacy byte-for-byte)", async () => {
+    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
+
+    const result = await postWorkflowDispatch(baseOpts);
+
+    const body = JSON.parse(fake.calls[0].body);
+    expect("return_run_details" in body).toBe(false);
+    expect(result).toEqual({ success: true, status: 204 });
+    expect("outcome" in result).toBe(false);
+  });
+
+  it("200 with valid run details for the requested repo → accepted with exact identity", async () => {
+    fakeFetch({
+      [DISPATCHES]: {
+        status: 200,
+        json: {
+          id: 555,
+          html_url: "https://github.com/acme/widgets/actions/runs/555",
+          repository: { full_name: "acme/widgets" },
+        },
+      },
+    }).install();
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({
+      success: true,
+      status: 200,
+      outcome: "accepted",
+      runId: 555,
+      runUrl: "https://github.com/acme/widgets/actions/runs/555",
+    });
+  });
+
+  it.each([
+    { workflow_run_id: 555 },
+    { workflow_run_id: 555, id: 555 },
+    { run: { id: 555 } },
+  ])("accepts documented dispatch IDs and compatible historical IDs: %j", async (fields) => {
+    const urls = {
+      run_url: "https://api.github.com/repos/acme/widgets/actions/runs/555",
+      html_url: "https://github.com/acme/widgets/actions/runs/555",
+    };
+    const body = "run" in fields ? { run: { ...fields.run, ...urls } } : { ...fields, ...urls };
+    fakeFetch({ [DISPATCHES]: { status: 200, json: body } }).install();
+
+    expect(await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true })).toEqual({
+      success: true, status: 200, outcome: "accepted", runId: 555, runUrl: urls.html_url,
+    });
+  });
+
+  it.each([
+    { name: "conflicting identity fields", fields: { id: 556 } },
+    { name: "a string run ID", fields: { workflow_run_id: "555" } },
+    { name: "a nonpositive run ID", fields: { workflow_run_id: 0 } },
+    { name: "an unsafe run ID", fields: { workflow_run_id: Number.MAX_SAFE_INTEGER + 1 } },
+    { name: "a different HTML run ID", fields: { html_url: "https://github.com/acme/widgets/actions/runs/556" } },
+    { name: "a different HTML repository", fields: { html_url: "https://github.com/other/widgets/actions/runs/555" } },
+    { name: "a different API run ID", fields: { run_url: "https://api.github.com/repos/acme/widgets/actions/runs/556" } },
+    { name: "a different API repository", fields: { run_url: "https://api.github.com/repos/other/widgets/actions/runs/555" } },
+  ])("does not bind $name in a documented response", async ({ fields }) => {
+    fakeFetch({
+      [DISPATCHES]: {
+        status: 200,
+        json: {
+          workflow_run_id: 555,
+          run_url: "https://api.github.com/repos/acme/widgets/actions/runs/555",
+          html_url: "https://github.com/acme/widgets/actions/runs/555",
+          ...fields,
+        },
+      },
+    }).install();
+
+    expect(await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true }))
+      .toEqual({ success: true, status: 200, outcome: "unknown" });
+  });
+
+  it("204 → accepted with unresolved identity, distinct from rejected", async () => {
+    fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
+    expect("runId" in result).toBe(false);
+    expect("runUrl" in result).toBe(false);
+  });
+
+  it("a definite 422/404 application rejection → rejected", async () => {
+    fakeFetch({ [DISPATCHES]: { status: 422, text: "Unprocessable Entity" } }).install();
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({
+      success: false,
+      status: 422,
+      error: "Unprocessable Entity",
+      outcome: "rejected",
+    });
+  });
+
+  it("a transport failure (thrown fetch) → unknown, without throwing", async () => {
+    fakeFetch({ [DISPATCHES]: () => { throw new Error("network reset"); } }).install();
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe("unknown");
+  });
+
+  it("legacy (non-opted-in) throws on a transport failure, unchanged", async () => {
+    fakeFetch({ [DISPATCHES]: () => { throw new Error("network reset"); } }).install();
+
+    await expect(postWorkflowDispatch(baseOpts)).rejects.toThrow("network reset");
+  });
+
+  it("an unparseable 200 body → unknown, not accepted", async () => {
+    fakeFetch({ [DISPATCHES]: { status: 200, text: "not json" } }).install();
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({ success: true, status: 200, outcome: "unknown" });
+    expect("runId" in result).toBe(false);
+  });
+
+  it("a 5xx (ambiguous server outcome) → unknown, not rejected", async () => {
+    fakeFetch({ [DISPATCHES]: { status: 503, text: "Service Unavailable" } }).install();
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({
+      success: false,
+      status: 503,
+      error: "Service Unavailable",
+      outcome: "unknown",
+    });
+  });
+
+  it("a 200 body whose html_url points at a different repo never populates trusted identity", async () => {
+    fakeFetch({
+      [DISPATCHES]: {
+        status: 200,
+        json: {
+          id: 999,
+          html_url: "https://github.com/other-org/other-repo/actions/runs/999",
+          repository: { full_name: "other-org/other-repo" },
+        },
+      },
+    }).install();
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({ success: true, status: 200, outcome: "unknown" });
+    expect("runId" in result).toBe(false);
+    expect("runUrl" in result).toBe(false);
+  });
+
+  it("a 200 body whose repository field disagrees with a matching html_url never populates trusted identity", async () => {
+    // html_url alone can't be trusted if another field on the same payload contradicts it —
+    // both signals must agree before identity is trusted.
+    fakeFetch({
+      [DISPATCHES]: {
+        status: 200,
+        json: {
+          id: 42,
+          html_url: "https://github.com/acme/widgets/actions/runs/42",
+          repository: { full_name: "acme/other-repo" },
+        },
+      },
+    }).install();
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({ success: true, status: 200, outcome: "unknown" });
+  });
+
+  it("still performs the existing 422 strip-and-retry when returnRunDetails is also requested", async () => {
+    const fake = fakeFetch({
+      [DISPATCHES]: [
+        { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+        { status: 204 },
+      ],
+    }).install();
+
+    const result = await postWorkflowDispatch({
+      ...baseOpts,
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+      returnRunDetails: true,
+    });
+
+    expect(fake.calls).toHaveLength(2);
+    const secondBody = JSON.parse(fake.calls[1].body);
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect(secondBody.return_run_details).toBe(true);
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
+  });
+
+  it("never repeats a POST following an unknown outcome (no retry loop on ambiguity)", async () => {
+    // Only the definite 422 strip-and-retry path issues a second request; an unknown
+    // outcome (transport loss, unparseable/mismatched 200, 5xx) must return immediately so
+    // a caller building retry logic on this contract never double-dispatches.
+    const fake = fakeFetch({ [DISPATCHES]: [() => { throw new Error("timeout"); }] }).install();
+
+    await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  it("dispatchWorkflow (used by index.ts and comment-gapfill-drain.ts) never opts into returnRunDetails", async () => {
+    const fake = fakeFetch({ "POST /repos/test-org/test-repo/actions/workflows/claude-implement.yml/dispatches": { status: 204 } }).install();
+
+    const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs);
+
+    const body = JSON.parse(fake.calls[0].body);
+    expect("return_run_details" in body).toBe(false);
+    expect(result).toEqual({ success: true, status: 204 });
+  });
+});
+
+describe("ensureBranchExists", () => {
+  const refReply = (sha: string): ReplyInit => ({ json: { object: { sha } } });
 
   it("returns the SHA when a branch exists and null on 404 (getBranchSha)", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(refResponse("abc123"));
-    expect(await getBranchSha("t", "o", "r", "feat")).toBe("abc123");
+    fakeFetch({
+      "GET /repos/o/r/git/ref/heads/feat": refReply("abc123"),
+      "GET /repos/o/r/git/ref/heads/missing": githubError(404, "Not Found"),
+    }).install();
 
-    vi.mocked(fetch).mockResolvedValueOnce(notFound);
+    expect(await getBranchSha("t", "o", "r", "feat")).toBe("abc123");
     expect(await getBranchSha("t", "o", "r", "missing")).toBeNull();
   });
 
   it("preserves slash separators in the ref path for multi-segment branch names", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(refResponse("abc123"));
+    const fake = fakeFetch({ "GET /repos/o/r/git/ref/heads/ai-implement/feature/ool-78": refReply("abc123") }).install();
     await getBranchSha("t", "o", "r", "ai-implement/feature/ool-78");
-    const url = vi.mocked(fetch).mock.calls[0][0] as string;
+    const url = fake.calls[0].url.href;
     expect(url).toBe("https://api.github.com/repos/o/r/git/ref/heads/ai-implement/feature/ool-78");
     expect(url).not.toContain("%2F");
   });
 
   it("throws on a 422 that is not an 'already exists' race", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(notFound)
-      .mockResolvedValueOnce(refResponse("base-sha"))
-      .mockResolvedValueOnce({ ok: false, status: 422, text: async () => "Validation Failed: sha is not a commit" } as Response);
+    fakeFetch({
+      "GET /repos/o/r/git/ref/heads/feat": githubError(404, "Not Found"),
+      "GET /repos/o/r/git/ref/heads/testing": refReply("base-sha"),
+      "POST /repos/o/r/git/refs": githubError(422, "Validation Failed"),
+    }).install();
 
     await expect(ensureBranchExists("t", "o", "r", "feat", "testing")).rejects.toThrow(/HTTP 422/);
   });
 
   it("creates the branch from the base head when it does not exist", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(notFound)              // target branch missing
-      .mockResolvedValueOnce(refResponse("base-sha")) // base branch head
-      .mockResolvedValueOnce({ ok: true, status: 201 } as Response); // create ref
+    const fake = fakeFetch({
+      "GET /repos/o/r/git/ref/heads/ai-implement/feature/eng-1": githubError(404, "Not Found"),
+      "GET /repos/o/r/git/ref/heads/testing": refReply("base-sha"),
+      "POST /repos/o/r/git/refs": { status: 201 },
+    }).install();
 
     await ensureBranchExists("t", "o", "r", "ai-implement/feature/eng-1", "testing");
 
-    const createCall = vi.mocked(fetch).mock.calls[2];
-    expect(createCall[0]).toBe("https://api.github.com/repos/o/r/git/refs");
-    const body = JSON.parse((createCall[1] as RequestInit).body as string);
-    expect(body).toEqual({ ref: "refs/heads/ai-implement/feature/eng-1", sha: "base-sha" });
+    const createCall = fake.calls[2];
+    expect(createCall.url.href).toBe("https://api.github.com/repos/o/r/git/refs");
+    expect(JSON.parse(createCall.body)).toEqual({ ref: "refs/heads/ai-implement/feature/eng-1", sha: "base-sha" });
   });
 
   it("is a no-op when the branch already exists", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(refResponse("already-here"));
+    const fake = fakeFetch({ "GET /repos/o/r/git/ref/heads/feat": refReply("already-here") }).install();
     await ensureBranchExists("t", "o", "r", "feat", "testing");
-    expect(vi.mocked(fetch).mock.calls.length).toBe(1); // only the existence check
+    expect(fake.calls).toHaveLength(1); // only the existence check
   });
 
   it("tolerates a 422 create race as success", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(notFound)
-      .mockResolvedValueOnce(refResponse("base-sha"))
-      .mockResolvedValueOnce({ ok: false, status: 422, text: async () => "Reference already exists" } as Response);
+    fakeFetch({
+      "GET /repos/o/r/git/ref/heads/feat": githubError(404, "Not Found"),
+      "GET /repos/o/r/git/ref/heads/testing": refReply("base-sha"),
+      "POST /repos/o/r/git/refs": githubError(422, "Reference already exists"),
+    }).install();
 
     await expect(ensureBranchExists("t", "o", "r", "feat", "testing")).resolves.toBeUndefined();
   });
@@ -269,49 +477,48 @@ describe("capRunnerEnv", () => {
 });
 
 describe("cancelWorkflowRun", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns true on 202 Accepted", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 202, ok: true } as Response);
+    const fake = fakeFetch({ "POST /repos/owner/repo/actions/runs/42/cancel": { status: 202 } }).install();
     const result = await cancelWorkflowRun("token", "owner", "repo", 42);
     expect(result).toBe(true);
-    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
-      "https://api.github.com/repos/owner/repo/actions/runs/42/cancel",
-      expect.objectContaining({ method: "POST" }),
-    );
+    expect(fake.calls[0].url.href).toBe("https://api.github.com/repos/owner/repo/actions/runs/42/cancel");
   });
 
   it("returns true on 409 (run not in a cancellable state)", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 409, ok: false } as Response);
+    fakeFetch({ "POST /repos/owner/repo/actions/runs/99/cancel": githubError(409, "Conflict") }).install();
     const result = await cancelWorkflowRun("token", "owner", "repo", 99);
     expect(result).toBe(true);
   });
 
   it("returns false on other non-OK statuses", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 500, ok: false } as Response);
+    fakeFetch({ "POST /repos/owner/repo/actions/runs/7/cancel": githubError(500, "Server Error") }).install();
     const result = await cancelWorkflowRun("token", "owner", "repo", 7);
     expect(result).toBe(false);
   });
 
   it("returns false on 404 without throwing", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 404, ok: false } as Response);
+    fakeFetch({ "POST /repos/owner/repo/actions/runs/1/cancel": githubError(404, "Not Found") }).install();
     await expect(cancelWorkflowRun("token", "owner", "repo", 1)).resolves.toBe(false);
   });
 });
 
 describe("getPullRequestState", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  const PULL = "GET /repos/o/r/pulls/7";
+
+  // The branch an implementation run opens for ENG-7, named as production names it.
+  const branch = buildIssueBranchName("ENG-7", "Test");
+  const head = { ref: branch, sha: "sha-7" };
+
   it("returns merged=true for a merged PR", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ merged: true, state: "closed" }) })));
-    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: true, state: "closed" });
+    fakeFetch({ [PULL]: { json: { merged: true, state: "closed", head } } }).install();
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: true, state: "closed", headRef: branch, headSha: "sha-7" });
   });
   it("returns merged=false for a closed-unmerged PR", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ merged: false, state: "closed" }) })));
-    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "closed" });
+    fakeFetch({ [PULL]: { json: { merged: false, state: "closed", head } } }).install();
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "closed", headRef: branch, headSha: "sha-7" });
   });
   it("returns null on a non-OK response", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 })));
+    fakeFetch({ [PULL]: githubError(404, "Not Found") }).install();
     expect(await getPullRequestState("t", "o", "r", 7)).toBeNull();
   });
 });
@@ -348,8 +555,9 @@ describe("skillsRepoDispatchFields", () => {
   });
 
   it("includes skills_repo when set", () => {
-    expect(skillsRepoDispatchFields(makeMapping({ skillsRepo: "org/skills" }))).toEqual({
-      skills_repo: "org/skills",
+    // The admin save stores a skills repository in its normalized URL form.
+    expect(skillsRepoDispatchFields(makeMapping({ skillsRepo: "https://github.com/org/skills" }))).toEqual({
+      skills_repo: "https://github.com/org/skills",
     });
   });
 });
@@ -360,8 +568,8 @@ describe("skillsRepoRunnerEnv", () => {
   });
 
   it("includes AI_IMPLEMENT_SKILLS_REPO when set", () => {
-    expect(skillsRepoRunnerEnv(makeMapping({ skillsRepo: "org/skills" }))).toEqual({
-      AI_IMPLEMENT_SKILLS_REPO: "org/skills",
+    expect(skillsRepoRunnerEnv(makeMapping({ skillsRepo: "https://github.com/org/skills" }))).toEqual({
+      AI_IMPLEMENT_SKILLS_REPO: "https://github.com/org/skills",
     });
   });
 });
@@ -394,26 +602,58 @@ describe("profilesRunnerEnv", () => {
   });
 });
 
+describe("assigneeRunnerEnv", () => {
+  it("returns empty object when the issue has no assignee", () => {
+    expect(assigneeRunnerEnv({})).toEqual({});
+  });
+
+  it("includes AI_IMPLEMENT_ASSIGNEE_NAME when present", () => {
+    expect(assigneeRunnerEnv({ assigneeName: "Paz" })).toEqual({
+      AI_IMPLEMENT_ASSIGNEE_NAME: "Paz",
+    });
+  });
+});
+
 describe("buildEnvelopeDispatchInputs", () => {
   const baseIssue = { id: "uuid-1", identifier: "AII-1", title: "T", description: "D" };
+  // Profiles and an assignee name come only from the Jira provider, so those tests use a Jira mapping and issue.
+  const jiraMapping = makeMapping({
+    ticketingProvider: "jira",
+    ticketingConfig: {
+      kind: "jira", jql: "project = ACME", repoFieldValue: "test-org/test-repo",
+      statusFieldOverride: null, repoFieldOverride: null, profilesFieldOverride: null, baseBranchFieldOverride: null,
+    },
+  });
+  const jiraIssue = { id: "10001", identifier: "ACME-1", title: "T", description: "D" };
 
   it("carries profiles in run_config when non-empty", () => {
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: ["backend", "webapp"] }, { runnerPhase: "implementation" });
+    const inputs = buildEnvelopeDispatchInputs(jiraMapping, { ...jiraIssue, profiles: ["backend", "webapp"] }, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
     const cfg = decodeRunConfig(inputs.run_config as string);
     expect(cfg.profiles).toEqual(["backend", "webapp"]);
   });
 
   it("omits profiles from run_config when absent or empty", () => {
-    const noProfiles = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "implementation" });
+    const noProfiles = buildEnvelopeDispatchInputs(jiraMapping, jiraIssue, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
     expect(decodeRunConfig(noProfiles.run_config as string).profiles).toBeUndefined();
 
-    const emptyProfiles = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: [] }, { runnerPhase: "implementation" });
+    const emptyProfiles = buildEnvelopeDispatchInputs(jiraMapping, { ...jiraIssue, profiles: [] }, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
     expect(decodeRunConfig(emptyProfiles.run_config as string).profiles).toBeUndefined();
+  });
+
+  it("carries assigneeName in run_config when present", () => {
+    const inputs = buildEnvelopeDispatchInputs(jiraMapping, { ...jiraIssue, assigneeName: "Paz" }, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
+    expect(decodeRunConfig(inputs.run_config as string).assigneeName).toBe("Paz");
+  });
+
+  it("omits assigneeName from run_config when absent", () => {
+    const inputs = buildEnvelopeDispatchInputs(jiraMapping, jiraIssue, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
+    expect(decodeRunConfig(inputs.run_config as string).assigneeName).toBeUndefined();
   });
 
   it("carries planningContext in run_config when provided", () => {
     const ctx = { parent: "- AII-0: parent", siblings: "None", dependencies: "None" };
     const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       planningContext: ctx,
     });
@@ -422,12 +662,12 @@ describe("buildEnvelopeDispatchInputs", () => {
   });
 
   it("omits planningContext from run_config when not provided", () => {
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning" });
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning", retryPolicy: null });
     expect(decodeRunConfig(inputs.run_config as string).planningContext).toBeUndefined();
   });
 
   it("implementation dispatch carries profiles but no planningContext", () => {
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: ["backend"] }, { runnerPhase: "implementation" });
+    const inputs = buildEnvelopeDispatchInputs(jiraMapping, { ...jiraIssue, profiles: ["backend"] }, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
     const cfg = decodeRunConfig(inputs.run_config as string);
     expect(cfg.profiles).toEqual(["backend"]);
     expect(cfg.planningContext).toBeUndefined();
@@ -435,247 +675,295 @@ describe("buildEnvelopeDispatchInputs", () => {
 
   it("planning dispatch with context but no profiles", () => {
     const ctx = { parent: "- AII-0: parent", siblings: "None", dependencies: "None" };
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning", planningContext: ctx });
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning", planningContext: ctx, retryPolicy: null });
     const cfg = decodeRunConfig(inputs.run_config as string);
     expect(cfg.profiles).toBeUndefined();
     expect(cfg.planningContext).toEqual(ctx);
   });
+
+  it("implementation dispatch carries referenceRepos when mapping has entries", () => {
+    const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
+    const cfg = decodeRunConfig(inputs.run_config as string);
+    expect(cfg.referenceRepos).toEqual(repos);
+  });
+
+  it("implementation dispatch omits referenceRepos when mapping has none", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: null }), baseIssue, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
+    expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
+  });
+
+  it("planning dispatch omits referenceRepos even when mapping has entries", () => {
+    const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "planning", retryPolicy: null });
+    expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
+  });
+
+  it("kg-refresh dispatch omits referenceRepos even when mapping has entries", () => {
+    const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "kg-refresh", retryPolicy: null });
+    expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
+  });
+
+  it("gap-analysis dispatch carries referenceRepos when mapping has entries", () => {
+    const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "gap-analysis", retryPolicy: DEFAULT_RETRY_POLICY });
+    expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toEqual(repos);
+  });
+
+  it("encode-then-decode round-trip preserves all referenceRepos entries including one without ref", () => {
+    const repos = [
+      { repo: "https://github.com/org/repo-a", path: "refs/repo-a", ref: "main" },
+      { repo: "https://github.com/org/repo-b", path: "refs/repo-b" },
+    ];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "implementation", retryPolicy: DEFAULT_RETRY_POLICY });
+    const cfg = decodeRunConfig(inputs.run_config as string);
+    expect(cfg.referenceRepos).toEqual(repos);
+    expect("ref" in (cfg.referenceRepos?.[1] ?? {})).toBe(false);
+  });
 });
 
 describe("deleteBranch", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+  const REF = "DELETE /repos/owner/repo/git/refs/heads/ai-implement/feature/foo-1";
 
   it("returns true on 204 No Content", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    const fake = fakeFetch({ [REF]: { status: 204 } }).install();
     expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
-    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
-      "https://api.github.com/repos/owner/repo/git/refs/heads/ai-implement/feature/foo-1",
-      expect.objectContaining({ method: "DELETE" }),
-    );
+    expect(fake.calls[0].url.href).toBe("https://api.github.com/repos/owner/repo/git/refs/heads/ai-implement/feature/foo-1");
   });
 
   it("returns true on 404 (idempotent — branch already deleted)", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ status: 404, ok: false } as Response);
+    fakeFetch({ [REF]: githubError(404, "Not Found") }).install();
     expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
   });
 
   it('returns true on 422 "Reference does not exist" (the git-refs API reports a missing ref as 422, not 404)', async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      status: 422,
-      ok: false,
-      text: async () =>
-        '{"message":"Reference does not exist","documentation_url":"https://docs.github.com/rest/git/refs#delete-a-reference","status":"422"}',
-    } as unknown as Response);
+    fakeFetch({ [REF]: githubError(422, "Reference does not exist") }).install();
     expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
   });
 
   it("throws on a 422 that is not a missing ref (e.g. protected branch)", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      status: 422,
-      ok: false,
-      text: async () => '{"message":"Refusing to delete the default branch"}',
-    } as unknown as Response);
+    fakeFetch({ [REF]: githubError(422, "Refusing to delete the default branch") }).install();
     await expect(deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).rejects.toThrow();
   });
 
   it("throws on other non-success statuses", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      status: 403,
-      ok: false,
-      text: async () => "Forbidden",
-    } as unknown as Response);
+    fakeFetch({ [REF]: githubError(403, "Resource not accessible by integration") }).install();
     await expect(deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).rejects.toThrow();
   });
 });
 
 describe("findPullRequestByBranches", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  const PULLS = "GET /repos/owner/repo/pulls";
 
   it("returns merged PR when merged_at is set", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => [{ number: 5, html_url: "https://gh/pr/5", state: "closed", merged_at: "2026-06-30T12:00:00Z" }],
-    })));
+    fakeFetch({
+      [PULLS]: { json: [{ number: 5, html_url: "https://github.com/owner/repo/pull/5", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z", head: { sha: "sha-5" } }] },
+    }).install();
     expect(await findPullRequestByBranches("tok", "owner", "repo", "head-branch", "base-branch")).toEqual({
-      number: 5, url: "https://gh/pr/5", state: "closed", merged: true,
+      number: 5, url: "https://github.com/owner/repo/pull/5", state: "closed", merged: true, headSha: "sha-5",
     });
   });
 
   it("returns open PR with merged=false", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => [{ number: 3, html_url: "https://gh/pr/3", state: "open", merged_at: null }],
-    })));
+    fakeFetch({
+      [PULLS]: { json: [{ number: 3, html_url: "https://github.com/owner/repo/pull/3", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z", head: { sha: "sha-3" } }] },
+    }).install();
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 3, url: "https://gh/pr/3", state: "open", merged: false,
+      number: 3, url: "https://github.com/owner/repo/pull/3", state: "open", merged: false, headSha: "sha-3",
     });
   });
 
   it("returns closed-unmerged PR with merged=false", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => [{ number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null }],
-    })));
+    fakeFetch({
+      [PULLS]: { json: [{ number: 2, html_url: "https://github.com/owner/repo/pull/2", state: "closed", merged_at: null, updated_at: "2026-07-01T08:00:00Z", head: { sha: "sha-2" } }] },
+    }).install();
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+      number: 2, url: "https://github.com/owner/repo/pull/2", state: "closed", merged: false, headSha: "sha-2",
     });
   });
 
   it("returns null when the PR list is empty", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
+    fakeFetch({ [PULLS]: { json: [] } }).install();
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toBeNull();
   });
 
   it("prefers a merged PR when multiple results are returned", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => [
-        { number: 9, html_url: "https://gh/pr/9", state: "closed", merged_at: null },
-        { number: 8, html_url: "https://gh/pr/8", state: "closed", merged_at: "2026-06-30T12:00:00Z" },
-      ],
-    })));
+    fakeFetch({
+      [PULLS]: {
+        json: [
+          { number: 9, html_url: "https://github.com/owner/repo/pull/9", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z", head: { sha: "sha-9" } },
+          { number: 8, html_url: "https://github.com/owner/repo/pull/8", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z", head: { sha: "sha-8" } },
+        ],
+      },
+    }).install();
     const result = await findPullRequestByBranches("tok", "owner", "repo", "h", "b");
-    expect(result).toMatchObject({ number: 8, merged: true });
+    expect(result).toMatchObject({ number: 8, merged: true, headSha: "sha-8" });
   });
 
   it("prefers an open PR over a newer closed-unmerged one (reopened PRs keep their created date)", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => [
-        { number: 12, html_url: "https://gh/pr/12", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
-        { number: 7, html_url: "https://gh/pr/7", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z" },
-      ],
-    })));
+    fakeFetch({
+      [PULLS]: {
+        json: [
+          { number: 12, html_url: "https://github.com/owner/repo/pull/12", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z", head: { sha: "sha-12" } },
+          { number: 7, html_url: "https://github.com/owner/repo/pull/7", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z", head: { sha: "sha-7" } },
+        ],
+      },
+    }).install();
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 7, url: "https://gh/pr/7", state: "open", merged: false,
+      number: 7, url: "https://github.com/owner/repo/pull/7", state: "open", merged: false, headSha: "sha-7",
     });
   });
 
   it("prefers a merged PR over an open one", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => [
-        { number: 12, html_url: "https://gh/pr/12", state: "open", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
-        { number: 7, html_url: "https://gh/pr/7", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z" },
-      ],
-    })));
+    fakeFetch({
+      [PULLS]: {
+        json: [
+          { number: 12, html_url: "https://github.com/owner/repo/pull/12", state: "open", merged_at: null, updated_at: "2026-07-02T09:00:00Z", head: { sha: "sha-12" } },
+          { number: 7, html_url: "https://github.com/owner/repo/pull/7", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z", head: { sha: "sha-7" } },
+        ],
+      },
+    }).install();
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 7, url: "https://gh/pr/7", state: "closed", merged: true,
+      number: 7, url: "https://github.com/owner/repo/pull/7", state: "closed", merged: true, headSha: "sha-7",
     });
   });
 
   it("picks the most recently updated PR when all are closed-unmerged, regardless of list order", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => [
-        { number: 4, html_url: "https://gh/pr/4", state: "closed", merged_at: null, updated_at: "2026-06-20T10:00:00Z" },
-        { number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, updated_at: "2026-07-05T10:00:00Z" },
-        { number: 3, html_url: "https://gh/pr/3", state: "closed", merged_at: null, updated_at: "2026-06-28T10:00:00Z" },
-      ],
-    })));
+    fakeFetch({
+      [PULLS]: {
+        json: [
+          { number: 4, html_url: "https://github.com/owner/repo/pull/4", state: "closed", merged_at: null, updated_at: "2026-06-20T10:00:00Z", head: { sha: "sha-4" } },
+          { number: 2, html_url: "https://github.com/owner/repo/pull/2", state: "closed", merged_at: null, updated_at: "2026-07-05T10:00:00Z", head: { sha: "sha-2" } },
+          { number: 3, html_url: "https://github.com/owner/repo/pull/3", state: "closed", merged_at: null, updated_at: "2026-06-28T10:00:00Z", head: { sha: "sha-3" } },
+        ],
+      },
+    }).install();
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+      number: 2, url: "https://github.com/owner/repo/pull/2", state: "closed", merged: false, headSha: "sha-2",
     });
   });
 
   it("requests the list sorted by updated desc so the per_page window holds recently active PRs", async () => {
-    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => [] }));
-    vi.stubGlobal("fetch", fetchMock);
+    const fake = fakeFetch({ [PULLS]: { json: [] } }).install();
     await findPullRequestByBranches("tok", "owner", "repo", "h", "b");
-    expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("state=all&sort=updated&direction=desc&per_page=10"),
-      expect.anything(),
-    );
+    expect(fake.calls[0].url.href).toContain("state=all&sort=updated&direction=desc&per_page=10");
   });
 
   it("returns null on non-OK response", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 })));
+    fakeFetch({ [PULLS]: githubError(404, "Not Found") }).install();
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toBeNull();
   });
 });
 
 describe("mergePullRequest", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  const MERGE = "PUT /repos/owner/repo/pulls/5/merge";
 
   it('returns "merged" on HTTP 200', async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 200, ok: true })));
+    fakeFetch({ [MERGE]: { status: 200 } }).install();
     expect(await mergePullRequest("tok", "owner", "repo", 5, "sha5", "merge")).toBe("merged");
   });
 
   it('returns "blocked" on HTTP 405', async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 405, ok: false })));
+    fakeFetch({ [MERGE]: githubError(405, "Pull Request is not mergeable") }).install();
     expect(await mergePullRequest("tok", "owner", "repo", 5, "sha5", "merge")).toBe("blocked");
   });
 
   it('returns "conflict" on HTTP 409', async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 409, ok: false })));
+    fakeFetch({ [MERGE]: githubError(409, "Conflict") }).install();
     expect(await mergePullRequest("tok", "owner", "repo", 5, "sha5", "merge")).toBe("conflict");
   });
 });
 
 describe("getCombinedChecksState", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  const CHECK_RUNS = "GET /repos/owner/repo/commits/abc/check-runs";
+  const STATUS = "GET /repos/owner/repo/commits/abc/status";
+  // GitHub reports a commit with no statuses as "pending" with a zero count.
+  const noStatuses: ReplyInit = { json: { state: "pending", total_count: 0, statuses: [] } };
 
   it('returns "success" when there are zero check-runs and zero commit statuses', async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ check_runs: [], state: "success", total_count: 0 }),
-    })));
+    fakeFetch({
+      [CHECK_RUNS]: { json: { total_count: 0, check_runs: [] } },
+      [STATUS]: noStatuses,
+    }).install();
     expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("success");
   });
 
   it('returns "pending" when a check-run is in_progress', async () => {
-    vi.stubGlobal("fetch", vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ check_runs: [{ status: "in_progress", conclusion: null }] }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
-    );
+    fakeFetch({
+      [CHECK_RUNS]: { json: { total_count: 1, check_runs: [{ status: "in_progress", conclusion: null }] } },
+      [STATUS]: noStatuses,
+    }).install();
     expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
   });
 
   it('returns "failure" when a completed check-run has conclusion "failure"', async () => {
-    vi.stubGlobal("fetch", vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ check_runs: [{ status: "completed", conclusion: "failure" }] }),
-      })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
-    );
+    fakeFetch({
+      [CHECK_RUNS]: { json: { total_count: 1, check_runs: [{ status: "completed", conclusion: "failure" }] } },
+      [STATUS]: noStatuses,
+    }).install();
     expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("failure");
+  });
+
+  it('does not return "success" when check-runs 403s, even with an empty/ok commit-status response (AII-736)', async () => {
+    // A check-runs read the App is not permitted to do is not evidence the checks passed —
+    // falling through to the unconditional "success" would let auto-merge merge a PR with red
+    // or running checks purely because the token could not read them.
+    fakeFetch({
+      [CHECK_RUNS]: githubError(403, "Resource not accessible by integration"),
+      [STATUS]: noStatuses,
+    }).install();
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).not.toBe("success");
+  });
+
+  it('returns "pending" specifically on a check-runs 403, matching the existing hold-and-continue branch in auto-merge.ts', async () => {
+    fakeFetch({
+      [CHECK_RUNS]: githubError(403, "Resource not accessible by integration"),
+      [STATUS]: noStatuses,
+    }).install();
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
+
+  it('returns "pending" specifically on a check-runs 404, treated as a permission error on a repo the token can otherwise see (AII-736)', async () => {
+    fakeFetch({
+      [CHECK_RUNS]: githubError(404, "Not Found"),
+      [STATUS]: noStatuses,
+    }).install();
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
+
+  it('does not return "success" on a transient, non-permission check-runs read failure (e.g. a 500), even with an empty/ok commit-status response (AII-736)', async () => {
+    fakeFetch({
+      [CHECK_RUNS]: githubError(500, "Server Error"),
+      [STATUS]: noStatuses,
+    }).install();
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
   });
 });
 
 describe("fetchRepoTarball", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
-  const tarball = (bytes: number[]) =>
-    ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array(bytes).buffer }) as Response;
+  const tarball = (bytes: number[]) => () => new Response(new Uint8Array(bytes));
 
   it("requests the tarball endpoint at the exact ref", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(tarball([1, 2, 3]));
+    const fake = fakeFetch({ "GET /repos/Owner/Repo/tarball/abc123": tarball([1, 2, 3]) }).install();
     await fetchRepoTarball("tok", "Owner", "Repo", "abc123");
 
     // A wrong path here surfaces only as a 404 at deploy time, when the orchestrator
     // is mid-deploy and least able to explain itself.
-    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
+    expect(fake.calls[0].url.href).toBe(
       "https://api.github.com/repos/Owner/Repo/tarball/abc123",
     );
   });
 
   it("sends the bearer token — the source repository may be private", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(tarball([1]));
+    const fake = fakeFetch({ "GET /repos/Owner/Repo/tarball/abc123": tarball([1]) }).install();
     await fetchRepoTarball("tok", "Owner", "Repo", "abc123");
 
-    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
-    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer tok");
+    expect(fake.calls[0].headers.get("Authorization")).toBe("Bearer tok");
   });
 
   it("returns the bytes as a Buffer", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(tarball([31, 139, 8]));
+    fakeFetch({ "GET /repos/Owner/Repo/tarball/abc123": tarball([31, 139, 8]) }).install();
     const out = await fetchRepoTarball("tok", "Owner", "Repo", "abc123");
     expect(Buffer.isBuffer(out)).toBe(true);
     expect([...out]).toEqual([31, 139, 8]);
@@ -683,7 +971,552 @@ describe("fetchRepoTarball", () => {
 
   it("throws on a non-ok response rather than returning an empty context", async () => {
     // Returning empty bytes would extract to an empty build context and fail much later.
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+    fakeFetch({ "GET /repos/Owner/Repo/tarball/nope": githubError(404, "Not Found") }).install();
     await expect(fetchRepoTarball("tok", "Owner", "Repo", "nope")).rejects.toThrow(/HTTP 404/);
+  });
+});
+
+describe("listPullRequestFiles (AII-639)", () => {
+  const FILES = "GET /repos/o/r/pulls/7/files";
+  // GitHub's pagination links name the repository by its numeric id, carry per_page, and add rel="last".
+  const PAGE_2 = "https://api.github.com/repositories/1300192/pulls/7/files?per_page=100&page=2";
+
+  it("follows Link rel=\"next\" so a guard-relevant file past the first page is still returned", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ filename: `docs/page-${i}.md` }));
+    const page2 = [{ filename: "sources.yml" }];
+    const fake = fakeFetch({
+      [FILES]: { json: page1, headers: { link: `<${PAGE_2}>; rel="next", <${PAGE_2}>; rel="last"` } },
+      "GET /repositories/1300192/pulls/7/files": { json: page2 },
+    }).install();
+    const files = await listPullRequestFiles("tok", "o", "r", 7);
+    expect(files).toHaveLength(101);
+    expect(files).toContain("sources.yml");
+    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls[1].url.href).toBe(PAGE_2); // followed verbatim
+  });
+
+  it("throws on a non-OK page so the caller can report files_fetch_failed instead of treating it as no change", async () => {
+    fakeFetch({ [FILES]: githubError(502, "Server Error") }).install();
+    await expect(listPullRequestFiles("tok", "o", "r", 7)).rejects.toThrow(/listPullRequestFiles failed: HTTP 502/);
+  });
+});
+
+describe("listPullRequestCommits (AII-1302)", () => {
+  const COMMITS = "GET /repos/o/r/pulls/7/commits";
+
+  it("follows Link rel=\"next\" and returns SHAs oldest first across pages", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ sha: `sha-${i}` }));
+    const page2 = [{ sha: "head" }];
+    const fake = fakeFetch({
+      [COMMITS]: [
+        { json: page1, headers: { link: '<https://api.github.com/repos/o/r/pulls/7/commits?per_page=100&page=2>; rel="next"' } },
+        { json: page2 },
+      ],
+    }).install();
+    const shas = await listPullRequestCommits("tok", "o", "r", 7);
+    expect(shas).toHaveLength(101);
+    expect(shas[0]).toBe("sha-0");
+    expect(shas[100]).toBe("head");
+    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls[0].url.href).toContain("/pulls/7/commits?per_page=100");
+    expect(fake.calls[1].url.href).toContain("page=2");
+  });
+
+  it("throws on a non-OK page rather than reading it as no commits", async () => {
+    fakeFetch({ [COMMITS]: githubError(502, "Server Error") }).install();
+    await expect(listPullRequestCommits("tok", "o", "r", 7)).rejects.toThrow(/listPullRequestCommits failed: HTTP 502/);
+  });
+});
+
+describe("parseLinkNext", () => {
+  it("returns null for a null header", () => {
+    expect(parseLinkNext(null)).toBeNull();
+  });
+
+  it("returns null when only rel='prev' is present", () => {
+    expect(parseLinkNext('<https://api.github.com/repos/o/r/branches?page=1>; rel="prev"')).toBeNull();
+  });
+
+  it("returns the URL for a header containing rel='next'", () => {
+    const header = '<https://api.github.com/repos/o/r/branches?page=2>; rel="next"';
+    expect(parseLinkNext(header)).toBe("https://api.github.com/repos/o/r/branches?page=2");
+  });
+
+  it("extracts rel='next' when the header contains multiple relations", () => {
+    const header =
+      '<https://api.github.com/repos/o/r/branches?page=1>; rel="prev", ' +
+      '<https://api.github.com/repos/o/r/branches?page=3>; rel="next"';
+    expect(parseLinkNext(header)).toBe("https://api.github.com/repos/o/r/branches?page=3");
+  });
+});
+
+describe("listRepoBranchesAndTags pagination", () => {
+  function page(names: string[], nextUrl: string | null): ReplyInit {
+    return {
+      json: names.map((name) => ({ name })),
+      ...(nextUrl ? { headers: { link: `<${nextUrl}>; rel="next"` } } : {}),
+    };
+  }
+
+  it("follows Link rel=next and accumulates all branches across pages", async () => {
+    const page1Names = Array.from({ length: 100 }, (_, i) => `branch-${String(i).padStart(3, "0")}`);
+    const page2Names = Array.from({ length: 22 }, (_, i) => `branch-${String(i + 100).padStart(3, "0")}`);
+
+    fakeFetch({
+      "GET /repos/o/r/branches": page(page1Names, "https://api.github.com/repositories/1300192/branches?per_page=100&page=2"),
+      "GET /repositories/1300192/branches": page(page2Names, null),
+      "GET /repos/o/r/tags": page([], null),
+    }).install();
+
+    const result = await listRepoBranchesAndTags("tok", "o", "r");
+    expect(result.branches).toHaveLength(122);
+    expect(result.branches[0]).toBe("branch-000");
+    expect(result.branches[99]).toBe("branch-099");
+    expect(result.branches[121]).toBe("branch-121");
+  });
+
+  it("returns a single page of results when there is no Link header", async () => {
+    fakeFetch({
+      "GET /repos/o/r/branches": page(["main", "dev"], null),
+      "GET /repos/o/r/tags": page(["v1.0"], null),
+    }).install();
+
+    const result = await listRepoBranchesAndTags("tok", "o", "r");
+    expect(result.branches).toEqual(["main", "dev"]);
+    expect(result.tags).toEqual(["v1.0"]);
+  });
+});
+
+describe("getCommitTime", () => {
+  const COMMIT = "GET /repos/o/r/commits/abc";
+
+  it("parses commit.committer.date to epoch ms", async () => {
+    const fake = fakeFetch({ [COMMIT]: { json: { commit: { committer: { date: "2026-10-10T19:10:30Z" } } } } }).install();
+    expect(await getCommitTime("t", "o", "r", "abc")).toBe(Date.parse("2026-10-10T19:10:30Z"));
+    expect(fake.calls[0].url.href).toBe("https://api.github.com/repos/o/r/commits/abc");
+  });
+
+  it("throws on a non-ok response", async () => {
+    fakeFetch({ [COMMIT]: githubError(404, "Not Found") }).install();
+    await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/404/);
+  });
+
+  it("throws on a missing or invalid date", async () => {
+    fakeFetch({
+      [COMMIT]: [
+        { json: { commit: { committer: null } } }, // GitHub always sends committer, but it may be null
+        { json: { commit: { committer: { date: "nope" } } } },
+      ],
+    }).install();
+    await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/valid committer date/);
+    await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/valid committer date/);
+  });
+
+  it("throws on a fetch error", async () => {
+    fakeFetch({ [COMMIT]: () => { throw new Error("net"); } }).install();
+    await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/net/);
+  });
+});
+
+describe("getDefaultBranchFileText", () => {
+  const X = "GET /repos/o/r/contents/x";
+
+  it("decodes a base64 file and encodes each path segment", async () => {
+    const fake = fakeFetch({ "GET /repos/o/r/contents/.ai-implement/my%20file%231.yml": githubFile("a: 1\n") }).install();
+    expect(await getDefaultBranchFileText("t", "o", "r", ".ai-implement/my file#1.yml")).toBe("a: 1\n");
+    expect(fake.calls[0].url.href).toBe("https://api.github.com/repos/o/r/contents/.ai-implement/my%20file%231.yml");
+  });
+
+  it("sends no ref by default and an encoded ref when given", async () => {
+    const fake = fakeFetch({ [X]: githubFile("a: 1\n") }).install();
+    await getDefaultBranchFileText("t", "o", "r", "x");
+    expect(fake.calls[0].url.search).toBe("");
+    await getDefaultBranchFileText("t", "o", "r", "x", "feature/x y");
+    expect(fake.calls[1].url.href).toBe("https://api.github.com/repos/o/r/contents/x?ref=feature%2Fx%20y");
+  });
+
+  it("returns null on 404", async () => {
+    fakeFetch({ [X]: githubError(404, "Not Found") }).install();
+    expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
+  });
+
+  it("throws on other non-ok responses", async () => {
+    fakeFetch({ [X]: githubError(500, "Server Error") }).install();
+    await expect(getDefaultBranchFileText("t", "o", "r", "x")).rejects.toThrow(/500/);
+  });
+
+  it("returns null when the path is not a file", async () => {
+    // GitHub answers a directory with an array of its entries, not a file object.
+    fakeFetch({ [X]: { json: [{ type: "file", name: "a.yml", path: "x/a.yml" }] } }).install();
+    expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
+  });
+});
+
+describe("listPrComments strict option (AII-1309)", () => {
+  const COMMENTS = "GET /repos/o/r/issues/5/comments";
+
+  it("stops quietly on a non-ok response by default", async () => {
+    fakeFetch({ [COMMENTS]: githubError(502, "Server Error") }).install();
+    expect(await listPrComments("t", "o", "r", 5)).toEqual([]);
+  });
+
+  it.each([502, 403])("throws on a %s when strict", async (status) => {
+    fakeFetch({ [COMMENTS]: githubError(status, "Request failed") }).install();
+    await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(new RegExp(String(status)));
+  });
+
+  it("throws when strict and a later page fails", async () => {
+    fakeFetch({
+      [COMMENTS]: [
+        { json: [{ id: 1, body: "a" }], headers: { link: '<https://api.github.com/repos/o/r/issues/5/comments?per_page=100&page=2>; rel="next"' } },
+        githubError(502, "Server Error"),
+      ],
+    }).install();
+    await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(/502/);
+  });
+});
+
+describe("getFailedRunStepJob", () => {
+  const JOBS = "GET /repos/o/r/actions/runs/5/jobs" as const;
+  const jobs = (steps: Array<{ name: string; conclusion: string | null }>): ReplyInit => ({
+    json: { jobs: [{ name: "implement", html_url: "https://github.com/o/r/actions/runs/5/job/9", steps }] },
+  });
+
+  it.each([CONTAINER_INIT_STEP, APP_TOKEN_STEP])("returns the job name and URL when %s failed", async (step) => {
+    const fake = fakeFetch({ [JOBS]: jobs([
+      { name: "Set up job", conclusion: "success" },
+      { name: step, conclusion: "failure" },
+    ]) }).install();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, step)).toEqual({
+      jobName: "implement",
+      htmlUrl: "https://github.com/o/r/actions/runs/5/job/9",
+    });
+    expect(fake.calls[0].url.search).toBe("?filter=latest&per_page=100");
+  });
+
+  it("matches a failed step on a job without name or html_url", async () => {
+    fakeFetch({ [JOBS]: { json: { jobs: [{ steps: [{ name: CONTAINER_INIT_STEP, conclusion: "failure" }] }] } } }).install();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, CONTAINER_INIT_STEP)).toEqual({ jobName: "unknown", htmlUrl: null });
+  });
+
+  it("returns null when only a step other than the one asked for failed", async () => {
+    fakeFetch({ [JOBS]: jobs([
+      { name: CONTAINER_INIT_STEP, conclusion: "success" },
+      { name: APP_TOKEN_STEP, conclusion: "failure" },
+    ]) }).install();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, CONTAINER_INIT_STEP)).toBeNull();
+  });
+
+  it("returns null on a non-OK response", async () => {
+    fakeFetch({ [JOBS]: githubError(403, "Forbidden") }).install();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, APP_TOKEN_STEP)).toBeNull();
+  });
+
+  it("returns null when the request throws", async () => {
+    fakeFetch({ [JOBS]: () => { throw new Error("network down"); } }).install();
+    expect(await getFailedRunStepJob("token", "o", "r", 5, APP_TOKEN_STEP)).toBeNull();
+  });
+
+  // The orchestrator recognizes the step by name, so the synced templates must keep naming it so.
+  it.each(["claude-implement.yml", "claude-plan.yml"])("names the token step in workflows/%s", (file) => {
+    expect(readFileSync(join(process.cwd(), "workflows", file), "utf8")).toContain(`- name: ${APP_TOKEN_STEP}\n`);
+  });
+});
+
+describe("getPrReadiness", () => {
+  const PULL = "GET /repos/o/r/pulls/7";
+  const REVIEWS = "GET /repos/o/r/pulls/7/reviews";
+  const pull = (o: Record<string, unknown> = {}): ReplyInit =>
+    ({ json: { state: "open", draft: false, mergeable: true, mergeable_state: "clean", head: { sha: "sha1" }, ...o } });
+  const run = (expected?: string, sleep = vi.fn(async () => {})) => getPrReadiness("tok", "o", "r", 7, expected, { sleep });
+
+  it("clean at the expected head with no changes requested -> ready", async () => {
+    fakeFetch({ [PULL]: pull(), [REVIEWS]: { json: [] } }).install();
+    expect(await run("sha1")).toEqual({ ready: true, reason: "clean", headSha: "sha1", mergeableState: "clean" });
+  });
+
+  it("re-reads a lazily computed mergeable state until it is known", async () => {
+    const sleep = vi.fn(async () => {});
+    const fake = fakeFetch({
+      [PULL]: [pull({ mergeable: null, mergeable_state: "unknown" }), pull()],
+      [REVIEWS]: { json: [] },
+    }).install();
+    expect((await run("sha1", sleep)).ready).toBe(true);
+    expect(fake.calls.filter((c) => c.path === "/repos/o/r/pulls/7")).toHaveLength(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up as unknown after 1 + 3 reads", async () => {
+    const sleep = vi.fn(async () => {});
+    const unknown = pull({ mergeable: null, mergeable_state: "unknown" });
+    fakeFetch({ [PULL]: [unknown, unknown, unknown, unknown] }).install();
+    expect(await run("sha1", sleep)).toMatchObject({ ready: false, reason: "unknown" });
+    expect(sleep).toHaveBeenCalledTimes(3);
+  });
+
+  for (const state of ["dirty", "behind", "blocked", "unstable"]) {
+    it(`${state} -> not ready with that reason, without reading reviews`, async () => {
+      fakeFetch({ [PULL]: pull({ mergeable: state !== "dirty", mergeable_state: state }) }).install();
+      expect(await run("sha1")).toMatchObject({ ready: false, reason: state, mergeableState: state });
+    });
+  }
+
+  it("a latest CHANGES_REQUESTED review -> changes_requested", async () => {
+    fakeFetch({ [PULL]: pull(), [REVIEWS]: { json: [{ user: { id: 1 }, state: "CHANGES_REQUESTED" }] } }).install();
+    expect(await run("sha1")).toMatchObject({ ready: false, reason: "changes_requested" });
+  });
+
+  it("a non-OK PR read -> error", async () => {
+    fakeFetch({ [PULL]: { status: 500, json: {} } }).install();
+    expect(await run("sha1")).toMatchObject({ ready: false, reason: "error" });
+  });
+
+  it("a rejected fetch -> error, never throws", async () => {
+    fakeFetch({ [PULL]: () => { throw new Error("network down"); } }).install();
+    expect(await run("sha1")).toMatchObject({ ready: false, reason: "error" });
+  });
+});
+
+describe("classifyPullReadiness", () => {
+  const base = { state: "open", draft: false, mergeable: true, mergeable_state: "clean", head: { sha: "sha1" } };
+
+  it("closed or merged wins over every other condition", () => {
+    expect(classifyPullReadiness({ ...base, state: "closed", draft: true }, "other").reason).toBe("closed");
+    expect(classifyPullReadiness({ ...base, merged: true }).reason).toBe("closed");
+  });
+
+  it("draft, then a moved head", () => {
+    expect(classifyPullReadiness({ ...base, draft: true }).reason).toBe("draft");
+    expect(classifyPullReadiness(base, "other")).toMatchObject({ ready: false, reason: "head_moved", headSha: "sha1" });
+    expect(classifyPullReadiness(base).ready).toBe(true);
+  });
+
+  it("an unlisted mergeable_state is unrecognized, never dirty or blocked", () => {
+    expect(classifyPullReadiness({ ...base, mergeable_state: "has_hooks" }).reason).toBe("unrecognized");
+    expect(classifyPullReadiness({ ...base, mergeable: false, mergeable_state: undefined }).reason).toBe("unrecognized");
+  });
+
+  it("clean requires mergeable === true", () => {
+    expect(classifyPullReadiness({ ...base, mergeable: false }).ready).toBe(false);
+    expect(classifyPullReadiness({ ...base, mergeable: null }).reason).toBe("unknown");
+  });
+});
+
+describe("readPublicRepository", () => {
+  it("reads a public repository and its ref without a token", async () => {
+    const fake = fakeFetch({ "GET /repos/o/r": { json: { default_branch: "main" } }, "GET /repos/o/r/commits": { json: [{ sha: "abc" }] } }).install();
+
+    expect(await readPublicRepository("o", "r", "v1")).toEqual({ status: 200, refExists: true });
+    expect(fake.calls.every((c) => !c.headers.has("authorization"))).toBe(true);
+    expect(fake.calls[1].url.searchParams.get("sha")).toBe("v1");
+  });
+
+  it("asks nothing about a ref when none is given, or when the repository is not public", async () => {
+    const fake = fakeFetch({ "GET /repos/o/r": { json: {} }, "GET /repos/o/private": githubError(404, "Not Found") }).install();
+
+    expect(await readPublicRepository("o", "r")).toEqual({ status: 200, refExists: null });
+    expect(await readPublicRepository("o", "private", "main")).toEqual({ status: 404, refExists: null });
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("reads 404 and 422 for the ref as a missing ref, and throws any other refusal", async () => {
+    fakeFetch({ "GET /repos/o/r": { json: {} }, "GET /repos/o/r/commits": [githubError(422, "No commit found"), githubError(404, "Not Found"), githubError(403, "API rate limit exceeded")] }).install();
+
+    expect(await readPublicRepository("o", "r", "nope")).toEqual({ status: 200, refExists: false });
+    expect(await readPublicRepository("o", "r", "nope")).toEqual({ status: 200, refExists: false });
+    await expect(readPublicRepository("o", "r", "nope")).rejects.toMatchObject({ name: "GitHubApiError", status: 403 });
+  });
+
+  // GitHub's rate-limit page: a limited request gets 403 or 429, `retry-after` in seconds when present, else `x-ratelimit-remaining: 0`
+  // with `x-ratelimit-reset` in UTC epoch seconds, and with neither, at least a minute's wait.
+  it("reads a refusal for GitHub's rate limit as the time the repository may be read again, on either read", async () => {
+    const now = Date.parse("2026-11-17T07:00:00Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    onTestFinished(() => clock.mockRestore());
+    const reset = Date.parse("2026-11-17T08:00:00Z") / 1000;
+    const limited = { ...githubError(403, "API rate limit exceeded"), headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } };
+    fakeFetch({
+      "GET /repos/o/primary": limited,
+      "GET /repos/o/secondary": { ...githubError(429, "You have exceeded a secondary rate limit"), headers: { "retry-after": "30" } },
+      "GET /repos/o/unmarked": { ...githubError(403, "API rate limit exceeded"), headers: { "x-ratelimit-remaining": "0" } },
+      "GET /repos/o/forbidden": githubError(403, "Forbidden"),
+      // The last read the limit allows answers, with nothing left after it.
+      "GET /repos/o/last": { json: {}, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } },
+      "GET /repos/o/r": { json: {} },
+      "GET /repos/o/r/commits": limited,
+    }).install();
+
+    expect(await readPublicRepository("o", "primary")).toEqual({ status: 403, refExists: null, rateLimitedUntil: reset * 1000 });
+    expect(await readPublicRepository("o", "secondary")).toEqual({ status: 429, refExists: null, rateLimitedUntil: now + 30_000 });
+    expect(await readPublicRepository("o", "unmarked")).toEqual({ status: 403, refExists: null, rateLimitedUntil: now + 60_000 });
+    expect(await readPublicRepository("o", "forbidden")).toEqual({ status: 403, refExists: null });
+    expect(await readPublicRepository("o", "last")).toEqual({ status: 200, refExists: null });
+    expect(await readPublicRepository("o", "r", "v1")).toEqual({ status: 200, refExists: null, rateLimitedUntil: reset * 1000 });
+  });
+});
+
+describe("readRepositoryFacts", () => {
+  const GRAPHQL = "POST /graphql";
+  const request = {
+    repo: "app",
+    expressions: ["HEAD:.github/workflows/claude-implement.yml", "main:.github/workflows/claude-plan.yml"],
+    openPullRequestHeads: ["sync/ai-implement"],
+  };
+  // The shape GitHub answered for a repository the token sees (read against the live API at AII-1536).
+  const seen = { isPrivate: true, defaultBranchRef: { name: "main" }, e0: { __typename: "Blob" }, e1: null, p0: { nodes: [{ number: 12, url: "https://github.com/o/app/pull/12" }] } };
+
+  it("asks for every repository, expression and head in one query, each value a variable", async () => {
+    const fake = fakeFetch({ [GRAPHQL]: { json: { data: { r0: seen, r1: { defaultBranchRef: { name: "trunk" } } } } } }).install();
+
+    await readRepositoryFacts("ghs_t", "o", [request, { repo: "lib", expressions: [], openPullRequestHeads: [] }]);
+
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].headers.get("authorization")).toBe("Bearer ghs_t");
+    const { query, variables } = JSON.parse(fake.calls[0].body) as { query: string; variables: Record<string, string> };
+    expect(variables).toEqual({
+      owner: "o",
+      r0: "app",
+      r0e0: "HEAD:.github/workflows/claude-implement.yml",
+      r0e1: "main:.github/workflows/claude-plan.yml",
+      r0p0: "sync/ai-implement",
+      r1: "lib",
+    });
+    for (const value of Object.values(variables)) expect(query).not.toContain(`"${value}"`);
+    expect(query).toContain("orderBy: { field: CREATED_AT, direction: DESC }");
+    // Only an open sync pull request is one an operator can merge.
+    expect(query).toContain("pullRequests(states: OPEN,");
+  });
+
+  it("reads the default branch, each expression's existence and each head's open pull request", async () => {
+    fakeFetch({ [GRAPHQL]: { json: { data: { r0: { ...seen, p0: { nodes: [] } } } } } }).install();
+    const withoutPull = await readRepositoryFacts("t", "o", [request]);
+    expect(withoutPull.get("app")?.openPullRequests).toEqual({ "sync/ai-implement": null });
+
+    fakeFetch({ [GRAPHQL]: { json: { data: { r0: seen } } } }).install();
+    expect((await readRepositoryFacts("t", "o", [request])).get("app")).toEqual({
+      visible: true,
+      private: true,
+      defaultBranch: "main",
+      exists: { "HEAD:.github/workflows/claude-implement.yml": true, "main:.github/workflows/claude-plan.yml": false },
+      openPullRequests: { "sync/ai-implement": { number: 12, url: "https://github.com/o/app/pull/12" } },
+    });
+  });
+
+  it("reports a repository GitHub cannot resolve as not visible", async () => {
+    fakeFetch({
+      [GRAPHQL]: {
+        json: {
+          data: { r0: seen, r1: null },
+          errors: [{ type: "NOT_FOUND", path: ["r1"], message: "Could not resolve to a Repository with the name 'o/hidden'." }],
+        },
+      },
+    }).install();
+
+    const facts = await readRepositoryFacts("t", "o", [request, { repo: "hidden", expressions: ["HEAD:x"], openPullRequestHeads: [] }]);
+    expect(facts.get("app")?.visible).toBe(true);
+    expect(facts.get("hidden")).toEqual({ visible: false, private: false, defaultBranch: null, exists: {}, openPullRequests: {} });
+  });
+
+  it("throws on any other error, including a NOT_FOUND below a repository", async () => {
+    fakeFetch({ [GRAPHQL]: { json: { data: { r0: seen }, errors: [{ type: "NOT_FOUND", path: ["r0", "e0"], message: "nested" }] } } }).install();
+    await expect(readRepositoryFacts("t", "o", [request])).rejects.toThrow("readRepositoryFacts o failed: nested");
+
+    fakeFetch({ [GRAPHQL]: { json: { errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] } } }).install();
+    await expect(readRepositoryFacts("t", "o", [request])).rejects.toThrow("API rate limit exceeded");
+  });
+
+  it("throws a GitHubApiError when the request is refused", async () => {
+    fakeFetch({ [GRAPHQL]: githubError(401, "Bad credentials") }).install();
+
+    const error = await readRepositoryFacts("t", "o", [request]).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "GitHubApiError", status: 401, path: "/graphql" });
+  });
+});
+
+describe("listAllOpenPullRequests", () => {
+  const PULLS = "GET /repos/owner/repo/pulls";
+  const nextUrl = "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100&page=2";
+  const next = { link: `<${nextUrl}>; rel="next"` };
+  const pull = (number: number, draft?: boolean, created_at = "2026-10-10T19:10:30Z") => ({
+    number, html_url: `https://github.com/owner/repo/pull/${number}`,
+    base: { ref: "main" }, head: { ref: `feature-${number}`, sha: `sha-${number}` },
+    title: `Pull ${number}`, created_at, ...(draft === undefined ? {} : { draft }),
+  });
+
+  it("follows the next URL and maps both pages in order with authenticated, bounded requests", async () => {
+    const fake = fakeFetch({ [PULLS]: [
+      { json: [pull(1, true)], headers: next },
+      { json: [pull(2, false), pull(3)] },
+    ] }).install();
+    const result = await listAllOpenPullRequests("token", "owner", "repo");
+    expect(result).toEqual([1, 2, 3].map((number) => ({
+      number, url: `https://github.com/owner/repo/pull/${number}`, base: "main",
+      head: `feature-${number}`, headSha: `sha-${number}`, title: `Pull ${number}`,
+      author: null, draft: number === 1, createdAt: Date.parse("2026-10-10T19:10:30Z"),
+    })));
+    expect(fake.calls.map((c) => c.url.href)).toEqual([
+      "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100", nextUrl,
+    ]);
+    for (const call of fake.calls) {
+      expect(call.headers.get("authorization")).toBe("Bearer token");
+      expect(call.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it("maps author logins and absent users", async () => {
+    fakeFetch({ [PULLS]: { json: [
+      { ...pull(1), user: { login: "app[bot]" } },
+      { ...pull(2), user: null }, pull(3),
+    ] } }).install();
+    expect((await listAllOpenPullRequests("t", "owner", "repo")).map((p) => p.author))
+      .toEqual(["app[bot]", null, null]);
+  });
+
+  it("returns an empty list for a successful empty response", async () => {
+    fakeFetch({ [PULLS]: { json: [] } }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).resolves.toEqual([]);
+  });
+
+  it.each([403, 404, 500])("throws repository and HTTP status for %s", async (status) => {
+    fakeFetch({ [PULLS]: { status } }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).rejects.toThrow(`owner/repo: HTTP ${status}`);
+  });
+
+  it("rejects the whole read when page two fails", async () => {
+    fakeFetch({ [PULLS]: [
+      { json: [pull(1)], headers: next }, { status: 500 },
+    ] }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).rejects.toThrow("owner/repo: HTTP 500");
+  });
+
+  it.each([1, 2])("propagates fetch rejection unchanged on page %s", async (page) => {
+    const error = new Error("connection reset");
+    const fail = () => { throw error; };
+    fakeFetch({ [PULLS]: page === 1 ? fail : [
+      { json: [pull(1)], headers: next }, fail,
+    ] }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).rejects.toBe(error);
+  });
+
+  it.each([false, true])("handles the 50-page boundary with further pages=%s", async (more) => {
+    const fake = fakeFetch({ [PULLS]: Array.from({ length: 50 }, (_, i) => ({
+      json: [pull(i + 1)], headers: i < 49 || more ? next : {},
+    })) }).install();
+    const result = listAllOpenPullRequests("t", "owner", "repo");
+    if (more) await expect(result).rejects.toThrow(/owner\/repo.*50 pages/);
+    else expect((await result).map((p) => p.number)).toEqual(Array.from({ length: 50 }, (_, i) => i + 1));
+    expect(fake.calls).toHaveLength(50);
+  });
+
+  it("rejects an invalid creation date on a later page", async () => {
+    fakeFetch({ [PULLS]: [
+      { json: [pull(1)], headers: next }, { json: [pull(2, false, "invalid")] },
+    ] }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).rejects.toThrow(/created_at.*owner\/repo/);
+  });
+
+  it("accepts an epoch-zero creation date", async () => {
+    fakeFetch({ [PULLS]: { json: [pull(1, false, "1970-01-01T00:00:00Z")] } }).install();
+    expect((await listAllOpenPullRequests("t", "owner", "repo"))[0].createdAt).toBe(0);
   });
 });

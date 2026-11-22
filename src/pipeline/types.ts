@@ -1,3 +1,13 @@
+import type { ReferenceRepo } from "../reference-repos.js";
+import type { ReviewProcessId } from "../review-process.js";
+import type { ReviewerSelection } from "../config.js";
+
+import type { RetryPolicy } from "./retry-backoff.js";
+import type { ReviewerDefinition } from "./reviewers/registry.js";
+import type { FailureRecord } from "./failure-classification.js";
+import { STAGE_NAMES, type AccountAuthMode, type StageName } from "../agent-config.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+
 export type StepStatus = "running" | "passed" | "failed" | "skipped" | "cancelled";
 
 export type StepType =
@@ -30,7 +40,7 @@ export interface PipelineContextData {
   issueDescription: string;
   nonce: string;
   orchestratorUrl: string;
-  /** Optional model override for Claude invocations (e.g. "claude-opus-4-5"). */
+  /** Optional model override for Claude invocations (e.g. claude-opus-5-5). */
   model?: string;
   /** Autonomous runner: absolute path to the cloned workspace. */
   workspaceDir?: string;
@@ -39,6 +49,7 @@ export interface PipelineContextData {
   /** Autonomous runner: fully rendered implementation prompt from WORKFLOW.md or fallback. */
   implementationPrompt?: string;
   /** Autonomous runner: existing PR number for gap-fill runs, "" if none. */
+  reviewOnly?: { reviewers: ReviewerSelection[]; expectedHeadSha?: string };
   prNumber?: string;
   /** Autonomous runner: target GitHub repo owner. */
   githubOwner?: string;
@@ -64,6 +75,12 @@ export interface PipelineContextData {
    *  Always set by run-autonomous ([] when the env var is absent). No built-in step reads
    *  it — it is the contract surface for image-baked custom/ steps. */
   profiles?: string[];
+  /** Resolved per-stage agent snapshot from the envelope (AII-944). Absent = legacy behavior.
+   *  Not to be confused with `profiles`, which are workflow profiles, not model account profiles. */
+  agentConfig?: ResolvedAgentSnapshotV1;
+  /** Autonomous runner: issue assignee display name (Jira), from the run_config envelope or
+   *  AI_IMPLEMENT_ASSIGNEE_NAME env. Used by push.ts to attribute the opened PR's title. */
+  assigneeName?: string;
   /** Autonomous runner: per-project sensitive-file add/allow globs from the run_config envelope. */
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   /** Autonomous runner: true when this is a grouping parent's own closing-work run. Push.ts
@@ -73,17 +90,53 @@ export interface PipelineContextData {
   hooks?: { setup?: string; verify?: string; teardown?: string };
   /** Autonomous runner: callback URL for runner result/progress posts (from runnerCallbackUrl / RUNNER_CALLBACK_URL). */
   callbackUrl?: string;
+  /** Bearer credential for authenticated runner callbacks. */
+  progressToken?: string;
   /** Autonomous runner: per-project dependency-repo read access scope (from run_config envelope). */
   dependencyTokenScope?: "installation";
+  /** Autonomous runner: reference repositories to clone read-only into the workspace (from run_config envelope). */
+  referenceRepos?: ReferenceRepo[];
+  /** Autonomous runner: project reviewer selection from the trusted run_config envelope. */
+  reviewers?: ReviewerSelection[];
+  /** Autonomous runner: project review process from the trusted run_config envelope; defaults to "ai-implement". */
+  reviewProcess?: ReviewProcessId;
+  /** Autonomous runner: extra GitHub logins whose approve block can gate a merge, from the trusted run_config envelope. */
+  trustedReviewAuthors?: string[];
+  /** Autonomous runner: selected image-baked reviewer code resolved from the trusted package root, never the checked-out workspace. */
+  trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
+  /** Autonomous runner: optional reviewer rubric appended to the review prompt (e.g. kg-refresh-specific approval criteria). */
+  reviewRubric?: string;
   /** Autonomous runner: short-lived read token minted by the dependency-auth step; set on context rather than returned as a step output so it is never persisted to the step log. */
   dependencyToken?: string;
   /** Autonomous runner: expiry timestamp for the dependency token (ISO 8601). */
   dependencyTokenExpiresAt?: string;
+  /** Autonomous runner: retry/backoff policy and reviewer turn cap, from the run_config
+   *  envelope's retryPolicy or DEFAULT_RETRY_POLICY when absent. The implement/review
+   *  steps pass this to the executor as `retry` for pre-tool-use request retries
+   *  (BAC-27114); `retryPolicy.stageRetries` also bounds the whole-stage retry rail on
+   *  top, read directly by feedback-loop.ts and post-push-review.ts (BAC-27134). */
+  retryPolicy?: RetryPolicy;
+  /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
+  kgDryRun?: boolean;
+  /**
+   * Optional runner-activity/cycle sink (AII-788). Mirrors `PipelineContext.activitySink`
+   * so a context constructed from a plain `PipelineContextData` bag (e.g. the dev harness,
+   * or a future concrete `PipelineContext` implementation) can carry the same optional
+   * sink through the data bag rather than only the interface. Absent on every existing
+   * call site — nothing constructs or calls one yet.
+   */
+  activitySink?: ActivitySink;
 }
 
 export interface PipelineContext {
   readonly data: PipelineContextData;
   readonly llmExecutor: LLMExecutor;
+  /**
+   * Optional runner-activity/cycle sink (AII-788). Absent on every existing
+   * `PipelineContext` implementation and call site — nothing constructs or
+   * calls one yet; a later issue wires a concrete sink here.
+   */
+  readonly activitySink?: ActivitySink;
   getOutputs(stepId: string): Record<string, unknown>;
   setOutputs(stepId: string, outputs: Record<string, unknown>): void;
   resolveInputs(
@@ -94,8 +147,115 @@ export interface PipelineContext {
   ): Record<string, unknown>;
 }
 
+// ---------------------------------------------------------------------------
+// Activity/cycle sink (AII-788)
+// ---------------------------------------------------------------------------
+//
+// Pure protocol shapes for reporting runner activity and per-cycle summaries
+// out of the pipeline — no Restate or Claude Code SDK dependency, no
+// transport, no buffering/redaction/retry behavior. Those belong to a
+// concrete implementation (e.g. `ActivityReporter`, ./activity-reporter.ts,
+// AII-784) that a later issue wires into the executor/steps below. Every
+// method exists so a producer never has to invent its own wire shape.
+// Optional everywhere it attaches, so every existing implementation of
+// `PipelineContext`/`InvokeParams` and every existing call site stays source
+// compatible with no edits. Nothing in this codebase constructs or calls an
+// `ActivitySink` yet.
+
+/**
+ * Identifies one activity record within an attempt's ordered stream.
+ * `sequence` must be contiguous per (attemptId, producerId) — a gap is how a
+ * downstream consumer detects a missing tail, matching the wire identity
+ * already used by the AII-784 activity transport (`ReviewFixActivityEvent`,
+ * ../review-fix-contract.ts).
+ */
+export interface ActivityIdentity {
+  readonly attemptId: string;
+  readonly producerId: string;
+  readonly sequence: number;
+}
+
+/** Per-event redacted-payload byte cap. */
+export const ACTIVITY_MAX_EVENT_BYTES = 16 * 1024;
+
+/** Cumulative redacted-byte cap per attempt. */
+export const ACTIVITY_MAX_ATTEMPT_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Already-redacted text bounded to `ACTIVITY_MAX_EVENT_BYTES`. `truncated` is
+ * explicit so a consumer never has to infer truncation from length.
+ */
+export interface BoundedActivityText {
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
+/** An observable tool call starting. Never the model's hidden reasoning or tokens. */
+export interface ActivityToolStart {
+  readonly cycle: number;
+  readonly action: string;
+  /** Observable, structured arguments only — must not carry hidden reasoning. */
+  readonly detail?: unknown;
+}
+
+/** An observable tool call's outcome. `output` is already bounded per `ACTIVITY_MAX_EVENT_BYTES`. */
+export interface ActivityToolResult {
+  readonly cycle: number;
+  readonly action: string;
+  readonly output: BoundedActivityText;
+}
+
+/**
+ * End-of-cycle summary. Deliberately independent of the activity byte limit:
+ * none of these fields is redacted/bounded text, so a cycle summary always
+ * carries its full commit list, disposition set, test results, verdict and
+ * usage rather than competing with tool activity for the
+ * `ACTIVITY_MAX_EVENT_BYTES`/`ACTIVITY_MAX_ATTEMPT_BYTES` caps.
+ */
+export interface CycleActivitySummary {
+  readonly cycle: number;
+  readonly commits: readonly string[];
+  readonly dispositions: readonly { readonly key: string; readonly disposition: string }[];
+  readonly tests: readonly { readonly name: string; readonly passed: boolean }[] | null;
+  readonly verdict: { readonly approved: boolean; readonly summary?: string } | null;
+  readonly usage: {
+    readonly tokensIn: number | null;
+    readonly tokensOut: number | null;
+    readonly costUsd: number | null;
+  };
+}
+
+/**
+ * Optional producer-side sink for runner activity and per-cycle telemetry.
+ *
+ * Behavior a concrete implementation must honor (enforced by the
+ * transport/storage layer, not by this type — nothing here does I/O):
+ *  - The same identity with an identical payload is idempotent — replaying it
+ *    is a safe no-op.
+ *  - The same identity with a *different* payload is rejected and must raise
+ *    an alert, never silently overwrite the stored event.
+ *  - `sequence` is contiguous per (attemptId, producerId); a gap is the
+ *    signal a missing tail is visible downstream.
+ *  - `final()` marks the highest sequence issued for the identity's
+ *    (attemptId, producerId) pair; an attempt with no final marker is
+ *    presumed still in-flight.
+ */
+export interface ActivitySink {
+  toolStart(identity: ActivityIdentity, input: ActivityToolStart): void;
+  toolResult(identity: ActivityIdentity, result: ActivityToolResult): void;
+  cycleSummary(identity: ActivityIdentity, summary: CycleActivitySummary): void;
+  final(identity: ActivityIdentity, lastSequence: number): void;
+}
+
 export interface StepReporter {
-  report(step: Step): Promise<void>;
+  /**
+   * Optional second param carries the runner-activity/cycle sink (AII-788)
+   * alongside the step report. Optional so `NoopStepReporter`, `HttpStepReporter`,
+   * `TokenStepReporter`, `TimingStepReporter` and every existing call site
+   * (`reporter.report(step)`) stay source compatible with zero edits. No
+   * implementation reads it yet.
+   */
+  report(step: Step, activitySink?: ActivitySink): Promise<void>;
 }
 
 export interface StepModule<
@@ -106,6 +266,210 @@ export interface StepModule<
 }
 
 export type LogLevel = "summary" | "stream";
+
+/** Current version of {@link InvocationAttributionV1}. */
+export const INVOCATION_ATTRIBUTION_VERSION = 1;
+/** Hard cap on the serialized size of one attribution object. */
+export const ATTRIBUTION_MAX_BYTES = 2048;
+
+export type UsageAvailability = "complete" | "partial" | "unavailable";
+export type AttributionCostStatus = "reported" | "unavailable";
+export type AttributionLimitKind = "timeout_ms" | "max_turns";
+
+export interface AttributionUsage {
+  availability: UsageAvailability;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  /** Provider-reported cost only. Never derived from token counts; null when unavailable. */
+  costUsd: number | null;
+  costStatus: AttributionCostStatus;
+}
+
+/**
+ * Optional, versioned diagnostic attribution for one model invocation (AII-946).
+ * Diagnostic only: an invalid value is stripped (see {@link sanitizeAttribution}) and never
+ * blocks terminal reporting — unlike an invalid authoritative `agentConfig`, which fails closed.
+ * `outcome` reuses the closed telemetry enum; a timeout is `outcome: "error"` with failure code
+ * `INVOCATION_TIMEOUT` (failure-classification's open UPPER_SNAKE code contract).
+ * Nothing emits or persists this yet — AII-971 owns emission.
+ */
+export interface InvocationAttributionV1 {
+  version: 1;
+  invocationId: string;
+  stage: StageName;
+  snapshotId: string;
+  agent: "claude" | "codex";
+  provider: "anthropic" | "bedrock" | "openai" | "openrouter";
+  model: string;
+  profileId: string | null;
+  authMode: AccountAuthMode;
+  limit: { kind: AttributionLimitKind; value: number } | null;
+  outcome: "success" | "max_turns" | "error" | "unknown";
+  usage: AttributionUsage | null;
+}
+
+const ATTRIBUTION_KEYS = ["version", "invocationId", "stage", "snapshotId", "agent", "provider", "model", "profileId", "authMode", "limit", "outcome", "usage"];
+const ATTRIBUTION_USAGE_KEYS = ["availability", "tokensIn", "tokensOut", "costUsd", "costStatus"];
+const ATTRIBUTION_AUTH_MODES = ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription", "openrouter-api-key"];
+const ATTRIBUTION_ID_RE = /^[\w.:/@-]{1,128}$/;
+/** Model ids may carry suffixes such as `[1m]` or `+`: printable non-whitespace ASCII, bounded. */
+const ATTRIBUTION_MODEL_RE = /^[\x21-\x7e]{1,128}$/;
+const ATTRIBUTION_SECRET_RE = /(sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}|ghp_|gho_|ghs_|xox[bp]-)/i;
+
+function attrRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function onlyKeys(v: Record<string, unknown>, allowed: string[]): boolean {
+  return Object.keys(v).every((k) => allowed.includes(k));
+}
+
+function attrId(v: unknown): v is string {
+  return typeof v === "string" && ATTRIBUTION_ID_RE.test(v) && !ATTRIBUTION_SECRET_RE.test(v);
+}
+
+function attrModel(v: unknown): v is string {
+  return typeof v === "string" && ATTRIBUTION_MODEL_RE.test(v) && !ATTRIBUTION_SECRET_RE.test(v);
+}
+
+function nullableCount(v: unknown): v is number | null {
+  return v === null || (typeof v === "number" && Number.isFinite(v) && v >= 0);
+}
+
+/**
+ * Validates `value` as an allowlisted, bounded {@link InvocationAttributionV1} and returns a fresh
+ * projection containing only known fields, or `null` when it is absent, malformed, oversized,
+ * of an unknown version, or credential-shaped. Null usage/cost stay null (never zero or estimated).
+ * Callers drop-and-warn with a count only; never echo the rejected payload.
+ */
+export function sanitizeAttribution(value: unknown): InvocationAttributionV1 | null {
+  if (!attrRecord(value) || !onlyKeys(value, ATTRIBUTION_KEYS)) return null;
+  try {
+    if (Buffer.byteLength(JSON.stringify(value), "utf-8") > ATTRIBUTION_MAX_BYTES) return null;
+  } catch {
+    return null;
+  }
+  if (value.version !== INVOCATION_ATTRIBUTION_VERSION) return null;
+  if (!attrId(value.invocationId) || !attrId(value.snapshotId) || !attrModel(value.model)) return null;
+  if (!(STAGE_NAMES as readonly unknown[]).includes(value.stage)) return null;
+  if (value.agent !== "claude" && value.agent !== "codex") return null;
+  if (value.provider !== "anthropic" && value.provider !== "bedrock" && value.provider !== "openai" && value.provider !== "openrouter") return null;
+  if (value.profileId !== null && !attrId(value.profileId)) return null;
+  if (!ATTRIBUTION_AUTH_MODES.includes(value.authMode as string)) return null;
+  if (!["success", "max_turns", "error", "unknown"].includes(value.outcome as string)) return null;
+
+  let limit: InvocationAttributionV1["limit"] = null;
+  if (value.limit !== null && value.limit !== undefined) {
+    const l = value.limit;
+    if (!attrRecord(l) || !onlyKeys(l, ["kind", "value"])) return null;
+    if (l.kind !== "timeout_ms" && l.kind !== "max_turns") return null;
+    if (typeof l.value !== "number" || !Number.isSafeInteger(l.value) || l.value <= 0) return null;
+    limit = { kind: l.kind, value: l.value };
+  }
+
+  let usage: AttributionUsage | null = null;
+  if (value.usage !== null && value.usage !== undefined) {
+    const u = value.usage;
+    if (!attrRecord(u) || !onlyKeys(u, ATTRIBUTION_USAGE_KEYS)) return null;
+    const { availability, tokensIn, tokensOut, costStatus } = u;
+    const costUsd = u.costUsd === undefined ? null : u.costUsd;
+    if (availability !== "complete" && availability !== "partial" && availability !== "unavailable") return null;
+    if (costStatus !== "reported" && costStatus !== "unavailable") return null;
+    if (!nullableCount(tokensIn) || !nullableCount(tokensOut) || !nullableCount(costUsd)) return null;
+    const present = (tokensIn !== null ? 1 : 0) + (tokensOut !== null ? 1 : 0);
+    if (availability === "complete" && present !== 2) return null;
+    if (availability === "partial" && present !== 1) return null;
+    if (availability === "unavailable" && present !== 0) return null;
+    // Cost is reported by the provider or unavailable; it is never a zero/estimated placeholder.
+    if (costStatus === "reported" && costUsd === null) return null;
+    if (costStatus === "unavailable" && costUsd !== null) return null;
+    usage = { availability, tokensIn, tokensOut, costUsd, costStatus };
+  }
+
+  return {
+    version: 1,
+    invocationId: value.invocationId,
+    stage: value.stage as StageName,
+    snapshotId: value.snapshotId,
+    agent: value.agent,
+    provider: value.provider,
+    model: value.model,
+    profileId: value.profileId as string | null,
+    authMode: value.authMode as AccountAuthMode,
+    limit,
+    outcome: value.outcome as InvocationAttributionV1["outcome"],
+    usage,
+  };
+}
+
+/** Upper bounds for the per-job accounting lists a runner result may carry. */
+export const INVOCATION_RECORDS_MAX = 200;
+export const PUSHED_COMMITS_MAX = 1000;
+
+/**
+ * One model invocation of a job as the runner reports it in the result's `invocations` list:
+ * the attribution plus the usage details {@link AttributionUsage} does not carry. A separate type so
+ * `sanitizeAttribution`'s strict key list never widens (an older orchestrator would otherwise drop the
+ * single `attribution` of a newer runner).
+ */
+export interface InvocationRecordV1 {
+  attribution: InvocationAttributionV1;
+  cacheReadTokens: number | null;
+  cacheCreationTokens: number | null;
+  /** Spawn attempts the executor made for this invocation; 1 when it did not report. */
+  attempts: number;
+}
+
+const INVOCATION_RECORD_KEYS = ["attribution", "cacheReadTokens", "cacheCreationTokens", "attempts"];
+
+/**
+ * Projects an untrusted `invocations` value to valid records, in order. Malformed entries (and everything
+ * past {@link INVOCATION_RECORDS_MAX}) are counted in `dropped`, never echoed. A non-array yields none.
+ */
+export function sanitizeInvocationRecords(value: unknown): { valid: InvocationRecordV1[]; dropped: number } {
+  if (!Array.isArray(value)) return { valid: [], dropped: value === undefined || value === null ? 0 : 1 };
+  const valid: InvocationRecordV1[] = [];
+  let dropped = 0;
+  for (const entry of value) {
+    if (valid.length >= INVOCATION_RECORDS_MAX) {
+      dropped++;
+      continue;
+    }
+    if (!attrRecord(entry) || !onlyKeys(entry, INVOCATION_RECORD_KEYS)) {
+      dropped++;
+      continue;
+    }
+    const attribution = sanitizeAttribution(entry.attribution);
+    const cacheRead = entry.cacheReadTokens ?? null;
+    const cacheCreation = entry.cacheCreationTokens ?? null;
+    const attempts = entry.attempts ?? 1;
+    if (
+      !attribution ||
+      !nullableCount(cacheRead) ||
+      !nullableCount(cacheCreation) ||
+      typeof attempts !== "number" ||
+      !Number.isSafeInteger(attempts) ||
+      attempts < 1
+    ) {
+      dropped++;
+      continue;
+    }
+    valid.push({ attribution, cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation, attempts });
+  }
+  return { valid, dropped };
+}
+
+const COMMIT_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Validates a `pushedCommits` list (oldest first). Returns `null` when absent or malformed (including
+ * over {@link PUSHED_COMMITS_MAX}); `[]` is a valid, meaningful "nothing was pushed".
+ */
+export function sanitizePushedCommits(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > PUSHED_COMMITS_MAX) return null;
+  if (!value.every((v): v is string => typeof v === "string" && COMMIT_SHA_RE.test(v))) return null;
+  return [...value];
+}
 
 export interface RunTelemetry {
   outcome: "success" | "max_turns" | "error" | "unknown";
@@ -119,6 +483,15 @@ export interface RunTelemetry {
   cacheCreationTokens?: number | null;
   /** Compact per-call tool trace ("ToolName input-summary"), capped; last entry may be a truncation marker. */
   toolTrace?: string[];
+  /** Bash commands with a matching structured tool result; never inferred from model text. */
+  executedCommands?: Array<{ command: string; failed: boolean }>;
+  /** Optional diagnostic attribution (AII-946); absent on legacy/unemitting runs. */
+  attribution?: InvocationAttributionV1;
+}
+
+export interface LLMTerminalStatus {
+  subtype: string | null;
+  isError: boolean | null;
 }
 
 export interface LLMResult {
@@ -127,15 +500,98 @@ export interface LLMResult {
   exitCode: number;
   tokensUsed: number;
   telemetry?: RunTelemetry;
+  structuredOutput?: unknown;
+  terminalStatus?: LLMTerminalStatus;
+  /** Termination signal from the CLI process's close event (e.g. SIGTERM), null when it exited normally. */
+  signal?: string | null;
+  /** The agent's own terminal error text (redacted), when its event stream reported one. Classification places it ahead of stderr/stdout in the message for every failure and records it as `evidence.llmErrorMessage`. */
+  errorMessage?: string;
+  /** Number of spawn attempts made for this invocation; 1 unless `retry` was supplied and a transient pre-tool-use failure was re-spawned. Optional so a custom LLMExecutor may omit it — consumers fall back to `?? 1`. */
+  attempts?: number;
+  /** Set on any classified failure of the final attempt (retryable or not) — the last attempt's classified record. */
+  failure?: FailureRecord;
+  /** Optional diagnostic attribution (AII-946); mirrors `telemetry.attribution` for results without telemetry. */
+  attribution?: InvocationAttributionV1;
+}
+
+export interface InvokeParams {
+  prompt: string;
+  model: string;
+  maxTurns?: number;
+  /**
+   * Permission patterns passed as `--allowed-tools`. This PREAPPROVES tools; it
+   * does not restrict availability, and a pattern (e.g. `Bash(curl *)`) is not a
+   * built-in tool name. Use `builtinTools` to restrict what a session can use.
+   */
+  tools?: string[];
+  /**
+   * Built-in tool NAMES (e.g. `Read`) that are the only tools available to the
+   * session. When set, the executor passes `--tools` plus flags that deny MCP
+   * tools, skills and delegates, and denies Bash/Edit/Write. Absent = the
+   * ordinary unrestricted tool set (implementation).
+   */
+  builtinTools?: string[];
+  jsonSchema?: Record<string, unknown>;
+  /**
+   * Stage identifier used to tag a classified failure (e.g. "implement" or
+   * "review"). Read independently of `retry` — a bare invoke() caller (the
+   * dev harness, or any custom LLMExecutor) still gets a correctly-staged
+   * failure record even with no retry policy configured.
+   */
+  stage?: string;
+  /**
+   * Configured agent stage this call belongs to (AII-944). Independent of the diagnostic
+   * `stage` label above. No built-in executor reads it yet; absent = legacy behavior.
+   */
+  agentStage?: StageName;
+  /**
+   * Elapsed-time limit for this one invocation, from the resolved snapshot (AII-944).
+   * Separate from native Claude `maxTurns`; turns are never translated into time.
+   */
+  invocationTimeoutMs?: number;
+  /**
+   * Whether this call site requires `structuredOutput` (review does; implement
+   * never requests it). Read independently of `retry` for the same reason as
+   * `stage`: without it, a call site with no retry policy configured (e.g. the
+   * dev harness) would never classify a dropped/missing verdict as
+   * invalid_output, since `classifyLlmResult`'s structural checks are all
+   * gated on this flag.
+   */
+  expectsStructuredOutput?: boolean;
+  /**
+   * Enables re-spawning a transient failure that occurred before any tool use.
+   * Omit to keep single-attempt behaviour (the default before BAC-27114).
+   */
+  retry?: {
+    policy: RetryPolicy;
+    /**
+     * True when a tool call made during a failed attempt cannot have mutated the
+     * workspace (review runs read-only tools) — but only a proven read-only
+     * built-in (Read/Glob/Grep) counts as safe; any other, unknown or malformed
+     * tool use still blocks a retry regardless of this flag. See
+     * `effectiveSawToolUse`/`sawUnsafeToolUse`.
+     */
+    toolUseIsSafe: boolean;
+  };
+  /**
+   * Optional runner-activity sink this invocation may report tool
+   * start/result and cycle-summary events to (AII-788). Absent means no
+   * activity reporting — identical behavior to before this field existed.
+   * No built-in `LLMExecutor` reads it yet.
+   */
+  activitySink?: ActivitySink;
+  /**
+   * The feedback-loop iteration this invocation belongs to, stamped onto every
+   * `ActivityToolStart`/`ActivityToolResult` this call emits (AII-798) so a
+   * `CycleActivitySummary.cycle` can be matched back to the tool events that
+   * produced it. Defaults to 1 for a bare/non-loop caller (e.g. the dev
+   * harness), matching single-pass behavior.
+   */
+  cycle?: number;
 }
 
 export interface LLMExecutor {
-  invoke(params: {
-    prompt: string;
-    model: string;
-    maxTurns?: number;
-    tools?: string[];
-  }): Promise<LLMResult>;
+  invoke(params: InvokeParams): Promise<LLMResult>;
 }
 
 export interface StepDefinition {
@@ -144,7 +600,8 @@ export interface StepDefinition {
   /** Module registry key override — defaults to `type`. Use for custom step variants. */
   moduleId?: string;
   inputs?: Record<string, unknown> | ((context: PipelineContext) => Record<string, unknown>);
-  skip?: (context: PipelineContext) => boolean;
+  /** Return `false`/falsy to run the step. A truthy string is logged as the skip reason; bare `true` gets a generic fallback. */
+  skip?: (context: PipelineContext) => boolean | string | Promise<boolean | string>;
 }
 
 export interface PipelineDefinition {

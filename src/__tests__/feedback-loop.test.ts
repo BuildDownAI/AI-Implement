@@ -1,5 +1,14 @@
+import { commentInstructionReviewRubric } from "../pipeline/feedback-loop-core.js";
+import { createStageExecutor } from "../pipeline/stage-executor.js";
+import { ModelAuthClientError, type ModelInvocation } from "../model-auth-client.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import { classifyLlmResult } from "../pipeline/failure-classification.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { spawnSync } from "node:child_process";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { wrapWithPlanningGuard, assemblePlanningContext } from "../planning-context-assembly.js";
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn().mockReturnValue({
@@ -25,22 +34,13 @@ import { reviewStep } from "../pipeline/steps/review.js";
 const mockImplementRun = vi.mocked(implementStep.run);
 const mockReviewRun = vi.mocked(reviewStep.run);
 
-function makeCtx() {
-  return {
-    data: { issueIdentifier: "AII-374", model: undefined },
-    llmExecutor: { invoke: vi.fn() },
-    getOutputs: () => ({}),
-    setOutputs: () => {},
-    resolveInputs: (i: unknown) => i,
-  } as never;
-}
-
 const IMPLEMENT_SUCCESS = {
   filesChanged: [] as string[],
   tokensUsed: 0,
   exitCode: 0,
   subagentCount: 0,
   telemetry: { outcome: "success" as const, numTurns: 5, costUsd: 0.01, durationMs: 1000, tokensIn: 100, tokensOut: 50 },
+  attempts: 1,
 };
 
 const REVIEW_APPROVED = {
@@ -50,6 +50,7 @@ const REVIEW_APPROVED = {
   progressDelta: 10,
   feedback: "looks good",
   tokensUsed: 100,
+  attempts: 1,
 };
 
 const REVIEW_REJECTED = {
@@ -59,6 +60,7 @@ const REVIEW_REJECTED = {
   progressDelta: 50,
   feedback: "not done yet",
   tokensUsed: 50,
+  attempts: 1,
 };
 
 const NEW_FORMAT_CONTEXT = [
@@ -99,7 +101,11 @@ const REAL_SEPARATOR_CONTEXT = [
   "Some risks.",
 ].join("\n");
 
+// The loop writes cycle summaries and reviewer feedback under the workspace's ai-output/.
+let workspaceDir: string;
+
 beforeEach(() => {
+  workspaceDir = testDir("feedback-loop");
   vi.clearAllMocks();
   mockImplementRun.mockResolvedValue(IMPLEMENT_SUCCESS);
   mockReviewRun.mockResolvedValue(REVIEW_APPROVED);
@@ -224,10 +230,10 @@ describe("splitPlanningContext with real assemblePlanningContext output", () => 
 
 describe("feedbackLoopStep — planning context routing", () => {
   it("sends full planningContext to implement on pass 1 with new-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 1 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 1 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun).toHaveBeenCalledOnce();
@@ -235,28 +241,29 @@ describe("feedbackLoopStep — planning context routing", () => {
   });
 
   it("sends acceptanceBar to review on every pass with new-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
+    const reviewRubric = commentInstructionReviewRubric("Fix the documentation only");
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, reviewRubric, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     const expectedBar = "## ✅ AI Planning: Acceptance Bar\n\n1. Foo.\n2. Bar.";
-    expect(mockReviewRun.mock.calls[0][1]).toMatchObject({ acceptanceBar: expectedBar });
-    expect(mockReviewRun.mock.calls[1][1]).toMatchObject({ acceptanceBar: expectedBar });
+    expect(mockReviewRun.mock.calls[0][1]).toMatchObject({ acceptanceBar: expectedBar, reviewRubric });
+    expect(mockReviewRun.mock.calls[1][1]).toMatchObject({ acceptanceBar: expectedBar, reviewRubric });
   });
 
   it("sends wrapped mapSection (with security guard) to implement on pass 2 with new-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun).toHaveBeenCalledTimes(2);
@@ -271,13 +278,13 @@ describe("feedbackLoopStep — planning context routing", () => {
   });
 
   it("sends full planningContext on every pass with old-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: OLD_FORMAT_CONTEXT, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: OLD_FORMAT_CONTEXT, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun.mock.calls[0][1]).toMatchObject({ planningContext: OLD_FORMAT_CONTEXT });
@@ -285,10 +292,10 @@ describe("feedbackLoopStep — planning context routing", () => {
   });
 
   it("sends no acceptanceBar to review with old-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: OLD_FORMAT_CONTEXT, maxIterations: 1 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: OLD_FORMAT_CONTEXT, maxIterations: 1 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockReviewRun).toHaveBeenCalledOnce();
@@ -297,17 +304,215 @@ describe("feedbackLoopStep — planning context routing", () => {
 
   it("falls back to rawPlanningContext on pass 2 when new-format has no map section", async () => {
     const barOnlyContext = "## ✅ AI Planning: Acceptance Bar\n\n1. Only a bar, no map.";
-    const ctx = makeCtx();
+    const ctx = makeContext();
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: barOnlyContext, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: barOnlyContext, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun.mock.calls[0][1]).toMatchObject({ planningContext: barOnlyContext });
     // mapSection absent — fall back to full raw context rather than sending undefined
     expect(mockImplementRun.mock.calls[1][1].planningContext).toBe(barOnlyContext);
   });
+});
+
+describe("feedbackLoopStep — pass attribution (AII-971)", () => {
+  const attribution = {
+    version: 1 as const, invocationId: "inv-1", stage: "implementation" as const, snapshotId: "snap-1",
+    agent: "codex" as const, provider: "openai" as const, model: "gpt-synthetic", profileId: "p1",
+    authMode: "openai-api-key" as const, limit: null, outcome: "success" as const, usage: null,
+  };
+  const run = async () => {
+    const out = await feedbackLoopStep.run(
+      makeContext(),
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: "", maxIterations: 1 },
+      { report: vi.fn(async () => undefined) },
+    );
+    return out as { passes: Array<Record<string, unknown>> };
+  };
+
+  it("carries the implement telemetry's attribution onto the pass", async () => {
+    mockImplementRun.mockResolvedValue({ ...IMPLEMENT_SUCCESS, telemetry: { ...IMPLEMENT_SUCCESS.telemetry, attribution } });
+    expect((await run()).passes[0].attribution).toEqual(attribution);
+  });
+
+  it("leaves legacy passes without an attribution key", async () => {
+    expect(await run()).toSatisfy((o: { passes: Array<Record<string, unknown>> }) => !("attribution" in o.passes[0]));
+  });
+});
+
+describe("account-switch retries", () => {
+  it.each([false, true])("stops after an executor-produced fallback checkout failure (dirty=%s)", async dirty => {
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from(dirty ? "M src/file.ts" : ""), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const selection = { agent: "claude" as const, provider: "anthropic" as const,
+      model: "claude-test", accountProfileId: "A", invocationTimeoutMs: 1000 };
+    const profile = { id: "A", identity: "primary", revision: 1, agent: "claude" as const,
+      provider: "anthropic" as const, authMode: "anthropic-api-key" as const };
+    const snapshot: ResolvedAgentSnapshotV1 = {
+      version: 1, snapshotId: "test-snapshot",
+      configRevisions: { orchestratorDefault: { configRevisionId: "rev", revision: 1 }, project: { configRevisionId: "rev", revision: 1 } },
+      sources: {} as ResolvedAgentSnapshotV1["sources"],
+      stages: { planning: selection, implementation: selection, review: selection },
+      profiles: { planning: profile, implementation: profile, review: profile },
+    };
+    const checkout = vi.fn(async (id: string) => {
+      if (id === "B") throw new ModelAuthClientError("profile_not_allowed");
+    });
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0, failure: classifyLlmResult({
+      stdout: "", exitCode: 0, tokensUsed: 0, terminalStatus: { isError: true, subtype: "turn.failed" },
+      errorMessage: "You've hit your usage limit.",
+    }, { stage: "implement", attempt: 1, expectsStructuredOutput: false }) }));
+    const executor = createStageExecutor({ workspaceDir, snapshot, legacy: { invoke },
+      auth: { async invoke<T>(id: string, run: (selected: ModelInvocation) => Promise<T>): Promise<T> {
+        await checkout(id);
+        return run({ env: {}, strippedKeys: [] });
+      } },
+      createClaude: () => ({ invoke }),
+      accountFallbacks: { implementation: ["B", "C"].map(accountProfileId => ({
+        ...selection, accountProfileId, profileRevision: 1, authMode: profile.authMode,
+      })) },
+    });
+    mockImplementRun.mockImplementation(async () => {
+      const result = await executor.invoke({ prompt: "test", model: selection.model, agentStage: "implementation" });
+      return { ...IMPLEMENT_SUCCESS, invocationFailure: result.failure };
+    });
+    const ctx = makeContext();
+    ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 3 };
+    const promise = feedbackLoopStep.run(ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
+      { report: vi.fn(async () => undefined) });
+    const expectedFailure = { code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", retryable: false };
+    if (dirty) {
+      await expect(promise).resolves.toMatchObject({ approved: false, failure: expectedFailure });
+    } else {
+      await expect(promise).rejects.toMatchObject({ failure: expectedFailure });
+    }
+    const outcome = await promise.catch((error: unknown) => error);
+    expect((outcome as { failure: { accountFallback?: unknown } }).failure.accountFallback).toBeUndefined();
+    expect(checkout.mock.calls).toEqual([["A"], ["B"]]);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(mockImplementRun).toHaveBeenCalledTimes(2);
+    expect(mockReviewRun).not.toHaveBeenCalled();
+  });
+
+  it("rejects an auth failure without an account switch even with a dirty workspace", async () => {
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const failure = { category: "auth" as const, code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", stage: "implement",
+      attempt: 1, retryable: false, message: "Profile not allowed", evidence: { truncated: false } };
+    mockImplementRun.mockRejectedValueOnce(Object.assign(new Error(failure.message), { failure }));
+    const promise = feedbackLoopStep.run(makeContext(),
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1 },
+      { report: vi.fn(async () => undefined) });
+    await expect(promise).rejects.toMatchObject({ failure: { ...failure, stage: "feedback-loop/implement-1" } });
+    expect(mockImplementRun).toHaveBeenCalledTimes(1);
+    expect(mockReviewRun).not.toHaveBeenCalled();
+  });
+
+  it.each([["ACCOUNT_USAGE_LIMIT", "You've hit your usage limit."], ["PROVIDER_AUTH", "authentication_error"], ["PROVIDER_CONFIG", "unknown model"]])("gives a classified exit-zero %s result an extra attempt for the next account", async (code, errorMessage) => {
+    const failure = classifyLlmResult({
+      stdout: "", stderr: "", exitCode: 0, tokensUsed: 0, attempts: 1,
+      terminalStatus: { isError: true, subtype: "turn.failed" },
+      errorMessage,
+    }, { stage: "implement", attempt: 1, expectsStructuredOutput: false });
+    expect(failure.code).toBe(code);
+    failure.accountFallback = { stage: "implementation", from: "A", to: "B" };
+    mockImplementRun.mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure });
+    const ctx = makeContext();
+    ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+    const result = await feedbackLoopStep.run(ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
+      { report: vi.fn(async () => undefined) });
+    expect(result.approved).toBe(true);
+    expect(mockImplementRun).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["PROVIDER_AUTH", "PROVIDER_CONFIG"])("continues dirty implementation work after a thrown %s switches accounts with zero retries", async code => {
+    const failure = {
+      category: "auth" as const, code, stage: "implement", attempt: 1, retryable: false,
+      message: "Provider refused the key or model", evidence: { truncated: false },
+      accountFallback: { stage: "implementation" as const, from: "A", to: "B" },
+    };
+    mockImplementRun.mockRejectedValueOnce(Object.assign(new Error(failure.message), { failure }))
+      .mockResolvedValueOnce(IMPLEMENT_SUCCESS);
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const ctx = makeContext();
+    ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+
+    const result = await feedbackLoopStep.run(ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
+      { report: vi.fn(async () => undefined) });
+
+    expect(result.approved).toBe(true);
+    expect(mockImplementRun).toHaveBeenCalledTimes(2);
+    expect(mockImplementRun.mock.calls[1][1].prompt).toContain("Continue from the current state; do not revert it.");
+    expect(mockReviewRun).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["ACCOUNT_USAGE_LIMIT", "PROVIDER_AUTH", "PROVIDER_CONFIG"].flatMap(code => (["implementation", "review"] as const).map(stage => ({ code, stage }))))("gives successive switches an attempt beyond the retry budget: $stage $code", async ({ stage, code }) => {
+    const failure = (from: string, to: string) => ({
+      category: "auth" as const, code, stage, attempt: 1, retryable: false,
+      message: "limit", evidence: { truncated: false }, accountFallback: { stage, from, to },
+    });
+    if (stage === "implementation") {
+      mockImplementRun.mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure("A", "B") })
+        .mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure("B", "C") });
+    } else {
+      mockReviewRun.mockRejectedValueOnce(Object.assign(new Error("limit"), { failure: failure("A", "B") }))
+        .mockRejectedValueOnce(Object.assign(new Error("limit"), { failure: failure("B", "C") }));
+    }
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const ctx = makeContext();
+    ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+    const result = await feedbackLoopStep.run(ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
+      { report: vi.fn(async () => undefined) });
+    expect(result.approved).toBe(true);
+    if (stage === "implementation") expect(mockImplementRun.mock.calls[1][1].prompt).toContain("Continue from the current state; do not revert it.");
+    expect(stage === "implementation" ? mockImplementRun : mockReviewRun).toHaveBeenCalledTimes(3);
+  });
+});
+
+it.each(["ACCOUNT_USAGE_LIMIT", "PROVIDER_AUTH", "PROVIDER_CONFIG"])("preserves a terminal review account failure for the notice: %s", async code => {
+  const failure = { category: "auth" as const, code, stage: "review", attempt: 1, retryable: false,
+    message: "Usage limit reached on every account: A, B, C", evidence: { truncated: false, llmErrorMessage: "Usage limit reached on every account: A, B, C" } };
+  mockReviewRun.mockRejectedValueOnce(Object.assign(new Error(failure.message), { failure }));
+  const result = await feedbackLoopStep.run(makeContext(),
+    { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1 },
+    { report: vi.fn(async () => undefined) });
+  expect(result.failure).toMatchObject({ code: failure.code, message: failure.message, evidence: failure.evidence });
+});
+
+it.each([false, true])("preserves terminal implement usage limits only for dirty work (dirty=%s)", async dirty => {
+  const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+  vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from(dirty ? "M src/file.ts" : ""), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+  mockImplementRun.mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure });
+  const promise = feedbackLoopStep.run(makeContext(), { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1 }, { report: vi.fn(async () => undefined) });
+  if (dirty) expect(await promise).toMatchObject({ approved: false, failure: { code: failure.code } });
+  else await expect(promise).rejects.toMatchObject({ failure: { code: failure.code } });
+  expect(mockReviewRun).not.toHaveBeenCalled();
+});
+
+it.each(["ACCOUNT_USAGE_LIMIT", "PROVIDER_AUTH", "PROVIDER_CONFIG"])("keeps changes after both implement accounts fail with zero retries: %s", async code => {
+  const failure = { category: "auth" as const, code, stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+  mockImplementRun.mockRejectedValueOnce(Object.assign(new Error("limit"), { failure: { ...failure, accountFallback: { stage: "implementation", from: "A", to: "B" } } }))
+    .mockRejectedValueOnce(Object.assign(new Error("limit"), { failure }));
+  vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+  const ctx = makeContext();
+  ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+  const result = await feedbackLoopStep.run(ctx, { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} }, { report: vi.fn(async () => undefined) });
+  expect(result).toMatchObject({ approved: false, failure: { code: failure.code } });
+  expect(mockImplementRun).toHaveBeenCalledTimes(2);
+  expect(mockReviewRun).not.toHaveBeenCalled();
+});
+
+it("retains the ordinary review error output shape", async () => {
+  const failure = { category: "llm" as const, code: "LLM_NO_STRUCTURED_OUTPUT", stage: "review", attempt: 1, retryable: false, message: "missing output", evidence: { truncated: false } };
+  mockReviewRun.mockRejectedValueOnce(Object.assign(new Error("missing output"), { failure }));
+  const result = await feedbackLoopStep.run(makeContext(), { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1 }, { report: vi.fn(async () => undefined) });
+  expect(result.terminationReason).toBe("review_error");
+  expect(result.failure).toBeUndefined();
+  expect(result.finalFeedback).toContain("Review step failed and was skipped");
 });

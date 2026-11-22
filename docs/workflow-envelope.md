@@ -12,13 +12,14 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 
 ---
 
-## 8-Input Implementation Contract
+## 9-Input Implementation Contract
 
-`claude-implement.yml` (post-envelope generation) exposes exactly these eight `workflow_dispatch` inputs:
+A top-level `workflow_dispatch` input is reserved for a value GitHub must evaluate before any step runs (routing, image selection, timeout) or a secret this workflow has to mask; every other per-run value rides inside `run_config` instead of growing the input list. `issue_identifier` is the one deliberate exception: it carries no data the runner needs — `run_config.issue.identifier` is authoritative — but `run-name:` is itself a value GitHub evaluates before any step runs, and a `run-name:` expression cannot decode `run_config`, so the ticket key has to duplicate onto a plain top-level input for the run list to show it. `claude-implement.yml` (post-envelope generation) exposes exactly these nine `workflow_dispatch` inputs:
 
 | Input | Required | Type | Notes |
 |-------|----------|------|-------|
 | `run_config` | **Yes** | string | Base64-encoded `RunConfigV1` JSON — all issue data and per-project config |
+| `issue_identifier` | No | string | Display-only duplicate of `run_config.issue.identifier`, read solely by `run-name:` to title the Actions run with the ticket key; no step reads it |
 | `runner_image` | No | string | Container image override; allowlist-validated against `ghcr.io/builddownai/`, the repo owner's namespace, and `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` |
 | `job_timeout_minutes` | No | string | GHA `timeout-minutes` for the implement job; empty defaults to 90 |
 | `provider` | No | string | `anthropic` (default) or `bedrock` — determines auth path before the runner starts |
@@ -27,7 +28,74 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 | `run_progress_token` | No | string | HMAC bearer token for in-progress callbacks; empty skips progress posts. **Masked.** |
 | `run_publication_token` | No | string | Dedicated, single-use bearer token that may be exchanged immediately before repository publication for a fresh repo-scoped GitHub credential. **Masked. Implementation and gap-analysis only.** |
 
-The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs.
+The three runner tokens remain separate inputs under the current dispatch contract (a private `credentials` namespace, when present, supersedes them at the runner; see AII-1000 below); the envelope remains secret-free. The first container-job step reads the token values from GitHub's `GITHUB_EVENT_PATH` event file and registers `::add-mask::` commands before any diagnostics or credential consumers run. It has no token-valued `env:` entries or input interpolation in its script: GitHub prints both script and environment headers before executing the step, so either would expose values before masking. Later runner steps retain their token environment mappings after masks are registered. Mask command data escapes percent signs and line endings; malformed event data fails the bootstrap before consumers run. The publication token remains restricted to the pipeline process and is never forwarded to model child processes or persisted step inputs.
+
+These are live credentials in the runner's environment; `src/__tests__/setup/clear-runner-credentials.ts` (registered as a Vitest `setupFile`) deletes all five credential variables before every test so no suite can burn a single-use token against the live orchestrator. A test that needs a credential value may set it in the test body — the global `beforeEach` ensures it is cleared again before the next test. Tests that exercise callback or fetch paths should inject a mock `fetchImpl` (or equivalent dependency-injection point) rather than letting code reach a live URL.
+
+Headroom note: GitHub caps `workflow_dispatch` at 10 inputs; 9 of 10 used; one slot free. That ceiling is part of why the envelope exists; a new field must ride inside `run_config` unless the workflow itself has to read it before the runner starts (masking, routing), in which case an existing input has to make room. `claude-plan.yml` declares eight of these (no `run_publication_token`).
+
+The first step of the container job prints every input (`[dispatch-inputs] …`), with the three tokens reduced to `<redacted>`/`(empty)` and `run_config` shown as the credential-free diagnostic projection (see "Workflow bootstrap and capability"). `provider` and `aws_region` are also forwarded into the entrypoint env as `PROVIDER`/`AWS_REGION`: the runner reads the provider from env, not from the envelope, so a template that drops them silently downgrades Bedrock repos to the anthropic provider.
+
+---
+
+## Compatibility with older templates
+
+Every launch path except kg-refresh builds `run_config` with `buildRunConfig` (`src/run-config.ts`); kg-refresh uses `buildKgRefreshRunConfig`. The envelope dispatch builders, `buildEnvelopeDispatchInputs` and the public/private KG GHA builders in `src/github.ts`, omit `runner_phase` and `runner_callback_url` from top-level inputs. Both values ride inside `run_config`; `session/entrypoint.sh` reads them from the envelope (AII-653). A KG source repo on a template predating AII-653 may default to implementation when the top-level phase is absent and must sync its workflow. The `workflow:envelope` preflight still rejects templates that predate envelope support.
+
+GitHub rejects a `workflow_dispatch` naming an input the target workflow doesn't declare (422 `Unexpected inputs provided: [...]`). A target repo adopts a new template shape only when it merges a sync PR, so the orchestrator cannot assume every repo has re-synced. `src/github.ts` declares:
+
+```typescript
+const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url", "issue_identifier"] as const;
+```
+
+— inputs an older template declares and a newer one does not, because a newer template reads their values from `run_config` (AII-653), or a value a newer template declares but an older one predates (`issue_identifier`, AII-656). The shared poster, `postWorkflowDispatch`, strips-and-retries on a 422: when the response is HTTP 422, the body matches `/unexpected inputs/i`, and names — by exact match against the rejection's quoted input list, never by substring — at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in the dispatch's `inputs` — **and only when `inputs.run_config` is a non-empty string** — it strips exactly the named members and posts once more, logging `[dispatch] <owner>/<repo>/<file> does not declare <names> (re-sync workflows); retrying without`. Exact matching matters because a rejection naming an unrelated input that happens to contain `runner_phase` as a substring (e.g. a hypothetical `runner_phase_extra`) must not be mistaken for a match; the poster parses the rejection's quoted tokens (handling both the bare-text and GitHub's escaped-JSON error shapes) and checks set membership, not `body.includes(name)`.
+
+The `run_config` guard matters: on the legacy (non-envelope) contract, `runner_phase`, `runner_callback_url`, and `issue_identifier` are authoritative issue data, not compatibility duplicates — the legacy `dispatchWorkflow` callers in `src/index.ts` never set `run_config`, so they are excluded from the strip without a separate flag. Stripping them there would run a gap-fill as an implementation (or drop the real ticket key). The guard requires *non-empty* — `run_config: ""` does not count as "the caller is on the envelope contract."
+
+The retry is **capped at exactly two requests, by construction, not just by the common case where removing a name works**: the poster sends the first request, and if that 422s in a strippable way it sends exactly one more — whatever that second response says (success, a different 422, the same 422 again) is returned unconditionally, with no further request. This matters because a target repo's second 422 can legitimately name a *different* still-present optional input than the first did (e.g. reject `runner_phase` first, then `runner_callback_url`); naively recursing on "does the response still match a strippable name" would chain a third request in that case. Both `dispatchWorkflow` (the thin wrapper most dispatch sites use) and the kg-refresh dispatch path go through `postWorkflowDispatch`. The compatibility allowlist remains unchanged; current KG dispatches can use this fallback for `issue_identifier`, but never send the two removed phase/callback inputs.
+
+---
+
+## Dispatch outcomes and `returnRunDetails`
+
+`postDispatchOnce`, the function inside `postWorkflowDispatch`/`dispatchWorkflow` that actually posts one `workflow_dispatch` request, accepts an opt-in `returnRunDetails?: boolean` option (AII-778, default off). The Restate review-fix worker opts in; ordinary `dispatchWorkflow` callers retain the existing response contract.
+
+Setting `returnRunDetails: true`:
+
+- Adds `return_run_details: true` to the POST body sent to GitHub's `workflow_dispatch` endpoint.
+- Populates a new `outcome: DispatchOutcome` field on `DispatchResult`, and — only when the response is a repo-validated `200` — `runId`/`runUrl`.
+
+```typescript
+export type DispatchOutcome = "accepted" | "rejected" | "unknown";
+
+export interface DispatchResult {
+  success: boolean;
+  status: number;
+  error?: string;
+  outcome?: DispatchOutcome;   // only set when returnRunDetails: true
+  runId?: number;              // only set for a repo-validated 200
+  runUrl?: string;             // only set for a repo-validated 200
+}
+```
+
+`outcome` reflects an identity-trust judgment, not just the HTTP status:
+
+| Response | `outcome` | `runId`/`runUrl` | Why |
+|---|---|---|---|
+| `204` | `accepted` | absent | GitHub queued the dispatch. `workflow_dispatch` never returns a run id on a plain 204 — there is no exact identity to report, only "this plausibly started." |
+| `200`, body validates against the requested repo | `accepted` | present | GitHub's [documented response](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event) contains `workflow_run_id`, `run_url` and `html_url`. `extractDispatchRunIdentity` accepts that positive safe-integer ID and retains historical `id`/`run` payload support. Supplied ID fields must agree; `html_url` and any supplied `run_url` must name that exact repository and run. An optional `repository` field must agree too. Missing, malformed or conflicting identity stays unresolved. |
+| `200`, unparseable or repo-mismatched body | `unknown` | absent | Same reasoning as above, on the failing side. |
+| `4xx` | `rejected` | absent | A definite application-level refusal — safe to treat as "did not happen." |
+| `5xx`, or any other unrecognised status | `unknown` | absent | GitHub may have started the run before failing to report it cleanly; not safe to assume either accepted or rejected. |
+| transport failure (`fetch` throws) | `unknown` (only if `returnRunDetails: true`) | absent | See legacy behavior below — the identical failure is a thrown error for a caller that did not opt in. |
+
+The three-way split matters to a caller trying to avoid a duplicate dispatch: `rejected` is safe to retry (GitHub is certain nothing started), `accepted` needs no retry, and `unknown` is neither — a transport failure or 5xx must not be blindly retried, because GitHub may have already started the run.
+
+**Legacy callers are unchanged, byte-for-byte.** A caller that does not pass `returnRunDetails` gets exactly the pre-AII-778 `DispatchResult` shape (`success`/`status`/`error`, no `outcome`/`runId`/`runUrl`) and the pre-AII-778 throw-on-transport-failure behavior: `postDispatchOnce` only catches and converts a `fetch` rejection into `{ outcome: "unknown", ... }` when `returnRunDetails` is set; otherwise the rejection propagates exactly as it always did. This is deliberate (AII-778's compatibility constraint) — opting in to run-detail reporting must never change behavior for a caller that didn't ask for it.
+
+**`findWorkflowRunId` stays, but only as legacy identity — the pilot must not treat it as exact.** The existing post-dispatch heuristic (`src/github.ts`) scans the workflow's recent-runs list for a run created at or after the dispatch time, on the expected branch, optionally disambiguated by `display_title` against `issueIdentifier` — because `workflow_dispatch` alone never returns a run id, this scan is how every legacy (non-pilot) caller resolves one today, and `returnRunDetails` changes nothing there: a legacy caller doesn't pass it and keeps using the heuristic exactly as before.
+
+The Restate review-fix pilot is held to a stricter rule: a title/time-window match is never exact execution identity, so the pilot must not fall back to `findWorkflowRunId` to manufacture one. A `200` with a validated body (`runId`/`runUrl`) *is* exact identity, and needs no heuristic. A `204` — the common case — is accepted but carries no identity at all; that is not a signal to guess via the heuristic, and it is not a signal to blindly repeat the POST (GitHub may have already started the run, and a second dispatch would duplicate it). Instead the pilot holds the attempt's occupancy and reconciles by exact attempt/execution identity — correlating the run that reports back against `run_config.reviewFix.attemptId` — until that resolves or the attempt's `deadlineAt` passes. This constraint is specific to the pilot; every other dispatch/monitor path (gap-analysis, planning, `src/monitor-gha.ts`, the GHA polling in `src/index.ts`) is unaffected and keeps resolving run identity via the heuristic as before.
 
 ---
 
@@ -41,7 +109,7 @@ interface RunConfigV1 {
   issue: { id: string; identifier: string; title: string; description: string };
   prNumber?: string;
   baseBranch?: string;
-  runnerPhase?: "implementation" | "gap-analysis" | "planning";
+  runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   branchPrefix?: string;
   skillsRepo?: string;
   runnerCallbackUrl?: string;
@@ -50,8 +118,35 @@ interface RunConfigV1 {
   commentInstruction?: string;
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   profiles?: string[];
+  assigneeName?: string;
   planningContext?: { parent?: string; siblings?: string; dependencies?: string };
+  groupingParent?: boolean;
   dependencyTokenScope?: "installation";
+  referenceRepos?: Array<{ repo: string; path: string; ref?: string }>;
+  reviewers?: Array<{ id: string; gates: boolean }>;
+  reviewProcess?: "ai-implement" | "claude-code-review";
+  trustedReviewAuthors?: string[];
+  retryPolicy?: {
+    requestRetries: number;
+    stageRetries: number;
+    pushRetries: number;
+    backoffInitialMs: number;
+    backoffMaxMs: number;
+    backoffJitter: number;
+    reviewMaxTurns: number;
+  };
+  reviewFix?: {
+    version: 1;
+    attemptId: string;
+    installationId: number;
+    repository: string;
+    prNumber: number;
+    deadlineAt: number;
+  };
+  agentConfig?: ResolvedAgentSnapshotV1; // AII-944, see "Resolved agent snapshot"
+  modelFallbacks?: Partial<Record<StageName, string>>; // Public per-stage fallback model ids
+  accountFallbacks?: Partial<Record<StageName, StageAccount[]>>; // Ordered frozen public account entries
+  modelPrices?: RunModelPrices; // Public cached prices and fetchedAt (epoch milliseconds)
 }
 ```
 
@@ -62,12 +157,164 @@ Field notes:
 | `issue.description` | Capped at 40,000 characters on encode; truncation is appended as a marker string |
 | `prNumber` | Set for gap-analysis and review-feedback re-dispatches; absent on initial implementation |
 | `baseBranch` | Feature-branch parent for child issues; repo default branch otherwise |
-| `runnerPhase` | `"implementation"` (default), `"gap-analysis"`, or `"planning"` |
+| `runnerPhase` | `"implementation"` (default), `"gap-analysis"`, `"planning"`, or `"kg-refresh"` |
 | `sensitiveFiles.add` | Glob patterns extending the built-in sensitive-file blocklist |
 | `sensitiveFiles.allow` | Glob patterns that override the blocklist; allow wins over both built-in and add patterns |
 | `profiles` | Jira AI-Implement Profiles field values (comma-split strings) |
+| `assigneeName` | Jira issue assignee display name; absent for Linear or unassigned Jira issues. `push.ts` appends it as `(Name)` to the opened PR's title. Fly/local mirror it as `AI_IMPLEMENT_ASSIGNEE_NAME`. Envelope-only — unlike `profiles`, `assignee` was never a legacy workflow_dispatch input, so it is not forwarded on the legacy GHA contract. |
 | `planningContext` | Populated for child issues in a feature tree; carries parent and sibling summaries |
+| `groupingParent` | True when this dispatch is a grouping parent's own closing-work run |
 | `dependencyTokenScope` | `"installation"` enables the dependency token step in the runner; absent or null disables it. The runner fetches a read-only token covering all App-installation repos and injects it as a git credential helper and `COMPOSER_AUTH`. Requires a publicly reachable orchestrator (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`). |
+| `referenceRepos` | Repositories to clone read-only into the workspace before the implement loop. Each entry carries `repo` (normalized `https://github.com/owner/repo`), `path` (workspace-relative directory), and an optional `ref` (branch, tag, or commit hash; absent means the default branch). **Absent on planning dispatches** — the planning runner reads no such field. **Absent on kg-refresh dispatches** — the kg-refresh pipeline clones a knowledge-graph source repository as its workspace and has no pipeline step that would consume reference repos. Envelope-only: no dispatch input and no environment variable carry this field, so a target repo on the legacy workflow contract does not receive it. |
+| `reviewers` | Project reviewer selection copied from the mapping when non-null. Each entry carries a reviewer `id` and whether that reviewer `gates` merge readiness. Absent means the runner uses `DEFAULT_REVIEWER_SELECTION` (`gap-analysis` and `code-review`, both gating), not an empty list; this keeps older orchestrators and already-dispatched runs from silently losing their review gate. Malformed values are dropped during decode with one warning and then resolve to the same default. The runner forwards the selection to the post-push review step, which runs selected internal reviewers, applies their gating policy, and fails closed for an empty selection. The external `claude-review-summary` id controls prose gating rather than resolving executable reviewer code. |
+| `reviewProcess` | The project's review process (ADR 038), copied from the mapping when non-null. Absent means `ai-implement`. A value that is not a known process id is dropped during decode with one warning (`[run-config] Ignoring invalid reviewProcess field; using ai-implement`) rather than rejecting the envelope, so version skew between orchestrator and runner cannot fail a run. The autonomous run and `post-push-review` read it: under `claude-code-review` the gate accepts the process's check-run/app pairs and an empty internal reviewer selection is valid. |
+| `trustedReviewAuthors` | Extra GitHub logins trusted as review authors, copied from the mapping when non-null. Absent means the process's own authors. The list adds to those authors and never replaces them. Anything other than an array of non-empty strings is dropped during decode with one warning (`[run-config] Ignoring invalid trustedReviewAuthors field; using the process's own authors`). `post-push-review` reads it when matching review authors. |
+| `modelFallbacks` | Optional public map of `planning`, `implementation`, and `review` to fallback model ids, separate from the frozen snapshot. Empty maps are omitted. Unknown stages or values outside printable non-space ASCII (1–128 characters) discard the entire field without preventing the run. Contains no credentials. |
+| `accountFallbacks` | Optional ordered frozen account entries per stage; absent or empty means no fallback accounts. Strictly copied without credentials or credential references; see "Stored fallback models". |
+| `modelPrices` | Optional copy of `ModelPrices/builddown.current`: `prices` contains only model, version, effectiveFrom and the four per-token USD rates; `fetchedAt` is epoch milliseconds (nullable). Implementation dispatch reads the cache through Restate with a one-second request timeout and no retries; failed or empty reads omit the field. The run-stats comment estimates missing implement/review costs only when model and token telemetry permit it, adds an estimate provenance note, and preserves reported costs. Incomplete totals retain the reported-cost partial/unavailable labels. Estimates never enter accounting or callbacks. |
+| `retryPolicy` | Global retry/backoff policy and reviewer turn cap, edited on the admin Settings page and stored in the orchestrator's `settings` table (never an env var). Absent means the runner uses `DEFAULT_RETRY_POLICY` (`src/pipeline/retry-backoff.ts`). Populated by `getRetryPolicy()` on every implementation-phase and gap-analysis-phase dispatch across all three execution modes — the initial dispatch, the `/ai-implement` comment gap-fill drain, the PR-comment gap-fill trigger, and the review-fix re-dispatch — because `pushRetries` and `reviewMaxTurns` apply to those re-dispatches exactly as to initial runs. Never sent on planning or kg-refresh dispatches, which have no retry loop. On the GHA path, `buildEnvelopeDispatchInputs`'s `retryPolicy` option is required (nullable), not optional — a caller can no longer omit it silently, it must state intent: planning passes `null` explicitly, implementation/gap-analysis pass the real policy from `getRetryPolicy()`. The function itself only stamps the field into `run_config` when `runnerPhase` is neither `planning` nor `kg-refresh`, substituting `DEFAULT_RETRY_POLICY` only if the passed value is `null`, so all three backends agree that every implementation/gap-analysis dispatch carries this field. The runner runs the decoded value through `normalizeRetryPolicy` (an out-of-range or malformed field degrades to the default for that field alone; an unknown key is dropped). The `push` step consumes `pushRetries` and the backoff fields (see [pipeline-architecture.md](pipeline-architecture.md), "Push retry and remote reconciliation"); the remaining fields are stored and transported so the retry rails built on top of them read one source of truth. |
+| `reviewFix` | The Restate review-fix pilot's explicit attempt-identity marker (AII-776), shaped by the canonical AII-770 contract (`src/review-fix-contract.ts`'s `ReviewFixMetadataV1`): `attemptId` identifies one Restate attempt, `installationId`/`repository`/`prNumber` scope it to one PR under one GitHub App installation, and `deadlineAt` is an epoch-ms timestamp (not ISO) so it compares with plain `<`/`>`. Absent means Legacy (non-pilot) dispatch, the only path the legacy flat-env contract can produce — there is no environment-variable equivalent. Unlike every other optional field on this envelope, a **present but malformed or unsupported** `reviewFix` fails closed: `decodeRunConfig` throws rather than dropping the field and falling back to Legacy, because a bad pilot marker must never be silently treated as a non-pilot dispatch. Carries no credential or token — repository/PR/execution authority is verified downstream against stored state, never trusted from this field alone. This slice only carries the field through `RunConfigV1` and `ResolvedRunnerInputs`; no pipeline step reads it yet. |
+
+## Resolved agent snapshot (`agentConfig`, AII-944)
+
+`agentConfig` is an optional, frozen, already-resolved stage configuration: `{ version: 1, snapshotId, configRevisions: { orchestratorDefault: { configRevisionId, revision }, project: { configRevisionId, revision } }, stages, sources, profiles }`. `stages`, `sources` and `profiles` each hold exactly `planning`, `implementation` and `review`. Each stage carries `agent`, `provider`, `model`, `accountProfileId` and `invocationTimeoutMs` (the actual limit; `maxTurns`/`maxIterations` stay separate envelope fields and turns are never converted to time). `sources` holds a `FieldSource` per field; `profiles` holds the safe projection `id/identity/revision/agent/provider/authMode`. All five `AccountAuthMode` values are valid, including `claude-subscription`. Each `configRevisions` layer is a keyed reference holding the exact immutable `configRevisionId` (a non-empty bounded string, the `stage_agent_config_revisions` row id) and its positive integer `revision`. `resolveProjectStageConfig` returns these as `configReferences` (`configRevisionIds` stays as a compatibility projection derived from them). **Prerelease tightening:** version 1 has no production writer yet, so the earlier numeric-only `configRevisions` shape is rejected rather than supported; row ids are never synthesized from numbers. Decoding is pure — it checks shape only and cannot verify that an id belongs to its revision; that consistency comes from building the snapshot from store resolution. The snapshot `version` is independent of envelope `v`. The types come from `src/agent-config.ts`, which is unchanged.
+
+- **Validation** is `validateResolvedAgentSnapshot` in `src/run-config.ts` (pure, no SQLite). It runs on `encodeRunConfig`, `decodeRunConfig`, `pickKnownKeys` and `buildImplRunConfig`. It checks structure, version, required stages, positive integer revisions/timeouts, allowed sources, stage/profile consistency (id, agent, provider) and the supported agent/provider/authMode combinations, and rejects unknown fields at every level (including credential-shaped ones). Diagnostics name the path only and never echo values.
+- **Fail closed.** A present-but-invalid `agentConfig` throws, like `reviewFix`; it never falls back to legacy. Absent means legacy behavior, byte-for-byte unchanged.
+- **Data, not authorization.** Decoding does not re-resolve defaults or check profile permissions. Trusted preparation and dispatch authorization come later. Credential grant values belong only to the protected bootstrap namespace (AII-680), never this field.
+- **Builder.** `buildImplRunConfig` accepts an optional `agentConfig`, validates it and copies it; it never resolves settings.
+- **Not to be confused with** `profiles` (workflow profiles) or `InvokeParams.stage` (a diagnostic label). `InvokeParams.agentStage` (`StageName`) and `invocationTimeoutMs` are new optional fields; `LLMExecutor` and `PlanningExecutor` are unchanged. `RunPlanningLocalOptions` gains optional `agentConfig` and `configured` inputs, consumed by planning (AII-961, below); `LocalFullLoopOptions` still carries `agentConfig` / `stageExecutor`, not yet consumed.
+
+### Writer census (no writer sets the field in this wave)
+
+Verified by grep: the only `src/` files mentioning `agentConfig`, `agentStage` or `invocationTimeoutMs` are `run-config.ts`, `pipeline/types.ts`, `run-planning.ts`, `local/full-loop.ts` and `agent-config.ts` (definitions only). No caller below is edited.
+
+| File | Role | Status |
+|---|---|---|
+| `src/run-config.ts` | `encodeRunConfig` / `decodeRunConfig` / `pickKnownKeys` / `buildImplRunConfig` | Validates and passes through when present; absent stays absent |
+| `src/github.ts` (dispatch builders, `RunConfigV1` literal, `encodeRunConfig`) | GHA writer | Does not set `agentConfig` |
+| `src/index.ts` (`buildImplRunConfig` call, KG writers) | Orchestrator writers | Implementation sets it for a managed launch (AII-1389/1390); KG writers do not |
+| `src/planning-launch.ts` (`launchPlanningSession`) | Planning writer | Sets `agentConfig` for a managed Fly or local launch (AII-1391); the GitHub Actions `preparePlanningLaunch` never does |
+| `src/local-gapfill.ts` | `decodeRunConfig` then `encodeRunConfig` | Passes through a present snapshot (re-validated); does not set it |
+| `src/dev-harness/index.ts` | `encodeRunConfig` of a literal | Does not set `agentConfig` |
+| `src/run-autonomous.ts` | `decodeRunConfig` (reader of the envelope) | Does not set it |
+| `src/run-planning.ts` | `decodeRunConfig`; `RunPlanningLocalOptions` gains optional `agentConfig` / `configured` | Does not set it; consumes it through `prepareConfiguredRun` (AII-961) |
+| `src/run-local-planning.ts`, `src/run-local-full-loop.ts` | `decodeRunConfig` of the encoded envelope | Do not set it |
+| `src/local/full-loop.ts` | `LocalFullLoopOptions` gains optional `agentConfig` / `stageExecutor` | Does not set it; new options unconsumed |
+| `src/pipeline/kg-refresh-run.ts` | `decodeRunConfig` | Does not set it |
+
+### Reader census
+
+`InvokeParams` readers (the stage executor and planning read `agentStage` / `invocationTimeoutMs` since AII-959/AII-961; the legacy implementation steps still ignore them):
+
+| File | Use |
+|---|---|
+| `src/pipeline/executor.ts` | `ClaudeCliExecutor.invoke` / `spawnOnce` consume existing params only |
+| `src/run-planning.ts` | Builds the one planning `InvokeParams` with `agentStage: "planning"` and the snapshot's model and `invocationTimeoutMs` (AII-961) |
+| `src/pipeline/steps/implement.ts`, `feedback-loop.ts`, `review.ts`, `post-push-review.ts` | Build `InvokeParams` for `llmExecutor.invoke`; do not set the new fields |
+| `src/pipeline/context.ts` | No-op default executor; ignores params |
+| `src/run-autonomous.ts`, `src/pipeline/kg-refresh-run.ts`, `src/local/full-loop.ts` | Accept an optional custom `LLMExecutor`; do not inspect params |
+
+`PipelineContextData` readers (none reads `agentConfig`): `src/pipeline/context.ts` (holds `data`), `src/pipeline/pipeline-loader.ts`, `src/pipeline/steps/kg-ingest.ts`, `src/pipeline/kg-refresh-run.ts`, `src/run-autonomous.ts` (constructs it from the decoded envelope without copying the snapshot). The `PipelineContextData.agentConfig` field is new and unread.
+
+`decodeRunConfig` consumers are the files listed in the writer census that import it.
+
+### Mixed-version matrix
+
+| Orchestrator | Runner | Result |
+|---|---|---|
+| old (no field) | new | Field absent, legacy behavior |
+| new, legacy project | old or new | Field absent, legacy behavior |
+| new, configured project | new | Snapshot validated and consumed by configured run preparation |
+| new, configured project | old | **Unsafe:** `pickKnownKeys` silently drops the field and the run executes legacy |
+
+The last row must never happen. Production writers set `agentConfig` only for a configured project's managed launch (implementation and planning on Fly and local Docker). The readiness gate rejects configured work on runners lacking snapshot support rather than silently running legacy. For rollback, set projects to the legacy path for new attempts as described in [Stage agent configuration](stage-agent-configuration.md); the schema addition is harmless to mixed versions.
+
+Below the TS runner layer, `session/entrypoint.sh` picks the phase (and, for kg-refresh, the callback URL it re-exports) via `resolve_envelope_field` in `session/lib.sh`: when `RUNNER_PHASE` (or `RUNNER_CALLBACK_URL`) is already set in the container env, that value wins and the envelope is not consulted; only when the env var is empty does the shell decode `AI_IMPLEMENT_RUN_CONFIG` and fill it from `runnerPhase` / `runnerCallbackUrl`, falling back to the `implementation` default (no fallback for the callback URL) if the envelope is absent, malformed, or lacks the field. Env-wins matters because Fly Machines and local Docker set `RUNNER_PHASE`/`RUNNER_CALLBACK_URL` directly in the container env, and the local dev harness (`npm run dev:run`) sets `RUNNER_PHASE=full` or `local-planning` while its envelope still carries `runnerPhase: implementation` — if the envelope won, a local dev run would silently switch to the autonomous loop instead of the local full loop it asked for.
+
+---
+
+## Private credentials namespace (`credentials`, AII-981)
+
+`RunConfigV1.credentials` is an optional, versioned `{ version: 1, resultToken?, progressToken?, publicationToken?, attemptToken?, modelAuthGrant? }` for trusted transport. `modelAuthGrant` is the plain grant or sealed Fly form from `src/model-auth-contract.ts` and is never part of `agentConfig`. `validateRunCredentials` rejects unknown fields, bad types, oversized tokens and invalid grants with path-only errors that never echo values or key names.
+
+| Function | Credentials |
+|---|---|
+| `encodeRunConfig` | Dropped |
+| `decodeRunConfig` | Validated (fail closed), not returned |
+| `encodeTrustedRunConfig` / `decodeTrustedRunConfig` | Carried |
+| `diagnosticProjection` | Field names only |
+
+### Workflow bootstrap and capability (AII-982)
+
+The first container-job step of `claude-implement.yml` and `claude-plan.yml` (identical in `workflows/` and `.github/workflows/`) reads `GITHUB_EVENT_PATH` and registers `::add-mask::` for the legacy token inputs, then for the **entire encoded `run_config`**, then for each extracted secret, one per line with `%`, CR and LF escaped: every `credentials.*` token, the plain grant's `bearer`, and a sealed grant's `nonce`, `ciphertext` and `tag` (8+ characters). Masks are emitted only after the namespace and any `agentConfig` validated; recursive masking is never a substitute for validation. The bootstrap re-implements `validateRunCredentials` (including the plain and sealed `modelAuthGrant` variants of `src/model-auth-contract.ts`, discriminated by an `algorithm` key) and `validateResolvedAgentSnapshot` in jq, and `workflow-token-masking.test.ts` checks it against the TypeScript validators on valid and malformed fixtures. Base64 is not protection; masking is a log layer verified against real logs in AII-984. Present-but-invalid private data (a `null` namespace, token or grant counts as present; also bad base64/JSON, wrong types, unknown keys, version, whitespace in a token, an invalid grant or snapshot) exits non-zero with a fixed message — jq stderr is discarded because it can echo input — before any consumer runs. After validation the same step delivers the credentials (AII-1000): the private namespace is the **single authority**, so `RUN_TOKEN`, `RUN_PROGRESS_TOKEN` and (implementation only) `RUN_PUBLICATION_TOKEN` are written as step outputs (`$GITHUB_OUTPUT`, step id `bootstrap`) from `credentials.resultToken` / `progressToken` / `publicationToken`, using a random heredoc delimiter, with no value in command text or output. They are mapped into the env of the `Run pipeline` / `Run planning` step only via `${{ steps.bootstrap.outputs.* }}` — never `$GITHUB_ENV`, which every later step (including third-party actions such as AWS credential configuration) would inherit, so the publication token stays restricted to the pipeline process. A field the namespace omits is exported empty and is **never** backfilled from the public `run_*` inputs, and conflicting public values are ignored. Planning exports result and progress only; a `publicationToken` in a planning envelope is dropped, not rejected, so planning never gains publication authority. When no `credentials` namespace exists, the legacy `run_token` / `run_progress_token` / `run_publication_token` inputs are exported unchanged through the same path. The `Run pipeline` / `Run planning` steps therefore read `RUN_*TOKEN` solely from those outputs. `attemptToken` stays the public `run_attempt_token` marker and `modelAuthGrant` is never exported (AII-958); `decodeRunConfig` still strips credentials. `workflow-token-masking.test.ts` runs the real bootstrap and Run step against a stub entrypoint to prove delivery, the planning audience, metacharacter safety and fail-before-entrypoint.
+
+"Print dispatch inputs" no longer dumps the decoded envelope. It prints the diagnostic projection: known envelope keys only, `credentials` replaced by `credentialFields` (names only), and `agentConfig` replaced by the fixed marker `"<omitted>"` — the nested snapshot is validated by the bootstrap but never copied raw into logs.
+
+A workflow advertises private-envelope support with the static comment `# ai-implement-capability: private-run-config-v1` — not a `workflow_dispatch` input. `resolveWorkflowCapabilities` sets `supportsPrivateRunConfig` only for an envelope workflow carrying it; missing or unprobed means `false`. It is independent of the `stage-agent-config-v1` capability. The canonical implementation and planning templates (`workflows/claude-implement.yml`, `workflows/claude-plan.yml`) now carry both markers. Carrying them does not activate a target: that still requires an authorized template sync to the target repo and a capable trusted image. No sync has occurred.
+
+`buildEnvelopeDispatchInputs` takes `privateTransport` (AII-983) and an optional extra `credentials`; see below. The two-request optional-input retry never strips `run_config` or the tokens, and resends `run_config` byte-identical.
+
+### Private writers and the compatibility matrix (AII-983)
+
+Every GHA writer (implementation, planning, the legacy index.ts review-fix writer, comment-triggered gap-fill and the KG GitHub Actions sender in `src/restate/kg-refresh-senders.ts`) probes the **exact workflow file at the exact ref it dispatches** (planning: `planningWorkflowFile`; KG: `claude-implement.yml` at `kgSourceRef` or the default branch, using the control token) and selects private transport only when `supportsPrivateRunConfig === true`. `contract === "envelope"` alone is never sufficient. The Restate-owned review-fix writer (`src/review-fix-worker.ts`, AII-999) follows the same rule.
+
+| Writer | Reader | Transport |
+|---|---|---|
+| new | new (`supportsPrivateRunConfig === true`) | Bearers in `run_config.credentials` (`encodeTrustedRunConfig`); `run_token` is `""`; no `run_progress_token` / `run_publication_token` inputs |
+| new | old (envelope without the marker, or probe `false`/failed) | Generic `encodeRunConfig` envelope plus masked top-level tokens |
+| new | legacy contract | Legacy per-field inputs plus top-level tokens |
+| old | new | Reader falls back to the top-level `run_*` inputs when no `credentials` namespace exists |
+
+Audiences are unchanged: result for every kind, progress for implementation/gap-fill/KG, publication only for implementation/gap-fill where the reader advertises it. Planning and KG never receive publication authority. `credentials.attemptToken` is never filled from the public `run_attempt_token`. The orchestrator-minted result/progress/publication bearers are authoritative and phase-scoped: of the caller-supplied `credentials` (planning `trustedCredentials`, the KG config's own namespace, `buildEnvelopeDispatchInputs` `credentials`) only `modelAuthGrant` and `attemptToken` are carried, and any supplied result/progress/publication token is discarded, so a supplied `publicationToken` can never reach a planning or KG envelope.
+
+Protected transport fails closed: explicitly supplied private `credentials` (e.g. a `modelAuthGrant`) passed to `buildEnvelopeDispatchInputs` without capability throw. The KG GitHub Actions sender moves the KG bearers into `run_config.credentials` only on a strictly capable reader and otherwise keeps the masked inputs; a KG config carries no `credentials` or `agentConfig`, and each of the three KG refresh senders (Fly, local Docker, GitHub Actions) enforces that first, before any token mint, image resolution or backend call: an envelope with `agentConfig` or `credentials.modelAuthGrant` is refused with a `rejected` result (the run ends `dispatch_rejected`) and the log line `[kg-refresh] refused: a KG refresh envelope carries model authentication`. The implementation (`dispatchGitHubActions`), planning (`PlanningDispatchContext.trustedCredentials`) and GHA gap-fill (`DrainCommentGapfillsInput.getTrustedCredentials`) writers expose the same typed trusted-preparation seam and call `assertPrivateTransportForCredentials` right after the probe, so an unsupported reader, a legacy-contract reader or a failed probe throws inside the pre-launch block: no `postWorkflowDispatch`, no fetch, admission released. This happens before any dispatch request; nothing is stripped or downgraded and there is no provider/account fallback. Implementation dispatch on Fly now prepares and seals (AII-1389): `dispatchSession` runs `prepareManagedDispatch` after admission, the Fly closure embeds the snapshot as `agentConfig`, seals the grant into the protected bootstrap, and drops `AI_IMPLEMENT_RUN_CONFIG` from `extraEnv` (the builder owns it). "Both" mode skips the Fly shadow for a configured project, and a caller that passes no `managedAuth` refuses with `phase_not_wired`. Planning is wired in AII-1391 (below). Gap-fill is wired in AII-1392: the comment drain (`drainCommentGapfillQueue`) and the legacy review-fix writer prepare a configured project on GitHub Actions after admission exactly as below (AII-1420; a refusal fails the queue item or review-fix row), and on Fly (drain only; the legacy review-fix writer has no Fly path) and local Docker (both) they prepare after admission and carry a protected grant: `agentConfig` on the gap-fill envelope, a sealed `protectedModelBootstrap` on Fly or the plain local grant in the private env file, `AI_IMPLEMENT_MODEL_AUTH_URL`, no `AI_IMPLEMENT_RUN_CONFIG` in `extraEnv` and no Anthropic credentials. `refuse` fails the item, `leave-queued` and `hold` leave it pending, both releasing the admission; a drain with no `modelAuthRuntime` refuses as `phase_not_wired`. A drain `createMachine` failure now settles the grant and releases the admission on a definitive 4xx (including projects on the legacy path); a 5xx or transport error keeps it for reconciliation.
+
+**Fleet sync requirement:** a repo receives private transport only after its synced `claude-implement.yml` / `claude-plan.yml` carry the AII-982/AII-1000 bootstrap. This change performs no sync, deploy or project activation. **Rollback:** private writers stay capability-gated; an older workflow reports no capability and the writers revert to the masked top-level path. Never re-enable credential dumps into generic envelopes or logs.
+
+An absent namespace decodes as the legacy envelope. No writer sets it in this slice; the exact input allowlists, rollout order and rollback are in [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). Statements above that the envelope is "secret-free" describe the generic envelope. `repoProcessEnv`, `modelProcessEnv` and `gitProcessEnv` strip `AI_IMPLEMENT_RUN_CONFIG` and `AI_IMPLEMENT_MODEL_AUTH_*` bootstrap handles.
+
+### Runner use of the stage snapshot (AII-960)
+
+`run-autonomous.ts` `prepareConfiguredRun` is the one place a runner turns a configured envelope into executors. `runAutonomous` (managed), `runAutonomousLocally` and `runKgRefresh` all call it first, before the branch, planning fetch, clone, hooks or any model work. A run is *configured* when it carries `agentConfig`, a `credentials.modelAuthGrant`, or (local) an injected `configured.localCredentialPort`/`modelAuthClient`; a snapshot without a grant, or a grant without a snapshot, is invalid, never legacy. With none of them the run is the legacy run and `opts.llmExecutor` is passed through as the same object.
+
+- **Validation, all before backend work:** snapshot re-validated; grant opened with `acceptModelAuthBootstrap` / `openSealedModelAuthBootstrap` against the *launcher's* `AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID`, `_PROJECT_KEY`, `_BACKEND` (plus `_PROTECTION_KEY` for the sealed form and `_URL` for the transport) and the snapshot's own id; the grant's bindings must match every stage's profile id, revision and auth mode. Failures are `ConfiguredRunError` with a fixed message (`reason` is one of a closed set) and never echo the grant. Injection (`opts.llmExecutor`, `configured.modelAuthClient`) cannot skip any of this.
+- **One client per run:** the client is created once, profiles are checked out lazily on first use (never for an unused stage), and `createStageExecutor` receives only `invoke`. Callers must pass an explicit `agentStage`; nothing is inferred from the diagnostic `stage` label.
+- **Precedence:** a configured run's context `model` comes from the implementation stage selection, overriding `WORKFLOW.md`, `opts.model` and `CLAUDE_MODEL`. The context `provider` stays a legacy label narrowed to `anthropic | bedrock` (legacy readers branch on it), so an `openai` stage reads as `anthropic` there. The PR footer does not use it: it reads the snapshot's implementation stage for harness (`Claude Code` or `Codex`) and provider. Legacy precedence is unchanged.
+- **Cleanup:** after teardown the run calls `finish("completed" | "failed")`, which finishes each `ready` profile and disposes the client. If any invocation raised a recovery-required, possibly-live-child or uncertain-checkpoint error, or a profile is not `ready`, nothing is finished or disposed: ownership and credential state are retained (backend release stays with the managed-dispatch owner contract, AII-958).
+- **KG:** the kg-refresh pipeline has no agent step and ingest is deterministic (zero model calls). A configured envelope that fails to decode throws instead of using the environment fallbacks; only the context executor is wrapped. An envelope with no snapshot/grant signal keeps the warn-and-continue behaviour.
+
+### Planning runner use of the stage snapshot (AII-961)
+
+The planning writer of `agentConfig` is `launchPlanningSession` (`src/planning-launch.ts`), reached from both the poll loop and the Restate `PlanningRun` workflow. For a configured project it passes `managedAuth` to `dispatchSession`, embeds the decision's snapshot in the planning envelope, seals the grant (Fly `protectedModelBootstrap`, local `protectedModelAuth`), drops `AI_IMPLEMENT_RUN_CONFIG` from `extraEnv` and sends no Anthropic credentials; it skips the Anthropic-key precheck only for such a project. A missing bootstrap, callback URL or a repository image override throws before `markLaunchAttempted`. `preparePlanningLaunch` (GitHub Actions) prepares a configured project after admission and before any lookup or token mint; a refusal is one `markPlanningFailed`, a breaker count of the refusal code, and a value-free throw that both callers treat as a non-launch.
+
+`run-planning.ts` reuses the same `prepareConfiguredRun` (no second resolver): `runPlanning` (managed) calls it with the process env and the envelope's `agentConfig`, `runPlanningLocally` with `env: {}` and `opts.agentConfig` / `opts.configured`. A configured run then calls `configured.createExecutor({ legacy: guardedClaudeExecutor })` and invokes it once with `agentStage: "planning"`, `stage: "plan"`, the snapshot's model and `invocationTimeoutMs`; `CLAUDE_MODEL`, `opts.model` and the `PLANNING.md` model are not consulted. The `PLANNING.md` body, `${PARENT}/${SIBLINGS}/${DEPENDENCIES}` substitution and envelope `planningContext` still build the prompt.
+
+- **Production entry takes no options.** `runPlanning()` finds its snapshot and protected grant in the envelope and its dispatch context in `AI_IMPLEMENT_MODEL_AUTH_*`. A snapshot with no grant is `bootstrap_missing`; a grant with no snapshot is `snapshot_incomplete`. The local default entry has no credential source, so a snapshot there fails closed (`bootstrap_missing`) until the caller passes `configured.localCredentialPort`.
+- **Invalid configured intent is judged first.** A present envelope that shows configured intent (`agentConfig` or `credentials.modelAuthGrant`) but does not decode reports `Configured planning failed (invalid_snapshot)` through the normal result callback, before any `ISSUE_*` env lookup, prompt, write-policy, auth or model work, and never uses the legacy executor. A malformed envelope with no such signal keeps the legacy env fallback.
+- **Claude write policy is preserved.** The guarded `ClaudeCliExecutor` (trusted `--tools Read,Glob,Grep,Write`, `--settings` hook inserted before `-p`) is the `legacy` handed to `createExecutor`, which uses it for Claude stages; the policy directory is removed in a `finally`. Codex planning uses its native driver and receives no Claude flags or policy.
+- **Lifecycle ownership.** Managed planning owns the client: after the executor returns (child stopped) it calls `finish("completed" | "failed")`, which holds instead when a child may be live or a checkpoint is uncertain. `runPlanningLocally` finishes a client it built from a credential port; an injected `configured.modelAuthClient` stays with the caller.
+- **Safe failures.** Only a bounded category reaches `failureReason` / `diagnostics` (`Configured planning failed (<category>)`); there is one invocation and no retry on another profile. Success still requires a readable Markdown file under `ai-output/comments`.
+
+### Verifying masking in real Actions logs (AII-984)
+
+`workflow-token-masking.test.ts` runs the bootstrap under `sh`, where `::add-mask::` is inert, so it proves delivery and validation but not log masking. `.github/workflows/private-envelope-smoke.yml` (not a synced template; sync never distributes it) proves masking on the real runner. It triggers on `pull_request` into `ai-implement/feature/**`, so a feature PR (including a child PR into `ai-implement/feature/aii-680`) verifies itself with no default-branch deployment. It holds only `contents: read` (verifier also `actions: read`), references no secret, uploads no artifact and makes no model, AWS or tracker call.
+
+| Job | Role | Expected result |
+|---|---|---|
+| `private-envelope-implement` | Canonical `claude-implement.yml` bootstrap; delivers result, progress, publication | `success` |
+| `private-envelope-plan` | Canonical `claude-plan.yml` bootstrap; delivers result, progress only (planning publication exclusion) | `success` |
+| `private-envelope-failure` | Implementation bootstrap, then a deliberately failing trusted consumer (`continue-on-error`, so the check stays green) | `success` |
+| `private-envelope-verifier` | Runs after all three (`if: always()`), reads their complete logs | `success` |
+
+`scripts/check-private-envelope-gha-logs.mjs` extracts the `id: bootstrap` run block and the Run step's `steps.bootstrap.outputs.*` env mapping from `workflows/claude-*.yml` at run time (it fails if the step is missing; no jq or mask logic is copied). Each consumer job builds a synthetic event inside the process — encoded `run_config`, result/progress/publication/attempt tokens, a plain grant bearer or sealed grant nonce/ciphertext/tag, and hostile public `run_*` inputs that must be ignored — derived from the run id so the verifier can rebuild them independently. The values never appear in step `env`/`with`/`run` text before the masks register. The bootstrap's stdout goes straight to the runner; the job then prints every value after masking (the log must show `***`), maps the outputs into a trusted consumer env exactly as the Run step does (the header prints masked, the consumer compares exact values and prints fixed `PROOF ...` markers), runs an untrusted step that must see no callback env, no grant promotion, and finally the failing consumer.
+
+The verifier cannot use a running job's own log, so it waits (bounded) for the consumer jobs, requires each `needs.*.result` to equal its expectation (a skipped job or an unexpected success fails), fetches each job's complete log via `actions/jobs/<id>/logs` with bounded retries, and fails on: an unavailable or incomplete log (no cleanup end marker), any raw synthetic value, a missing or out-of-order proof marker, a `MISMATCH` proof, or a missing/duplicate job. Failure messages name labels only, never values. `--self-test` proves each of those paths fails (exposure of every value, truncated/empty/cut logs, each missing marker, wrong or missing consumer proof, skipped/cancelled/missing jobs, wrong conclusion, unbounded retry) and also checks the workflow's shape (triggers, permissions, no secrets or artifacts, trusted env matching the canonical Run step).
+
+Run it locally with `node scripts/check-private-envelope-gha-logs.mjs --self-test` (needs `npm ci`, `jq`, `openssl`). To run it on Actions, open or update a PR targeting `ai-implement/feature/<key>`; the `private-envelope-smoke` workflow starts automatically.
+
+**Evidence required before the parent (AII-680) is completed:** record in the PR description or the parent ticket the actual run URL and attempt, the four job IDs with their conclusions, the verifier's `OK <job> job=<id> ... checkedValues=<n>` lines (also in the run's step summary), and the local `--self-test` result. Source review alone is not evidence. If the end-of-log marker or a log format assumption fails on the first real run, fix the checker; never relax it to pass.
+
 
 ---
 
@@ -75,12 +322,24 @@ Field notes:
 
 Before every dispatch the orchestrator calls `resolveWorkflowCapabilities` (`src/workflow-probe.ts`; `resolveWorkflowContract` remains the backward-compatible contract-only wrapper). The probe:
 
-1. Fetches `https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflowFile}` from the **default branch**.
-2. Base64-decodes the YAML and detects the required `run_config` input plus optional capability inputs such as `run_publication_token`.
-3. Returns the envelope/legacy contract and optional capability bits. Publication credentials are minted and dispatched only when the target explicitly advertises support.
-4. On any fetch error (network failure, 404, non-200, malformed JSON) returns `"legacy"` and logs a warning — fail-safe.
+1. Fetches `https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflowFile}` from `ref` — the branch the actual `workflow_dispatch` will target, so the contract check agrees with the dispatch it gates. Every current call site passes `mapping.defaultBranch` for both the probe's `ref` and the dispatch's own `ref` (`dispatchWorkflow` always dispatches against `mapping.defaultBranch`, even for a feature-branch child whose run then checks out a different branch via `run_config.baseBranch`), so in practice this reads as "the default branch" — but the parameter, not a hardcoded branch, is what the probe and the dispatch actually agree on.
+2. Base64-decodes the YAML and detects the required `run_config` input plus optional capability inputs: `run_publication_token` (`RUN_PUBLICATION_TOKEN_RE`) and, identically, `run_attempt_token` (`RUN_ATTEMPT_TOKEN_RE`) — see "Attempt correlation" below.
+3. Returns the envelope/legacy contract plus both capability bits, `supportsRunPublicationToken` and `supportsAttemptCorrelation`. Publication credentials are minted and dispatched only when the target explicitly advertises support; the same principle applies to attempt correlation once a consumer sends it.
+4. On any fetch error (network failure, 404, non-200, malformed JSON) returns `"legacy"` with both capability bits `false`, and logs a warning — fail-safe.
 
-Results are cached in-process per `owner/repo/workflowFile` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`). A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
+Results are cached in-process per `owner/repo/workflowFile/ref` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`) — `WorkflowCapabilities` as a whole is the cached value, so `supportsAttemptCorrelation` shares the same cache entry, key, and TTL as the contract and `supportsRunPublicationToken`; there is no separate probe or cache for it. A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
+
+---
+
+## Attempt correlation: `supportsAttemptCorrelation` and `run_attempt_token`
+
+`WorkflowCapabilities` carries a `supportsAttemptCorrelation` bit, detected the same way as `supportsRunPublicationToken`: the probe regex-matches a `run_attempt_token:` input declaration in the fetched YAML; it does not parse the YAML structure. The bit is `true` only when the contract itself resolved to `"envelope"` and the regex matched; a `"legacy"` result (or any probe failure) forces it `false` regardless of what the YAML contains.
+
+The implementation template now declares the optional, secret-free `run_attempt_token` input (AII-782), and its synced `.github/workflows/claude-implement.yml` copy is identical. A target repo must re-sync the template before its probe can advertise support; until then that target still reports `supportsAttemptCorrelation: false`. Re-sync is part of the later manual pilot, not this source change. The five-minute probe cache applies after re-sync.
+
+**The probe bit is a template capability marker, not an attempt identity.** It answers "does this target's declared workflow support attempt correlation." For an individual pilot run, the top-level `run_attempt_token` value is the exact `attemptId` shown in the GitHub run name; the authoritative scoped identity travels in `run_config.reviewFix` (`ReviewFixMetadataV1`, AII-776; shape in the `RunConfigV1` schema above: `attemptId`, `installationId`, `repository`, `prNumber`, `deadlineAt`). The workflow validates that both values match before printing the envelope or running the pipeline. An explicit pilot marker with a missing, malformed, or mismatched top-level input fails closed; a Legacy run omits `reviewFix` and leaves the optional input empty.
+
+The capability bit and a run's metadata remain separate: a repo may support the input while a Legacy dispatch uses neither field. AII-793 will use the capability probe when wiring pilot dispatch; `decodeRunConfig` still validates `reviewFix` on its own terms, while this workflow checks the display input against it.
 
 ---
 
@@ -98,7 +357,7 @@ Results are cached in-process per `owner/repo/workflowFile` key for **5 minutes*
 1. **Open the orchestrator admin UI** at `/admin` → Projects.
 2. Find the repo row and click **Sync workflows**.
 3. The sync opens a PR in the target repo titled something like `chore: sync AI-Implement workflow templates`. Review and **merge it**.
-   - The PR replaces the existing `claude-implement.yml` with the 8-input envelope version.
+   - The PR replaces the existing `claude-implement.yml` with the 9-input envelope version.
    - It **removes** `.github/workflows/comment-trigger.yml` (if present) — `/ai-implement` comments are now handled by the orchestrator webhook.
    - `claude-plan.yml` is updated alongside.
    - `WORKFLOW.md` and `PLANNING.md` are left untouched if they already exist.
@@ -111,6 +370,12 @@ To revert to the legacy contract, revert the sync PR. The probe detects the abse
 ### Verification
 
 After the sync PR merges, trigger a test dispatch (add the `AI-Implement` label to a test issue). In the GitHub Actions run, the "Run pipeline" step should show `AI_IMPLEMENT_RUN_CONFIG` in the environment rather than the legacy `ISSUE_ID`, `ISSUE_TITLE`, etc. variables.
+
+---
+
+## Input allowlist guard (AII-680)
+
+Each synced workflow's `workflow_dispatch` inputs are pinned exactly, with a reason per input, in `src/__tests__/workflow-input-allowlist.test.ts` and [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). The same test checks canonical/synced byte identity and scans diagnostic and forwarding steps for envelope or credential leaks, with negative fixtures. Adding an input means changing both the test contract and the ADR. `provider` and `aws_region` are retained top-level nonsecret inputs. Rollout evidence (run 36867304479) and the future sync gate are recorded in the ADR; no sync has been performed.
 
 ---
 
@@ -132,3 +397,109 @@ The `v` field in `RunConfigV1` is a version discriminant. The current version is
 - **Removing or renaming a field** that existing runners read requires a new version (`v: 2`) and a dual-decode path until all runners are updated.
 - **Changing the semantics** of an existing field in a breaking way requires a version bump.
 - The version is validated on decode; any unsupported version throws immediately with a clear error (`"unsupported run_config version: N"`).
+
+### Managed GitHub Actions dispatch (AII-1420)
+
+A configured project dispatches on GitHub Actions only when `prepareManagedDispatch` returns `launch`, which requires the default-branch workflow to carry `ai-implement-capability: stage-agent-config-v1` and neither retired trigger to exist. `createModelAuthRuntime` reads those files with `getDefaultBranchFileText` and a token scoped to the one repository; a 404 is an absent file and any other failure is `delivery_unreadable`. The same reader backs admin readiness, which stays read-only.
+
+The four GitHub Actions writers (implementation `dispatchGitHubActions`, planning `preparePlanningLaunch`, comment gap-fill, legacy review-fix) call it after admission and before any run token is minted, pass the stored snapshot as `agentConfig` (`EnvelopeDispatchOpts.agentConfig`) and the one-shot bootstrap as `credentials.modelAuthGrant` (`ghaManagedCredentials`), and keep `assertPrivateTransportForCredentials` as a second, independent gate on `supportsPrivateRunConfig`. Neither the grant nor its bearer reaches a log, a refusal text, a journal row or a top-level input. A post-prepare failure or a rejected dispatch revokes the grant and releases the admission; an uncertain outcome (5xx, thrown error) revokes the grant but keeps the admission for reconciliation. `claude-subscription` launches from a stored setup-token resolved through a protected-secret reference, without reserving an account (ADR 049); a missing token refuses with authentication-required `session_unavailable`. The Restate review-fix admission (`canAdmit`) admits a configured project on GitHub Actions only after exact-ref capability and read-only readiness proof (AII-1444); Fly and local Docker require backend prerequisites and managed model-auth readiness before admission.
+
+### Independent model-auth context for GHA (AII-1427)
+
+The runner compares the grant against trusted launcher values (`AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID`, `_PROJECT_KEY`, `_BACKEND`, `_URL`); the grant never supplies its own. Fly and local launchers set them directly. For GitHub Actions the dispatcher writes `credentials.modelAuthContext` beside the grant in the protected envelope: `{version: 1, dispatchId, projectKey, backend: "gha", modelAuthUrl}`. Values come from the `launch` decision (the dispatch request) and the configured `runnerCallbackBaseUrl`, built by `ghaManagedCredentials(decision, callbackBaseUrl)` — never from the grant. A missing or unsafe base URL (anything but a plain `https://host[:port][/path]`) throws before the bootstrap is taken, so the dispatch fails and the grant is released.
+
+Validation is strict (`parseModelAuthContext`, mirrored in the workflow `jq`): known fields only, version 1, bounded ids, backend `gha`, no userinfo/query/fragment, and a real HTTPS authority (port 1-65535, IPv4-shaped hosts must be four octets of at most 255; `isValidModelAuthUrl` in TypeScript, the same checks in `jq`). A GHA envelope that carries `modelAuthGrant` must also carry `modelAuthContext`: the bootstrap step fails with the fixed error, emits nothing and the Run step never starts. Envelopes with no grant (Legacy callback-only) are unaffected. The bootstrap step masks the values and emits them as step outputs; only the Run step maps them to the env vars above, never `$GITHUB_ENV`, and `process-env.ts` strips the `AI_IMPLEMENT_MODEL_AUTH_` prefix from hook and model children. The context is encoded only by `encodeTrustedRunConfig`; the generic encoder and diagnostic projections omit it. Writers: implementation, planning, manual gap-fill and legacy review-fix.
+
+`credentials.executionPolicy` (AII-1437) travels in the same protected namespace, beside `modelAuthContext`, as `{version: 1, implementationSandbox: "ephemeral-full-access", dispatchId, projectKey, backend: "gha", ephemeralRunnerAsserted: true}` (`parseExecutionPolicy`, mirrored in the workflow `jq`). It is valid only with a `modelAuthContext` carrying the same dispatch id, project key and backend, and only the implementation workflow (capability `github-hosted-execution-policy-v2`) accepts it; `claude-plan.yml` rejects the key. The generic encoder, generic decoder and `diagnosticProjection` never emit or return it (diagnostics list the field name only). See [execution-backends.md](execution-backends.md#ephemeral-full-access-for-codex-implementation-aii-1437).
+
+### Stored fallback models
+
+Configured stage defaults and project overrides accept an optional `fallbackModel`
+(non-empty string or `null`). A non-null project value wins; null restores
+inheritance. A fallback must differ from the resolved primary model and shares the
+stage's account profile. The resolved admin route includes `values.fallbackModel`
+and `sources.fallbackModel` (null when absent).
+
+Operators edit the orchestrator default in the "Fallback model" column of the
+Orchestrator stage defaults card on Models & providers. A project override is edited
+on the project dialog's Agents tab: choose Inherit or override the value. Inherit saves
+`null`.
+
+Preparation freezes these values in `resolved_config_json.fallbackModels` alongside
+the stages and profiles, and returns them separately on its ready result. Retries
+reuse the dispatch's stored values; old rows have no fallbacks. The five-field
+snapshot selections and source maps are unchanged. The envelope delivers the values in
+`run_config.modelFallbacks`, and the runner uses them as described in
+[Pipeline architecture](pipeline-architecture.md). Before reverting to code that predates this field,
+clear fallback models from every stored configuration.
+
+
+The optional `run_config.accountFallbacks` carries the ordered account fallback
+lists frozen in `resolved_config_json.accountFallbacks`. Each stage maps to an
+array of complete entries: `{accountProfileId, profileRevision, agent, provider,
+authMode, model}`. Preparation returns the stored list unchanged on reuse and
+`managedRunConfigFields` copies it into every managed launch envelope. Absent or
+empty lists mean no fallback accounts; the snapshot schema is unchanged. The
+strict copier rejects unknown stages, missing fields and extra keys with the fixed
+error `invalid run_config.accountFallbacks`, without echoing input values. Older
+runners ignore the new optional field.
+
+The same credential grant binds the chosen profile and every fallback profile for
+each stage, within the 16-binding cap. Preparation trims fallback tails across
+stages to fit the cap while preserving each chosen account and fallback prefix.
+Preparation checks credential readiness only for the chosen profile;
+fallback credentials are issued only on checkout. The model-auth server authorizes
+fallbacks from the frozen row's provider, revision and auth mode after checking the
+grant binding. No credential values or credential references enter this list.
+The runner forwards it to stage executor options. Implement and review switch to
+the next account when an account reaches its usage limit; exhausted accounts stop
+the stage, preserving partial work for a draft PR when available.
+
+
+### Review-fix machine result contract
+
+The optional review-fix marker field `executionBackend` accepts only
+`fly-machines` or `local-docker`; absence preserves the GitHub Actions wire
+shape. GitHub results require positive safe integer `githubRunId` and
+`githubRunAttempt`. Machine results carry the backend tag and `outputCommit`
+without either GitHub ID. Mixed shapes fail validation. Every result requires
+a full lowercase 40-character output commit SHA.
+
+`resultMatchesExecution` correlates GitHub IDs or matching machine backend tags.
+For machines, origin proof is the attempt-scoped result token plus launch-once,
+rather than a machine/container ID. This contract does not enable machine result
+production, intake admission, or publication. An old Fly/local runner drops the
+backend tag and, without GitHub IDs, reports no result; approval ends as
+`not_applicable` (fails closed). An old orchestrator with a newer runner retains
+the unchanged GitHub shape; machine launches remain a later slice.
+
+### Advisory review-only gap-fills
+
+`reviewOnly: { reviewers: ReviewerSelection[]; expectedHeadSha?: string }` selects a single internal review pass
+for an existing `prNumber` with `runnerPhase: "gap-analysis"`. The selection must be
+nonempty. Absent mode preserves the normal implement/fix gap-fill flow. Malformed
+mode fails decoding; it cannot be combined with `reviewFix`.
+
+`expectedHeadSha` is optional and must be a 40–64 character hexadecimal SHA.
+The runner compares it with the current PR head before reading the diff or calling
+reviewers. A mismatch returns a successful skip with `rollupReview.skipReason`
+explaining both heads: no reviewer runs, no PR verdict is posted, and the callback
+files no child or retry. Omitting the field preserves review of the current head.
+The head is still checked again after reading the diff to catch concurrent moves.
+
+GHA envelope dispatch, Fly and local Docker retain this payload. Legacy per-input
+GHA workflows reject the mode before launch. Roll-up reviews on GHA and Fly launch
+only on the runner image paired with the orchestrator deployment
+(`resolveSessionImage(...).source === "default"`). A repository image override
+causes a quiet skip: no run launches and no PR comment is posted. Local Docker is
+always capable because its runner is built alongside the orchestrator. Ordinary
+gap-fills are unaffected by this restriction.
+The runner reads the PR's full base-to-head diff and invokes the selected internal
+reviewers once with read-only tools. It skips installs, repository hooks,
+implementation, fixes, preflight, commit/push, and external-review polling.
+
+It posts one advisory PR verdict comment marked `<!-- ai-implement rollup-review -->`,
+including finding severity, file:line and body (or an incomplete-review verdict on
+reviewer failure). The result carries `reviewOnly: true`. Its callback records the
+terminal dispatch status but writes no findings, dispositions or approval mark and
+never submits `LateExternalReview`. The verdict is not a merge gate.

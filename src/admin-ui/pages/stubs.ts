@@ -85,14 +85,6 @@ export const stubsHtml = [
     ],
   }),
   stubPage({
-    route: "mcp",
-    title: "MCP server",
-    subtitle: "Claude as the primary interface",
-    status: "not-implemented",
-    body:
-      "An MCP server that exposes the orchestrator's data and actions to Claude is not built yet. The plan: phase 1 read-only (issues, jobs, blockers), phase 2 dispatch + retry actions, phase 3 full orchestration with Claude as the operator.",
-  }),
-  stubPage({
     route: "webhooks",
     title: "Webhooks",
     subtitle: "Inbound endpoints + outbound delivery log",

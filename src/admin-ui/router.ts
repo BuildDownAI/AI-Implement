@@ -1,7 +1,14 @@
 export const routerJs = `
 (function () {
+  window.failedPages = {};
+  window.markPageFailed = function (key, err) { window.failedPages[key] = err; };
+
   const inits = {};
-  window.registerPage = function (key, fn) { inits[key] = fn; };
+  window.registerPage = function (key, fn) {
+    inits[key] = function () {
+      try { fn(); } catch (e) { console.error('[admin-ui] page ' + key + ' init failed', e); }
+    };
+  };
 
   function show(route) {
     document.querySelectorAll('[data-page]').forEach(el => {
@@ -10,28 +17,36 @@ export const routerJs = `
     document.querySelectorAll('.nav-item').forEach(el => {
       el.classList.toggle('active', el.getAttribute('data-route') === route);
     });
+    if (window.failedPages[route]) {
+      var section = document.querySelector('[data-page="' + route + '"]');
+      if (section) section.innerHTML = '<div class="page-body"><p style="color:var(--st-fail-fg)">Page failed to load. Check the browser console for details.</p></div>';
+      return;
+    }
     if (inits[route]) { inits[route](); inits[route] = null; /* once */ }
   }
 
   function readHash() {
     const h = (location.hash || '').replace(/^#/, '');
-    const valid = Array.from(document.querySelectorAll('.nav-item')).map(e => e.getAttribute('data-route'));
-    return valid.includes(h) ? h : 'overview';
+    // auth.js hides the nav items for ungranted pages, so typing the hash gains nothing over clicking.
+    const valid = Array.from(document.querySelectorAll('.nav-item:not([hidden])')).map(e => e.getAttribute('data-route'));
+    if (valid.includes(h)) return h;
+    if (valid.includes('overview')) return 'overview';
+    // A user granted nothing has an empty nav; 'no-access' is the section that explains why.
+    return valid[0] || 'no-access';
   }
 
+  // Held until auth.js knows the role: a page's init runs once, so routing against an unknown
+  // identity renders it wrong permanently.
+  let routing = false;
+
   window.navigate = function (route) { location.hash = '#' + route; };
-  window.addEventListener('hashchange', () => show(readHash()));
-  document.addEventListener('DOMContentLoaded', () => {
+  window.addEventListener('hashchange', () => { if (routing) show(readHash()); });
+
+  /** Called by auth.js once the session identity has resolved, and not before. */
+  window.startRouting = function () {
+    routing = true;
     show(readHash());
-    // One-time fetch so any page (drawer, etc.) can build provider-aware URLs.
-    if (window.api) {
-      window.api('/api/admin/config-status').then(function (res) {
-        if (!res.ok) return res.json().catch(function () { return {}; }).then(function () {});
-        return res.json().then(function (status) {
-          if (status && status.jiraSiteUrl) window.jiraSiteUrl = status.jiraSiteUrl;
-        });
-      }).catch(function () {});
-    }
-  });
+    if (window.openFilesystemIssueFromLocation) window.openFilesystemIssueFromLocation();
+  };
 })();
 `;

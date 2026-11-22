@@ -1,8 +1,8 @@
 # Review-fix rail
 
-How review feedback on an AI-Implement pull request becomes another run. Covers the finding ledger, the four `review_*` tables, the webhook events that feed the queue, the drain loop, and how findings get resolved.
+How review feedback on an AI-Implement pull request becomes another run. Covers the finding ledger, the four `review_*` tables, the webhook events that feed the queue, the dispatch gate that enforces one writer per PR, the drain loop, and how findings get resolved and dispositioned.
 
-This is the reference for `src/review-ledger-store.ts`, `src/review-fix-queue.ts`, `src/pipeline/review-ledger.ts`, `src/pipeline/steps/post-push-review.ts`, and the review-handling half of `src/webhook.ts`. `CLAUDE.md` carries the summary and points here.
+This is the reference for `src/review-ledger-store.ts`, `src/review-fix-queue.ts`, `src/pipeline/review-ledger.ts`, `src/pipeline/finding-dispositions.ts`, `src/pipeline/steps/post-push-review.ts`, `src/dispatch-gate.ts`, `src/dispatch-breaker.ts`, and the review-handling half of `src/webhook.ts` and `src/runner-callback.ts`. `CLAUDE.md` carries the summary and points here.
 
 ## What it does
 
@@ -17,17 +17,58 @@ The second half is the reason the rail exists. Without it, any review posted aft
 
 ## Prerequisites
 
-The post-run half is **entirely webhook-driven**. Three GitHub event subscriptions feed it, and a repo subscribed to none of them silently gets no rail at all — no error, no log line, just a PR that never receives a fix run:
+The post-run half's finding-driven enqueues are **entirely webhook-driven**. Three GitHub event subscriptions feed it, and a repo subscribed to none of them silently gets no rail at all — no error, no log line, just a PR that never receives a fix run:
 
 | Event | Gate | Recorded as |
 |-------|------|-------------|
 | `pull_request_review` | `action=submitted` **and** `state=CHANGES_REQUESTED` | `github-review`, severity `blocking` |
-| `pull_request_review_comment` | `action=created` | `github-review-thread`, severity `medium` |
-| `issue_comment` | author's `user.type == "Bot"` **and** the body contains a `<!-- claude-review-verdict {...} -->` marker | `claude-review-summary`, severity `blocking` or `minor` |
+| `pull_request_review_comment` | `action=created`; only a **bot** author enqueues — a human's comment is recorded but starts no run (see below) | `github-review-thread`, severity `medium` |
+| `issue_comment` | `classifyReviewIssueComment` (`src/pipeline/review-ledger.ts`) accepts `github-actions[bot]` (author `type === "Bot"`) or a login in the project's trusted authors (the review process's authors plus the project's Trusted Review Authors) | `review-contract` (fenced block, source `review-contract`, reason `review_contract`) when present, else `claude-review-summary` prose (reason `claude_review_summary`) |
+
+The `issue_comment` path calls the same `classifyReviewIssueComment` function post-push review uses (`collectClaudeIssueComments` in `src/pipeline/review-ledger.ts`), so both readers share one author rule and one parse order: the fenced `review-findings` contract block first (`extractReviewFindingsBlock`, "The review-findings contract" below), then heading-based prose. A block that parses to an `approve` verdict with no findings is ignored with reason `approved`; a broken/unclosed block, or a well-formed block whose verdict is `incomplete` with no findings, is ignored with reason `findings_unavailable` and logged. Only when no block is present does a trusted-author comment fall back to prose scanning.
 
 `GITHUB_WEBHOOK_SECRET` must be set, and deliveries are rejected 401 on an invalid signature. Note that `pull_request` and `issue_comment` are already needed for merge reconciliation and `/ai-implement` handling respectively — the two review events are the ones easily missed.
 
 Every path additionally requires a **matching dispatch record**: the orchestrator looks up the PR against its own dispatch log, and ignores anything it did not create. Reviews on unrelated PRs in the same repo are not picked up.
+
+### A human inline comment is recorded, not enqueued
+
+The rail collects a human reviewer's feedback and starts one run for it, not one per comment. A human's `pull_request_review_comment` writes its `github-review-thread` finding to the ledger and answers `{ recorded: true, reason: "awaiting_changes_requested", findingId }` without queueing a review-fix row or forwarding to `ReviewFixPR.feedback` — independent of stored lifecycle. Any author whose `user.type` is not `Bot`, including a missing one, takes this path. Each recorded comment logs `[webhook] Recorded human inline comment on PR #<n> as finding #<id>`.
+
+A human starts the fix run in one of two ways, and both read every open finding on the PR, so the recorded comments ride it:
+
+- Submitting the review as **Request changes** (the `pull_request_review` row above). The review-fix drain builds its task from `listOpenReviewFindings`, and a Restate attempt from `unprocessedOpenReviewFindings`, not only from the event that queued it.
+- Commenting `/ai-implement`. The comment gap-fill rail appends the PR's open findings to the comment's instruction ([comment-gapfill-rail.md](comment-gapfill-rail.md#open-review-findings)).
+
+A review submitted as "Comment" or "Approve" queues nothing; its inline comments stay open in the ledger until a Request changes review, a bot finding, or `/ai-implement` starts a run. The same holds for an inline comment that arrives after a run has already been dispatched — GitHub sends the review and its comments as independent deliveries with no ordering guarantee.
+
+The record-only path uses `recordReviewFinding` (`src/review-ledger-store.ts`), not `upsertReviewFinding`. It skips `acceptReviewFixWebhookEvent` and so its delivery-id dedup, so a redelivered or repeated comment must leave the finding's `revision` alone: the Restate attempt filter and the revision-conditional disposition helpers key on it. A comment repeating a finding that is already resolved reopens it as a new revision.
+
+Under the `codex-code-review` process a human's comment is `medium`, so it is still ignored as `advisory_finding` before this path and is not recorded.
+
+### Codex Code Review
+
+The `codex-code-review` process is available only with the Restate lifecycle. It trusts `chatgpt-codex-connector[bot]` and the GraphQL login `chatgpt-codex-connector`. Inline intake applies the same current-head bot rule below, then the process's badge classifier: P0/P1 are `blocking` and forward to `ReviewFixPR.feedback`; P2 and untagged comments are `minor` and do not forward. The ledger retains advisory threads as `github-review-thread` findings, classifying the originating Codex finding and keeping the latest reply as context; Codex minor inline findings also stay advisory in the in-run gate and start no fix pass. Claude marker classification and forwarding remain unchanged.
+
+Codex posts no check run. The in-run gate polls paginated issue comments for the newest trusted bot `codex-review-state:v1` JSON comment whose nested `code_review.commit_sha` equals the PR head. Completed with `has_unresolved_findings: false` approves. With `true`, only P0/P1 block: trusted P2-only open badge threads approve with advice. Open means unresolved and not outdated, across all commits, regardless of a comment’s current or original commit ID. A successful thread read with no open Codex badge threads also approves: resolving a P1 thread releases the PR when no other blocker remains. Any open P0/P1 requests changes. If thread state is unavailable or partial, the gate preserves the prior fail-closed rule: only readable trusted P2-only badges on the exact head approve an unresolved state. Running, silence, stale state, and malformed state keep waiting and fail closed at the timeout; failed state is no real verdict. Security-review state and receipt reviews do not supply the code-review verdict. The summary comment is edited in place: `issue_comment` intake still handles creation only, so polling observes edits. LateExternalReview uses the same rule for approval marks, as described below.
+
+### The bot-review rule
+
+Past the matching-dispatch check, `shouldEnqueueReviewEvent` (`src/webhook.ts:998-1035`) gates all three events one more way. A **bot-authored** event (`user.type == "Bot"`) can loop — a bot reviewing the fix run's own push would otherwise enqueue another run — so it enqueues only when it describes the PR's *current* head and no run has started since:
+
+| Condition | Result | Reason |
+|---|---|---|
+| Body contains `<!-- ai-implement` | never enqueues, any author | `self` |
+| Author is not `Bot` | enqueues, except a `pull_request_review_comment`, which is recorded only (see above) | — |
+| Bot author; `commitId` and `headSha` are both present and differ | does not enqueue | `stale_head` |
+| Bot author; the event's timestamp is before the latest dispatch recorded for the PR | does not enqueue | `run_after_review` |
+| Bot author; `commitId` and `headSha` are both undefined, and the event timestamp is also undefined | does not enqueue | `missing_fields` |
+| Bot author; exactly one of `commitId` / `headSha` is defined and the other is undefined | does not enqueue | `missing_fields` |
+| Bot author; none of the above | enqueues | — |
+
+The `self` check runs first and applies regardless of author: any event body containing `<!-- ai-implement` is the rail's own output (see "The rail does not ingest its own output" below) and never re-enqueues, so the rail cannot feed on its own comments. See [ADR 027](adr/027-a-bot-review-starts-a-fix-run-only-for-the-current-unread-head.md).
+
+`missing_fields` behaves differently per event type, because only two of the three callers pass real head data. `pull_request_review` and `pull_request_review_comment` events pass the review's/comment's `commit_id` and the PR's current `head.sha` (`src/webhook.ts:612-618`, `676-682`), so a partial pair — one present, one not — is the realistic way to land on the second `missing_fields` row. `issue_comment` events always pass `commitId: undefined, headSha: undefined` (`src/webhook.ts:950-951`), landing on the first row instead — and GitHub always supplies `comment.created_at`, so `eventAt` is normally defined and that row does not fire either. In practice, a trusted bot's `issue_comment` event is gated only by `self` and `run_after_review`; `missing_fields` is reachable there only if the comment timestamp itself fails to parse (`parseEventTimestamp` returns `undefined` on a malformed value).
 
 ## Finding identity
 
@@ -35,29 +76,75 @@ A finding's identity is a SHA-256 over its source, path, line, and **normalized*
 
 Two consequences worth knowing:
 
-- The same finding reported repeatedly collapses to one row, with `last_seen_at` advancing. Re-reporting a **resolved** finding reopens it — the upsert sets `status = 'open'` and clears `resolved_at`.
+- The same finding reported repeatedly collapses to one row, with `last_seen_at` advancing. Re-reporting a **resolved** finding reopens it — the upsert sets `status = 'open'` and clears `resolved_at`. Re-reporting a **deferred** or **rejected** finding does not: the upsert leaves those rows alone (status and `resolved_at` both), so a fixing agent's follow-up deferral survives a later run that reports the same finding again.
 - A **reworded** finding is a new finding. A reviewer who rephrases the same objection produces a second row, because the hash covers the body.
 
 Collection additionally dedupes in memory by normalized body before anything is stored, keeping the variant that carries a file and line over one that does not.
+
+### Revisions
+
+Every row also carries a `revision`, starting at 1 on insert (`upsertReviewFinding`, `src/review-ledger-store.ts`). Every re-report of an existing `(repo, pr_number, finding_key)` row reaches the `ON CONFLICT` branch, regardless of the row's current status, and that branch increments the revision by exactly 1 unconditionally — even when the key and body are byte-identical to the previous report, and even when the row is currently `deferred` or `rejected`. There is no "no-op" re-report that leaves the revision unchanged. Only the `status` and `resolved_at` columns are conditional on the current status (a separate `CASE WHEN` preserves `deferred` and `rejected` rather than reopening them); the revision bump is not gated by it. This is a change from the pre-revision behavior described above: the row still collapses to one, but its revision now moves on every accepted repeat, not just on a substantive edit.
+
+The revision exists so a caller can hold a stale snapshot and detect that the finding moved under it. `markReviewFindingResolvedIfRevision` and `markReviewFindingDeferredIfRevision` (`src/review-ledger-store.ts`) each take an `(id, revision)` pair and update only when the row's current revision still matches — a disposition keyed by an older `(id, revision)` is a no-op against the row, and the newer open report (from the re-report that bumped the revision past the caller's snapshot) is left untouched, still `open`, for the next pass to see. This is what protects a fix run's disposition from silently resolving or deferring a finding that was re-reported after the run took its snapshot.
+
+**These conditional helpers have no current caller.** The legacy disposition path (`markReviewFindingsDeferredByKeys`, used from `src/runner-callback.ts`) still dispositions by key alone, unaware of revisions, and is unchanged by their addition. `markReviewFindingResolvedIfRevision` and `markReviewFindingDeferredIfRevision` exist as the contract surface for a later revision-aware pilot consumer, not as something wired into today's resolution or disposition flow.
 
 ## The four tables
 
 | Table | Grain | Purpose |
 |-------|-------|---------|
-| `review_findings` | one row per distinct finding per PR | The ledger. `status` is `open` or `resolved` |
+| `review_findings` | one row per distinct finding per PR | The ledger. `status` is `open`, `resolved`, `deferred`, or `rejected`. A fixing agent that dispositions a finding `follow-up` (ADR 028) moves it from `open` to `deferred` — no longer counted as open, but distinct from `resolved` so it is not silently reopenable by a normal resolve call |
 | `review_fix_queue` | **one row per PR** (unique on `repo, pr_number`) | Work queue; `pending` → `dispatched` / `skipped` / `failed` |
 | `review_fix_events` | append-only, one per enqueue | Audit trail of what triggered each enqueue, with actor and source URL |
-| `review_fix_dispatches` | one per dispatch id | Snapshot of which finding ids a given dispatch is allowed to resolve |
+| `review_fix_dispatches` | one per dispatch id | Snapshot of which finding ids a given dispatch is allowed to resolve (a finding in it resolves only with a `fixed` disposition) |
 
 The queue's one-row-per-PR grain is deliberate. Enqueuing coalesces: a second event for a PR already queued updates the existing row rather than adding another, and if the new reason differs from the stored one the reason becomes `multiple`. Three reviewers commenting in quick succession produce one fix run, not three. The `review_fix_events` table is what preserves the individual triggers, since the queue row itself is overwritten.
 
-## Severity, and why an inline comment does not block
+## Webhook intake: forward every mapped repository to Restate (AII-1773)
+
+Restate is mandatory; project setup offers no lifecycle choice. The retired HTTP `reviewFixLifecycle` input is ignored and stored values are historical metadata. Saving configuration does not certify dispatch readiness.
+
+The three review webhook handlers (`handleReviewWebhook`, `handleReviewCommentWebhook`, and the `claude_review_summary` branch of `handleIssueCommentWebhook`, all in `src/webhook.ts`) share one front half: HMAC check, dispatch match, author and severity rules for the project's review process, and the `shouldEnqueueReviewEvent` gate (`self`, `stale_head`, `run_after_review`, `missing_fields`). A gated event answers 200 `{ ignored, reason }` and goes no further, regardless of repository mapping or lifecycle. `resolveRepoReviewProcess` forwards every mapped repository to Restate, including projects whose stored `reviewFixLifecycle` is `legacy` or unset. Only genuinely unmapped repositories retain the direct SQLite intake path. SQLite queue rows for mapped projects are nudged by the poll drain:
+
+| Repository / ingress | Handler writes SQLite | Forwards | Answers |
+| -- | -- | -- | -- |
+| Unmapped repo | yes, `acceptReviewFixWebhookEvent` | no | 200, `queued` / `duplicate` / `findingId(s)` / `reviewFixId` |
+| Mapped repo, ingress reachable | no | `ReviewFixPR.feedback(event)`, key = delivery id | 202 `{ forwarded: true }` |
+| Mapped repo, ingress unreachable, timed out, or not wired | no | attempted | 503 `{ error: "restate_unavailable" }` |
+| Mapped repo, repeated delivery id | no | yes; Restate returns the first result | 202 |
+| Mapped repo, no `x-github-delivery` header or no `installation.id` | no | no | 400 |
+
+**Unmapped repository (retained Legacy intake).** `acceptReviewFixWebhookEvent` (`src/review-fix-queue.ts`) wraps `upsertReviewFinding` and `enqueueReviewFix` in one transaction and records the event identity `(repo, source_event_id)` before the handler answers, so a restart between the write and the ACK loses nothing and a redelivery is a no-op. `resolveReviewFixEventId` supplies the identity: GitHub's `x-github-delivery` (`gh-delivery:<id>`), else the review or comment id (`gh-object:<kind>:<id>`), else a SHA-256 over the event fields (`synthesized:<hex>`). A thrown database error becomes a 500 in `src/index.ts`, and GitHub keeps the failed delivery. The drain (`processReviewFixQueue`) later picks the queue row up.
+
+**Mapped repository (Restate).** The handler writes nothing. It truncates each finding body and the reason to `REVIEW_FIX_EVENT_BODY_MAX_BYTES` on a UTF-8 boundary, then calls `createReviewFixIngressClient(...).feedback(scope, event, { idempotencyKey: deliveryId })` over the loopback ingress (`src/restate/review-fix-client.ts`). The object key is `reviewFixPRKey({ installationId, repository, prNumber })`, with `installationId` taken from the payload's `installation.id`. `ReviewFixPR.feedback` validates the event and projects it into `review_findings` and `review_fix_queue` inside its own journaled `record-feedback` step, so the journal is the first record and SQLite is its projection. There is no inbox row, no queue, and no retry loop in the route.
+
+An unreachable ingress answers 503 rather than falling back to SQLite: a half-written event with no Restate record is the state the journal rule forbids. GitHub keeps the failed delivery and redelivers it under the same `x-github-delivery` id (AII-1178), and Restate absorbs a duplicate by idempotency key. The route logs `[webhook] review event <delivery id> forwarded to ReviewFixPR <key>` on success and `[webhook] restate_unavailable: ...` on failure.
+
+The ingress client never throws: a connection error, a timeout, and a non-2xx all resolve `unavailable`.
+
+The internal automatic producers (`guardOpenPrBeforeImplementationDispatch` for `open_pr`, `handleLeaseRejectedFailure` for `lease_rejected`) still use `acceptReviewFixWebhookEvent` directly, and the drain's periodic nudge calls `createReviewFixIngressClient(...).feedback(scope, undefined, { idempotencyKey: "<queue id>.<event id>.<30 s bucket>" })`; an `unavailable` result is logged and the next tick retries. `/ai-implement` (`enqueueCommentGapfill`, `src/comment-gapfill-queue.ts`) uses a separate queue.
+
+## Source, severity, and why an inline comment does not block
 
 Severity is `blocking`, `medium`, or `minor`, and the rule for deciding it is the subtlest part of the rail.
 
-**A reviewer's latest formal verdict is authoritative.** Only reviewers whose most recent actionable review is `CHANGES_REQUESTED` contribute blocking findings. Unresolved inline threads authored by someone who has since approved are recorded as `medium` — non-blocking context. Without that rule, a stale nit thread from an approving reviewer would keep the PR blocked forever.
+Minor findings are advisory for every source and review process. For non-minor findings, merge gating retains the source rules below; `review-contract` also reads the contract verdict:
 
-The `pull_request_review_comment` webhook records `medium` for the same reason from the other direction: that event carries no parent review state, so an inline comment alone cannot be assumed to block. A genuine changes-requested verdict arrives separately via `pull_request_review` and records the blocking finding itself.
+| Source | Gates a merge? |
+|---|---|
+| `review-contract` | When `blocking`, or when `medium` and the contract verdict is not `approve` (`reviewContractFindingGates`) |
+| `github-review` | Yes |
+| `github-review-thread` | Yes, when collected from a reviewer whose latest formal verdict is `CHANGES_REQUESTED` |
+| `ai-implement-internal` | Yes |
+| `claude-review-summary` | No by default — advisory only, unless the project reviewer selection includes `{ id: "claude-review-summary", gates: true }` |
+
+**Summary headings.** A heading that starts with 🔴 is a `blocking` finding and one that starts with 🟡 is `minor`, in both summary parsers (the trusted `claude[bot]` heading scan and the `github-actions[bot]` "Claude finished" shape). The marker mapping is `classifyClaudeInlineMarker` (`src/review-process.ts`), checked before the word rules; 🟣 and untagged headings fall through to those rules. Under the `claude-code-review` and `claude-code-review-repository-fix` processes (the definition's `summaryBlockingGates`) a `blocking` `claude-review-summary` finding gates the in-run approval even without a reviewer selection (`isReviewLedgerFindingGating`'s `summaryBlockingGates`), so a green review check with no inline comments cannot approve past a 🔴 section; `minor` and `medium` summary findings stay advisory. The gate goes through the external-findings path, not `claudeCodeReviewVerdict`. The ledger and the late-review workflow see the same finding.
+
+A `review-contract` finding gates when it is `blocking`, or when it is `medium` and the verdict is not `approve`. A `minor` finding is advisory even under `changes_requested` or `incomplete` (`reviewContractFindingGates`, `src/pipeline/review-ledger.ts`). A completed negative verdict whose own findings are exclusively minor is advisory; incomplete verdicts, empty negative verdicts, and aggregate blocking severity counts remain independent approval safeguards. A `blocking` `claude-review-summary` finding is advisory by default because it came from scraped prose. PR comments split those lists: gating findings stay under "Unresolved external review findings", while prose-only findings are shown under an advisory heading that says they do not block the merge.
+
+**A reviewer's latest formal verdict is authoritative.** Only reviewers whose most recent actionable review is `CHANGES_REQUESTED` contribute blocking findings. Unresolved inline threads authored by someone who has since approved are recorded as `medium` advisory context unless their reviewer still has a changes-requested verdict. Without that rule, a stale nit thread from an approving reviewer would keep the PR blocked forever.
+
+Under the default AI-Implement process, the `pull_request_review_comment` webhook records `medium` for the same reason from the other direction: that event carries no parent review state, so an inline comment alone cannot be assumed to block. A genuine changes-requested verdict arrives separately via `pull_request_review` and records the blocking finding itself.
 
 Unresolved threads are collected via GraphQL with pagination, and a thread is only collected when it is both **unresolved and not outdated**.
 
@@ -68,19 +155,107 @@ Findings are collected from bot comments, and the rail itself posts bot comments
 - Any comment body containing `<!-- ai-implement` is skipped during collection.
 - A review whose body carries the native-review marker, or begins with `AI-Implement post-push review`, is ignored at the webhook.
 
-Trusted comment authors are an explicit allowlist (`ai-implement`, `claude`, and their `[bot]` forms), so an arbitrary bot commenting on a PR cannot inject findings.
+Trusted comment authors come from the project's review process (`src/review-process.ts`, ADR 038) plus the project's `trustedReviewAuthors`, through `isTrustedReviewAuthor`. The webhook reads both from the project mapping; the in-run ledger receives them as the `{ process, extraAuthors }` options argument, defaulting to the `ai-implement` process. The built-in authors stay trusted whatever the extra list holds, and `webhook.ts` and `review-ledger.ts` hold no author list of their own.
+
+Inline-comment severity follows the process. `ai-implement` keeps `medium` for every inline webhook comment. `claude-code-review` and `claude-code-review-repository-fix` (the definition's `classifyInline` classifier) classify a trusted bot's comment by its leading marker: 🔴 `blocking`, 🟡 or untagged `minor`, and 🟣 is skipped (the webhook answers `{ ignored: true, reason: "pre_existing" }` and stores nothing). Under that process a bot that is not trusted is ignored (`untrusted_author`). A human's inline comment is always `medium` and is recorded without enqueueing (see "A human inline comment is recorded, not enqueued"), and a CHANGES_REQUESTED author's thread stays `blocking` whatever its marker.
+
+**An approve verdict with only non-gating findings starts no fix run.** In the `issue_comment` summary path, when the `review-findings` block's verdict is `approve` and no finding gates under `reviewContractFindingGates` (`src/pipeline/review-ledger.ts`; only `blocking` gates under `approve`), the webhook answers `{ ignored: true, reason: "approved" }` before any queue entry, `ReviewFixPR.feedback` forward, or ledger row. A `blocking` finding under `approve`, or any finding under `changes_requested`, still enqueues. The inline-comment rail above is unchanged: a trusted bot's 🟡 `minor` inline comment still queues a fix.
+
+**The in-run gate's inline fallback honours thread state.** Under `claude-code-review`, when the resolution-aware thread list is empty but the check-and-comments verdict is `changes_requested`, the gate falls back to the REST inline findings. Those carry no thread state, so `collectClosedReviewThreadCommentUrls` (`src/pipeline/review-ledger.ts`) reads the review threads and the gate drops each finding whose comment URL sits on a resolved or outdated thread. If no blocking finding remains, the verdict is treated as `approve`. A failed thread read keeps every finding, so the gate stays blocked.
+
+## The review-findings contract
+
+`extractReviewFindingsBlock` (`src/pipeline/review-ledger.ts`) reads a machine-readable verdict from a reviewer comment. It has precedence over heading-based prose extraction and returns early when it finds a fenced block, so a comment that carries one is never also scanned for prose.
+
+The contract is a fenced code block, not an HTML comment — `anthropics/claude-code-action` strips HTML comments (`stripHtmlComments()`) from every comment it posts before the comment is created, which is why the predecessor `<!-- claude-review-verdict {...} -->` marker never once arrived across PRs 543–557. A fenced block survives that transform:
+
+````
+```json review-findings
+{
+  "schema": "review-findings/v1",
+  "verdict": "approve" | "changes_requested" | "incomplete",
+  "findings": [
+    { "severity": "blocking" | "minor", "body": "...", "path": "src/x.ts", "line": 12 }
+  ]
+}
+```
+````
+
+`schema` and `verdict` are required; `findings` defaults to `[]`. In a finding, `body` is required, `path` and `line` are optional. `schema` must be exactly `review-findings/v1` — any other value (including a plausible-looking future version) is rejected rather than parsed as v1, so a field whose meaning changes between versions is never read under today's semantics. Every finding from this parser is tagged `source: "review-contract"`; `ReviewLedgerFinding` gets no new field for it. The collector returns the parsed `verdict` with `verdictSource: "review-contract"` so post-push review can fail closed on a structured non-approve verdict even when the block has no findings.
+
+Every state the parser can be in, and its result:
+
+| Comment state | Findings returned | `verdict` | `findingsUnavailable` |
+|---|---|---|---|
+| No block present | none | `undefined` | `false` — falls back to prose extraction |
+| One valid block | its findings | its verdict | `false` |
+| Block present, JSON does not parse | none | `"incomplete"` | `true` |
+| Opening block fence present without a closing fence | none | `"incomplete"` | `true` |
+| Block present, JSON parses but fails the schema | none | `"incomplete"` | `true` |
+| `schema` is not `review-findings/v1` | none | `"incomplete"` | `true` |
+| More than one block in one comment | the last block's findings | the last block's verdict | `false` |
+
+A broken block, including an opened `review-findings` fence with no closing fence, sets `findingsUnavailable` and does **not** fall back to prose extraction — a reviewer that tried to emit the contract and failed is a broken reviewer, not a prose reviewer, and treating it as prose would hide the breakage.
+
+The trust boundary is unchanged: only a comment from an already-trusted Claude author or the GitHub Actions bot (`isVerdictEligibleAuthor`) is even offered to this parser, so a lookalike block from another bot or a human commenter cannot supersede a real review.
+
+**Migration overlap.** For one release, a comment with no fenced block falls back to scanning for the deprecated `<!-- claude-review-verdict {...} -->` marker, so a reviewer mid-migration is not silently dropped. The first comment seen using that legacy form logs a one-time deprecation warning (a module-level flag, not per-comment). Legacy marker findings keep their old `claude-review-summary` source and are advisory by default.
 
 ## In-run: the post-push-review step
 
 The last step of the pipeline. It runs only when the feedback loop approved, something was actually pushed, and a PR number exists.
 
+**It is skipped on gap-fill runs.** The step's `skip` predicate returns early when `ctx.data.prNumber` is already set (`src/pipeline/pipeline-loader.ts:118-121`, `shouldSkipPostPushReview`) — a gap-fill run updates an existing PR and keeps that PR's already-established review flow rather than starting a second post-push review cycle. This is also why a bot review of a review-fix run's own push is never evaluated by this step (see "The bot-review rule" above and ADR 027).
+
+Built-in reviewers return a short `summary` and a `checks` list alongside their
+verdict and findings, including when they approve. Each check names what was
+examined, its result (`passed`, `failed`, `not_verified`, or `not_applicable`),
+and concrete evidence. Gap analysis maps acceptance criteria to implementation;
+code review describes relevant behavior, risks, and validation. Reading a test
+is distinguished from running it, and checks that were not performed are named
+explicitly. These reports appear in the GitHub review and are saved in each
+reviewer step's outputs. The runner sends each report with its reviewed head SHA and iteration to the authenticated
+`POST <callbackUrl>/runner/review-publication` route using the progress token.
+The `PostPushReviewPublication` Restate object posts the GitHub COMMENT review
+with only `ai-implement-internal` findings eligible for inline comments mapped
+to lines in that pass’s diff; external findings remain in the review body. Each inline finding
+carries `<!-- ai-implement review-finding:v1 -->`; findings outside the diff
+are appended to the review body. At most 100 inline comments are sent; excess
+comments join “Findings outside the diff” in the body, labeled as exceeding
+the inline comment limit. If the serialized UTF-8
+request still exceeds 48,000 bytes, the runner sends no inline comments and
+shortens the body to fit, with a note pointing to the full report retained in
+the status comment, split into ordered comments of at most 65,536 characters and 64,000 UTF-8 bytes
+when needed. The runner does not post GitHub reviews directly.
+Every pass with findings posts a review, including passes that start a fix.
+Publication completes before the fix starts, while the reviewed head is current.
+A no-file-changes exit reuses that pass’s publication without posting again.
+The status comment links to the returned review URL instead
+of repeating the checklist. If review publication fails or returns no usable
+link (including a stale head, HTTP error, network failure, or absent callback
+credentials), the status comment retains the full report. The runner logs one
+fallback diagnostic per attempted publication.
+
+Built-in reviewers must return both report fields; a checklist embedded in the
+summary does not satisfy the structured contract. The report fields remain
+optional for compatibility with existing custom reviewers.
+They explain the verdict; actionable defects must still be in `findings` and
+cannot be replaced by report prose. A `not_verified` check records a limitation,
+not an automatic blocker; a required fix or validation gap belongs in findings.
+
 It runs its own LLM review, then **waits for the external review check** on the PR's current head SHA to reach a terminal state — polling every 5 seconds up to a 5-minute budget — before deciding merge readiness. The wait exists because the external review starts at roughly the same moment; reading findings immediately would read an empty snapshot.
 
-**It fails closed.** If the internal review is clean but the external check has not finished within the budget, the step does *not* auto-approve. It posts a comment saying manual review is required and stops. The same applies when the reviewer returns structurally invalid output.
+**It fails closed.** If the internal review is clean but the external check has not finished within the budget, the step does *not* auto-approve. It posts a comment saying manual review is required and stops. The same applies when the reviewer returns structurally invalid output. The internal reviewer itself runs under the retry policy's `reviewMaxTurns` cap (default 30, Settings-configurable; the in-loop reviewer is uncapped): a reviewer that runs out of turns is reported once as `reviewer_turns_exhausted` / `REVIEWER_TURNS_EXHAUSTED` — "the reviewer ran out of turns", never "did not approve" — and a reviewer that fails transiently is retried up to `stageRetries` times before being reported as `provider_unavailable` (see [pipeline-architecture.md](pipeline-architecture.md), "Reviewer turn cap" and "Stage-level retry and provider outages").
 
-Internal issues are deduplicated against external findings so the same problem is not reported twice, and fix passes iterate up to the configured maximum. PR comments carry `<!-- ai-implement post-push iter=N ... -->` markers so repeated passes update rather than duplicate.
+**Only `success` and `stale` count as a finished review.** Every other conclusion means the check finished *without a verdict*, `failure` included: a `review-findings/v1` emitter fails its check only when it has no verdict to post (see [review-findings-contract.md](review-findings-contract.md), "Emitter obligations"), and `claude-code-action` fails only when its own run errors. With a clean internal review, a check that finished without a verdict ends as `invalid_review` through the "external review verdict unavailable" comment, never as approval, even when an older head's approving comment is still on the PR; its feedback points the reader at the PR's checks for the conclusion. Findings the reviewer did post are still read, so a blocking contract finding or a formal `CHANGES_REQUESTED` review still starts a fix pass. A check still running when the budget runs out is the timeout case above.
 
-**External check name matching** uses an explicit name list, not a heuristic. The defaults are `review`, `code-review-plugin`, `claude-review`, and `claude code review`. When no check with one of those names exists for the head SHA, the gate logs a warning listing the names that *were* present and then fails open (so repos without an external review check are not blocked). Configure the exact name for a specific repo with `reviewCheckNames` in `.ai-implement/config.yml`:
+**It fails closed on evidence it never got, too.** A check-runs read that errors (`gh api` non-zero) is reported as *unreadable*, not as "no reviewer", and the loop keeps polling; the head-SHA read (`GET /pulls/{n}`) is retried inside the same loop rather than resolved once before it, since an installation token can expire during the review pass that precedes the wait. Exhausting the budget in either state fails closed. The check-runs read is paginated (`--paginate --slurp`) so a review check beyond the first page is not mistaken for absence. Both settling states — *absent* (fail open) and *no real verdict* (fail closed) — must be seen on two **consecutive** probes: absent because it is the one state that fails open, no-real-verdict because a `cancel-in-progress` run's replacement check appears a moment after the cancelled one. Once a matching check has been seen on a SHA, a later empty read is treated as a read artefact rather than as absence, because check runs are never removed from a SHA. Each distinct condition warns once per wait.
+
+**Not every unreadable check-runs response retries to the timeout, though.** A 403 or a 404 (or the `gh` CLI's own "Resource not accessible by integration" / "(HTTP 404)" wording) means the GitHub App's token lacks **Checks: read**, or the installation hasn't accepted an updated permission set — a condition that will not clear on a later poll within the same run. A 404 is treated the same as a 403 here because every check-runs read is only reached once the same token has already read the owning repo/PR successfully this run, so it is "a repo the token can otherwise see" rather than a genuine not-found. That case skips the retry loop entirely and fails closed at once, reported as `checks_permission_denied` / `CHECKS_PERMISSION_DENIED` with a PR comment and tracker message naming the missing permission, rather than burning the wait budget as an ordinary timeout. A transient read failure (a 5xx, a network error) is unaffected and keeps retrying as described above. The same detector also gates the step's separate CI check-runs read (used to fail the gate on a red non-review check) and `getCombinedChecksState` (`src/github.ts`), used by the late external review (`src/restate/late-external-review.ts`) — a permission denial there holds the PR as `"pending"` instead of reading as `"success"`, and `getCombinedChecksState` fails closed the same way for *any* unreadable check-runs response (a transient 5xx included), not only a permission denial. Either read failing transiently (not on a permission denial) surfaces as a blocking "CI check status could not be verified" issue rather than being read as "no failing checks". The pipeline reads CI checks on the current commit, so earlier CI gate issues are omitted from reviewer history and the reviewer must not report CI status as an issue.
+
+Internal issues are deduplicated against external findings so the same problem is not reported twice, and fix passes iterate up to the configured maximum. PR comments carry `<!-- ai-implement post-push iter=N ... -->` markers. Start and disposition comments are appended on each run to establish the posting identity and preserve disposition history; other status comments can be updated.
+
+**External check name matching** uses an explicit name list, plus a heuristic fallback. `DEFAULT_REVIEW_CHECK_NAMES` (`src/pipeline/steps/post-push-review.ts`) lists five defaults: `review`, `code-review-plugin`, `claude-review`, `claude code review`, and `claude-code-review`. A check whose name isn't in the configured or default list still matches when it contains both `claude` and `review` (`isExternalReviewCheckName`), which is what catches an unenumerated variant like a differently-cased `Claude Code Review`. When no check matches by either name or heuristic for the head SHA on two consecutive probes, the gate logs a warning listing the names that *were* present and then fails open (so repos without an external review check are not blocked). Configure the exact name for a specific repo with `reviewCheckNames` in `.ai-implement/config.yml`:
 
 ```yaml
 reviewCheckNames:
@@ -89,31 +264,148 @@ reviewCheckNames:
 
 External collection can be disabled per repo via `reviewProviders` in `.ai-implement/config.yml`; when it is, the step skips the wait entirely.
 
-## Post-run: the drain loop
+The `claude-review`/`claude-code-review`/`claude` workflows pin `anthropics/claude-code-action` to v1.0.217 rather than floating `@v1` — a `@v1` build shipped 2026-09-08 that failed the native binary install on every run, silently starving this gate of a verdict. v1.0.217 is pinned rather than a later build because it's the last version upstream confirms works; move the pin forward only once a newer release is confirmed to fix the installer regression (tracked upstream as issue #1817).
 
-`processReviewFixQueue` runs once per poll tick. For each pending item, in FIFO order:
+### Repository-fix process (AII-1252)
 
-1. Find the mapping whose `owner/repo` matches. **No mapping → `skipped`.**
-2. **Paused project → `skipped`.**
-3. Mint result and progress tokens (only when a runner callback is configured).
-4. **Snapshot the currently-open finding ids.** This is what the dispatch is permitted to resolve.
-5. Dispatch a `gap-analysis` phase run against the existing PR.
-6. Record the dispatch with its snapshot, then mark the queue row `dispatched`.
+Under `claude-code-review-repository-fix` the repository's own auto-fix is the only fixer for Claude's findings. Once Claude's review of the current commit has completed, the step branches before it would post the fix-pass comment: Claude blocking with a clean internal review ends the run `external_review_pending` with `reviewedHeadSha` (no fix pass), so `LateExternalReview` follows the auto-fix to its new commit; an internal blocking finding (including a failing CI check) with a clean Claude review runs the fix pass as under the other processes; both blocking ends the run unapproved (`REVIEW_UNAPPROVED`) for a person; neither approves. After the run, `ReviewFixPR.check` hands the fix to the repository (the process's fixer is `repository`); `recordDelegatedFix` marks the row `skipped`, so no AI-Implement gap-fill ever runs on the repository's branch (AII-1270). The ledger findings stay. Auto-merge holds a PR under this process unless the current head passes `headReviewedClean` (`src/review-head-clean.ts`): its review check completed with `success` (a `skipped` or `neutral` run does not count) and no open `blocking` finding was last seen at or after the head's commit time. See ADR 038 decision 8.
 
-A dispatch failure marks the row `failed` and surfaces a notification; the loop continues to the next item rather than aborting.
+### The approval mark after a Restate attempt (AII-1307)
 
-**The drain loop dispatches through GitHub Actions specifically** — it calls `dispatchWorkflow` directly rather than going through runner-mode resolution. A project running on Fly Machines still gets its review-fix runs on GitHub Actions.
+A clean internal review with no gating finding left, but a real external verdict that blocks (`changes_requested` or `incomplete`, read from Claude's review comment under the `ai-implement` process), does not end the run `invalid_review` (AII-1583). The run ends `external_review_pending` with `reviewedHeadSha` and hands the PR to `LateExternalReview`, so the in-run gate and the late gate cannot disagree; the PR comment (`<!-- ai-implement post-push iter=N invalid-external-review -->`) says the late external review now decides. Only that case is handed off (AII-1589): a check that finished without a verdict, unreadable findings, and any other review process still end `invalid_review` with no `reviewedHeadSha`, because for processes with check pairs `LateExternalReview` does not require an initial run's own review check to succeed and would otherwise stamp the mark with no external review of that head. A finding with no disposition still gates, so such a run never takes this path. `LateExternalReview` holds a `changes_requested` verdict that lists findings unless every listed finding has a row in the review ledger (keyed `owner/repo`, by `stableReviewFindingKey`) and every row is `deferred` or `rejected` (ADR 028 decision 4). A missing row (the deferral was never recorded), or a row that is `open` or `resolved`, keeps the `changes_requested` hold. `incomplete`, unreadable findings, a `changes_requested` review that lists no finding, and the ledger `blocking` rule are unchanged, and follow mode (repository-fix) does not read the verdict.
+
+**Codex late approval:** For a `codex-code-review` project, initial and gap-fill late-review ticks use the process's shared `readVerdict` reader on strictly fetched PR issue and inline review comments (all pages). Approval requires the trusted Codex state comment for the current head to be `completed` with no unresolved findings or with only trusted P2 open badge threads (unresolved and not outdated, across commits), or no open badge threads after a successful thread read, plus green CI and no current-head blocking ledger finding. Missing, running, or older-head state stays pending until the existing timeout; the five-minute no-reviewer grace never applies. Only P0/P1 findings block; P2-only is approved with the findings returned as advice. Any open P0/P1 badge holds as `changes_requested`; resolving or outdating that thread removes the hold when no other blocker remains. Unknown thread state retains the legacy head-badge rule. An inline-comment or thread read failure retries the tick; failed review state holds as `review-failed`, with instructions to post `@codex review` and then `/ai-implement verify only, make no code change` after approval. Processes with check pairs keep their check-run gate, using the shared `claude-code-review-repository-fix` check pairs. All Codex reads happen inside the existing tick step, preserving Restate replay order.
+
+A succeeded Restate attempt writes no approval mark itself. Once the attempt facts hold (an accepted result with no conflict, recorded outcome `succeeded`, current authority, PR head equal to the result's output commit, and full finding dispositions), the production wrapper (`src/restate/review-fix-production.ts`) submits `LateExternalReview` with `gapFill: true` for the PR's latest `implementation` / `gap-analysis` row (the row auto-merge reads), through the `LateExternalReview` submit hook (the raw hook, without the run callback's `followHead` wrapper: attempts are never created for `repository`-fixer mappings, so follow mode never applies here). The workflow key is `<dispatchId>-<attemptId>`, so an earlier workflow on that row that ended (for example `superseded` by the attempt's push) does not block it, and a repeated submit for the attempt is a no-op. The workflow reads the pushed head, waits for its selected review process (the review check or Codex state comment), checks the ledger and the reviewer's newest verdict, and only then stamps the row by the `dispatchId` in its input. If that row is `dispatched` or `running` by then (a newer run started in the window), the attempt's workflow ends `superseded` and stamps nothing. A `changes_requested` verdict leaves no mark. The workflow then posts one held comment (marker `<!-- ai-implement late-external-held key=<dispatchId>-<attemptId> -->`) naming the reason and the action, even when a review-fix run starts; see `docs/feature-branch-grouping.md` §8. The submit does not wait for the merge policy (AII-1414): the attempt finalizes when its run ends, which is when its push starts CI on the head, so the policy (false while any check is incomplete or `mergeable_state` is not yet `clean`) is always false then, and gating the submit on it left the PR with no mark until a person commented. The policy still gates the approval comment (`applyApprovalEffect`), which stays `withheld` and logs one line when the late review is submitted anyway; `LateExternalReview` does the waiting for the head's review check and CI, and is the only writer of the mark. The submit runs before the policy read, so a transient GitHub error there cannot block it. The submit never fails the finalize step: a missing row logs and skips. Before submitting, the wrapper records a `late_review_pending` outbox row (AII-1362; workflow key `<dispatchId>-<attemptId>`, attempt id, dispatch id, PR URL, the attempt's output commit as head SHA). The same outbox holds initial-run submits (key `<dispatchId>`, with the head SHA). The AII-1304 poll sweep (`resubmitPendingGapFillReviews`) re-submits each such row (with `gapFill` and its `attemptId` for an attempt row) whenever Restate is ready, within 24 h, and clears it only once the hook reports the submit settled (accepted, or a conflict from an existing workflow). The hook resolves `false` when Restate is not ready or the ingress call came back `unavailable`, and the record stays for the next tick. The wrapper clears the record itself on a settled first submit, so a healthy attempt does not trigger a redundant sweep submit. `attempt_review_pending` (AII-1307) is no longer written: it is created only so an older image starts, and any row left in it moves to the outbox at each boot. A repeat submit is a no-op through the workflow key, so a brief Restate outage at finalize time does not leave the PR waiting for a person's `/ai-implement` comment.
+The submit is skipped when that row is still `dispatched` or `running`: that run writes its own outcome, and a row picked at submit time that later ended unapproved could otherwise be stamped by this review. A settled row cannot change status, so the stamp target stays the row that was settled at submit. A `late_review_pending` row older than the sweep's 24 h window is deleted when the sweep reads, with a log line.
+
+
+## One writer per PR
+
+Every dispatch path — the poll loop, the review-fix drain (`processReviewFixQueue`), and the comment gap-fill drain (`drainCommentGapfillQueue`) — asks one predicate before starting a run: `canDispatch` (`src/dispatch-gate.ts:24-64`). It is keyed by **issue id, not PR**: every gap-fill run record carries its issue's id, so "a run for this issue is in flight" already means "a run is writing to this issue's PR" (ADR 026).
+
+`canDispatch` checks, in this order, stopping at the first match:
+
+| Order | Reason | Meaning | Applies to |
+|---|---|---|---|
+| 1 | `in_flight` | a `dispatch_log` row for the issue is `dispatched`/`running` | every kind |
+| 2 | `dedup` | a `dispatched` row already exists for the issue | `planning`/`implementation` only — skipped for `gap-fill` |
+| 3 | `pr_budget` | the PR's gap-fill dispatches in the last rolling 24h reached the project's budget | `gap-fill` only, and only when not human-requested (see "PR dispatch budget" below) |
+| 4 | `parked` | the dispatch breaker has parked this issue for the kind's phase | every kind, except a human-requested `gap-fill` |
+| 5 | `team_capacity` | the team has no free in-progress slot (`maxInProgressAiIssues`, excluding `kg-refresh` jobs) | `gap-fill` only |
+
+A blocked dispatch is a **deferral, not a failure**: the review-fix and comment gap-fill drains leave their queue row `pending` rather than marking it `failed` or `skipped`, so the next poll tick retries once the blocking condition clears (ADR 026, decision 1).
+
+**Open-PR routing** is what gets a selected issue with an existing PR into a `gap-fill` dispatch in the first place, so it reaches `canDispatch` at all instead of racing a fresh implementation onto the same branch — see "A non-webhook enqueue source" just below, `reason: open_pr`.
+
+**Lease rejection.** A push that loses its optimistic-concurrency lease fails as `GIT_LEASE_REJECTED`. `handleLeaseRejectedFailure` asks GitHub who authored the PR's current head commit: a **bot** head accepts one review-fix event for the failed dispatch (`reason: "lease_rejected"`); a **human** head — and an indeterminate/unknown author, since guessing "bot" would race a human mid-edit — instead posts a sticky comment saying a human pushed and that `/ai-implement` resumes the run, and the run stops without retrying.
+
+**Time limit for in-flight records.** The `in_flight` reason blocks a dispatch for as long as the run record says `running`, so a run that died without reporting would otherwise block its PR forever. `jobTtlDecision` (`src/github-actions-watchdog.ts:56`) and `remediateStuckJob` (`src/stuck-watchdog.ts`) detect a job that has outlived its time limit and close it out with conclusion `ttl_expired` (`src/index.ts:2152-2176`). This is the general job watchdog, not machinery the rail owns — it matters here only because it is what keeps a stuck record from permanently defeating the `in_flight` check.
+
+See [ADR 026](adr/026-one-writer-per-pr-and-an-open-pr-is-never-reimplemented.md).
+
+## PR dispatch budget
+
+Gap-fill dispatches on one PR are capped at `DEFAULT_PR_DISPATCH_BUDGET` (4) per rolling 24 hours, resolved per project by `resolvePrDispatchBudget` (`src/config.ts:18,122-124`); a project overrides it with the **PR Dispatch Budget** setting (blank means the default). [AII-757](https://linear.app/eudoxus/issue/AII-757/park-a-pr-at-its-dispatch-budget-and-ask-for-a-human) is the issue that turned this from a stored setting into an enforced one.
+
+The Restate review-fix admission path also parks on `deferred: budget_exhausted`. Its production services receive an `onBudgetExhausted` dependency, wired to the existing `firePrBudgetPark` mechanism with the mapping, the scoped queue cursor's tracker issue id, repository, PR number and resolved project budget. Atomic admission checks the PR budget before the issue park, so an exhausted parked PR still reaches this callback to retry failed delivery or post a budget notice after a breaker-first park. Admission remains blocked. Repeated refusals use the same notice claim and do not duplicate successful notices. If the cursor cannot resolve a tracker issue id, the stable `repository#prNumber` identity owns the park and PR notice, and the wrapper skips tracker delivery. Admission checks that fallback park too, so it persists after the rolling budget becomes available. Other deferrals (`paused`, `occupied`, `at_capacity`) do not post budget notices.
+
+When `canDispatch` returns `pr_budget` for a gap-fill dispatch, the caller (`firePrBudgetPark`, in `src/index.ts` for the poll/review-fix path and in `src/comment-gapfill-drain.ts` for the comment gap-fill drain) parks the issue with `parkIssue(issueId, "gap-analysis", "pr_budget")`. The gate checks the budget before the park, so it still returns `pr_budget` for a row the dispatch breaker parked first. `parkIssue` keeps an existing park's `last_conclusion`, so the breaker's reason stays visible at `/admin#runners`.
+
+The one-time **Needs Human** notice (`prBudgetParkMessage`, `src/dispatch-breaker.ts`) does not depend on who parked the row:
+
+- `claimPrBudgetNotice` sets `dispatch_breaker.pr_budget_notified_at` and succeeds once per park. A PR the breaker parked first still gets its budget comment.
+- The PR comment starts with `prBudgetMarker(parked_at)`, a hidden marker that names the park. Before posting, the PR's comments are read strictly (an unreadable list throws rather than reading as empty) and the post is skipped when the marker is already there, so a retry in the same park does not post twice. A comment from an earlier park does not match.
+- The same message is posted as a tracker comment unless the breaker's trip comment already reached the tracker: `fireBreakerTrip` sets `trip_notified_at` after its tracker post, and `prBudgetTrackerCommentOwed` reads it. A stuck fix run parks without a trip comment, so the tracker still gets the budget comment.
+- If the PR post or the tracker post fails, `releasePrBudgetNotice` gives the claim back and the next tick retries.
+- `unpark` clears `pr_budget_notified_at` and `trip_notified_at`, so a later park notifies again.
+
+A human is not stuck once a PR is parked. A `/ai-implement` comment sets `humanRequested`, which bypasses both the budget check and the `parked` check in `canDispatch` (`src/dispatch-gate.ts`) — so a human can always run one more pass, and that pass still counts against the budget. Parking otherwise persists until a human calls **Unpark** at `/admin` (`unpark`, `src/dispatch-breaker.ts`), which clears `parked_at` and resets the consecutive-failure counter so a fresh run of failures is required to re-park.
+
+The parked list at `/admin#runners` takes each row's issue name from the dispatch log (same phase first, then any phase) and falls back to the `dispatched` table; a row with no name shows `unknown issue` and the raw issue id.
+
+See the glossary's [PR dispatch budget](../CONTEXT.md#pr-dispatch-budget) entry.
+
+## Reported capacity: reservations, not tracker labels or running-job displays
+
+`GET /api/blockers` (`handleListBlockers`, `src/admin.ts`) reports `capacityByMapping`, one entry per mapping key: `{ used, cap, source: "reservations" }`. `used` is `count(mappingKey)` from `src/dispatch-admission.ts` — the unreleased, non-`kg-refresh` row count in `dispatch_admissions`, the exact same read `acquireDispatch` (`src/dispatch-gate.ts`) checks against `cap` before reserving a slot for a planning/implementation dispatch. `cap` is the mapping's own `maxInProgressAiIssues`. `selectBlockers` (`src/poll-selection.ts`) is fed this same per-team count for its `concurrency` reason, so the blocker preview's `used`/`cap` never drifts from the projection: both read `dispatch_admissions`, never a tracker-provider's business-status label.
+
+This is a deliberate authority split, not an oversight:
+
+- **Planning/implementation capacity** (this projection, and `acquireDispatch`'s own check) is reservation-backed: a slot is spent the instant `acquireDispatch`'s transaction commits — before the external launch call — and freed only by an explicit `release` once a launch is confirmed rejected, cancelled, or a run's termination is verified (see AII-783/AII-791). A reservation with no `dispatch_log` `run_id` yet (the launch call hasn't returned) still counts as used; a tracker label that hasn't advanced (or never will, because the provider write failed) never masks it.
+- **`gap-fill`'s `team_capacity` reason** in `canDispatch` (`src/dispatch-gate.ts`, "One writer per PR" above) is a separate, older predicate over `dispatch_log`'s `dispatched`/`running` rows, excluding `kg-refresh` the same way. It is not sourced from `capacityByMapping` and is out of scope for this projection — gap-fill's own migration onto `dispatch_admissions` is a later issue (AII-787).
+- **The Admin UI's own capacity display** (`src/admin-ui/pages/overview.ts`) still independently recomputes an in-progress count client-side from `/api/log` + `/api/mappings` — a *running-job* view, not this reservation authority. The two can disagree in the interim: a reservation is held (and shows in `capacityByMapping`) from the moment `acquireDispatch` commits, while a `dispatch_log` row (and so the overview's count) only exists once the dispatch is actually appended, and only reflects `dispatched`/`running` status, not "reserved". Wiring the overview and blocker views onto `capacityByMapping` is [AII-797](https://linear.app/eudoxus/issue/AII-797/show-reserved-capacity-in-admin-views); until it lands, treat the overview page's number as a display of recent activity, not the admission authority.
+
+## A non-webhook enqueue source: an issue selected for dispatch that already has an open PR
+
+Before the poll loop dispatches a fresh implementation for a selected issue, it looks up the
+issue's newest recorded PR (`getLatestPrUrlForIssue`, `src/log.ts`) and checks its state
+(`guardOpenPrBeforeImplementationDispatch`, `src/index.ts`). An **open** PR is never
+re-implemented — a fresh run's push would force-overwrite the open PR's branch (see ADR 026,
+decision 4). Instead the issue is routed into this same queue with reason `open_pr`, and
+`markDispatched` is called so the issue is not re-selected and re-enqueued on the next poll tick.
+A **merged** PR gets no dispatch and no queue row — merge reconciliation completes the issue. A
+PR state lookup that fails (network/API error) blocks dispatch for that tick only, so the issue is
+re-evaluated on the next poll rather than falling through to a fresh implementation. A **closed,
+unmerged** PR still gets a fresh implementation, on the assumption a human closed it to start over.
+This check only applies to implementation dispatches, never planning.
+
+## Post-run: universal Restate routing
+
+`processReviewFixQueue` runs once per poll tick. Every mapped project's pending rows go to `ReviewFixPR.feedback`, regardless of whether its stored lifecycle is NULL, `legacy`, or `restate`. The nudge idempotency key is `<queueId>.<eventId>.<30s bucket>`; repeated ticks in the same bucket reuse it.
+
+1. No matching mapping marks the row `skipped`.
+2. A paused mapping leaves the row `pending`; it resumes after unpause.
+3. Missing callback URL or token secret, or an unavailable Restate endpoint, leaves the row `pending`.
+4. Unknown PR state leaves the row `pending`; a confirmed closed or merged PR marks it `skipped`.
+5. A row without review-fix events stays `pending`. Otherwise the latest event supplies the nudge identity.
+
+The poll drain never launches a runner, mints launch tokens, or reserves capacity. `ReviewFixPR` and `ReviewFixAttempt` own feedback loading, delegation, budget checks, admission and launch. Automatic attempts use the resolved backend: GitHub Actions probes workflow capabilities, Fly Machines requires a sessions app and token and a non-Bedrock provider, and Local Docker uses its configured image. See the [runbook](./restate-review-fix-pilot.md).
+
+The Legacy drain and its helpers remain dormant for rollback until C7b removes them. Legacy runs already in flight retain their Legacy monitors. The cutover requires the operator's OK at the final roll-up.
 
 The synthesized issue title is `Review feedback fix for PR #<n>`, and the phase is reported as `gap-analysis` so the ticket's status does not regress to in-progress for what is a follow-up pass.
 
+A failed or stuck `gap-analysis` run (review-fix queue or `/ai-implement` comment rail) does not change the ticket status or the dispatched entry (`remediateFailedJob` / `remediateStuckJob` in `src/stuck-watchdog.ts` skip the ticket reset). A stuck one is stopped, closed out as `timed_out` / `stuck_review_fix`, and a human is told once (webhook plus ticket comment); the Fly max-age sweep and the issue-terminal sweep (`src/reaper.ts`) likewise skip `resetTicket` for a `gap-analysis` job. AI-Implement does not retry a review-fix or `/ai-implement` fix run automatically (a feature-branch conflict-resolution run is separate: `src/auto-merge.ts` may enqueue a new one, up to its cap), and a run the orchestrator cannot find (`run_not_found`) is reported as not found rather than as timed out. Accordingly, its findings stay open until a new review event arrives or a person comments `/ai-implement`. The PR Dispatch Budget limits dispatches; it does not create them.
+
+A fix run's outcome counts against the `gap-analysis` dispatch-breaker bucket, the one the fix-run dispatch gate reads (`isParked(…, "gap-analysis")`); `planning` and `implementation` runs keep their own buckets. Repeated failed or stuck fix runs park fix runs on that ticket, with the normal breaker trip notice (a stuck fix run's trip sends it too), and do not block a fresh implementation dispatch. A human `/ai-implement` comment still bypasses a park.
+
+A successful fix run no longer resets the `implementation` failure count, because it counts in the `gap-analysis` bucket.
+
+A `review_failed` fix run (it pushed and the second review still has findings) does not count toward the breaker, and it does not reset the failure count either. Failed, timed-out and stuck fix runs do count. For example, `failed, failed, review_failed, failed` parks on the fourth run.
+
 ## Resolution
 
-When a `gap-analysis` run reports success, the callback resolves findings — and *which* findings depends on whether a dispatch snapshot exists:
+When a `gap-analysis` run reports success, the callback resolves a finding only when **both** hold:
 
-- **With a snapshot** — exactly the finding ids captured at dispatch time are resolved.
-- **Without one** — everything for that PR last seen at or before the job's dispatch timestamp.
+1. It is in the set the run was allowed to resolve — with a snapshot, exactly the finding ids captured at dispatch time; without one, everything for that PR last seen at or before the job's dispatch timestamp.
+2. The callback's sanitized `findingDispositions` gives its `findingKey` the disposition `fixed`.
+
+A finding in the allowed set with no disposition stays `open` and is shown to the next fix run (the drain reads `listOpenReviewFindings`). A finding outside the set stays `open` even with a `fixed` disposition. `follow-up` findings become `deferred` and `invalid` findings become `rejected` earlier in the callback, on every phase and outcome with an existing PR; neither is resolved by the snapshot path. The callback logs one line per success: `resolved=` and `left_open=` count the allowed set, while `deferred_on_pr=` and `rejected=` count findings closed on the PR, so the numbers need not add up to the allowed set.
+
+A success that reports no dispositions at all — including a runner image that predates the `findingDispositions` field — resolves nothing. Only a review-fix drain run records a snapshot. A `/ai-implement` comment run takes the no-snapshot path; its instruction lists the PR's open findings under their finding keys, so the agent's `fixed` dispositions resolve those findings, and a finding it leaves undisposed, or one left out of the instruction by its size cap, stays `open` for a later run. This is deliberate: a finding is never resolved without a recorded disposition.
 
 The snapshot is the important case. A finding that arrives *while* a fix run is in flight was never seen by that run, and resolving it would silently drop real feedback. Scoping resolution to the snapshot leaves it open for the next queue event instead.
+
+## Finding dispositions
+
+An `invalid` disposition rejects a finding that is wrong about the code. The run keeps one closed-key set for rejections and follow-ups, so a repeated key cannot gate again; a different key gates as usual. Fix-pass comments and approved and unapproved terminal PR comments list rejections and their reasons under **Rejected by the fix pass**, including summary-only findings. Reasons remain visible across later fix cycles.
+
+The callback stores `invalid` as **`rejected`**, before phase-specific resolution, on every phase carrying dispositions. Like `deferred`, `rejected` survives a re-report with the same key (both status and `resolved_at` stay unchanged); only `fixed` resolves, and resolved findings reopen on re-report. `listOpenReviewFindings` excludes rejected rows. Late external review accepts a nonempty `changes_requested` review only when every listed finding has a ledger row that is `deferred` or `rejected`; an open or missing row still holds approval.
+
+Both fix paths — the in-run fix pass and a review-fix run — receive the open ledger findings and are told to give each one exactly one **disposition** (`Disposition`, `src/pipeline/finding-dispositions.ts:20`): `fixed`, `follow-up`, or `invalid`, each with a one-sentence reason. This exists because an external reviewer does not know the issue's scope and reports improvements the issue never asked for; without a disposition, an out-of-scope finding gated the merge until someone fixed it (ADR 028).
+
+**The scope rule:** a finding that reports a defect in lines the PR changed is always in scope and can only be `fixed` or `invalid` — never `follow-up`. Only a request for behavior the issue does not require may be deferred (ADR 028, decision 3). The rule is enforced solely by the prompt (`buildDispositionInstructions`, `src/pipeline/finding-dispositions.ts:65-77`); nothing in code rejects a wrong disposition.
+
+The agent writes its dispositions to `ai-output/finding-dispositions.json` (`DISPOSITIONS_FILE`, `src/pipeline/finding-dispositions.ts:62`), one entry per finding with `findingKey`, `disposition`, and `reason`. The runner reports them on the result callback, which sanitizes the array (`sanitizeFindingDispositions`, same file) before acting on it.
+
+For each `follow-up` disposition, the runner replies on the finding's review thread with the reason and resolves the thread (`replyToDispositionThreads` → `replyToThread` / `resolveThread`, `src/pipeline/finding-dispositions.ts:108-131,166-196`); the reply carries an `<!-- ai-implement finding-disposition -->` marker, so the webhook's self-guard never treats it as a new review. An `invalid` disposition replies `Not changed: {reason}` and also resolves the thread after a successful reply. Summary-comment findings (`claude-review-summary`) have no thread and require no thread mutation.
+
+The orchestrator then moves the finding from `open` to **`deferred`** (`markReviewFindingsDeferredByKeys`, `src/review-ledger-store.ts:127-137`). `deferred` no longer gates the merge, but unlike a `resolved` finding, it never reopens: the ledger's upsert leaves a `deferred` row's status alone even if the same finding is reported again later (see "Finding identity" above, and contrast with a `resolved` finding, which *does* reopen on re-report). This is deliberate — the fixing agent's follow-up call should survive a later reviewer pass restating the same objection.
+
+The orchestrator posts one issue comment listing every finding deferred by a run (`renderDeferredFindingsComment`, `src/runner-callback.ts:698-718`, invoked from the callback's disposition handling at `src/runner-callback.ts:511-533`). No tracker issue is filed automatically — a human triages the list from that comment.
+
+See [ADR 028](adr/028-the-fixing-agent-dispositions-each-finding-and-may-defer-out-of-scope-ones.md).
 
 ## Gotchas
 
@@ -123,4 +415,30 @@ The snapshot is the important case. A finding that arrives *while* a fix run is 
 - **Findings from a review on a PR the orchestrator did not dispatch are ignored**, since every path requires a matching dispatch record.
 - **`review_findings` has no retention policy.** Rows persist for merged and closed PRs alike.
 - **`pull_request_target` resolves the workflow file from the repository's default branch (`main`), not from the PR base branch or the PR head.** A rename of a job in a workflow triggered by `pull_request_target` (such as `claude-review.yml`) is not in force until it lands on the default branch — regardless of which branch the PR targets. For example, a PR targeting `testing` will still use the workflow as declared on `main`, so a rename committed only to `testing` does not change the check-run name the gate sees. When the gate logs "No external review check matched", compare the present names against what the **default branch** workflow file declares.
+- **A 503 from the webhook route is recovered by `src/webhook-redelivery.ts`**, which redelivers the App's failed deliveries (the four review-related events) at the next Restate registration. The KG PR-check route (`handleKgPrCheckWebhook`) and the three review handlers for every mapped repository, regardless of stored lifecycle (AII-1184, AII-1773) answer 503 while Restate is unavailable. A delivery older than 24 hours needs a manual redelivery from the App's Advanced tab.
 - **Renaming a review job name is a silent gate change.** If no check matches the configured or default names, the gate fails open (logs a warning, then approves). Use `reviewCheckNames` in `.ai-implement/config.yml` to pin the expected name and make mismatches visible rather than silently bypassed.
+
+## Task-text admission budgets (AII-1006)
+
+`prepareReviewFixTask` (`src/review-fix-queue.ts`) is the one admission contract for both the durable loader (`loadPendingReviewFixFeedback`) and the dormant Legacy drain. Review feedback is never clipped: a set over any budget is rejected whole, with a category.
+
+| Budget | Limit | Category |
+|---|---|---|
+| Findings per task | 30 | `count` |
+| Raw body per finding | 8,000 chars | `body` |
+| Rendered feedback (headings, metadata, quote prefixes, URLs) | 19,000 chars | `aggregate` |
+| Whole rendered task, including up to 20,000 chars of issue context | 40,000 chars (run-config's description cap) | `envelope` |
+
+On overflow the durable loader throws `ReviewFixFeedbackIncompleteError` before `admit`, so no snapshot, attempt, token or dispatch exists and every finding version stays pending. The dormant Legacy loop logs a bounded warning and leaves the queue item `pending`. An over-limit set needs source reduction or a later batching capability. `GithubReviewFixWorker.launch` also decodes the encoded `run_config` and refuses to dispatch unless `issue.description` and `commentInstruction` equal the admitted task text. `dispatchFindingIds` and the durable snapshot are exactly the rendered findings (AII-758 invariant).
+
+Non-launch reads of over-budget feedback (`inspectPendingReviewFixFeedback`) report `incomplete` instead of throwing: the admin attempt detail shows `pendingFeedback: true`, and the Restate `load()` resolves with no pending feedback and logs only the bounded category, so nothing is admitted, nothing is retried in a tight loop, and every finding stays pending until the set is reduced.
+
+Review-fix execution binding uses the attempt's frozen execution backend. GitHub
+Actions identities bind the run ID and run attempt; Fly Machines and local Docker
+identities bind a backend-scoped `execution_ref`. Cross-backend binding is rejected
+without changing the attempt. Historical journal identities without a backend
+normalize to GitHub Actions. Result evidence and the operator adopt request remain
+GitHub-only; machine identities can bind and reach terminal completion without
+granting result-based approval.
+
+Closed finding keys persist across runs in versioned `<!-- ai-implement closed-findings v1 ... -->` markers on fix-pass PR comments. `rejected` (`invalid`) and `deferred` (`follow-up`) close keys; a later `fixed` reopens them. At step start, the runner reads all issue-comment pages oldest first; the newest disposition wins. The trust check accepts markers only from the login read from this run's newly posted start comment. Foreign-author markers warn and are ignored; unreadable identity or history seeds nothing. No dispatch-envelope field is needed.

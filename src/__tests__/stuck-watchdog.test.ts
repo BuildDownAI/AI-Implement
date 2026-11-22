@@ -1,0 +1,655 @@
+import { parkIssue } from "../dispatch-breaker.js";
+vi.mock("../dispatch-breaker.js", () => ({ parkIssue: vi.fn() }));
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { Job } from "../log.js";
+import { makeJob, makeProvider } from "./helpers/builders.js";
+
+vi.mock("../github.js", async (importOriginal) => ({
+  CONTAINER_INIT_STEP: (await importOriginal<typeof import("../github.js")>()).CONTAINER_INIT_STEP,
+  cancelWorkflowRun: vi.fn().mockResolvedValue(true),
+  // Default: cancellation was accepted but the run has not actually terminated yet —
+  // this is the realistic case, since GHA does not stop a run the instant it accepts
+  // a cancel request. Tests that need a confirmed stop override this explicitly.
+  getWorkflowRunStatus: vi.fn().mockResolvedValue({ status: "in_progress", conclusion: null, html_url: "https://x" }),
+  getFailedRunStepJob: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock("../github-app-auth.js", () => ({
+  getInstallationToken: vi.fn().mockResolvedValue("gh-token-mock"),
+}));
+
+vi.mock("../log.js", () => ({
+  getStuckAttempts: vi.fn().mockReturnValue(0),
+  incrementStuckAttempts: vi.fn(),
+  updateJobStatus: vi.fn(),
+  resetStuckAttempts: vi.fn(),
+  getJobById: vi.fn(),
+}));
+
+vi.mock("../dedup.js", () => ({
+  deleteDispatched: vi.fn(),
+}));
+
+vi.mock("../dispatch-admission.js", () => ({
+  read: vi.fn().mockReturnValue(null),
+}));
+
+vi.mock("../notify.js", () => ({
+  IMAGE_PULL_FAILED_STATUS: "runner_image_pull_failed",
+  notifyStuckGiveUp: vi.fn().mockResolvedValue(undefined),
+}));
+
+import { remediateStuckJob, remediateFailedJob } from "../stuck-watchdog.js";
+import { getStuckAttempts, incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getJobById } from "../log.js";
+import { deleteDispatched } from "../dedup.js";
+import { notifyStuckGiveUp } from "../notify.js";
+import { cancelWorkflowRun, getWorkflowRunStatus, getFailedRunStepJob, CONTAINER_INIT_STEP } from "../github.js";
+import { read as readAdmission } from "../dispatch-admission.js";
+
+const mockConfig = {
+  githubAppId: "12345",
+  githubAppPrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nmock\n-----END RSA PRIVATE KEY-----",
+  notifyType: "slack",
+  notifyWebhookUrl: "https://hooks.slack.com/test",
+};
+
+const stuckJob = (overrides: Partial<Job> = {}) => makeJob({ issueId: "issue-abc", runId: 99, ...overrides });
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(parkIssue).mockReset();
+  // Default: getJobById returns a job with null conclusion (no callback yet)
+  vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: null }));
+});
+
+describe("remediateStuckJob — kg-refresh guard", () => {
+  it("returns immediately for a kg-refresh phase job — no runner cancel, no retry, no dedup clear", async () => {
+    const provider = makeProvider();
+    const job = stuckJob({ phase: "kg-refresh" });
+
+    await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+  });
+});
+
+describe("remediateFailedJob — kg-refresh guard", () => {
+  it("returns immediately for a kg-refresh phase job — no dedup clear, no alert, no comment", async () => {
+    const provider = makeProvider();
+    const job = stuckJob({ phase: "kg-refresh" });
+
+    await remediateFailedJob(mockConfig, provider, job, "failure");
+
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+});
+
+describe("review-fix (gap-analysis) jobs leave the ticket alone", () => {
+  it("remediateFailedJob makes no ticket write, dedup clear, or counter increment", async () => {
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "failure");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("remediateFailedJob skips even for an owner call", async () => {
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "failure", { ownerCall: true });
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [true, { backendTerminated: true }],
+    [false, { skipAdmissionRelease: true }],
+  ])("remediateStuckJob closes out the job (stop confirmed=%s) without touching the ticket", async (confirmed, opts) => {
+    const provider = makeProvider();
+    const stopRunner = vi.fn().mockResolvedValue(confirmed);
+    const result = await remediateStuckJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "in_progress", stopRunner);
+    expect(result).toBe(confirmed);
+    expect(stopRunner).toHaveBeenCalled();
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_review_fix", undefined, opts);
+    expect(notifyStuckGiveUp).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(notifyStuckGiveUp).mock.calls[0][2]).toMatchObject({ fixRun: true });
+    expect(provider.postComment).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(provider.postComment).mock.calls[0][1]).toContain("comment `/ai-implement`");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("remediateStuckJob without a webhook still comments on the ticket and sends no notification", async () => {
+    const provider = makeProvider();
+    const stopRunner = vi.fn().mockResolvedValue(true);
+    await remediateStuckJob(
+      { ...mockConfig, notifyWebhookUrl: null },
+      provider,
+      makeJob({ phase: "gap-analysis" }),
+      "in_progress",
+      stopRunner,
+    );
+    expect(provider.postComment).toHaveBeenCalledTimes(1);
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+
+  it("remediateStuckJob comment says the run was stopped at its time limit and is not retried automatically", async () => {
+    const provider = makeProvider();
+    await remediateStuckJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "in_progress", vi.fn().mockResolvedValue(true));
+    const text = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(text).toContain("did not finish in its time limit");
+    expect(text).toContain("does not retry a review-fix or `/ai-implement` fix run automatically");
+    expect(text).not.toContain("will not start it again");
+  });
+
+  it("remediateStuckJob comment says the run was not found for run_not_found", async () => {
+    const provider = makeProvider();
+    await remediateStuckJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "run_not_found", vi.fn().mockResolvedValue(true));
+    const text = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(text).toContain("could not find the fix run");
+    expect(text).not.toContain("time limit");
+    expect(text).toContain("does not retry a review-fix or `/ai-implement` fix run automatically");
+  });
+
+  it("remediateStuckJob without stopRunner uses the default cancel path", async () => {
+    await remediateStuckJob(mockConfig, makeProvider(), makeJob({ phase: "gap-analysis", runId: 555 }), "in_progress");
+    expect(cancelWorkflowRun).toHaveBeenCalled();
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_review_fix", undefined, { skipAdmissionRelease: true });
+  });
+
+  it("remediateStuckJob does nothing when the DB conclusion is operator_cancelled", async () => {
+    vi.mocked(getJobById).mockReturnValue({ conclusion: "operator_cancelled" } as Job);
+    const provider = makeProvider();
+    const stopRunner = vi.fn().mockResolvedValue(true);
+    const result = await remediateStuckJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "in_progress", stopRunner);
+    expect(result).toBe(false);
+    expect(stopRunner).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+
+  it("remediateStuckJob still returns false for an operator-cancelled gap-analysis job", async () => {
+    const stopRunner = vi.fn().mockResolvedValue(true);
+    const result = await remediateStuckJob(
+      mockConfig,
+      makeProvider(),
+      makeJob({ phase: "gap-analysis", conclusion: "operator_cancelled" }),
+      "in_progress",
+      stopRunner,
+    );
+    expect(result).toBe(false);
+    expect(stopRunner).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+
+  it.each(["implementation", "planning"])("%s jobs still reach boundedCleanup", async (phase) => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, makeJob({ phase }), "failure");
+    expect(incrementStuckAttempts).toHaveBeenCalled();
+    expect(provider.clearWorkingState).toHaveBeenCalled();
+  });
+});
+
+describe("remediateStuckJob — operator_cancelled guard", () => {
+  it("returns immediately when job.conclusion is operator_cancelled — no runner cancel, no retry", async () => {
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: "operator_cancelled" });
+
+    await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+  });
+
+  it("returns immediately when fresh DB conclusion is operator_cancelled (race: callback fired mid-tick)", async () => {
+    // job.conclusion is null (read before callback), but DB was updated during the tick
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: "operator_cancelled" }));
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: null });
+
+    await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+
+  it("still remediates when job.conclusion is null (normal stuck path)", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: null });
+
+    await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(incrementStuckAttempts).toHaveBeenCalled();
+    // GHA accepted the cancellation, but the default mock's run status is still
+    // "in_progress" — accepting a cancel request is not proof of termination
+    // (AII-783 review on PR #681), so the reservation must stay held.
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, {
+      skipAdmissionRelease: true,
+    });
+  });
+});
+
+describe("remediateStuckJob — GHA cancel-acceptance is not termination confirmation (AII-783 review on PR #681)", () => {
+  it("holds the reservation when GitHub accepts the cancel (202) but the run is still in_progress", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(cancelWorkflowRun).mockResolvedValue(true);
+    vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "in_progress", conclusion: null, html_url: "https://x" });
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: null });
+
+    const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(stopConfirmed).toBe(false);
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, {
+      skipAdmissionRelease: true,
+    });
+  });
+
+  it("holds the reservation when GitHub returns 409 (not cancellable) but the run is still queued", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    // cancelWorkflowRun collapses 202 and 409 to `true` — a 409 does not mean the run
+    // already finished, it can also mean it hasn't started cancelling yet.
+    vi.mocked(cancelWorkflowRun).mockResolvedValue(true);
+    vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "queued", conclusion: null, html_url: "https://x" });
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: null });
+
+    const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(stopConfirmed).toBe(false);
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, {
+      skipAdmissionRelease: true,
+    });
+  });
+
+  it("releases the reservation once the run's own status is observed completed", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(cancelWorkflowRun).mockResolvedValue(true);
+    vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "completed", conclusion: "cancelled", html_url: "https://x" });
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: null });
+
+    const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(stopConfirmed).toBe(true);
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
+  });
+
+  it("holds the reservation when the cancel request itself throws", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(cancelWorkflowRun).mockRejectedValue(new Error("network error"));
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: null });
+
+    const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(stopConfirmed).toBe(false);
+    expect(getWorkflowRunStatus).not.toHaveBeenCalled();
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, {
+      skipAdmissionRelease: true,
+    });
+  });
+});
+
+describe("remediateFailedJob — operator_cancelled guard", () => {
+  it("returns immediately when job.conclusion is operator_cancelled — no dedup clear, no alert", async () => {
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: "operator_cancelled" }));
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: "operator_cancelled" });
+
+    await remediateFailedJob(mockConfig, provider, job, "failure");
+
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+
+  it("returns immediately when fresh DB conclusion is operator_cancelled (race: callback fired mid-tick)", async () => {
+    // job.conclusion is null (read before callback), but DB was updated during the tick
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: "operator_cancelled" }));
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: null });
+
+    await remediateFailedJob(mockConfig, provider, job, "failure");
+
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+
+  it("still remediates when conclusion is exit_1 (normal failure path not affected)", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: "exit_1" }));
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: "exit_1" });
+
+    await remediateFailedJob(mockConfig, provider, job, "exit_1");
+
+    expect(incrementStuckAttempts).toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalled();
+  });
+
+  it("still remediates when conclusion is null (fresh DB also null — normal path)", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: null }));
+    const provider = makeProvider();
+    const job = stuckJob({ conclusion: null });
+
+    await remediateFailedJob(mockConfig, provider, job, "failure");
+
+    expect(incrementStuckAttempts).toHaveBeenCalled();
+  });
+});
+
+describe("remediateFailedJob — Restate-owned job (AII-1020)", () => {
+  const provider = makeProvider();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(getJobById).mockReturnValue(null as never);
+    vi.mocked(readAdmission).mockReturnValue({ lifecycleOwner: { kind: "restate", attemptId: "d-1" } } as never);
+  });
+
+  it("returns early without the owner option", async () => {
+    await remediateFailedJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "planning" }), "failure");
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+  });
+
+  it("runs the handling with ownerCall", async () => {
+    await remediateFailedJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "planning" }), "failure", { ownerCall: true });
+    expect(incrementStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).toHaveBeenCalledOnce();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+  });
+
+  it("ownerCall still skips kg-refresh jobs", async () => {
+    await remediateFailedJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "kg-refresh" }), "failure", { ownerCall: true });
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+});
+
+describe("remediateStuckJob — Restate-owned job", () => {
+  const provider = makeProvider();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(getJobById).mockReturnValue(null as never);
+    vi.mocked(readAdmission).mockReturnValue({ lifecycleOwner: { kind: "restate", attemptId: "d-1" } } as never);
+  });
+
+  it("returns false and changes nothing without ownerCall", async () => {
+    const result = await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1" }), "ttl_expired");
+    expect(result).toBe(false);
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+  });
+
+  it("requeues with ownerCall while attempts are within the bound", async () => {
+    await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1" }), "ttl_expired", undefined, { ownerCall: true });
+    expect(incrementStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).toHaveBeenCalledOnce();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, expect.anything());
+  });
+
+  it("gives up with ownerCall above the attempt bound", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(4);
+    await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1" }), "ttl_expired", undefined, { ownerCall: true });
+    expect(provider.postComment).toHaveBeenCalledOnce();
+    expect(vi.mocked(provider.postComment).mock.calls[0]![1]).toContain("Stuck — Needs Human");
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, expect.anything());
+  });
+
+  it.each([1, 4])("confirmed termination still defers admission release for ownerCall at attempt %s", async (attempt) => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(attempt);
+    const confirmed = await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1" }), "ttl_expired", async () => true, { ownerCall: true });
+    expect(confirmed).toBe(true);
+    expect(incrementStuckAttempts).toHaveBeenCalledOnce();
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", attempt === 1 ? "stuck_requeued" : "stuck_giveup", undefined, { skipAdmissionRelease: true });
+  });
+
+  it("ownerCall still skips kg-refresh and operator_cancelled jobs", async () => {
+    expect(await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "kg-refresh" }), "x", undefined, { ownerCall: true })).toBe(false);
+    expect(await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", conclusion: "operator_cancelled" }), "x", undefined, { ownerCall: true })).toBe(false);
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+});
+
+describe("boundedCleanup give-up — parkForHuman", () => {
+  const GIVE_UP = 4;
+  const linearLine = "To start AI-Implement again, unpark the issue at /admin#runners.";
+  const resetLine = "To start AI-Implement again, reset the AI-Implement status or label on the ticket.";
+
+  beforeEach(() => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(GIVE_UP);
+  });
+
+  it("implementation give-up parks, then clears dedup and the counter; no clearWorkingState", async () => {
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, stuckJob({ phase: "implementation" }), "failure");
+
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(parkIssue).toHaveBeenCalledWith("issue-abc", "implementation", "failure", { project: "ENG", identifier: "ENG-1" });
+    const park = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+    expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+  });
+
+  it("keeps dedup and the counter when persisting the Linear park fails", async () => {
+    vi.mocked(parkIssue).mockImplementationOnce(() => { throw new Error("database unavailable"); });
+    await remediateFailedJob(mockConfig, makeProvider(), stuckJob(), "failure");
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(resetStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("planning give-up parks with the planning phase", async () => {
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, stuckJob({ phase: "planning" }), "failure");
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "planning");
+    expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "planning", "failure", { project: "ENG", identifier: "ENG-1" });
+    const park = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+  });
+
+  it("the timeout path (remediateStuckJob) gives up the same way", async () => {
+    const provider = makeProvider();
+    await remediateStuckJob(mockConfig, provider, stuckJob(), "in_progress", async () => true);
+    expect(provider.parkForHuman).toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+  });
+
+  it("keeps dedup and the counter when parkForHuman returns false", async () => {
+    const provider = makeProvider({ parkForHuman: vi.fn().mockResolvedValue(false) });
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(resetStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("keeps dedup and the counter when parkForHuman throws, and still comments and notifies", async () => {
+    const provider = makeProvider({ parkForHuman: vi.fn().mockRejectedValue(new Error("tracker down")) });
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(resetStuckAttempts).not.toHaveBeenCalled();
+    expect(provider.postComment).toHaveBeenCalledOnce();
+    expect(notifyStuckGiveUp).toHaveBeenCalledOnce();
+  });
+
+  it("on Linear the give-up comment ends with the admin unpark instruction", async () => {
+    const provider = makeProvider({ id: "linear" });
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body.endsWith(linearLine)).toBe(true);
+  });
+
+  it.each(["jira", "filesystem"] as const)("on %s the give-up comment ends with the reset line", async (id) => {
+    const provider = makeProvider({ id });
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body.endsWith(resetLine)).toBe(true);
+  });
+
+  it("the retry branch is unchanged: clearWorkingState and dedup, no park", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(provider.parkForHuman).not.toHaveBeenCalled();
+    expect(resetStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("a failed planning job is reset with the planning phase (Ready, not Plan Approved)", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, stuckJob({ phase: "planning" }), "failure");
+    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG", "planning");
+  });
+});
+
+describe("remediateFailedJob — runner image pull failure", () => {
+  const initFailure = { jobName: "implement", htmlUrl: "https://github.com/org/repo/actions/runs/99/job/7" };
+  const ghaJob = (overrides: Partial<Job> = {}) =>
+    stuckJob({ repo: "org/repo", executionMode: "github-actions", phase: "implementation", ...overrides });
+
+  beforeEach(() => {
+    vi.mocked(getStuckAttempts).mockReturnValue(1);
+  });
+
+  it("gives up on attempt 2: parks, clears dedup, posts the image-pull comment, notifies", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedRunStepJob).mockResolvedValueOnce(initFailure);
+    const provider = makeProvider({ id: "jira" });
+
+    await remediateFailedJob(mockConfig, provider, ghaJob({ sessionImage: "ghcr.io/org/runner:1" }), "failure");
+
+    expect(getFailedRunStepJob).toHaveBeenCalledWith("gh-token-mock", "org", "repo", 99, CONTAINER_INIT_STEP);
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body).toContain("could not pull the runner image");
+    expect(body).toContain("`ghcr.io/org/runner:1`");
+    expect(body).toContain("`org/repo`");
+    expect(body).toContain("AI-Implement tried 2 times.");
+    expect(body).toContain("Manage Actions access");
+    expect(body).toContain("3. To start AI-Implement again, reset the AI-Implement status or label on the ticket.");
+    expect(body).toContain(`Failed job (\`implement\`): ${initFailure.htmlUrl}`);
+    expect(body).not.toContain("Needs Human");
+    expect(notifyStuckGiveUp).toHaveBeenCalledWith(
+      "slack",
+      "https://hooks.slack.com/test",
+      expect.objectContaining({ lastRunStatus: "runner_image_pull_failed" }),
+    );
+  });
+
+  it.each(["implementation", "planning"])("Linear %s image-pull give-up persists before cleanup and explains unpark", async (phase) => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedRunStepJob).mockResolvedValueOnce(initFailure);
+    const provider = makeProvider({ id: "linear" });
+    await remediateFailedJob(mockConfig, provider, ghaJob({ phase }), "failure");
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", phase);
+    expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", phase, "runner_image_pull_failed", { project: "ENG", identifier: "ENG-1" });
+    const park = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body).toContain("3. To start AI-Implement again, unpark the issue at /admin#runners.");
+  });
+
+  it("falls back to 'the resolved runner image' when sessionImage is unset", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedRunStepJob).mockResolvedValueOnce(initFailure);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob({ sessionImage: null }), "failure");
+    expect(vi.mocked(provider.postComment).mock.calls[0][1]).toContain("The image was the resolved runner image.");
+  });
+
+  it("shows the run URL when the failed job has no name or URL", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedRunStepJob).mockResolvedValueOnce({ jobName: "unknown", htmlUrl: null });
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body).toContain("Failed job: https://github.com/org/repo/actions/runs/99");
+    expect(body).not.toContain("null");
+  });
+
+  it("skips the jobs lookup on attempt 1 and takes the normal retry", async () => {
+    vi.mocked(getStuckAttempts).mockReturnValue(0);
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    expect(getFailedRunStepJob).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(provider.postComment).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+
+  it("skips the jobs lookup for a runner-reported failure", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    await remediateFailedJob(mockConfig, makeProvider(), ghaJob(), "failure", { runnerReported: true });
+    expect(getFailedRunStepJob).not.toHaveBeenCalled();
+  });
+
+  it("takes the normal retry when no Initialize containers step failed", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    expect(getFailedRunStepJob).toHaveBeenCalled();
+    expect(provider.parkForHuman).not.toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+
+  it("takes the normal retry when the jobs lookup throws", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedRunStepJob).mockRejectedValueOnce(new Error("boom"));
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    expect(provider.parkForHuman).not.toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+
+  it.each(["fly-machines", "local-docker"])("skips the jobs lookup for a %s job", async (executionMode) => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    await remediateFailedJob(mockConfig, makeProvider(), ghaJob({ executionMode }), "failure");
+    expect(getFailedRunStepJob).not.toHaveBeenCalled();
+  });
+});

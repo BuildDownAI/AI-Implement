@@ -115,6 +115,11 @@ export interface CleanExitDecision {
   deferForPrRecheck: boolean;
 }
 
+// kg-refresh rows have no tracker issue; generic notice fires bogus "kg-refresh: Unknown" (AII-496 owns their outcome).
+export function shouldSkipCompletionNotice(job: { phase: string }): boolean {
+  return job.phase === "kg-refresh";
+}
+
 /**
  * AII-264 r5 seam: terminal decision for the fly-machines and local-docker monitors.
  *

@@ -1,7 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { clearPublicationCredential } from "./publication-credential.js";
+import { decodeRunConfig } from "./run-config.js";
 
 const DEFAULT_TOKEN_REQUEST_TIMEOUT_MS = 5_000;
+/** Backoff for the fail-closed exchange, mirroring push.ts's LS_REMOTE_RETRY_DELAYS_MS. */
+const TOKEN_REQUEST_RETRY_DELAYS_MS = [250, 1_000];
 
 interface RefreshRunnerGithubTokenInputs {
   currentToken: string;
@@ -10,6 +13,7 @@ interface RefreshRunnerGithubTokenInputs {
   callbackUrl?: string;
   publicationToken?: string;
   owner: string;
+  repo?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   /** Fail instead of retaining the current token. Intended for the explicit refresh CLI. */
@@ -19,6 +23,41 @@ interface RefreshRunnerGithubTokenInputs {
 interface RefreshRunnerGithubCredentialsInputs extends RefreshRunnerGithubTokenInputs {
   repo: string;
   workspaceDir: string;
+}
+
+function executionHeaders(owner: string, repo: string): Record<string, string> {
+  return {
+    "x-run-repository": `${owner}/${repo}`,
+    "x-github-run-id": process.env.GITHUB_RUN_ID ?? "",
+    "x-github-run-attempt": process.env.GITHUB_RUN_ATTEMPT ?? "",
+  };
+}
+
+/** Pilot marker comes from the validated runner envelope. A malformed marker must
+ * fail closed rather than silently falling through to Legacy publication. */
+function isPilotRun(): boolean {
+  const encoded = process.env.AI_IMPLEMENT_RUN_CONFIG;
+  return Boolean(encoded && decodeRunConfig(encoded).reviewFix);
+}
+
+export async function assertRunnerPublicationAuthority(input: {
+  callbackUrl?: string; owner: string; repo: string; fetchImpl?: typeof fetch;
+}): Promise<void> {
+  if (!isPilotRun()) return;
+  const resultToken = process.env.RUN_TOKEN;
+  const callbackUrl = input.callbackUrl?.trim();
+  if (!resultToken || !callbackUrl) throw new Error("[runner-token] Pilot publication authority unavailable");
+  let response: Response;
+  try {
+    response = await (input.fetchImpl ?? fetch)(`${callbackUrl.replace(/\/$/, "")}/api/runner/publication-authority`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${resultToken}`, ...executionHeaders(input.owner, input.repo) },
+      signal: AbortSignal.timeout(DEFAULT_TOKEN_REQUEST_TIMEOUT_MS),
+    });
+  } catch {
+    throw new Error("[runner-token] Pilot publication authority unavailable");
+  }
+  if (!response.ok) throw new Error(`[runner-token] Pilot publication authority rejected with HTTP ${response.status}`);
 }
 
 /**
@@ -50,22 +89,51 @@ export async function refreshRunnerGithubToken(
   const fetchImpl = inputs.fetchImpl ?? fetch;
   const timeoutMs = inputs.timeoutMs ?? DEFAULT_TOKEN_REQUEST_TIMEOUT_MS;
 
-  let response: Response;
-  try {
-    response = canUseMachineNonce
-      ? await fetchImpl(`${orchestratorUrl!.replace(/\/$/, "")}/api/token`, {
+  const requestOnce = (): Promise<Response> =>
+    canUseMachineNonce
+      ? fetchImpl(`${orchestratorUrl!.replace(/\/$/, "")}/api/token`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ nonce: machineNonce, owner: inputs.owner }),
           signal: AbortSignal.timeout(timeoutMs),
         })
-      : await fetchImpl(`${callbackUrl!.replace(/\/$/, "")}/api/runner/publication-token`, {
+      : fetchImpl(`${callbackUrl!.replace(/\/$/, "")}/api/runner/publication-token`, {
           method: "POST",
-          headers: { Authorization: `Bearer ${publicationToken}` },
+          headers: {
+            Authorization: `Bearer ${publicationToken}`,
+            ...(isPilotRun() ? executionHeaders(inputs.owner, inputs.repo ?? "") : {}),
+          },
           signal: AbortSignal.timeout(timeoutMs),
         });
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
+
+  // The fail-closed exchange is the one request in a run that no later poll can
+  // retry, and failing it discards the whole completed run — so it gets a bounded
+  // retry. Retry ONLY transport failures (connect/timeout: the request may never
+  // have reached the server) and 5xx/429 responses; never any other 4xx. The
+  // publication credential is consumed BEFORE the mint, so a processed request
+  // must not be replayed into `already_consumed` — and if a retried 5xx does land
+  // there, the resulting 403 falls through to the normal rejection path.
+  // The best-effort machine-nonce path keeps its single attempt: it has a
+  // fallback (the boot token), and stacked timeouts would just delay it.
+  const retryDelaysMs = failClosed ? TOKEN_REQUEST_RETRY_DELAYS_MS : [];
+  let response: Response | undefined;
+  let transportError: unknown;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      transportError = undefined;
+      response = await requestOnce();
+    } catch (err) {
+      transportError = err;
+      response = undefined;
+    }
+    const retryable = response === undefined || response.status === 429 || response.status >= 500;
+    if (!retryable || attempt >= retryDelaysMs.length) break;
+    const cause = response ? `HTTP ${response.status}` : (transportError instanceof Error ? transportError.message : String(transportError));
+    console.warn(`[runner-token] Token refresh attempt ${attempt + 1} failed (${cause}); retrying in ${retryDelaysMs[attempt]}ms`);
+    await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
+  }
+  if (response === undefined) {
+    const reason = transportError instanceof Error ? transportError.message : String(transportError);
     if (failClosed) {
       throw new Error(`[runner-token] Token refresh unavailable (${reason})`);
     }
@@ -108,7 +176,9 @@ export async function refreshRunnerGithubToken(
     return inputs.currentToken;
   }
 
-  console.log("[runner-token] Obtained a current GitHub token from the orchestrator.");
+  console.log(
+    `[runner-token] Obtained a current GitHub token from the orchestrator (source: ${canUseMachineNonce ? "machine-nonce" : "publication-token"}).`,
+  );
   return body.token;
 }
 
@@ -119,6 +189,9 @@ export async function refreshRunnerGithubToken(
 export async function refreshRunnerGithubCredentials(
   inputs: RefreshRunnerGithubCredentialsInputs,
 ): Promise<string> {
+  await assertRunnerPublicationAuthority({
+    callbackUrl: inputs.callbackUrl, owner: inputs.owner, repo: inputs.repo, fetchImpl: inputs.fetchImpl,
+  });
   const canVend = Boolean(
     (inputs.orchestratorUrl?.trim() && inputs.machineNonce?.trim())
       || (inputs.callbackUrl?.trim() && inputs.publicationToken?.trim()),
@@ -126,7 +199,12 @@ export async function refreshRunnerGithubCredentials(
   const token = await refreshRunnerGithubToken(inputs);
   if (!canVend) return token;
 
-  if (inputs.publicationToken?.trim() && token !== inputs.currentToken) {
+  // Only clear the single-use publication credential when it was the path
+  // actually exchanged: requestOnce prefers the machine nonce whenever one is
+  // available, and a caller supplying both must not burn an unused credential.
+  const usedPublicationToken =
+    Boolean(inputs.publicationToken?.trim()) && !(inputs.orchestratorUrl?.trim() && inputs.machineNonce?.trim());
+  if (usedPublicationToken && token !== inputs.currentToken) {
     clearPublicationCredential();
   }
 

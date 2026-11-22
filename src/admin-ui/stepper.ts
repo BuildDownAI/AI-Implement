@@ -1,7 +1,7 @@
 export const stepperHtml = `
 <div id="np-stepper-wrap" class="modal" hidden>
   <div class="modal-backdrop" onclick="closeNewProjectStepper()"></div>
-  <div class="modal-card" style="display:flex;flex-direction:column;max-height:90vh">
+  <div class="modal-card" style="display:flex;flex-direction:column;max-height:90vh;width:860px">
     <div style="padding:18px 24px 14px;border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center">
       <div>
         <h2 style="font-size:15px;font-weight:600;margin:0">New project</h2>
@@ -10,9 +10,10 @@ export const stepperHtml = `
       <button class="btn btn-ghost btn-icon" onclick="closeNewProjectStepper()" title="Close">&times;</button>
     </div>
 
+    <div style="display:grid;grid-template-columns:186px 1fr;flex:1;min-height:0">
     <div class="stepper" id="np-stepper-rail"></div>
 
-    <div id="np-step-body" style="padding:24px;flex:1;overflow-y:auto;min-height:360px">
+    <div id="np-step-body" style="padding:24px;overflow-y:auto;min-height:360px">
       <div data-step="0">
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Ticketing System</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Choose where this mapping&rsquo;s issues come from. Each ticketing system has different config requirements on the next step.</p>
@@ -21,8 +22,9 @@ export const stepperHtml = `
           <select class="input" id="np-ticketing-provider" onchange="onStepperTicketingProviderChange()">
             <option value="linear">Linear</option>
             <option value="jira">Jira</option>
+            <option value="filesystem">Filesystem / local</option>
           </select>
-          <div class="field-hint">Jira requires JIRA_TOKEN + JIRA_SITE_URL, plus either JIRA_EMAIL (Basic auth) or JIRA_CLOUD_ID (OAuth) env vars on the orchestrator.</div>
+          <div class="field-hint">Filesystem tickets are Markdown files on this machine. They run real GitHub PRs through local Docker and require RUNNER_MODE=local.</div>
         </div>
       </div>
 
@@ -46,7 +48,7 @@ export const stepperHtml = `
               <button type="button" class="btn btn-sm" onclick="stepperValidateJql()">Validate</button>
               <span id="np-jira-jql-status" style="font-size:12px;color:var(--fg-tertiary)"></span>
             </div>
-            <div class="field-hint">Scope only (e.g. &ldquo;project = TEST&rdquo;). The orchestrator adds its own status filter, so never include one here. It also matches the repo field itself, so a repo clause is not needed for selection.</div>
+            <div class="field-hint">The orchestrator wraps this with status filters at query time. Don&rsquo;t include status filters here.</div>
           </div>
           <div class="field">
             <label class="field-label">Status Field</label>
@@ -57,10 +59,10 @@ export const stepperHtml = `
           </div>
           <div class="field">
             <label class="field-label">Repo Field</label>
-            <select class="input" id="np-jira-repo-field">
+            <select class="input" id="np-jira-repo-field" onchange="onStepperRepoFieldChange()">
               <option value="">(auto-discover by name "AI-Implement Repo")</option>
             </select>
-            <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to. Issues are matched on this field holding the repo you enter on the next step; if your options are labelled differently, set an explicit Repo Field Value after saving, in Edit.</div>
+            <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.</div>
           </div>
           <div class="field">
             <label class="field-label">Profiles Field</label>
@@ -69,28 +71,47 @@ export const stepperHtml = `
             </select>
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.</div>
           </div>
+          <div class="field">
+            <label class="field-label">Base Branch Field</label>
+            <select class="input" id="np-jira-base-branch-field">
+              <option value="">(auto-discover by name "AI-Implement Base Branch")</option>
+            </select>
+            <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Base Branch&rdquo;. Otherwise pick the text field that holds the branch an issue's PR should target instead of the repo's default branch.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Repo Field Value (optional)</label>
+            <select class="input" id="np-jira-repo-value" onchange="updateStepperNextButton()">
+              <option value="">(none, matches the repository)</option>
+            </select>
+            <input class="input mono hidden" id="np-jira-repo-value-text" type="text" placeholder="Blank matches the repository" oninput="updateStepperNextButton()">
+            <div class="field-hint">Leave blank to match issues whose Repo field holds this project's repository as owner/repo, which you enter on the next step. Pick a value only when the Repo field's options name repositories another way.</div>
+          </div>
+        </div>
+
+        <div id="np-filesystem-config" hidden>
+          <div class="field">
+            <label class="field-label">Ticket Directory</label>
+            <input class="input mono" id="np-filesystem-directory" placeholder="/private/tmp/filesystem-local-tickets" autocomplete="off" oninput="updateStepperNextButton()">
+            <div class="field-hint">Absolute host path containing Markdown tickets. The orchestrator writes local state there, while implementation still opens real GitHub PRs for review iteration.</div>
+          </div>
+          <div class="alert info">
+            <div class="alert-icon">&#8505;</div>
+            <div>
+              <div class="alert-title">Local Docker execution</div>
+              <div class="alert-desc">Use this with <span class="mono">RUNNER_MODE=local</span>. Local mode sends these tickets through the local Docker runner and the normal GitHub PR review loop.</div>
+            </div>
+          </div>
         </div>
       </div>
 
       <div data-step="2" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Source</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Connect to the GitHub repository this mapping dispatches against.</p>
-        <div class="alert info" style="margin-bottom:18px">
-          <div class="alert-icon">&#8505;</div>
-          <div style="flex:1">
-            <div class="alert-title">GitHub App required</div>
-            <div class="alert-desc">The AI-Implement GitHub App must be installed on the target repo before it can sync. Enter the repository, then check the installation.</div>
-            <div id="np-install-state" style="margin-top:10px;font-size:12px"></div>
-            <div class="alert-actions" style="margin-top:10px">
-              <button type="button" class="btn btn-sm" id="np-install-check" onclick="checkInstallState()">Check installation</button>
-            </div>
-          </div>
-        </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div class="field" style="grid-column:1 / -1">
             <label class="field-label">GitHub Repository</label>
-            <input class="input mono" id="np-github-repo" placeholder="acme-corp/backend" autocomplete="off" oninput="updateStepperNextButton()">
-            <div class="field-hint">Owner and repository name, slash-separated. This is the only place the repo is entered - it also identifies the project and matches the Jira repo field.</div>
+            <input class="input mono" id="np-github-repo" placeholder="acme-corp/backend or https://github.com/acme-corp/backend" autocomplete="off" oninput="updateStepperNextButton()">
+            <div class="field-hint">The repository as owner/repo, or paste its GitHub address.</div>
           </div>
           <div class="field" style="grid-column:1 / -1">
             <label class="field-label">Default Branch</label>
@@ -98,35 +119,91 @@ export const stepperHtml = `
             <div class="field-hint">Branch used for workflow dispatches, runner clones, and implementation PR bases.</div>
           </div>
           <div class="field" style="grid-column:1 / -1">
-            <label class="field-label">Skills Repo <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
-            <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
-            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+            <label class="field-label">Branch Prefix <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input mono" id="np-branch-prefix" placeholder="pr" autocomplete="off">
+            <div class="field-hint">Blank = none.</div>
+            <details class="explain">
+              <summary>What a prefix changes</summary>
+              <div class="explain-body">A run names its branch <span class="mono">ai-implement/&lt;issue-key&gt;-&lt;title-slug&gt;</span>. The prefix is joined in front of that as a leading path segment, so <span class="mono">pr</span> turns <span class="mono">ai-implement/aii-42-add-search</span> into <span class="mono">pr/ai-implement/aii-42-add-search</span>. It may contain <span class="mono">/</span> itself to nest several segments deep.</div>
+              <div class="explain-body">The branch name is computed at dispatch, so this only affects the first run of an issue &mdash; and a project created without a prefix has already produced that branch by the time one is added.</div>
+            </details>
           </div>
-          <div class="field" style="grid-column:1 / -1">
-            <label class="field-label">Additional sensitive patterns <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
-            <textarea class="input mono" id="np-sensitive-add" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
-            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
+        </div>
+        <div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin:22px 0 10px">Guardrails</div>
+        <div style="display:grid;gap:12px">
+          <div class="field">
+            <label class="field-label">Additional protected files <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <textarea class="input mono" id="np-sensitive-add" rows="3" placeholder="infra/**&#10;*.pem&#10;deploy/production.yml" autocomplete="off"></textarea>
+            <div class="field-hint">One file pattern per line, on top of the built-in sensitive-files list. <span class="mono">*</span> matches within one path segment, <span class="mono">**</span> matches across segments. Blank = none.</div>
           </div>
-          <div class="field" style="grid-column:1 / -1">
-            <label class="field-label">Allowed exceptions <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
-            <textarea class="input mono" id="np-sensitive-allow" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
-            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
+          <div class="field">
+            <label class="field-label">Exceptions to those rules <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <textarea class="input mono" id="np-sensitive-allow" rows="3" placeholder="infra/README.md&#10;deploy/example.yml" autocomplete="off"></textarea>
+            <div class="field-hint">One file pattern per line. Same syntax as above.</div>
           </div>
-          <div class="field" style="grid-column:1 / -1">
-            <label class="field-label">Dependency Token Scope <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
-            <select class="input" id="np-dep-token-scope">
-              <option value="">Off (default)</option>
-              <option value="installation">All repos the App can access (read-only)</option>
-            </select>
-            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos. When enabled, the runner mounts a scoped installation token as a git credential helper and sets <code>COMPOSER_AUTH</code>, so private dependencies resolve automatically during the install step.</div>
+          <div class="alert warn">
+            <div class="alert-icon">&#9888;</div>
+            <div>
+              <div class="alert-title">Exceptions win over every other rule</div>
+              <div class="alert-desc">A file matching an exception is pushed even when it also matches the built-in sensitive-files list or a pattern added above.</div>
+            </div>
           </div>
         </div>
       </div>
 
       <div data-step="3" hidden>
-        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Runner</h3>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Context</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">What a run can reach beyond the target repository.</p>
+        <div style="display:grid;gap:12px">
+          <div class="field">
+            <label class="field-label">Skills Repo <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
+            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Reference Repositories <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <div style="display:flex;gap:8px;align-items:flex-end">
+              <input class="input mono" id="np-refrepo-repo" style="flex:2;min-width:0" placeholder="repository" autocomplete="off">
+              <input class="input mono" id="np-refrepo-path" style="flex:2;min-width:0" placeholder="workspace path" autocomplete="off">
+              <input class="input mono" id="np-refrepo-ref" style="flex:1;min-width:0" placeholder="ref (optional)" autocomplete="off">
+              <button class="btn btn-icon" style="flex:none;color:var(--accent)" onclick="npAddRefRepo()" title="Add">+</button>
+            </div>
+            <div id="np-refrepo-list"></div>
+            <div class="field-hint">Cloned read-only into the run's workspace so the agent can check a claim against real source instead of trusting the issue. Blank = none. Up to ten entries.</div>
+            <details class="explain">
+              <summary>What each field accepts</summary>
+              <div class="explain-body">The path is where the clone lands in the runner's workspace, alongside the checked-out target repository, and it is also the address the agent is given &mdash; so it should match whatever the target repo's own instructions call that source. If they say to check claims against <span class="mono">ai-implement-source</span>, that is the path to enter here. Any depth works, and each entry needs its own directory.</div>
+              <div class="explain-body">The repository is either <span class="mono">owner/repo</span> shorthand or a full <span class="mono">https://github.com/owner/repo</span> URL. Private repositories work as long as the App is installed on that owner.</div>
+              <div class="explain-body">The ref pins a branch, a tag, or a full commit hash. Blank clones the default branch.</div>
+            </details>
+          </div>
+          <div class="field">
+            <label class="field-label">Dependency Token Scope <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <select class="input" id="np-dep-token-scope">
+              <option value="">Off (default)</option>
+              <option value="installation">All repos the App can access (read-only)</option>
+            </select>
+            <div class="field-hint">Lets the run read private sibling repos while installing dependencies. It can never write to them. Leave off unless builds need it.</div>
+            <details class="explain">
+              <summary>How the token is scoped</summary>
+              <div class="explain-body">The run receives a second token, installation-wide but strictly read-only, fetched over the runner callback and installed as a git credential helper for github.com and as <span class="mono">COMPOSER_AUTH</span>. So private dependencies resolve during the install step, and the run still cannot push anywhere but its own target repository.</div>
+              <div class="explain-body">The scope is all-or-nothing: it reads every repository the App installation covers, not a chosen subset. It also needs a publicly reachable orchestrator &mdash; a run dispatched without a progress token skips the fetch and proceeds without private-dependency access rather than failing.</div>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <div data-step="4" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Execution</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Choose where AI-Implement executes implementation runs.</p>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
+        <div id="np-local-docker-note" class="alert info" hidden style="margin-bottom:18px">
+          <div class="alert-icon">&#8505;</div>
+          <div>
+            <div class="alert-title">Filesystem tickets use local Docker</div>
+            <div class="alert-desc">With <span class="mono">RUNNER_MODE=local</span>, this project runs in the local Docker runner and still opens real GitHub PRs for review iteration. No Fly credentials are needed for this path.</div>
+          </div>
+        </div>
+        <div id="np-hosted-runner-options" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
           <div class="runner-card active" data-runner="github-actions" onclick="selectExecutionMode('github-actions')">
             <div style="font-size:13px;font-weight:600;margin-bottom:4px">GitHub Actions</div>
             <div style="font-size:12px;color:var(--fg-secondary)">Run Claude via GitHub-hosted or self-hosted runners. Zero infrastructure overhead.</div>
@@ -137,7 +214,7 @@ export const stepperHtml = `
           </div>
         </div>
         <div id="np-fly-fields" hidden style="margin-bottom:18px">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
             <div class="field">
               <label class="field-label">CPUs</label>
               <input class="input" id="np-cpus" type="number" min="1" value="2">
@@ -145,6 +222,14 @@ export const stepperHtml = `
             <div class="field">
               <label class="field-label">Memory (MB)</label>
               <input class="input" id="np-mem" type="number" min="256" step="256" value="4096">
+            </div>
+            <div class="field">
+              <label class="field-label" for="np-cpu-kind">CPU kind</label>
+              <select class="select" id="np-cpu-kind">
+                <option value="shared">shared</option>
+                <option value="performance">performance</option>
+              </select>
+              <div class="field-hint">Fly limits a shared CPU. Use performance for a project whose tests use the CPU for more than some minutes. Performance needs 2048 MB or more for each CPU.</div>
             </div>
           </div>
         </div>
@@ -158,7 +243,7 @@ export const stepperHtml = `
         </div>
       </div>
 
-      <div data-step="4" hidden>
+      <div data-step="5" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Provider</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Select the AI provider and configure planning behaviour.</p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
@@ -202,9 +287,9 @@ export const stepperHtml = `
         </div>
       </div>
 
-      <div data-step="5" hidden>
+      <div data-step="6" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Capacity</h3>
-        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Limit how many AI issues run concurrently for this project.</p>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">How much work this project may have running, and how long each run may take. Every cap applies to re-dispatches as well as initial runs.</p>
         <div class="alert warn" style="margin-bottom:18px">
           <div class="alert-icon">&#9888;</div>
           <div style="flex:1">
@@ -212,14 +297,51 @@ export const stepperHtml = `
             <div class="alert-desc">Each in-progress issue consumes API quota and spawns at least one GitHub Actions run or Fly Machine. Keep low (1&ndash;3) while evaluating.</div>
           </div>
         </div>
-        <div class="field" style="max-width:180px">
-          <label class="field-label">Max parallel AI issues</label>
-          <input class="input" type="number" id="np-maxAi" min="1" value="3">
-          <div class="field-hint">Must be a positive integer.</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="field">
+            <label class="field-label">Max parallel AI issues</label>
+            <input class="input" type="number" id="np-maxAi" min="1" value="3">
+            <div class="field-hint">Issues in flight at once for this project. Must be a positive integer.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Max Turns <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input" type="number" id="np-maxTurns" min="1" step="1" placeholder="50">
+            <div class="field-hint">Claude turns per implement pass. Blank = 50.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Max Iterations <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input" type="number" id="np-maxIterations" min="1" step="1" placeholder="3">
+            <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">PR Dispatch Budget <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input" type="number" id="np-prDispatchBudget" min="1" step="1" placeholder="4">
+            <div class="field-hint">Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Review process</label>
+            <select class="select" id="np-review-process">
+              <option value="ai-implement">AI-Implement</option>
+              <option value="claude-code-review">Claude Code Review</option>
+              <option value="codex-code-review">Codex Code Review</option>
+              <option value="claude-code-review-repository-fix">Claude Code Review, repository auto-fix</option>
+            </select>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Codex Code Review reads the hosted Codex verdict for the PR head. Restate coordinates AI-Implement fix attempts on every backend.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Trusted Review Authors <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <textarea class="textarea" id="np-trusted-review-authors" rows="3" placeholder="topia-ai-implement-bot[bot]"></textarea>
+            <div class="field-hint">Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Job Timeout (min) <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input" type="number" id="np-maxJobMinutes" min="1" step="1" placeholder="90">
+            <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
+          </div>
         </div>
       </div>
 
-      <div data-step="6" hidden>
+      <div data-step="7" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Secrets</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Optionally seed one or more secrets for this project now. You can always add or update secrets later via the Secrets button on the Projects page.</p>
         <div class="alert info" style="margin-bottom:18px">
@@ -233,72 +355,167 @@ export const stepperHtml = `
         <button class="btn btn-sm" onclick="addSecretRow()">+ Add secret</button>
       </div>
 
-      <div data-step="7" hidden>
+      <div data-step="8" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Review</h3>
-        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Confirm your settings before creating the project.</p>
-        <div style="display:flex;flex-direction:column">
-          <div class="np-review-row">
-            <div class="np-review-label">Ticketing</div>
-            <div data-review="ticketing"></div>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Confirm your settings before creating the project. Each section shows the setup checks for its settings, run as the project would be saved.</p>
+        <div style="display:flex;flex-direction:column;gap:22px">
+          <div class="np-review-section" data-section="ticketing">
+            <div class="section-h"><h3>Ticketing</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('ticketing')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">System</div>
+                <div data-review="ticketing"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Config</div>
+                <div data-review="ticketingConfig"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Team key</div>
+                <div data-review="teamKey"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Ticketing Config</div>
-            <div data-review="ticketingConfig"></div>
+
+          <div class="np-review-section" data-section="source">
+            <div class="section-h"><h3>Source</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('source')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Repository</div>
+                <div data-review="repo"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Default branch</div>
+                <div data-review="defaultBranch"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Branch prefix</div>
+                <div data-review="branchPrefix"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Protected files</div>
+                <div data-review="sensitiveAddPatterns"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Exceptions</div>
+                <div data-review="sensitiveAllowPatterns"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Team Key</div>
-            <div data-review="teamKey" class="mono"></div>
+
+          <div class="np-review-section" data-section="context">
+            <div class="section-h"><h3>Context</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('context')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Skills repo</div>
+                <div data-review="skillsRepo"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Reference repositories</div>
+                <div data-review="referenceRepos"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Dependency token scope</div>
+                <div data-review="dependencyTokenScope"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Repository</div>
-            <div data-review="repo" class="mono"></div>
+
+          <div class="np-review-section" data-section="execution">
+            <div class="section-h"><h3>Execution</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('execution')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Mode</div>
+                <div data-review="runner"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Session mode</div>
+                <div data-review="session"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Default branch</div>
-            <div data-review="defaultBranch" class="mono"></div>
+
+          <div class="np-review-section" data-section="provider">
+            <div class="section-h"><h3>Provider</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('provider')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Claude provider</div>
+                <div data-review="provider"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Planning</div>
+                <div data-review="planning"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Skills Repo</div>
-            <div data-review="skillsRepo" class="mono"></div>
+
+          <div class="np-review-section" data-section="capacity">
+            <div class="section-h"><h3>Capacity</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('capacity')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Parallel issues</div>
+                <div data-review="cap"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Run caps</div>
+                <div data-review="caps"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Review process</div>
+                <div data-review="reviewProcess"></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Trusted authors</div>
+                <div data-review="trustedReviewAuthors"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Sensitive add patterns</div>
-            <div data-review="sensitiveAddPatterns"></div>
+
+          <div class="np-review-section" data-section="secrets">
+            <div class="section-h"><h3>Secrets</h3><button type="button" class="btn btn-ghost btn-sm text-accent np-review-change" onclick="changeReviewSection('secrets')">Change</button></div>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Seeded</div>
+                <div data-review="secrets"></div>
+              </div>
+            </div>
+            <div class="np-review-checks"></div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Allowed exceptions</div>
-            <div data-review="sensitiveAllowPatterns"></div>
+
+          <div>
+            <div class="section-h"><h3>Pinned defaults</h3></div>
+            <p class="np-review-lead">Most projects keep these. The Edit dialog can change them if yours needs to.</p>
+            <div class="np-review-rows">
+              <div class="np-review-row">
+                <div class="np-review-label">Workflow file</div>
+                <div><span class="mono">claude-implement.yml</span></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Planning workflow</div>
+                <div><span class="mono">claude-plan.yml</span></div>
+              </div>
+              <div class="np-review-row">
+                <div class="np-review-label">Extra env</div>
+                <div>none</div>
+              </div>
+            </div>
           </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Dep. Token Scope</div>
-            <div data-review="dependencyTokenScope"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Runner</div>
-            <div data-review="runner"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Session mode</div>
-            <div data-review="session"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Provider</div>
-            <div data-review="provider"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Planning</div>
-            <div data-review="planning"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Capacity</div>
-            <div data-review="cap"></div>
-          </div>
-          <div class="np-review-row">
-            <div class="np-review-label">Secrets</div>
-            <div data-review="secrets"></div>
+
+          <div class="np-review-section" data-section="orchestrator" hidden>
+            <div class="section-h"><h3>This orchestrator</h3></div>
+            <p class="np-review-lead">Shared by every project, and fixed on the Setup page.</p>
+            <div class="np-review-checks"></div>
           </div>
         </div>
       </div>
+    </div>
+
     </div>
 
     <div id="np-error" class="error hidden" style="margin:0 24px"></div>
@@ -307,6 +524,7 @@ export const stepperHtml = `
       <button class="btn btn-sm" onclick="closeNewProjectStepper()">Cancel</button>
       <div style="display:flex;gap:6px">
         <button id="np-back" class="btn btn-sm" onclick="stepperBack()" hidden>Back</button>
+        <button type="button" id="np-setup-check-btn" class="btn btn-sm" onclick="checkSetup()" hidden>Check setup</button>
         <button id="np-next" class="btn btn-primary btn-sm" onclick="stepperNext()">Continue &rarr;</button>
         <button id="np-create" class="btn btn-accent btn-sm" onclick="stepperSubmit()" hidden>Create project</button>
       </div>
@@ -318,40 +536,55 @@ export const stepperHtml = `
 export const stepperScript = `
 (function () {
   let step = 0;
-  const LAST_STEP = 7;
-  const STEP_LABELS = ['Ticketing', 'Config', 'Source', 'Runner', 'Provider', 'Capacity', 'Secrets', 'Review'];
+  const LAST_STEP = 8;
+  const STEP_LABELS = ['Ticketing', 'Config', 'Source', 'Context', 'Execution', 'Provider', 'Capacity', 'Secrets', 'Review'];
   const data = {
     ticketingProvider: 'linear',
+    filesystemDirectory: '',
     jiraJql: '',
+    jiraRepoFieldValue: '',
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
     jiraProfilesFieldOverride: '',
-    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '', dependencyTokenScope: null,
-    executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
+    jiraBaseBranchFieldOverride: '',
+    teamKey: '', githubRepo: '', owner: '', repo: '', defaultBranch: '', branchPrefix: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
+    skillsRepo: '', referenceRepos: [], dependencyTokenScope: null,
+    executionMode: 'github-actions', machineCpuKind: 'shared', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
-    maxInProgressAiIssues: 3,
+    maxInProgressAiIssues: 3, maxTurns: null, maxIterations: null, prDispatchBudget: null, maxJobMinutes: null,
+    reviewProcess: 'ai-implement', trustedReviewAuthors: null,
     secrets: [],
   };
   let jiraFieldsLoaded = false;
 
   function openNewProjectStepper() {
     // Reset state
+    reviewReturnAt = null;
+    continueSeq++;
     step = 0;
+    clearSetupCheck();
     data.ticketingProvider = 'linear';
+    data.filesystemDirectory = '';
     data.jiraJql = '';
+    data.jiraRepoFieldValue = '';
     data.jiraStatusFieldOverride = '';
     data.jiraRepoFieldOverride = '';
     data.jiraProfilesFieldOverride = '';
+    data.jiraBaseBranchFieldOverride = '';
     data.teamKey = '';
+    data.githubRepo = '';
     data.owner = '';
     data.repo = '';
     data.defaultBranch = '';
+    data.branchPrefix = '';
     data.skillsRepo = '';
+    data.referenceRepos = [];
     data.sensitiveAddPatterns = '';
     data.sensitiveAllowPatterns = '';
     data.dependencyTokenScope = null;
     data.executionMode = 'github-actions';
+    data.machineCpuKind = 'shared';
     data.machineCpus = 2;
     data.machineMemoryMb = 4096;
     data.sessionMode = 'autonomous';
@@ -361,16 +594,27 @@ export const stepperScript = `
     data.autoApprovePlans = true;
     data.autoMerge = false;
     data.maxInProgressAiIssues = 3;
+    data.maxTurns = null;
+    data.maxIterations = null;
+    data.prDispatchBudget = null;
+    data.reviewProcess = 'ai-implement';
+    data.trustedReviewAuthors = null;
+    data.maxJobMinutes = null;
     data.secrets = [];
 
-    // Clear inputs
-    const toClear = ['np-teamKey', 'np-github-repo', 'np-defaultBranch', 'np-skills-repo', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion'];
+    // Clear inputs. Not derived from the initializer above — a new field needs both.
+    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-github-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-prDispatchBudget', 'np-maxJobMinutes', 'np-trusted-review-authors'];
     const depScopeEl = document.getElementById('np-dep-token-scope');
     if (depScopeEl) depScopeEl.value = '';
+    const reviewProcessEl = document.getElementById('np-review-process');
+    if (reviewProcessEl) reviewProcessEl.value = 'ai-implement';
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
     }
+    refRepoPending = null;
+    npRenderRefRepos();
+    document.getElementById('np-cpu-kind').value = 'shared';
     const cpusEl = document.getElementById('np-cpus');
     if (cpusEl) cpusEl.value = '2';
     const memEl = document.getElementById('np-mem');
@@ -392,6 +636,8 @@ export const stepperScript = `
     }
     const flyFields = document.getElementById('np-fly-fields');
     if (flyFields) flyFields.setAttribute('hidden', '');
+    const localDockerNote = document.getElementById('np-local-docker-note');
+    if (localDockerNote) localDockerNote.setAttribute('hidden', '');
 
     // Reset provider cards
     for (const card of document.querySelectorAll('[data-provider]')) {
@@ -411,18 +657,29 @@ export const stepperScript = `
     if (tpEl) tpEl.value = 'linear';
     const jqlEl = document.getElementById('np-jira-jql');
     if (jqlEl) jqlEl.value = '';
+    const repoValSel = document.getElementById('np-jira-repo-value');
+    if (repoValSel) {
+      repoValSel.innerHTML = '<option value="">(none, matches the repository)</option>';
+      repoValSel.classList.remove('hidden');
+    }
+    const repoValTxt = document.getElementById('np-jira-repo-value-text');
+    if (repoValTxt) { repoValTxt.value = ''; repoValTxt.classList.add('hidden'); }
     const statusFldEl = document.getElementById('np-jira-status-field');
     if (statusFldEl) statusFldEl.value = '';
     const repoFldEl = document.getElementById('np-jira-repo-field');
     if (repoFldEl) repoFldEl.value = '';
     const profilesFldEl = document.getElementById('np-jira-profiles-field');
     if (profilesFldEl) profilesFldEl.value = '';
+    const baseBranchFldEl = document.getElementById('np-jira-base-branch-field');
+    if (baseBranchFldEl) baseBranchFldEl.value = '';
     const jqlStatus = document.getElementById('np-jira-jql-status');
     if (jqlStatus) { jqlStatus.textContent = ''; jqlStatus.style.color = ''; }
     const linearCfg = document.getElementById('np-linear-config');
     if (linearCfg) linearCfg.setAttribute('hidden', '');
     const jiraCfg = document.getElementById('np-jira-config');
     if (jiraCfg) jiraCfg.setAttribute('hidden', '');
+    const filesystemCfg = document.getElementById('np-filesystem-config');
+    if (filesystemCfg) filesystemCfg.setAttribute('hidden', '');
 
     // Hide error
     const errEl = document.getElementById('np-error');
@@ -451,9 +708,6 @@ export const stepperScript = `
       const cls = i === step ? 'active' : i < step ? 'done' : '';
       const numContent = i < step ? '&#10003;' : String(i + 1);
       html += '<div class="stepper-step ' + cls + '"><div class="num">' + numContent + '</div>' + STEP_LABELS[i] + '</div>';
-      if (i < STEP_LABELS.length - 1) {
-        html += '<div class="stepper-divider"></div>';
-      }
     }
     rail.innerHTML = html;
   }
@@ -463,15 +717,24 @@ export const stepperScript = `
     const provider = provEl ? provEl.value : 'linear';
     const linearSection = document.getElementById('np-linear-config');
     const jiraSection = document.getElementById('np-jira-config');
+    const filesystemSection = document.getElementById('np-filesystem-config');
     const descEl = document.getElementById('np-ticketing-desc');
     if (provider === 'jira') {
       if (linearSection) linearSection.setAttribute('hidden', '');
       if (jiraSection) jiraSection.removeAttribute('hidden');
+      if (filesystemSection) filesystemSection.setAttribute('hidden', '');
       if (descEl) descEl.textContent = 'Configure the JQL scope and field mappings for this Jira mapping.';
       stepperLoadJiraFields();
+      stepperPreloadRepoFieldOptions();
+    } else if (provider === 'filesystem') {
+      if (linearSection) linearSection.setAttribute('hidden', '');
+      if (jiraSection) jiraSection.setAttribute('hidden', '');
+      if (filesystemSection) filesystemSection.removeAttribute('hidden');
+      if (descEl) descEl.textContent = 'Configure the local Markdown ticket directory. The backend validates filesystem mappings only when the effective runner mode is local.';
     } else {
       if (linearSection) linearSection.removeAttribute('hidden');
       if (jiraSection) jiraSection.setAttribute('hidden', '');
+      if (filesystemSection) filesystemSection.setAttribute('hidden', '');
       if (descEl) descEl.textContent = 'Configure the Linear team this mapping operates on.';
     }
   }
@@ -495,28 +758,23 @@ export const stepperScript = `
     const createBtn = document.getElementById('np-create');
 
     if (backBtn) { if (n === 0) backBtn.setAttribute('hidden', ''); else backBtn.removeAttribute('hidden'); }
+    if (n === LAST_STEP) reviewReturnAt = null;
     if (nextBtn) { if (n === LAST_STEP) nextBtn.setAttribute('hidden', ''); else nextBtn.removeAttribute('hidden'); }
+    if (nextBtn) nextBtn.textContent = n === reviewReturnAt ? 'Back to review' : 'Continue →';
     if (createBtn) { if (n === LAST_STEP) createBtn.removeAttribute('hidden'); else createBtn.setAttribute('hidden', ''); }
+    const checkBtn = document.getElementById('np-setup-check-btn');
+    if (checkBtn) checkBtn.hidden = n !== LAST_STEP;
 
     renderRail();
     updateStepperNextButton();
-    if (n === LAST_STEP) populateReview();
-  }
-
-  // Parses the single "owner/repo" input into its two stored halves. Returns null
-  // when the value isn't exactly one slash with both sides non-empty, so callers
-  // can treat "unparseable" and "empty" the same way. A pasted GitHub URL is
-  // accepted, since that is what a browser hands you when you copy a repo.
-  function splitGithubRepo(raw) {
-    let v = String(raw == null ? '' : raw).trim();
-    v = v.replace(/^https?:\\/\\/(?:www\\.)?github\\.com\\//i, '').replace(/\\.git$/i, '');
-    v = v.replace(/^\\/+/, '').replace(/\\/+$/, '');
-    const parts = v.split('/');
-    if (parts.length !== 2) return null;
-    const owner = parts[0].trim();
-    const repo = parts[1].trim();
-    if (!owner || !repo) return null;
-    return { owner: owner, repo: repo };
+    if (n === LAST_STEP) {
+      populateReview();
+      showSetupCheckMessage();
+      refreshSetupCheck();
+    } else {
+      // The step arrived at owns the error area. A step that refused Continue stays where it is, so its own error is untouched.
+      hideError();
+    }
   }
 
   function updateStepperNextButton() {
@@ -531,86 +789,336 @@ export const stepperScript = `
       if (provider === 'jira') {
         const jql = (document.getElementById('np-jira-jql') || {}).value || '';
         if (!jql.trim()) ok = false;
+      } else if (provider === 'filesystem') {
+        const dir = (document.getElementById('np-filesystem-directory') || {}).value || '';
+        if (!dir.trim()) ok = false;
       } else {
         const tk = (document.getElementById('np-teamKey') || {}).value || '';
         if (!tk.trim()) ok = false;
       }
     } else if (step === 2) {
-      const gh = splitGithubRepo((document.getElementById('np-github-repo') || {}).value || '');
+      const gh = (document.getElementById('np-github-repo') || {}).value || '';
       const br = (document.getElementById('np-defaultBranch') || {}).value || '';
-      if (!gh || !br.trim()) ok = false;
-      resetInstallState();
+      if (!gh.trim() || !br.trim()) ok = false;
     }
     if (ok) nextBtn.removeAttribute('disabled');
     else nextBtn.setAttribute('disabled', '');
   }
 
-  async function checkInstallState() {
-    const parsed = splitGithubRepo((document.getElementById('np-github-repo') || {}).value || '');
-    const owner = parsed ? parsed.owner : '';
-    const repo = parsed ? parsed.repo : '';
-    const out = document.getElementById('np-install-state');
-    const btn = document.getElementById('np-install-check');
-    if (!out || !btn) return;
-    if (!owner || !repo) {
-      out.innerHTML = '<span style="color:var(--fg-tertiary)">Enter the repository as owner/repo first.</span>';
-      return;
-    }
-    btn.disabled = true;
-    btn.textContent = 'Checking…';
-    out.innerHTML = '';
-    try {
-      const res = await window.api('/api/admin/github-install-state?owner=' + encodeURIComponent(owner) + '&repo=' + encodeURIComponent(repo));
-      const data = await res.json();
-      if (!res.ok) {
-        out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check: ' + window.esc(data.error || 'unknown error') + '</span>';
-        return;
-      }
-      out.innerHTML = renderInstallState(data);
-    } catch (_) {
-      out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check installation.</span>';
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Re-check';
-    }
-  }
-  
-  function renderInstallState(data) {
-    const state = data.state;
-    if (state === 'ready') {
-      return '<span class="badge success">Ready</span> The App is installed and can access this repo.';
-    }
-    if (state === 'app-not-installed') {
-      return '<span class="badge warn">Action needed</span> The App is not installed on this owner. '
-        + '<a class="text-accent" href="' + window.safeUrl(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Install the App &#8599;</a> then Re-check.';
-    }
-    if (state === 'repo-not-selected') {
-      return '<span class="badge warn">Action needed</span> The App is installed, but this repo is not in its selected repositories. '
-      + '<a class="text-accent" href="' + window.safeUrl(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Add this repo &#8599;</a> then Re-check.';
-    }
-    return '';
+  // The candidate the shown results were checked for, so Review runs the checks again only once the project changed.
+  let setupCheckedFor = null;
+  // Each check's number, so an answer to an older check never replaces a newer one's.
+  let setupCheckSeq = 0;
+  // Create waits while a check runs, and while any of the project's own required checks fails.
+  let setupCheckRunning = false;
+  let setupCheckBlocking = [];
+
+  // The project's own required rows that fail: the core and mode tiers, judged and stamped with the project, which a step here can fix.
+  // An orchestrator-wide row, or one that cannot be verified, never blocks, since nothing in this window fixes it.
+  function setupBlockingRows(results) {
+    return results.filter(function (row) {
+      return row.project !== undefined && row.tier !== 'feature' && row.verifiable !== false && row.state === 'fail';
+    });
   }
 
-  // Clears a stale probe result when owner/repo change, so a "Ready" for the old repo can't linger.
-  function resetInstallState() {
-    const out = document.getElementById('np-install-state');
-    const btn = document.getElementById('np-install-check');
-    if (out) out.innerHTML = '';
-    if (btn) btn.textContent = 'Check installation';
+  function updateCreateGate() {
+    const createBtn = document.getElementById('np-create');
+    if (!createBtn) return;
+    createBtn.disabled = setupCheckRunning || setupCheckBlocking.length > 0;
+    createBtn.title = setupCheckRunning ? 'Waiting for the setup checks' : setupCheckBlocking.length ? 'A required setup check fails' : '';
+  }
+
+  function listTitles(rows) {
+    const titles = rows.map(function (row) { return row.title; });
+    return titles.length < 2 ? titles.join('') : titles.slice(0, -1).join(', ') + ' and ' + titles[titles.length - 1];
+  }
+
+  // The project as Create would save it.
+  function setupCheckCandidate() {
+    for (let i = 0; i < LAST_STEP; i++) collectStep(i);
+    return mappingBody();
+  }
+
+  // Runs the checks as Review opens, unless the results shown are already for this project as it stands.
+  function refreshSetupCheck() {
+    if (JSON.stringify(setupCheckCandidate()) !== setupCheckedFor) checkSetup();
+  }
+
+  // What the last check has to say in the stepper's error area on Review: what keeps Create unavailable, or why it could not run.
+  let setupCheckMessage = '';
+
+  // Shows the check's message on Review. Other steps own the error area for their own validation.
+  function showSetupCheckMessage() {
+    if (step !== LAST_STEP) return;
+    if (setupCheckMessage) showError(setupCheckMessage);
+    else hideError();
+  }
+
+  function clearSetupCheck() {
+    setupCheckSeq++;
+    setupCheckedFor = null;
+    setupCheckRunning = false;
+    setupCheckBlocking = [];
+    setupCheckMessage = '';
+    updateCreateGate();
+    const btn = document.getElementById('np-setup-check-btn');
+    renderReviewChecks(null);
+    if (btn) { btn.disabled = false; btn.textContent = 'Check setup'; }
+  }
+
+  async function checkSetup() {
+    const btn = document.getElementById('np-setup-check-btn');
+    if (!btn) return;
+    const body = setupCheckCandidate();
+    const seq = ++setupCheckSeq;
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    setupCheckMessage = '';
+    showSetupCheckMessage();
+    renderReviewChecks(null);
+    setupCheckedFor = null;
+    setupCheckRunning = true;
+    setupCheckBlocking = [];
+    updateCreateGate();
+    try {
+      const res = await window.api('/api/setup-checks/candidate', { method: 'POST', body: JSON.stringify(body) });
+      let payload = {};
+      try { payload = await res.json(); } catch (_) {}
+      if (seq !== setupCheckSeq) return;
+      if (!res.ok) {
+        // A 400 is the save's own refusal, which names the field. Anything else is the run failing on the orchestrator's side.
+        setupCheckMessage = res.status === 400
+          ? 'Could not check: ' + (payload.error || 'unknown error')
+          : 'The checks could not run. The orchestrator\\'s log has the error.';
+        return;
+      }
+      setupCheckedFor = JSON.stringify(body);
+      setupCheckBlocking = setupBlockingRows(payload.results || []);
+      setupCheckMessage = setupGateLine(payload.results || []);
+      renderReviewChecks(payload.results || []);
+    } catch (_) {
+      if (seq === setupCheckSeq) setupCheckMessage = 'Could not check setup.';
+    } finally {
+      if (seq === setupCheckSeq) {
+        // Checks that could not run leave Create open, since a network failure should not stop a save.
+        setupCheckRunning = false;
+        updateCreateGate();
+        showSetupCheckMessage();
+        btn.disabled = false;
+        btn.textContent = 'Re-check';
+      }
+    }
+  }
+
+
+  function setupFoldLabel(rows) {
+    const passing = rows.filter(function (row) { return row.state === 'pass'; }).length;
+    const notApplicable = rows.length - passing;
+    return [passing ? passing + ' passing' : '', notApplicable ? notApplicable + ' not applicable' : ''].filter(Boolean).join(', ');
+  }
+
+  // The line that names what keeps Create unavailable, shown as text in the error area above it.
+  function setupGateLine(results) {
+    const blocking = setupBlockingRows(results);
+    if (!blocking.length) return '';
+    return 'Create is unavailable while ' + (blocking.length === 1 ? 'this check fails: ' : 'these checks fail: ')
+      + listTitles(blocking) + '. Fix ' + (blocking.length === 1 ? 'it' : 'each') + ', then check again.';
+  }
+
+  // The Review section holding the settings a check reads, where an id's prefix does not already say.
+  const SETUP_CHECK_SECTION = {
+    'github.reference-repos': 'context',
+    'github.skills-repo': 'context',
+    'github.target-secrets': 'execution',
+    'github.review-process': 'capacity',
+  };
+
+  // A row with no project is the orchestrator's own, shared by every project and fixed on the Setup page.
+  function reviewSectionOf(row) {
+    if (row.project === undefined) return 'orchestrator';
+    return SETUP_CHECK_SECTION[row.id] || (row.id.indexOf('tracker.') === 0 ? 'ticketing' : 'source');
+  }
+
+  // Each section's checks under its settings. Null clears them while no answer is shown.
+  function renderReviewChecks(results) {
+    // Shading counts on from the open checks into the folded ones, so the alternation holds once the fold opens.
+    const items = function (list, hidden, from) {
+      return list.map(function (row, i) { return window.setupCheckItem(row, hidden, (from + i) % 2 === 1); }).join('');
+    };
+    for (const section of document.querySelectorAll('#np-step-body .np-review-section')) {
+      const key = section.dataset.section;
+      // Worst first, so what needs fixing leads. The passing and not-applicable rows fold away, as on the Setup page.
+      const order = window.SETUP_STATE_ORDER;
+      const rows = (results || []).filter(function (row) { return reviewSectionOf(row) === key; })
+        .sort(function (a, b) { return order.indexOf(a.state) - order.indexOf(b.state); });
+      const open = window.groupWaitingRows(rows.filter(function (row) { return window.SETUP_ACTIONABLE.indexOf(row.state) !== -1; }));
+      const folded = rows.filter(function (row) { return window.SETUP_ACTIONABLE.indexOf(row.state) === -1; });
+      const checks = section.querySelector('.np-review-checks');
+      // A card headed so what the rows are is said, beneath the settings they check.
+      const card = function (body) {
+        return '<div class="card np-checks-card"><div class="card-header"><h4 class="card-title">Setup checks</h4></div><div class="np-checks-body">' + body + '</div></div>';
+      };
+      if (key === 'orchestrator') {
+        // Only what needs attention: the rest reads the same for every project.
+        section.hidden = !rows.length;
+        checks.innerHTML = rows.length ? card(open.length ? items(open, false, 0) : '<div class="np-review-note">The orchestrator\\'s own checks pass.</div>') : '';
+        continue;
+      }
+      const fold = folded.length
+        ? '<div class="np-review-fold"><button type="button" class="btn btn-ghost btn-sm text-accent" aria-expanded="false" onclick="toggleReviewFold(this)">'
+          + '<span style="display:inline-block">›</span> ' + window.esc(setupFoldLabel(folded)) + '</button></div>'
+        : '';
+      checks.innerHTML = rows.length ? card(items(open, false, 0) + fold + items(folded, true, open.length)) : '';
+    }
+  }
+
+  function toggleReviewFold(button) {
+    const opening = button.getAttribute('aria-expanded') !== 'true';
+    button.setAttribute('aria-expanded', opening ? 'true' : 'false');
+    button.firstElementChild.style.transform = opening ? 'rotate(90deg)' : '';
+    for (let item = button.parentElement.nextElementSibling; item; item = item.nextElementSibling) item.hidden = !opening;
+  }
+
+  // The first and last step behind each Review section. Ticketing starts at its system, since that decides what Config asks.
+  const REVIEW_SECTION_STEPS = { ticketing: [0, 1], source: [2, 2], context: [3, 3], execution: [4, 4], provider: [5, 5], capacity: [6, 6], secrets: [7, 7] };
+  // While a Review section is being changed, the step whose Continue returns to Review instead of walking the later steps.
+  let reviewReturnAt = null;
+
+  // Change: back to the section's first step with its values kept, shown as Continue shows it, so the step behaves as it does
+  // on the way through. Continue walks the section's steps, and its last one returns to Review, where the checks run again.
+  function changeReviewSection(key) {
+    const range = REVIEW_SECTION_STEPS[key];
+    reviewReturnAt = range[1];
+    step = range[0];
+    showStep(step);
+  }
+
+  // Row markup and rules come from the Projects page; this side owns its inputs and draft.
+  // refRepoPending carries the last staging attempt's message for validateStep.
+  let refRepoPending = null;
+  const NP_REFREPO_INPUTS = ['np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref'];
+
+  function npRenderRefRepos() {
+    const el = document.getElementById('np-refrepo-list');
+    if (el) el.innerHTML = window.refRepoRowsHtml(data.referenceRepos, 'npRemoveRefRepo');
+  }
+
+  function npStageRefRepo() {
+    const value = function (id) {
+      const el = document.getElementById(id);
+      return el ? el.value : '';
+    };
+    const problem = window.refRepoStage(
+      { repo: value(NP_REFREPO_INPUTS[0]), path: value(NP_REFREPO_INPUTS[1]), ref: value(NP_REFREPO_INPUTS[2]) },
+      data.referenceRepos,
+    );
+    if (problem) return problem;
+    for (const id of NP_REFREPO_INPUTS) {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    }
+    npRenderRefRepos();
+    return null;
+  }
+
+  function npPendingRefRepo() {
+    return NP_REFREPO_INPUTS.some(function (id) {
+      const el = document.getElementById(id);
+      return !!(el && el.value.trim());
+    });
+  }
+
+  function npAddRefRepo() {
+    const problem = npStageRefRepo();
+    if (problem) showError(problem);
+    else hideError();
+  }
+
+  function npRemoveRefRepo(i) {
+    data.referenceRepos.splice(i, 1);
+    npRenderRefRepos();
   }
 
   function stepperBack() {
+    continueSeq++;
     collectStep(step);
     step--;
     showStep(step);
   }
 
-  function stepperNext() {
-    collectStep(step);
-    if (validateStep(step)) {
-      step++;
-      showStep(step);
+  // The step holding each field a save can refuse. A Jira or Filesystem project's key comes from Source's repository.
+  const FIELD_STEPS = {
+    ticketingProvider: 0, ticketingConfig: 1,
+    owner: 2, repo: 2, defaultBranch: 2, branchPrefix: 2, sensitiveAddPatterns: 2, sensitiveAllowPatterns: 2,
+    skillsRepo: 3, referenceRepos: 3, dependencyTokenScope: 3,
+    executionMode: 4, sessionMode: 4, machineCpus: 4, machineMemoryMb: 4,
+    provider: 5, awsRegion: 5,
+    maxInProgressAiIssues: 6, maxTurns: 6, maxIterations: 6, prDispatchBudget: 6, maxJobMinutes: 6, reviewProcess: 6, trustedReviewAuthors: 6,
+  };
+
+  function fieldStep(field) {
+    if (field === 'teamKey') return data.ticketingProvider === 'linear' ? 1 : 2;
+    return FIELD_STEPS[field];
+  }
+
+  // Each Continue's number, so an answer to an older one never moves the stepper.
+  let continueSeq = 0;
+
+  // The save's refusal of the project as entered, or null. A request that fails refuses nothing, since Create validates again.
+  async function saveRefusal() {
+    try {
+      const res = await window.api('/api/mappings/validate', { method: 'POST', body: JSON.stringify(mappingBody()) });
+      if (res.status !== 400) return null;
+      const payload = await res.json();
+      return { field: payload.field, error: payload.error || 'unknown error' };
+    } catch (_) {
+      return null;
     }
+  }
+
+  // Continue checks the step's own fields here, then asks the save whether it would accept the project so far. A refusal of
+  // a field on a step not reached yet waits for that step. One on an earlier step returns there, so it shows beside its field.
+  async function stepperNext() {
+    collectStep(step);
+    if (!validateStep(step)) return;
+    const from = step;
+    const seq = ++continueSeq;
+    const nextBtn = document.getElementById('np-next');
+    if (nextBtn) nextBtn.disabled = true;
+    const refusal = await saveRefusal();
+    if (seq !== continueSeq || step !== from) return;
+    updateStepperNextButton();
+    const at = refusal ? fieldStep(refusal.field) : undefined;
+    if (refusal && (at === undefined || at <= from)) {
+      if (at !== undefined && at < from) {
+        step = at;
+        showStep(step);
+      }
+      showError(refusal.error);
+      return;
+    }
+    // The last step of a Review section being changed returns to Review rather than walking the steps after it.
+    step = from === reviewReturnAt ? LAST_STEP : from + 1;
+    showStep(step);
+  }
+
+  // Blank means "use the built-in default", which the payload carries as null. Number()
+  // rather than parseInt so "1.5" fails validation instead of truncating to 1.
+  function optionalCap(id) {
+    const el = document.getElementById(id);
+    const v = el ? el.value.trim() : '';
+    return v === '' ? null : Number(v);
+  }
+
+  const CAP_FIELDS = [
+    ['Max Turns', 'maxTurns'],
+    ['Max Iterations', 'maxIterations'],
+    ['PR Dispatch Budget', 'prDispatchBudget'],
+    ['Job Timeout', 'maxJobMinutes'],
+  ];
+
+  function badCap(value) {
+    return value !== null && (!Number.isInteger(value) || value < 1);
   }
 
   function collectStep(n) {
@@ -621,12 +1129,21 @@ export const stepperScript = `
       if (data.ticketingProvider === 'jira') {
         const jqlEl = document.getElementById('np-jira-jql');
         if (jqlEl) data.jiraJql = jqlEl.value;
+        const sel = document.getElementById('np-jira-repo-value');
+        const txt = document.getElementById('np-jira-repo-value-text');
+        if (sel && !sel.classList.contains('hidden')) data.jiraRepoFieldValue = sel.value.trim();
+        else if (txt) data.jiraRepoFieldValue = txt.value.trim();
         const sf = document.getElementById('np-jira-status-field');
         const rf = document.getElementById('np-jira-repo-field');
         const pf = document.getElementById('np-jira-profiles-field');
+        const bbf = document.getElementById('np-jira-base-branch-field');
         if (sf) data.jiraStatusFieldOverride = sf.value.trim();
         if (rf) data.jiraRepoFieldOverride = rf.value.trim();
         if (pf) data.jiraProfilesFieldOverride = pf.value.trim();
+        if (bbf) data.jiraBaseBranchFieldOverride = bbf.value.trim();
+      } else if (data.ticketingProvider === 'filesystem') {
+        const dirEl = document.getElementById('np-filesystem-directory');
+        if (dirEl) data.filesystemDirectory = dirEl.value.trim();
       } else {
         const tkEl = document.getElementById('np-teamKey');
         if (tkEl) data.teamKey = tkEl.value.trim();
@@ -634,28 +1151,35 @@ export const stepperScript = `
     } else if (n === 2) {
       const ghEl = document.getElementById('np-github-repo');
       const brEl = document.getElementById('np-defaultBranch');
-      const srEl = document.getElementById('np-skills-repo');
+      const bpEl = document.getElementById('np-branch-prefix');
       const saEl = document.getElementById('np-sensitive-add');
       const salEl = document.getElementById('np-sensitive-allow');
       if (ghEl) {
-        const parts = splitGithubRepo(ghEl.value);
-        data.owner = parts ? parts.owner : '';
-        data.repo = parts ? parts.repo : '';
+        const parsed = window.splitGithubRepo(ghEl.value);
+        data.githubRepo = ghEl.value.trim();
+        data.owner = parsed ? parsed.owner : '';
+        data.repo = parsed ? parsed.repo : '';
       }
       if (brEl) data.defaultBranch = brEl.value.trim();
-      if (srEl) data.skillsRepo = srEl.value.trim();
+      if (bpEl) data.branchPrefix = bpEl.value.trim();
       if (saEl) data.sensitiveAddPatterns = saEl.value.trim();
       if (salEl) data.sensitiveAllowPatterns = salEl.value.trim();
-      const dtsEl = document.getElementById('np-dep-token-scope');
-      if (dtsEl) data.dependencyTokenScope = dtsEl.value || null;
     } else if (n === 3) {
+      const srEl = document.getElementById('np-skills-repo');
+      const dtsEl = document.getElementById('np-dep-token-scope');
+      if (srEl) data.skillsRepo = srEl.value.trim();
+      if (dtsEl) data.dependencyTokenScope = dtsEl.value || null;
+      // A filled add row is staged rather than discarded, as on the edit dialog.
+      refRepoPending = npPendingRefRepo() ? npStageRefRepo() : null;
+    } else if (n === 4) {
       const smEl = document.getElementById('np-sessionMode');
       const cpEl = document.getElementById('np-cpus');
       const memEl = document.getElementById('np-mem');
       if (smEl) data.sessionMode = smEl.value;
+      data.machineCpuKind = document.getElementById('np-cpu-kind').value;
       if (cpEl) data.machineCpus = parseInt(cpEl.value, 10) || 2;
       if (memEl) data.machineMemoryMb = parseInt(memEl.value, 10) || 4096;
-    } else if (n === 4) {
+    } else if (n === 5) {
       const arEl = document.getElementById('np-awsRegion');
       const plEl = document.getElementById('np-planning');
       const aaEl = document.getElementById('np-autoApprove');
@@ -664,10 +1188,19 @@ export const stepperScript = `
       if (plEl) data.planningEnabled = plEl.checked;
       if (aaEl) data.autoApprovePlans = aaEl.checked;
       if (amEl) data.autoMerge = amEl.checked;
-    } else if (n === 5) {
-      const maxEl = document.getElementById('np-maxAi');
-      if (maxEl) data.maxInProgressAiIssues = parseInt(maxEl.value, 10);
     } else if (n === 6) {
+      const maxEl = document.getElementById('np-maxAi');
+      if (maxEl) data.maxInProgressAiIssues = maxEl.value.trim() === '' ? NaN : Number(maxEl.value);
+      data.maxTurns = optionalCap('np-maxTurns');
+      data.maxIterations = optionalCap('np-maxIterations');
+      data.prDispatchBudget = optionalCap('np-prDispatchBudget');
+      const rpEl = document.getElementById('np-review-process');
+      if (rpEl) data.reviewProcess = rpEl.value;
+      const taEl = document.getElementById('np-trusted-review-authors');
+      const authors = taEl ? taEl.value.split('\\n').map(function (x) { return x.trim(); }).filter(Boolean) : [];
+      data.trustedReviewAuthors = authors.length ? authors : null;
+      data.maxJobMinutes = optionalCap('np-maxJobMinutes');
+    } else if (n === 7) {
       const secrets = [];
       const list = document.getElementById('np-secrets-list');
       if (list) {
@@ -702,18 +1235,22 @@ export const stepperScript = `
     } else if (n === 1) {
       if (data.ticketingProvider === 'jira') {
         if (!data.jiraJql.trim()) { showError('JQL is required for Jira.'); return false; }
+      } else if (data.ticketingProvider === 'filesystem') {
+        if (!data.filesystemDirectory) { showError('Ticket Directory is required for filesystem ticketing.'); return false; }
+        if (data.filesystemDirectory.charAt(0) !== '/') { showError('Ticket Directory must be an absolute path.'); return false; }
       } else {
         if (!data.teamKey) { showError('Linear Team Key is required.'); return false; }
       }
     } else if (n === 2) {
-      if (!data.owner || !data.repo) {
-        showError('GitHub Repository is required, as owner/repo (e.g. acme-corp/backend).');
-        return false;
-      }
+      if (!data.githubRepo) { showError('GitHub Repository is required, as owner/repo.'); return false; }
+      if (!data.owner || !data.repo) { showError('GitHub Repository must be owner/repo, such as acme-corp/backend, or its GitHub address.'); return false; }
       if (!data.defaultBranch) { showError('Default Branch is required.'); return false; }
     } else if (n === 3) {
-      // executionMode is set via card selection — always valid
+      // Every Context setting is optional; only an add row that cannot be staged blocks.
+      if (refRepoPending) { showError(refRepoPending); return false; }
     } else if (n === 4) {
+      // executionMode is set via card selection — always valid
+    } else if (n === 5) {
       if (data.provider === 'bedrock' && data.executionMode === 'fly-machines') {
         showError('AWS Bedrock cannot be used with the Fly Machines runner. Please change the runner or provider.');
         return false;
@@ -722,10 +1259,16 @@ export const stepperScript = `
         showError('AWS Region is required when using the Bedrock provider.');
         return false;
       }
-    } else if (n === 5) {
-      if (!Number.isFinite(data.maxInProgressAiIssues) || data.maxInProgressAiIssues < 1) {
+    } else if (n === 6) {
+      if (!Number.isInteger(data.maxInProgressAiIssues) || data.maxInProgressAiIssues < 1) {
         showError('Max parallel AI issues must be a positive integer.');
         return false;
+      }
+      for (const cap of CAP_FIELDS) {
+        if (badCap(data[cap[1]])) {
+          showError(cap[0] + ' must be a positive integer, or blank for the default.');
+          return false;
+        }
       }
     }
     return true;
@@ -734,6 +1277,9 @@ export const stepperScript = `
   function effectiveTeamKey() {
     if (data.ticketingProvider === 'jira') {
       return (data.owner && data.repo) ? (data.owner + '/' + data.repo) : '';
+    }
+    if (data.ticketingProvider === 'filesystem') {
+      return (data.owner && data.repo) ? ('filesystem_' + data.owner + '_' + data.repo) : '';
     }
     return data.teamKey;
   }
@@ -744,31 +1290,48 @@ export const stepperScript = `
       if (el) el.innerHTML = html;
     };
 
+    // The mono face goes on the value, never the slot, so a placeholder never inherits it.
+    const monoOr = function (value) {
+      return value ? '<span class="mono">' + window.esc(value) + '</span>' : '&mdash;';
+    };
+
     set('ticketing', window.esc(data.ticketingProvider));
 
     let cfgText;
     if (data.ticketingProvider === 'jira') {
       const jqlPreview = data.jiraJql.length > 80 ? data.jiraJql.substring(0, 80) + '...' : data.jiraJql;
-      cfgText = 'JQL: ' + (window.esc(jqlPreview) || '&mdash;') + ' &middot; repo field=' + (window.esc(effectiveTeamKey()) || '&mdash;');
+      const repoMatch = data.jiraRepoFieldValue || (data.owner && data.repo ? data.owner + '/' + data.repo + ' (the repository)' : '');
+      cfgText = 'JQL: ' + (window.esc(jqlPreview) || '&mdash;') + ' &middot; repo=' + (window.esc(repoMatch) || '&mdash;');
       if (data.jiraStatusFieldOverride) cfgText += ' &middot; statusField=' + window.esc(data.jiraStatusFieldOverride);
       if (data.jiraRepoFieldOverride) cfgText += ' &middot; repoField=' + window.esc(data.jiraRepoFieldOverride);
       if (data.jiraProfilesFieldOverride) cfgText += ' &middot; profilesField=' + window.esc(data.jiraProfilesFieldOverride);
+      if (data.jiraBaseBranchFieldOverride) cfgText += ' &middot; baseBranchField=' + window.esc(data.jiraBaseBranchFieldOverride);
+    } else if (data.ticketingProvider === 'filesystem') {
+      cfgText = 'directory=' + monoOr(data.filesystemDirectory) + ' &middot; local Docker + real GitHub PRs';
     } else {
       cfgText = 'team=' + (window.esc(data.teamKey) || '&mdash;');
     }
     set('ticketingConfig', cfgText);
 
-    set('teamKey', window.esc(effectiveTeamKey()) || '&mdash;');
-    set('repo', window.esc(data.owner) + '/' + window.esc(data.repo));
-    set('defaultBranch', window.esc(data.defaultBranch) || '&mdash;');
-    set('skillsRepo', data.skillsRepo ? window.esc(data.skillsRepo) : '&mdash;');
+    set('teamKey', monoOr(effectiveTeamKey()));
+    set('repo', monoOr(data.owner && data.repo ? data.owner + '/' + data.repo : ''));
+    set('defaultBranch', monoOr(data.defaultBranch));
+    set('branchPrefix', monoOr(data.branchPrefix));
+    set('skillsRepo', monoOr(data.skillsRepo));
     set('sensitiveAddPatterns', data.sensitiveAddPatterns ? (data.sensitiveAddPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' pattern(s)') : '&mdash;');
     set('sensitiveAllowPatterns', data.sensitiveAllowPatterns ? (data.sensitiveAllowPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' exception(s)') : '&mdash;');
+    // Counted rather than listed, like the glob rows above.
+    const refRepoCount = data.referenceRepos.length;
+    set('referenceRepos', refRepoCount
+      ? (refRepoCount + (refRepoCount === 1 ? ' repository' : ' repositories'))
+      : '&mdash;');
     set('dependencyTokenScope', data.dependencyTokenScope ? window.esc(data.dependencyTokenScope) : '&mdash;');
 
-    let runnerText = window.esc(data.executionMode);
-    if (data.executionMode === 'fly-machines') {
-      runnerText += ' &middot; ' + data.machineCpus + 'cpu / ' + data.machineMemoryMb + ' MB';
+    let runnerText = data.ticketingProvider === 'filesystem'
+      ? 'local Docker via RUNNER_MODE=local'
+      : window.esc(data.executionMode);
+    if (data.ticketingProvider !== 'filesystem' && data.executionMode === 'fly-machines') {
+      runnerText += ' &middot; ' + data.machineCpus + 'cpu ' + window.esc(data.machineCpuKind) + ' / ' + data.machineMemoryMb + ' MB';
     }
     set('runner', runnerText);
 
@@ -786,14 +1349,28 @@ export const stepperScript = `
     }
     set('planning', planningText);
 
-    set('cap', data.maxInProgressAiIssues + ' parallel');
+    set('cap', String(data.maxInProgressAiIssues));
+
+    const capText = function (value, unit) { return value == null ? 'default' : value + (unit || ''); };
+    set('caps', 'turns ' + capText(data.maxTurns)
+      + ' &middot; iterations ' + capText(data.maxIterations)
+      + ' &middot; PR budget ' + capText(data.prDispatchBudget)
+      + ' &middot; timeout ' + capText(data.maxJobMinutes, ' min'));
+
+    set('reviewProcess', window.esc(data.reviewProcess));
+    set('trustedReviewAuthors', data.trustedReviewAuthors
+      ? data.trustedReviewAuthors.map(function (l) { return window.esc(l); }).join(', ')
+      : '&mdash;');
 
     const validSecrets = data.secrets.filter(function (s) { return s.name && s.value; });
-    set('secrets', validSecrets.length + ' configured');
+    set('secrets', String(validSecrets.length));
   }
 
   function selectExecutionMode(mode) {
+    if (data.ticketingProvider === 'filesystem') mode = 'github-actions';
     data.executionMode = mode;
+    const hostedOptions = document.getElementById('np-hosted-runner-options');
+    if (hostedOptions) hostedOptions.style.display = data.ticketingProvider === 'filesystem' ? 'none' : 'grid';
     for (const card of document.querySelectorAll('[data-runner]')) {
       card.classList.toggle('active', card.dataset.runner === mode);
     }
@@ -801,6 +1378,11 @@ export const stepperScript = `
     if (flyFields) {
       if (mode === 'fly-machines') flyFields.removeAttribute('hidden');
       else flyFields.setAttribute('hidden', '');
+    }
+    const localDockerNote = document.getElementById('np-local-docker-note');
+    if (localDockerNote) {
+      if (data.ticketingProvider === 'filesystem') localDockerNote.removeAttribute('hidden');
+      else localDockerNote.setAttribute('hidden', '');
     }
     // Refresh bedrock+fly warning if on provider step
     const bedrockWarn = document.getElementById('np-bedrock-fly-warn');
@@ -854,6 +1436,14 @@ export const stepperScript = `
     const provEl = document.getElementById('np-ticketing-provider');
     const provider = provEl ? provEl.value : 'linear';
     data.ticketingProvider = provider;
+    if (provider === 'filesystem') {
+      selectExecutionMode('github-actions');
+      data.sessionMode = 'autonomous';
+      const sessionEl = document.getElementById('np-sessionMode');
+      if (sessionEl) sessionEl.value = 'autonomous';
+    } else {
+      selectExecutionMode(data.executionMode);
+    }
     // If we're already on the Ticketing Config step, re-apply visibility immediately.
     if (step === 1) applyTicketingConfigStepVisibility();
     updateStepperNextButton();
@@ -863,8 +1453,9 @@ export const stepperScript = `
     const statusSel = document.getElementById('np-jira-status-field');
     const repoSel = document.getElementById('np-jira-repo-field');
     const profilesSel = document.getElementById('np-jira-profiles-field');
+    const baseBranchSel = document.getElementById('np-jira-base-branch-field');
     if (jiraFieldsLoaded) return;
-    if (!statusSel && !repoSel && !profilesSel) return;
+    if (!statusSel && !repoSel && !profilesSel && !baseBranchSel) return;
     try {
       const res = await window.api('/api/jira/fields');
       if (!res.ok) return;
@@ -875,15 +1466,19 @@ export const stepperScript = `
       const prevStatus = statusSel ? (statusSel.value || statusSel.dataset.pendingValue || '') : '';
       const prevRepo = repoSel ? (repoSel.value || repoSel.dataset.pendingValue || '') : '';
       const prevProfiles = profilesSel ? (profilesSel.value || profilesSel.dataset.pendingValue || '') : '';
+      const prevBaseBranch = baseBranchSel ? (baseBranchSel.value || baseBranchSel.dataset.pendingValue || '') : '';
       const statusPlaceholder = statusSel && statusSel.options[0] ? statusSel.options[0] : null;
       const repoPlaceholder = repoSel && repoSel.options[0] ? repoSel.options[0] : null;
       const profilesPlaceholder = profilesSel && profilesSel.options[0] ? profilesSel.options[0] : null;
+      const baseBranchPlaceholder = baseBranchSel && baseBranchSel.options[0] ? baseBranchSel.options[0] : null;
       if (statusSel) statusSel.innerHTML = '';
       if (repoSel) repoSel.innerHTML = '';
       if (profilesSel) profilesSel.innerHTML = '';
+      if (baseBranchSel) baseBranchSel.innerHTML = '';
       if (statusSel && statusPlaceholder) statusSel.appendChild(statusPlaceholder);
       if (repoSel && repoPlaceholder) repoSel.appendChild(repoPlaceholder);
       if (profilesSel && profilesPlaceholder) profilesSel.appendChild(profilesPlaceholder);
+      if (baseBranchSel && baseBranchPlaceholder) baseBranchSel.appendChild(baseBranchPlaceholder);
       for (const f of fields) {
         const labelText = f.name + ' (' + f.id + ')';
         if (statusSel) {
@@ -904,43 +1499,96 @@ export const stepperScript = `
           o3.textContent = labelText;
           profilesSel.appendChild(o3);
         }
+        if (baseBranchSel) {
+          const o4 = document.createElement('option');
+          o4.value = f.id;
+          o4.textContent = labelText;
+          baseBranchSel.appendChild(o4);
+        }
       }
       if (statusSel && prevStatus) statusSel.value = prevStatus;
       if (repoSel && prevRepo) repoSel.value = prevRepo;
       if (profilesSel && prevProfiles) profilesSel.value = prevProfiles;
+      if (baseBranchSel && prevBaseBranch) baseBranchSel.value = prevBaseBranch;
       jiraFieldsLoaded = true;
     } catch (err) {
       console.error('stepperLoadJiraFields failed:', err);
     }
   }
 
-  function detectStatusFilterInJql(jql, statusFieldOverride) {
-    // Returns a warning string if the JQL looks like it references the AI-Implement Status
-    // field. The orchestrator wraps the user's JQL with its own status filter, so any
-    // status clause here will conflict with status transitions.
-    if (/ai[\\s\\-_]?implement[\\s\\-_]?status/i.test(jql)) {
-      return 'JQL appears to reference the AI-Implement Status field. ' +
-        'The orchestrator adds its own status filter at query time — including one in ' +
-        'your JQL will prevent the issue from being picked up after status transitions ' +
-        '(e.g. Plan Approved → Implementing won\\'t flow). Remove status filters from this JQL.';
+  async function stepperPreloadRepoFieldOptions() {
+    const repoFieldInput = document.getElementById('np-jira-repo-field');
+    if (repoFieldInput && repoFieldInput.value) {
+      onStepperRepoFieldChange();
+      return;
     }
-    if (statusFieldOverride) {
-      const idPattern = new RegExp('\\\\b' + statusFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
-      if (idPattern.test(jql)) {
-        return 'JQL appears to reference customfield ' + statusFieldOverride + ' (your status field). ' +
-          'The orchestrator adds its own status filter at query time — remove the status clause here.';
+    try {
+      const res = await window.api('/api/jira/fields?name=' + encodeURIComponent('AI-Implement Repo'));
+      if (!res.ok) return;
+      const fields = await res.json();
+      if (Array.isArray(fields) && fields.length === 1) {
+        await stepperPopulateRepoValueOptions(fields[0].id);
       }
+    } catch (err) {
+      console.error('stepperPreloadRepoFieldOptions failed:', err);
     }
-    return null;
+  }
+
+  async function stepperPopulateRepoValueOptions(fieldId) {
+    const select = document.getElementById('np-jira-repo-value');
+    const text = document.getElementById('np-jira-repo-value-text');
+    if (!select || !text) return;
+    try {
+      const res = await window.api('/api/jira/field-options?fieldId=' + encodeURIComponent(fieldId));
+      if (!res.ok) throw new Error('fetch failed');
+      const options = await res.json();
+      if (!Array.isArray(options) || options.length === 0) {
+        select.classList.add('hidden');
+        text.classList.remove('hidden');
+        updateStepperNextButton();
+        return;
+      }
+      let html = '<option value="">(none, matches the repository)</option>';
+      for (const o of options) {
+        html += '<option value="' + window.escAttr(o.value) + '">' + window.esc(o.value) + '</option>';
+      }
+      select.innerHTML = html;
+      select.classList.remove('hidden');
+      text.classList.add('hidden');
+      updateStepperNextButton();
+    } catch (err) {
+      console.error('stepperPopulateRepoValueOptions failed:', err);
+      select.classList.add('hidden');
+      text.classList.remove('hidden');
+      updateStepperNextButton();
+    }
+  }
+
+  async function onStepperRepoFieldChange() {
+    const fieldEl = document.getElementById('np-jira-repo-field');
+    const fieldId = fieldEl ? fieldEl.value : '';
+    const select = document.getElementById('np-jira-repo-value');
+    const text = document.getElementById('np-jira-repo-value-text');
+    if (!fieldId) {
+      if (select) {
+        select.innerHTML = '<option value="">(none, matches the repository)</option>';
+        select.classList.remove('hidden');
+      }
+      if (text) text.classList.add('hidden');
+      updateStepperNextButton();
+      return;
+    }
+    await stepperPopulateRepoValueOptions(fieldId);
   }
 
   async function stepperValidateJql() {
     const jqlEl = document.getElementById('np-jira-jql');
     const statusFieldEl = document.getElementById('np-jira-status-field');
+    const repoFieldEl = document.getElementById('np-jira-repo-field');
     const status = document.getElementById('np-jira-jql-status');
     if (!jqlEl || !status) return;
     const jql = jqlEl.value;
-    const statusFieldOverride = statusFieldEl ? statusFieldEl.value : '';
+    const fields = { statusField: statusFieldEl ? statusFieldEl.value : '', repoField: repoFieldEl ? repoFieldEl.value : '' };
     status.textContent = 'Validating...';
     status.style.color = '';
     try {
@@ -957,13 +1605,13 @@ export const stepperScript = `
         return;
       }
       await res.json();
-      const warning = detectStatusFilterInJql(jql, statusFieldOverride);
+      const warning = window.jqlScopeWarning(jql, fields);
       if (warning) {
-        status.textContent = '⚠ Valid but: ' + warning;
+        status.textContent = '⚠ Valid. ' + warning;
         status.style.color = 'var(--st-warn-fg, #c80)';
       } else {
         status.textContent = 'Valid';
-        status.style.color = 'var(--st-ok-fg, #2a8)';
+        status.style.color = 'var(--st-success-fg)';
       }
     } catch (err) {
       status.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
@@ -997,20 +1645,10 @@ export const stepperScript = `
     }
   }
 
-  async function stepperSubmit() {
-    // Collect any final values from secrets step
-    collectStep(6);
-
-    // Validate all non-secret/non-review steps (0..5)
-    for (let i = 0; i < 6; i++) {
-      collectStep(i);
-      if (!validateStep(i)) return;
-    }
-
-    const teamKey = effectiveTeamKey();
-
-    const body = {
-      teamKey: teamKey,
+  // The body Create saves, which Check setup sends as its candidate, so the checks see what a save stores.
+  function mappingBody() {
+    return {
+      teamKey: effectiveTeamKey(),
       owner: data.owner,
       repo: data.repo,
       workflowFile: 'claude-implement.yml',
@@ -1018,6 +1656,7 @@ export const stepperScript = `
       maxInProgressAiIssues: data.maxInProgressAiIssues,
       executionMode: data.executionMode,
       sessionMode: data.sessionMode,
+      machineCpuKind: data.machineCpuKind,
       machineCpus: data.machineCpus,
       machineMemoryMb: data.machineMemoryMb,
       planningEnabled: data.planningEnabled,
@@ -1027,7 +1666,15 @@ export const stepperScript = `
       extraEnv: {},
       provider: data.provider,
       awsRegion: data.provider === 'bedrock' ? (data.awsRegion || null) : null,
+      branchPrefix: data.branchPrefix || null,
+      maxTurns: data.maxTurns,
+      maxIterations: data.maxIterations,
+      prDispatchBudget: data.prDispatchBudget,
+      reviewProcess: data.reviewProcess,
+      trustedReviewAuthors: data.trustedReviewAuthors,
+      maxJobMinutes: data.maxJobMinutes,
       skillsRepo: data.skillsRepo || null,
+      referenceRepos: data.referenceRepos.length ? data.referenceRepos : null,
       sensitiveAddPatterns: data.sensitiveAddPatterns || null,
       sensitiveAllowPatterns: data.sensitiveAllowPatterns || null,
       dependencyTokenScope: data.dependencyTokenScope || null,
@@ -1036,21 +1683,36 @@ export const stepperScript = `
         ? {
             kind: 'jira',
             jql: data.jiraJql,
-            // Derived from owner/repo by the orchestrator. Only the Edit dialog
-            // can set an explicit override, for instances whose repo-field
-            // options are labelled with something other than owner/repo.
-            repoFieldValue: null,
+            repoFieldValue: data.jiraRepoFieldValue || null,
             statusFieldOverride: data.jiraStatusFieldOverride || null,
             repoFieldOverride: data.jiraRepoFieldOverride || null,
             profilesFieldOverride: data.jiraProfilesFieldOverride || null,
+            baseBranchFieldOverride: data.jiraBaseBranchFieldOverride || null,
           }
-        : { kind: 'linear' },
+        : data.ticketingProvider === 'filesystem'
+          ? { kind: 'filesystem', directory: data.filesystemDirectory }
+          : { kind: 'linear' },
     };
+  }
+
+  async function stepperSubmit() {
+    if (setupCheckRunning || setupCheckBlocking.length) return;
+    // Collect any final values from secrets step
+    collectStep(7);
+
+    // Validate all non-secret/non-review steps (0..6)
+    for (let i = 0; i < 7; i++) {
+      collectStep(i);
+      if (!validateStep(i)) return;
+    }
+
+    const teamKey = effectiveTeamKey();
+    const body = mappingBody();
 
     const createBtn = document.getElementById('np-create');
     const origCreateLabel = createBtn ? createBtn.textContent : '';
     if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Creating...'; }
-    
+
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
     let resData = {};
     try { resData = await res.json(); } catch (_) {}
@@ -1084,6 +1746,9 @@ export const stepperScript = `
     if (secretFailures > 0) {
       notices.push(secretFailures + ' secret(s) failed to save. Add them via the Secrets button on the Projects page.');
     }
+    if (Array.isArray(resData.warnings)) {
+      resData.warnings.forEach(function (w) { notices.push(String(w)); });
+    }
     if (notices.length) {
       // Use a brief timeout so the modal closes first
       setTimeout(function () { alert('Project created.\\n\\n' + notices.join('\\n\\n')); }, 100);
@@ -1099,9 +1764,14 @@ export const stepperScript = `
   window.selectProvider = selectProvider;
   window.addSecretRow = addSecretRow;
   window.removeSecretRow = removeSecretRow;
+  window.npAddRefRepo = npAddRefRepo;
+  window.npRemoveRefRepo = npRemoveRefRepo;
   window.onStepperTicketingProviderChange = onStepperTicketingProviderChange;
+  window.onStepperRepoFieldChange = onStepperRepoFieldChange;
   window.stepperValidateJql = stepperValidateJql;
   window.updateStepperNextButton = updateStepperNextButton;
-  window.checkInstallState = checkInstallState;
+  window.checkSetup = checkSetup;
+  window.toggleReviewFold = toggleReviewFold;
+  window.changeReviewSection = changeReviewSection;
 })();
 `;

@@ -4,6 +4,8 @@
  * Mirrors the mint→cache→Bearer shape of github-app-auth.ts, simplified to a single workspace-wide token (one Linear app credential, no per-owner cache).
  */
 
+import { defaultFetchSignal } from "./github.js";
+
 const TOKEN_ENDPOINT = "https://api.linear.app/oauth/token";
 const SCOPES = "read,write";
 
@@ -23,6 +25,14 @@ interface TokenResponse {
   expires_in: number;
 }
 
+/** Linear answered a request with an HTTP error: the token mint, or a GraphQL call. */
+export class LinearApiError extends Error {
+  constructor(readonly status: number, readonly bodyText: string, message: string) {
+    super(message);
+    this.name = "LinearApiError";
+  }
+}
+
 // Singleton state: one app credential per orchestrator, one cached token.
 let clientId: string | null = null;
 let clientSecret: string | null = null;
@@ -35,6 +45,15 @@ export function configureLinearAuth(id: string, secret: string): void {
   clientSecret = secret;
 }
 
+/** Configures the credential from `LINEAR_CLIENT_ID` and `LINEAR_CLIENT_SECRET` when both are set, and says whether it did. */
+export function configureLinearAuthFromEnv(env: Readonly<Record<string, string | undefined>> = process.env): boolean {
+  const id = env.LINEAR_CLIENT_ID;
+  const secret = env.LINEAR_CLIENT_SECRET;
+  if (!id || !secret) return false;
+  configureLinearAuth(id, secret);
+  return true;
+}
+
 /** Whether the app credential is present — the "is Linear usable?" signal for callers. */
 export function isLinearAuthConfigured(): boolean {
   return Boolean(clientId && clientSecret);
@@ -45,20 +64,22 @@ async function mintToken(): Promise<CachedToken> {
     throw new Error("Linear auth not configured (set LINEAR_CLIENT_ID and LINEAR_CLIENT_SECRET)");
   }
 
+  const tokenBody = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+    scope: SCOPES,
+    actor: "app",
+  });
   const res = await fetch(TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: clientId,
-      client_secret: clientSecret,
-      scope: SCOPES,
-      actor: "app",
-    }),
+    body: tokenBody,
+    signal: defaultFetchSignal(),
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Linear token mint failed (${res.status}): ${body}`);
+    throw new LinearApiError(res.status, body, `Linear token mint failed (${res.status}): ${body}`);
   }
 
   const data = (await res.json()) as TokenResponse;

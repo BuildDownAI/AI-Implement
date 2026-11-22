@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue } from "./providers/types.js";
-import { ensureBranchExists, findPullRequestByBranches } from "./github.js";
+import { ensureBranchExists, findPullRequestByBranches, getBranchSha } from "./github.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
 
 /**
@@ -15,6 +15,60 @@ import { buildGroupingBranchName } from "./pipeline/branch-name.js";
  * `TicketIssue.featureBranchChain`. This module only turns that chain into real remote
  * branches and reports the branch the PR should target.
  */
+
+/**
+ * One child's state for feature-node readiness: whether it carries the AI-Implement
+ * label ("designated") and whether it has reached a terminal tracker workflow state
+ * (completed or cancelled). This is the canonical definition of "terminal" — see
+ * docs/feature-branch-grouping.md §3 — read live from the tracker on every check; it
+ * must never be inferred from the presence or absence of an orchestrator job row, which
+ * can lag behind (dispatched but not yet terminal) or simply not exist (a human moved
+ * the child to Done outside the pipeline).
+ *
+ * `nonTerminalDesignatedChildren` below is called directly by both providers' roll-up
+ * gates, by Linear's dispatch gate, and by Jira's dispatch gate (which also uses it to
+ * name the children blocking a `feature-node-blocked` classification). Jira's
+ * classification itself still comes from its own `classifyByChildren`
+ * (jira-hierarchy.ts), because that check additionally races on non-designated children
+ * mid-labeling (AII-349) — a case this type doesn't model. Keep Jira's per-field
+ * `isChildTerminal` (jira.ts) as the one place that reads "terminal" off raw Jira
+ * fields, so both of Jira's gates agree with each other and with this definition.
+ */
+export type FeatureChildState = {
+  identifier: string;
+  designated: boolean;
+  terminal: boolean;
+};
+
+/** Designated children that have not reached a terminal tracker state — the set that
+ *  holds a feature node back. Non-designated children never appear here (they're a
+ *  separate race guard; see the AII-349 "waiting parent" check in each provider). An
+ *  empty result means the feature node is ready to dispatch. */
+export function nonTerminalDesignatedChildren(children: FeatureChildState[]): FeatureChildState[] {
+  return children.filter((c) => c.designated && !c.terminal);
+}
+
+/** Refuse grouped dispatch when a grouping ancestor will roll up in another repo.
+ * Missing mappings also fail closed; an ungrouped issue needs no such lookup. */
+export function hasCompatibleFeatureMapping(
+  child: { identifier: string; scopeKey: string },
+  ancestor: { identifier: string; scopeKey: string } | undefined,
+  mappings: Record<string, RepoMapping>,
+): boolean {
+  if (!ancestor) return true;
+  const childMapping = mappings[child.scopeKey];
+  const ancestorMapping = mappings[ancestor.scopeKey];
+  if (childMapping && ancestorMapping &&
+      childMapping.owner === ancestorMapping.owner && childMapping.repo === ancestorMapping.repo) return true;
+
+  const describe = (scopeKey: string, mapping: RepoMapping | undefined) =>
+    `${scopeKey} → ${mapping ? `${mapping.owner}/${mapping.repo}` : "unmapped"}`;
+  console.log(
+    `[linear] Refusing to dispatch ${child.identifier} (${describe(child.scopeKey, childMapping)}): ` +
+    `grouping ancestor ${ancestor.identifier} (${describe(ancestor.scopeKey, ancestorMapping)}) has a different or missing repository mapping`,
+  );
+  return false;
+}
 
 /**
  * Resolves the branch a dispatched issue's PR should target, creating any feature
@@ -59,6 +113,39 @@ export async function resolveBaseBranch(opts: {
       { cause: err },
     );
   }
+}
+
+/**
+ * Read-only counterpart to resolveBaseBranch for planning dispatch (AII-898): resolves
+ * the branch a chain's tip WOULD target, without ever creating it — planning must not
+ * create branches, only observe whether the implementation-side one already exists.
+ *
+ * Returns the chain's target branch name when it exists on GitHub, or null when the
+ * chain is empty (nothing to resolve) or the branch hasn't been cut yet — e.g. a parent
+ * labelled before any child has merged into it. Callers fall back to
+ * mapping.defaultBranch in the null case; a missing (as opposed to absent) chain logs
+ * one line naming the fallback.
+ */
+export async function resolvePlanningBranch(opts: {
+  ghToken: string;
+  issue: TicketIssue;
+  mapping: RepoMapping;
+}): Promise<string | null> {
+  const { ghToken, issue, mapping } = opts;
+  const chain = issue.featureBranchChain ?? [];
+  if (chain.length === 0) return null;
+
+  const last = chain[chain.length - 1];
+  const branch = buildGroupingBranchName(last.identifier, last.mode);
+  const sha = await getBranchSha(ghToken, mapping.owner, mapping.repo, branch);
+  if (sha === null) {
+    console.log(
+      `[poll] Planning for ${issue.identifier}: feature branch "${branch}" does not exist yet — ` +
+        `falling back to default branch "${mapping.defaultBranch}"`,
+    );
+    return null;
+  }
+  return branch;
 }
 
 /** AII-264 r3 churn-loop guard: a grouping parent whose top-of-tree roll-up PR is

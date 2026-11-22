@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
+import { classifyLlmResult, isLlmResultFailure, type FailureRecord } from "../failure-classification.js";
+import { describeReferenceRepoCause, type ReferenceRepoResult } from "../../reference-repos.js";
+import { DEFAULT_MODEL } from "../default-model.js";
 
 interface ImplementInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -8,6 +11,9 @@ interface ImplementInputs extends Record<string, unknown> {
   model?: string;
   maxTurns?: number;
   planningContext?: string;
+  referenceRepoResults?: ReferenceRepoResult[];
+  /** Feedback-loop iteration this call belongs to (AII-798); defaults to 1. */
+  iteration?: number;
 }
 
 interface ImplementOutputs extends Record<string, unknown> {
@@ -16,6 +22,44 @@ interface ImplementOutputs extends Record<string, unknown> {
   exitCode: number;
   subagentCount: number;
   telemetry?: RunTelemetry;
+  attempts: number;
+  /**
+   * Set when the invocation exited 0 but its own terminal status or executor
+   * verdict says it failed (e.g. a fatal/corrupt Codex stream). The step still
+   * returns so the workspace can be reviewed, but the real invocation outcome
+   * stays on the outputs and must not be overwritten by a later review verdict.
+   */
+  invocationFailure?: FailureRecord;
+}
+
+function buildReferenceReposSection(results: ReferenceRepoResult[]): string {
+  const arrived = results.filter((r) => r.arrived);
+  const missed = results.filter((r) => !r.arrived);
+  const lines: string[] = ["## Reference Repositories"];
+
+  if (arrived.length > 0) {
+    lines.push(
+      "",
+      "The following repositories are available in the workspace as read-only reference material. Read them for context and do not modify them.",
+      "",
+    );
+    for (const r of arrived) {
+      lines.push(`- \`${r.repo}\` — available at \`${r.path}\``);
+    }
+  }
+
+  if (missed.length > 0) {
+    lines.push(
+      "",
+      "The following repositories were declared but could not be cloned. Do not assert anything about their contents — treat them as unavailable.",
+      "",
+    );
+    for (const r of missed) {
+      lines.push(`- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`);
+    }
+  }
+
+  return lines.join("\n");
 }
 
 export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
@@ -24,7 +68,8 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     inputs: ImplementInputs,
     _reporter: StepReporter,
   ): Promise<ImplementOutputs> {
-    const { workspaceDir, model, maxTurns, planningContext } = inputs;
+    const { workspaceDir, model, maxTurns, planningContext, referenceRepoResults } = inputs;
+    const iteration = typeof inputs.iteration === "number" ? inputs.iteration : 1;
 
     let fullPrompt = inputs.prompt;
 
@@ -32,25 +77,72 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       fullPrompt += `\n\n## Planning Context\n\n${planningContext}`;
     }
 
+    if (referenceRepoResults && referenceRepoResults.length > 0) {
+      fullPrompt += `\n\n${buildReferenceReposSection(referenceRepoResults)}`;
+    }
+
+    const { retryPolicy } = context.data;
     const result = await context.llmExecutor.invoke({
       prompt: fullPrompt,
-      model: model ?? "claude-sonnet-4-6",
+      model: model ?? DEFAULT_MODEL,
       maxTurns,
+      stage: "implement",
+      agentStage: "implementation",
+      expectsStructuredOutput: false,
+      retry: retryPolicy ? { policy: retryPolicy, toolUseIsSafe: false } : undefined,
+      cycle: iteration,
     });
 
     // A max_turns termination is a completed-but-capped pass, not an invocation
     // failure: the feedback loop needs the partial work + telemetry to run its
     // post-mortem and open a draft PR, so don't discard it by throwing.
     if (result.exitCode !== 0 && result.telemetry?.outcome !== "max_turns") {
-      throw new Error(`LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
+      const err = new Error(
+        `LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`,
+      ) as Error & { failure?: FailureRecord; telemetry?: RunTelemetry };
+      // The executor already classified this failure (with the correct
+      // expectsStructuredOutput/attempt/elapsedMs) when deciding whether to retry.
+      // A custom LLMExecutor (e.g. a test seam) may settle a non-zero exit without
+      // attaching one at all — fall back to classifying it here so failure_json is
+      // never empty just because the executor that produced this result didn't.
+      err.failure =
+        result.failure ??
+        classifyLlmResult(result, {
+          stage: "implement",
+          attempt: result.attempts ?? 1,
+          expectsStructuredOutput: false,
+          elapsedMs: result.telemetry?.durationMs ?? undefined,
+        });
+      // Carry whatever telemetry this settled (but failing) attempt reported —
+      // a spawn-level rejection already stamps this on the executor's own thrown
+      // error, but a settled LLMResult never did; without it the failed sub-step
+      // report built from this error would lose the tokens/cost this attempt burned.
+      err.telemetry = result.telemetry;
+      throw err;
     }
 
+    // Exit 0 does not prove success: a fatal or corrupt stream settles with
+    // terminalStatus.isError. Keep that failure visible next to the outputs
+    // instead of letting a later review approval stand in for the invocation.
+    const invocationFailure =
+      result.exitCode === 0 && result.telemetry?.outcome !== "max_turns" && isLlmResultFailure(result, false)
+        ? (result.failure ??
+          classifyLlmResult(result, {
+            stage: "implement",
+            attempt: result.attempts ?? 1,
+            expectsStructuredOutput: false,
+            elapsedMs: result.telemetry?.durationMs ?? undefined,
+          }))
+        : undefined;
+
     return {
+      ...(invocationFailure ? { invocationFailure } : {}),
       filesChanged: getChangedFiles(workspaceDir),
       tokensUsed: result.tokensUsed,
       exitCode: result.exitCode,
       subagentCount: 0,
       telemetry: result.telemetry,
+      attempts: result.attempts ?? 1,
     };
   },
 };

@@ -1,21 +1,31 @@
+import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary } from "../step-utils.js";
+import { formatGitNameStatusSummary, openOrFindPullRequest, PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
+import { recordPushedCommits } from "../job-accounting.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
-import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
+import { classifyGitFailure, envSecrets, oneLinerMessage, type FailureRecord } from "../failure-classification.js";
+import { computeBackoffMs, normalizeRetryPolicy, sleepAsync } from "../retry-backoff.js";
+import { dependenciesMissing } from "../pipeline-loader.js";
+import { neutralizeFences } from "../../completion-classification.js";
+import { formatPassRow, STATS_TABLE_DIVIDER, STATS_TABLE_HEADER, type StatsPass } from "../../run-autopsy.js";
 
-const LS_REMOTE_MAX_ATTEMPTS = 3;
+// Waits between ls-remote attempts (attempts = delays + 1). A freshly minted installation
+// token is not accepted by git over HTTPS for a few seconds (AII-936), so a refreshed
+// token gets a ~15 s schedule; the boot token keeps the short one.
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
+const LS_REMOTE_FRESH_TOKEN_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
 
-export const UNAPPROVED_TITLE_PREFIX = "[NEEDS REVIEW — unapproved] ";
+export { PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX };
 
 export interface ReviewSummary extends Record<string, unknown> {
   terminationReason: string;
   iterations: number;
   finalFeedback: string;
-  passes: Array<{ iteration: number; implementTurns: number | null; implementOutcome: string; costUsd: number | null; reviewApproved: boolean | null }>;
+  passes: Array<StatsPass & { reviewAttempts?: number }>;
   postMortem?: string;
 }
 
@@ -51,6 +61,11 @@ interface PushOutputs extends Record<string, unknown> {
   branchPushed: boolean;
   commitSha: string | null;
   draft: boolean;
+  /** Number of `git push` invocations attempted. Present whenever the push loop ran. */
+  pushAttempts?: number;
+  /** True when a push reported failure but the remote was already at the local commit
+   *  (the commit landed despite the reported error — e.g. BAC-27048's `commit_refs`). */
+  landedDespiteError?: boolean;
 }
 
 export const pushStep: StepModule<PushInputs, PushOutputs> = {
@@ -67,6 +82,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       // so a push would sweep their in-progress work into the commit. Changes are
       // left in the mount for inspection with `git diff`; shipping them is the
       // user's call. Skip push and PR creation.
+      recordPushedCommits([]);
       return { prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false };
     }
 
@@ -97,12 +113,17 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       "git checkout",
     );
 
+    if (hasWorkingTreeChanges(workspaceDir, githubToken)) {
+      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+    }
+    removeScratchFromIndex(workspaceDir);
     const hasWTChanges = hasWorkingTreeChanges(workspaceDir, githubToken);
     // Only check commits-ahead when working tree is clean: if there ARE working-tree changes
     // we always take the standard add→commit path regardless of prior commits.
     const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseRef, githubToken);
 
     if (!hasWTChanges && !agentCommitted) {
+      recordPushedCommits([]);
       if (existingPrNumber) {
         return {
           prUrl: null,
@@ -131,8 +152,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
 
     let commitSha: string | null;
     if (hasWTChanges) {
-      // Standard path: stage all changes → sensitive-file guard → commit.
-      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+      // Standard path: changes are staged and scratch removed before change detection.
       // --diff-filter=d excludes staged deletions: removing an accidentally-committed
       // secret (e.g. deleting a .env) is exactly what the guard wants to allow.
       const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only", "--diff-filter=d"], {
@@ -185,52 +205,336 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       owner: repoOwner,
       repo: repoRepo,
       workspaceDir,
+      // The publication exchange fails the whole run if it fails, and no later
+      // poll can retry it — give it more room than the 5s default.
+      timeoutMs: 15_000,
     });
+
+    // AII-922: name the credential the push goes out with, so a 403 can be told apart from a
+    // boot-token fallback. Never the token itself.
+    const freshToken = activeGithubToken !== githubToken;
+    const credentialSource = !freshToken
+      ? "boot-token"
+      : inputs.orchestratorUrl?.trim() && inputs.machineNonce?.trim() ? "machine-nonce" : "publication-token";
+    console.log(`[push] credential source: ${credentialSource}`);
 
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
     // stdout/stderr. Token is redacted from any error messages.
-    const remote = `https://x-access-token:${activeGithubToken}@github.com/${repoOwner}/${repoRepo}.git`;
+    const buildRemoteUrl = (token: string): string =>
+      `https://x-access-token:${token}@github.com/${repoOwner}/${repoRepo}.git`;
+    let remote = buildRemoteUrl(activeGithubToken);
     const remoteRef = `refs/heads/${branchName}`;
     const remoteBranchSha = await span("git-ls-remote", async () =>
-      resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken),
+      resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken, { freshToken }),
     );
+    let expectedRemoteSha: string | null;
     if (existingPrNumber && remoteBranchSha !== baseRef) {
-      throw new Error(
-        `Existing PR branch changed during the run (expected ${baseRef}, found ${remoteBranchSha ?? "missing"}); refusing to overwrite concurrent work`,
-      );
+      if (remoteBranchSha !== null && isAncestorOf(workspaceDir, remoteBranchSha, "HEAD")) {
+        // The run's own agent pushed from this workspace. Adopt the new remote
+        // tip so the force-with-lease succeeds — baseRef is behind and would
+        // fail immediately.
+        console.error(`[push] remote branch advanced by agent push (${baseRef} → ${remoteBranchSha}); adopting`);
+        expectedRemoteSha = remoteBranchSha;
+      } else {
+        throw buildExistingPrBranchChangedError(workspaceDir, activeGithubToken, baseRef, remoteBranchSha, commitSha);
+      }
+    } else {
+      expectedRemoteSha = existingPrNumber ? baseRef : remoteBranchSha;
     }
-    const expectedRemoteSha = existingPrNumber ? baseRef : remoteBranchSha;
     const tracePush = process.env.AI_IMPLEMENT_LOG_LEVEL === "stream";
-    const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
-      remote,
-      remoteRef,
-      expectedRemoteSha,
-      tracePush,
-    );
-    const pushResult = await span("git-push", async () =>
-      spawnSync("git", pushArgs, {
-        cwd: workspaceDir,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: pushEnv,
-      }),
-    );
-    if (tracePush) {
-      // Diagnostic for slow pushes: GIT_TRACE2_PERF region timings (pack-objects
-      // vs send-pack vs server wait) + --verbose object counts. Redact the token
-      // with replaceAll — the tokenized remote URL can recur many times here.
-      // Trim each stream and join with a newline so partial-line stdout doesn't
-      // run onto the first byte of stderr.
-      const trace = [pushResult.stdout?.toString() ?? "", pushResult.stderr?.toString() ?? ""]
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .join("\n")
-        .replaceAll(activeGithubToken, "***");
-      if (trace) console.error(`[git-push trace]\n${trace}`);
+    const retryPolicy = normalizeRetryPolicy(context.data.retryPolicy);
+    const maxPushAttempts = 1 + retryPolicy.pushRetries;
+
+    let pushToken = activeGithubToken;
+    let attempt = 1;
+    let landedDespiteError = false;
+    // Notes about mid-retry credential-refresh failures. `failure` below is
+    // re-classified from scratch on every loop iteration, so a note appended
+    // directly onto it is lost the moment a later attempt also fails — this
+    // list survives across iterations and is folded into every terminal
+    // throw's message.
+    const refreshNotes: string[] = [];
+    // Every appended note (a credential-refresh failure reason, or an ls-remote
+    // inspection failure reason) goes through the same one-line/redact/cap
+    // contract `FailureRecord.message` itself is held to — otherwise raw,
+    // unredacted, unbounded error text would splice straight onto a message
+    // that both the tracker comment and failure_json are built from.
+    // Fallback "" (not the default NO_DETAIL_MESSAGE): a blank reason must append nothing
+    // to the note it's embedded in below, not a placeholder sentence.
+    // envSecrets() is re-read on every call rather than captured once before the loop: a
+    // credential refresh mid-loop can mint a new token into process.env, and a note built
+    // from a LATER attempt's error text must redact that new token too, not just the one
+    // live when the loop started.
+    const oneLinerNote = (text: string): string => oneLinerMessage(text, envSecrets(), "");
+    // A blank `reason` (oneLinerNote found no non-blank line) must skip the whole
+    // parenthetical rather than render an empty "(remote could not be inspected: )".
+    const remoteInspectionNote = (reason: string): string =>
+      reason ? ` (remote could not be inspected: ${reason})` : "";
+    const remoteInspectionNoteAfterPushFailure = (reason: string): string =>
+      reason ? ` (remote could not be inspected after push failure: ${reason})` : "";
+    const NOTE_SUFFIX_MAX_CHARS = 1000;
+    const noteSuffix = (): string => {
+      const deduped = dedupeNotes(refreshNotes);
+      if (deduped.length === 0) return "";
+      const joined = deduped.join("; ");
+      const capped = joined.length > NOTE_SUFFIX_MAX_CHARS ? `${joined.slice(0, NOTE_SUFFIX_MAX_CHARS - 1)}…` : joined;
+      return ` (${capped})`;
+    };
+    for (;;) {
+      await assertRunnerPublicationAuthority({ callbackUrl: inputs.callbackUrl, owner: repoOwner, repo: repoRepo });
+      const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
+        remote,
+        remoteRef,
+        expectedRemoteSha,
+        tracePush,
+      );
+      const pushResult = await span("git-push", async () =>
+        spawnSync("git", pushArgs, {
+          cwd: workspaceDir,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: pushEnv,
+        }),
+      );
+      if (tracePush) {
+        // Diagnostic for slow pushes: GIT_TRACE2_PERF region timings (pack-objects
+        // vs send-pack vs server wait) + --verbose object counts. Redact the token
+        // with replaceAll — the tokenized remote URL can recur many times here.
+        // Trim each stream and join with a newline so partial-line stdout doesn't
+        // run onto the first byte of stderr.
+        const trace = [pushResult.stdout?.toString() ?? "", pushResult.stderr?.toString() ?? ""]
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .join("\n")
+          .replaceAll(pushToken, "***");
+        if (trace) console.error(`[git-push trace]\n${trace}`);
+      }
+
+      if (pushResult.status === 0) break;
+
+      const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(pushToken, "***");
+      let failure = classifyGitFailure(stderr, pushResult.status ?? null, { stage: "push", attempt });
+      // AII-922: GitHub has refused pushes made with an installation token minted seconds
+      // earlier (about one in three), and the same token succeeds on a later attempt. A 403
+      // on a freshly minted token is therefore retried with backoff like a transient error;
+      // a boot-token 403 stays a plain auth failure. The single-use credential cannot be
+      // re-minted, so the retry reuses the token — it delays, it does not re-authenticate.
+      // The final attempt keeps the original auth / GIT_AUTH classification, so a permanent
+      // credential problem (missing Workflows permission, revoked installation) that outlasts
+      // the retries still points the autopsy and the tracker comment at credentials.
+      if (failure.category === "auth" && failure.code === "GIT_AUTH" && freshToken && attempt < maxPushAttempts) {
+        failure = { ...failure, category: "transient", code: "GIT_AUTH_FRESH_TOKEN", retryable: true };
+      }
+      const err = new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`) as Error & {
+        failure?: FailureRecord;
+      };
+      err.failure = failure;
+      // No git-bundle artifact exists yet for unpublished commits (out of scope for this
+      // issue) — the commit SHA and a diff --stat are the evidence of what would be lost
+      // if this run ends without publishing. Computed lazily: only invoked at a terminal
+      // throw site below, never on an attempt that goes on to retry. Redacts against the
+      // CURRENT pushToken (not the original dispatch token) for consistency with the rest
+      // of this loop's redaction.
+      const lostWorkEvidence = () =>
+        describeUnpublishedWork(workspaceDir, pushToken, commitSha, expectedRemoteSha, baseRef);
+
+      // A conflict, or an unrecognized ("unknown") failure, is ordinarily never retried —
+      // but on attempt 2+ either can very often be our own earlier push landing: attempt 1
+      // reached GitHub and committed, the client saw a conflict- or unknown-shaped error
+      // before seeing success, and this rejection is "stale info" against our own commit
+      // reported by a lagging ls-remote replica on the retry's pre-push lookup. A
+      // first-attempt conflict/unknown has no such retry to blame and keeps the immediate
+      // throw.
+      const isRetryableAmbiguous = (failure.category === "conflict" || failure.category === "unknown") && attempt > 1;
+      if (failure.category !== "transient" && !isRetryableAmbiguous) {
+        // failure_json (persisted from err.failure) and the tracker comment (built
+        // from err.message) must not disagree about the same run — both get the
+        // credential-refresh note.
+        failure.message += noteSuffix();
+        err.message += noteSuffix() + lostWorkEvidence();
+        throw err;
+      }
+
+      if (isRetryableAmbiguous) {
+        let remoteShaAfterConflict: string | null;
+        try {
+          remoteShaAfterConflict = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken, { freshToken });
+        } catch (lsRemoteErr) {
+          const reason = oneLinerNote(lsRemoteErr instanceof Error ? lsRemoteErr.message : String(lsRemoteErr));
+          failure.message = `${failure.message}${remoteInspectionNote(reason)}${noteSuffix()}`;
+          err.message = `${err.message}${remoteInspectionNoteAfterPushFailure(reason)}${noteSuffix()}${lostWorkEvidence()}`;
+          throw err;
+        }
+
+        if (commitSha != null && remoteShaAfterConflict === commitSha) {
+          console.log(
+            `[push] push landed despite error (attempt ${attempt}): remote ${branchName} is already at local HEAD ${commitSha}`,
+          );
+          landedDespiteError = true;
+          break;
+        }
+
+        if (remoteShaAfterConflict === expectedRemoteSha) {
+          // The remote never moved off the leased SHA: this rejection is a genuine
+          // lease conflict, not our own earlier push landing somewhere else.
+          // Concluding GIT_REMOTE_ADVANCED here would misreport "expected X, remote
+          // is at X" for a remote that never advanced at all.
+          failure.message += noteSuffix();
+          err.message += noteSuffix() + lostWorkEvidence();
+          throw err;
+        }
+
+        if (commitSha == null) {
+          // Can't tell "landed" from "foreign" without our own commit SHA to compare
+          // against — fall back to the original conflict record rather than concluding
+          // GIT_REMOTE_ADVANCED on a guess.
+          failure.message += ` (local commit SHA unavailable; the landed check was skipped)${noteSuffix()}`;
+          err.message += ` (local commit SHA unavailable; the landed check was skipped)${noteSuffix()}${lostWorkEvidence()}`;
+          throw err;
+        }
+
+        if (failure.category === "conflict") {
+          throw buildRemoteAdvancedError(
+            failure,
+            branchName,
+            expectedRemoteSha,
+            remoteShaAfterConflict,
+            noteSuffix(),
+            lostWorkEvidence(),
+          );
+        }
+
+        // An incoming "unknown" failure is never reclassified as GIT_REMOTE_ADVANCED —
+        // the classifier never recognized attempt 2's git text in the first place, so
+        // rewriting category/code/message here would replace the real (if unrecognized)
+        // git error with a conflict record the classifier never actually produced. The
+        // remote having moved past the lease is still worth recording, so it's appended
+        // as a note instead.
+        const advancedNote = ` Remote ${branchName} advanced past the lease SHA during this attempt.`;
+        failure.message += `${advancedNote}${noteSuffix()}`;
+        err.message += `${advancedNote}${noteSuffix()}${lostWorkEvidence()}`;
+        throw err;
+      }
+
+      let remoteShaAfterFailure: string | null;
+      try {
+        remoteShaAfterFailure = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken, { freshToken });
+      } catch (lsRemoteErr) {
+        // The push record is the evidence that matters here — ls-remote's own
+        // failure only means the remote could not be inspected to decide the next
+        // step, so the ORIGINAL push failure is what gets thrown, not this one.
+        const reason = oneLinerNote(lsRemoteErr instanceof Error ? lsRemoteErr.message : String(lsRemoteErr));
+        failure.message = `${failure.message}${remoteInspectionNote(reason)}${noteSuffix()}`;
+        err.message = `${err.message}${remoteInspectionNoteAfterPushFailure(reason)}${noteSuffix()}${lostWorkEvidence()}`;
+        throw err;
+      }
+
+      if (commitSha != null && remoteShaAfterFailure === commitSha) {
+        console.log(
+          `[push] push landed despite error (attempt ${attempt}): remote ${branchName} is already at local HEAD ${commitSha}`,
+        );
+        landedDespiteError = true;
+        break;
+      }
+
+      if (remoteShaAfterFailure !== expectedRemoteSha) {
+        // The remote moved to neither our own commit nor the leased SHA: someone
+        // else's push landed. This is "do not push over a foreign SHA" restated —
+        // refreshing the lease here would silently overwrite that human's or
+        // sibling run's work, exactly what force-with-lease exists to prevent.
+        if (commitSha == null) {
+          // Can't tell "landed" from "foreign" without our own commit SHA — throw the
+          // original transient record rather than concluding GIT_REMOTE_ADVANCED on a guess.
+          failure.message += ` (local commit SHA unavailable; the landed check was skipped)${noteSuffix()}`;
+          err.message += ` (local commit SHA unavailable; the landed check was skipped)${noteSuffix()}${lostWorkEvidence()}`;
+          throw err;
+        }
+        throw buildRemoteAdvancedError(
+          failure,
+          branchName,
+          expectedRemoteSha,
+          remoteShaAfterFailure,
+          noteSuffix(),
+          lostWorkEvidence(),
+        );
+      }
+
+      // Remote unchanged: a genuinely transient failure (whether or not commitSha is
+      // known — the landed check above only needed it to detect our own commit already
+      // published, and it plainly did not). Retry with the same lease after backoff, as
+      // long as attempts remain.
+      if (attempt >= maxPushAttempts) {
+        // Exhausted retries get their own code and are never retryable — an
+        // orchestrator rail keying off `retryable` must not start a run again that
+        // already spent its whole push-retry budget. `category` stays "transient"
+        // since that is still the accurate classification of what happened.
+        const exhaustedSuffix = ` (exhausted after ${attempt} attempt${attempt === 1 ? "" : "s"})`;
+        err.failure = {
+          ...failure,
+          code: "GIT_PUSH_RETRIES_EXHAUSTED",
+          retryable: false,
+          message: `${failure.message}${exhaustedSuffix}${noteSuffix()}`,
+        };
+        // err.message backs the tracker comment; failure_json is persisted from
+        // err.failure above — both must agree that retries ran out, not just that
+        // the last push failed.
+        err.message += exhaustedSuffix + noteSuffix() + lostWorkEvidence();
+        throw err;
+      }
+      // Async so a multi-minute backoff (backoffMaxMs can reach the retry policy's
+      // upper bound) never blocks the event loop or a SIGTERM handler — this loop
+      // already awaits everything else.
+      await sleepAsync(computeBackoffMs(attempt, retryPolicy));
+      // A long backoff must not turn a transient failure into an auth failure —
+      // refresh the same way the pre-push exchange above does. On GHA the publication
+      // credential is single-use and already consumed by the pre-push exchange above,
+      // so this is a no-op returning the current token; only the Fly/local machine-nonce
+      // path actually re-mints here. getPublicationCredential() is re-read rather than
+      // reusing the captured `publicationToken` const in case a future path can vend it
+      // more than once. A throwing refresh must not replace this attempt's classified
+      // failure record: log it, note it in refreshNotes (folded into every terminal
+      // throw's message below), and retry with a token still in hand rather than losing
+      // the evidence of the push failure that triggered this.
+      const preRefreshEnvToken = process.env.GITHUB_TOKEN;
+      try {
+        pushToken = await refreshRunnerGithubCredentials({
+          currentToken: pushToken,
+          orchestratorUrl: inputs.orchestratorUrl,
+          machineNonce: inputs.machineNonce,
+          callbackUrl: inputs.callbackUrl,
+          publicationToken: getPublicationCredential(),
+          owner: repoOwner,
+          repo: repoRepo,
+          workspaceDir,
+          timeoutMs: 15_000,
+        });
+        remote = buildRemoteUrl(pushToken);
+      } catch (refreshErr) {
+        const reason = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
+        // refreshRunnerGithubCredentials writes process.env.GITHUB_TOKEN before the
+        // `git remote set-url` call that can itself fail — when that happened, the new
+        // token is already live in the environment, so use it for the retry instead of
+        // falling back to the stale pushToken this catch would otherwise keep.
+        if (typeof process.env.GITHUB_TOKEN === "string" && process.env.GITHUB_TOKEN !== preRefreshEnvToken) {
+          pushToken = process.env.GITHUB_TOKEN;
+          remote = buildRemoteUrl(pushToken);
+          console.warn(
+            `[push] credential refresh before retry failed applying the new token; using the new token anyway: ${reason}`,
+          );
+        } else {
+          console.warn(`[push] credential refresh before retry failed; continuing with the current token: ${reason}`);
+        }
+        const note = oneLinerNote(reason);
+        // A blank note (refreshErr carried no usable text) appends nothing rather than a
+        // dangling "credential refresh before retry failed: " with nothing after the colon.
+        if (note) refreshNotes.push(`credential refresh before retry failed: ${note}`);
+      }
+      attempt++;
     }
-    if (pushResult.status !== 0) {
-      const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(activeGithubToken, "***");
-      throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
-    }
+
+    // The push landed: report the SHAs this job published, oldest first (AII-1562). baseRef is the
+    // clone-time commit, or on a gap-fill the PR branch tip the run started from.
+    const pushedShas = listPushedCommits(workspaceDir, baseRef);
+    if (pushedShas) recordPushedCommits(pushedShas);
 
     if (existingPrNumber) {
       return {
@@ -239,86 +543,29 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
         branchPushed: true,
         commitSha,
         draft: false,
+        pushAttempts: attempt,
+        ...(landedDespiteError ? { landedDespiteError: true } : {}),
       };
     }
 
     const draft = inputs.draft === true;
+    const providerUnavailable = inputs.reviewSummary?.terminationReason === "provider_unavailable";
     // Span covers the POST and the 422 list-open-PRs fallback so re-runs (which
     // hit 422 and pay an extra round-trip) are timed in full, not just the POST.
     const pr = await span("pr-create", async () =>
-      createOrFindPullRequest({ repoOwner, repoRepo, githubToken: activeGithubToken, prTitle, branchName, baseBranch, prBody, draft }),
+      openOrFindPullRequest({ repoOwner, repoRepo, githubToken: pushToken, prTitle, branchName, baseBranch, prBody, draft, providerUnavailable }),
     );
-    return { prUrl: pr.url, prNumber: pr.number, branchPushed: true, commitSha, draft: pr.draft };
+    return {
+      prUrl: pr.url,
+      prNumber: pr.number,
+      branchPushed: true,
+      commitSha,
+      draft: pr.draft,
+      pushAttempts: attempt,
+      ...(landedDespiteError ? { landedDespiteError: true } : {}),
+    };
   },
 };
-
-interface CreatePrInputs {
-  repoOwner: string;
-  repoRepo: string;
-  githubToken: string;
-  prTitle: string;
-  branchName: string;
-  baseBranch: string;
-  prBody: string;
-  draft: boolean;
-}
-
-/** Create the PR, tolerating 422 (already exists) by finding the open PR. */
-async function createOrFindPullRequest(
-  inputs: CreatePrInputs,
-): Promise<{ url: string; number: number; draft: boolean }> {
-  const { repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody, draft } = inputs;
-
-  const create = async (title: string, asDraft: boolean): Promise<Response> =>
-    fetch(`https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${githubToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ title, head: branchName, base: baseBranch, body: prBody, ...(asDraft ? { draft: true } : {}) }),
-    });
-
-  const parseCreated = async (res: Response, asDraft: boolean): Promise<{ url: string; number: number; draft: boolean }> => {
-    const pr = (await res.json()) as { html_url?: unknown; number?: unknown };
-    if (typeof pr.html_url !== "string" || typeof pr.number !== "number") {
-      throw new Error("Unexpected PR creation response shape from GitHub API");
-    }
-    return { url: pr.html_url, number: pr.number, draft: asDraft };
-  };
-
-  const prRes = await create(prTitle, draft);
-  if (prRes.ok) return parseCreated(prRes, draft);
-
-  if (prRes.status === 422) {
-    // Ambiguous: either the PR already exists, or the repo plan rejects draft
-    // PRs. Check for an existing open PR first (existing behavior), then — if
-    // we were drafting — retry as a clearly-titled normal PR so the work is
-    // never vaporized on Free-plan private repos.
-    const listRes = await fetch(
-      `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls?head=${repoOwner}:${branchName}&state=open`,
-      { headers: { Authorization: `Bearer ${githubToken}` } },
-    );
-    if (!listRes.ok) {
-      const listBody = await listRes.text().catch(() => "");
-      throw new Error(`PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`);
-    }
-    const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown; draft?: unknown }>;
-    if (prs.length > 0) {
-      const existing = prs[0];
-      if (typeof existing.html_url === "string" && typeof existing.number === "number") {
-        return { url: existing.html_url, number: existing.number, draft: existing.draft === true };
-      }
-    }
-    if (draft) {
-      const retryRes = await create(`${UNAPPROVED_TITLE_PREFIX}${prTitle}`, false);
-      if (retryRes.ok) return parseCreated(retryRes, false);
-      const retryBody = await retryRes.text().catch(() => "");
-      throw new Error(`Draft PR rejected (422) and non-draft fallback failed with HTTP ${retryRes.status}: ${retryBody}`);
-    }
-    throw new Error(`PR already exists (422) but no open PR found for branch ${branchName}`);
-  }
-
-  const body = await prRes.text().catch(() => "");
-  throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
-}
 
 /**
  * Build the `git push` argv and spawn env. When `trace` is true (driven by
@@ -355,6 +602,16 @@ function buildPullRequestBody(
 ): string {
   const { issueIdentifier, issueTitle, issueDescription } = context.data;
   const preflightOutputs = context.getOutputs("preflight");
+  const installOutputs = context.getOutputs("install");
+  const installRetryOutputs = context.getOutputs("install-retry");
+  const initialInstallFailed = installOutputs.installFailed === true;
+  const retryFailed = installRetryOutputs.installFailed === true;
+  // A skipped install-retry (first install succeeded) leaves empty outputs, so
+  // retryFailed is false and both branches below fall through to "nothing new".
+  const retrySucceeded = initialInstallFailed && !retryFailed;
+  // Single source of truth shared with the push step's own `draft` input
+  // (pipeline-loader.ts) so this section can never diverge from draft/skip behaviour.
+  const dependenciesFailed = dependenciesMissing(context);
   const title = stringValue(issueTitle) ?? "AI implementation";
   const description = stringValue(issueDescription);
 
@@ -362,19 +619,45 @@ function buildPullRequestBody(
     stringValue(inputs.implementationSummary) ??
     `Implemented the requested work for ${issueIdentifier}: ${title}.`;
   const explicitTestsSummary = stringValue(inputs.testsSummary) ?? stringValue(preflightOutputs.summary);
-  // No explicit/preflight summary to fall back on: say what actually happened. An unapproved
-  // run (reviewSummary present) skipped preflight/verify entirely — claiming verification ran
-  // would contradict the "Automated review did not approve" section above it.
-  const testsSummary =
-    explicitTestsSummary ??
-    (inputs.reviewSummary
-      ? "Automated verification was skipped — the review loop did not approve this change."
-      : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
-  const testsSummaryChecked = explicitTestsSummary != null || !inputs.reviewSummary;
+  // A provider outage is not a review verdict — the reviewer may never have run, so this
+  // fallback must not claim the review loop rejected the change (BAC-27201).
+  const providerUnavailableForTestsSummary = inputs.reviewSummary?.terminationReason === "provider_unavailable";
+  const verifyFailedForTestsSummary = inputs.reviewSummary?.terminationReason === "verify_failed";
+  // A failed install (after the retry) is a more specific reason than a review rejection —
+  // preflight/verify never ran either way, but the install failure is the actual cause.
+  const testsSummary = dependenciesFailed
+    ? "Automated verification was skipped — dependency install failed."
+    : // No explicit/preflight summary to fall back on: say what actually happened. An unapproved
+      // run (reviewSummary present) skipped preflight/verify entirely — claiming verification ran
+      // would contradict the "Automated review did not approve" section above it.
+      explicitTestsSummary ??
+      (inputs.reviewSummary
+        ? providerUnavailableForTestsSummary
+          ? "Automated verification was skipped — the AI service was not available and the run was interrupted."
+          : verifyFailedForTestsSummary
+            ? "Automated verification ran and failed — the repository's verify hook did not pass."
+            : inputs.reviewSummary.terminationReason === "max_turns"
+            ? "Automated verification was skipped — the implementation did not finish within its turn budget."
+            : "Automated verification was skipped — the review loop did not approve this change."
+        : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  const testsSummaryChecked = dependenciesFailed ? false : explicitTestsSummary != null || !inputs.reviewSummary;
 
+  const dependencyInstallSection = dependenciesFailed
+    ? buildDependencyInstallSection(
+        stringValue(installRetryOutputs.installMethod) ?? stringValue(installOutputs.installMethod) ?? "install",
+        stringValue(installRetryOutputs.installError) ?? undefined,
+      )
+    : null;
   const unapprovedSection = buildUnapprovedSection(inputs.reviewSummary as ReviewSummary | undefined, inputs.draft === true);
 
+  // A configured run names the implementation stage's harness and provider; the context `provider`
+  // is a narrowed legacy label (anthropic | bedrock) and would show `openai` as anthropic.
+  const implementationStage = context.data.agentConfig?.stages.implementation;
+  const footerHarness = implementationStage ? (implementationStage.agent === "codex" ? "Codex" : "Claude Code") : "Claude Code";
+  const footerProvider = implementationStage?.provider ?? context.data.provider ?? "anthropic";
+
   return [
+    ...(dependencyInstallSection ? [dependencyInstallSection, ""] : []),
     ...(unapprovedSection ? [unapprovedSection, ""] : []),
     "## Summary",
     implementationSummary,
@@ -386,40 +669,84 @@ function buildPullRequestBody(
     "",
     "## Test plan",
     `- [${testsSummaryChecked ? "x" : " "}] ${testsSummary}`,
+    // Blank line first: a non-blank line right after a list item is a lazy continuation in GFM
+    // and would render on the checkbox line itself.
+    "",
+    TEST_VERDICT_SENTENCE,
+    "",
+    ...(retrySucceeded ? ["- [x] Initial dependency install failed; it succeeded after this change."] : []),
     "- [ ] Manual: review the changed behavior against the ticket acceptance criteria.",
     "",
     `Fixes ${issueIdentifier}`,
     "",
-    `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
+    `Generated with AI-Implement · harness: ${footerHarness} · model: ${context.data.model ?? "unknown"} · provider: ${footerProvider}`,
+  ].join("\n");
+}
+
+/** Plain text under the Test plan checkbox: CI, not the runner's preflight line, is the verdict. */
+const TEST_VERDICT_SENTENCE =
+  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push report.";
+
+/**
+ * Leads the PR body (before the unapproved section, per the "why first" rationale:
+ * reviewers and the external review check read top-down, and a build/lint/typecheck/test
+ * warning must land before the summary of what the change does) when both the first
+ * install and its retry (after feedback-loop) failed.
+ */
+function buildDependencyInstallSection(installMethod: string, installError: string | undefined): string {
+  return [
+    "## ⚠️ Dependencies did not install",
+    "",
+    `Dependency install (\`${installMethod}\`) failed before and after the agent ran; build, lint, typecheck, and tests never ran.`,
+    "",
+    "```",
+    installError ? neutralizeFences(installError) : "(no output captured)",
+    "```",
   ].join("\n");
 }
 
 function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boolean): string | null {
   if (!summary) return null;
-  const passRows = summary.passes
-    .map((p) => {
-      const cost = p.costUsd != null ? `$${p.costUsd.toFixed(2)}` : "—";
-      const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${cost} | ${review} |`;
-    })
-    .join("\n");
+  const passRows = summary.passes.map(p => formatPassRow(p)).join("\n");
+  // A provider outage is not a review verdict: the reviewer may never have run, so the
+  // heading, the sentence and the feedback label must not claim it rejected anything.
+  const providerUnavailable = summary.terminationReason === "provider_unavailable";
+  // A failing verify hook is not a review verdict either: the review never examined the last pass.
+  const verifyFailed = summary.terminationReason === "verify_failed";
+  // Turn-cap exhaustion is unfinished work, not a review verdict: no reviewer rejected it.
+  const maxTurns = summary.terminationReason === "max_turns";
   return [
-    "## ⚠️ Automated review did not approve",
+    verifyFailed
+      ? "## ⚠️ The verify hook failed"
+      : providerUnavailable ? "## 🟠 The AI service was not available during this run"
+      : maxTurns ? "## ⏱️ The implementation did not finish within its turn budget"
+      : "## ⚠️ Automated review did not approve",
     "",
-    `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
+    verifyFailed
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the repository's verify hook still failed after ${summary.iterations} iteration(s); the review did not examine the last pass.`
+      : providerUnavailable
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI service was not available and the AI-Implement loop stopped after ${summary.iterations} iteration(s); the work completed so far is preserved here and was not reviewed.`
+      : maxTurns
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the implementation used its full turn budget before it finished (after ${summary.iterations} iteration(s)). The work so far is preserved here. It is incomplete.`
+      : `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
     "",
-    "**Reviewer's final feedback:**",
+    verifyFailed ? "**Verify hook result:**" : providerUnavailable || maxTurns ? "**Run notes:**" : "**Reviewer's final feedback:**",
     "",
     ...summary.finalFeedback.split("\n").map((l) => `> ${l}`),
     "",
     "**Run stats:**",
     "",
-    "| Pass | Implement outcome | Turns | Cost | Review |",
-    "|---|---|---|---|---|",
+    STATS_TABLE_HEADER,
+    STATS_TABLE_DIVIDER,
     passRows,
     ...(summary.postMortem ? ["", "<details><summary><strong>Post-mortem</strong></summary>", "", summary.postMortem, "", "</details>"] : []),
     "",
-    "_Preflight and verify hooks were skipped for this unapproved run._",
+    // The verify hook runs inside the feedback loop, so only preflight is skipped here.
+    providerUnavailable
+      ? "_Preflight was skipped because the run was interrupted._"
+      : maxTurns
+        ? "_Preflight was skipped because the implementation did not finish._"
+        : "_Preflight was skipped for this unapproved run._",
   ].join("\n");
 }
 
@@ -489,6 +816,146 @@ function summarizeCommittedChanges(workspaceDir: string, githubToken: string, ba
   return formatGitNameStatusSummary(result.stdout.toString());
 }
 
+/**
+ * Evidence attached to every terminal push-failure throw. There is no git-bundle
+ * artifact store for unpublished commits (explicitly out of scope for BAC-27116),
+ * so the local commit SHA plus a `git diff --stat` against the last known-published
+ * point (the push lease SHA, falling back to the immutable base ref) are the only
+ * record of what would be lost if the run ends here without publishing.
+ */
+function describeUnpublishedWork(
+  workspaceDir: string,
+  githubToken: string,
+  commitSha: string | null,
+  compareRef: string | null,
+  fallbackRef: string,
+): string {
+  const primaryRef = compareRef ?? fallbackRef;
+  const { stat, refUsed } = summarizeDiffStat(workspaceDir, githubToken, primaryRef, compareRef ? fallbackRef : null);
+  return `\n\nUnpublished local commit: ${commitSha ?? "unknown"}\ngit diff --stat ${refUsed}..HEAD:\n${stat}`;
+}
+
+/**
+ * Builds the terminal `GIT_LEASE_REJECTED` error for a gap-fill push whose remote
+ * branch moved to a SHA that is neither the leased `baseRef` nor reachable from
+ * HEAD (i.e. not this run's own earlier push) — someone else's write landed on
+ * the PR branch before this run could push. Thrown before the push retry loop
+ * starts, so there is no already-classified `FailureRecord` to build from; this
+ * mirrors `classifyGitFailure`'s shape directly (BAC-27112-style: `category`,
+ * `code`, `evidence`). Message text and the lost-work evidence match the
+ * pre-AII-749 plain-`Error` this replaces, so downstream rendering
+ * (`formatFailureComment`) is unchanged; only classification is added.
+ */
+function buildExistingPrBranchChangedError(
+  workspaceDir: string,
+  githubToken: string,
+  expectedRef: string,
+  foundRef: string | null,
+  commitSha: string | null,
+): Error & { failure?: FailureRecord } {
+  const message = `Existing PR branch changed during the run (expected ${expectedRef}, found ${foundRef ?? "missing"}); refusing to overwrite concurrent work`;
+  const err = new Error(
+    `${message}${describeUnpublishedWork(workspaceDir, githubToken, commitSha, foundRef, expectedRef)}`,
+  ) as Error & { failure?: FailureRecord };
+  err.failure = {
+    category: "conflict",
+    code: "GIT_LEASE_REJECTED",
+    stage: "push",
+    attempt: 1,
+    retryable: false,
+    message,
+    evidence: { truncated: false },
+  };
+  return err;
+}
+
+/**
+ * Builds the terminal `GIT_REMOTE_ADVANCED` error for a remote branch that moved to
+ * neither our own commit nor the SHA we leased against — someone else's push landed
+ * there. Overrides the record's `message` to name the expected lease and observed
+ * remote SHA (plus `noteSuffix`, so a mid-retry credential-refresh-failure note isn't
+ * lost when this record replaces the original); the rest of `failure` (including
+ * `evidence.stderrTail`, the original git output) is preserved via the spread.
+ * `noteSuffix` and `lostWorkEvidence` are kept as separate parameters because only
+ * the former belongs on the record — the latter is diagnostic bulk (a `git diff
+ * --stat`) that belongs on the thrown Error's message, not the persisted record.
+ */
+function buildRemoteAdvancedError(
+  failure: FailureRecord,
+  branchName: string,
+  expectedRemoteSha: string | null,
+  observedRemoteSha: string | null,
+  noteSuffix: string,
+  lostWorkEvidence: string,
+): Error & { failure?: FailureRecord } {
+  const conflictErr = new Error(
+    `git push failed: remote branch ${branchName} advanced to ${observedRemoteSha ?? "missing"} (expected ${expectedRemoteSha ?? "none"})${noteSuffix}${lostWorkEvidence}`,
+  ) as Error & { failure?: FailureRecord };
+  conflictErr.failure = {
+    ...failure,
+    category: "conflict",
+    code: "GIT_REMOTE_ADVANCED",
+    retryable: false,
+    message: `Expected ${branchName} to be at lease SHA ${expectedRemoteSha ?? "none"}, but the remote is at ${observedRemoteSha ?? "missing"}${noteSuffix}`,
+  };
+  return conflictErr;
+}
+
+/**
+ * `compareRef` is often a remote lease SHA that was only ever observed via
+ * `ls-remote` and was never fetched into the local object database — `git diff
+ * --stat` against it then fails with "unknown revision", not because there is
+ * no diff to show. `fallbackRef` (the immutable clone ref) is always present
+ * locally, so a failure on `compareRef` retries against it before giving up.
+ * Returns `refUsed` alongside the stat text so a caller labelling the output
+ * (e.g. `describeUnpublishedWork`'s `git diff --stat <ref>..HEAD:` header)
+ * names the ref the diff was actually taken against, not the one that failed.
+ */
+function summarizeDiffStat(
+  workspaceDir: string,
+  githubToken: string,
+  compareRef: string | null,
+  fallbackRef: string | null,
+): { stat: string; refUsed: string } {
+  if (!compareRef) return { stat: "(no comparison ref available)", refUsed: fallbackRef ?? "unknown" };
+  const run = (ref: string) =>
+    spawnSync("git", ["diff", "--stat", `${ref}..HEAD`], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  let result = run(compareRef);
+  let refUsed = compareRef;
+  if (result.status !== 0 && fallbackRef && fallbackRef !== compareRef) {
+    result = run(fallbackRef);
+    refUsed = fallbackRef;
+  }
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
+    return { stat: `(git diff --stat failed: ${stderr.trim()})`, refUsed };
+  }
+  const stat = result.stdout.toString().trim();
+  return { stat: stat || "(no diff)", refUsed };
+}
+
+/**
+ * Collapses repeated notes (e.g. the same credential-refresh failure recurring
+ * across several retry attempts) down to one copy each, suffixed with a count,
+ * preserving first-seen order. Without this, a failure that repeats across N
+ * retries would otherwise fold the identical note onto the message N times.
+ */
+function dedupeNotes(notes: string[]): string[] {
+  const counts = new Map<string, number>();
+  const order: string[] = [];
+  for (const note of notes) {
+    if (!counts.has(note)) order.push(note);
+    counts.set(note, (counts.get(note) ?? 0) + 1);
+  }
+  return order.map((note) => {
+    const count = counts.get(note) ?? 1;
+    return count > 1 ? `${note} (×${count})` : note;
+  });
+}
+
 function runGit(
   workspaceDir: string,
   args: string[],
@@ -517,6 +984,16 @@ function hasWorkingTreeChanges(workspaceDir: string, githubToken: string): boole
   return result.stdout.toString().trim().length > 0;
 }
 
+/** `git rev-list --reverse <baseRef>..HEAD`; null when git cannot answer (the list is then unknown, not empty). */
+function listPushedCommits(workspaceDir: string, baseRef: string): string[] | null {
+  const result = spawnSync("git", ["rev-list", "--reverse", `${baseRef}..HEAD`], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) return null;
+  return result.stdout.toString().split("\n").map((l) => l.trim()).filter(Boolean);
+}
+
 function resolveCommitSha(workspaceDir: string): string | null {
   const result = spawnSync("git", ["rev-parse", "HEAD"], {
     cwd: workspaceDir,
@@ -526,15 +1003,19 @@ function resolveCommitSha(workspaceDir: string): string | null {
   return result.stdout.toString().trim() || null;
 }
 
-function resolveRemoteBranchSha(
+async function resolveRemoteBranchSha(
   workspaceDir: string,
   remote: string,
   branchName: string,
   githubToken: string,
-): string | null {
+  options: { freshToken: boolean },
+): Promise<string | null> {
   const remoteRef = `refs/heads/${branchName}`;
+  const delays = options.freshToken ? LS_REMOTE_FRESH_TOKEN_RETRY_DELAYS_MS : LS_REMOTE_RETRY_DELAYS_MS;
+  const maxAttempts = delays.length + 1;
   let lastError = "";
-  for (let attempt = 1; attempt <= LS_REMOTE_MAX_ATTEMPTS; attempt++) {
+  let lastStatus: number | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const result = spawnSync("git", ["ls-remote", remote, remoteRef], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
@@ -550,14 +1031,40 @@ function resolveRemoteBranchSha(
     }
 
     lastError = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
-    if (attempt < LS_REMOTE_MAX_ATTEMPTS) {
-      sleepSync(LS_REMOTE_RETRY_DELAYS_MS[attempt - 1] ?? 1000);
+    lastStatus = result.status ?? null;
+    console.error(`[push] ls-remote attempt ${attempt}/${maxAttempts} failed: ${lastError.trim()}`);
+    if (attempt < maxAttempts) {
+      await sleepAsync(delays[attempt - 1] ?? 1000);
     }
   }
-  throw new Error(`git ls-remote failed after ${LS_REMOTE_MAX_ATTEMPTS} attempts: ${lastError}`);
+  const err = new Error(`git ls-remote failed after ${maxAttempts} attempts: ${lastError}`) as Error & {
+    failure?: FailureRecord;
+  };
+  if (options.freshToken) {
+    // AII-936: GitHub answers "Repository not found" (or a 403) for a private repo while a
+    // just-minted installation token has not propagated. Name that cause instead of "unknown".
+    // Not retryable: the push loop that would retry is never reached, and the single-use
+    // credential cannot be re-minted. Other failures (network, 5xx) keep their own record.
+    const failure = classifyGitFailure(lastError, lastStatus, { stage: "push", attempt: maxAttempts });
+    const repoNotFound = failure.code === "UNKNOWN" && /repository\b.*\bnot found/i.test(lastError);
+    if ((failure.category === "auth" && failure.code === "GIT_AUTH") || repoNotFound) {
+      err.failure = { ...failure, category: "transient", code: "GIT_AUTH_FRESH_TOKEN", retryable: false };
+    } else {
+      err.failure = failure;
+    }
+  }
+  throw err;
 }
 
-function sleepSync(ms: number): void {
-  if (process.env.NODE_ENV === "test") return;
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+/**
+ * Returns true when `ancestorSha` is reachable from `ref` in the local clone.
+ * Used by the push guard to distinguish the run's own agent push (reachable
+ * from HEAD) from genuinely concurrent foreign work (not reachable).
+ */
+function isAncestorOf(dir: string, ancestorSha: string, ref: string): boolean {
+  const result = spawnSync("git", ["merge-base", "--is-ancestor", ancestorSha, ref], {
+    cwd: dir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return result.status === 0;
 }

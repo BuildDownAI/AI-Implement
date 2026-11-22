@@ -1,15 +1,18 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type http from "node:http";
 import { SESSION_COOKIE_NAME } from "../cookies.js";
+import { testDb } from "./helpers/test-db.js";
 
-// dedup.ts freezes its DB path at import time, so each test sets a unique DEDUP_DB_PATH and
-// re-imports the modules fresh (the same isolation pattern admin.test.ts uses).
 let session: typeof import("../admin-session.js");
+let access: typeof import("../access-entries.js");
 let dedup: typeof import("../dedup.js");
-let dbPath: string;
+
+/** Seed the list in force the way a pre-handover deployment does — from the env. */
+function allow(domains: string, emails = ""): void {
+  process.env.OAUTH_ALLOWED_DOMAINS = domains;
+  process.env.OAUTH_ALLOWED_EMAILS = emails;
+  access.refreshEffectiveAllowlist();
+}
 
 const mkReq = (headers: Record<string, string>) => ({ headers }) as unknown as http.IncomingMessage;
 
@@ -23,20 +26,15 @@ function sessionRow(token: string) {
 }
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `admin-session-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  session = await import("../admin-session.js");
-  dedup = await import("../dedup.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
+  ({ session, access, dedup } = (
+    await testDb({
+      modules: {
+        session: () => import("../admin-session.js"),
+        access: () => import("../access-entries.js"),
+        dedup: () => import("../dedup.js"),
+      },
+    })
+  ).modules);
 });
 
 describe("createSession", () => {
@@ -73,31 +71,48 @@ describe("createSession", () => {
   });
 });
 
-describe("isValidSession", () => {
-  it("returns false for an undefined or unknown token", () => {
-    expect(session.isValidSession(undefined)).toBe(false);
-    expect(session.isValidSession("not-a-real-token")).toBe(false);
+describe("resolveSession", () => {
+  it("returns null for an undefined or unknown token", () => {
+    expect(session.resolveSession(undefined)).toBeNull();
+    expect(session.resolveSession("not-a-real-token")).toBeNull();
   });
 
-  it("returns true for a fresh session", () => {
-    const token = session.createSession();
-    expect(session.isValidSession(token)).toBe(true);
+  it("returns the identity for a session minted through SSO", () => {
+    const token = session.createSession({ email: "ada@eudoxus.ai", sub: "google|123", provider: "google", name: "Ada" });
+    expect(session.resolveSession(token)).toEqual({
+      identity: { email: "ada@eudoxus.ai", sub: "google|123", provider: "google", name: "Ada" },
+    });
   });
 
-  it("returns false and lazily deletes the row when the session has expired", () => {
+  it("distinguishes a live access-code session from no session at all", () => {
     const token = session.createSession();
+    expect(session.resolveSession(token)).toEqual({ identity: null });
+    expect(session.resolveSession("not-a-real-token")).toBeNull();
+  });
+
+  it("returns null and lazily deletes the row when the session has expired", () => {
+    const token = session.createSession({ email: "ada@eudoxus.ai", sub: "google|123", provider: "google" });
     dedup.getDb().prepare("UPDATE admin_sessions SET expires_at = ? WHERE token = ?").run(Date.now() - 1, token);
-    expect(session.isValidSession(token)).toBe(false);
+    expect(session.resolveSession(token)).toBeNull();
     expect(sessionRow(token)).toBeUndefined();
+  });
+
+  // A partial row is neither SSO nor access-code. Reporting it as identity-less was harmless while
+  // every session was equally privileged, but that branch is now the access-code path and carries
+  // admin — so the ambiguous case has to be rejected rather than resolve toward privilege.
+  it("rejects a row carrying only some of the identity columns", () => {
+    const token = session.createSession({ email: "ada@eudoxus.ai", sub: "google|123", provider: "google" });
+    dedup.getDb().prepare("UPDATE admin_sessions SET provider = NULL WHERE token = ?").run(token);
+    expect(session.resolveSession(token)).toBeNull();
   });
 });
 
 describe("revokeSession", () => {
   it("drops the row so the token no longer validates (server-side logout)", () => {
     const token = session.createSession();
-    expect(session.isValidSession(token)).toBe(true);
+    expect(session.resolveSession(token)).not.toBeNull();
     session.revokeSession(token);
-    expect(session.isValidSession(token)).toBe(false);
+    expect(session.resolveSession(token)).toBeNull();
     expect(sessionRow(token)).toBeUndefined();
   });
 });
@@ -125,6 +140,74 @@ describe("getRequestToken", () => {
 
   it("ignores a non-Bearer authorization header", () => {
     expect(session.getRequestToken(mkReq({ authorization: "Basic abc123" }))).toBeUndefined();
+  });
+});
+
+describe("authenticateAdminRequest", () => {
+  const withToken = (token: string) => mkReq({ authorization: `Bearer ${token}` });
+  const ada = { email: "ada@eudoxus.ai", sub: "google|123", provider: "google" };
+
+  it("refuses a request carrying no token, and one carrying an unknown token", () => {
+    allow("eudoxus.ai");
+    expect(session.authenticateAdminRequest(mkReq({}))).toEqual({ ok: false, status: 401, error: "Unauthorized" });
+    expect(session.authenticateAdminRequest(withToken("nope"))).toMatchObject({ ok: false, status: 401 });
+  });
+
+  it("admits an access-code session without consulting the list, since it carries no address", () => {
+    allow("");
+    const token = session.createSession();
+    // Admin despite having no entry to take a role from: the access-code path is local development.
+    expect(session.authenticateAdminRequest(withToken(token))).toEqual({ ok: true, identity: null, entry: null, role: "admin" });
+  });
+
+  it("admits an allowed identity and hands back the entry that matched", () => {
+    allow("eudoxus.ai");
+    const token = session.createSession(ada);
+    const gate = session.authenticateAdminRequest(withToken(token));
+    expect(gate.ok).toBe(true);
+    if (gate.ok) {
+      expect(gate.identity?.email).toBe("ada@eudoxus.ai");
+      // The entry is what carries the role once roles land.
+      expect(gate.entry).toMatchObject({ kind: "domain", value: "eudoxus.ai" });
+    }
+  });
+
+  it("keeps a claim-admitted builddown session valid, with the claim's role, and ends it once the claim is cleared", () => {
+    allow("unrelated.example");
+    const bd = { email: "cam@eudoxus.ai", sub: "bd|1", provider: "builddown" };
+    const token = session.createSession({ ...bd, name: "Cam" });
+    expect(session.authenticateAdminRequest(withToken(token))).toMatchObject({ ok: false, status: 401 });
+
+    const again = session.createSession({ ...bd, name: "Cam" });
+    access.recordOrgClaimRole(bd, "user", Date.now() + 1e6);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: true, role: "user" });
+    access.recordOrgClaimRole(bd, "admin", Date.now() + 1e6);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: true, role: "admin" });
+
+    access.clearOrgClaimRole(bd);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: false, status: 401 });
+  });
+
+  it("revokes the session when the identity is no longer admitted, so a removal takes effect at once", () => {
+    allow("eudoxus.ai");
+    const token = session.createSession(ada);
+    expect(session.authenticateAdminRequest(withToken(token)).ok).toBe(true);
+
+    allow("");
+    expect(session.authenticateAdminRequest(withToken(token))).toMatchObject({ ok: false, status: 401 });
+    // The row is gone, so re-adding them requires a fresh sign-in.
+    expect(sessionRow(token)).toBeUndefined();
+  });
+
+  it("answers 503 and keeps the session when the list cannot be read", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const token = session.createSession(ada);
+    dedup.getDb().exec("DROP TABLE access_entries");
+
+    // A 401 would log every operator out of the SPA over a transient database problem.
+    expect(session.authenticateAdminRequest(withToken(token))).toMatchObject({ ok: false, status: 503 });
+    expect(sessionRow(token)).toBeDefined();
+    error.mockRestore();
   });
 });
 

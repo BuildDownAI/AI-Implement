@@ -8,26 +8,26 @@ This document is the orchestrator's half. For the graph's full lifecycle — the
 
 ## Deploy shape
 
-The sidecar runs **inside the orchestrator container on loopback** — no separate service, no public port, no second Fly app. `docker-entrypoint.sh` starts it on `127.0.0.1:8765`, waits for it, exports `KG_SIDECAR_URL`, and only then executes Node.
+The sidecar runs **inside the orchestrator container on loopback** — no separate service, no public port, no second Fly app. `KgSidecar.start()` starts it on `127.0.0.1:8765`, waits for readiness, and sets `KG_SIDECAR_URL` before `loadConfig()` reads it. Each call first deletes any existing value, so an operator-supplied URL is ignored.
 
 Startup has two entry points, tried in order: `kg/start.sh` (preferred — the vendor script knows its own arguments, and is generated at build time) or a bare `kg/server.py` with a pre-built `.venv`. Neither present means no sidecar.
 
 Readiness is polled for up to 30 seconds. **Any HTTP response counts as ready**, including 4xx and 5xx — the check is whether the server accepts connections, not whether it answers correctly. The poll also bails early if the sidecar process has already exited, rather than waiting out the full timeout.
 
-**Sidecar failure is non-fatal at every stage.** A missing entry point, a crash, or a readiness timeout all leave `KG_SIDECAR_URL` unset and let the orchestrator boot normally; `/mcp` returns 503 and every other route is unaffected.
+**Sidecar failure is non-fatal at every stage.** A missing entry point, a crash, or a readiness timeout all leave `KG_SIDECAR_URL` unset and let the orchestrator boot normally; `/mcp` still serves, without the `kg_*` tools, and every other route is unaffected.
 
-For local development, start the sidecar yourself and set `KG_SIDECAR_URL` in `.env`, or leave it blank to run without `/mcp`.
+For local development, `npm run dev` on a laptop serves `/mcp` without the `kg_*` tools because the default KG directory, `/app/kg`, has no startup entry point. To test the sidecar locally, run a locally built orchestrator image containing the KG source, using the build credentials described under [Building the image](#building-the-image). `/mcp` still requires its OAuth configuration.
 
 ## What `/mcp` tells you, and what it hides
 
-The endpoint needs **both** `KG_SIDECAR_URL` and `OAUTH_REDIRECT_BASE_URL`, but the two are not equally visible from outside, because the auth gate sits between their checks.
+The endpoint needs `OAUTH_REDIRECT_BASE_URL`; `KG_SIDECAR_URL` only adds the `kg_*` tools. The two are not equally visible from outside, because the auth gate sits between their checks.
 
 - **`OAUTH_REDIRECT_BASE_URL` unset** — `/mcp` answers **503** to every caller.
-- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. Only an authenticated request that actually needs the sidecar reaches the 503; an authenticated `tools/list` still answers **200**, listing the built-in diagnostic tools alone. The sidecar check sits below both the auth gate and that routing deliberately, so those diagnostics stay reachable on a sidecar-less image.
+- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. An authenticated `tools/list` answers **200**, listing every non-`kg_*` tool the caller's role allows; the `kg_*` tools are left out. A `kg_*` call from a stale list is not a 503 either: it answers 200 with a tool result `isError: true` and the text `no memory provider is configured` (`src/restate/tools.ts`). To serve them, run an image containing the KG source and ensure the sidecar reaches readiness at startup.
 
-**So an unauthenticated probe of `/mcp` cannot distinguish a sidecar-less release from a healthy one — both answer 401.** The public endpoint that can is `/.well-known/oauth-protected-resource`, which 503s when either variable is missing.
+**So an unauthenticated probe of `/mcp` cannot distinguish a sidecar-less release from a healthy one — both answer 401.** Neither can the OAuth routes: `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server` and `/mcp/*` (`routeMcpOAuth`, `src/mcp-oauth.ts`) gate on `OAUTH_REDIRECT_BASE_URL` alone, so a client can sign in and reach the non-`kg_*` tools on a sidecar-less image. They used to 503 without a sidecar too — a leftover from when `/mcp` was only a sidecar proxy — which locked every client out of those tools. The public signal is the health check **`GET /`**: `sidecar.reachable: true` with `toolsListed: true` means the boot-time probe passed, and `sidecar.checkedAt: null` means no sidecar was ever probed — a sidecar-less release.
 
-Inside the container the question is settled without a request at all: `docker-entrypoint.sh` exports `KG_SIDECAR_URL` only after the sidecar answers its readiness check, so an absent value is the sidecar-less signal. That is what the orchestrator itself reads at boot.
+Inside the orchestrator process, `KgSidecar.start()` sets `KG_SIDECAR_URL` only after the sidecar answers its readiness check, so an absent value is the sidecar-less signal. That is what `loadConfig()` reads at boot.
 
 ## Building the image
 
@@ -39,11 +39,12 @@ Inside the container the question is settled without a request at all: `docker-e
 
 The knowledge-graph repository is private. A **BuildKit build secret** mounts a GitHub token for exactly one `RUN` layer to clone it; the token is never written to `ARG`, `ENV`, or image history.
 
-The source repository defaults to `BuildDownAI/knowledge-graph-ai-implement`. Set `KG_SOURCE_REPO`
-to another GitHub `owner/repo` value, for example `Answer9-llc/knowledge-graph-answer9-app`,
-when an orchestrator instance should bundle a project-specific graph. This is deliberately a repo
-identifier, not a URL: `src/deploy.ts` validates it before minting a repo-scoped installation token,
-and the Dockerfile validates the same build arg before constructing the clone URL.
+Set `KG_SOURCE_REPO` to a GitHub `owner/repo` value to bundle a graph — for example
+`Answer9-llc/knowledge-graph-answer9-app` for a project-specific graph. An unset value builds
+without a sidecar: the orchestrator boots normally, and `/mcp` serves without the `kg_*` tools. `KG_SOURCE_REPO` is
+deliberately a repo identifier, not a URL: `src/deploy.ts` validates it before minting a
+repo-scoped installation token, and the Dockerfile validates the same build arg before
+constructing the clone URL.
 
 **Where that token comes from is an operational prerequisite, not a detail.** A self-deploy mints it from the GitHub App installation, scoped to the configured knowledge-graph repository alone with `contents: read` — which only works if that repository is part of the installation. The installation grants selected repositories rather than the whole organisation, so it has to be added deliberately. Without it the mint fails with a 422 naming an inaccessible repository, before any build starts; the deploy reports a failure rather than shipping a sidecar-less image, which is the one good thing about failing this early. A manual deploy sidesteps the question entirely by passing an operator's own token.
 
@@ -65,7 +66,7 @@ The mount is declared `required=false`, so a build with no secret still succeeds
 3. **Model bake** — warms the fastembed model `BAAI/bge-small-en-v1.5` into `FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache` so the running sidecar never fetches it at query time. **Soft failure** — logs `[kg] WARNING: EMBEDDINGS BUILD FAILED`, writes `kg/.embeddings-failed`, and continues lexical-only.
 4. **Materialize and embed** — `kg_ingest.materialize --no-embed` produces `out/graph.trig`, then a second full pass adds semantic vectors. The graph pass is a **hard failure**: it is the one step not wrapped in a fallback, so a broken graph fails the build. The embed pass is **soft**: it writes `kg/.embeddings-failed` and falls back to lexical-only search.
 
-When `docker-entrypoint.sh` detects `kg/.embeddings-failed` at boot (or finds `out/embeddings.npz` absent as a belt-and-suspenders fallback for images built without the marker) it exports `KG_EMBEDDINGS_DEGRADED=1`, logs a warning, and the orchestrator surfaces this in two places: `GET /` returns `{"kgDegraded": true}` in the health payload, and deploy notifications include a warning line so the degraded state is visible immediately after a deploy.
+When `docker-entrypoint.sh` detects `kg/.embeddings-failed` at boot (or finds `out/embeddings.npz` absent as a belt-and-suspenders fallback for images built without the marker) it exports `KG_EMBEDDINGS_DEGRADED=1`, logs a warning, and the orchestrator surfaces this in two places: `GET /` returns `{"kgDegraded": true}` in the health payload, and deploy notifications include a warning line so the degraded state is visible immediately after a deploy. Liveness is reported separately: after the sidecar is ready the orchestrator probes it (`tools/list` + one `kg_neighbors`) and every health read carries `kgUnavailable` plus a `sidecar` record (`reachable`, `toolsListed`, `lastError`, `checkedAt`) beside `kgDegraded` — see [deployment.md](deployment.md#kg-sidecar-health) (AII-648, AII-650).
 
 `start.sh` exports the same `FASTEMBED_CACHE_PATH`, so the running sidecar reads the baked cache rather than downloading on first query. `kg_hybrid_search` therefore returns results immediately on boot with no separate data-load step.
 
@@ -79,6 +80,56 @@ Updating the graph therefore means updating the snapshot upstream **and** rebuil
 
 The container runs as the unprivileged `node` user.
 
+## Serving from a remote store
+
+Set `KG_BACKEND=stardog_run` in the orchestrator environment to serve the graph
+from Stardog. The sidecar code comes from the public base KG repo; no customer
+KG repo is needed. These values are environment-only for now;
+[AII-1880](https://linear.app/eudoxus/issue/AII-1880) moves them to the admin KG page.
+
+| Variable | Purpose |
+| -- | -- |
+| `KG_BACKEND` | Set to `stardog_run` to select the remote store. |
+| `KG_STARDOG_RUN_TOKEN` | Access token, passed to the sidecar without logging it. |
+| `KG_STARDOG_DB` | Database name. |
+| `KG_STARDOG_RUN_ENDPOINT` | SPARQL endpoint URL. |
+| `KG_STARDOG_DATASET` | Dataset sent as `default-graph-uri`. Necessary for a graph installed as a Knowledge Graph: the database default graph is empty, and queries without this parameter see no data. |
+| `KG_STARDOG_RUN_CONSOLE` | Endpoint console URL. |
+| `KG_NAMESPACE` | Graph IRI namespace; a nonempty value takes precedence over `sources.yml`, including for the boot probe. |
+
+| `KG_BACKEND` in the orchestrator environment | Staged overlay with `parts/` | Child `KG_BACKEND` | Overlay variables | `KG_EMBEDDINGS_DEGRADED` |
+| -- | -- | -- | -- | -- |
+| not set | no | not set (as today) | none | as today |
+| not set | yes | `nt_parts` (as today) | `KG_DATA_DIR`, `KG_PARTS_DIR` (as today) | as today |
+| `stardog_run` | no | `stardog_run` | none | never set |
+| `stardog_run` | yes | `stardog_run` | none: the remote store wins | never set |
+| a different value | any | as today | as today | as today |
+
+Remote serving ignores local overlays, including inherited `KG_DATA_DIR` and
+`KG_PARTS_DIR`, and clears any stale embeddings-degraded flag. Database search
+needs no local embeddings. Removing `KG_BACKEND` and restarting restores the
+local selection behavior.
+
+Build a local image with the base repository:
+
+```bash
+docker build -t ai-implement:stardog-local \
+  --build-arg KG_SOURCE_REPO=BuildDownAI/bd-knowledge-graph-base \
+  --secret id=kg_token,env=GH_TOKEN .
+```
+
+The build clones the default branch (`main`); the KGB store changes must land
+there before the operator's live check. Run the image locally with the variables
+above, using `KG_STARDOG_DB=builddown-kg`,
+`KG_STARDOG_DATASET=tag:stardog:kit:alias:builddown_kg` (underscore), and
+`KG_NAMESPACE=https://kg.builddown.dev/`, then call `kg_neighbors` through `/mcp`.
+Do not set these variables on a deployed orchestrator for this check.
+
+Each Stardog request is billed, including probes. The console counts usage in
+Stardog Units (SDUs) for the time the endpoint is active. An inactive endpoint can
+take five minutes to wake; the AII-1888 hand check observed about two minutes.
+Remote probe and timeout behavior is described below.
+
 ## Deploying
 
 **A plain `fly deploy` silently produces a sidecar-less image.** Deploy through the orchestrator itself, or with the manual command in [deployment.md](deployment.md#deploy-paths) when there is no orchestrator to ask.
@@ -91,9 +142,11 @@ Three separate mistakes each produce a silently degraded deploy, and each has ha
 
 Self-deploy carries all three by construction: they are assembled in one place and a test asserts each is present, so they cannot be dropped the way a hand-typed command can. The exported-token trap disappears entirely there, because the secret is passed as an argument rather than through a shell.
 
-A release that boots is not necessarily a release that serves, and the difference is invisible from the Fly dashboard. **After a self-deploy** the orchestrator checks itself: the process that comes up in place of the one that started the deploy records whether its own image carries a sidecar, and `/admin#deployments` shows the result. A release made any other way records nothing, because no deploy hold was taken for it — those still need the manual check below.
+A release that boots is not necessarily a release that serves, and the difference is invisible from the Fly dashboard. **After a self-deploy** the orchestrator checks itself: the process that comes up in place of the one that started the deploy runs the liveness probe described below and records whether its own image actually serves, and `/admin#deployments` shows the result. A release made any other way records nothing, because no deploy hold was taken for it — those still need the manual check below.
 
-To check by hand, poll **`/.well-known/oauth-protected-resource`** — 200 means both variables are set, 503 means one is missing. Polling `/mcp` for a 401 proves only that the route is configured.
+The self-deploy record is now honest about the KGB-28 failure mode (AII-648): a sidecar can come up — `KG_SIDECAR_URL` gets set, the readiness poll answered — and still not actually serve `kg_*` tools, because the Python MCP SDK's streamable-HTTP transport can reject a stateless `tools/list` with `400 Missing session ID`. Before this probe existed, that shipped as `deployed-ok`: the deploy record only checked whether `KG_SIDECAR_URL` was set, not whether the sidecar actually answered a real query. Two things had to change together, in the same file (`src/kg-provider.ts`) — the proxy has to tolerate a session-demanding sidecar for real MCP traffic (AII-649), and the boot-time record has to stop trusting the env var alone (this issue). They're separable in principle but landed together because both touch `sendWithSessionRetry`.
+
+To check by hand, poll the health check **`GET /`**: `sidecar.reachable: true` with `toolsListed: true` means the boot-time probe passed, and `sidecar.checkedAt: null` means no sidecar was ever probed — a sidecar-less release. Polling `/mcp` for a 401, or `/.well-known/oauth-protected-resource` for a 200, proves only that `OAUTH_REDIRECT_BASE_URL` is set.
 
 ### Verifying more than "it answers"
 
@@ -101,11 +154,43 @@ A 401 proves the endpoint is alive and OAuth-gated. It does not prove the graph 
 
 The clone copies the KG's `sources.yml`, which pins the IRI namespace. Without it the server falls back to a placeholder namespace and every type-filtered `kg_*` tool returns empty — the graph loads, queries match nothing, and nothing errors. Verify a deploy with a real query (`kg_search` returning non-empty, or `degraded:false` in a `kg_hybrid_search` response), not just the 401.
 
+**The orchestrator now runs that verification itself at boot, rather than only telling an operator to do it by hand (AII-648).** Right after `sidecar.start()` sets `KG_SIDECAR_URL`, `main()` calls `SidecarMemoryProvider.probe()`: a session-tolerant `tools/list` (reusing the same `sendWithSessionRetry` handshake `listTools` and `callKgTool` use) that must return the six required `kg_*` tool names (`kg_repo_history` is optional, so an older sidecar without it still probes healthy), followed by one cheap `tools/call` — `kg_neighbors` on the served graph's spine IRI (`<namespace>resource/graph/spine`, namespace read from whichever `sources.yml` is actually being served — the runtime overlay if one is staged, else the baked image) with `limit: 1` — that must come back a JSON-RPC `result`, not an `error`. The boot log carries the outcome: `[kg] sidecar probe: ok (6 required tools)` or `[kg] sidecar probe FAILED: <reason>`.
+
+The result lives in a module-level `sidecarHealth` record (`{ reachable, toolsListed, lastError, checkedAt }`, exported from `src/kg-provider.ts`) and `isKgUnavailable()`, which is `true` only when the *last completed* probe failed — a sidecar that has never been probed is not reported as unavailable. Every failed `listTools` or `callKgTool` also triggers a re-probe, throttled to at most one real sidecar round-trip per 60 seconds so a persistently down sidecar doesn't double every failing request's latency. The boot-time probe itself is never subject to that throttle — the first check always runs.
+
+Every buffered sidecar request the provider makes — the session handshake, `listTools`, `callKgTool`, and both probe steps — carries a 10-second request timeout, the same bounding pattern `KgSidecar`'s own readiness poll uses (2s, scaled up here because these calls run a real query rather than just checking that the port accepts connections). Without this, a sidecar that accepts the connection but never answers — the process is up, `[kg] sidecar ready` already logged, but `tools/list` or `kg_neighbors` hangs — would leave `main()`'s `await memoryProvider.probe()` unresolved forever, which blocks `startServer()` (so the health check, admin UI, and poll loop never come up) and `postBootNotice()` (so not even `deployed-not-serving` gets recorded) — a strictly worse outcome than the silently-wrong `deployed-ok` this issue exists to fix. A timed-out request resolves `ok: false` rather than retrying the session handshake, so the worst case for a hung `tools/list` is one timeout, not a multiple of it.
+
+### Remote store wake-up and probes
+
+With `KG_BACKEND=stardog_run`, a sleeping endpoint is normal and each store call is billed. Boot makes one store query to wake the endpoint and detect configuration errors. After boot, recovery probes use `tools/list` only; they never query the store. Local stores retain the behavior described above.
+
+| Event on a remote store | Result |
+| -- | -- |
+| Boot probe: `tools/list` fails | Unavailable, as today |
+| Boot probe: `kg_neighbors` answers | Healthy |
+| Boot probe: `kg_neighbors` stops with `ETIMEDOUT` | Healthy, `lastError` null. Log `[kg] remote store did not answer in 10 s; it is possibly starting` |
+| Boot probe: `kg_neighbors` returns a store failure result | Unavailable; `lastError` and the recorded store error are the first text message, cut to 200 characters (or `store call failed` if absent) |
+| Boot probe: `kg_neighbors` returns a JSON-RPC error | Unavailable; the recorded store error and `lastError` are the sidecar's message, cut to 200 characters |
+| Boot probe: the `kg_neighbors` step has a handshake failure or an unparseable response | Unavailable with the normal probe diagnostic. No store error is recorded; a successful list-only probe clears it |
+| Post-deploy warm-up probe | `tools/list` only. It never calls the store and keeps a recorded store error |
+| A tool call returns a store failure result | The caller receives the original result. No recorded store error is cleared, no healthy result is recorded, and no re-probe runs |
+| `maybeReprobe()` after a failed call | `tools/list` only. It never calls the store |
+| `probeKgSidecarIfUnavailable()` each poll cycle | `tools/list` only. It never calls the store, and it does not clear a store error from the boot probe |
+| A tool call returns a result that is not a store failure | Clears a recorded store error: health becomes `reachable`, `toolsListed`, `lastError` null |
+| A tool call stops with `ETIMEDOUT` | Returns `{ ok: false, error: "The knowledge graph store is starting. Try again in one minute." }`. No health change, no re-probe |
+| A tool call returns a JSON-RPC error | The sidecar's message, as today |
+
+A store failure result has `result.isError: true`. The Python MCP SDK returns raised tool exceptions as `{ result: { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] } }`, rather than a JSON-RPC `error`. The first content entry of type `text` supplies the message, limited to 200 characters; without one, the message is `store call failed`. These rules apply only to remote stores; local behavior is unchanged.
+
+The request timeout remains 10 seconds so boot stays bounded. The store call continues in the sidecar after the orchestrator stops waiting, allowing the endpoint to wake for a later user call. Successful list-only probes preserve boot store errors until a user tool call succeeds.
+
+**The deploy record now reflects the probe, not just the env var.** **Superseded:** the boot-time `decideDeployOutcome` that wrote `deployed-not-serving` from the probe is gone; the outcome now comes from the `SelfDeploy` object (`deployed-ok` on `succeeded`), and probe health is reported by `GET /` and `get_kg_status`. This is the detection half only (AII-648); a follow-on issue plumbs `isKgUnavailable()` and `sidecarHealth` into `GET /`, `get_kg_status`, `get_tenant_health`, and the Deployments admin page.
+
 ### Building without the sidecar
 
 ```bash
 docker build .                 # local, no secret
-fly deploy --remote-only       # degraded: /mcp returns 503, all other routes healthy
+fly deploy --remote-only       # degraded: /mcp serves without kg_* tools, all other routes healthy
 ```
 
 ## MCP OAuth
@@ -121,7 +206,9 @@ fly deploy --remote-only       # degraded: /mcp returns 503, all other routes he
 | `GET /.well-known/oauth-protected-resource` | Resource metadata pointing at the authorization server |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 authorization-server metadata |
 
-Authorization is **fail-closed**: a verified identity must pass the same `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` allowlist as the admin UI.
+Authorization is **fail-closed**, against the same allowlist the admin UI uses — which is database-backed and edited at `/admin#access`, with `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` seeding it until the first save. See [access-model.md](access-model.md).
+
+The list is re-checked on **every `/mcp` request**, not only at sign-in. An access token otherwise outlives a removal by up to its full hour; re-checking closes that window to a single request. A removed identity gets the same 401 an invalid token does, while an unreadable allowlist answers 503 — a database fault must not look like a revoked token.
 
 ### Token lifetimes and rotation
 
@@ -133,7 +220,7 @@ Registration is bounded in the same spirit: a dynamically registered client that
 
 `MCP_ALLOWED_REDIRECT_ORIGINS` controls which callback origins dynamic clients may use. Loopback IP-literal HTTP callbacks are allowed by default; any other HTTPS origin must be listed explicitly, and arbitrary HTTPS callbacks are denied.
 
-The orchestrator proxies auth-verified requests to the sidecar verbatim and **strips the `Authorization` header before forwarding**, so the sidecar never sees the caller's token. It should be reachable only from loopback.
+The orchestrator never forwards a caller's request to the sidecar. Since AII-711 a `kg_*` tool call is a handler on the `orchestratorTools` Restate service that calls `MemoryProvider.callKgTool(name, args)`, which sends its own JSON-RPC `tools/call` to the sidecar with the probe headers and no caller credential, so the sidecar never sees the caller's token. It should be reachable only from loopback.
 
 Register two additional redirect URIs in the provider consoles, alongside the admin-UI ones:
 
@@ -144,15 +231,99 @@ Register two additional redirect URIs in the provider consoles, alongside the ad
 
 Fastembed models load into process memory at startup. A small model such as `BAAI/bge-small-en-v1.5` is ~130 MB on disk but expands to roughly 300–400 MB resident. With the orchestrator's own Node footprint of 100–150 MB, **256 MB Fly machines are too small** and will OOM-kill one process or the other.
 
-Minimum with the sidecar is **512 MB**; **1 GB** gives comfortable headroom for larger models or concurrent requests.
+Minimum with the sidecar is **512 MB** for serving alone. The refresh rail needs more: its materialize step runs as a second Python process beside the serving sidecar, and at ~31.6k quads it reached 271 MB RSS and was OOM-killed on a 512 MB machine (2026-09-08). **1 GB** is the working size for an orchestrator that refreshes its graph in place.
 
 ```toml
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1gb"
 ```
 
-`fly.toml` ships 512 MB as the base default. Adjust per client in `clients/<slug>.toml`.
+`fly.toml` ships 1 GB as the base default. Adjust per client in `clients/<slug>.toml`.
+
+## Memory provider contract
+
+The orchestrator abstracts KG access behind a `MemoryProvider` interface (defined in `src/kg-provider.ts`). The bundled sidecar is provider `"sidecar"` and is selected by default. An external implementer can build a conforming provider without reading orchestrator source; this section is the authoritative contract.
+
+### The capability contract
+
+Every `MemoryProvider` maps to up to seven MCP tool names. The provider declares which it can serve via a `MemoryProviderCapabilities` object; callers degrade gracefully when a capability flag is `false`.
+
+| Capability flag | MCP tool names | Degradation when `false` |
+|---|---|---|
+| `hybridSearch` | `kg_hybrid_search`, `kg_search`, `kg_semantic_search` | Tools are absent from `tools/list`; a `tools/call` for any of them returns a tool result with `isError: true` and the text `Tool not supported by this memory provider: <tool>` |
+| `neighbors` | `kg_neighbors` | Same — absent from list, `isError` on call |
+| `path` | `kg_path` | Same |
+| `provenance` | `kg_provenance`, `kg_repo_history` | Same |
+| `stalenessStamp` | *(no dedicated tool — served via `kg_neighbors` on the spine IRI)* | Callers that check graph freshness skip the staleness check or treat the result as unknown |
+
+The `kg_*` handler enforces the capability filter (`src/restate/tools.ts`): a `tools/call` for a tool whose capability is `false` returns a tool result `{ isError: true, content: [{ type: "text", text: "Tool not supported by this memory provider: <tool>" }] }` at HTTP 200 — never a 503 and never a proxy error. Before AII-711 the same refusal travelled as a JSON-RPC `-32601` error; the text is unchanged and is what the skills layer's dual-target degradation rules key on.
+
+### Interface
+
+```typescript
+interface MemoryProviderCapabilities {
+  hybridSearch: boolean;
+  neighbors: boolean;
+  path: boolean;
+  provenance: boolean;
+  stalenessStamp: boolean;
+}
+
+interface MemoryProvider {
+  readonly id: string;
+  readonly capabilities: MemoryProviderCapabilities;
+  listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]>;
+  callKgTool(name: string, args: Record<string, unknown>): Promise<KgToolResult>;
+}
+
+type KgToolResult = { ok: true; result: unknown } | { ok: false; error: string };
+```
+
+- `id` — unique string identifying the provider (e.g. `"sidecar"`).
+- `capabilities` — declare gaps up front; the orchestrator reads this once per request and filters the advertised tool list accordingly.
+- `listTools` — return the MCP tool-definition objects (same shape as a JSON-RPC `tools/list` result) that this provider can serve. Only tools whose capability flag is `true` should appear here; the orchestrator will not enforce a second filter.
+- `callKgTool` — run one `kg_*` tool and return its parsed JSON-RPC `result`, or `{ ok: false, error }` with a human-readable message. Called by the `kg_*` Restate handlers only for tools that cleared the capability check; it never receives the caller's credential and never writes to an HTTP response. The bundled provider's error texts are `KG sidecar unavailable: connection refused`, `KG sidecar error`, or the sidecar's own JSON-RPC error message.
+
+### Session handling
+
+Every sidecar response is buffered and parsed as JSON or SSE. A 400 or 404 is also classified to determine whether a session handshake and retry are needed.
+
+The bundled `SidecarMemoryProvider` prefers a stateless sidecar: `listTools` and `callKgTool` each send a single POST with no MCP session, and that request count never grows when the sidecar answers straight away. A stateful sidecar — the Python MCP SDK's streamable-HTTP transport defaults to this — is tolerated rather than fatal: on a `400` "Missing session ID" rejection, the provider performs a lazy `initialize` → `notifications/initialized` handshake against the same sidecar URL, caches the returned `mcp-session-id` on the provider instance, and retries the original call once with that header attached. The cached id is negotiated once per process lifetime and reused by `listTools`, `callKgTool` and `probe`, not renegotiated per request. A `404` on a previously-used session clears the cached id and re-initializes exactly once. At most one handshake and one retry happen per inbound call — if the handshake itself fails, the original rejection is surfaced rather than retried again.
+
+`probe()` (the liveness check described above) is a third consumer of this same handshake path — it shares `sendWithSessionRetry` rather than issuing a raw, session-less request, so a sidecar that demands a session behaves identically for the probe as it does for real `tools/list`/`tools/call` traffic.
+
+### Provider selection
+
+The active provider is chosen at boot from the `MEMORY_PROVIDER` environment variable (default: `"sidecar"`). Per-mapping override is stored in the `memory_provider_id` column on the `mappings` table (TEXT, nullable, JSON-ready for future per-phase selection); it is not yet surfaced in the admin UI, and is not yet consulted at request time — `handleMcpRequest` uses the single global provider resolved at boot. This is scaffolding for future per-mapping routing.
+
+### Building a conforming external provider
+
+1. Implement `MemoryProvider` in TypeScript (or any language that can be imported/loaded into the orchestrator process).
+2. Declare your `capabilities` conservatively — `false` for any tool you cannot reliably serve.
+3. In `listTools`, return only tools whose capability is `true`.
+4. In `callKgTool`, handle every tool the capabilities declare as true and never throw: resolve `{ ok: false, error }` for anything you cannot serve, so the handler surfaces the text as an `isError` tool result.
+5. Register the provider in `resolveMemoryProvider()` in `src/kg-provider.ts` and add `MEMORY_PROVIDER=your-id` to `.env.example`.
+
+## Orchestrator-native diagnostic tools
+
+These tools need no working sidecar. Since AII-711 they are handlers on the `orchestratorTools` Restate service (`src/restate/tools.ts`), discovered by `/mcp` from Restate's admin API; only `get_session_identity` is served by the door itself.
+
+| Tool | Description |
+|---|---|
+| `get_tenant_health` | Runner mode, in-flight job count, pending gap-fill queue count, project count, KG degraded flag |
+| `get_kg_status` | KG refresh rail state — stage, served snapshot stamp, last refresh outcome and gate. Same object as `GET /api/kg/status`, callable without an admin token |
+| `get_runner_mode` | Global runner mode and its source (env / db / default) |
+| `list_projects` | All project mappings with per-project settings |
+| `list_in_flight_jobs` | Currently dispatching or running jobs with elapsed time |
+| `get_issue_dispatch_status` | Dispatch state for a specific issue identifier |
+| `get_issue_report_card` | Full dispatch history, telemetry, and approval status for an issue |
+| `get_fleet_report` | Aggregated per-repo stats over a configurable look-back window |
+| `get_deploy_posture` | Deploy posture summary — see below |
+
+### `get_deploy_posture`
+
+No inputs. Returns a read-only snapshot of deploy and runner-channel state. The fields, and when a merged change reaches a run, are in [When a change reaches a run](runner-images.md#when-a-change-reaches-a-run).
 
 ## Repository layout
 

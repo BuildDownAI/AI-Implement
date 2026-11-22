@@ -1,0 +1,1389 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { spawn as realSpawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
+import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
+import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
+import { createRestateExitHandler, createRestateRegistrationGate, createMainShutdown, runMainBoot, waitForRestateServing, RESTATE_BOOT_DEADLINE_MS, stopSidecarsConcurrently, onRestateRegistered } from "../index.js";
+import { testDir } from "./helpers/test-dir.js";
+
+// ---------------------------------------------------------------------------
+// Helpers — mirrors src/__tests__/kg-sidecar.test.ts
+// ---------------------------------------------------------------------------
+
+/** Write a shell script to path and make it executable. */
+function writeScript(path: string, body: string): void {
+  writeFileSync(path, `#!/bin/sh\n${body}\n`);
+  chmodSync(path, 0o755);
+}
+
+/** Spawn with stdio: 'ignore' to avoid open file-handle leaks in the test process. */
+function testSpawn(cmd: string, args: string[], opts: object) {
+  return realSpawn(cmd, args, { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  resetRestateStatus();
+});
+
+// ---------------------------------------------------------------------------
+// restateDataDir()
+// ---------------------------------------------------------------------------
+
+describe("restateDataDir", () => {
+  const originalOverride = process.env.RESTATE_DATA_DIR;
+
+  afterEach(() => {
+    if (originalOverride === undefined) delete process.env.RESTATE_DATA_DIR;
+    else process.env.RESTATE_DATA_DIR = originalOverride;
+  });
+
+  it("defaults to the dedup db's directory plus /restate", () => {
+    delete process.env.RESTATE_DATA_DIR;
+    expect(restateDataDir("/data/dedup.sqlite")).toBe("/data/restate");
+  });
+
+  it("honors RESTATE_DATA_DIR when set", () => {
+    process.env.RESTATE_DATA_DIR = "/custom/restate-dir";
+    expect(restateDataDir("/data/dedup.sqlite")).toBe("/custom/restate-dir");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Readiness polling
+// ---------------------------------------------------------------------------
+
+describe("readiness polling", () => {
+  it("sidecar answers on first poll → start() resolves true", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+
+    try {
+      await expect(sidecar.start()).resolves.toBe(true);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("sidecar answers on 5th poll → start() resolves true", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    let calls = 0;
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => ++calls >= 5, spawn: testSpawn, resolveBinary: () => script },
+    );
+
+    try {
+      await expect(sidecar.start()).resolves.toBe(true);
+      expect(calls).toBeGreaterThanOrEqual(5);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("child exits during startup → logs one warning, start() resolves false", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "exit 0"); // exits immediately
+
+    const stderrOutput: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+    });
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 3_000, pollIntervalMs: 50 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+
+    const ready = await sidecar.start();
+    expect(ready).toBe(false);
+
+    const exitedDuringStartup = stderrOutput.filter((line) => line.includes("exited during startup"));
+    expect(exitedDuringStartup).toHaveLength(1);
+
+    const degraded = stderrOutput.filter((line) => line.includes("orchestrator will exit"));
+    expect(degraded).toHaveLength(1);
+  });
+
+  it("readiness timeout → start() resolves false, logs one warning", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const stderrOutput: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+    });
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 200, pollIntervalMs: 50 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+
+    try {
+      const ready = await sidecar.start();
+      expect(ready).toBe(false);
+      const timeoutLines = stderrOutput.filter((line) => line.includes("readiness timeout"));
+      expect(timeoutLines).toHaveLength(1);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("missing platform binary → logs one warning, start() resolves false without spawning", async () => {
+    const spawnSpy = vi.fn(testSpawn);
+    const stderrOutput: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+    });
+
+    const sidecar = new RestateSidecar({}, { spawn: spawnSpy, resolveBinary: () => null });
+
+    const ready = await sidecar.start();
+    expect(ready).toBe(false);
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect(stderrOutput.some((line) => line.includes("no @restatedev/restate-server platform binary"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spawn configuration — bind addresses
+// ---------------------------------------------------------------------------
+
+describe("spawn configuration", () => {
+  it.each([
+    ["darwin", 100, undefined, "darwin"],
+    ["darwin", 101, "unix", "darwin"],
+    ["linux", 100, undefined, undefined],
+    ["linux", 100, "tcp", undefined],
+    ["linux", 101, "unix", "length"],
+  ] as const)("selects listen mode on %s with a %i-byte socket path", async (platform, bytes, ambientMode, reason) => {
+    vi.stubEnv("TMPDIR", "/tmp");
+    const root = testDir("s");
+    const hostname = "test-host";
+    // Multibyte input distinguishes UTF-8 bytes from character count; pass a relative base dir.
+    const prefix = join(root, "é");
+    const padding = bytes - Buffer.byteLength(join(prefix, hostname, "ingress.sock"));
+    const dataDir = relative(process.cwd(), prefix + "x".repeat(padding));
+    expect(Buffer.byteLength(join(resolve(dataDir), hostname, "ingress.sock"))).toBe(bytes);
+    vi.stubEnv("RESTATE_LISTEN_MODE", ambientMode);
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    const script = join(root, "fake-server.sh");
+    writeScript(script, "sleep 60");
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { platform, hostname, httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+    );
+    try {
+      await expect(sidecar.start()).resolves.toBe(true);
+      const opts = spawnSpy.mock.calls[0][2] as { env: NodeJS.ProcessEnv };
+      if (reason) expect(opts.env.RESTATE_LISTEN_MODE).toBe("tcp");
+      else if (ambientMode) expect(opts.env.RESTATE_LISTEN_MODE).toBe(ambientMode);
+      else expect(opts.env).not.toHaveProperty("RESTATE_LISTEN_MODE");
+      const lines = logs.mock.calls.map((args) => args.join(" ")).filter((line) => line.includes("listen mode"));
+      expect(lines).toEqual(reason ? [
+        `[restate] listen mode tcp (${reason === "darwin" ? "darwin" : `socket path ${bytes} bytes`})`,
+      ] : []);
+    } finally {
+      await sidecar.stop();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("binds ingress and admin listeners to 127.0.0.1 via env", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+    );
+
+    try {
+      await sidecar.start();
+
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+      const [, , spawnOpts] = spawnSpy.mock.calls[0] as [string, string[], { env?: NodeJS.ProcessEnv }];
+      const childEnv = spawnOpts.env;
+
+      expect(childEnv?.RESTATE_INGRESS__BIND_ADDRESS).toBe(RESTATE_INGRESS_BIND_ADDRESS);
+      expect(childEnv?.RESTATE_INGRESS__BIND_ADDRESS).toMatch(/^127\.0\.0\.1:\d+$/);
+
+      expect(childEnv?.RESTATE_ADMIN__BIND_ADDRESS).toBe(new URL(RESTATE_ADMIN_BASE_URL).host);
+      expect(childEnv?.RESTATE_ADMIN__BIND_ADDRESS).toMatch(/^127\.0\.0\.1:\d+$/);
+
+      expect(childEnv?.RESTATE_BIND_ADDRESS).toBe("127.0.0.1:5122");
+      expect(childEnv?.RESTATE_DEFAULT_NUM_PARTITIONS).toBe("4");
+      expect(childEnv?.RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE).toBe("256 MB");
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Env allowlist (AII-728) — childEnv is built from an explicit allowlist, never
+// `...process.env`: the sidecar is a separate binary that has no business seeing the
+// orchestrator's full environment (GitHub App keys, ticketing tokens, etc).
+// ---------------------------------------------------------------------------
+
+describe("env allowlist (AII-728)", () => {
+  it("forwards only PATH/HOME/TMPDIR/TZ and RESTATE_* keys, excluding an unrelated decoy credential", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    vi.stubEnv("PATH", "/usr/bin:/bin");
+    vi.stubEnv("HOME", "/home/tester");
+    vi.stubEnv("TMPDIR", "/tmp");
+    vi.stubEnv("TZ", "UTC");
+    vi.stubEnv("AWS_SECRET_ACCESS_KEY", "decoy-secret-value");
+    vi.stubEnv("GITHUB_APP_PRIVATE_KEY", "decoy-private-key");
+    vi.stubEnv("RESTATE_OPERATOR_OVERRIDE", "operator-set-value");
+
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+    );
+
+    try {
+      await sidecar.start();
+
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+      const [, , spawnOpts] = spawnSpy.mock.calls[0] as [string, string[], { env?: NodeJS.ProcessEnv }];
+      const childEnv = spawnOpts.env ?? {};
+
+      expect(childEnv.PATH).toBe("/usr/bin:/bin");
+      expect(childEnv.HOME).toBe("/home/tester");
+      expect(childEnv.TMPDIR).toBe("/tmp");
+      expect(childEnv.TZ).toBe("UTC");
+      expect(childEnv.RESTATE_OPERATOR_OVERRIDE).toBe("operator-set-value");
+      expect(childEnv.RESTATE_INGRESS__BIND_ADDRESS).toBe(RESTATE_INGRESS_BIND_ADDRESS);
+      expect(childEnv.RESTATE_ADMIN__BIND_ADDRESS).toBe(new URL(RESTATE_ADMIN_BASE_URL).host);
+      expect(childEnv.RESTATE_BASE_DIR).toBe(dataDir);
+      expect(childEnv.RESTATE_BIND_ADDRESS).toBe("127.0.0.1:5122");
+      expect(childEnv.RESTATE_DEFAULT_NUM_PARTITIONS).toBe("4");
+      expect(childEnv.RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE).toBe("256 MB");
+
+      expect(childEnv).not.toHaveProperty("AWS_SECRET_ACCESS_KEY");
+      expect(childEnv).not.toHaveProperty("GITHUB_APP_PRIVATE_KEY");
+      expect(Object.values(childEnv)).not.toContain("decoy-secret-value");
+      expect(Object.values(childEnv)).not.toContain("decoy-private-key");
+    } finally {
+      await sidecar.stop();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("advertises the ingress through the orchestrator origin when OAUTH_REDIRECT_BASE_URL is set (AII-1261)", async () => {
+    const run = async (base: string | undefined) => {
+      const dataDir = testDir("restate-sidecar");
+      const script = join(dataDir, "fake-server.sh");
+      writeScript(script, "sleep 60");
+      if (base === undefined) vi.stubEnv("OAUTH_REDIRECT_BASE_URL", ""); else vi.stubEnv("OAUTH_REDIRECT_BASE_URL", base);
+      const spawnSpy = vi.fn(testSpawn);
+      const sidecar = new RestateSidecar(
+        { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+        { httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+      );
+      try {
+        await sidecar.start();
+        const [, , o] = spawnSpy.mock.calls[0] as [string, string[], { env?: NodeJS.ProcessEnv }];
+        return o.env ?? {};
+      } finally {
+        await sidecar.stop();
+        vi.unstubAllEnvs();
+      }
+    };
+    const withBase = await run("https://orch.example/");
+    expect(withBase.RESTATE_INGRESS__ADVERTISED_ADDRESS).toBe("https://orch.example/admin/restate/ingress/");
+    expect(withBase.RESTATE_INGRESS__BIND_ADDRESS).toBe(RESTATE_INGRESS_BIND_ADDRESS);
+    expect(withBase.RESTATE_ADMIN__BIND_ADDRESS).toBe(new URL(RESTATE_ADMIN_BASE_URL).host);
+    const without = await run(undefined);
+    expect(without).not.toHaveProperty("RESTATE_INGRESS__ADVERTISED_ADDRESS");
+  });
+
+  it("a fixed RESTATE_* constant wins over an operator-set override of the same key", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    // An operator override of a key this module also sets explicitly must not win —
+    // the fixed constants (ingress/admin bind addresses, base dir, etc.) are load-bearing
+    // for the loopback-only guarantee (ADR 023) and must not be shadowable via process.env.
+    vi.stubEnv("RESTATE_BASE_DIR", "/should-not-be-used");
+
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+    );
+
+    try {
+      await sidecar.start();
+      const [, , spawnOpts] = spawnSpy.mock.calls[0] as [string, string[], { env?: NodeJS.ProcessEnv }];
+      expect(spawnOpts.env?.RESTATE_BASE_DIR).toBe(dataDir);
+    } finally {
+      await sidecar.stop();
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stop / shutdown behaviour
+// ---------------------------------------------------------------------------
+
+describe("unexpected child exit", () => {
+  it.each([0, 1, null])("reports exit %s once and suppresses intentional teardown", async code => {
+    const onUnexpectedExit = vi.fn();
+    const children: EventEmitter[] = [];
+    const sidecar = new RestateSidecar(
+      { dataDir: testDir("restate-exit"), onUnexpectedExit },
+      { resolveBinary: () => "/fake", httpGet: async () => true, spawn: () => {
+        const child = Object.assign(new EventEmitter(), {
+          exitCode: null, signalCode: null,
+          kill: () => { child.emit("exit", null, "SIGTERM"); child.emit("close"); return true; },
+        });
+        children.push(child);
+        return child as unknown as ChildProcess;
+      } },
+    );
+    await sidecar.start();
+    await sidecar.restart();
+    expect(onUnexpectedExit).not.toHaveBeenCalled();
+    children[1].emit("exit", code, "SIGKILL");
+    children[1].emit("exit", code, null);
+    expect(onUnexpectedExit.mock.calls).toEqual([[{ code, signal: "SIGKILL" }]]);
+    children[1].emit("close");
+    await sidecar.start();
+    children[2].emit("error", new Error("dead"));
+    children[2].emit("exit", 1, null);
+    expect(onUnexpectedExit.mock.calls[1]).toEqual([{ code: null, signal: null }]);
+    expect(onUnexpectedExit).toHaveBeenCalledTimes(2);
+    await sidecar.start();
+    await sidecar.stop();
+    expect(onUnexpectedExit).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("stop / shutdown", () => {
+  it("stop() sends SIGTERM to child", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+    await sidecar.start();
+
+    const pid = (sidecar as unknown as { _child: { pid?: number } })._child?.pid;
+    expect(pid).toBeTypeOf("number");
+
+    await sidecar.stop();
+
+    // After stop() resolves, the process must be gone (no orphan).
+    expect(() => process.kill(pid!, 0)).toThrow();
+  });
+
+  it("stop() when no sidecar running → resolves immediately", async () => {
+    const sidecar = new RestateSidecar();
+    await expect(sidecar.stop()).resolves.toBeUndefined();
+  });
+
+  it("stop() when child already exited → resolves immediately without error", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "exit 0");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 3_000, pollIntervalMs: 50 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+    await sidecar.start(); // child dies during poll
+
+    await expect(sidecar.stop()).resolves.toBeUndefined();
+  });
+
+  it("no orphan after stop() resolves (SIGKILL backstop integration test)", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    // Ignores SIGTERM so the SIGKILL backstop fires.
+    writeScript(script, "trap '' TERM; sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10, stopTimeoutMs: 200 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+    await sidecar.start();
+
+    const pid = (sidecar as unknown as { _child: { pid?: number } })._child?.pid;
+    expect(pid).toBeTypeOf("number");
+
+    await sidecar.stop();
+
+    expect(() => process.kill(pid!, 0)).toThrow();
+  }, 10_000);
+
+  it("stop() sends SIGTERM exactly once and the process is gone afterward", async () => {
+    // Whether the SIGKILL backstop also fires is shell-dependent (a `trap '' TERM; sleep`
+    // fake exits on SIGTERM under macOS's bash 3.2 /bin/sh but not under Linux's dash/bash),
+    // so this only pins the SIGTERM count and the end state. The SIGKILL branch itself is
+    // covered by the "no orphan" integration test above.
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "trap '' TERM; sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10, stopTimeoutMs: 200 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+    await sidecar.start();
+
+    const child = (sidecar as unknown as { _child: { pid?: number; kill: (sig: string) => boolean } })._child;
+    expect(child).not.toBeNull();
+    const pid = child!.pid;
+    const killSpy = vi.spyOn(child!, "kill");
+
+    await sidecar.stop();
+
+    const sigtermCalls = killSpy.mock.calls.filter(([sig]) => sig === "SIGTERM").length;
+    expect(sigtermCalls).toBe(1);
+    expect(() => process.kill(pid!, 0)).toThrow();
+  }, 10_000);
+
+  it("concurrent stop() calls run the sequence once (re-entrancy latch)", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+    await sidecar.start();
+
+    const child = (sidecar as unknown as { _child: { kill: (sig: string) => boolean } })._child;
+    expect(child).not.toBeNull();
+    const killSpy = vi.spyOn(child!, "kill");
+
+    const [p1, p2] = [sidecar.stop(), sidecar.stop()];
+    await Promise.all([p1, p2]);
+
+    const sigtermCalls = killSpy.mock.calls.filter(([sig]) => sig === "SIGTERM").length;
+    expect(sigtermCalls).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Late readiness — background polling continues past the initial timeout
+// ---------------------------------------------------------------------------
+
+describe("late readiness", () => {
+  it("resolves whenReady() true after the initial timeout, without a second spawn", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const spawnSpy = vi.fn(testSpawn);
+    let calls = 0;
+    // pollTimeoutMs / pollIntervalMs bounds the initial poll to roughly 10 calls;
+    // answering ready only after 25 guarantees the "true" answer lands in the
+    // background-polling phase, past the initial timeout.
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 10 },
+      {
+        httpGet: async () => {
+          calls++;
+          return calls > 25;
+        },
+        spawn: spawnSpy,
+        resolveBinary: () => script,
+      },
+    );
+
+    try {
+      const ready = await sidecar.start();
+      expect(ready).toBe(false);
+      expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
+
+      await expect(sidecar.whenReady()).resolves.toBe(true);
+      expect(getRestateStatus().sidecar).toEqual({ state: "ready" });
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("exit after a ready sidecar logs code/signal exactly once and status becomes 'exited'", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const stderrOutput: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+    });
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+
+    await sidecar.start();
+    await sidecar.stop(); // SIGTERM → child exits
+
+    const exitLines = stderrOutput.filter((line) => line.includes("sidecar exited (code="));
+    expect(exitLines).toHaveLength(1);
+    expect(getRestateStatus().sidecar.state).toBe("exited");
+  });
+
+  it("exit while still degraded (never became ready) resolves whenReady() false", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    // Ignores SIGTERM so the SIGKILL backstop fires deterministically (same pattern as
+    // the "no orphan" stop/shutdown test above).
+    writeScript(script, "trap '' TERM; sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 20, stopTimeoutMs: 200 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+
+    await sidecar.start();
+    expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
+
+    const pid = (sidecar as unknown as { _child: { pid?: number } })._child?.pid;
+
+    await sidecar.stop(); // SIGTERM ignored → SIGKILL backstop exits the child before it ever answers ready
+
+    await expect(sidecar.whenReady()).resolves.toBe(false);
+    const sidecarStatus = getRestateStatus().sidecar;
+    // Whether the SIGKILL backstop also fires is shell-dependent, see the note at line 355.
+    expect(sidecarStatus).toMatchObject({ state: "exited", code: null });
+    if (sidecarStatus.state !== "exited") throw new Error("unreachable");
+    expect(["SIGKILL", "SIGTERM"]).toContain(sidecarStatus.signal);
+    expect(() => process.kill(pid!, 0)).toThrow();
+  }, 10_000);
+
+  it("stop() clears background polling — httpGet call count stabilizes", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    let calls = 0;
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 50, pollIntervalMs: 10 },
+      {
+        httpGet: async () => {
+          calls++;
+          return false;
+        },
+        spawn: testSpawn,
+        resolveBinary: () => script,
+      },
+    );
+
+    await sidecar.start();
+    expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
+
+    await sidecar.stop();
+    const callsAtStop = calls;
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(calls).toBe(callsAtStop);
+  });
+
+  it("no implicit restart on exit; explicit restart() spawns exactly one new child", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "exit 0"); // exits immediately every time
+
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 500, pollIntervalMs: 20 },
+      { httpGet: async () => false, spawn: spawnSpy, resolveBinary: () => script },
+    );
+
+    await sidecar.start();
+    expect(spawnSpy).toHaveBeenCalledTimes(1);
+
+    // The child already exited on its own; nothing should re-spawn it.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(spawnSpy).toHaveBeenCalledTimes(1);
+
+    const ready = await sidecar.restart();
+    expect(spawnSpy).toHaveBeenCalledTimes(2);
+    expect(ready).toBe(false);
+  });
+
+  it("exit fires without a lagging close — status stays 'exited', not clobbered back to 'timeout'", async () => {
+    // Regression test: childDead must be readable as soon as "exit" fires, not only once
+    // "close" fires (which Node does not guarantee is synchronous with "exit" — it lags by
+    // one or more event-loop ticks). This fake child never emits "close" at all, which
+    // pins that the post-timeout guard's `isDead()` check no longer depends on it.
+    const fakeChild = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(fakeChild, { pid: 4242, kill: vi.fn() });
+
+    const sidecar = new RestateSidecar(
+      { dataDir: testDir("restate-fake-child"), pollTimeoutMs: 60, pollIntervalMs: 15 },
+      {
+        httpGet: async () => false,
+        spawn: () => fakeChild,
+        resolveBinary: () => "/fake/restate-server",
+      },
+    );
+
+    const startPromise = sidecar.start();
+
+    // Fires well inside the polling window, before the readiness deadline elapses —
+    // "close" is deliberately never emitted.
+    setTimeout(() => {
+      fakeChild.emit("exit", 1, null);
+    }, 20);
+
+    const ready = await startPromise;
+    expect(ready).toBe(false);
+    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: 1, signal: null });
+    await expect(sidecar.whenReady()).resolves.toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Status contract (AII-773, src/restate/status.ts) transitions
+// ---------------------------------------------------------------------------
+
+describe("status contract transitions", () => {
+  it("missing binary → status 'missing-binary'", async () => {
+    const sidecar = new RestateSidecar({}, { spawn: vi.fn(testSpawn), resolveBinary: () => null });
+    await sidecar.start();
+    expect(getRestateStatus().sidecar).toEqual({ state: "missing-binary" });
+  });
+
+  it("early exit during startup → status 'exited' with code/signal", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "exit 3");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 3_000, pollIntervalMs: 50 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+    await sidecar.start();
+    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: 3, signal: null });
+  });
+
+  it("readiness timeout without exit → status 'timeout'", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 20 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+    try {
+      await sidecar.start();
+      expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("ready within the initial timeout → status 'ready'", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+    try {
+      await sidecar.start();
+      expect(getRestateStatus().sidecar).toEqual({ state: "ready" });
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("spawn 'error' event (e.g. EACCES) → status 'exited', not stuck at 'starting'", async () => {
+    const fakeChild = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(fakeChild, { pid: undefined, kill: vi.fn() });
+
+    const stderrOutput: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+    });
+
+    const sidecar = new RestateSidecar(
+      { dataDir: testDir("restate-fake-child-error"), pollTimeoutMs: 200, pollIntervalMs: 20 },
+      {
+        httpGet: async () => false,
+        spawn: () => fakeChild,
+        resolveBinary: () => "/fake/restate-server",
+      },
+    );
+
+    const startPromise = sidecar.start();
+
+    setTimeout(() => {
+      fakeChild.emit("error", Object.assign(new Error("spawn EACCES"), { code: "EACCES" }));
+    }, 10);
+
+    const ready = await startPromise;
+    expect(ready).toBe(false);
+    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: null, signal: null });
+    expect(stderrOutput.some((line) => line.includes("sidecar process error"))).toBe(true);
+    await expect(sidecar.whenReady()).resolves.toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boot wiring (AII-807): src/index.ts's createRestateRegistrationGate /
+// stopSidecarsConcurrently, exercised standalone with fakes, then combined with a real
+// RestateSidecar to prove the whenReady()-driven wiring end to end.
+// ---------------------------------------------------------------------------
+
+describe("createRestateRegistrationGate", () => {
+  it("attempt() starts and registers the endpoint exactly once, even called twice (flapping late-readiness signal)", async () => {
+    const startRestateEndpoint = vi.fn(async () => undefined);
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    const gate = createRestateRegistrationGate(() => false, { startRestateEndpoint, registerRestateEndpoint });
+
+    await gate.attempt();
+    await gate.attempt();
+
+    expect(startRestateEndpoint).toHaveBeenCalledTimes(1);
+    expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
+    expect(getRestateStatus().registration).toEqual({ state: "registered" });
+  });
+
+  it("refuses to start or register once shutdown has begun", async () => {
+    const startRestateEndpoint = vi.fn(async () => undefined);
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    const gate = createRestateRegistrationGate(() => true, { startRestateEndpoint, registerRestateEndpoint });
+
+    await gate.attempt();
+
+    expect(startRestateEndpoint).not.toHaveBeenCalled();
+    expect(registerRestateEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("does not register if shutdown begins while endpoint startup is pending", async () => {
+    let finishStart!: () => void;
+    const startRestateEndpoint = vi.fn(() => new Promise<void>((resolve) => { finishStart = resolve; }));
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    let shuttingDown = false;
+    const gate = createRestateRegistrationGate(() => shuttingDown, { startRestateEndpoint, registerRestateEndpoint });
+
+    const attempt = gate.attempt();
+    expect(startRestateEndpoint).toHaveBeenCalledTimes(1);
+    shuttingDown = true;
+    finishStart();
+    await attempt;
+
+    expect(registerRestateEndpoint).not.toHaveBeenCalled();
+    expect(getRestateStatus().registration).toEqual({ state: "not-attempted" });
+  });
+
+  it.each([
+    ["registered-no-force", { state: "registered" }],
+    ["registered-drained-force", { state: "registered" }],
+    ["declined-conflict", { state: "declined-conflict" }],
+    ["unreachable", { state: "unreachable" }],
+  ] as const)("maps registration outcome %s onto the shared status contract", async (outcome, expected) => {
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: async () => undefined,
+      registerRestateEndpoint: async () => ({ outcome }),
+    });
+
+    await gate.attempt();
+
+    expect(getRestateStatus().registration).toEqual(expected);
+  });
+
+  it("a thrown endpoint-start error is reported as unreachable, not left unset", async () => {
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: async () => {
+        throw new Error("boom");
+      },
+      registerRestateEndpoint: async () => ({ outcome: "registered-no-force" }),
+    });
+
+    await gate.attempt();
+
+    expect(getRestateStatus().registration).toEqual({ state: "unreachable" });
+    expect(await gate.whenSettled()).toBe("unreachable");
+  });
+
+  // -------------------------------------------------------------------------
+  // Retry-on-decline (AII-721): a `declined-conflict` outcome arms a single
+  // unref'd 60s retry timer, one attempt at a time, cleared on success or on
+  // shutdown.
+  // -------------------------------------------------------------------------
+
+  const RETRY_MS = 60_000;
+
+  it("a declined-conflict outcome retries registration every 60s until it succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      const registerRestateEndpoint = vi
+        .fn<() => Promise<{ outcome: "declined-conflict" | "registered-drained-force" }>>()
+        .mockResolvedValueOnce({ outcome: "declined-conflict" })
+        .mockResolvedValueOnce({ outcome: "registered-drained-force" });
+      const gate = createRestateRegistrationGate(() => false, {
+        startRestateEndpoint: async () => undefined,
+        registerRestateEndpoint,
+      });
+
+      const settled = vi.fn();
+      void gate.whenSettled().then(settled);
+      await gate.attempt();
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
+      expect(getRestateStatus().registration).toEqual({ state: "declined-conflict" });
+      expect(settled).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(settled).toHaveBeenCalledWith("serving");
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(2);
+      expect(getRestateStatus().registration).toEqual({ state: "registered" });
+
+      // The timer cleared itself on success: a further tick calls register no more.
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not arm a second interval while a retry is already pending — one timer, not one per decline", async () => {
+    vi.useFakeTimers();
+    try {
+      const registerRestateEndpoint = vi.fn(async () => ({ outcome: "declined-conflict" as const }));
+      const setIntervalSpy = vi.spyOn(global, "setInterval");
+      const gate = createRestateRegistrationGate(() => false, {
+        startRestateEndpoint: async () => undefined,
+        registerRestateEndpoint,
+      });
+
+      await gate.attempt();
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(3); // initial attempt + two retries
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1); // armed once, reused on every subsequent decline
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the retry timer is unref'd — it must never keep the process alive on its own", async () => {
+    vi.useFakeTimers();
+    try {
+      const setIntervalSpy = vi.spyOn(global, "setInterval");
+      const gate = createRestateRegistrationGate(() => false, {
+        startRestateEndpoint: async () => undefined,
+        registerRestateEndpoint: async () => ({ outcome: "declined-conflict" as const }),
+      });
+
+      await gate.attempt();
+
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+      const timer = setIntervalSpy.mock.results[0].value as { hasRef(): boolean };
+      expect(timer.hasRef()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stopRetrying() clears an armed retry timer — a shutdown must not leave a pending retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const registerRestateEndpoint = vi.fn(async () => ({ outcome: "declined-conflict" as const }));
+      const gate = createRestateRegistrationGate(() => false, {
+        startRestateEndpoint: async () => undefined,
+        registerRestateEndpoint,
+      });
+
+      await gate.attempt();
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
+
+      gate.stopRetrying();
+
+      await vi.advanceTimersByTimeAsync(RETRY_MS * 2);
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(1); // no retry fired after stopRetrying()
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("stopSidecarsConcurrently", () => {
+  it("two 4s stops finish together in under 5s", async () => {
+    const fakeStop = () => new Promise<void>((resolve) => setTimeout(resolve, 4_000));
+    const started = Date.now();
+
+    await stopSidecarsConcurrently({ stop: fakeStop }, { stop: fakeStop });
+
+    expect(Date.now() - started).toBeLessThan(5_000);
+  }, 10_000);
+});
+
+describe("main() wiring: whenReady() drives the registration gate end to end", () => {
+  it("a sidecar that only becomes ready after the initial timeout still gets registered, exactly once", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    let calls = 0;
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 10 },
+      {
+        httpGet: async () => {
+          calls++;
+          return calls > 15;
+        },
+        spawn: testSpawn,
+        resolveBinary: () => script,
+      },
+    );
+
+    const startRestateEndpoint = vi.fn(async () => undefined);
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    const gate = createRestateRegistrationGate(() => false, { startRestateEndpoint, registerRestateEndpoint });
+
+    try {
+      const ready = await sidecar.start();
+      expect(ready).toBe(false); // times out initially — recovers in the background
+
+      void sidecar.whenReady().then((r) => {
+        if (r) void gate.attempt();
+      });
+
+      await expect(sidecar.whenReady()).resolves.toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 20)); // let the .then() continuation run
+
+      expect(startRestateEndpoint).toHaveBeenCalledTimes(1);
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("a late-readiness signal that arrives after shutdown starts does not start or register the endpoint", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    let calls = 0;
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 10 },
+      {
+        httpGet: async () => {
+          calls++;
+          return calls > 15;
+        },
+        spawn: testSpawn,
+        resolveBinary: () => script,
+      },
+    );
+
+    const startRestateEndpoint = vi.fn(async () => undefined);
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    let shuttingDown = false;
+    const gate = createRestateRegistrationGate(() => shuttingDown, { startRestateEndpoint, registerRestateEndpoint });
+
+    try {
+      const ready = await sidecar.start();
+      expect(ready).toBe(false);
+
+      shuttingDown = true; // shutdown wins the race — begins before the late signal arrives
+
+      void sidecar.whenReady().then((r) => {
+        if (r) void gate.attempt();
+      });
+
+      await expect(sidecar.whenReady()).resolves.toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(startRestateEndpoint).not.toHaveBeenCalled();
+      expect(registerRestateEndpoint).not.toHaveBeenCalled();
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+describe("request identity key", () => {
+  function fakeSpawn(envs: NodeJS.ProcessEnv[]) {
+    return (_cmd: string, _args: string[], opts: object) => {
+      envs.push((opts as { env: NodeJS.ProcessEnv }).env);
+      return testSpawn("/bin/sh", ["-c", "sleep 5"], opts);
+    };
+  }
+
+  it("writes the pair once on first boot and reuses it on the next", async () => {
+    const dataDir = testDir("restate-sidecar");
+    const envs: NodeJS.ProcessEnv[] = [];
+    const mk = () =>
+      new RestateSidecar(
+        { dataDir, pollIntervalMs: 10, pollTimeoutMs: 1_000, stopTimeoutMs: 500 },
+        { spawn: fakeSpawn(envs), httpGet: async () => true, resolveBinary: () => "/bin/true" },
+      );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const first = mk();
+    await first.start();
+    const pemPath = envs[0].RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE!;
+    expect(pemPath.startsWith(dataDir)).toBe(true);
+    expect(first.identityKey).toMatch(/^publickeyv1_[1-9A-HJ-NP-Za-km-z]+$/);
+    expect(statSync(pemPath).mode & 0o777).toBe(0o600);
+    const pem = readFileSync(pemPath, "utf8");
+    await first.stop();
+
+    const second = mk();
+    await second.start();
+    expect(readFileSync(pemPath, "utf8")).toBe(pem);
+    expect(second.identityKey).toBe(first.identityKey);
+    await second.stop();
+  });
+
+  it("encodes a known ED25519 public key to its compact publickeyv1_ form", () => {
+    // Seed 00 01 .. 1f, wrapped as PKCS#8; the public key is
+    // 03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8 and the base58 string below
+    // was computed independently of src/restate/server.ts.
+    const seed = Buffer.from(Array.from({ length: 32 }, (_, i) => i));
+    const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+    const pem = `-----BEGIN PRIVATE KEY-----\n${der.toString("base64")}\n-----END PRIVATE KEY-----\n`;
+    expect(identityKeyFromPem(pem)).toBe("publickeyv1_FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF");
+  });
+
+  it("replaces a corrupt PEM, returns the matching key, and reuses it afterwards", () => {
+    const dataDir = testDir("restate-sidecar");
+    const pemPath = join(dataDir, "request-identity-private.pem");
+    writeFileSync(pemPath, "not a pem");
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const first = ensureRequestIdentityKey(dataDir);
+    const pem = readFileSync(pemPath, "utf8");
+    expect(pem).toContain("BEGIN PRIVATE KEY");
+    expect(first.publicKey).toBe(identityKeyFromPem(pem));
+    expect(statSync(pemPath).mode & 0o777).toBe(0o600);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes("regenerated"))).toHaveLength(1);
+
+    const second = ensureRequestIdentityKey(dataDir);
+    expect(second.publicKey).toBe(first.publicKey);
+    expect(readFileSync(pemPath, "utf8")).toBe(pem);
+  });
+
+  it("does not spawn the child and reports the degraded state when the key cannot be prepared", async () => {
+    const dataDir = testDir("restate-sidecar");
+    // A file where the data directory should be makes the key write fail regardless of uid.
+    const blocker = join(dataDir, "not-a-dir");
+    writeFileSync(blocker, "");
+    const spawnFn = vi.fn();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const sidecar = new RestateSidecar(
+      { dataDir: blocker, pollIntervalMs: 10, pollTimeoutMs: 200 },
+      { spawn: spawnFn, httpGet: async () => true, resolveBinary: () => "/bin/true" },
+    );
+
+    expect(await sidecar.start()).toBe(false);
+    expect(await sidecar.whenReady()).toBe(false);
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(sidecar.identityKey).toBeUndefined();
+    expect(getRestateStatus().sidecar.state).toBe("exited");
+  });
+
+  it("derives a stable key from the PEM", () => {
+    const dataDir = testDir("restate-sidecar");
+    expect(ensureRequestIdentityKey(dataDir).publicKey).toBe(ensureRequestIdentityKey(dataDir).publicKey);
+  });
+});
+
+describe("model price schedule boot hook", () => {
+  it("arms prices when the successful-registration hook runs", async () => {
+    const armPrices = vi.fn(async () => {});
+    const step = async () => {};
+    const deps = { armPrices, releaseHold: step, sweep: () => {}, scrub: step, seed: step, refresh: step };
+    await onRestateRegistered(deps);
+    expect(armPrices).toHaveBeenCalledOnce();
+  });
+});
+
+describe("waitForRestateServing", () => {
+  it("allows late readiness within the provisioning health budget", async () => {
+    const { HEALTH_WAIT_MS } = await import("../provision-client.js");
+    expect(RESTATE_BOOT_DEADLINE_MS).toBe(300_000);
+    expect(RESTATE_BOOT_DEADLINE_MS).toBeGreaterThan(30_000);
+    expect(RESTATE_BOOT_DEADLINE_MS).toBeLessThan(HEALTH_WAIT_MS);
+  });
+
+  it.each([
+    ["missing-binary", "not-attempted", undefined, "missing-binary"],
+    ["exited", "registered", "serving", "exited"],
+    ["exited", "registered", undefined, "exited"],
+    ["ready", "unreachable", "unreachable", "unreachable"],
+    ["ready", "unreachable", "hook-failed", "hook-failed"],
+    ["ready", "registered", "serving", "serving"],
+    ["ready", "registered", undefined, "deadline"],
+    ["ready", "not-attempted", undefined, "deadline"],
+    ["starting", "not-attempted", undefined, "deadline"],
+    ["timeout", "not-attempted", undefined, "deadline"],
+  ] as const)("%s / %s / %s yields %s", async (sidecar, registration, settlement, expected) => {
+    let time = 0;
+    const result = await waitForRestateServing({
+      status: () => ({ sidecar: sidecar === "exited" ? { state: sidecar, code: 1, signal: null } : { state: sidecar }, registration: { state: registration } }),
+      gate: { whenSettled: () => settlement ? Promise.resolve(settlement) : new Promise(() => {}) },
+      now: () => time,
+      deadlineMs: 100,
+      sleep: async () => { time += 50; },
+    });
+    expect(result).toBe(expected);
+    if (expected === "deadline") expect(time).toBe(100);
+  });
+
+  it("keeps a declined conflict waiting beyond the deadline, then accepts recovery", async () => {
+    let time = 0;
+    let finish!: (value: "serving") => void;
+    const settled = new Promise<"serving">(resolve => { finish = resolve; });
+    const result = await waitForRestateServing({
+      status: () => ({ sidecar: { state: "ready" }, registration: { state: time < 200 ? "declined-conflict" : "registered" } }),
+      gate: { whenSettled: () => settled }, now: () => time, deadlineMs: 100,
+      sleep: async () => { time += 50; if (time === 200) finish("serving"); },
+    });
+    expect(result).toBe("serving");
+    expect(time).toBe(200);
+  });
+
+  it("accepts readiness after the sidecar's initial timeout", async () => {
+    let time = 0;
+    let finish!: (value: "serving") => void;
+    const settled = new Promise<"serving">(resolve => { finish = resolve; });
+    expect(await waitForRestateServing({
+      status: () => ({ sidecar: { state: time < 40_000 ? "timeout" : "ready" }, registration: { state: time < 40_000 ? "not-attempted" : "registered" } }),
+      gate: { whenSettled: () => settled }, now: () => time,
+      sleep: async () => { time += 10_000; if (time === 40_000) finish("serving"); },
+    })).toBe("serving");
+  });
+
+  it.each(["SIGTERM", "SIGINT"])("%s interrupts the wait before boot can continue", async () => {
+    let stopped = false;
+    expect(await waitForRestateServing({
+      status: getRestateStatus, gate: { whenSettled: () => new Promise(() => {}) },
+      isShuttingDown: () => stopped, sleep: async () => { stopped = true; },
+    })).toBe("shutdown");
+  });
+});
+
+describe("registration hook settlement", () => {
+  it("never invokes the hook for unreachable registration", async () => {
+    const onRegistered = vi.fn(async () => {});
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: async () => {}, registerRestateEndpoint: async () => ({ outcome: "unreachable" }), onRegistered,
+    });
+    await gate.attempt();
+    expect(await gate.whenSettled()).toBe("unreachable");
+    expect(onRegistered).not.toHaveBeenCalled();
+  });
+
+  it("settles only after sweep, scrub, seed and refresh finish, before reconciliation and polling", async () => {
+    const calls: string[] = [];
+    let finishSeed!: () => void;
+    const seed = new Promise<void>(resolve => { finishSeed = resolve; });
+    const step = (name: string) => async () => { calls.push(name); };
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: step("endpoint"), registerRestateEndpoint: async () => ({ outcome: "registered-no-force" }),
+      onRegistered: () => onRestateRegistered({
+        releaseHold: step("hold"), armPrices: step("prices"), sweep: () => { calls.push("sweep"); },
+        scrub: step("scrub"), seed: async () => { await seed; calls.push("seed"); }, refresh: step("refresh"),
+      }),
+    });
+    const attempt = gate.attempt();
+    const boot = runMainBoot({
+      registerSignal: () => {}, startServer: () => { calls.push("server"); },
+      wait: () => waitForRestateServing({ status: () => ({ ...getRestateStatus(), sidecar: { state: "ready" } }), gate }),
+      isShuttingDown: () => false, shutdown: async () => {},
+      logFly: () => { calls.push("Fly logs"); }, refreshCache: step("cache"),
+      reconcile: step("reconciliation"), postBootNotice: () => { calls.push("notice"); },
+      poll: step("poll"), startInterval: () => { calls.push("interval"); },
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(calls).toEqual(["endpoint", "server", "hold", "prices", "sweep", "scrub"]);
+    finishSeed();
+    await attempt;
+    await boot;
+    expect(calls).toEqual(["endpoint", "server", "hold", "prices", "sweep", "scrub", "seed", "refresh", "Fly logs", "cache", "reconciliation", "notice", "poll", "interval"]);
+  });
+
+  // Boot starts its setup checks and never waits for them: the first poll runs while both are still going.
+  it("starts the setup checks right after the server and once Restate serves, and polls without waiting for them", async () => {
+    const calls: string[] = [];
+    const step = (name: string) => async () => { calls.push(name); };
+    await runMainBoot({
+      registerSignal: () => {}, startServer: () => { calls.push("server"); },
+      setupChecksBeforeRestate: () => { calls.push("checks before Restate"); },
+      setupChecksAfterServing: () => { calls.push("checks once serving"); },
+      wait: async () => { calls.push("wait"); return "serving"; },
+      isShuttingDown: () => false, shutdown: async () => {},
+      onServing: () => { calls.push("serving"); }, logFly: () => {}, refreshCache: step("cache"),
+      reconcile: step("reconciliation"), postBootNotice: () => {}, poll: step("poll"), startInterval: () => {},
+    });
+    expect(calls).toEqual(["server", "checks before Restate", "wait", "serving", "checks once serving", "cache", "reconciliation", "poll"]);
+  });
+
+  it("distinguishes a thrown hook from an endpoint failure", async () => {
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: async () => {}, registerRestateEndpoint: async () => ({ outcome: "registered-no-force" }),
+      onRegistered: async () => { throw new Error("hook failed"); },
+    });
+    await gate.attempt();
+    expect(await gate.whenSettled()).toBe("hook-failed");
+    expect(getRestateStatus().registration.state).toBe("unreachable");
+  });
+});
+
+
+describe("main shutdown during Restate boot", () => {
+  function fixture() {
+    let shuttingDown = false;
+    const kg = { stop: vi.fn(async () => {}) };
+    const restate = { stop: vi.fn(async () => {}) };
+    const closeServer = vi.fn((done: () => void) => { done(); });
+    const exit = vi.fn();
+    const postShutdownNotice = vi.fn(async () => {});
+    const recordShutdown = vi.fn();
+    const shutdown = createMainShutdown({
+      isShuttingDown: () => shuttingDown, markShuttingDown: () => { shuttingDown = true; },
+      stopPolling: vi.fn(), stopRetrying: vi.fn(), recordShutdown, postShutdownNotice,
+      stopSidecars: () => stopSidecarsConcurrently(kg, restate),
+      closeServer, closeDb: vi.fn(), exit,
+    });
+    const signals = new Map<string, () => void>();
+    const postBootNotice = vi.fn();
+    const poll = vi.fn(async () => {});
+    const logFly = vi.fn();
+    const refreshCache = vi.fn(async () => {});
+    const reconcile = vi.fn(async () => {});
+    const startInterval = vi.fn();
+    const startServer = vi.fn();
+    const restateExit = createRestateExitHandler();
+    const boot = (wait: () => ReturnType<typeof waitForRestateServing>) => runMainBoot({
+      registerSignal: (signal, handler) => { signals.set(signal, handler); },
+      onServing: () => restateExit.arm(shutdown),
+      startServer, wait, isShuttingDown: () => shuttingDown, shutdown,
+      postBootNotice, poll, logFly, refreshCache, reconcile, startInterval,
+    });
+    return { restateExit, kg, restate, closeServer, exit, postShutdownNotice, recordShutdown, shutdown,
+      boot, signals, postBootNotice, poll, logFly, refreshCache, reconcile, startInterval, startServer,
+      isShuttingDown: () => shuttingDown };
+
+  }
+
+  it("runtime exit notifies and exits 1 once during pending shutdown", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const f = fixture();
+    await f.boot(async () => "serving");
+    let release!: () => void;
+    f.kg.stop.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    f.restateExit.onUnexpectedExit({ code: 0, signal: null });
+    expect(errors).toHaveBeenCalledExactlyOnceWith("[main] Restate sidecar exited (code=0); shutting down");
+    await vi.waitFor(() => expect(f.kg.stop).toHaveBeenCalledOnce());
+    f.restateExit.onUnexpectedExit({ code: 1, signal: null });
+    release();
+    await vi.waitFor(() => expect(f.exit).toHaveBeenCalledExactlyOnceWith(1));
+    expect(f.recordShutdown).toHaveBeenCalledOnce();
+    expect(f.postShutdownNotice).toHaveBeenCalledOnce();
+    expect(f.restate.stop).toHaveBeenCalledOnce();
+    expect(f.closeServer).toHaveBeenCalledOnce();
+  });
+
+  it("early exit during start leaves fatal boot in charge", async () => {
+    const f = fixture();
+    const child = new EventEmitter();
+    const sidecar = new RestateSidecar(
+      { dataDir: testDir("restate-early"), onUnexpectedExit: f.restateExit.onUnexpectedExit },
+      { resolveBinary: () => "/fake", spawn: () => child as ChildProcess,
+        httpGet: async () => { child.emit("error", new Error("boot exit")); return true; } },
+    );
+    await expect(sidecar.start()).resolves.toBe(false);
+    expect(f.exit).not.toHaveBeenCalled();
+    await f.boot(async () => {
+      f.restateExit.onUnexpectedExit({ code: 1, signal: null });
+      return "exited";
+    });
+    expect(f.exit).toHaveBeenCalledExactlyOnceWith(1);
+    expect(f.recordShutdown).not.toHaveBeenCalled();
+    expect(f.postShutdownNotice).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing-binary", "exited", "unreachable", "hook-failed", "deadline"] as const)("fatal %s stops both children, closes HTTP and exits 1 without notice writes", async reason => {
+    const f = fixture();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    // A pending KG stop must not prevent Restate stop from starting.
+    let releaseKg!: () => void;
+    f.kg.stop.mockImplementation(() => new Promise<void>(resolve => { releaseKg = resolve; }));
+    const boot = f.boot(async () => reason);
+    await vi.waitFor(() => { expect(f.restate.stop).toHaveBeenCalledOnce(); });
+    expect(f.closeServer).not.toHaveBeenCalled();
+    releaseKg();
+    await boot;
+    expect(errors.mock.calls).toEqual([[`[main] Restate boot failed: ${reason}`]]);
+    errors.mockRestore();
+    expect(f.startServer).toHaveBeenCalledOnce();
+    expect(f.postBootNotice).not.toHaveBeenCalled();
+    expect(f.poll).not.toHaveBeenCalled();
+    expect(f.startInterval).not.toHaveBeenCalled();
+    expect(f.logFly).not.toHaveBeenCalled();
+    expect(f.refreshCache).not.toHaveBeenCalled();
+    expect(f.reconcile).not.toHaveBeenCalled();
+    expect(f.kg.stop).toHaveBeenCalledOnce();
+    expect(f.restate.stop).toHaveBeenCalledOnce();
+    expect(f.closeServer).toHaveBeenCalledOnce();
+    expect(f.exit).toHaveBeenCalledWith(1);
+    expect(f.postShutdownNotice).not.toHaveBeenCalled();
+    expect(f.recordShutdown).not.toHaveBeenCalled();
+    expect(f.isShuttingDown()).toBe(true);
+  });
+
+  it.each(["SIGTERM", "SIGINT"])("%s during the wait exits 0 and prevents polling after late hook completion", async signal => {
+    const f = fixture();
+    let settle!: (value: "serving") => void;
+    const settled = new Promise<"serving">(resolve => { settle = resolve; });
+    const boot = f.boot(() => settled);
+    expect(f.startServer).toHaveBeenCalledOnce();
+    f.signals.get(signal)!();
+    await vi.waitFor(() => { expect(f.exit).toHaveBeenCalledWith(0); });
+    settle("serving");
+    await boot;
+    expect(f.postBootNotice).not.toHaveBeenCalled();
+    expect(f.logFly).not.toHaveBeenCalled();
+    expect(f.refreshCache).not.toHaveBeenCalled();
+    expect(f.reconcile).not.toHaveBeenCalled();
+    expect(f.startInterval).not.toHaveBeenCalled();
+    expect(f.exit).toHaveBeenCalledWith(0);
+    expect(f.kg.stop).toHaveBeenCalledOnce();
+    expect(f.restate.stop).toHaveBeenCalledOnce();
+    expect(f.closeServer).toHaveBeenCalledOnce();
+    expect(f.poll).not.toHaveBeenCalled();
+  });
+});

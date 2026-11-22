@@ -1,17 +1,26 @@
 import crypto from "node:crypto";
 import http from "node:http";
-import { listLog } from "./log.js";
+import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
+import { findLinkByPr, setLinkOutcome } from "./pr-links.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
-import { enqueueReviewFix } from "./review-fix-queue.js";
-import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings } from "./pipeline/review-ledger.js";
-import { upsertReviewFinding } from "./review-ledger-store.js";
+import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
+import { recordReviewFinding } from "./review-ledger-store.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, isAiImplementComment, reviewContractFindingGates, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { getMappings } from "./config.js";
+import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
+import { REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "./restate/review-fix-pr.js";
+import { isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { resolveWorkflowContract } from "./workflow-probe.js";
+import { resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
-import { addCommentReaction } from "./github.js";
+import { addCommentReaction, listPullRequestFiles, postPrComment } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import type { KgDryRunReportTarget } from "./kg-refresh.js";
+import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
+
+/** The old prefix stays: comments already on open PRs still start with it. */
+const AI_IMPLEMENT_NATIVE_REVIEW_PREFIXES = ["AI-Implement post-push review", "AI-Implement second review"];
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -43,7 +52,7 @@ interface PullRequestPayload {
     number?: number;
     merged?: boolean;
     html_url?: string;
-    head?: { ref?: string };
+    head?: { ref?: string; sha?: string };
     merge_commit_sha?: string;
   };
   repository?: {
@@ -51,18 +60,192 @@ interface PullRequestPayload {
   };
 }
 
+export interface KgPrCheckConfig {
+  /** The bound KG source repo (`kg.source_repo`), owner/repo. Null disables the check for it. */
+  kgSourceRepo: string | null;
+  /** The configured base template repo (Settings → KG Refresh), owner/repo. Null disables the check for it. */
+  kgBaseRepo: string | null;
+  githubAppId?: string;
+  githubAppPrivateKey?: string;
+  /**
+   * Hands a PR-check dry-run to the `KgRepo` object (AII-730), which runs it now or holds it
+   * until the in-flight refresh releases. `idempotencyKey` is the delivery id, so Restate
+   * absorbs a redelivered event. Never throws in production; `unavailable` and `conflict`
+   * are reported, not retried.
+   */
+  enqueueDryRun: (
+    key: string,
+    entry: { ref: string; report: KgDryRunReportTarget },
+    opts?: { idempotencyKey?: string },
+  ) => Promise<
+    | { status: "accepted"; value?: { triggerId: string } | { queued: true } | { duplicate: true } | { closed: true } }
+    | { status: "conflict" }
+    | { status: "unavailable" }
+  >;
+  /** Evicts the `KgRepo` object's stored dry-run outcome for `repo`#`prNumber` (AII-636), on `closed`. */
+  forgetKgPr?: (repo: string, prNumber: number) => void | Promise<void>;
+}
+
+/** Paths whose change on a KG repo PR proves the dry-run rail before merge (AII-633). */
+const KG_GUARD_PATH_PATTERNS: RegExp[] = [/^kg_ingest\//, /^sources\.yml$/, /^ontology\//, /^snapshot\//];
+/** Head branch names that indicate an upstream merge, guard-relevant regardless of changed files. */
+const KG_GUARD_BRANCH_PATTERNS: RegExp[] = [/^kg-upstream\//, /^sync\/upstream-/];
+
+function matchesKgGuard(files: string[], headRef: string): boolean {
+  if (KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) return true;
+  return files.some((f) => KG_GUARD_PATH_PATTERNS.some((re) => re.test(f)));
+}
+
+/**
+ * Evicts the `KgRepo` object's stored dry-run outcome and held head for `repo`#`prNumber`
+ * when `kgPrCheck.forgetKgPr` is wired (AII-636, AII-977); a rejection is logged, not thrown.
+ * Called on `pull_request` `closed` — a closed PR's stored outcome and held head are
+ * not needed, so they are not left to wait for the MAX_TRACKED_PRS cap.
+ */
+function forgetKgPr(kgPrCheck: KgPrCheckConfig | undefined, repoFullName: string, prNumber: number): void {
+  Promise.resolve(kgPrCheck?.forgetKgPr?.(repoFullName, prNumber)).catch((err) => {
+    console.warn(`[webhook] kg-refresh forgetPr failed for ${repoFullName}#${prNumber}:`, err);
+  });
+}
+
+/**
+ * Handles a `pull_request` event against the KG PR-triggered dry-run rail (AII-633).
+ * Returns true when it owns the HTTP response (matched and handled, or matched and
+ * explicitly ignored); false when the caller should fall through to the existing
+ * pull_request handling (repo isn't the bound KG source or base template repo, or
+ * the action isn't one this check cares about).
+ */
+async function handleKgPrCheckWebhook(
+  payload: PullRequestPayload,
+  res: http.ServerResponse,
+  kgPrCheck: KgPrCheckConfig | undefined,
+  deliveryId?: string,
+): Promise<boolean> {
+  if (!kgPrCheck) return false;
+  if (payload.action !== "opened" && payload.action !== "synchronize") {
+    return false;
+  }
+
+  const repoFullName = payload.repository?.full_name;
+  const prNumber = payload.pull_request?.number;
+  if (!repoFullName || !prNumber) return false;
+  if (repoFullName !== kgPrCheck.kgSourceRepo && repoFullName !== kgPrCheck.kgBaseRepo) return false;
+
+  const sha = payload.pull_request?.head?.sha;
+  const headRef = payload.pull_request?.head?.ref;
+
+  // AII-639: this check owns the HTTP response only for events nothing else handles
+  // (`opened`). On `synchronize` it runs as a side effect and returns false,
+  // so the existing pull_request handling (gap-fill matching via findMatchingDispatch,
+  // merge reconciliation) still runs for the KG repos — they are ordinary onboarded
+  // projects too. Outcomes on `synchronize` go to the log instead of the response.
+  const owns = payload.action !== "synchronize";
+  const answer = (status: number, body: Record<string, unknown>, note: string): boolean => {
+    if (owns) {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    } else {
+      console.log(`[webhook] kg-refresh dry-run: ${note} for ${repoFullName}#${prNumber} (falling through to pull_request handling)`);
+    }
+    return owns;
+  };
+
+  // A base template PR's head branch exists only in the base repo, so a dry run (dispatched on the
+  // source repo) can never succeed. Base changes get their dry run on the source repo's upstream-merge PR.
+  if (repoFullName === kgPrCheck.kgBaseRepo && repoFullName !== kgPrCheck.kgSourceRepo) {
+    return answer(200, { ignored: true, reason: "base_repo_pr" }, "base template PR: dry-run runs on the source repo's upstream-merge PR");
+  }
+
+  if (!sha || !headRef) {
+    return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
+  }
+
+  // The refresh's own snapshot PR is merged and its branch deleted within seconds, so a dry-run
+  // of it can never start (AII-1107).
+  if (headRef.startsWith(KG_SNAPSHOT_BRANCH_PREFIX)) {
+    return answer(200, { ignored: true, reason: "rail_snapshot_pr" }, "rail snapshot PR");
+  }
+
+  const key = `${repoFullName}#${prNumber}`;
+  if (!kgPrCheck.githubAppId || !kgPrCheck.githubAppPrivateKey) {
+    return answer(200, { ignored: true, reason: "no_app_credentials" }, "no App credentials");
+  }
+
+  const slashIdx = repoFullName.indexOf("/");
+  const owner = repoFullName.slice(0, slashIdx);
+  const repo = repoFullName.slice(slashIdx + 1);
+
+  // A branch-pattern match (upstream merge) is guard-relevant regardless of which
+  // files it touches, so it never needs the files fetch — a transient failure of
+  // that fetch must not cost it the dispatch it would otherwise unconditionally get.
+  let files: string[] = [];
+  if (!KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) {
+    try {
+      const token = await getInstallationToken(kgPrCheck.githubAppId, kgPrCheck.githubAppPrivateKey, owner);
+      files = await listPullRequestFiles(token, owner, repo, prNumber);
+    } catch (err) {
+      console.warn(`[webhook] kg-refresh dry-run: failed to fetch changed files for ${repoFullName}#${prNumber}:`, err);
+      return answer(200, { ignored: true, reason: "files_fetch_failed" }, "files fetch failed");
+    }
+  }
+
+  if (!matchesKgGuard(files, headRef)) {
+    return answer(200, { ignored: true, reason: "no_guard_relevant_change" }, "no guard-relevant change");
+  }
+
+  const report: KgDryRunReportTarget = {
+    repo: repoFullName,
+    prNumber,
+    sha,
+  };
+
+  const result = await kgPrCheck
+    .enqueueDryRun(key, { ref: headRef, report }, deliveryId ? { idempotencyKey: deliveryId } : undefined)
+    .catch((err) => {
+      console.error(`[webhook] kg-refresh dry-run enqueue failed for ${repoFullName}#${prNumber}:`, err);
+      return { status: "unavailable" as const };
+    });
+
+  if (result.status !== "accepted") {
+    // No inbox, queue, or retry loop here: a lost delivery leaves the required check
+    // pending, and a re-push or manual redelivery recovers it.
+    console.warn(`[webhook] kg-refresh dry-run enqueue ${result.status} for ${repoFullName}#${prNumber}`);
+    return answer(502, { error: "kg_refresh_enqueue_failed", status: result.status }, `enqueue ${result.status}`);
+  }
+
+  const value = result.value;
+  if (value && "duplicate" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} skipped (duplicate sha)`);
+    return answer(200, { ignored: true, reason: "duplicate_sha" }, "duplicate head sha");
+  }
+  if (value && "closed" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} skipped (PR closed)`);
+    return answer(200, { ignored: true, reason: "pr_closed" }, "PR already closed");
+  }
+  if (value && "queued" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} (queued dispatch)`);
+    return answer(202, { queued: true }, "queued behind the running refresh");
+  }
+  console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}${value ? ` (trigger ${value.triggerId})` : ""}`);
+  return answer(202, { triggered: true, ...(value ? { triggerId: value.triggerId } : {}) }, "dispatched");
+}
+
 interface ReviewPayload {
   action?: string;
+  installation?: { id?: number };
   review?: {
+    id?: number;
     state?: string;
     body?: string | null;
     html_url?: string;
-    user?: { login?: string };
+    user?: { login?: string; type?: string };
+    commit_id?: string;
+    submitted_at?: string;
   };
   pull_request?: {
     number?: number;
     html_url?: string;
-    head?: { ref?: string };
+    head?: { ref?: string; sha?: string };
   };
   repository?: {
     full_name?: string;
@@ -71,18 +254,22 @@ interface ReviewPayload {
 
 interface ReviewCommentPayload {
   action?: string;
+  installation?: { id?: number };
   comment?: {
+    id?: number;
     body?: string;
     html_url?: string;
     path?: string;
     line?: number | null;
     original_line?: number | null;
-    user?: { login?: string };
+    user?: { login?: string; type?: string };
+    commit_id?: string;
+    created_at?: string;
   };
   pull_request?: {
     number?: number;
     html_url?: string;
-    head?: { ref?: string };
+    head?: { ref?: string; sha?: string };
   };
   repository?: {
     full_name?: string;
@@ -91,11 +278,13 @@ interface ReviewCommentPayload {
 
 interface IssueCommentPayload {
   action?: string;
+  installation?: { id?: number };
   comment?: {
     id?: number;
     body?: string;
     html_url?: string;
-    user?: { login?: string };
+    user?: { login?: string; type?: string };
+    created_at?: string;
   };
   issue?: {
     number?: number;
@@ -109,15 +298,8 @@ interface IssueCommentPayload {
 
 interface PushPayload {
   ref?: string;
+  repository?: { full_name?: string };
 }
-
-const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
-  "ai-implement",
-  "ai-implement[bot]",
-  "claude",
-  "claude[bot]",
-  "claude-code[bot]",
-]);
 
 /**
  * Finds a dispatch log entry that matches the merged PR.
@@ -151,6 +333,9 @@ function findMatchingDispatch(repo: string, branch?: string, prUrl?: string, prN
  *
  * Security: validates the X-Hub-Signature-256 HMAC-SHA256 header against
  * GITHUB_WEBHOOK_SECRET before processing any payload.
+ *
+ * Push events: requires the GitHub App to be subscribed to `push` events for
+ * push-triggered availability refresh to fire.
  */
 export async function handleGitHubWebhook(
   req: http.IncomingMessage,
@@ -159,6 +344,9 @@ export async function handleGitHubWebhook(
   appId?: string,
   privateKey?: string,
   selfDeploy?: SelfDeployTarget,
+  kgPrCheck?: KgPrCheckConfig,
+  onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
+  reviewFixIngress?: ReviewFixIngressClient,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -170,6 +358,7 @@ export async function handleGitHubWebhook(
   }
 
   const event = req.headers["x-github-event"] as string | undefined;
+  const deliveryId = req.headers["x-github-delivery"] as string | undefined;
 
   let payload: PullRequestPayload;
   try {
@@ -181,17 +370,17 @@ export async function handleGitHubWebhook(
   }
 
   if (event === "pull_request_review") {
-    handleReviewWebhook(payload as ReviewPayload, res);
+    await handleReviewWebhook(payload as ReviewPayload, res, deliveryId, reviewFixIngress);
     return;
   }
 
   if (event === "pull_request_review_comment") {
-    handleReviewCommentWebhook(payload as ReviewCommentPayload, res);
+    await handleReviewCommentWebhook(payload as ReviewCommentPayload, res, deliveryId, reviewFixIngress);
     return;
   }
 
   if (event === "issue_comment") {
-    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey);
+    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey, deliveryId, reviewFixIngress);
     return;
   }
 
@@ -206,9 +395,39 @@ export async function handleGitHubWebhook(
     return;
   }
 
+  if (payload.action === "opened" || payload.action === "synchronize") {
+    // The KG PR check owns the `opened` response; on `synchronize`
+    // it runs as a side effect and returns false so handlePullRequestSynchronize below
+    // still runs (AII-639).
+    const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck, deliveryId);
+    if (handled) return;
+  }
+
   if (payload.action === "synchronize") {
     handlePullRequestSynchronize(payload, res);
     return;
+  }
+
+  if (payload.action === "closed") {
+    // Evict this PR's KG PR-check state regardless of merged status — a closed PR
+    // (merged or not) has no use for its stored outcome, so it is not held until the
+    // MAX_TRACKED_PRS cap evicts it (AII-636).
+    const kgRepoFullName = payload.repository?.full_name;
+    const kgPrNumber = payload.pull_request?.number;
+    if (kgRepoFullName && kgPrNumber && (kgRepoFullName === kgPrCheck?.kgSourceRepo || kgRepoFullName === kgPrCheck?.kgBaseRepo)) {
+      forgetKgPr(kgPrCheck, kgRepoFullName, kgPrNumber);
+    }
+    if (kgRepoFullName && kgPrNumber && onReviewFixPrClosed) {
+      try {
+        await onReviewFixPrClosed(kgRepoFullName, kgPrNumber);
+      } catch (err) {
+        // Authority is already revoked; the cancel forward did not land. 503 makes GitHub redeliver (AII-1178).
+        console.warn(`[webhook] review-fix cancellation for ${kgRepoFullName}#${kgPrNumber} unavailable:`, err);
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Review-fix cancellation unavailable" }));
+        return;
+      }
+    }
   }
 
   // Only process merged PRs
@@ -230,38 +449,106 @@ export async function handleGitHubWebhook(
     return;
   }
 
-  const match = findMatchingDispatch(repoFullName, branch, prUrl, prNumber);
+  const link = findLinkByPr(repoFullName, prNumber);
 
-  if (!match) {
-    // Not an AI-created PR — ignore silently
+  if (!link) {
+    // Only linked PRs belong to merge reconciliation.
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true, reason: "no matching dispatch" }));
+    res.end(JSON.stringify({ ignored: true, reason: "no pull request link" }));
     return;
   }
 
-  if (hasReconciliationForPr(repoFullName, prNumber)) {
+  setLinkOutcome(repoFullName, prNumber, "merged", Date.now());
+
+  if (link.role === "roll-up") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  if (hasReconciliationForPr(repoFullName, prNumber, false)) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true, reason: "already queued" }));
     return;
   }
 
   const reconciliationId = enqueueReconciliation({
-    issueId: match.issueId,
-    issueIdentifier: match.issueIdentifier,
+    issueId: link.issue.trackerIssueId,
+    issueIdentifier: link.issue.identifier,
     prNumber,
     repo: repoFullName,
     mergeCommitSha,
   });
 
   console.log(
-    `[webhook] Queued reconciliation #${reconciliationId} for ${match.issueIdentifier} (PR #${prNumber} merged in ${repoFullName})`,
+    `[webhook] Queued reconciliation #${reconciliationId} for ${link.issue.identifier} (PR #${prNumber} merged in ${repoFullName})`,
   );
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ queued: true, reconciliationId }));
 }
 
-function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): void {
+/** The review process and the project's extra authors for a repository; an unmapped repository gets the defaults. */
+function resolveRepoReviewProcess(repoFullName: string) {
+  const mapping = Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repoFullName);
+  return {
+    restate: mapping !== undefined,
+    process: resolveReviewProcess(mapping?.reviewProcess),
+    extraAuthors: mapping?.trustedReviewAuthors ?? [],
+  };
+}
+
+/** Cuts `text` to at most `maxBytes` UTF-8 bytes without splitting a code point. */
+function truncateUtf8(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+/**
+ * Restate lifecycle (AII-1184): forwards the validated event to `ReviewFixPR.feedback` with the GitHub
+ * delivery id as the idempotency key, and writes nothing to SQLite. 503 on an unreachable ingress leaves the
+ * failed delivery for GitHub to redeliver (AII-1178) under the same id.
+ */
+async function forwardReviewFixEvent(
+  res: http.ServerResponse,
+  ingress: ReviewFixIngressClient | undefined,
+  input: Omit<ReviewFixFeedbackEvent, "deliveryId">,
+  deliveryId: string | undefined,
+  installationId: number | undefined,
+): Promise<void> {
+  const send = (status: number, body: unknown) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  if (!deliveryId) return send(400, { error: "missing_delivery_id" });
+  if (!installationId) return send(400, { error: "missing_installation" });
+  const event: ReviewFixFeedbackEvent = {
+    ...input,
+    reason: truncateUtf8(input.reason, REVIEW_FIX_EVENT_BODY_MAX_BYTES),
+    deliveryId,
+    ...(input.findings
+      ? { findings: input.findings.map((f) => ({ ...f, body: truncateUtf8(f.body, REVIEW_FIX_EVENT_BODY_MAX_BYTES) })) }
+      : {}),
+  };
+  const scope = { installationId, repository: input.repo, prNumber: input.prNumber };
+  const outcome = ingress ? await ingress.feedback(scope, event, { idempotencyKey: deliveryId }) : { status: "unavailable" as const };
+  if (outcome.status === "accepted") {
+    console.log(`[webhook] review event ${deliveryId} forwarded to ReviewFixPR ${JSON.stringify([installationId, input.repo, input.prNumber])}`);
+    return send(202, { forwarded: true });
+  }
+  console.warn(`[webhook] restate_unavailable: review event ${deliveryId} for ${input.repo}#${input.prNumber} not forwarded`);
+  send(503, { error: "restate_unavailable" });
+}
+
+async function handleReviewWebhook(
+  payload: ReviewPayload,
+  res: http.ServerResponse,
+  deliveryId: string | undefined,
+  ingress?: ReviewFixIngressClient,
+): Promise<void> {
   if (payload.action !== "submitted" || payload.review?.state?.toUpperCase() !== "CHANGES_REQUESTED") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -292,15 +579,51 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
     return;
   }
 
-  const findingId = upsertReviewFinding({
-    repo: repoFullName,
-    prNumber,
+  // A bot review counts only from a trusted author of the project's review process; humans always pass (ADR 027).
+  const reviewProcess = resolveRepoReviewProcess(repoFullName);
+  if (
+    payload.review?.user?.type === "Bot" &&
+    !isTrustedReviewAuthor(payload.review.user.login ?? "", reviewProcess.process, reviewProcess.extraAuthors)
+  ) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "untrusted_author" }));
+    return;
+  }
+
+  const [reviewOwner, reviewRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.review?.submitted_at);
+  const gate = shouldEnqueueReviewEvent({
+    authorType: payload.review?.user?.type,
+    body,
+    commitId: payload.review?.commit_id,
+    headSha: payload.pull_request?.head?.sha,
+    eventAt,
+    latestRunDispatchedAt: getLatestDispatchForPr(reviewOwner, reviewRepo, prNumber)?.dispatchedAt ?? null,
+  });
+  if (!gate.enqueue) {
+    console.log(`[webhook] Ignored bot review on PR #${prNumber}: ${gate.reason}`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: gate.reason }));
+    return;
+  }
+
+  const finding: ReviewLedgerFinding = {
     source: "github-review",
     severity: "blocking",
     body,
     ...(payload.review?.html_url ? { url: payload.review.html_url } : {}),
-  });
-  const reviewFixId = enqueueReviewFix({
+  };
+  const input = {
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "pull_request_review",
+      sourceId: payload.review?.id,
+      actor: payload.review?.user?.login,
+      body,
+      commitId: payload.review?.commit_id,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
@@ -308,14 +631,29 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
     reason: "changes_requested",
     sourceUrl: payload.review?.html_url,
     actor: payload.review?.user?.login,
-    findingIds: [findingId],
-  });
+    findings: [finding],
+  };
+  if (reviewProcess.restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingId, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingId: outcome.findingIds[0],
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
-function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse): void {
+async function handleReviewCommentWebhook(
+  payload: ReviewCommentPayload,
+  res: http.ServerResponse,
+  deliveryId: string | undefined,
+  ingress?: ReviewFixIngressClient,
+): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -340,6 +678,43 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     return;
   }
 
+  const [commentOwner, commentRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.comment?.created_at);
+  const gate = shouldEnqueueReviewEvent({
+    authorType: payload.comment?.user?.type,
+    body,
+    commitId: payload.comment?.commit_id,
+    headSha: payload.pull_request?.head?.sha,
+    eventAt,
+    latestRunDispatchedAt: getLatestDispatchForPr(commentOwner, commentRepo, prNumber)?.dispatchedAt ?? null,
+  });
+  if (!gate.enqueue) {
+    console.log(`[webhook] Ignored bot review on PR #${prNumber}: ${gate.reason}`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: gate.reason }));
+    return;
+  }
+
+  // Inline severity comes from the selected process; internal reviewers emit the ADR 020 block. Humans stay
+  // `medium`; an unlisted bot is ignored under every process.
+  const reviewProcess = resolveRepoReviewProcess(repoFullName);
+  let severity: ReviewLedgerFinding["severity"] = "medium";
+  const isBotAuthor = payload.comment?.user?.type === "Bot";
+  if (isBotAuthor && !isTrustedReviewAuthor(payload.comment?.user?.login ?? "", reviewProcess.process, reviewProcess.extraAuthors)) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "untrusted_author" }));
+    return;
+  }
+  if (reviewProcess.process.classifyInline && isBotAuthor) {
+    const marker = reviewProcess.process.classifyInline(body);
+    if (marker === null) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "pre_existing" }));
+      return;
+    }
+    severity = marker === "blocking" ? "blocking" : "minor";
+  }
+
   const line = typeof payload.comment?.line === "number"
     ? payload.comment.line
     : typeof payload.comment?.original_line === "number"
@@ -350,17 +725,27 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   // genuine "changes requested" verdict arrives separately via handleReviewWebhook
   // (state=CHANGES_REQUESTED), which records the blocking finding. This keeps tool
   // feedback flowing to the fixer without overriding an approving reviewer.
-  const findingId = upsertReviewFinding({
-    repo: repoFullName,
-    prNumber,
+  const finding: ReviewLedgerFinding = {
     source: "github-review-thread",
-    severity: "medium",
+    severity,
     body,
     ...(payload.comment?.path ? { path: payload.comment.path } : {}),
     ...(typeof line === "number" ? { line } : {}),
     ...(payload.comment?.html_url ? { url: payload.comment.html_url } : {}),
-  });
-  const reviewFixId = enqueueReviewFix({
+  };
+  const input = {
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "pull_request_review_comment",
+      sourceId: payload.comment?.id,
+      path: payload.comment?.path,
+      line,
+      actor: payload.comment?.user?.login,
+      body,
+      commitId: payload.comment?.commit_id,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
@@ -368,11 +753,40 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     reason: "review_comment",
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
-    findingIds: [findingId],
-  });
+    findings: [finding],
+  };
+  if (reviewProcess.process.id === "codex-code-review" && severity !== "blocking") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "advisory_finding" }));
+    return;
+  }
+  // A human's inline comment is recorded but never starts a run on its own: a reviewer
+  // leaving comments one at a time would otherwise start a fix run per comment. A
+  // "Request changes" review or an `/ai-implement` comment starts the run, and both read
+  // every open finding on the PR, so the recorded comments ride it. This holds for both
+  // lifecycles: the comment is not forwarded to Restate either.
+  if (!isBotAuthor) {
+    // Not upsertReviewFinding: this path skips the delivery-id dedup in
+    // acceptReviewFixWebhookEvent, so a redelivery must not bump the finding's revision.
+    const findingId = recordReviewFinding({ repo: repoFullName, prNumber, ...finding });
+    console.log(`[webhook] Recorded human inline comment on PR #${prNumber} as finding #${findingId}; awaiting a Request changes review or /ai-implement`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ recorded: true, reason: "awaiting_changes_requested", findingId }));
+    return;
+  }
+  if (reviewProcess.restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingId, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingId: outcome.findingIds[0],
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
 function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.ServerResponse): void {
@@ -405,7 +819,14 @@ async function handlePushWebhook(
   selfDeploy: SelfDeployTarget | undefined,
 ): Promise<void> {
   const branch = payload.ref?.replace(/^refs\/heads\//, "");
-  if (!selfDeploy || !appId || !privateKey || branch !== selfDeploy.branch) {
+  const repoFullName = payload.repository?.full_name;
+  if (
+    !selfDeploy ||
+    !appId ||
+    !privateKey ||
+    branch !== selfDeploy.branch ||
+    repoFullName !== `${selfDeploy.owner}/${selfDeploy.repo}`
+  ) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;
@@ -426,13 +847,17 @@ async function handlePushWebhook(
 
 const AI_IMPLEMENT_COMMENT_RE = /^\/ai-implement(?:\s+([\s\S]*))?$/;
 
+type WritePermission = "write" | "no_write" | "error";
+
+/** `error` is a failed lookup (fetch throw, 5xx/429, bad JSON), distinct from a real
+ *  non-writer. A 404 means the user is not a collaborator, so it is `no_write`. */
 async function checkCollaboratorWritePermission(
   token: string,
   owner: string,
   repo: string,
   username: string,
-): Promise<boolean> {
-  if (!username) return false;
+): Promise<WritePermission> {
+  if (!username) return "no_write";
   let res: Response;
   try {
     res = await fetch(
@@ -447,17 +872,46 @@ async function checkCollaboratorWritePermission(
       },
     );
   } catch {
-    return false;
+    return "error";
   }
-  if (res.status !== 200) return false;
+  if (res.status >= 500 || res.status === 429) return "error";
+  if (res.status !== 200) return "no_write";
   let data: unknown;
   try {
     data = await res.json();
   } catch {
-    return false;
+    return "error";
   }
   const perm = (data as { permission?: string }).permission;
-  return perm === "write" || perm === "maintain" || perm === "admin";
+  return perm === "write" || perm === "maintain" || perm === "admin" ? "write" : "no_write";
+}
+
+/** Retries `fn` once when it reports failure (throw or `isError`). Returns null if both attempts fail. */
+async function withOneRetry<T>(fn: () => Promise<T>, isError: (v: T) => boolean): Promise<T | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const v = await fn();
+      if (!isError(v)) return v;
+    } catch {
+      // fall through to the retry
+    }
+  }
+  return null;
+}
+
+async function replyWebhookFailure(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number | undefined,
+  body: string,
+): Promise<void> {
+  if (!prNumber) return;
+  try {
+    await postPrComment(token, owner, repo, prNumber, body);
+  } catch (err) {
+    console.error(`[webhook] /ai-implement: failed to post failure reply on ${owner}/${repo}#${prNumber}:`, err);
+  }
 }
 
 async function handleIssueCommentWebhook(
@@ -465,6 +919,8 @@ async function handleIssueCommentWebhook(
   res: http.ServerResponse,
   appId?: string,
   privateKey?: string,
+  deliveryId?: string,
+  ingress?: ReviewFixIngressClient,
 ): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -516,13 +972,27 @@ async function handleIssueCommentWebhook(
       return;
     }
 
-    const contract = await resolveWorkflowContract({
-      owner,
-      repo,
-      workflowFile: mapping.workflowFile,
-      token,
-      ref: mapping.defaultBranch,
-    }).catch(() => "legacy" as const);
+    const contract: WorkflowContract | null = await withOneRetry(
+      () => resolveWorkflowContract({
+        owner,
+        repo,
+        workflowFile: mapping.workflowFile,
+        token,
+        ref: mapping.defaultBranch,
+        failOnTransient: true,
+      }),
+      () => false,
+    );
+    if (contract === null) {
+      console.error(`[webhook] /ai-implement: workflow contract probe failed twice for ${owner}/${repo}`);
+      await replyWebhookFailure(
+        token, owner, repo, payload.issue?.number,
+        "AI-Implement could not read this repository's workflow from GitHub just now, so it did not queue your `/ai-implement` comment. Please repost it.",
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "contract_probe_failed" }));
+      return;
+    }
 
     if (contract !== "envelope") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -531,8 +1001,21 @@ async function handleIssueCommentWebhook(
     }
 
     const commenter = payload.comment?.user?.login ?? "";
-    const hasWriteAccess = await checkCollaboratorWritePermission(token, owner, repo, commenter);
-    if (!hasWriteAccess) {
+    const permission = await withOneRetry(
+      async () => checkCollaboratorWritePermission(token, owner, repo, commenter),
+      (v) => v === "error",
+    );
+    if (permission === null) {
+      console.error(`[webhook] /ai-implement: permission check failed twice for ${commenter} on ${owner}/${repo}`);
+      await replyWebhookFailure(
+        token, owner, repo, payload.issue?.number,
+        "AI-Implement could not check your permission on this repository with GitHub just now, so it did not queue your `/ai-implement` comment. Please repost it.",
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "permission_check_failed" }));
+      return;
+    }
+    if (permission !== "write") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ignored: true, reason: "insufficient_permission" }));
       return;
@@ -557,8 +1040,11 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const login = payload.comment?.user?.login?.toLowerCase() ?? "";
-  if (!TRUSTED_REVIEW_COMMENT_AUTHORS.has(login)) {
+  const classified = classifyReviewIssueComment(
+    (payload.comment ?? {}) as Record<string, unknown>,
+    resolveRepoReviewProcess(payload.repository?.full_name ?? ""),
+  );
+  if (classified === null) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;
@@ -574,10 +1060,34 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const findings = extractClaudeSummaryFindings(body, payload.comment?.html_url);
-  if (findings.length === 0) {
+  // A broken/unclosed block flags findingsUnavailable directly; a well-formed block whose
+  // reviewer explicitly gave up (`verdict: "incomplete"`, no findings) parses cleanly but
+  // carries the same "nothing actionable, and not an approval" signal.
+  const findingsUnavailable = classified.findingsUnavailable
+    || (classified.verdict === "incomplete" && classified.findings.length === 0);
+  if (findingsUnavailable) {
+    console.warn(`[webhook] Review findings unavailable on PR #${prNumber}: unparseable or incomplete review-findings block`);
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true }));
+    res.end(JSON.stringify({ ignored: true, reason: "findings_unavailable" }));
+    return;
+  }
+
+  if (classified.findings.length === 0) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(classified.verdict === "approve" ? { ignored: true, reason: "approved" } : { ignored: true }));
+    return;
+  }
+
+  // An approve verdict whose findings are all non-gating (minor) never starts a fix run:
+  // no queue entry, no Restate forward, no ledger row. The inline-comment rail is unchanged.
+  // Only `review-contract` findings carry the blocking/minor contract; other sources (e.g. prose
+  // `claude-review-summary` findings with `medium` severity) keep queueing as before.
+  if (
+    classified.verdict === "approve" &&
+    classified.findings.every((f) => f.source === "review-contract" && !reviewContractFindingGates(f, classified.verdict))
+  ) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "approved" }));
     return;
   }
 
@@ -588,23 +1098,161 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const findingIds = findings.map((finding) => upsertReviewFinding({ repo: repoFullName, prNumber, ...finding }));
-  const reviewFixId = enqueueReviewFix({
+  const [issueCommentOwner, issueCommentRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.comment?.created_at);
+  const gate = shouldEnqueueReviewEvent({
+    authorType: payload.comment?.user?.type,
+    body,
+    commitId: undefined,
+    headSha: undefined,
+    eventAt,
+    latestRunDispatchedAt: getLatestDispatchForPr(issueCommentOwner, issueCommentRepo, prNumber)?.dispatchedAt ?? null,
+  });
+  if (!gate.enqueue) {
+    console.log(`[webhook] Ignored bot review on PR #${prNumber}: ${gate.reason}`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: gate.reason }));
+    return;
+  }
+
+  const reviewFixReason = classified.verdictSource === "review-contract" ? "review_contract" : "claude_review_summary";
+  const input = {
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "issue_comment",
+      sourceId: payload.comment?.id,
+      actor: payload.comment?.user?.login,
+      body,
+      commitId: undefined,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
     prNumber,
-    reason: "claude_review_summary",
+    reason: reviewFixReason,
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
-    findingIds,
-  });
+    findings: classified.findings,
+  };
+  if (resolveRepoReviewProcess(repoFullName).restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingIds, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingIds: outcome.findingIds,
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
 function isAiImplementNativeReviewBody(body: string): boolean {
-  return body.includes(AI_IMPLEMENT_NATIVE_REVIEW_MARKER) ||
-    body.replace(/\s+/g, " ").trim().startsWith("AI-Implement post-push review");
+  if (body.includes(AI_IMPLEMENT_NATIVE_REVIEW_MARKER)) return true;
+  const normalized = body.replace(/\s+/g, " ").trim();
+  return AI_IMPLEMENT_NATIVE_REVIEW_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
+/** Parses an ISO-8601 timestamp to milliseconds since epoch, treating a missing or malformed
+ *  value the same as "unknown" rather than letting NaN compare as 0. */
+function parseEventTimestamp(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * A stable identity for one webhook-sourced review event, scoped to `acceptReviewFixWebhookEvent`'s
+ * per-repo dedup key (AII-792). GitHub's delivery id (`x-github-delivery`) is preferred — a genuine
+ * redelivery of the same webhook carries the identical GUID. When it is absent (a caller without that
+ * header, a GitHub review/comment id identifies the source object. If neither exists,
+ * a deterministic hash of the fields that
+ * make two events "the same" stands in: two calls with identical repo/PR/kind/actor/body/commit/eventAt/path/line
+ * synthesize to the same id, while a genuinely distinct event (different timestamp, different body, ...)
+ * does not.
+ */
+function resolveReviewFixEventId(
+  deliveryId: string | undefined,
+  parts: {
+    repo: string;
+    prNumber: number;
+    kind: "pull_request_review" | "pull_request_review_comment" | "issue_comment";
+    sourceId?: number;
+    path?: string;
+    line?: number;
+    actor: string | undefined;
+    body: string;
+    commitId: string | undefined;
+    eventAt: number | undefined;
+  },
+): string {
+  if (deliveryId) return `gh-delivery:${deliveryId}`;
+  if (parts.sourceId !== undefined) return `gh-object:${parts.kind}:${parts.sourceId}`;
+  const digest = crypto
+    .createHash("sha256")
+    .update(JSON.stringify([
+      parts.repo,
+      parts.prNumber,
+      parts.kind,
+      parts.actor ?? null,
+      parts.body,
+      parts.commitId ?? null,
+      parts.eventAt ?? null,
+      parts.path ?? null,
+      parts.line ?? null,
+    ]))
+    .digest("hex");
+  return `synthesized:${digest}`;
+}
+
+/**
+ * Gates whether a review-shaped webhook event (a `pull_request_review`, a
+ * `pull_request_review_comment`, or a trusted-author `issue_comment`) should enqueue a
+ * review-fix run. Human authors always pass this gate, but the
+ * `pull_request_review_comment` caller then only records a human's comment and does not
+ * enqueue. A bot's event only enqueues when it describes the PR's current head and no run
+ * has been dispatched since — otherwise a bot reviewing its own fix's push starts another
+ * run, looping (ADR 027).
+ */
+export function shouldEnqueueReviewEvent(input: {
+  authorType: string | undefined;
+  body: string;
+  commitId: string | undefined;
+  headSha: string | undefined;
+  eventAt: number | undefined;
+  latestRunDispatchedAt: number | null;
+}): { enqueue: true } | { enqueue: false; reason: "self" | "stale_head" | "run_after_review" | "missing_fields" } {
+  if (isAiImplementComment(input.body)) {
+    return { enqueue: false, reason: "self" };
+  }
+
+  if (input.authorType !== "Bot") {
+    return { enqueue: true };
+  }
+
+  if (input.commitId !== undefined && input.headSha !== undefined && input.commitId !== input.headSha) {
+    return { enqueue: false, reason: "stale_head" };
+  }
+
+  if (
+    input.eventAt !== undefined &&
+    input.latestRunDispatchedAt !== null &&
+    input.latestRunDispatchedAt > input.eventAt
+  ) {
+    return { enqueue: false, reason: "run_after_review" };
+  }
+
+  if (input.commitId === undefined && input.headSha === undefined) {
+    if (input.eventAt === undefined) {
+      return { enqueue: false, reason: "missing_fields" };
+    }
+  } else if (input.commitId === undefined || input.headSha === undefined) {
+    return { enqueue: false, reason: "missing_fields" };
+  }
+
+  return { enqueue: true };
 }

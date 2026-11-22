@@ -1,6 +1,143 @@
 import { getDb } from "./dedup.js";
+import { upsertReviewFinding } from "./review-ledger-store.js";
+import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 
 export type ReviewFixStatus = "pending" | "dispatched" | "skipped" | "failed";
+
+/**
+ * Execution budgets for one review-fix task. Review feedback is never clipped:
+ * a set that exceeds any budget is rejected whole (`incomplete`) so no caller can
+ * launch, or acknowledge as handled, a task that omits the end of a finding.
+ *
+ * The rendered task rides `issue.description` and `commentInstruction`, and
+ * run-config silently truncates descriptions at MAX_ENVELOPE_DESCRIPTION_LENGTH.
+ * Budgets: issue context <= 20,000 (+ marker), rendered feedback <= 19,000 and
+ * scaffold ~250, which keeps the worst case under the 40,000 envelope; the
+ * final envelope check still verifies the actual total.
+ */
+export const MAX_TASK_FINDINGS = 30;
+/** Per raw finding body. Comfortably above the 4,387-char four-finding regression. */
+export const MAX_FINDING_BODY_LENGTH = 8000;
+/** Rendered "Open review findings" content: headings, metadata, quote prefixes and URLs included. */
+export const MAX_FEEDBACK_AGGREGATE_LENGTH = 19000;
+/** Mirrors run-config.ts MAX_DESCRIPTION_CHARS; run-config's own truncation is unchanged. */
+export const MAX_ENVELOPE_DESCRIPTION_LENGTH = 40000;
+const MAX_ISSUE_DESCRIPTION_LENGTH = 20000;
+/** Bounded length of a log/UI preview; never used to build execution text. */
+const PREVIEW_LENGTH = 200;
+
+export type ReviewFixIncompleteCategory = "count" | "body" | "aggregate" | "envelope";
+
+export interface ReviewFixTaskFinding {
+  finding_key: string;
+  source: string;
+  severity: string;
+  path: string | null;
+  line: number | null;
+  body: string;
+  url: string | null;
+}
+
+export type ReviewFixTaskPreparation =
+  | { status: "complete"; text: string; findings: ReviewFixTaskFinding[] }
+  | { status: "incomplete"; category: ReviewFixIncompleteCategory; reason: string };
+
+/** Thrown before admission when feedback cannot be delivered completely. The message is bounded and carries no finding text. */
+export class ReviewFixFeedbackIncompleteError extends Error {
+  constructor(readonly category: ReviewFixIncompleteCategory, reason: string) {
+    super(`review-fix feedback incomplete (${category}): ${reason}`);
+    this.name = "ReviewFixFeedbackIncompleteError";
+  }
+}
+
+/**
+ * Builds a review-fix run's task description: the queue reason, the original
+ * issue's requirements, and the open review findings keyed by finding_key so
+ * the agent can give each one a disposition instead of re-deriving scope from
+ * the raw PR thread. Every supplied finding is rendered in full or the whole
+ * set is reported `incomplete`; `findings` on success equals the rendered set.
+ */
+export function prepareReviewFixTask(input: {
+  prNumber: number;
+  reason: string;
+  findings: ReviewFixTaskFinding[];
+  issueDescription: string | null;
+}): ReviewFixTaskPreparation {
+  if (input.findings.length > MAX_TASK_FINDINGS) {
+    return incomplete("count", `${input.findings.length} findings exceed the ${MAX_TASK_FINDINGS}-finding limit`);
+  }
+  const oversized = input.findings.find((finding) => finding.body.length > MAX_FINDING_BODY_LENGTH);
+  if (oversized) {
+    return incomplete("body", `finding ${previewOf(oversized.finding_key)} body exceeds ${MAX_FINDING_BODY_LENGTH} characters`);
+  }
+  const rendered = input.findings.map(formatTaskFinding);
+  const feedbackLength = rendered.reduce((sum, part) => sum + part.length, 0) + 2 * Math.max(0, rendered.length - 1);
+  if (feedbackLength > MAX_FEEDBACK_AGGREGATE_LENGTH) {
+    return incomplete("aggregate", `rendered feedback is ${feedbackLength} characters, over the ${MAX_FEEDBACK_AGGREGATE_LENGTH} limit`);
+  }
+
+  const sections: string[] = [
+    `Address review feedback on PR #${input.prNumber}. Queue reason: ${input.reason}.`,
+    "## Issue requirements",
+    input.issueDescription !== null
+      ? truncateIssueDescription(input.issueDescription)
+      : "The original issue text was not available. Treat only defects as in scope.",
+    "## Open review findings",
+  ];
+  if (rendered.length === 0) {
+    sections.push("No structured findings are recorded. Read the PR discussion.");
+  } else {
+    sections.push(...rendered);
+  }
+  const text = sections.join("\n\n");
+  if (text.length > MAX_ENVELOPE_DESCRIPTION_LENGTH) {
+    return incomplete("envelope", `rendered task is ${text.length} characters, over the ${MAX_ENVELOPE_DESCRIPTION_LENGTH} envelope limit`);
+  }
+  return { status: "complete", text, findings: [...input.findings] };
+}
+
+/** String-returning form for callers that treat an incomplete set as an error. */
+export function buildReviewFixTaskDescription(input: Parameters<typeof prepareReviewFixTask>[0]): string {
+  const prepared = prepareReviewFixTask(input);
+  if (prepared.status === "incomplete") throw new ReviewFixFeedbackIncompleteError(prepared.category, prepared.reason);
+  return prepared.text;
+}
+
+/** Bounded single-line preview for logs/UI. Execution text never derives from it. */
+export function previewReviewFixText(text: string): string {
+  return previewOf(text);
+}
+
+function previewOf(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > PREVIEW_LENGTH ? `${flat.slice(0, PREVIEW_LENGTH)}…` : flat;
+}
+
+function incomplete(category: ReviewFixIncompleteCategory, reason: string): ReviewFixTaskPreparation {
+  return { status: "incomplete", category, reason };
+}
+
+/** Renders one finding under its `finding_key` heading, the key the agent's disposition names. */
+export function formatTaskFinding(finding: ReviewFixTaskFinding): string {
+  const location = finding.path
+    ? (typeof finding.line === "number" ? `${finding.path}:${finding.line}` : finding.path)
+    : undefined;
+  const meta = [finding.source, finding.severity, location].filter((part): part is string => Boolean(part)).join(" · ");
+  const body = finding.body
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+
+  const lines = [`### ${finding.finding_key}`, meta, body];
+  if (finding.url) lines.push(finding.url);
+  return lines.join("\n\n");
+}
+
+function truncateIssueDescription(text: string): string {
+  return text.length > MAX_ISSUE_DESCRIPTION_LENGTH
+    ? `${text.slice(0, MAX_ISSUE_DESCRIPTION_LENGTH)}…(issue text truncated)`
+    : text;
+}
 
 export interface ReviewFixQueueItem {
   id: number;
@@ -26,6 +163,7 @@ export interface ReviewFixEvent {
   sourceUrl: string | null;
   actor: string | null;
   findingIds: number[];
+  sourceEventId: string | null;
   createdAt: number;
 }
 
@@ -48,6 +186,8 @@ export interface EnqueueReviewFixInput {
   sourceUrl?: string | null;
   actor?: string | null;
   findingIds?: number[];
+  /** Stable identity of the webhook delivery or internal automatic event. */
+  sourceEventId?: string | null;
 }
 
 interface ReviewFixQueueRow {
@@ -74,6 +214,7 @@ interface ReviewFixEventRow {
   source_url: string | null;
   actor: string | null;
   finding_ids_json: string;
+  source_event_id: string | null;
   created_at: number;
 }
 
@@ -119,9 +260,9 @@ export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
     .get(input.repo, input.prNumber) as { id: number };
   db.prepare(`
     INSERT INTO review_fix_events
-      (queue_id, issue_id, issue_identifier, repo, pr_number, reason, source_url, actor, finding_ids_json, created_at)
+      (queue_id, issue_id, issue_identifier, repo, pr_number, reason, source_url, actor, finding_ids_json, source_event_id, created_at)
     VALUES
-      (@queueId, @issueId, @issueIdentifier, @repo, @prNumber, @reason, @sourceUrl, @actor, @findingIdsJson, @now)
+      (@queueId, @issueId, @issueIdentifier, @repo, @prNumber, @reason, @sourceUrl, @actor, @findingIdsJson, @sourceEventId, @now)
   `).run({
     queueId: row.id,
     issueId: input.issueId,
@@ -132,9 +273,75 @@ export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
     sourceUrl: input.sourceUrl ?? null,
     actor: input.actor ?? null,
     findingIdsJson: JSON.stringify(input.findingIds ?? []),
+    sourceEventId: input.sourceEventId ?? null,
     now,
   });
   return row.id;
+}
+
+export interface AcceptReviewFixWebhookEventInput {
+  /** GitHub delivery id, synthesized webhook id, or stable internal source id. Scoped by repo. */
+  eventId: string;
+  issueId: string;
+  issueIdentifier: string | null;
+  repo: string;
+  prNumber: number;
+  reason: string;
+  sourceUrl?: string | null;
+  actor?: string | null;
+  findings?: ReviewLedgerFinding[];
+}
+
+export type AcceptReviewFixWebhookEventOutcome =
+  | { status: "accepted"; findingIds: number[]; reviewFixId: number }
+  | { status: "duplicate"; findingIds: number[]; reviewFixId: number };
+
+interface ReviewFixSourceEventRow {
+  queue_id: number;
+  finding_ids_json: string;
+}
+
+/**
+ * Atomically accepts one automatic review-fix event: bumps (or creates) any
+ * finding-version rows (AII-780) and enqueues/merges the review-fix queue entry
+ * (this module's existing `ON CONFLICT (repo, pr_number)` seam), all inside one
+ * `db.transaction()` so a caller's HTTP 200 ACK — written only after this returns —
+ * never precedes the durable write. Identity is `(repo, eventId)`: a second call
+ * with an identity already recorded in `review_fix_events` is a no-op that returns
+ * the originally accepted findingIds/reviewFixId rather than bumping any finding's
+ * revision or inserting a second queue/event row — see the unique index on
+ * `review_fix_events(repo, source_event_id)` in dedup.ts.
+ */
+export function acceptReviewFixWebhookEvent(input: AcceptReviewFixWebhookEventInput): AcceptReviewFixWebhookEventOutcome {
+  const db = getDb();
+  return db.transaction((): AcceptReviewFixWebhookEventOutcome => {
+    const existing = db
+      .prepare("SELECT queue_id, finding_ids_json FROM review_fix_events WHERE repo = ? AND source_event_id = ?")
+      .get(input.repo, input.eventId) as ReviewFixSourceEventRow | undefined;
+    if (existing) {
+      return {
+        status: "duplicate",
+        findingIds: parseFindingIds(existing.finding_ids_json),
+        reviewFixId: existing.queue_id,
+      };
+    }
+
+    const findingIds = (input.findings ?? []).map((finding) =>
+      upsertReviewFinding({ repo: input.repo, prNumber: input.prNumber, ...finding }),
+    );
+    const reviewFixId = enqueueReviewFix({
+      issueId: input.issueId,
+      issueIdentifier: input.issueIdentifier,
+      repo: input.repo,
+      prNumber: input.prNumber,
+      reason: input.reason,
+      sourceUrl: input.sourceUrl,
+      actor: input.actor,
+      findingIds,
+      sourceEventId: input.eventId,
+    });
+    return { status: "accepted", findingIds, reviewFixId };
+  })();
 }
 
 export function getPendingReviewFixes(limit = 20): ReviewFixQueueItem[] {
@@ -184,6 +391,13 @@ export function recordReviewFixDispatch(input: {
   return Number(result.lastInsertRowid);
 }
 
+/** Returns true when a PR is confirmed merged or closed. Callers must defer a
+ * null lookup before using this predicate; false alone is not proof of open. */
+export function shouldSkipReviewFix(state: { merged: boolean; state: "open" | "closed" } | null): boolean {
+  if (state === null) return false;
+  return state.merged || state.state === "closed";
+}
+
 export function getReviewFixDispatchSnapshot(dispatchId: string): ReviewFixDispatchSnapshot | null {
   const row = getDb()
     .prepare("SELECT * FROM review_fix_dispatches WHERE dispatch_id = ?")
@@ -218,6 +432,7 @@ function mapEventRow(row: ReviewFixEventRow): ReviewFixEvent {
     sourceUrl: row.source_url,
     actor: row.actor,
     findingIds: parseFindingIds(row.finding_ids_json),
+    sourceEventId: row.source_event_id,
     createdAt: row.created_at,
   };
 }

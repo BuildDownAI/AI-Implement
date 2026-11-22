@@ -1,16 +1,13 @@
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as AdminModule from "../admin.js";
 import type * as ConfigModule from "../config.js";
 import type * as DedupModule from "../dedup.js";
-import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as BreakerModule from "../dispatch-breaker.js";
-import { FakeProvider } from "./providers/fake.js";
-import type { ProviderRegistry } from "../providers/registry.js";
+import { makeMapping, makeRegistry } from "./helpers/builders.js";
+import { linearData, linearGraphql } from "./helpers/replies/linear.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../notify.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../notify.js")>()),
@@ -24,18 +21,6 @@ vi.mock("../workflow-sync.js", () => ({
     message: err instanceof Error ? err.message : String(err),
   }),
 }));
-
-vi.mock("../github-install-state.js", () => ({
-  probeInstallState: vi.fn(),
-}));
-
-function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
-  return {
-    forMapping: async () => provider,
-    forAllMappings: async () => [provider],
-    invalidate: () => {},
-  } as unknown as ProviderRegistry;
-}
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -75,42 +60,24 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
 let admin: typeof AdminModule;
 let config: typeof ConfigModule;
 let dedup: typeof DedupModule;
-let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let breaker: typeof BreakerModule;
-let provider: FakeProvider;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `admin-parked-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  provider = new FakeProvider();
-  admin = await import("../admin.js");
-  config = await import("../config.js");
-  dedup = await import("../dedup.js");
-  runnerMode = await import("../runner-mode.js");
-  log = await import("../log.js");
-  breaker = await import("../dispatch-breaker.js");
-  config.initMappingsTable();
-  log.initLogTable();
-  runnerMode.initSettingsTable();
-  breaker.initDispatchBreakerTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
+  ({ admin, config, dedup, log, breaker } = (
+    await testDb({
+      modules: {
+        admin: () => import("../admin.js"),
+        config: () => import("../config.js"),
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        breaker: () => import("../dispatch-breaker.js"),
+      },
+    })
+  ).modules);
 });
 
 function adminConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
@@ -137,7 +104,7 @@ async function makeRequest(
     body === undefined ? undefined : JSON.stringify(body),
   );
   const res = new MockResponse();
-  admin.handleAdminRequest(req as never, res as never, adminConfig(), makeFakeRegistry(provider));
+  admin.handleAdminRequest(req as never, res as never, adminConfig(), makeRegistry());
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -145,14 +112,14 @@ async function makeRequest(
 async function login(): Promise<string> {
   const req = new MockRequest("/api/auth", "POST", {}, JSON.stringify({ code: "secret" }));
   const res = new MockResponse();
-  admin.handleAdminRequest(req as never, res as never, adminConfig(), makeFakeRegistry(provider));
+  admin.handleAdminRequest(req as never, res as never, adminConfig(), makeRegistry());
   await res.done;
   return JSON.parse(res.body).token as string;
 }
 
 function parkIssue(issueId: string, conclusion = "MAX_TURNS_EXHAUSTED"): void {
   for (let i = 0; i < 3; i++) {
-    breaker.recordDispatchFailure(issueId, "implementation", conclusion);
+    breaker.recordDispatchFailure(issueId, "implementation", conclusion, null);
   }
 }
 
@@ -218,6 +185,61 @@ describe("GET /api/parked", () => {
     expect(rows[0].repo).toBeNull();
   });
 
+  it("names an issue by the identifier its breaker recorded when no dispatch_log or dispatched row is left", async () => {
+    const token = await login();
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-pruned", "implementation", "MANAGED_REFUSED", { project: "SAN", identifier: "SAN-9" });
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueId: string; issueIdentifier: unknown; issueTitle: unknown; repo: unknown }>;
+    expect(rows).toEqual([expect.objectContaining({ issueId: "issue-pruned", issueIdentifier: "SAN-9", issueTitle: null, repo: null })]);
+  });
+
+  it("falls back to a dispatch_log row from another phase", async () => {
+    const token = await login();
+    log.appendLog({ issueId: "issue-fb", issueIdentifier: "AII-737", issueTitle: "Mint token", repo: "org/repo", phase: "planning" });
+    parkIssue("issue-fb");
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueIdentifier: unknown; issueTitle: unknown; repo: unknown }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issueIdentifier).toBe("AII-737");
+    expect(rows[0].issueTitle).toBe("Mint token");
+    expect(rows[0].repo).toBe("org/repo");
+  });
+
+  it("falls back to the dispatched table and maps team_key to the repo", async () => {
+    const token = await login();
+    config.upsertMapping("AII", makeMapping({ owner: "org", repo: "mapped" }));
+    dedup.markDispatched("issue-d1", "AII", "AII-5", "From dispatched");
+    dedup.markDispatched("issue-d2", "NOMAP", "AII-6", "No mapping");
+    parkIssue("issue-d1");
+    parkIssue("issue-d2");
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueId: string; issueIdentifier: unknown; issueTitle: unknown; repo: unknown }>;
+    const d1 = rows.find((r) => r.issueId === "issue-d1");
+    const d2 = rows.find((r) => r.issueId === "issue-d2");
+    expect(d1?.issueIdentifier).toBe("AII-5");
+    expect(d1?.issueTitle).toBe("From dispatched");
+    expect(d1?.repo).toBe("org/mapped");
+    expect(d2?.issueIdentifier).toBe("AII-6");
+    expect(d2?.repo).toBeNull();
+  });
+
+  it("prefers the same-phase row over other phases and dispatched", async () => {
+    const token = await login();
+    dedup.markDispatched("issue-p", "AII", "AII-DISP", "dispatched title");
+    log.appendLog({ issueId: "issue-p", issueIdentifier: "AII-PLAN", repo: "org/plan", phase: "planning" });
+    log.appendLog({ issueId: "issue-p", issueIdentifier: "AII-IMPL", repo: "org/impl", phase: "implementation" });
+    log.appendLog({ issueId: "issue-p", issueIdentifier: "AII-PLAN2", repo: "org/plan", phase: "planning" });
+    parkIssue("issue-p");
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueIdentifier: unknown; repo: unknown }>;
+    expect(rows[0].issueIdentifier).toBe("AII-IMPL");
+    expect(rows[0].repo).toBe("org/impl");
+  });
+
   it("returns two rows for an issue parked in both planning and implementation phases", async () => {
     const token = await login();
 
@@ -225,9 +247,9 @@ describe("GET /api/parked", () => {
     log.appendLog({ issueId: "issue-multi", issueIdentifier: "AII-200", repo: "org/repo", phase: "implementation" });
 
     // Park in planning phase
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "planning", "DISPATCH_FAILED");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "planning", "DISPATCH_FAILED", null);
     // Park in implementation phase
-    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "implementation", "MAX_TURNS_EXHAUSTED");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "implementation", "MAX_TURNS_EXHAUSTED", null);
 
     const res = await makeRequest("/api/parked", "GET", token);
     expect(res.statusCode).toBe(200);
@@ -270,6 +292,41 @@ describe("POST /api/parked/unpark", () => {
     expect(breaker.isParked("issue-to-unpark", "implementation")).toBe(false);
   });
 
+  it("restores Linear snapshot eligibility and dispatch admission after HTTP unpark", async () => {
+    const [{ LinearProvider }, auth, gate] = await Promise.all([
+      import("../providers/linear.js"), import("../linear-app-auth.js"), import("../dispatch-gate.js"),
+    ]);
+    auth.configureLinearAuth("client-id", "client-secret");
+    auth.__setLinearTokenForTest("test-token");
+    config.upsertMapping("AII", makeMapping());
+    const node = {
+      id: "linear-issue", identifier: "AII-1", title: "Retry me", description: null,
+      team: { id: "team-aii", key: "AII" }, state: { id: "todo", name: "Todo", type: "unstarted" },
+      labels: { nodes: [{ id: "pickup", name: "AI-Implement" }, { id: "plan", name: "Plan-Complete" }] },
+      inverseRelations: { nodes: [] }, children: { nodes: [] }, parent: null,
+    };
+    const page = () => linearData({ issues: { nodes: [node], pageInfo: { hasNextPage: false, endCursor: null } } });
+    linearGraphql(page(), page()).install();
+    const provider = new LinearProvider({});
+    const input = { issueId: node.id, kind: "implementation" as const, teamKey: "AII", maxInProgressAiIssues: 1 };
+    breaker.parkIssue(node.id, "implementation", "failure", null);
+    const parked = await provider.fetchAIImplementSnapshot();
+    expect(parked.readyForImplementation).toEqual([]);
+    expect(parked.needsPlanning).toEqual([]);
+    expect(gate.canDispatch(input)).toEqual({ ok: false, reason: "parked" });
+    const admission = { ...input, dispatchId: "retry", issueIdentifier: node.identifier, backend: "github-actions" as const };
+    expect(gate.acquireDispatch(admission)).toMatchObject({ ok: false, reason: "parked" });
+
+    const res = await makeRequest("/api/parked/unpark", "POST", await login(), { issueId: node.id });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ unparked: true });
+    expect((await provider.fetchAIImplementSnapshot()).readyForImplementation.map(issue => issue.id)).toEqual([node.id]);
+    expect(gate.canDispatch(input)).toEqual({ ok: true });
+    const admitted = gate.acquireDispatch(admission);
+    expect(admitted.ok).toBe(true);
+    if (admitted.ok) admitted.release("launch_rejected");
+  });
+
   it("returns { unparked: false } when the issue was not parked", async () => {
     const token = await login();
     const res = await makeRequest("/api/parked/unpark", "POST", token, { issueId: "not-parked" });
@@ -303,7 +360,7 @@ describe("POST /api/parked/unpark", () => {
       "not-json",
     );
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, adminConfig(), makeFakeRegistry(provider));
+    admin.handleAdminRequest(req as never, res as never, adminConfig(), makeRegistry());
     await res.done;
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("Invalid");

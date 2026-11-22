@@ -1,6 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
-import { encodeRunConfig } from "../run-config.js";
-import { resolveRunnerInputs } from "../run-autonomous.js";
+import { encodeRunConfig, encodeTrustedRunConfig } from "../run-config.js";
+import {
+  resolveRunnerInputs,
+  prepareConfiguredRun,
+  runAutonomousLocally,
+  ConfiguredRunError,
+  hasConfiguredIntent,
+  type ConfiguredRunOptions,
+} from "../run-autonomous.js";
+import { AgentStageError } from "../pipeline/stage-executor.js";
+import type { LLMExecutor } from "../pipeline/types.js";
+import { EXPECTED, NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { makeExecutor } from "./helpers/builders.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 
 const BASE_ENV = {
   GITHUB_OWNER: "o",
@@ -365,5 +378,512 @@ describe("resolveRunnerInputs", () => {
       const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
       expect(inputs.profiles).toEqual(["backend", "webapp"]);
     });
+  });
+
+  describe("(h) assigneeName preference", () => {
+    it("prefers envelope assigneeName over AI_IMPLEMENT_ASSIGNEE_NAME env var", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          assigneeName: "Paz",
+        }),
+        AI_IMPLEMENT_ASSIGNEE_NAME: "Someone Else",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.assigneeName).toBe("Paz");
+    });
+
+    it("falls back to AI_IMPLEMENT_ASSIGNEE_NAME when envelope omits assigneeName", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        AI_IMPLEMENT_ASSIGNEE_NAME: "Paz",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.assigneeName).toBe("Paz");
+    });
+
+    it("is undefined when neither envelope nor env var supply it", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.assigneeName).toBeUndefined();
+    });
+
+    it("parses AI_IMPLEMENT_ASSIGNEE_NAME in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        AI_IMPLEMENT_ASSIGNEE_NAME: " Paz ",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.assigneeName).toBe("Paz");
+    });
+  });
+
+  describe("(i) retryPolicy", () => {
+    it("uses the envelope's retryPolicy when present", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 60 },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy).toEqual({ ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 60 });
+    });
+
+    it("falls back to DEFAULT_RETRY_POLICY when the envelope omits it", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+    });
+
+    it("falls back to DEFAULT_RETRY_POLICY in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+    });
+
+    it("normalizes an unvalidated envelope retryPolicy — defaults an invalid field and drops an unknown one", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          retryPolicy: { reviewMaxTurns: "abc", junk: 1 } as never,
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+    });
+
+    it("normalizes a partially valid envelope retryPolicy field-by-field rather than resetting the whole policy", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, requestRetries: 999, stageRetries: 4 },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy.requestRetries).toBe(DEFAULT_RETRY_POLICY.requestRetries);
+      expect(inputs.retryPolicy.stageRetries).toBe(4);
+    });
+  });
+
+  describe("(j2) reviewProcess and trustedReviewAuthors", () => {
+    const issue = { id: "e", identifier: "AII-9", title: "t", description: "d" };
+
+    it("carries both fields from the envelope", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue,
+          reviewProcess: "claude-code-review",
+          trustedReviewAuthors: ["x[bot]"],
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewProcess).toBe("claude-code-review");
+      expect(inputs.trustedReviewAuthors).toEqual(["x[bot]"]);
+    });
+
+    it("defaults when the envelope omits them", () => {
+      const env = { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({ v: 1, issue }), ...BASE_ENV };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewProcess).toBe("ai-implement");
+      expect(inputs.trustedReviewAuthors).toEqual([]);
+    });
+
+    it("falls back to the defaults in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewProcess).toBe("ai-implement");
+      expect(inputs.trustedReviewAuthors).toEqual([]);
+    });
+  });
+
+  describe("(j) reviewers", () => {
+    it("uses reviewers from the envelope when present", () => {
+      const reviewers = [{ id: "gap-analysis", gates: false, maxTurns: 45 }];
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewers,
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewers).toEqual(reviewers);
+    });
+
+    it("falls back to DEFAULT_REVIEWER_SELECTION when the envelope omits reviewers", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
+    });
+
+    it("falls back to DEFAULT_REVIEWER_SELECTION when decode drops malformed reviewers", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const raw = {
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewers: [{ id: "gap-analysis", gates: "true" }],
+        };
+        const env = {
+          AI_IMPLEMENT_RUN_CONFIG: Buffer.from(JSON.stringify(raw), "utf-8").toString("base64"),
+          ...BASE_ENV,
+        };
+        const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+        expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reviewers"));
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("falls back to DEFAULT_REVIEWER_SELECTION when reviewer maxTurns is malformed", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const raw = {
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewers: [{ id: "gap-analysis", gates: true, maxTurns: 201 }],
+        };
+        const env = {
+          AI_IMPLEMENT_RUN_CONFIG: Buffer.from(JSON.stringify(raw), "utf-8").toString("base64"),
+          ...BASE_ENV,
+        };
+        const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+        expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reviewers"));
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("falls back to DEFAULT_REVIEWER_SELECTION in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
+    });
+  });
+
+  describe("(k) reviewFix", () => {
+    const validReviewFix = {
+      version: 1 as const,
+      attemptId: "attempt-1",
+      installationId: 123,
+      repository: "acme/widgets",
+      prNumber: 42,
+      deadlineAt: Date.parse("2026-01-01T00:00:00.000Z"),
+    };
+
+    it("mirrors the envelope's reviewFix when present", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewFix: validReviewFix,
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewFix).toEqual(validReviewFix);
+    });
+
+    it("is undefined when the envelope omits reviewFix", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewFix).toBeUndefined();
+    });
+
+    it("is undefined in legacy-env mode (no env-var equivalent)", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewFix).toBeUndefined();
+    });
+
+    it("throws (fails closed) when the envelope's reviewFix is malformed, never falling back to Legacy", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewFix: { ...validReviewFix, installationId: -1 } as never,
+        }),
+        ...BASE_ENV,
+      };
+      expect(() => resolveRunnerInputs(env as NodeJS.ProcessEnv)).toThrow(/reviewFix/);
+    });
+  });
+});
+
+describe("resolveRunnerInputs agentConfig", () => {
+  it("carries the snapshot and never the grant", () => {
+    const snap = makeSnapshot();
+    const env = { ...BASE_ENV, ...envelopeEnv(snap, makeGrant(snap)) };
+    const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+    expect(inputs.agentConfig).toEqual(snap);
+    expect(JSON.stringify(inputs)).not.toContain(SENTINEL_BEARER);
+  });
+
+  it("is undefined for envelope and flat-env legacy runs", () => {
+    const legacy = { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({ v: 1, issue: { id: "i", identifier: "A-1", title: "t", description: "d" } }), ...BASE_ENV };
+    expect(resolveRunnerInputs(legacy as NodeJS.ProcessEnv).agentConfig).toBeUndefined();
+    const flat = { ISSUE_ID: "1", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d", ...BASE_ENV };
+    expect(resolveRunnerInputs(flat as NodeJS.ProcessEnv).agentConfig).toBeUndefined();
+  });
+});
+
+describe("hasConfiguredIntent", () => {
+  const enc = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
+  it("detects a snapshot or grant even when the envelope is otherwise malformed", () => {
+    expect(hasConfiguredIntent(enc({ v: 1, agentConfig: { junk: true } }))).toBe(true);
+    expect(hasConfiguredIntent(enc({ credentials: { modelAuthGrant: 1 } }))).toBe(true);
+  });
+  it("treats absent, unparseable and signal-free envelopes as legacy", () => {
+    expect(hasConfiguredIntent(undefined)).toBe(false);
+    expect(hasConfiguredIntent("%%%not-json")).toBe(false);
+    expect(hasConfiguredIntent(enc({ v: 1, credentials: { version: 1, progressToken: "x" } }))).toBe(false);
+  });
+});
+
+describe("prepareConfiguredRun", () => {
+  const snap = makeSnapshot();
+  const prepare = (env: Record<string, string>, options: ConfiguredRunOptions = {}, snapshot = snap) =>
+    prepareConfiguredRun({ env: env as NodeJS.ProcessEnv, snapshot, workspaceDir: "/tmp/ws-x", options: { now: () => NOW, ...options } });
+  const reason = async (p: Promise<unknown>) => {
+    try {
+      await p;
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConfiguredRunError);
+      expect((e as Error).message).not.toContain(SENTINEL_BEARER);
+      return (e as ConfiguredRunError).reason;
+    }
+    return "no-error";
+  };
+
+  it("is legacy without a snapshot, grant or injected source", async () => {
+    await expect(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x" })).resolves.toBeUndefined();
+  });
+
+  it("rejects incomplete or invalid bootstrap before any client call", async () => {
+    const client = fakeClient();
+    const good = envelopeEnv(snap, makeGrant(snap));
+    expect(await reason(prepare(envelopeEnv(snap, undefined), { modelAuthClient: client }))).toBe("bootstrap_missing");
+    expect(await reason(prepareConfiguredRun({ env: envelopeEnv(undefined, makeGrant(snap)) as NodeJS.ProcessEnv, workspaceDir: "/tmp/ws-x", options: { modelAuthClient: client } }))).toBe("snapshot_incomplete");
+    expect(await reason(prepare({ ...good, AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID: "" }, { modelAuthClient: client }))).toBe("bootstrap_context_missing");
+    expect(await reason(prepare({ ...good, AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID: "other" }, { modelAuthClient: client }))).toBe("bootstrap_invalid");
+    expect(await reason(prepare(envelopeEnv(snap, makeGrant(snap, { expiresAt: NOW })), { modelAuthClient: client }))).toBe("bootstrap_invalid");
+    expect(await reason(prepare({ ...good, AI_IMPLEMENT_MODEL_AUTH_URL: "" }))).toBe("transport_unconfigured");
+    expect(await reason(prepare(good, { localCredentialPort: { load: vi.fn() }, modelAuthClient: client }))).toBe("bootstrap_invalid");
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(client.invoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects a grant that does not cover the snapshot's profiles", async () => {
+    const bad = makeGrant(snap, { bindings: makeGrant(snap).bindings.map((b) => (b.stage === "review" ? { ...b, profileRevision: 9 } : b)) });
+    expect(await reason(prepare(envelopeEnv(snap, bad), { modelAuthClient: fakeClient() }))).toBe("grant_bindings_mismatch");
+    const missing = makeGrant(snap, { bindings: makeGrant(snap).bindings.filter((b) => b.stage !== "planning") });
+    expect(await reason(prepare(envelopeEnv(snap, missing), { modelAuthClient: fakeClient() }))).toBe("grant_bindings_mismatch");
+  });
+
+  it("rejects a malformed snapshot", async () => {
+    expect(await reason(prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: fakeClient() }, { ...snap, version: 2 } as never))).toBe("snapshot_incomplete");
+  });
+
+
+  it("accepts a local synthetic provider only for selected Codex/OpenAI profiles", async () => {
+    const local = { localCredentialPort: { load: vi.fn() } };
+    await expect(prepareConfiguredRun({
+      env: {},
+      workspaceDir: "/tmp/ws-x",
+      options: {
+        agentConfig: snap,
+        ...local,
+        syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-impl"] },
+      },
+    })).resolves.toBeTruthy();
+  });
+
+  it("rejects synthetic providers outside the local protected-port path", async () => {
+    const synth = { version: 1 as const, kind: "local-feedback-provider" as const, port: 8080, profileIds: ["p-impl"] };
+    const local = { localCredentialPort: { load: vi.fn() } };
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: snap, syntheticProvider: synth } }))).toBe("bootstrap_missing");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: snap, ...local, modelAuthClient: fakeClient(), syntheticProvider: synth } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepare(envelopeEnv(snap, makeGrant(snap)), { syntheticProvider: synth }))).toBe("bootstrap_invalid");
+  });
+
+  it("rejects invalid synthetic provider ports and profile selections", async () => {
+    const local = { localCredentialPort: { load: vi.fn() } };
+    const base = { agentConfig: snap, ...local };
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 0, profileIds: ["p-impl"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 65536, profileIds: ["p-impl"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: [] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-rev"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-impl", "p-impl"] } } }))).toBe("bootstrap_invalid");
+  });
+
+  it("checks out each profile once, on first use, and finishes then disposes it", async () => {
+    const client = fakeClient();
+    const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;
+    const legacy = makeExecutor();
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy });
+    expect(client.checkout).not.toHaveBeenCalled();
+    await ex.invoke({ prompt: "p", model: "caller", agentStage: "review" });
+    await ex.invoke({ prompt: "p", model: "caller", agentStage: "review" });
+    expect(client.checkout).toHaveBeenCalledTimes(1);
+    expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
+    expect(client.invoke).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(legacy.invoke).mock.calls[0][0].model).toBe("claude-review");
+    await expect(run.finish("completed")).resolves.toBe(true);
+    await expect(run.finish("completed")).resolves.toBe(false);
+    expect(client.finish).toHaveBeenCalledTimes(1);
+    expect(client.finish).toHaveBeenCalledWith("p-rev", "completed");
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])("uses envelope fallback models after capacity failure only when present (configured=%s)", async (configured) => {
+    const env = {
+      ...envelopeEnv(snap, makeGrant(snap)),
+      AI_IMPLEMENT_RUN_CONFIG: encodeTrustedRunConfig({
+        v: 1,
+        issue: { id: "i1", identifier: "AII-1", title: "t", description: "d" },
+        agentConfig: snap,
+        credentials: { version: 1, modelAuthGrant: makeGrant(snap) },
+        ...(configured ? { modelFallbacks: { review: "claude-review-fallback" } } : {}),
+      }),
+    };
+    const run = (await prepare(env, { modelAuthClient: fakeClient() }))!;
+    const legacy = makeExecutor();
+    vi.mocked(legacy.invoke).mockResolvedValueOnce({
+      stdout: "capacity",
+      exitCode: 1,
+      tokensUsed: 0,
+      failure: {
+        category: "transient",
+        code: "PROVIDER_OVERLOADED",
+        stage: "review",
+        attempt: 3,
+        retryable: false,
+        message: "capacity",
+        evidence: { truncated: false },
+      },
+    });
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy });
+    const params = { prompt: "p", model: "caller", agentStage: "review" as const };
+    const failed = await ex.invoke(params);
+    expect(failed.attribution?.model).toBe("claude-review");
+    expect(failed.failure?.code).toBe("PROVIDER_OVERLOADED");
+    expect(failed.failure?.modelFallback).toEqual(configured
+      ? { stage: "review", from: "claude-review", to: "claude-review-fallback" }
+      : undefined);
+    const next = await ex.invoke(params);
+    const expectedModel = configured ? "claude-review-fallback" : "claude-review";
+    expect(vi.mocked(legacy.invoke).mock.calls.map(([call]) => call.model)).toEqual(["claude-review", expectedModel]);
+    expect(next.attribution).toMatchObject({ model: expectedModel, profileId: "p-rev", agent: "claude", provider: "anthropic" });
+    await run.finish("completed");
+  });
+
+  it("requires an explicit agentStage and never infers one", async () => {
+    const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: fakeClient() }))!;
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: makeExecutor() });
+    await expect(ex.invoke({ prompt: "p", model: "m", stage: "review" } as never)).rejects.toBeInstanceOf(AgentStageError);
+  });
+
+  it("retains state instead of finishing when a child may be live or a checkpoint is uncertain", async () => {
+    for (const mark of [{ possiblyLive: true }, { category: "checkpoint_uncertain" }]) {
+      const client = fakeClient();
+      const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;
+      const legacy: LLMExecutor = { invoke: vi.fn().mockRejectedValue(Object.assign(new Error("x"), mark)) };
+      const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy });
+      await expect(ex.invoke({ prompt: "p", model: "m", agentStage: "review" })).rejects.toBeTruthy();
+      await expect(run.finish("failed")).resolves.toBe(false);
+      expect(client.finish).not.toHaveBeenCalled();
+      expect(client.dispose).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not dispose while a profile is still invoking or uncertain", async () => {
+    const client = fakeClient();
+    const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: makeExecutor() });
+    await ex.invoke({ prompt: "p", model: "m", agentStage: "review" });
+    client.states.set("p-rev", "uncertain");
+    await expect(run.finish("failed")).resolves.toBe(false);
+    expect(client.finish).not.toHaveBeenCalled();
+    expect(client.dispose).not.toHaveBeenCalled();
+  });
+
+  it("does not leak the bearer through the snapshot, provider label or executor", async () => {
+    const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: fakeClient() }))!;
+    expect(JSON.stringify({ s: run.snapshot, p: run.provider })).not.toContain(SENTINEL_BEARER);
+    expect(run.provider).toBe("anthropic");
+    expect(EXPECTED.dispatchId).toBe("disp-1");
+  });
+
+  it("rejects a structurally forged borrowed configured run before local work", async () => {
+    const forged = {
+      snapshot: snap,
+      provider: "anthropic",
+      createExecutor: vi.fn(),
+      finish: vi.fn(),
+    };
+    await expect(runAutonomousLocally({
+      workspaceDir: "/tmp/ws-x",
+      issueIdentifier: "AII-1",
+      issueTitle: "t",
+      issueDescription: "d",
+      prebuiltConfiguredRun: forged as never,
+    })).rejects.toMatchObject({ reason: "bootstrap_invalid" });
   });
 });

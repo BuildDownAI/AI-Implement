@@ -6,11 +6,15 @@ dist/
 .env
 .envrc
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/restate/
 *.pem
 *.pem.txt
 clients/*.toml
 !clients/example-client.toml
 .claude/
+.mcp.json
 .conductor/
 .wrangler/
 .worktrees/
@@ -18,3 +22,4 @@ clients/*.toml
 /.idea/**
 
 /data/dedup.**
+.bd/

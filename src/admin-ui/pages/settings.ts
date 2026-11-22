@@ -3,14 +3,13 @@ export const settingsHtml = `
   <header class="page-header">
     <div class="page-header-left">
       <h1 class="page-title">Settings</h1>
-      <div class="page-subtitle">Sessions app, region, and global machine secrets</div>
+      <div class="page-subtitle">Sessions app, region, retry policy, and global machine secrets</div>
     </div>
   </header>
   <div class="page-body">
     <div class="card">
       <div class="card-header"><h2 class="card-title">Fly Sessions App</h2></div>
       <div class="card-body">
-        <div id="settings-env-warning" class="warning hidden">&#x26A0; One or more settings are overridden by environment variables. Changes saved here take effect on next restart only if the env var is removed.</div>
         <div class="field">
           <label>Sessions App Name</label>
           <div style="display:flex;gap:6px">
@@ -18,6 +17,7 @@ export const settingsHtml = `
             <button class="btn btn-primary btn-sm" onclick="saveSessionsApp()">Save</button>
           </div>
           <div id="settings-sessions-app-source" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+          <div id="settings-sessions-app-note" class="text-tertiary" style="font-size:11px;margin-top:3px">Change it only when no Fly run is in flight. A change applies to the next dispatch. Runs in flight stay in the old app; the kept KG machine is cleaned in its own app.</div>
         </div>
         <div class="field">
           <label>Sessions Region (optional)</label>
@@ -26,8 +26,123 @@ export const settingsHtml = `
             <button class="btn btn-primary btn-sm" onclick="saveSessionsRegion()">Save</button>
           </div>
         </div>
-        <div id="settings-restart-notice" class="warning hidden">&#x25B6; Restart the orchestrator for these changes to take effect.</div>
         <div id="settings-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Orchestrator Agent Defaults</h2></div>
+      <div class="card-body">
+        <p class="text-secondary" style="margin-bottom:12px">Stage defaults for planning, implementation and review live in the orchestrator, not in a target repository. When defaults are on, a new project starts configured. An existing project keeps its mode. Changes apply to the next run. Edit the per-stage agent, provider, model, account profile and elapsed time limit on the <a href="#models">Models &amp; providers</a> page.</p>
+        <div class="field">
+          <label>Defaults mode</label>
+          <div style="display:flex;gap:6px">
+            <select class="input" id="settings-agent-defaults-mode" style="flex:1">
+              <option value="legacy">legacy (stage defaults off)</option>
+              <option value="configured">configured (stage defaults on; new projects start configured, existing projects keep their mode)</option>
+            </select>
+            <button class="btn btn-primary btn-sm" id="settings-agent-defaults-save" onclick="saveAgentDefaultsMode()">Save</button>
+          </div>
+          <div id="settings-agent-defaults-summary" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+        </div>
+        <div id="settings-agent-defaults-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Linear Pickup Label</h2></div>
+      <div class="card-body">
+        <div class="warning">Changing this label changes which Linear issues this orchestrator dispatches. Change it only for a planned migration. Issues that carry the old label stop dispatching at the next poll. The lifecycle labels (AI-Planning, AI-Working, Plan-Complete, Ready for Review) do not change.</div>
+        <div class="field">
+          <label>Pickup Label</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-pickup-label" placeholder="AI-Implement" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="savePickupLabel()">Save</button>
+            <button class="btn btn-sm" onclick="resetPickupLabel()">Reset to default</button>
+          </div>
+          <div id="settings-pickup-label-source" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+        </div>
+        <div id="settings-pickup-label-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">KG Refresh</h2></div>
+      <div class="card-body">
+        <div class="field">
+          <label>Failure Report Issue</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-kg-report-issue" placeholder="e.g. AII-496" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="saveKgRefreshReportIssue()">Save</button>
+          </div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:3px">Linear issue identifier that receives a comment on each kg-refresh failure. Leave blank to skip the comment.</div>
+        </div>
+        <div class="field">
+          <label>Base template repo</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-kg-base-repo" placeholder="e.g. BuildDownAI/bd-knowledge-graph-base" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="saveKgBaseRepo()">Save</button>
+          </div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:3px">owner/repo watched by the PR-triggered kg-refresh dry-run check, alongside the bound KG source repo. Leave blank to check only the KG source repo.</div>
+        </div>
+        <div id="settings-kg-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Runner Image Prefixes</h2></div>
+      <div class="card-body">
+        <p class="text-secondary" style="margin-bottom:12px">The orchestrator checks the runner image before each GitHub Actions and Fly launch. Local Docker launches are not checked. It always trusts ghcr.io/builddownai/ and ghcr.io/&lt;repo owner&gt;/. Add more prefixes here, comma-separated. Each prefix must end with /. On GitHub Actions the workflow checks the image against the separate repository variable AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES.</p>
+        <div class="field">
+          <label>Extra Prefixes</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-runner-image-prefixes" placeholder="ghcr.io/acme/" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="saveRunnerImagePrefixes()">Save</button>
+            <button class="btn btn-sm" onclick="clearRunnerImagePrefixes()">Clear</button>
+          </div>
+          <div id="settings-runner-image-prefixes-source" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+        </div>
+        <div id="settings-runner-image-prefixes-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Retry Policy</h2></div>
+      <div class="card-body">
+        <p class="text-secondary" style="margin-bottom:12px">Global retry/backoff policy and second review turn cap. Blank fields fall back to the default shown as a placeholder.</p>
+        <div class="field">
+          <label>Request Retries <span class="text-tertiary">(re-spawns of one Claude invocation)</span></label>
+          <input class="input" id="rp-requestRetries" type="number" min="0" max="10" step="1">
+        </div>
+        <div class="field">
+          <label>Stage Retries <span class="text-tertiary">(re-runs of a whole implement/review stage)</span></label>
+          <input class="input" id="rp-stageRetries" type="number" min="0" max="10" step="1">
+        </div>
+        <div class="field">
+          <label>Push Retries</label>
+          <input class="input" id="rp-pushRetries" type="number" min="0" max="10" step="1">
+        </div>
+        <div class="field">
+          <label>Backoff Initial (ms)</label>
+          <input class="input" id="rp-backoffInitialMs" type="number" min="1000" max="600000" step="1">
+        </div>
+        <div class="field">
+          <label>Backoff Max (ms)</label>
+          <input class="input" id="rp-backoffMaxMs" type="number" min="1000" step="1">
+        </div>
+        <div class="field">
+          <label>Backoff Jitter <span class="text-tertiary">(fraction subtracted, 0 = none, 1 = up to &minus;100%)</span></label>
+          <input class="input" id="rp-backoffJitter" type="number" min="0" max="1" step="0.05">
+        </div>
+        <div class="field">
+          <label>Review Max Turns <span class="text-tertiary">(second review)</span></label>
+          <input class="input" id="rp-reviewMaxTurns" type="number" min="5" max="200" step="1">
+        </div>
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <button class="btn btn-primary btn-sm" onclick="saveRetryPolicy()">Save</button>
+          <button class="btn btn-sm" onclick="resetRetryPolicy()">Reset to defaults</button>
+        </div>
+        <div id="retry-policy-error" class="error hidden"></div>
       </div>
     </div>
 
@@ -61,6 +176,80 @@ export const settingsHtml = `
 
 export const settingsScript = `
 (function () {
+  var RETRY_POLICY_FIELDS = ['requestRetries', 'stageRetries', 'pushRetries', 'backoffInitialMs', 'backoffMaxMs', 'backoffJitter', 'reviewMaxTurns'];
+
+  function populateRetryPolicy(policy, defaults) {
+    RETRY_POLICY_FIELDS.forEach(function (field) {
+      var input = document.getElementById('rp-' + field);
+      if (!input) return;
+      input.placeholder = String(defaults[field]);
+      input.value = policy && policy[field] !== defaults[field] ? policy[field] : '';
+    });
+  }
+
+  var adDirty = false;
+
+  function adCanEdit() {
+    return typeof window.isAdmin === 'function' && window.isAdmin();
+  }
+
+  function adShowError(msg) {
+    var el = document.getElementById('settings-agent-defaults-error');
+    el.textContent = msg || '';
+    el.classList.toggle('hidden', !msg);
+  }
+
+  async function adErrorText(res, fallback) {
+    try {
+      var data = await res.json();
+      if (data && data.error) return fallback + ': ' + data.error;
+    } catch (_) {}
+    return fallback + ' (HTTP ' + res.status + ')';
+  }
+
+  async function loadAgentDefaults() {
+    if (adDirty) return;
+    var modeEl = document.getElementById('settings-agent-defaults-mode');
+    var saveBtn = document.getElementById('settings-agent-defaults-save');
+    var canEdit = adCanEdit();
+    modeEl.disabled = !canEdit;
+    saveBtn.classList.toggle('hidden', !canEdit);
+    modeEl.onchange = function () { adDirty = true; };
+    try {
+      var res = await window.api('/api/agent-defaults');
+      if (!res.ok) { adShowError(await adErrorText(res, 'Failed to load agent defaults')); return; }
+      var data = await res.json();
+      modeEl.value = data.mode === 'configured' ? 'configured' : 'legacy';
+      var stages = data.stages || {};
+      var n = Object.keys(stages).length;
+      document.getElementById('settings-agent-defaults-summary').textContent =
+        (data.configured ? 'Saved' : 'Nothing saved yet') + '; ' + n + ' of 3 stages have settings.';
+      adShowError('');
+    } catch (err) {
+      adShowError('Failed to load agent defaults: ' + String(err));
+    }
+  }
+
+  async function saveAgentDefaultsMode() {
+    if (!adCanEdit()) return;
+    adShowError('');
+    var modeEl = document.getElementById('settings-agent-defaults-mode');
+    var mode = modeEl.value === 'configured' ? 'configured' : 'legacy';
+    try {
+      // PUT replaces stages wholesale, so read the current stages immediately before writing.
+      var cur = await window.api('/api/agent-defaults');
+      if (!cur.ok) { adShowError(await adErrorText(cur, 'Failed to read current stage defaults')); return; }
+      var current = await cur.json();
+      var res = await window.api('/api/agent-defaults', { method: 'PUT', body: JSON.stringify({ mode: mode, stages: current.stages || {} }) });
+      if (!res.ok) { adShowError(await adErrorText(res, 'Failed to save agent defaults')); return; }
+      adDirty = false;
+      await loadAgentDefaults();
+    } catch (err) {
+      adShowError('Failed to save agent defaults: ' + String(err));
+    }
+  }
+  window.saveAgentDefaultsMode = saveAgentDefaultsMode;
+
   async function loadSettings() {
     try {
       const res = await window.api('/api/settings');
@@ -70,19 +259,57 @@ export const settingsScript = `
       const appInput = document.getElementById('settings-sessions-app');
       const regionInput = document.getElementById('settings-sessions-region');
       const sourceEl = document.getElementById('settings-sessions-app-source');
-      const envWarn = document.getElementById('settings-env-warning');
-      appInput.value = appInfo.dbValue || '';
-      regionInput.value = regionInfo.dbValue || '';
-      const overridden = appInfo.overriddenByEnv || regionInfo.overriddenByEnv;
-      envWarn.classList.toggle('hidden', !overridden);
-      const srcText = appInfo.runtimeValue
-        ? ('Active: ' + window.esc(appInfo.runtimeValue) + (appInfo.overriddenByEnv ? ' (from env var)' : ' (from DB)'))
-        : 'Not configured — add a sessions app name to enable Fly dispatch';
+      appInput.value = appInfo.runtimeValue || '';
+      regionInput.value = regionInfo.runtimeValue || '';
+      const kgReportInput = document.getElementById('settings-kg-report-issue');
+      kgReportInput.value = (data.kgRefreshReportIssue && data.kgRefreshReportIssue.value) || '';
+      const kgBaseRepoInput = document.getElementById('settings-kg-base-repo');
+      kgBaseRepoInput.value = (data.kgBaseRepo && data.kgBaseRepo.value) || '';
+      const pickupLabelInput = document.getElementById('settings-pickup-label');
+      const pickupLabelSource = document.getElementById('settings-pickup-label-source');
+      pickupLabelInput.value = data.linearPickupLabel.value || '';
+      pickupLabelSource.textContent = 'Active: ' + data.linearPickupLabel.effective
+        + (data.linearPickupLabel.value === null ? ' (default)' : ' (from settings)');
+      const prefixes = data.runnerImageAllowedPrefixes;
+      if (prefixes) {
+        document.getElementById('settings-runner-image-prefixes').value = prefixes.value || '';
+        document.getElementById('settings-runner-image-prefixes-source').textContent =
+          'Built-in: ' + (prefixes.builtIn || []).join(', ')
+          + '  Extra: ' + ((prefixes.effective || []).join(', ') || 'none');
+      }
+      const srcText = data.runnerBackendSource === 'not-loaded'
+        ? 'Restate has not answered yet'
+        : appInfo.runtimeValue
+          ? ('Active: ' + window.esc(appInfo.runtimeValue) + ' (source: restate)')
+          : 'Not configured — add a sessions app name to enable Fly dispatch';
       sourceEl.textContent = srcText;
+      populateRetryPolicy(data.retryPolicy, data.retryPolicyDefaults);
     } catch (err) {
       console.error('loadSettings failed:', err);
     }
   }
+
+  async function saveRetryPolicy() {
+    const errEl = document.getElementById('retry-policy-error');
+    errEl.classList.add('hidden');
+    const patch = {};
+    for (const field of RETRY_POLICY_FIELDS) {
+      const raw = document.getElementById('rp-' + field).value.trim();
+      if (raw === '') continue;
+      const num = Number(raw);
+      if (!Number.isFinite(num)) { errEl.textContent = field + ' must be a number.'; errEl.classList.remove('hidden'); return; }
+      patch[field] = num;
+    }
+    await saveSettings({ retryPolicy: patch }, errEl);
+  }
+  window.saveRetryPolicy = saveRetryPolicy;
+
+  async function resetRetryPolicy() {
+    const errEl = document.getElementById('retry-policy-error');
+    errEl.classList.add('hidden');
+    await saveSettings({ retryPolicy: null }, errEl);
+  }
+  window.resetRetryPolicy = resetRetryPolicy;
 
   async function saveSessionsApp() {
     const val = document.getElementById('settings-sessions-app').value.trim() || null;
@@ -96,15 +323,100 @@ export const settingsScript = `
   }
   window.saveSessionsRegion = saveSessionsRegion;
 
-  async function saveSettings(payload) {
-    const errEl = document.getElementById('settings-error');
+  async function saveKgRefreshReportIssue() {
+    const val = document.getElementById('settings-kg-report-issue').value.trim() || null;
+    const errEl = document.getElementById('settings-kg-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ kgRefreshReportIssue: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+  window.saveKgRefreshReportIssue = saveKgRefreshReportIssue;
+
+  async function saveKgBaseRepo() {
+    const val = document.getElementById('settings-kg-base-repo').value.trim() || null;
+    const errEl = document.getElementById('settings-kg-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ kgBaseRepo: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+  window.saveKgBaseRepo = saveKgBaseRepo;
+
+  async function savePickupLabel() {
+    const val = document.getElementById('settings-pickup-label').value.trim() || null;
+    const errEl = document.getElementById('settings-pickup-label-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ linearPickupLabel: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+  window.savePickupLabel = savePickupLabel;
+
+  async function resetPickupLabel() {
+    const errEl = document.getElementById('settings-pickup-label-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ linearPickupLabel: null }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+  window.resetPickupLabel = resetPickupLabel;
+
+  async function postRunnerImagePrefixes(val) {
+    const errEl = document.getElementById('settings-runner-image-prefixes-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ runnerImageAllowedPrefixes: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+
+  async function saveRunnerImagePrefixes() {
+    await postRunnerImagePrefixes(document.getElementById('settings-runner-image-prefixes').value.trim() || null);
+  }
+  window.saveRunnerImagePrefixes = saveRunnerImagePrefixes;
+
+  async function clearRunnerImagePrefixes() {
+    await postRunnerImagePrefixes(null);
+  }
+  window.clearRunnerImagePrefixes = clearRunnerImagePrefixes;
+
+  async function saveSettings(payload, errEl) {
+    errEl = errEl || document.getElementById('settings-error');
     errEl.classList.add('hidden');
     try {
       const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
       const data = await res.json();
       if (!res.ok) { errEl.textContent = data.error || 'Failed to save settings.'; errEl.classList.remove('hidden'); return; }
-      const noticeEl = document.getElementById('settings-restart-notice');
-      noticeEl.classList.toggle('hidden', !data.restartRequired);
       await loadSettings();
     } catch (err) {
       errEl.textContent = String(err);
@@ -137,7 +449,7 @@ export const settingsScript = `
           const tr = document.createElement('tr');
           const dt = s.createdAt ? new Date(s.createdAt).toLocaleString() : '—';
           tr.innerHTML = '<td class="mono">' + window.esc(s.name) + '</td>'
-            + '<td style="color:#888;font-size:0.85em">' + dt + '</td>'
+            + '<td style="color:var(--fg-tertiary);font-size:0.85em">' + dt + '</td>'
             + '<td></td>';
           const delSecretBtn = document.createElement('button');
           delSecretBtn.className = 'sm danger';
@@ -194,6 +506,6 @@ export const settingsScript = `
   }
   window.deleteGlobalSecret = deleteGlobalSecret;
 
-  window.registerPage('settings', function () { loadSettings(); loadGlobalSecrets(); });
+  window.registerPage('settings', function () { loadSettings(); loadGlobalSecrets(); loadAgentDefaults(); });
 })();
 `;

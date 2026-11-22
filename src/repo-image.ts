@@ -1,3 +1,5 @@
+import { getRunnerImageAllowedPrefixes } from "./orchestrator-settings.js";
+
 declare global {
   namespace NodeJS {
     interface ProcessEnv {
@@ -40,6 +42,41 @@ export interface ResolveSessionImageResult {
   source: "override" | "default";
 }
 
+const BUILTIN_IMAGE_PREFIX = "ghcr.io/builddownai/";
+
+/** Thrown when the resolved runner image is outside the allowlist. */
+export class RunnerImageNotAllowedError extends Error {
+  constructor(
+    readonly image: string,
+    readonly owner: string,
+    readonly allowedPrefixes: string[],
+    repo?: string,
+  ) {
+    super(
+      `runner image ${image} for ${owner}${repo ? `/${repo}` : ""} is not allowed; `
+      + `allowed prefixes: ${allowedPrefixes.join(", ")}; add a prefix at /admin#settings`,
+    );
+    this.name = "RunnerImageNotAllowedError";
+  }
+}
+
+function allowedPrefixList(owner: string, extraPrefixes: string[]): string[] {
+  return [...new Set([BUILTIN_IMAGE_PREFIX, `ghcr.io/${owner.toLowerCase()}/`, ...extraPrefixes])];
+}
+
+/** Literal prefix match only: a stored prefix is never compiled into a RegExp or glob. */
+export function isRunnerImageAllowed(image: string, owner: string, extraPrefixes: string[]): boolean {
+  return allowedPrefixList(owner, extraPrefixes).some((prefix) => prefix !== "" && image.startsWith(prefix));
+}
+
+function assertRunnerImageAllowed(result: ResolveSessionImageResult, owner: string, repo: string): void {
+  const extra = getRunnerImageAllowedPrefixes();
+  if (isRunnerImageAllowed(result.image, owner, extra)) return;
+  const err = new RunnerImageNotAllowedError(result.image, owner, allowedPrefixList(owner, extra), repo);
+  console.warn(`[repo-image] ${err.message}`);
+  throw err;
+}
+
 export async function resolveSessionImage(
   input: ResolveSessionImageInput,
 ): Promise<ResolveSessionImageResult> {
@@ -50,11 +87,14 @@ export async function resolveSessionImage(
   const cacheKey = `${owner}/${repo}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
-    return { image: cached.image, source: cached.source };
+    const hit = { image: cached.image, source: cached.source };
+    assertRunnerImageAllowed(hit, owner, repo);
+    return hit;
   }
 
   const result = await fetchImage(owner, repo, token, defaultImage, fetchImpl);
   cache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, ...result });
+  assertRunnerImageAllowed(result, owner, repo);
   return result;
 }
 
@@ -119,6 +159,7 @@ async function fetchImage(
 }
 
 const DEFAULT_RUNNER_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
+const NEXT_RUNNER_IMAGE = "ghcr.io/builddownai/ai-implement-runner:next";
 
 /**
  * State of the deprecated SESSION_IMAGE env var relative to its replacement:
@@ -137,6 +178,11 @@ export interface DefaultRunnerImageResult {
    * dispatches (see {@link selectRunnerImageInput}).
    */
   explicit: boolean;
+  /**
+   * True when no image variable is set and the image was derived from the
+   * `testing` source-branch stamp (`AI_IMPLEMENT_SOURCE_BRANCH`), i.e. `:next`.
+   */
+  channelDefault: boolean;
   sessionImageStatus: SessionImageStatus;
 }
 
@@ -148,7 +194,10 @@ export interface DefaultRunnerImageResult {
  * distinguishes "rename it" (active) from "it's ignored" (shadowed).
  */
 export function resolveDefaultRunnerImage(
-  env: Pick<NodeJS.ProcessEnv, "AI_IMPLEMENT_RUNNER_IMAGE" | "SESSION_IMAGE">,
+  env: Pick<
+    NodeJS.ProcessEnv,
+    "AI_IMPLEMENT_RUNNER_IMAGE" | "SESSION_IMAGE" | "AI_IMPLEMENT_SOURCE_BRANCH"
+  >,
 ): DefaultRunnerImageResult {
   const hasNew = Boolean(env.AI_IMPLEMENT_RUNNER_IMAGE);
   const hasLegacy = Boolean(env.SESSION_IMAGE);
@@ -157,9 +206,15 @@ export function resolveDefaultRunnerImage(
     : hasNew
       ? "shadowed"
       : "active";
+  const explicit = hasNew || hasLegacy;
+  const channelDefault = !explicit && env.AI_IMPLEMENT_SOURCE_BRANCH?.trim() === "testing";
   return {
-    image: env.AI_IMPLEMENT_RUNNER_IMAGE || env.SESSION_IMAGE || DEFAULT_RUNNER_IMAGE,
-    explicit: hasNew || hasLegacy,
+    image:
+      env.AI_IMPLEMENT_RUNNER_IMAGE ||
+      env.SESSION_IMAGE ||
+      (channelDefault ? NEXT_RUNNER_IMAGE : DEFAULT_RUNNER_IMAGE),
+    explicit,
+    channelDefault,
     sessionImageStatus,
   };
 }
@@ -171,7 +226,8 @@ export function resolveDefaultRunnerImage(
  * We only forward when the image represents an *explicit* choice:
  *   - a per-repo `.ai-implement/image.yml` override (source === "override"), or
  *   - an explicit orchestrator-wide default (AI_IMPLEMENT_RUNNER_IMAGE or the
- *     legacy SESSION_IMAGE), surfaced as `runnerImageExplicit`.
+ *     legacy SESSION_IMAGE), or the `:next` default a testing orchestrator
+ *     derives from its source-branch stamp, surfaced as `runnerImageExplicit`.
  *
  * When neither is true the resolved image is just the built-in fallback, so we
  * return `undefined` and let the target workflow keep its own resolution
@@ -218,4 +274,115 @@ export async function resolveRunnerImageForDispatch(opts: {
     fetchImpl: opts.fetchImpl,
   });
   return selectRunnerImageInput({ resolved, runnerImageExplicit: opts.runnerImageExplicit });
+}
+
+// Strip ":tag" or "@digest" from an image ref, leaving the bare registry/name.
+// Returns null when the image has no slash (not a valid ref) or no tag/digest.
+export function stripImageTag(image: string): string | null {
+  const firstSlash = image.indexOf("/");
+  if (firstSlash === -1) return null;
+  const atIdx = image.indexOf("@", firstSlash);
+  if (atIdx !== -1) return image.slice(0, atIdx);
+  const colonIdx = image.lastIndexOf(":");
+  if (colonIdx <= firstSlash) return null;
+  return image.slice(0, colonIdx);
+}
+
+// Parse "host/path:tag" into its components. Returns null on invalid format.
+function parseImageRef(image: string): { host: string; name: string; tag: string } | null {
+  const firstSlash = image.indexOf("/");
+  if (firstSlash === -1) return null;
+  const host = image.slice(0, firstSlash);
+  const rest = image.slice(firstSlash + 1);
+  const colonIdx = rest.lastIndexOf(":");
+  if (colonIdx === -1) return null;
+  return { host, name: rest.slice(0, colonIdx), tag: rest.slice(colonIdx + 1) };
+}
+
+/**
+ * Resolves the source commit baked into a runner channel image by fetching its
+ * OCI config labels. Returns null on any error (network, auth, missing label)
+ * so the caller always gets a usable value without needing to handle exceptions.
+ *
+ * Checks `org.opencontainers.image.revision` first (OCI standard), then falls
+ * back to the custom `AI_IMPLEMENT_SOURCE_COMMIT` label. A missing label or
+ * registry failure both yield null — the tool degrades gracefully in both cases.
+ */
+export async function resolveChannelCommit(
+  imageBase: string,
+  channelTag: string,
+  fetchImpl?: typeof fetch,
+  timeoutMs = 10_000,
+): Promise<string | null> {
+  const fetchFn = fetchImpl ?? fetch;
+  const imageRef = `${imageBase}:${channelTag}`;
+  const parsed = parseImageRef(imageRef);
+  if (!parsed) return null;
+  const { host, name, tag } = parsed;
+  const manifestUrl = `https://${host}/v2/${name}/manifests/${tag}`;
+  const accept =
+    "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    let token: string | null = null;
+    let res = await fetchFn(manifestUrl, { headers: { Accept: accept }, signal: controller.signal });
+
+    if (res.status === 401) {
+      const wwwAuth = res.headers.get("www-authenticate") ?? "";
+      const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+      const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
+      const scopeMatch = wwwAuth.match(/scope="([^"]+)"/);
+      if (!realmMatch) return null;
+
+      const params = new URLSearchParams();
+      if (serviceMatch) params.set("service", serviceMatch[1]);
+      if (scopeMatch) params.set("scope", scopeMatch[1]);
+      const tokenRes = await fetchFn(`${realmMatch[1]}?${params}`, { signal: controller.signal });
+      if (!tokenRes.ok) return null;
+      const { token: bearerToken } = (await tokenRes.json()) as { token?: string };
+      if (!bearerToken) return null;
+      token = bearerToken;
+
+      res = await fetchFn(manifestUrl, {
+        headers: { Accept: accept, Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+    }
+
+    if (!res.ok) return null;
+
+    // Parse manifest to get config layer digest.
+    const manifest = (await res.json()) as { config?: { digest?: unknown } };
+    const configDigest = manifest?.config?.digest;
+    if (typeof configDigest !== "string") return null;
+
+    // Fetch the config blob to read image labels.
+    const configUrl = `https://${host}/v2/${name}/blobs/${configDigest}`;
+    const configHeaders: Record<string, string> = {};
+    if (token) configHeaders["Authorization"] = `Bearer ${token}`;
+
+    const configRes = await fetchFn(configUrl, { headers: configHeaders, signal: controller.signal });
+    if (!configRes.ok) return null;
+
+    const config = (await configRes.json()) as {
+      config?: { Labels?: Record<string, unknown> | null };
+    };
+    const labels = config?.config?.Labels;
+    if (!labels || typeof labels !== "object") return null;
+
+    const revision = labels["org.opencontainers.image.revision"];
+    if (typeof revision === "string" && revision) return revision;
+
+    const stamp = labels["AI_IMPLEMENT_SOURCE_COMMIT"];
+    if (typeof stamp === "string" && stamp) return stamp;
+
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }

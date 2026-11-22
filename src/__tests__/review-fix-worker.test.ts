@@ -1,0 +1,1125 @@
+/**
+ * Behavioral tests for `src/review-fix-worker.ts` (AII-793), the production
+ * `ReviewFixWorkerPort` GitHub Actions adapter. Uses a real SQLite-backed
+ * `config.ts` mapping (matching `review-fix-attempt-store.test.ts`'s temp-file
+ * harness) and a controllable `ReviewFixWorkerTransport` double rather than
+ * mocking global `fetch`, since the transport is the seam AII-793's approved
+ * amendment asks for explicitly.
+ *
+ * This file is type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
+ */
+import { describe, expect, it, beforeEach, onTestFinished, vi } from "vitest";
+import path from "node:path";
+import fs from "node:fs";
+import type * as ConfigModule from "../config.js";
+import type * as WorkerModule from "../review-fix-worker.js";
+import type * as AttemptStoreModule from "../review-fix-attempt-store.js";
+import type { RepoMapping } from "../config.js";
+import type { ScopedPrIdentity } from "../review-fix-contract.js";
+import type { PreparedReviewFixAttempt } from "../review-fix-ports.js";
+import { makeMapping, makeScopedPrIdentity } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/replies/github.js";
+import { testDb } from "./helpers/test-db.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
+
+let config: typeof ConfigModule;
+let workerModule: typeof WorkerModule;
+let attemptStoreModule: typeof AttemptStoreModule;
+
+beforeEach(async () => {
+  ({ config, workerModule, attemptStoreModule } = (await testDb({
+    modules: {
+      config: () => import("../config.js"),
+      workerModule: () => import("../review-fix-worker.js"),
+      attemptStoreModule: () => import("../review-fix-attempt-store.js"),
+    },
+  })).modules);
+});
+
+const INSTALLATION_ID = 7;
+const SCOPE = makeScopedPrIdentity({ installationId: INSTALLATION_ID, repository: "eudoxus/ai-implement" });
+
+function seedMapping(overrides: Partial<RepoMapping> = {}): void {
+  config.upsertMapping("AII", makeMapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
+}
+
+function makeAttempt(overrides: Partial<PreparedReviewFixAttempt> = {}): PreparedReviewFixAttempt {
+  const attemptId = overrides.attemptId ?? "attempt-1";
+  return {
+    attemptId,
+    scope: SCOPE,
+    taskText: "Address the reported findings",
+    findings: [{ findingKey: "finding-1", version: 1 }],
+    owner: attemptId,
+    deadlineAt: Date.now() + 60 * 60 * 1000,
+    ...overrides,
+  };
+}
+
+/** Credential resolver double: always succeeds unless `fail` is set, and records every call
+ *  so a test can assert "no token fetched" for the safe-fallback paths. */
+function makeCredentials(opts: { installationId?: number; fail?: boolean } = {}) {
+  const calls: ScopedPrIdentity[] = [];
+  return {
+    calls,
+    resolver: {
+      async resolve(scope: ScopedPrIdentity) {
+        calls.push(scope);
+        if (opts.fail) throw new Error("injected credential failure");
+        return { token: "gh-token", installationId: opts.installationId ?? INSTALLATION_ID };
+      },
+    },
+  };
+}
+
+type CandidateRun = { runId: number; runAttempt: number | null; displayTitle: string; headBranch: string };
+type RunDetail = { status: string; conclusion: string | null; runAttempt: number | null };
+
+/** Controllable GitHub double. `dispatch` can be told to "accept, then lose the response" —
+ *  it records server-side state (as GitHub itself would) before throwing, so a later
+ *  `listRuns` call (possibly through a freshly constructed adapter) can still discover it.
+ *  The PR head SHA is tracked separately from any run detail, since a real gap-fill run's
+ *  dispatch-time `head_sha` and the PR's actual published head are two different values. */
+function makeTransport() {
+  const dispatchCalls: unknown[] = [];
+  const cancelCalls: unknown[] = [];
+  const pullRequestHeadShaCalls: unknown[] = [];
+  let dispatchImpl: (input: any) => Promise<any> = async () => ({ success: true, status: 204, outcome: "accepted" as const });
+  let serverRuns: CandidateRun[] = [];
+  let runDetail: RunDetail | null = null;
+  let cancelResult = true;
+  let pullRequestHeadSha: string | null = null;
+
+  return {
+    dispatchCalls,
+    cancelCalls,
+    pullRequestHeadShaCalls,
+    setDispatchImpl(fn: (input: any) => Promise<any>) { dispatchImpl = fn; },
+    setServerRuns(runs: CandidateRun[]) { serverRuns = runs; },
+    setRunDetail(detail: RunDetail | null) { runDetail = detail; },
+    setCancelResult(v: boolean) { cancelResult = v; },
+    setPullRequestHeadSha(sha: string | null) { pullRequestHeadSha = sha; },
+    transport: {
+      async dispatch(input: any) {
+        dispatchCalls.push(input);
+        return dispatchImpl(input);
+      },
+      async listRuns(_input: any) {
+        return serverRuns;
+      },
+      async getRun(_input: any) {
+        return runDetail;
+      },
+      async cancelRun(input: any) {
+        cancelCalls.push(input);
+        return cancelResult;
+      },
+      async getPullRequestHeadSha(input: any) {
+        pullRequestHeadShaCalls.push(input);
+        return pullRequestHeadSha;
+      },
+    },
+  };
+}
+
+describe("GithubReviewFixWorker.prepare", () => {
+  it("is pure: no credential fetch, no network call", async () => {
+    const { resolver, calls } = makeCredentials({ fail: true });
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver });
+    const attempt = makeAttempt();
+
+    const plan = await worker.prepare(attempt);
+
+    expect(plan).toEqual({
+      executionBackend: "github-actions",
+      attemptId: attempt.attemptId,
+      scope: attempt.scope,
+      taskText: attempt.taskText,
+      deadlineAt: attempt.deadlineAt,
+    });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+const caps = (over: Record<string, unknown> = {}) => ({
+  contract: "envelope" as const, supportsRunPublicationToken: true, supportsAttemptCorrelation: true, ...over,
+});
+const legacyProbe = async () => caps({ supportsPrivateRunConfig: false });
+const privateProbe = async () => caps({ supportsPrivateRunConfig: true });
+
+/** The real transport's dispatch route for the seeded mapping, and GitHub's 200 answer when run details are requested. */
+const DISPATCHES = "POST /repos/eudoxus/ai-implement/actions/workflows/claude-implement.yml/dispatches";
+const dispatchedRun = (id: number) => ({ json: {
+  workflow_run_id: id,
+  run_url: `https://api.github.com/repos/eudoxus/ai-implement/actions/runs/${id}`,
+  html_url: `https://github.com/eudoxus/ai-implement/actions/runs/${id}`,
+} });
+const UNEXPECTED_ISSUE_IDENTIFIER = githubError(422, 'Unexpected inputs provided: ["issue_identifier"]');
+const dispatchBodies = (calls: { body: string }[]) => calls.map((c) => JSON.parse(c.body) as { inputs: Record<string, string> });
+
+describe("GithubReviewFixWorker.launch private envelope capability", () => {
+  it("dispatches a run_config whose description and commentInstruction both equal the admitted task text", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9100 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const taskText = `${"a".repeat(30_000)}\nLAST-LINE`;
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ taskText })));
+    expect(outcome.status).toBe("accepted");
+    const inputs = (t.dispatchCalls[0] as { inputs: { run_config: string } }).inputs;
+    const decoded = JSON.parse(Buffer.from(inputs.run_config, "base64").toString("utf-8"));
+    expect(decoded.issue.description).toBe(taskText);
+    expect(decoded.commentInstruction).toBe(taskText);
+  });
+
+  it("never dispatches when the outer envelope would shorten the task text", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ taskText: `${"a".repeat(40_001)}\nLAST-LINE` }));
+    const outcome = await worker.launch(plan);
+    expect(outcome).toEqual({ status: "rejected", reason: expect.stringContaining("envelope") });
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  const CALLBACK_URL = "https://callback.example/runner";
+  const tokens = async () => ({
+    run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+    runner_callback_url: CALLBACK_URL,
+  });
+
+  async function run(probe: (i: any) => Promise<any>, extra: Record<string, unknown> = {}) {
+    seedMapping({ workflowFile: "custom-flow.yml", defaultBranch: "release" });
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9100 }));
+    const scopeStore = workerModule.inMemoryReviewFixWorkerScopeStore();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokens, resolveCapabilities: probe, scopeStore, ...extra });
+    const plan = await worker.prepare(makeAttempt());
+    const outcome = await worker.launch(plan);
+    const sent = t.dispatchCalls[0] as { inputs: Record<string, string> } | undefined;
+    return { t, plan, outcome, sent, scopeStore };
+  }
+
+  it("private transport: the trusted-encoded run_config carries the admitted task text in both fields", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9100 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport,
+      callbackInputs: tokens, resolveCapabilities: privateProbe });
+    const taskText = `${"a".repeat(30_000)}\nLAST-LINE`;
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ taskText })));
+    expect(outcome.status).toBe("accepted");
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    const trusted = decodeTrustedRunConfig((t.dispatchCalls[0] as { inputs: { run_config: string } }).inputs.run_config);
+    expect(trusted.credentials).toBeDefined();
+    expect(trusted.issue.description).toBe(taskText);
+    expect(trusted.commentInstruction).toBe(taskText);
+  });
+
+  it("private transport: never dispatches when the envelope would shorten the task text", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport,
+      callbackInputs: tokens, resolveCapabilities: privateProbe });
+    const plan = await worker.prepare(makeAttempt({ taskText: `${"a".repeat(40_001)}\nLAST-LINE` }));
+    expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: expect.stringContaining("envelope") });
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("probes the exact dispatch target with the dispatch token", async () => {
+    const probe = vi.fn(privateProbe);
+    const { t } = await run(probe);
+    const dispatched = t.dispatchCalls[0] as any;
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe).toHaveBeenCalledWith({
+      owner: dispatched.owner, repo: dispatched.repo, workflowFile: "custom-flow.yml", ref: "release", token: dispatched.token,
+    });
+    expect(dispatched.workflowFile).toBe("custom-flow.yml");
+    expect(dispatched.ref).toBe("release");
+  });
+
+  it("private path: trusted decoder returns bearers, generic omits them, no top-level bearers", async () => {
+    const { sent, plan, outcome, scopeStore } = await run(privateProbe);
+    const { decodeRunConfig, decodeTrustedRunConfig } = await import("../run-config.js");
+    const inputs = sent!.inputs;
+    expect(decodeRunConfig(inputs.run_config).credentials).toBeUndefined();
+    const trusted = decodeTrustedRunConfig(inputs.run_config);
+    expect(trusted.credentials).toEqual({
+      version: 1, resultToken: "secret-result", progressToken: "secret-progress", publicationToken: "secret-publication",
+    });
+    expect(trusted.credentials?.attemptToken).toBeUndefined();
+    expect(trusted.runnerCallbackUrl).toBe(CALLBACK_URL);
+    expect(inputs.run_attempt_token).toBe(plan.attemptId);
+    for (const k of ["run_token", "run_progress_token", "run_publication_token", "runner_callback_url"]) {
+      expect(inputs[k] ?? "").toBe("");
+    }
+    for (const surface of [JSON.stringify(plan), JSON.stringify(outcome), JSON.stringify(await scopeStore.scopeForAttempt(plan.attemptId))]) {
+      expect(surface).not.toContain("secret-");
+    }
+  });
+
+  it.each([
+    ["absent", async () => caps()],
+    ["false", legacyProbe],
+    ["legacy contract", async () => ({ contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false, supportsPrivateRunConfig: false })],
+    ["rejected probe", async () => { throw new Error("probe down"); }],
+  ])("%s capability keeps the generic envelope and masked top-level bearers", async (_n, probe) => {
+    const { sent, plan } = await run(probe as any);
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    const inputs = sent!.inputs;
+    const decoded = decodeTrustedRunConfig(inputs.run_config);
+    expect(decoded.credentials).toBeUndefined();
+    expect(decoded.runnerCallbackUrl).toBe(CALLBACK_URL);
+    expect(Buffer.from(inputs.run_config, "base64").toString("utf8")).not.toContain("secret-");
+    expect(inputs.run_token).toBe("secret-result");
+    expect(inputs.run_progress_token).toBe("secret-progress");
+    expect(inputs.run_publication_token).toBe("secret-publication");
+    expect(inputs.run_attempt_token).toBe(plan.attemptId);
+  });
+
+  it("fails before dispatch when protected transport is required but unavailable", async () => {
+    const { outcome, t } = await run(legacyProbe, { requiresProtectedTransport: () => true });
+    expect(outcome).toEqual({ status: "unknown" });
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("dispatches protected work over the private path when capable", async () => {
+    const { outcome, t } = await run(privateProbe, { requiresProtectedTransport: () => true });
+    expect(outcome.status).toBe("accepted");
+    expect(t.dispatchCalls).toHaveLength(1);
+  });
+
+  it("never prepares managed credentials on an unprotected workflow", async () => {
+    const prepareManagedLaunch = vi.fn();
+    const { outcome, t } = await run(legacyProbe, { requiresProtectedTransport: () => true, prepareManagedLaunch });
+    expect(outcome).toEqual({ status: "unknown" });
+    expect(prepareManagedLaunch).not.toHaveBeenCalled();
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("does not probe or dispatch on installation mismatch", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials({ installationId: 99 });
+    const t = makeTransport();
+    const probe = vi.fn(privateProbe);
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokens, resolveCapabilities: probe });
+    expect(await worker.launch(await worker.prepare(makeAttempt()))).toEqual({ status: "unknown" });
+    expect(probe).not.toHaveBeenCalled();
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("keeps the private run_config byte-identical through the real optional-input retry", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const api = fakeFetch({ [DISPATCHES]: [UNEXPECTED_ISSUE_IDENTIFIER, dispatchedRun(9101)] }).install();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokens, resolveCapabilities: privateProbe });
+    await worker.launch(await worker.prepare(makeAttempt()));
+    const bodies = dispatchBodies(api.calls);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1].inputs).not.toHaveProperty("issue_identifier");
+    expect(bodies[1].inputs.run_config).toBe(bodies[0].inputs.run_config);
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    expect(decodeTrustedRunConfig(bodies[1].inputs.run_config).credentials?.resultToken).toBe("secret-result");
+    expect(bodies[1].inputs.run_attempt_token).toBe("attempt-1");
+  });
+});
+
+describe("GithubReviewFixWorker.launch", () => {
+  it("adds callback credentials only at dispatch and keeps them out of the outcome", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9002 }));
+    const callbackInputs = vi.fn(async () => ({
+      run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+      runner_callback_url: "https://callback.example/runner",
+    }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs, resolveCapabilities: legacyProbe });
+    const plan = await worker.prepare(makeAttempt());
+    expect(callbackInputs).not.toHaveBeenCalled();
+
+    const outcome = await worker.launch(plan);
+    expect(callbackInputs).toHaveBeenCalledWith(plan.attemptId);
+    const inputs = (t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs;
+    expect(inputs).toEqual(expect.objectContaining({
+      run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+    }));
+    expect(inputs).not.toHaveProperty("runner_callback_url");
+    expect(JSON.stringify(outcome)).not.toContain("secret-");
+  });
+
+  const CALLBACK_URL = "https://callback.example/runner";
+  const tokenInputs = (over: Record<string, unknown> = {}) => async () => ({
+    run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+    runner_callback_url: CALLBACK_URL, ...over,
+  });
+
+  it("carries the callback URL in the envelope and keeps tokens out of the envelope, plan and routing store", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9010 }));
+    const scopeStore = workerModule.inMemoryReviewFixWorkerScopeStore();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokenInputs(), scopeStore, resolveCapabilities: legacyProbe });
+    const plan = await worker.prepare(makeAttempt());
+    const outcome = await worker.launch(plan);
+
+    const inputs = (t.dispatchCalls[0] as { inputs: Record<string, string> }).inputs;
+    const { decodeRunConfig } = await import("../run-config.js");
+    expect(decodeRunConfig(inputs.run_config).runnerCallbackUrl).toBe(CALLBACK_URL);
+    expect(inputs).not.toHaveProperty("runner_callback_url");
+    expect(inputs.run_token).toBe("secret-result");
+    expect(inputs.run_progress_token).toBe("secret-progress");
+    expect(inputs.run_publication_token).toBe("secret-publication");
+    const envelopeText = Buffer.from(inputs.run_config, "base64").toString("utf8");
+    for (const surface of [envelopeText, JSON.stringify(plan), JSON.stringify(outcome), JSON.stringify(await scopeStore.scopeForAttempt(plan.attemptId))]) {
+      expect(surface).not.toContain("secret-");
+    }
+  });
+
+  it("dispatches only inputs declared by the canonical workflow, and the entrypoint reads the envelope field", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9011 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokenInputs(), resolveCapabilities: legacyProbe });
+    await worker.launch(await worker.prepare(makeAttempt()));
+
+    const { parse } = await import("yaml");
+    const root = path.resolve(__dirname, "../..");
+    const workflow = parse(fs.readFileSync(path.join(root, "workflows/claude-implement.yml"), "utf8"));
+    const declared = Object.keys(workflow.on.workflow_dispatch.inputs);
+    const sent = Object.keys((t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs);
+    expect(sent.filter((k) => !declared.includes(k))).toEqual([]);
+
+    const entrypoint = fs.readFileSync(path.join(root, "session/entrypoint.sh"), "utf8");
+    expect(entrypoint).toMatch(/resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl/);
+  });
+
+  it("keeps run_config byte-identical through the real optional-input retry", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const api = fakeFetch({ [DISPATCHES]: [UNEXPECTED_ISSUE_IDENTIFIER, dispatchedRun(9012)] }).install();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokenInputs(), resolveCapabilities: legacyProbe });
+    await worker.launch(await worker.prepare(makeAttempt()));
+    const bodies = dispatchBodies(api.calls);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].inputs).toHaveProperty("issue_identifier");
+    expect(bodies[1].inputs).not.toHaveProperty("issue_identifier");
+    expect(bodies[1].inputs.run_config).toBe(bodies[0].inputs.run_config);
+    const { decodeRunConfig } = await import("../run-config.js");
+    expect(decodeRunConfig(bodies[1].inputs.run_config).runnerCallbackUrl).toBe(CALLBACK_URL);
+    expect(bodies[1].inputs.run_token).toBe("secret-result");
+  });
+
+  it.each([
+    ["callbackInputs rejects", async () => { throw new Error("no credential"); }],
+    ["the URL is missing", tokenInputs({ runner_callback_url: undefined })],
+    ["the URL is empty", tokenInputs({ runner_callback_url: "" })],
+  ])("does not dispatch when %s", async (_name, callbackInputs) => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: callbackInputs as any, resolveCapabilities: legacyProbe });
+    const outcome = await worker.launch(await worker.prepare(makeAttempt()));
+    expect(outcome).toEqual({ status: "unknown" });
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("dispatches once, returns accepted with a run_attempt of 1, and carries no secret fields", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9001, runUrl: "https://github.com/eudoxus/ai-implement/actions/runs/9001" }));
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt());
+    const outcome = await worker.launch(plan);
+
+    expect(outcome).toEqual({ status: "accepted", execution: { backend: "github-actions" as const, githubRunId: 9001, githubRunAttempt: 1 } });
+    expect(t.dispatchCalls).toHaveLength(1);
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    expect(dispatched.inputs.run_attempt_token).toBe(plan.attemptId);
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig.reviewFix).toEqual({
+      version: 1,
+      attemptId: plan.attemptId,
+      installationId: SCOPE.installationId,
+      repository: SCOPE.repository,
+      prNumber: SCOPE.prNumber,
+      deadlineAt: plan.deadlineAt,
+    });
+
+    // No token/header/body secret in the returned outcome.
+    if (outcome.status === "accepted") {
+      expect(Object.keys(outcome)).toEqual(["status", "execution"]);
+      expect(Object.keys(outcome.execution)).toEqual(["backend", "githubRunId", "githubRunAttempt"]);
+    }
+  });
+
+  it("returns rejected with a reason on a definite 4xx", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: false, status: 422, error: "Unprocessable Entity", outcome: "rejected" }));
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt());
+    const outcome = await worker.launch(plan);
+
+    expect(outcome).toEqual({ status: "rejected", reason: "Unprocessable Entity" });
+  });
+
+  it.each([
+    [404, ["github.installation", "github.workflow-default-branch", "github.workflow-mapping-branch"], "dispatch-404"],
+    [403, ["github.permissions"], "dispatch-refused"],
+    [422, [], undefined],
+  ] as const)("logs a %d refusal by status alone, naming the checks behind it for the project and asking for each to run again", async (status, ids, cause) => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: false, status, error: "echo of the request", outcome: "rejected" }));
+    const send = await recordRechecks();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // This file restores no spies between tests.
+    onTestFinished(() => warn.mockRestore());
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.launch(await worker.prepare(makeAttempt()));
+
+    const line = warn.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith("[review-fix] GitHub refused the dispatch"));
+    expect(line).toContain(`HTTP ${status}`);
+    expect(line).not.toContain("echo of the request");
+    for (const id of ids) expect(line).toContain(id);
+    expect(send.mock.calls).toEqual(ids.map((id) => [{ id, project: "AII", cause }]));
+  });
+
+  it("returns unknown when the credential's installation does not match the attempt's scope", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials({ installationId: 999 });
+    const t = makeTransport();
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt());
+    const outcome = await worker.launch(plan);
+
+    expect(outcome).toEqual({ status: "unknown" });
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("forwards the mapping's dependencyTokenScope into the versioned run config when enabled", async () => {
+    seedMapping({ dependencyTokenScope: "installation" });
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9002 }));
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-dep-token" }));
+    await worker.launch(plan);
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig.dependencyTokenScope).toBe("installation");
+  });
+
+  it("carries runnerCallbackUrl in the run config envelope and no token (AII-1273)", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9004 }));
+    const callbackInputs = vi.fn(async () => ({
+      run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+      runner_callback_url: "https://callback.example/runner",
+    }));
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport, callbackInputs, runnerCallbackUrl: "https://callback.example/runner",
+      resolveCapabilities: legacyProbe,
+    });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-cb-url" })));
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const decoded = Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8");
+    expect(JSON.parse(decoded).runnerCallbackUrl).toBe("https://callback.example/runner");
+    for (const token of ["secret-result", "secret-progress", "secret-publication"]) expect(decoded).not.toContain(token);
+  });
+
+  it("sends the resolved runner_image as a top-level input, never in the envelope (AII-1280)", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9010 }));
+    const runnerImage = vi.fn(async () => "ghcr.io/x/runner:next");
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, runnerImage });
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img" })));
+
+    expect(outcome.status).toBe("accepted");
+    expect(runnerImage).toHaveBeenCalledWith({ owner: "eudoxus", repo: "ai-implement", token: "gh-token" });
+    const inputs = (t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs;
+    expect(inputs.runner_image).toBe("ghcr.io/x/runner:next");
+    expect(Buffer.from(inputs.run_config as string, "base64").toString("utf8")).not.toContain("runner_image");
+  });
+
+  it("keeps runner_image alongside callback inputs", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9011 }));
+    const callbackInputs = vi.fn(async () => ({
+      run_token: "a", run_progress_token: "b", run_publication_token: "c", runner_callback_url: "https://callback.example/runner",
+    }));
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport, callbackInputs, runnerImage: async () => "ghcr.io/x/runner:next",
+      resolveCapabilities: legacyProbe,
+    });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img2" })));
+    expect((t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toEqual(expect.objectContaining({
+      runner_image: "ghcr.io/x/runner:next", run_token: "a",
+    }));
+  });
+
+  it("sends no runner_image key when resolution returns undefined", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9012 }));
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport, runnerImage: async () => undefined,
+    });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img3" })));
+    expect("runner_image" in (t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toBe(false);
+  });
+
+  it("launches without runner_image and warns once when resolution throws", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9013 }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const worker = new workerModule.GithubReviewFixWorker({
+        credentials: resolver, transport: t.transport, runnerImage: async () => { throw new Error("registry down"); },
+      });
+      const outcome = await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img4" })));
+      expect(outcome.status).toBe("accepted");
+      expect("runner_image" in (t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("returns rejected, and does not dispatch, when the runner image is refused", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const { RunnerImageNotAllowedError } = await import("../repo-image.js");
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport,
+      runnerImage: async () => { throw new RunnerImageNotAllowedError("evil.example/runner:1", "eudoxus", ["ghcr.io/builddownai/"], "ai-implement"); },
+    });
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img5" })));
+    expect(outcome.status).toBe("rejected");
+    expect((outcome as { reason: string }).reason).toContain("evil.example/runner:1");
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("omits runnerCallbackUrl from the run config when none is configured", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9005 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-no-cb-url" })));
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig).not.toHaveProperty("runnerCallbackUrl");
+  });
+
+  it("stamps the stored retry policy, read at launch time, and defaults when no dep is given", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9010 }));
+    const { DEFAULT_RETRY_POLICY } = await import("../pipeline/retry-backoff.js");
+    const decode = (i: number) => JSON.parse(Buffer.from((t.dispatchCalls[i] as { inputs: Record<string, unknown> }).inputs.run_config as string, "base64").toString("utf8"));
+
+    let policy = { ...DEFAULT_RETRY_POLICY, stageRetries: 7 };
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, retryPolicy: () => policy });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-retry-1" })));
+    expect(decode(0).retryPolicy).toEqual(policy);
+
+    policy = { ...DEFAULT_RETRY_POLICY, stageRetries: 9 };
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-retry-2" })));
+    expect(decode(1).retryPolicy).toEqual(policy);
+
+    const plain = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await plain.launch(await plain.prepare(makeAttempt({ attemptId: "attempt-retry-3" })));
+    expect(decode(2).retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("omits dependencyTokenScope from the run config when the mapping has none set", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9003 }));
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-no-dep-token" }));
+    await worker.launch(plan);
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig.dependencyTokenScope).toBeUndefined();
+  });
+
+  it("carries reviewProcess and trustedReviewAuthors into the run config, and omits them when null", async () => {
+    seedMapping({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["review-bot"] });
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9004 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-review-process" })));
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig.reviewProcess).toBe("claude-code-review");
+    expect(runConfig.trustedReviewAuthors).toEqual(["review-bot"]);
+  });
+
+  it("returns unknown, never throws, when the mapping cannot be resolved", async () => {
+    // The table exists (testDb creates every boot table) but carries no mapping for this repository.
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt());
+    const outcome = await worker.launch(plan);
+
+    expect(outcome).toEqual({ status: "unknown" });
+  });
+});
+
+describe("crash recovery: accepted-then-lost-response never double-launches", () => {
+  it("across a fresh adapter instance, exactly one dispatch POST is made total", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const attempt = makeAttempt({ attemptId: "attempt-crash-1" });
+
+    // The transport "accepts" the dispatch (GitHub genuinely creates the run) but then the
+    // response never reaches the caller — modeling a crash between GitHub's 200 and this
+    // process observing it.
+    t.setDispatchImpl(async () => {
+      t.setServerRuns([{
+        runId: 9100,
+        runAttempt: 1,
+        displayTitle: `Claude AI Implementation — review-fix-${SCOPE.prNumber} · attempt ${attempt.attemptId}`,
+        headBranch: "main",
+      }]);
+      throw new Error("simulated network drop after GitHub accepted");
+    });
+
+    const workerA = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await workerA.prepare(attempt);
+    const launchOutcome = await workerA.launch(plan);
+    expect(launchOutcome).toEqual({ status: "unknown" });
+    expect(t.dispatchCalls).toHaveLength(1);
+
+    // Fresh adapter instance — no shared in-memory state with workerA — reconstructed the
+    // way a process restart would recreate it, sharing only the transport (i.e. GitHub
+    // itself) and the credential resolver.
+    const workerB = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const reconciled = await workerB.reconcile(attempt.attemptId, attempt.scope);
+
+    expect(reconciled).toEqual({ status: "found", execution: { backend: "github-actions" as const, githubRunId: 9100, githubRunAttempt: 1 } });
+    // Still exactly one dispatch call total, across both adapter instances.
+    expect(t.dispatchCalls).toHaveLength(1);
+  });
+});
+
+describe("GithubReviewFixWorker.reconcile", () => {
+  it("never falls back to a fuzzy match: zero candidates stays uncertain", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setServerRuns([]);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const outcome = await worker.reconcile("attempt-x", SCOPE);
+
+    expect(outcome).toEqual({ status: "unknown" });
+  });
+
+  it("never falls back to a fuzzy match: multiple exact candidates stays uncertain", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const attemptId = "attempt-dup";
+    const title = `Claude AI Implementation — review-fix-${SCOPE.prNumber} · attempt ${attemptId}`;
+    t.setServerRuns([
+      { runId: 1, runAttempt: 1, displayTitle: title, headBranch: "main" },
+      { runId: 2, runAttempt: 1, displayTitle: title, headBranch: "main" },
+    ]);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const outcome = await worker.reconcile(attemptId, SCOPE);
+
+    expect(outcome).toEqual({ status: "unknown" });
+  });
+
+  it("rejects a candidate whose branch (ref) does not match, even as the sole other candidate", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const attemptId = "attempt-ref";
+    t.setServerRuns([{
+      runId: 1, runAttempt: 1,
+      displayTitle: `Claude AI Implementation — review-fix-${SCOPE.prNumber} · attempt ${attemptId}`,
+      headBranch: "some-other-branch",
+    }]);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const outcome = await worker.reconcile(attemptId, SCOPE);
+
+    expect(outcome).toEqual({ status: "unknown" });
+  });
+
+  it("never matches a longer attempt id as a substring of a shorter search (exact marker only)", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    // "abc" must not match a run titled for attempt "xabc".
+    t.setServerRuns([{
+      runId: 1, runAttempt: 1,
+      displayTitle: `Claude AI Implementation — review-fix-${SCOPE.prNumber} · attempt xabc`,
+      headBranch: "main",
+    }]);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const outcome = await worker.reconcile("abc", SCOPE);
+
+    expect(outcome).toEqual({ status: "unknown" });
+  });
+
+  it("never fabricates run_attempt 1 for a candidate whose run_attempt is missing — stays uncertain", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const attemptId = "attempt-no-run-attempt";
+    t.setServerRuns([{
+      runId: 1, runAttempt: null,
+      displayTitle: `Claude AI Implementation — review-fix-${SCOPE.prNumber} · attempt ${attemptId}`,
+      headBranch: "main",
+    }]);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const outcome = await worker.reconcile(attemptId, SCOPE);
+
+    expect(outcome).toEqual({ status: "unknown" });
+  });
+
+  it("returns unknown when the credential's installation does not match", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials({ installationId: 999 });
+    const t = makeTransport();
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const outcome = await worker.reconcile("attempt-x", SCOPE);
+
+    expect(outcome).toEqual({ status: "unknown" });
+  });
+});
+
+describe("GithubReviewFixWorker.cancel", () => {
+  it("is not terminal evidence: a 202/409-style acknowledgement reports cancelled, not a terminal outcome", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setCancelResult(true);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.prepare(makeAttempt({ attemptId: "attempt-cancel" }));
+    const outcome = await worker.cancel("attempt-cancel", { backend: "github-actions" as const, githubRunId: 5, githubRunAttempt: 1 });
+
+    expect(outcome).toEqual({ status: "cancelled" });
+    expect(t.cancelCalls).toHaveLength(1);
+  });
+
+  it("returns unknown when there is no route to the owning repo (fresh adapter, never saw this attempt)", async () => {
+    seedMapping();
+    const { resolver, calls } = makeCredentials();
+    const t = makeTransport();
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const outcome = await worker.cancel("never-seen", { backend: "github-actions" as const, githubRunId: 5, githubRunAttempt: 1 });
+
+    expect(outcome).toEqual({ status: "unknown" });
+    expect(calls).toHaveLength(0); // no wasted credential fetch when the scope can't be resolved
+    expect(t.cancelCalls).toHaveLength(0);
+  });
+});
+
+describe("GithubReviewFixWorker.inspectTerminal", () => {
+  it("returns reached:false with no credential fetch when the execution was never bound in this process", async () => {
+    seedMapping();
+    const { resolver, calls } = makeCredentials();
+    const t = makeTransport();
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 42, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("is not reached while GitHub still reports in_progress, even mid-cancellation", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setServerRuns([{
+      runId: 7001, runAttempt: 1,
+      displayTitle: "Claude AI Implementation — review-fix-42 · attempt attempt-poll",
+      headBranch: "main",
+    }]);
+    t.setRunDetail({ status: "in_progress", conclusion: null, runAttempt: 1 });
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.reconcile("attempt-poll", SCOPE);
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 7001, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
+  });
+
+  it("reports a confirmed terminal success with the PR's current head, not the run's dispatch-time head_sha", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const publishedSha = "a".repeat(40);
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8001 }));
+    // The run's own record carries no head_sha field at all now — outputCommit must come
+    // exclusively from a live PR read, never from anything reported by getRun.
+    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: 1 });
+    t.setPullRequestHeadSha(publishedSha);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-success" }));
+    await worker.launch(plan);
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8001, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: true, outcome: { status: "succeeded", outputCommit: publishedSha } });
+    expect(t.pullRequestHeadShaCalls).toHaveLength(1);
+    expect(t.pullRequestHeadShaCalls[0]).toMatchObject({ prNumber: SCOPE.prNumber });
+  });
+
+  it("does not report succeeded when the PR's head cannot be read", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8005 }));
+    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: 1 });
+    t.setPullRequestHeadSha(null);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-unreadable-head" }));
+    await worker.launch(plan);
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8005, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
+  });
+
+  it("reports confirmed cancelled only once the backend itself is terminal", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8002 }));
+    t.setRunDetail({ status: "completed", conclusion: "cancelled", runAttempt: 1 });
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-cancelled" }));
+    await worker.launch(plan);
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8002, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: true, outcome: { status: "cancelled" } });
+    // No PR read for a non-success conclusion.
+    expect(t.pullRequestHeadShaCalls).toHaveLength(0);
+  });
+
+  it("reports failed with a reason for any other conclusion", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8003 }));
+    t.setRunDetail({ status: "completed", conclusion: "failure", runAttempt: 1 });
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-failed" }));
+    await worker.launch(plan);
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8003, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: true, outcome: { status: "failed", reason: "failure" } });
+  });
+
+  it("does not conflate a different run attempt reaching terminal with the bound attempt", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8004 }));
+    // GitHub reports a *different* run_attempt (e.g. a manual re-run) as terminal.
+    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: 2 });
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-wrong-run-attempt" }));
+    await worker.launch(plan);
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8004, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
+  });
+
+  it("never fabricates run_attempt 1 when GitHub's run detail omits it — stays not reached", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8006 }));
+    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: null });
+    t.setPullRequestHeadSha("c".repeat(40));
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-missing-run-attempt" }));
+    await worker.launch(plan);
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8006, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
+  });
+});
+
+describe("durable scope lookup: cancel/inspectTerminal after a genuine adapter+store reconstruction", () => {
+  it("accepted launch -> persisted attempt record -> fresh SqliteReviewFixAttemptStore instance and fresh adapter, sharing no JS object -> terminal inspection and cancellation resolve scope from disk", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9200 }));
+
+    // The workflow's own persistence, standing in for `src/restate/review-fix-attempt.ts`
+    // (not landed): `admit` writes the attempt snapshot (attemptId -> scope) and
+    // `bindExecution` later writes the bound execution (execution -> scope) into the same
+    // SQLite row `review_fix_attempts`. Neither call is made by `GithubReviewFixWorker`
+    // itself — the worker only reads through the injected scope store.
+    const storeA = new attemptStoreModule.SqliteReviewFixAttemptStore();
+    const admission = await storeA.admit({
+      scope: SCOPE,
+      feedback: { taskText: "Address the reported findings", findings: [{ findingKey: "finding-1", version: 1 }] },
+      jobTimeoutMinutes: 90,
+    });
+    if (admission.status !== "prepared") throw new Error(`expected admission to prepare, got ${admission.status}`);
+    const attemptId = admission.attempt.attemptId;
+
+    const workerA = new workerModule.GithubReviewFixWorker({
+      credentials: resolver,
+      transport: t.transport,
+      scopeStore: workerModule.reviewFixAttemptStoreScopeStore(storeA),
+    });
+    const plan = await workerA.prepare(admission.attempt);
+    const launchOutcome = await workerA.launch(plan);
+    expect(launchOutcome).toEqual({ status: "accepted", execution: { backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 } });
+
+    // The workflow binds the accepted execution to the persisted attempt row — the fact this
+    // reconstruction test relies on to resolve scope with no shared in-memory state.
+    const bindOutcome = await storeA.bindExecution(attemptId, { backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 }, Date.now());
+    expect(bindOutcome).toEqual({ status: "bound" });
+
+    // A genuinely fresh store instance and a genuinely fresh adapter — the only thing shared
+    // with workerA/storeA is the on-disk SQLite file (via the process-wide getDb() singleton),
+    // exactly as a process restart would leave it. No in-memory Map is shared.
+    const storeC = new attemptStoreModule.SqliteReviewFixAttemptStore();
+    const workerC = new workerModule.GithubReviewFixWorker({
+      credentials: resolver,
+      transport: t.transport,
+      scopeStore: workerModule.reviewFixAttemptStoreScopeStore(storeC),
+    });
+
+    t.setRunDetail({ status: "in_progress", conclusion: null, runAttempt: 1 });
+    const midInspection = await workerC.inspectTerminal({ backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 });
+    expect(midInspection).toEqual({ reached: false });
+
+    const cancelOutcome = await workerC.cancel(attemptId, { backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 });
+    expect(cancelOutcome).toEqual({ status: "cancelled" });
+    expect(t.cancelCalls).toHaveLength(1);
+    // A cancellation acknowledgement is not terminal evidence — only a subsequent getRun
+    // reporting "completed" may report a terminal outcome.
+    const stillNotTerminal = await workerC.inspectTerminal({ backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 });
+    expect(stillNotTerminal).toEqual({ reached: false });
+
+    t.setRunDetail({ status: "completed", conclusion: "cancelled", runAttempt: 1 });
+    const terminalInspection = await workerC.inspectTerminal({ backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 });
+    expect(terminalInspection).toEqual({ reached: true, outcome: { status: "cancelled" } });
+  });
+
+  it("scopeForExecution finds no route for an execution the store never bound (fresh store instance, no fabricated scope)", async () => {
+    seedMapping();
+    const { resolver, calls } = makeCredentials();
+    const t = makeTransport();
+    const store = new attemptStoreModule.SqliteReviewFixAttemptStore();
+
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver,
+      transport: t.transport,
+      scopeStore: workerModule.reviewFixAttemptStoreScopeStore(store),
+    });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 12345, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("frozen execution backend", () => {
+  it.each([undefined, "github-actions", "fly-machines", "local-docker"] as const)("preserves %s without consulting current runner mode", async (executionBackend) => {
+    const { resolver, calls } = makeCredentials();
+    const transport = makeTransport();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: transport.transport });
+    const plan = await worker.prepare(makeAttempt({ executionBackend }));
+    expect(plan.executionBackend).toBe(executionBackend ?? "github-actions");
+    if (executionBackend && executionBackend !== "github-actions") {
+      expect((await worker.launch(plan)).status).toBe("rejected");
+      expect(calls).toHaveLength(0);
+      expect(transport.dispatchCalls).toHaveLength(0);
+    }
+  });
+});
+
+describe("backend router", () => {
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("delegates %s with identical arguments and persisted reconciliation", async backend => {
+    const fake = () => ({ prepare: vi.fn(), launch: vi.fn(), reconcile: vi.fn(), inspectTerminal: vi.fn(), cancel: vi.fn() });
+    const workers = { "github-actions": fake(), "fly-machines": fake(), "local-docker": fake() };
+    const selected = workers[backend];
+    const source = { getPreparedAttempt: vi.fn().mockResolvedValue({ executionBackend: backend }) };
+    const router = new workerModule.ReviewFixWorker(workers, source);
+    const attempt = makeAttempt({ executionBackend: backend });
+    const plan = { executionBackend: backend, attemptId: attempt.attemptId, scope: attempt.scope, taskText: attempt.taskText, deadlineAt: attempt.deadlineAt };
+    const execution = backend === "github-actions" ? { backend, githubRunId: 42, githubRunAttempt: 1 } as const : { backend, runRef: "machine" } as const;
+    await router.prepare(attempt);
+    await router.launch(plan);
+    await router.reconcile(attempt.attemptId, attempt.scope);
+    await router.inspectTerminal(execution);
+    await router.cancel(attempt.attemptId, execution);
+    expect(selected.prepare).toHaveBeenCalledWith(attempt);
+    expect(selected.launch.mock.calls[0][0]).toBe(plan);
+    expect(selected.reconcile).toHaveBeenCalledWith(attempt.attemptId, attempt.scope);
+    expect(selected.inspectTerminal).toHaveBeenCalledWith(execution);
+    expect(selected.cancel).toHaveBeenCalledWith(attempt.attemptId, execution);
+    for (const [key, worker] of Object.entries(workers)) if (key !== backend) expect(worker.launch).not.toHaveBeenCalled();
+  });
+  it("does not guess a backend for a missing persisted attempt", async () => {
+    const worker = { prepare: vi.fn(), launch: vi.fn(), reconcile: vi.fn(), inspectTerminal: vi.fn(), cancel: vi.fn() };
+    const router = new workerModule.ReviewFixWorker({ "github-actions": worker, "fly-machines": worker, "local-docker": worker }, { getPreparedAttempt: async () => null });
+    expect(await router.reconcile("missing", SCOPE)).toEqual({ status: "unknown" });
+    expect(worker.reconcile).not.toHaveBeenCalled();
+  });
+});

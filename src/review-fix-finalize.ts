@@ -1,0 +1,350 @@
+/**
+ * Production finalization for the Restate review-fix pilot (AII-769/AII-790):
+ * the single authority that turns a runner's reported outcome into an
+ * immutable per-attempt verdict and, when every gate holds, one idempotent
+ * approval effect — outside SDK/runner code, against AII-829's injectable
+ * ports (`src/review-fix-ports.ts`) rather than a live `TicketingProvider`.
+ * Pattern anchor: `src/runner-callback.ts`'s `handleRunnerResult` (validate →
+ * check authority/head-sha → apply dispositions → call injected adapters),
+ * moved into a standalone module and widened per this issue's stricter bar
+ * (a live PR-head-SHA check against the GitHub adapter, not the dispatch
+ * snapshot `handleRunnerResult` trusts).
+ *
+ * Two layers:
+ *  - `createReviewFixFinalizer` is the production `ReviewFixFinalizerPort`:
+ *    `recordOutcome` delegates straight to the attempt repository's
+ *    write-once column (AII-785); `applyApproval` enforces the three gates a
+ *    single evidence object can carry (authority, head-sha-equals-output,
+ *    policy) and then calls the GitHub effect. At-most-once comes from the
+ *    workflow's journaled `apply-approval-once` step plus the adapter's upsert,
+ *    not from a second bookkeeping layer here.
+ *  - `finalizeReviewFixAttempt` is the orchestration a caller (the future
+ *    Restate workflow, AII-796 — not this issue) uses. When the backend is
+ *    confirmed terminal it records the immutable verdict *before* any
+ *    approval effect for this call may be attempted — a previously recorded,
+ *    incompatible verdict (e.g. `failed`/`cancelled` from an earlier call)
+ *    withholds approval outright rather than racing behind it. It then binds
+ *    approval to the attempt repository's durably accepted result (never the
+ *    caller's `input.result` directly, since a racing result can be rejected
+ *    as a conflict without displacing the one actually accepted), gathers
+ *    the remaining evidence `applyApproval` needs (current authority, live PR
+ *    head SHA, merge policy, and — the fourth gate the port cannot check
+ *    itself since it never sees the admitted snapshot — that every finding in
+ *    that snapshot has an explicit disposition), re-checks the conflict
+ *    marker immediately before invoking the effect to close the window that
+ *    evidence-gathering opened, revokes authority up front on cancellation,
+ *    and releases the attempt's exact owner only once backend termination is
+ *    positively confirmed. This module owns no clock and no polling loop; it
+ *    is a pure decision given the caller's evidence plus what the attempt
+ *    repository has durably recorded.
+ */
+import type {
+  AttemptId,
+  ReviewFixResultMetadataV1,
+  ResultIntakeOutcome,
+  ScopedPrIdentity,
+} from "./review-fix-contract.js";
+import type {
+  ApprovalEffectOutcome,
+  PreparedReviewFixAttempt,
+  RecordOutcomeResult,
+  ReviewFixApprovalInput,
+  ReviewFixAttemptStorePort,
+  ReviewFixFinalizerPort,
+  ReviewFixFindingDisposition,
+  ReviewFixImmutableOutcome,
+  ReviewFixReleaseOutcome,
+  WorkerTerminalInspection,
+} from "./review-fix-ports.js";
+
+// ---------------------------------------------------------------------------
+// Injected adapters
+// ---------------------------------------------------------------------------
+
+/**
+ * The GitHub-side capabilities finalization needs. Every method is scoped to
+ * one PR and carries no credential — the caller (a production wiring, not
+ * this module) resolves the installation token. `applyApprovalEffect` is
+ * called at most once per attempt under normal operation (see
+ * `createReviewFixFinalizer`), but a caller recovering from a crash between
+ * "effect applied" and "acknowledged" may call it again for the same
+ * attempt; implementations should make the underlying write safe to repeat
+ * (e.g. an upsert keyed by a stable marker, mirroring
+ * `github.ts#postOrUpdateStickyComment`).
+ */
+export interface ReviewFixGitHubAdapter {
+  /** The PR's current HEAD commit SHA, or `null` if the PR or installation is unreachable. */
+  getPrHeadSha(scope: ScopedPrIdentity): Promise<string | null>;
+  /** Whether the repo's existing review/merge policy (required reviews, CI gates, etc.)
+   *  independently allows this PR to proceed. Backend/result success is never sufficient alone. */
+  evaluateMergePolicy(scope: ScopedPrIdentity, dispositions: readonly ReviewFixFindingDisposition[]): Promise<boolean>;
+  /** Applies the approval effect (e.g. an approving review or a sticky summary comment). */
+  applyApprovalEffect(
+    scope: ScopedPrIdentity,
+    attemptId: AttemptId,
+    result: ReviewFixResultMetadataV1,
+    dispositions: readonly ReviewFixFindingDisposition[],
+  ): Promise<void>;
+}
+
+/**
+ * The narrow tracker capability finalization needs: an operator-visible notice for the two
+ * cases this module cannot resolve on its own (backend termination that cannot be verified,
+ * a stale/conflicting result arriving after the attempt's outcome is already final — see
+ * `reviewFixResultAlertReason`). Never called on the ordinary approve/withhold path.
+ */
+export interface ReviewFixTrackerAdapter {
+  notifyOperator(scope: ScopedPrIdentity, attemptId: AttemptId, message: string): Promise<void>;
+}
+
+/**
+ * The attempt-repository surface finalization needs: the full `ReviewFixAttemptStorePort`
+ * (AII-829) plus `recordOutcome`, which `SqliteReviewFixAttemptStore` (AII-785) already
+ * exposes beyond that port's strict shape specifically for this issue to use.
+ */
+export interface ReviewFixFinalizeAttemptStore extends ReviewFixAttemptStorePort {
+  recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult>;
+  /** The persisted accepted result and conflict marker `finalizeReviewFixAttempt` binds approval
+   *  to — see `SqliteReviewFixAttemptStore.getAcceptedResult`. */
+  getAcceptedResult(attemptId: AttemptId): Promise<ReviewFixAcceptedResultView | null>;
+  /** The attempt's immutable terminal verdict, or `null` if none has been recorded yet — a
+   *  read-only peek at what `recordOutcome` has durably written, never itself writing. Lets a caller withhold when a since-recorded verdict is incompatible with
+   *  approval — see `SqliteReviewFixAttemptStore.getRecordedOutcome`. */
+  getRecordedOutcome(attemptId: AttemptId): Promise<ReviewFixImmutableOutcome | null>;
+}
+
+/** `result` is the durably accepted result for the attempt, or `null` if none has been accepted
+ *  yet. `hasConflict` is `true` once any racing result has ever been rejected against this
+ *  attempt (`result_conflict_at`), independent of whether `result` itself is set — a conflict
+ *  must withhold approval even though the originally accepted result was never displaced. */
+export interface ReviewFixAcceptedResultView {
+  readonly result: ReviewFixResultMetadataV1 | null;
+  readonly hasConflict: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// ReviewFixFinalizerPort production implementation
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the production `ReviewFixFinalizerPort`. `recordOutcome` is a direct pass-through to
+ * the attempt repository's write-once column. `applyApproval` enforces the three gates it can
+ * check from `ReviewFixApprovalInput` alone (current authority, head-sha-equals-output, policy)
+ * — the fourth gate ("explicit finding dispositions", which requires the admitted snapshot this
+ * port never sees) is the caller's obligation; see `finalizeReviewFixAttempt`.
+ */
+export function createReviewFixFinalizer(deps: {
+  attemptStore: ReviewFixFinalizeAttemptStore;
+  github: ReviewFixGitHubAdapter;
+}): ReviewFixFinalizerPort {
+  return {
+    async recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult> {
+      return deps.attemptStore.recordOutcome(outcome, now);
+    },
+
+    async applyApproval(input: ReviewFixApprovalInput): Promise<ApprovalEffectOutcome> {
+      if (!input.currentAuthority) {
+        return { status: "withheld", reason: "attempt does not currently hold approval authority" };
+      }
+      if (input.currentPrHeadSha !== input.result.outputCommit) {
+        return {
+          status: "withheld",
+          reason: `PR head sha ${input.currentPrHeadSha || "(unknown)"} does not match result outputCommit ${input.result.outputCommit}`,
+        };
+      }
+      if (!input.policyAllows) {
+        return { status: "withheld", reason: "review/merge policy does not allow this PR to proceed" };
+      }
+
+      const effectId = `${input.attemptId}.approval`;
+      await deps.github.applyApprovalEffect(input.scope, input.attemptId, input.result, input.findingDispositions);
+      return { status: "applied", effectId };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration: gathers evidence, enforces the fourth gate, releases owner
+// ---------------------------------------------------------------------------
+
+function findingsFullyDisposed(
+  attempt: PreparedReviewFixAttempt,
+  dispositions: readonly ReviewFixFindingDisposition[],
+): boolean {
+  const required = new Set(attempt.findings.map((f) => f.findingKey));
+  const given = new Set(dispositions.map((d) => d.findingKey));
+  if (required.size !== given.size) return false;
+  for (const key of required) if (!given.has(key)) return false;
+  return true;
+}
+
+export interface ReviewFixFinalizeDeps {
+  readonly attemptStore: ReviewFixFinalizeAttemptStore;
+  readonly finalizer: ReviewFixFinalizerPort;
+  readonly github: ReviewFixGitHubAdapter;
+  readonly tracker: ReviewFixTrackerAdapter;
+}
+
+export interface ReviewFixFinalizeInput {
+  readonly attemptId: AttemptId;
+  /** The accepted runner result, when the attempt has one. `null` covers "the backend reported
+   *  success (or the deadline passed) without the orchestrator ever accepting a valid result" —
+   *  that case must never approve, and passing `null` here is how a caller guarantees it: this
+   *  function never calls `applyApproval` when `result` is absent. */
+  readonly result: ReviewFixResultMetadataV1 | null;
+  /** Dispositions for every finding in the attempt's admitted snapshot. Ignored when `result`
+   *  is `null`. Checked for full coverage of `attempt.findings` before any gate the finalizer
+   *  itself evaluates — a partial or empty set (when the snapshot has findings) withholds
+   *  approval without calling the GitHub adapter. */
+  readonly findingDispositions: readonly ReviewFixFindingDisposition[];
+  /** Whether the worker backend has reached a terminal state, and with what outcome. `reached:
+   *  false` means occupancy is retained and neither `recordOutcome` nor `releaseOwner` runs —
+   *  "a final result never releases a still-running backend." */
+  readonly terminal: WorkerTerminalInspection;
+  /** Meaningful only when `terminal.reached` is `false`: whether that "not yet terminal"
+   *  observation is itself trustworthy. `false` means the termination check was inconclusive
+   *  (not proof the backend is still running) — occupancy is kept and the tracker adapter is
+   *  notified that operator action is required, rather than silently waiting. */
+  readonly terminationVerifiable: boolean;
+  /** Set to revoke approval authority before evaluating the approval gate — cancel, a closed
+   *  PR (map to `"cancelled"`), or the admission deadline passing. Revocation is idempotent and
+   *  always applied before the authority gate is read, so a late-arriving result can never sneak
+   *  past it. Also supplies the release reason once backend termination is confirmed. */
+  readonly revoke: { readonly reason: "cancelled" | "deadline_exceeded" } | null;
+}
+
+export interface ReviewFixFinalizeOutcome {
+  readonly approval: ApprovalEffectOutcome | null;
+  readonly recordedOutcome: RecordOutcomeResult | null;
+  readonly release: ReviewFixReleaseOutcome | null;
+  readonly operatorActionRequired: boolean;
+}
+
+/**
+ * Applies one attempt's finalization decision: evaluates approval (when a result is present),
+ * then — only once the backend's termination is positively confirmed — records the immutable
+ * outcome and releases the attempt's exact owner. Every step is safe to call again with the
+ * same input: `applyApproval` and `recordOutcome` are idempotent per `ReviewFixFinalizerPort`'s
+ * contract, and `releaseOwner` reports `not_owner` rather than double-releasing.
+ */
+export async function finalizeReviewFixAttempt(
+  deps: ReviewFixFinalizeDeps,
+  input: ReviewFixFinalizeInput,
+): Promise<ReviewFixFinalizeOutcome> {
+  const attempt = await deps.attemptStore.getPreparedAttempt(input.attemptId);
+  if (!attempt) {
+    return {
+      approval: { status: "withheld", reason: "unknown attempt" },
+      recordedOutcome: null,
+      release: null,
+      operatorActionRequired: false,
+    };
+  }
+
+  if (input.revoke) {
+    await deps.attemptStore.revokeAuthority(input.attemptId, Date.now());
+  }
+
+  // Establish the immutable verdict — when the backend is confirmed terminal — before any
+  // approval effect for this call may be applied. `already_recorded` means some earlier call
+  // already decided this attempt's fate; that stored verdict, not this call's own observation,
+  // is authoritative for whether approval may even be attempted below.
+  let recordedOutcome: RecordOutcomeResult | null = null;
+  if (input.terminal.reached) {
+    recordedOutcome = await deps.finalizer.recordOutcome({
+      attemptId: input.attemptId,
+      scope: attempt.scope,
+      terminal: input.terminal.outcome,
+    }, Date.now());
+  }
+  const authoritativeTerminal =
+    recordedOutcome?.status === "already_recorded"
+      ? recordedOutcome.outcome.terminal
+      : input.terminal.reached
+        ? input.terminal.outcome
+        : null;
+
+  let approval: ApprovalEffectOutcome | null = null;
+  if (input.result) {
+    if (authoritativeTerminal && authoritativeTerminal.status !== "succeeded") {
+      approval = {
+        status: "withheld",
+        reason: `attempt's recorded terminal outcome is '${authoritativeTerminal.status}', not 'succeeded'`,
+      };
+    } else if (!findingsFullyDisposed(attempt, input.findingDispositions)) {
+      approval = { status: "withheld", reason: "finding dispositions do not cover every finding in the admitted snapshot" };
+    } else {
+      // Bind to the durably accepted result rather than trusting the caller's `input.result`
+      // directly — a racing result can be rejected as a conflict without ever displacing the
+      // one actually accepted, and a conflict on record must withhold regardless of which
+      // result the caller happened to pass in.
+      const accepted = await deps.attemptStore.getAcceptedResult(input.attemptId);
+      if (!accepted || !accepted.result || accepted.hasConflict) {
+        approval = {
+          status: "withheld",
+          reason: accepted?.hasConflict
+            ? "a conflicting result has been recorded for this attempt; reconcile before approving"
+            : "no accepted result is on record for this attempt",
+        };
+      } else {
+        const currentAuthority = await deps.attemptStore.hasCurrentAuthority(input.attemptId);
+        const currentPrHeadSha = (await deps.github.getPrHeadSha(attempt.scope)) ?? "";
+        const policyAllows =
+          currentAuthority && currentPrHeadSha === accepted.result.outputCommit
+            ? await deps.github.evaluateMergePolicy(attempt.scope, input.findingDispositions)
+            : false;
+
+        // Re-read the conflict marker immediately before applying the effect, closing the
+        // window between the evidence gathered above and this decision: a conflict recorded
+        // while that evidence was being gathered must still block approval here.
+        const final = await deps.attemptStore.getAcceptedResult(input.attemptId);
+        if (!final || !final.result || final.hasConflict) {
+          approval = { status: "withheld", reason: "a conflicting result was recorded before the final approval decision" };
+        } else {
+          approval = await deps.finalizer.applyApproval({
+            attemptId: input.attemptId,
+            scope: attempt.scope,
+            result: final.result,
+            currentAuthority,
+            currentPrHeadSha,
+            findingDispositions: input.findingDispositions,
+            policyAllows,
+          });
+        }
+      }
+    }
+  }
+
+  if (!input.terminal.reached) {
+    if (!input.terminationVerifiable) {
+      await deps.tracker.notifyOperator(
+        attempt.scope,
+        input.attemptId,
+        "review-fix attempt backend termination could not be verified; operator action required",
+      );
+    }
+    return { approval, recordedOutcome: null, release: null, operatorActionRequired: !input.terminationVerifiable };
+  }
+
+  const release: ReviewFixReleaseOutcome = await deps.attemptStore.releaseOwner(
+    attempt.owner,
+    input.revoke?.reason ?? "finalized",
+  );
+
+  return { approval, recordedOutcome, release, operatorActionRequired: false };
+}
+
+// ---------------------------------------------------------------------------
+// Post-final result alerting (pure helper — the caller wires it to notifyOperator)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a result-intake outcome (from `ReviewFixAttemptStorePort.recordResult`) should raise
+ * an operator alert rather than being silently absorbed: `conflict` (a second, different result
+ * for an attempt) and `stale` (a result for an attempt whose outcome is already final, or that
+ * has been superseded) both qualify — `stored` and `duplicate` do not. Returns the reason to
+ * surface, or `null` when no alert is warranted. Pure; the caller decides whether/how to notify.
+ */
+export function reviewFixResultAlertReason(outcome: ResultIntakeOutcome): string | null {
+  return outcome.status === "conflict" || outcome.status === "stale" ? outcome.reason : null;
+}

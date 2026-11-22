@@ -1,11 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as DepTokenModule from "../dependency-token-vending.js";
 import type { RepoMapping } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
+import { recordRechecks } from "./helpers/fixtures/setup-checks.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -14,71 +13,46 @@ vi.mock("../github-app-auth.js", () => ({
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 let depToken: typeof DepTokenModule;
 let mockGetScopedToken: ReturnType<typeof vi.fn>;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `dep-token-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerTokens = await import("../runner-tokens.js");
-  depToken = await import("../dependency-token-vending.js");
-  const ghAuth = await import("../github-app-auth.js");
-  mockGetScopedToken = vi.mocked(ghAuth.getScopedInstallationToken);
-  dedup.getDb();
+  const { modules } = await testDb({
+    modules: {
+      runnerTokens: () => import("../runner-tokens.js"),
+      depToken: () => import("../dependency-token-vending.js"),
+      ghAuth: () => import("../github-app-auth.js"),
+    },
+  });
+  ({ runnerTokens, depToken } = modules);
+  mockGetScopedToken = vi.mocked(modules.ghAuth.getScopedInstallationToken);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "acme/app",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: "installation",
-    ...overrides,
-  };
-}
+const mapping = (overrides: Partial<RepoMapping> = {}) =>
+  makeMapping({ owner: "acme", dependencyTokenScope: "installation", ...overrides });
 
 function mintProgressToken(mappingTeamKey = "ENG"): string {
   const { token } = runnerTokens.mintRunToken({
     issueId: "issue-1",
     mappingTeamKey,
     phase: "implementation",
+    audience: "progress",
+    ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+    secret: SECRET,
+  });
+  return token;
+}
+
+function mintKgRefreshProgressToken(mappingTeamKey = "KGA"): string {
+  const { token } = runnerTokens.mintRunToken({
+    issueId: "kg-refresh",
+    mappingTeamKey,
+    phase: "kg-refresh",
     audience: "progress",
     ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
     secret: SECRET,
@@ -95,7 +69,7 @@ async function callHandler(opts: {
     secret: SECRET,
     githubAppId: "app-id",
     githubAppPrivateKey: "fake-key",
-    resolveMapping: opts.resolveMapping ?? (() => makeMapping()),
+    resolveMapping: opts.resolveMapping ?? (() => mapping()),
   });
 }
 
@@ -112,7 +86,7 @@ describe("handleDependencyTokenRequest", () => {
     expect(result.body.expires_at).toBe(realExpiry);
   });
 
-  it("force-mints with { contents: 'read' } permissions and no repositories field", async () => {
+  it("force-mints with { contents: 'read', pull_requests: 'read' } permissions and no repositories field", async () => {
     const token = mintProgressToken();
     mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_token", expiresAt: "2030-01-01T00:00:00Z" });
 
@@ -122,7 +96,7 @@ describe("handleDependencyTokenRequest", () => {
       "app-id",
       "fake-key",
       "acme",
-      { permissions: { contents: "read" }, forceRefresh: true },
+      { permissions: { contents: "read", pull_requests: "read" }, forceRefresh: true },
     );
     const opts = mockGetScopedToken.mock.calls[0][3] as Record<string, unknown>;
     expect(opts).not.toHaveProperty("repositories");
@@ -134,7 +108,7 @@ describe("handleDependencyTokenRequest", () => {
 
     await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ owner: "real-owner" }),
+      resolveMapping: () => mapping({ owner: "real-owner" }),
     });
 
     expect(mockGetScopedToken).toHaveBeenCalledWith(
@@ -237,7 +211,7 @@ describe("handleDependencyTokenRequest", () => {
 
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ dependencyTokenScope: null }),
+      resolveMapping: () => mapping({ dependencyTokenScope: null }),
     });
 
     expect(result.status).toBe(403);
@@ -263,7 +237,7 @@ describe("handleDependencyTokenRequest", () => {
       callHandler({ authorization: "Bearer bad.token" }),
       callHandler({ authorization: `Bearer ${resultToken}` }),
       callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => undefined }),
-      callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => makeMapping({ dependencyTokenScope: null }) }),
+      callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => mapping({ dependencyTokenScope: null }) }),
     ]);
 
     for (const result of cases) {
@@ -280,13 +254,65 @@ describe("handleDependencyTokenRequest", () => {
     expect(result.status).toBe(500);
   });
 
+  it("names the checks behind a GitHub App error in its line and asks for them to run again for the project", async () => {
+    const { GitHubApiError } = await import("../github-errors.js");
+    const send = await recordRechecks();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockGetScopedToken.mockRejectedValueOnce(new GitHubApiError({ status: 401, path: "/app/installations/1/access_tokens" }));
+    expect((await callHandler({ authorization: `Bearer ${mintProgressToken()}` })).status).toBe(500);
+    expect(send.mock.calls).toEqual([
+      [{ id: "github.app-identity", project: "ENG", cause: "token-vending" }],
+      [{ id: "github.clock", project: "ENG", cause: "token-vending" }],
+    ]);
+    expect(String(error.mock.calls[0]?.[0])).toContain("github.app-identity");
+  });
+
   it("token value does not appear in 403 error body", async () => {
     const token = mintProgressToken();
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ dependencyTokenScope: null }),
+      resolveMapping: () => mapping({ dependencyTokenScope: null }),
     });
 
     expect(JSON.stringify(result.body)).not.toContain(token);
+  });
+
+  describe("kg-refresh phase tokens", () => {
+    it("returns 200 when kg-refresh progress token carries real team key and mapping has scope=installation", async () => {
+      const token = mintKgRefreshProgressToken("KGA");
+      mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_kg_token", expiresAt: "2030-01-01T00:00:00Z" });
+
+      const result = await callHandler({
+        authorization: `Bearer ${token}`,
+        resolveMapping: () => mapping({ dependencyTokenScope: "installation" }),
+      });
+
+      expect(result.status).toBe(200);
+      expect(result.body.token).toBe("ghs_kg_token");
+    });
+
+    it("returns 403 when kg-refresh progress token carries real team key but mapping has scope=null", async () => {
+      const token = mintKgRefreshProgressToken("KGA");
+
+      const result = await callHandler({
+        authorization: `Bearer ${token}`,
+        resolveMapping: () => mapping({ dependencyTokenScope: null }),
+      });
+
+      expect(result.status).toBe(403);
+      expect(result.body).toEqual({ error: "Unauthorized" });
+    });
+
+    it("returns 403 when kg-refresh progress token resolves to no mapping", async () => {
+      const token = mintKgRefreshProgressToken("KGA");
+
+      const result = await callHandler({
+        authorization: `Bearer ${token}`,
+        resolveMapping: () => undefined,
+      });
+
+      expect(result.status).toBe(403);
+      expect(result.body).toEqual({ error: "Unauthorized" });
+    });
   });
 });

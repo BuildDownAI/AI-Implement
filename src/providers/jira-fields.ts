@@ -3,21 +3,36 @@ import type { JiraClient } from "./jira-client.js";
 export const STATUS_FIELD_NAME = "AI-Implement Status";
 export const REPO_FIELD_NAME = "AI-Implement Repo";
 export const PROFILES_FIELD_NAME = "AI-Implement Profiles";
+export const BASE_BRANCH_FIELD_NAME = "AI-Implement Base Branch";
 
 export interface ResolvedFieldIds {
   statusFieldId: string;
   repoFieldId: string;
   /** Classic-project "Epic Link" custom field, when the instance has one. Best-effort:
    *  absent on next-gen/team-managed projects (which use the native parent field) and
-   *  when all three overrides short-circuit the listFields call. */
+   *  when all four overrides short-circuit the listFields call. */
   epicLinkFieldId?: string;
   profilesFieldId: string | null;
+  /** "AI-Implement Base Branch" text field id. null when the field is absent or ambiguous
+   *  (feature inactive, not an error). */
+  baseBranchFieldId: string | null;
 }
 
-interface OverrideOptions {
+/** A required field that matches no field or several by name, so the poll cannot read its project. */
+export class JiraFieldResolutionError extends Error {
+  constructor(readonly fieldName: string, readonly fault: "missing" | "duplicate") {
+    super(fault === "missing"
+      ? `Custom field "${fieldName}" not found in Jira instance`
+      : `Multiple custom fields named "${fieldName}" — set explicit ID override`);
+    this.name = "JiraFieldResolutionError";
+  }
+}
+
+export interface OverrideOptions {
   statusOverride: string | null;
   repoOverride: string | null;
   profilesOverride: string | null;
+  baseBranchOverride: string | null;
 }
 
 interface ListFieldsClient {
@@ -28,11 +43,12 @@ export async function resolveCustomFieldIds(
   client: ListFieldsClient,
   overrides: OverrideOptions,
 ): Promise<ResolvedFieldIds> {
-  if (overrides.statusOverride && overrides.repoOverride && overrides.profilesOverride) {
+  if (overrides.statusOverride && overrides.repoOverride && overrides.profilesOverride && overrides.baseBranchOverride) {
     return {
       statusFieldId: overrides.statusOverride,
       repoFieldId: overrides.repoOverride,
       profilesFieldId: overrides.profilesOverride,
+      baseBranchFieldId: overrides.baseBranchOverride,
     };
   }
 
@@ -43,12 +59,8 @@ export async function resolveCustomFieldIds(
   const epicLink = fields.find((f) => f.name === "Epic Link");
   const lookup = (name: string): string => {
     const matches = fields.filter((f) => f.name === name);
-    if (matches.length === 0) {
-      throw new Error(`Custom field "${name}" not found in Jira instance`);
-    }
-    if (matches.length > 1) {
-      throw new Error(`Multiple custom fields named "${name}" — set explicit ID override`);
-    }
+    if (matches.length === 0) throw new JiraFieldResolutionError(name, "missing");
+    if (matches.length > 1) throw new JiraFieldResolutionError(name, "duplicate");
     return matches[0].id;
   };
 
@@ -66,11 +78,26 @@ export async function resolveCustomFieldIds(
     }
   }
 
+  let baseBranchFieldId: string | null = overrides.baseBranchOverride;
+  if (baseBranchFieldId === null) {
+    const baseBranchMatches = fields.filter((f) => f.name === BASE_BRANCH_FIELD_NAME);
+    if (baseBranchMatches.length === 0) {
+      console.warn(`[jira] Custom field "${BASE_BRANCH_FIELD_NAME}" not found — base branch will not be populated`);
+    } else if (baseBranchMatches.length > 1) {
+      console.warn(
+        `[jira] Multiple custom fields named "${BASE_BRANCH_FIELD_NAME}" — set an explicit baseBranchFieldOverride to disambiguate`,
+      );
+    } else {
+      baseBranchFieldId = baseBranchMatches[0].id;
+    }
+  }
+
   return {
     statusFieldId: overrides.statusOverride ?? lookup(STATUS_FIELD_NAME),
     repoFieldId: overrides.repoOverride ?? lookup(REPO_FIELD_NAME),
     ...(epicLink ? { epicLinkFieldId: epicLink.id } : {}),
     profilesFieldId,
+    baseBranchFieldId,
   };
 }
 
@@ -82,12 +109,21 @@ export async function getCachedFieldIds(
   overrides: OverrideOptions,
 ): Promise<ResolvedFieldIds> {
   // Override values must participate in the key — changing them on a live mapping otherwise serves stale IDs.
-  const fullKey = `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}`;
+  const fullKey = fieldCacheKey(cacheKey, overrides);
   const existing = cache.get(fullKey);
   if (existing) return existing;
   const ids = await resolveCustomFieldIds(client, overrides);
   cache.set(fullKey, ids);
   return ids;
+}
+
+function fieldCacheKey(cacheKey: string, overrides: OverrideOptions): string {
+  return `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}::${overrides.baseBranchOverride ?? ""}`;
+}
+
+/** Inspect without resolving or populating the poll's cache. */
+export function peekCachedFieldIds(cacheKey: string, overrides: OverrideOptions): ResolvedFieldIds | undefined {
+  return cache.get(fieldCacheKey(cacheKey, overrides));
 }
 
 export function clearFieldCache(): void {
@@ -97,7 +133,7 @@ export function clearFieldCache(): void {
 export const STATUS_VALUES = {
   READY: "Ready",
   PLANNING: "Planning",
-  /** Reserved for a future approval-gating phase; never written by Phase 2's verbs. */
+  /** Written by `markPlanComplete` when the mapping's "Auto-approve plans" is off; the Jira field needs this option. */
   AWAITING_APPROVAL: "Awaiting Approval",
   APPROVED: "Plan Approved",
   IMPLEMENTING: "Implementing",
@@ -108,18 +144,6 @@ export const STATUS_VALUES = {
 } as const;
 
 export type StatusValue = (typeof STATUS_VALUES)[keyof typeof STATUS_VALUES];
-
-/** Build a minimal ADF document for a single paragraph. */
-export function adfParagraph(text: string): unknown {
-  return {
-    type: "doc",
-    version: 1,
-    content: [{
-      type: "paragraph",
-      content: [{ type: "text", text }],
-    }],
-  };
-}
 
 /** ADF for a paragraph with a hyperlink. */
 export function adfWithLink(prefix: string, label: string, url: string): unknown {
@@ -138,4 +162,15 @@ export function adfWithLink(prefix: string, label: string, url: string): unknown
       ],
     }],
   };
+}
+
+/** A field as JQL names it: REST's `customfield_N` is `cf[N]`, which some instances require. Any other ID is used as given. */
+export function jqlFieldRef(fieldId: string): string {
+  const match = /^customfield_(\d+)$/.exec(fieldId);
+  return match ? `cf[${match[1]}]` : fieldId;
+}
+
+/** A project's JQL as the poll runs it, so the poll and the setup checks run the same search. */
+export function buildBucketQuery(jql: string, statusFieldId: string): string {
+  return `(${jql}) AND ${jqlFieldRef(statusFieldId)} in (Ready, "Plan Approved")`;
 }

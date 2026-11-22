@@ -1,0 +1,373 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import type * as LogModule from "../log.js";
+import type * as QueueModule from "../comment-gapfill-queue.js";
+import type * as RunnerTokensModule from "../runner-tokens.js";
+import type * as RunnerCallbackModule from "../runner-callback.js";
+import type * as DrainModule from "../comment-gapfill-drain.js";
+import type * as LocalDockerModule from "../local-docker.js";
+import type { RepoMapping } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+
+const SECRET = "filesystem-flow-secret";
+
+const localDockerMock = vi.hoisted(() => ({
+  startLocalRunnerContainer: vi.fn<typeof LocalDockerModule.startLocalRunnerContainer>(),
+}));
+
+vi.mock("../local-docker.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../local-docker.js")>();
+  return {
+    ...actual,
+    startLocalRunnerContainer: localDockerMock.startLocalRunnerContainer,
+  };
+});
+
+let ticketDir: string;
+let log: typeof LogModule;
+let queue: typeof QueueModule;
+let runnerTokens: typeof RunnerTokensModule;
+let runnerCallback: typeof RunnerCallbackModule;
+let drain: typeof DrainModule;
+
+beforeEach(async () => {
+  ticketDir = testDir("filesystem-tickets");
+  vi.stubEnv("RUNNER_MODE", "local");
+  ({ log, queue, runnerTokens, runnerCallback, drain } = (
+    await testDb({
+      modules: {
+        log: () => import("../log.js"),
+        queue: () => import("../comment-gapfill-queue.js"),
+        runnerTokens: () => import("../runner-tokens.js"),
+        runnerCallback: () => import("../runner-callback.js"),
+        drain: () => import("../comment-gapfill-drain.js"),
+      },
+    })
+  ).modules);
+  localDockerMock.startLocalRunnerContainer.mockResolvedValue({
+    containerId: "local-container-1",
+    containerName: "ai-implement-fs-1",
+  });
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+  localDockerMock.startLocalRunnerContainer.mockReset();
+  vi.restoreAllMocks();
+});
+
+function writeTicket(id: string, body = "Implement the local flow."): void {
+  fs.writeFileSync(
+    path.join(ticketDir, `${id}.md`),
+    [
+      "---",
+      `title: ${id} real PR flow`,
+      `id: ${id}`,
+      "base: testing",
+      "profiles:",
+      "  - backend",
+      "limits:",
+      "  maxTurns: 17",
+      "  maxIterations: 2",
+      "---",
+      "",
+      body,
+    ].join("\n"),
+  );
+}
+
+function filesystemMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
+  return makeMapping({
+    owner: "BuildDownAI",
+    repo: "AI-Implement",
+    planningEnabled: true,
+    ticketingProvider: "filesystem",
+    ticketingConfig: { kind: "filesystem", directory: ticketDir },
+    reviewers: [
+      { id: "code-review", gates: true },
+      { id: "branch-preview", gates: false },
+    ],
+    ...overrides,
+  });
+}
+
+
+describe("filesystem tickets through the local PR loop", () => {
+  it("reconciles a merged filesystem PR using its linked project without a dispatch when two projects share a repo", async () => {
+    writeTicket("FS-303");
+    const mapping = filesystemMapping({ paused: true });
+    const other = filesystemMapping({ ticketingProvider: "linear", ticketingConfig: { kind: "linear" } });
+    const mappings = { OTHER: other, FS: mapping };
+    const { ProviderRegistry } = await import("../providers/registry.js");
+    const registry = new ProviderRegistry({}, () => mappings);
+    const provider = await registry.forMapping(mapping);
+    const issue = (await provider.findByKey("FS-303"))!;
+    await provider.markPrReady(issue.id, "FS", "https://github.com/BuildDownAI/AI-Implement/pull/303");
+    const { linkPullRequest } = await import("../pr-links.js");
+    linkPullRequest({
+      repository: "BuildDownAI/AI-Implement", number: 303,
+      url: "https://github.com/BuildDownAI/AI-Implement/pull/303",
+      role: "implementation", source: "backfill",
+      issue: { trackerKind: "filesystem", mappingKey: "FS", trackerIssueId: issue.id,
+        identifier: issue.identifier, title: issue.title, url: null },
+    });
+    const recon = await import("../reconciliation.js");
+    const { runReconciliations, resolvePrMapping } = await import("../reconcile-merged.js");
+    recon.initReconciliationTable();
+    recon.enqueueReconciliation({ issueId: issue.id, issueIdentifier: issue.identifier,
+      repo: "BuildDownAI/AI-Implement", prNumber: 303, mergeCommitSha: "test-sha" });
+    await runReconciliations({
+      mappingForRepo: (repo, prNumber) => resolvePrMapping(mappings, repo, prNumber),
+      resolveProvider: (selected) => {
+        expect(selected).toBe(mapping);
+        return registry.forMapping(selected);
+      },
+    });
+    expect((await provider.fetchLifecycleStates([issue.id])).get(issue.id)).toBe("completed");
+    expect(resolvePrMapping({ OTHER: other }, "BuildDownAI/AI-Implement", 303)).toBeUndefined();
+  });
+
+  it.each(["callback", "image", "credentials"])("refuses an incomplete local iteration (%s) before starting Docker", async (missing) => {
+    const { dispatchLocalGapfill } = await import("../local-gapfill.js");
+    const { DEFAULT_RETRY_POLICY } = await import("../pipeline/retry-backoff.js");
+    await expect(dispatchLocalGapfill({
+      mapping: filesystemMapping(),
+      issue: { id: "filesystem:FS:FS-1", identifier: "FS-1", title: "Iteration" },
+      prNumber: 1,
+      githubToken: "fake-gh-token",
+      image: missing === "image" ? "" : "ai-implement-runner:local",
+      orchestratorUrl: "http://host.docker.internal:8080",
+      runnerCallbackUrl: missing === "callback" ? undefined : "http://host.docker.internal:8080",
+      runToken: "fake-run-token",
+      anthropicApiKey: missing === "credentials" ? null : "fake-model-key",
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    })).rejects.toThrow(/Local gap-fill requires/);
+    expect(localDockerMock.startLocalRunnerContainer).not.toHaveBeenCalled();
+  });
+
+  it("resolves Markdown tickets through the registry and persists runner callback results locally", async () => {
+    writeTicket("FS-101", "Add callback state persistence.");
+    const mapping = filesystemMapping();
+    const { ProviderRegistry } = await import("../providers/registry.js");
+    const registry = new ProviderRegistry({}, () => ({ FS: mapping }));
+    const provider = await registry.forMapping(mapping);
+
+    const snapshot = await provider.fetchAIImplementSnapshot();
+    expect(snapshot.needsPlanning.map((issue) => issue.identifier)).toEqual(["FS-101"]);
+    expect(snapshot.needsPlanning[0]).toMatchObject({
+      scopeKey: "FS",
+      baseBranch: "testing",
+      profiles: ["backend"],
+      maxTurns: 17,
+      maxIterations: 2,
+    });
+
+    const issueId = snapshot.needsPlanning[0]!.id;
+    await provider.markPlanningStarted(issueId, "FS");
+    const planningMint = runnerTokens.mintRunToken({
+      issueId,
+      mappingTeamKey: "FS",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const planningToken = planningMint.token;
+    log.appendLog({ issueId, issueIdentifier: "FS-1", teamKey: "FS", repo: "BuildDownAI/AI-Implement",
+      dispatchId: planningMint.dispatchId, phase: "planning" });
+    const planningResult = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${planningToken}`,
+      body: { phase: "planning", outcome: "success", comments: [{ body: "## ✅ AI Planning: Acceptance Bar\n\nChange one file." }] },
+      secret: SECRET,
+      resolveProvider: async () => provider,
+    });
+    expect(planningResult.status).toBe(200);
+    registry.invalidate();
+    const resumedProvider = await registry.forMapping(mapping);
+    expect((await resumedProvider.fetchAIImplementSnapshot()).readyForImplementation.map((issue) => issue.id)).toEqual([issueId]);
+    expect(await resumedProvider.fetchPlanningContext(issueId)).toContain("Change one file.");
+    await resumedProvider.markImplementing(issueId, "FS");
+
+    const implToken = runnerTokens.mintRunToken({
+      issueId,
+      mappingTeamKey: "FS",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    }).token;
+    const implResult = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${implToken}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        prUrl: "https://github.com/BuildDownAI/AI-Implement/pull/9001",
+        comments: [{ body: "Opened a PR." }],
+      },
+      secret: SECRET,
+      resolveProvider: async () => provider,
+    });
+
+    expect(implResult.status).toBe(200);
+    registry.invalidate();
+    const afterPr = await registry.forMapping(mapping);
+    const afterPrSnapshot = await afterPr.fetchAIImplementSnapshot();
+    expect(afterPrSnapshot.needsPlanning).toEqual([]);
+    expect(afterPrSnapshot.readyForImplementation).toEqual([]);
+    expect(afterPrSnapshot.inProgressCountsByScope).toEqual({});
+    await afterPr.markMerged(issueId, "FS");
+    expect((await afterPr.fetchLifecycleStates([issueId])).get(issueId)).toBe("completed");
+    await expect(provider.findByKey("FS-101")).resolves.toMatchObject({ title: "FS-101 real PR flow" });
+  });
+
+  it("submits filesystem PR comment iteration to ImplementationRun on local Docker", async () => {
+    const http = fakeFetch({
+      "GET /repos/BuildDownAI/AI-Implement/pulls/9001": {
+        json: { merged: false, state: "open", head: { ref: "ai-implement/fs-202" } },
+      },
+    }).install();
+    const mapping = filesystemMapping({
+      maxTurns: 31,
+      maxIterations: 4,
+      branchPrefix: "local",
+      skillsRepo: "BuildDownAI/skills",
+    });
+    queue.enqueueCommentGapfill({
+      owner: "BuildDownAI",
+      repo: "AI-Implement",
+      prNumber: 9001,
+      commentId: 44,
+      commenter: "cameron",
+      instruction: "Please address the reviewer feedback.",
+    });
+    const seedJob = log.appendLog({
+      issueId: "FS-202",
+      issueIdentifier: "FS-202",
+      issueTitle: "Filesystem PR iteration",
+      teamKey: "FS",
+      repo: "BuildDownAI/AI-Implement",
+      phase: "implementation",
+      // Completed, not in-flight: this row only establishes tracker identity for the
+      // PR (via getLatestDispatchForPr); the dispatch gate would otherwise defer the
+      // comment gap-fill below as if this original run were still running.
+      status: "completed",
+    });
+    log.updateJobPrUrl(seedJob, "https://github.com/BuildDownAI/AI-Implement/pull/9001");
+
+    const dispatch = vi.fn<DrainModule.DrainCommentGapfillsInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+    const checkContract = vi.fn<DrainModule.DrainCommentGapfillsInput["checkContract"]>(async () => "envelope");
+
+    const submit = vi.fn<NonNullable<DrainModule.DrainCommentGapfillsInput["implementationRun"]>["submit"]>(async () => ({ status: "accepted" }));
+    await drain.drainCommentGapfillQueue({
+      implementationRun: { submit },
+      restateCanServe: () => true,
+      getMappings: () => ({ FS: mapping }),
+      runnerMode: "local",
+      notifyType: "slack",
+      notifyWebhookUrl: null,
+      runnerCallbackBaseUrl: "http://host.docker.internal:8080",
+      runnerTokenSecret: SECRET,
+      getInstallationToken: vi.fn(async () => "gh-token"),
+      getTargetRepoToken: vi.fn(async () => "gh-token"),
+      getInstallationId: vi.fn(async () => 778899),
+      resolveRunnerImage: vi.fn(async () => undefined),
+      checkContract,
+      dispatch,
+      postComment: vi.fn(async () => undefined),
+      listPrComments: vi.fn(async () => []),
+      postTrackerComment: vi.fn(async () => undefined),
+      onDispatchFailure: vi.fn(async () => undefined),
+      flySessionsToken: null,
+      flySessionsApp: null,
+      flySessionsRegion: null,
+      flyOrchestratorApp: null,
+      tenantId: null,
+      anthropicApiKey: "anthropic-key",
+      claudeOAuthToken: null,
+      sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+      localRunnerImage: "ai-implement-runner:local",
+      localRunnerOrchestratorUrl: "http://host.docker.internal:8080",
+    });
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(checkContract).not.toHaveBeenCalled();
+    expect(localDockerMock.startLocalRunnerContainer).not.toHaveBeenCalled();
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(http.calls).toHaveLength(1);
+    const [dispatchId, input] = submit.mock.calls[0]!;
+    expect(input).toMatchObject({
+      dispatchId, teamKey: "FS", issueId: "FS-202", issueIdentifier: "FS-202",
+      backend: "local-docker", launchContext: { runnerMode: "local" },
+      gapFill: { repository: "BuildDownAI/AI-Implement", installationId: "778899",
+        prNumber: 9001, humanRequested: true },
+    });
+    expect(queue.getCommentGapfillItem(input.gapFill!.queueItemId)?.status).toBe("dispatched");
+    // Launch and job-row creation belong to the workflow after acceptance.
+    expect(log.listLog({ limit: 5 }).some((job) => job.phase === "gap-analysis")).toBe(false);
+  });
+
+  it("does not dispatch filesystem PR comment iteration after leaving local runner mode", async () => {
+    const http = fakeFetch({
+      "GET /repos/BuildDownAI/AI-Implement/pulls/9002": {
+        json: { merged: false, state: "open", head: { ref: "ai-implement/fs-203" } },
+      },
+    }).install();
+    const mapping = filesystemMapping();
+    queue.enqueueCommentGapfill({
+      owner: "BuildDownAI",
+      repo: "AI-Implement",
+      prNumber: 9002,
+      commentId: 45,
+      commenter: "cameron",
+      instruction: "Please try again.",
+    });
+    const seedJob = log.appendLog({
+      issueId: "FS-203",
+      issueIdentifier: "FS-203",
+      issueTitle: "Filesystem local-only guard",
+      teamKey: "FS",
+      repo: "BuildDownAI/AI-Implement",
+      phase: "implementation",
+    });
+    log.updateJobPrUrl(seedJob, "https://github.com/BuildDownAI/AI-Implement/pull/9002");
+
+    const dispatch = vi.fn<DrainModule.DrainCommentGapfillsInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+
+    await drain.drainCommentGapfillQueue({
+      getMappings: () => ({ FS: mapping }),
+      runnerMode: "gha",
+      notifyType: "slack",
+      notifyWebhookUrl: null,
+      runnerCallbackBaseUrl: "http://host.docker.internal:8080",
+      runnerTokenSecret: SECRET,
+      getInstallationToken: vi.fn(async () => "gh-token"),
+      getTargetRepoToken: vi.fn(async () => "gh-token"),
+      getInstallationId: vi.fn(async () => 778899),
+      resolveRunnerImage: vi.fn(async () => undefined),
+      checkContract: vi.fn<DrainModule.DrainCommentGapfillsInput["checkContract"]>(async () => "envelope"),
+      dispatch,
+      postComment: vi.fn(async () => undefined),
+      listPrComments: vi.fn(async () => []),
+      postTrackerComment: vi.fn(async () => undefined),
+      onDispatchFailure: vi.fn(async () => undefined),
+      flySessionsToken: null,
+      flySessionsApp: null,
+      flySessionsRegion: null,
+      flyOrchestratorApp: null,
+      tenantId: null,
+      anthropicApiKey: "anthropic-key",
+      claudeOAuthToken: null,
+      sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+      localRunnerImage: "ai-implement-runner:local",
+      localRunnerOrchestratorUrl: "http://host.docker.internal:8080",
+    });
+
+    expect(localDockerMock.startLocalRunnerContainer).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(http.calls).toHaveLength(1);
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+});

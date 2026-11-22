@@ -1,0 +1,187 @@
+import { createHash } from "node:crypto";
+import { describe, expect, it } from "vitest";
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
+import {
+  BUILTIN_REVIEWER_VERDICT_SCHEMA,
+  resolveReviewer,
+  REVIEWER_VERDICT_SCHEMA,
+  type ReviewerDefinition,
+  type ReviewerPromptInput,
+} from "../pipeline/reviewers/registry.js";
+
+const input: ReviewerPromptInput = {
+  issueIdentifier: "AII-665",
+  issueTitle: "Add built-in reviewer definitions",
+  issueDescription: "## Acceptance Criteria\n- Create gap-analysis\n- Create code-review",
+  prNumber: "123",
+  diff: "diff --git a/src/file.ts b/src/file.ts",
+  previousFindings: "No previous findings.",
+};
+
+function keys(definition: ReviewerDefinition): string[] {
+  return Object.keys(definition).sort();
+}
+
+describe("built-in reviewers", () => {
+  it("keeps the default selection unchanged", () => {
+    expect(DEFAULT_REVIEWER_SELECTION).toEqual([
+      { id: "gap-analysis", gates: true },
+      { id: "code-review", gates: true },
+    ]);
+  });
+
+  it("integration-review traces cross-file contracts and reports evidence honestly", async () => {
+    const reviewer = await resolveReviewer("integration-review", { customRoot: "/workspace", existsSyncImpl: () => false });
+    expect(reviewer?.outputSchema).toBe(BUILTIN_REVIEWER_VERDICT_SCHEMA);
+    expect(keys(reviewer!)).toEqual(["buildPrompt", "id", "outputSchema"]);
+    expect(reviewer?.maxTurns).toBeUndefined();
+    const prompt = reviewer!.buildPrompt(input);
+    for (const text of [
+      "each value, field, row, status, or failure code that the diff writes",
+      "every reader, inside and outside the",
+      "contracts that two parts of the diff change in different ways",
+      "each changed return and failure path to what consumes the result",
+      "merge commits from the base for dropped or duplicated changes",
+      "If merge evidence is", 'result="not_verified"',
+      "No style nits", "self-contained and immediately actionable",
+      "findings[] as the only internal finding list",
+      "top-level checks JSON array and a concise plain-prose summary even when approved",
+      "Distinguish inspecting test source from executing",
+      "On follow-up reviews, first verify every previous issue is fixed",
+      input.issueIdentifier, input.issueTitle, input.prNumber,
+      input.issueDescription, input.diff, input.previousFindings,
+    ]) expect(prompt).toContain(text);
+  });
+
+  it("resolves the gap-analysis and code-review built-ins", async () => {
+    await expect(resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false }))
+      .resolves.toMatchObject({ id: "gap-analysis" });
+    await expect(resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false }))
+      .resolves.toMatchObject({ id: "code-review" });
+  });
+
+  it("keeps the shared schema's report fields optional (nullable) and makes them mandatory for built-ins", async () => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
+
+    expect(gap?.outputSchema).toBe(BUILTIN_REVIEWER_VERDICT_SCHEMA);
+    expect(code?.outputSchema).toBe(BUILTIN_REVIEWER_VERDICT_SCHEMA);
+    // Strict mode requires every property; nullability is what keeps summary and checks optional.
+    expect(REVIEWER_VERDICT_SCHEMA).toMatchObject({
+      required: ["approved", "findings", "summary", "checks"],
+      properties: {
+        approved: { type: "boolean" },
+        findings: { type: "array" },
+        summary: { type: ["string", "null"], minLength: 1 },
+        checks: { type: ["array", "null"], minItems: 1 },
+      },
+    });
+    expect(BUILTIN_REVIEWER_VERDICT_SCHEMA).toMatchObject({
+      required: ["approved", "findings", "summary", "checks"],
+      properties: {
+        findings: (REVIEWER_VERDICT_SCHEMA.properties as Record<string, unknown>).findings,
+        summary: { type: "string", minLength: 1 },
+        checks: { type: "array", minItems: 1 },
+      },
+    });
+  });
+
+  it("does not let either built-in declare gates", async () => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
+
+    expect(keys(gap!)).toEqual(["buildPrompt", "id", "outputSchema"]);
+    expect(keys(code!)).toEqual(["buildPrompt", "id", "outputSchema"]);
+    expect("gates" in gap!).toBe(false);
+    expect("gates" in code!).toBe(false);
+  });
+
+  it("leaves built-in turn caps to the retry policy default", async () => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
+
+    expect(gap?.maxTurns).toBeUndefined();
+    expect(code?.maxTurns).toBeUndefined();
+  });
+
+  it("scopes grouping parent review to its own closing work", async () => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const prompt = gap!.buildPrompt({ ...input, groupingParent: true });
+    expect(prompt).toContain("The child issues delivered their own requirements into the base branch");
+    expect(prompt).toContain("Grade only the requirements that the parent keeps for itself");
+    expect(prompt).toContain("Do not report a child requirement as missing solely because it is absent from this diff");
+    expect(prompt).toContain('result="not_applicable"');
+    expect(prompt).toContain("Missing parent-owned work remains a finding");
+  });
+
+  it.each([undefined, false])("preserves the ordinary gap prompt (groupingParent: %s)", async groupingParent => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const prompt = gap!.buildPrompt({ ...input, groupingParent });
+    // SHA-256 of the pre-change prompt for this fixture.
+    expect(createHash("sha256").update(prompt).digest("hex")).toBe("58ebc67b5390c314d31f3bec5f57c2fcdabe15f924635602898f1b21ededd1ac");
+  });
+
+  it("gap-analysis prompt is scoped to acceptance-criteria coverage", async () => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const prompt = gap!.buildPrompt(input);
+
+    expect(prompt).toContain("spec-coverage review only");
+    expect(prompt).toContain("issue's acceptance criteria");
+    expect(prompt).toContain("any requirement in the issue not implemented in the diff");
+    expect(prompt).toContain("requirement from the issue acceptance criteria that has no implementation");
+    expect(prompt).toContain("unrequested scope");
+    expect(prompt).toContain("Do not report style problems, code defects, security issues, test gaps");
+    expect(prompt).toContain("return a top-level checks JSON array and a concise plain-prose summary even when approved");
+    expect(prompt).toContain("Each acceptance criterion should have a checks[] item");
+    expect(prompt).toContain("include one scope check");
+    expect(prompt).toContain("concrete acceptance criterion");
+    expect(prompt).toContain("Use result=\"not_verified\"");
+    expect(prompt).toContain("Distinguish inspecting test");
+    expect(prompt).toContain("Do not claim tests were executed or runtime behavior was checked");
+    expect(prompt).toContain("Do not put tool XML");
+    expect(prompt).toContain("checks must be top-level");
+    expect(prompt).toContain(input.issueDescription);
+    expect(prompt).toContain(input.diff);
+  });
+
+  it("gap-analysis prompt separates code deliverables from operator-owned execution evidence", async () => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const prompt = gap!.buildPrompt(input);
+
+    expect(prompt).toContain("Code deliverables are different from execution evidence");
+    expect(prompt).toContain("not visible in a diff and are not missing implementation");
+    expect(prompt).toContain("explicitly assigns that evidence to an operator");
+    expect(prompt).toContain("Do not report them as findings or request code fixes");
+    expect(prompt).toContain("result=\"not_verified\" or result=\"not_applicable\"");
+    expect(prompt).toContain("never mark them \"passed\"");
+    expect(prompt).toContain("do not infer it, and do not ignore failed or unmet acceptance criteria in general");
+    expect(prompt).toContain("Missing code or test source that the issue explicitly requires");
+    expect(prompt).toContain("still report the missing implementation requirements");
+  });
+
+  it("code-review prompt keeps defect review wording without requirements coverage", async () => {
+    const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const prompt = code!.buildPrompt(input);
+
+    expect(prompt).toContain("Set approved=true only when no code changes are needed");
+    expect(prompt).toContain("bug");
+    expect(prompt).toContain("unsafe behavior");
+    expect(prompt).toContain("test gap");
+    expect(prompt).toContain("self-contained and immediately actionable");
+    expect(prompt).toContain("Do not put praise, overall status, or optional/future cleanup");
+    expect(prompt).toContain("On follow-up reviews, first verify every previous issue is fixed");
+    expect(prompt).toContain("changed API/data contracts, error handling");
+    expect(prompt).toContain("return a top-level checks JSON array and a concise plain-prose summary even when approved");
+    expect(prompt).toContain("such as changed");
+    expect(prompt).toContain("behavior, edge cases, contracts, security, and tests");
+    expect(prompt).toContain("Use result=\"not_verified\"");
+    expect(prompt).toContain("Distinguish inspecting test source from executing");
+    expect(prompt).toContain("Do not claim runtime tests, browser checks, or");
+    expect(prompt).toContain("Do not put tool XML");
+    expect(prompt).toContain("checks must be top-level");
+    expect(prompt).toContain("Findings remain");
+    expect(prompt).not.toContain("missing requirement");
+    expect(prompt).not.toContain("check requirements coverage");
+    expect(prompt).not.toContain("acceptance criteria");
+  });
+});

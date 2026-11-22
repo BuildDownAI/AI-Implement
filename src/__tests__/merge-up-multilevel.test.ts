@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { resetRollUpHandledMarkers, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
+import { makeMapping } from "./helpers/builders.js";
 
 vi.mock("../dedup.js", async () => {
   const Database = (await import("better-sqlite3")).default;
@@ -13,6 +14,7 @@ vi.mock("../github-app-auth.js", () => ({
 }));
 vi.mock("../github.js", () => ({
   compareBranches: vi.fn(),
+  getBranchSha: vi.fn(async () => null),
   findOpenPullRequest: vi.fn(async () => null),
   findPullRequestByBranches: vi.fn(async () => null),
   createPullRequest: vi.fn(async () => ({ number: 7, url: "https://gh/pr/7" })),
@@ -25,19 +27,11 @@ import {
   createPullRequest,
   mergeBranch,
   findPullRequestByBranches,
+  getBranchSha,
   deleteBranch,
 } from "../github.js";
 
-function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "jodwyer", repo: "alpacaWheel", workflowFile: "claude-implement.yml",
-    defaultBranch: "testing", maxInProgressAiIssues: 3, executionMode: "github-actions",
-    sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false,
-    planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
-    ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
-    ...overrides,
-  };
-}
+const mapping = () => makeMapping({ owner: "jodwyer", repo: "alpacaWheel", defaultBranch: "testing" });
 
 const deps = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn(async () => {})) => ({
   githubAppId: "1", githubAppPrivateKey: "k", resolveMapping: resolve, finalizeMerged,
@@ -52,6 +46,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   resetRollUpHandledMarkers();
   vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+  vi.mocked(getBranchSha).mockResolvedValue(null);
   vi.mocked(createPullRequest).mockResolvedValue({ number: 7, url: "https://gh/pr/7" });
   vi.mocked(mergeBranch).mockResolvedValue("merged");
   vi.mocked(deleteBranch).mockResolvedValue(true);
@@ -91,7 +86,7 @@ describe("runMergeUps — multi-level feature trees", () => {
   it("only the top-of-tree node finalizes when its PR is detected as merged", async () => {
     vi.mocked(compareBranches).mockResolvedValue(1);
     vi.mocked(findPullRequestByBranches).mockResolvedValue({
-      number: 42, url: "https://gh/pr/42", state: "closed", merged: true,
+      number: 42, url: "https://gh/pr/42", state: "closed", merged: true, headSha: "sha-42",
     });
 
     const finalizeMerged = vi.fn(async () => {});

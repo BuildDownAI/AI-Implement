@@ -1,3 +1,5 @@
+import { stepperHtml } from "../stepper.js";
+
 export const projectsHtml = `
 <section data-page="projects" hidden>
   <header class="page-header">
@@ -10,13 +12,20 @@ export const projectsHtml = `
     </div>
   </header>
   <div class="page-body">
+    <div id="projects-setup-note" class="alert warn" hidden>
+      <div class="alert-icon">&#9888;</div>
+      <div>
+        <div class="alert-title">Setup checks to look at</div>
+        <div class="alert-desc"><span id="projects-setup-note-count"></span> The Setup page lists each project's checks with their fixes, and runs a project's checks again. <a href="#setup" class="text-accent">Open Setup &rarr;</a></div>
+      </div>
+    </div>
     <div class="card">
       <div class="card-body tight">
-        <table class="tbl" id="mappings-table">
+        <table class="tbl">
           <thead>
             <tr>
               <th>Team</th><th>Repo</th><th>Runner</th><th>Session</th>
-              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th>Status</th><th></th>
+              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th>Status</th><th style="width:132px;white-space:nowrap">Setup</th><th style="width:132px;white-space:nowrap">Optional setup</th><th></th>
             </tr>
           </thead>
           <tbody id="mappings-body"></tbody>
@@ -31,7 +40,7 @@ export const projectsHtml = `
         <button class="btn btn-sm" style="margin-left:auto" onclick="document.getElementById('secrets-panel').classList.add('hidden')">&#215;</button>
       </div>
       <div class="card-body">
-        <div class="warning">&#9888; Secrets are shared across all machines for this team. Values are write-only and cannot be read back through the API.</div>
+        <div class="warning">&#9888; Secrets are stored on the shared sessions app and injected into every machine on that app by Fly. The runner entrypoint filters them: each machine sees only its own team&#x27;s secrets under their unprefixed names, and other teams&#x27; secrets are unset before the agent starts. Secrets reach setup, verify, and dependency install only; the agent never sees them. Values are write-only and cannot be read back through the API.</div>
         <table class="tbl">
           <thead>
             <tr><th>Name (suffix)</th><th>Status</th><th></th></tr>
@@ -61,173 +70,363 @@ export const projectsHtml = `
       <button class="btn btn-ghost btn-icon" onclick="closeMappingDialog()">&#215;</button>
     </div>
     <input type="hidden" id="md-team-key-orig">
+    <div style="padding:12px 20px 0">
+      <span class="seg" id="md-tabs">
+        <button type="button" class="btn btn-sm active" data-md-tab="ticketing" onclick="switchMappingTab('ticketing')">Ticketing</button>
+        <button type="button" class="btn btn-sm" data-md-tab="source" onclick="switchMappingTab('source')">Source</button>
+        <button type="button" class="btn btn-sm" data-md-tab="context" onclick="switchMappingTab('context')">Context</button>
+        <button type="button" class="btn btn-sm" data-md-tab="execution" onclick="switchMappingTab('execution')">Execution</button>
+        <button type="button" class="btn btn-sm" data-md-tab="capacity" onclick="switchMappingTab('capacity')">Capacity</button>
+        <button type="button" class="btn btn-sm" data-md-tab="guardrails" onclick="switchMappingTab('guardrails')">Guardrails</button>
+        <button type="button" class="btn btn-sm" data-md-tab="provider" onclick="switchMappingTab('provider')">Provider</button>
+        <button type="button" class="btn btn-sm" data-md-tab="agents" id="md-tab-agents" onclick="switchMappingTab('agents')">Agents</button>
+      </span>
+    </div>
     <div class="md-body">
-      <fieldset>
-        <legend>Ticketing Provider</legend>
-        <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
-          <div class="md-field" style="margin-bottom:0;min-width:140px">
-            <label>Provider</label>
-            <select id="md-ticketing-provider" onchange="onTicketingProviderChange()">
-              <option value="linear">Linear</option>
-              <option value="jira">Jira</option>
-            </select>
+      <div data-md-panel="ticketing">
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Ticketing</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Where this project&rsquo;s issues come from, and how the orchestrator recognises them.</p>
+        <div style="display:grid;gap:12px">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="field">
+              <label class="field-label">Provider</label>
+              <select class="select" id="md-ticketing-provider" onchange="onTicketingProviderChange()">
+                <option value="linear">Linear</option>
+                <option value="jira">Jira</option>
+                <option value="filesystem">Filesystem / local</option>
+              </select>
+              <div class="field-hint">Filesystem tickets are Markdown files on this machine. They run real GitHub PRs through local Docker and require RUNNER_MODE=local.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Mapping Key</label>
+              <input class="input mono" id="md-team-key" placeholder="MY_TEAM">
+              <div class="field-hint">Identifies this project independently of its ticket directory. Cannot be changed after creation.</div>
+            </div>
+          </div>
+          <div id="md-jira-fields" class="hidden" style="display:grid;gap:12px">
+            <div class="field">
+              <label class="field-label">Mapping ID</label>
+              <input class="input mono" id="md-jira-mapping-id" placeholder="acme/billing">
+            </div>
+            <div class="field">
+              <label class="field-label">JQL</label>
+              <textarea class="textarea" id="md-jira-jql" rows="3" placeholder="project = TEST"></textarea>
+              <div style="display:flex;gap:8px;align-items:center;margin-top:2px">
+                <button type="button" class="btn btn-sm" onclick="validateJqlButton()">Validate</button>
+                <span id="md-jira-jql-status" class="field-hint"></span>
+              </div>
+              <div class="field-hint">The orchestrator wraps this with its own status filter at query time. Don't include status filters here.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Status Field</label>
+              <select class="select" id="md-jira-status-field">
+                <option value="">(auto-discover by name "AI-Implement Status")</option>
+              </select>
+              <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Status&rdquo;. Otherwise pick the field that holds the workflow status (Ready, Planning, Implementing, etc.).</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Repo Field</label>
+              <select class="select" id="md-jira-repo-field" onchange="onRepoFieldChange()">
+                <option value="">(auto-discover by name "AI-Implement Repo")</option>
+              </select>
+              <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Profiles Field</label>
+              <select class="select" id="md-jira-profiles-field">
+                <option value="">(auto-discover by name "AI-Implement Profiles")</option>
+              </select>
+              <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Base Branch Field</label>
+              <select class="select" id="md-jira-base-branch-field">
+                <option value="">(auto-discover by name "AI-Implement Base Branch")</option>
+              </select>
+              <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Base Branch&rdquo;. Otherwise pick the text field that holds the branch an issue&#x27;s PR should target instead of the repo&#x27;s default branch.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Repo Field Value (override, optional)</label>
+              <select class="select" id="md-jira-repo-value">
+                <option value="">(none, matches the repository)</option>
+              </select>
+              <input class="input mono hidden" id="md-jira-repo-value-text" type="text" placeholder="Blank matches the repository">
+              <div class="field-hint">Leave blank to match issues whose Repo field holds the repository on the Source tab, as owner/repo. Set this only when the Repo field&#x27;s options name repositories another way.</div>
+            </div>
+          </div>
+          <div id="md-filesystem-fields" class="hidden" style="display:grid;gap:12px">
+            <div class="field">
+              <label class="field-label">Ticket Directory</label>
+              <input class="input mono" id="md-filesystem-directory" placeholder="/private/tmp/filesystem-local-tickets">
+              <div class="field-hint">Absolute host path containing Markdown tickets. The orchestrator writes local state there, while implementation still opens real GitHub PRs for review iteration.</div>
+            </div>
+            <div class="alert info">
+              <div class="alert-icon">&#8505;</div>
+              <div>
+                <div class="alert-title">Local Docker execution</div>
+                <div class="alert-desc">Use this with <span class="mono">RUNNER_MODE=local</span>. Local mode sends these tickets through the local Docker runner and the normal GitHub PR review loop.</div>
+              </div>
+            </div>
           </div>
         </div>
-        <div id="md-jira-fields" class="hidden" style="margin-top:12px">
-          <div class="md-field">
-            <label>Mapping ID</label>
-            <input id="md-jira-mapping-id" placeholder="acme/billing">
+      </div>
+      <div data-md-panel="source" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Source</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">The GitHub repository this mapping dispatches against, and how its branches are named.</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">GitHub Repository</label>
+            <input class="input mono" id="md-github-repo" placeholder="acme-corp/backend or https://github.com/acme-corp/backend">
+            <div class="field-hint">The repository as owner/repo, or paste its GitHub address.</div>
           </div>
-          <div class="md-field">
-            <label>JQL</label>
-            <textarea id="md-jira-jql" rows="3" placeholder="project = TEST"></textarea>
-            <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
-              <button type="button" class="btn btn-ghost" onclick="validateJqlButton()">Validate</button>
-              <span id="md-jira-jql-status" class="text-tertiary" style="font-size:0.85em"></span>
-            </div>
-            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Scope only (e.g. &ldquo;project = TEST&rdquo;). The orchestrator adds its own status filter, so never include one here. It also matches the repo field itself, so a repo clause is not needed for selection.
-            </div>
+          <div class="field">
+            <label class="field-label">Default Branch</label>
+            <input class="input mono" id="md-branch" placeholder="development">
+            <div class="field-hint">Base for runner clones and implementation PRs.</div>
           </div>
-          <div class="md-field">
-            <label>Status Field</label>
-            <select id="md-jira-status-field">
-              <option value="">(auto-discover by name "AI-Implement Status")</option>
-            </select>
-            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Status&rdquo;. Otherwise pick the field that holds the workflow status (Ready, Planning, Implementing, etc.).
-            </div>
+          <div class="field">
+            <label class="field-label">Workflow File</label>
+            <input class="input mono" id="md-wf" value="claude-implement.yml">
+            <div class="field-hint">Synced into the target repo under .github/workflows/.</div>
           </div>
-          <div class="md-field">
-            <label>Repo Field</label>
-            <select id="md-jira-repo-field" onchange="onRepoFieldChange()">
-              <option value="">(auto-discover by name "AI-Implement Repo")</option>
-            </select>
-            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.
-            </div>
-          </div>
-          <div class="md-field">
-            <label>Profiles Field</label>
-            <select id="md-jira-profiles-field">
-              <option value="">(auto-discover by name "AI-Implement Profiles")</option>
-            </select>
-            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.
-            </div>
-          </div>
-          <div class="md-field">
-            <label>Repo Field Value <span class="text-tertiary" style="font-size:0.85em">(override, optional)</span></label>
-            <select id="md-jira-repo-value">
-              <option value="">Select a Repo Field first</option>
-            </select>
-            <input id="md-jira-repo-value-text" type="text" class="hidden" placeholder="owner/repo">
-            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Leave blank to match on the GitHub Repository below (&ldquo;owner/repo&rdquo;). Set this only when your Repo field&rsquo;s options are labelled with something other than owner/repo.
-            </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Branch Prefix</label>
+            <input class="input mono" id="md-branch-prefix" placeholder="pr">
+            <div class="field-hint">Blank = none.</div>
+            <details class="explain">
+              <summary>What a prefix changes</summary>
+              <div class="explain-body">A run names its branch <span class="mono">ai-implement/&lt;issue-key&gt;-&lt;title-slug&gt;</span>. The prefix is joined in front of that as a leading path segment, so <span class="mono">pr</span> turns <span class="mono">ai-implement/aii-42-add-search</span> into <span class="mono">pr/ai-implement/aii-42-add-search</span>. It may contain <span class="mono">/</span> itself to nest several segments deep.</div>
+              <div class="explain-body">Only the first run of an issue is affected. A gap-fill run commits to the pull-request branch that already exists, so setting this later does not rename anything already created.</div>
+            </details>
           </div>
         </div>
-      </fieldset>
-      <div class="md-cols">
-        <fieldset>
-          <legend>Basic</legend>
-          <div class="md-field"><label>Team Key</label><input id="md-team-key" placeholder="MY_TEAM"></div>
-          <div class="md-field" style="grid-column:1 / -1"><label>GitHub Repository</label><input id="md-github-repo" class="mono" placeholder="acme-corp/backend"><div class="text-tertiary" style="font-size:0.85em;margin-top:4px">Owner and repository name, slash-separated. This is the only place the repo is entered - it also matches the Jira repo field unless overridden above.</div></div>
-          <div class="md-field"><label>Workflow File</label><input id="md-wf" value="claude-implement.yml"></div>
-          <div class="md-field"><label>Default Branch</label><input id="md-branch" placeholder="development"></div>
-          <div class="md-field"><label>Max AI Issues</label><input id="md-max-ai" type="number" min="1" value="3"></div>
-          <div class="md-field"><label>Max Turns <span class="text-tertiary" style="font-size:0.85em">(blank = 50)</span></label><input id="md-max-turns" type="number" min="1" step="1" placeholder="50"></div>
-          <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" step="1" placeholder="3"></div>
-          <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
-          <div class="md-field"><label>Branch Prefix <span class="text-tertiary" style="font-size:0.85em">(blank = none)</span></label><input id="md-branch-prefix" placeholder="pr"></div>
-          <div class="md-field">
-            <label>Skills Repo <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
-            <input id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
+      </div>
+      <div data-md-panel="context" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Context</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">What a run can reach beyond the target repository.</p>
+        <div style="display:grid;gap:12px">
+          <div class="field">
+            <label class="field-label">Skills Repo</label>
+            <input class="input mono" id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
-          <div class="md-field">
-            <label>Additional sensitive patterns <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
-            <textarea id="md-sensitive-add" rows="3" placeholder="one glob per line"></textarea>
-            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
+          <div class="field">
+            <label class="field-label">Reference Repositories</label>
+            <div style="display:flex;gap:8px;align-items:flex-end">
+              <input class="input mono" id="md-refrepo-repo" style="flex:2;min-width:0" placeholder="repository">
+              <input class="input mono" id="md-refrepo-path" style="flex:2;min-width:0" placeholder="workspace path">
+              <input class="input mono" id="md-refrepo-ref" style="flex:1;min-width:0" placeholder="ref (optional)">
+              <button class="btn btn-icon" style="flex:none;color:var(--accent)" onclick="addRefRepo()" title="Add">+</button>
+            </div>
+            <div id="md-refrepo-list"></div>
+            <div class="field-hint">Cloned read-only into the run's workspace so the agent can check a claim against real source instead of trusting the issue. Blank = none. Up to ten entries.</div>
+            <details class="explain">
+              <summary>What each field accepts</summary>
+              <div class="explain-body">The path is where the clone lands in the runner's workspace, alongside the checked-out target repository, and it is also the address the agent is given &mdash; so it should match whatever the target repo's own instructions call that source. If they say to check claims against <span class="mono">ai-implement-source</span>, that is the path to enter here. Any depth works, and each entry needs its own directory.</div>
+              <div class="explain-body">The repository is either <span class="mono">owner/repo</span> shorthand or a full <span class="mono">https://github.com/owner/repo</span> URL. Private repositories work as long as the App is installed on that owner.</div>
+              <div class="explain-body">The ref pins a branch, a tag, or a full commit hash. Blank clones the default branch.</div>
+            </details>
           </div>
-          <div class="md-field">
-            <label>Allowed exceptions <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
-            <textarea id="md-sensitive-allow" rows="3" placeholder="one glob per line"></textarea>
-            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
-          </div>
-          <div class="md-field">
-            <label>Dependency Token Scope <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
-            <select id="md-dep-token-scope">
+          <div class="field">
+            <label class="field-label">Dependency Token Scope</label>
+            <select class="select" id="md-dep-token-scope">
               <option value="">Off (default)</option>
               <option value="installation">All repos the App can access (read-only)</option>
             </select>
-            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos. When enabled, the runner mounts a scoped installation token as a git credential helper and sets <code>COMPOSER_AUTH</code>, so private dependencies resolve automatically during the install step.</div>
+            <div class="field-hint">Lets the run read private sibling repos while installing dependencies. It can never write to them. Leave off unless builds need it.</div>
+            <details class="explain">
+              <summary>How the token is scoped</summary>
+              <div class="explain-body">The run receives a second token, installation-wide but strictly read-only, fetched over the runner callback and installed as a git credential helper for github.com and as <span class="mono">COMPOSER_AUTH</span>. So private dependencies resolve during the install step, and the run still cannot push anywhere but its own target repository.</div>
+              <div class="explain-body">The scope is all-or-nothing: it reads every repository the App installation covers, not a chosen subset. It also needs a publicly reachable orchestrator &mdash; a run dispatched without a progress token skips the fetch and proceeds without private-dependency access rather than failing.</div>
+            </details>
           </div>
-        </fieldset>
-        <fieldset>
-          <legend>Execution</legend>
-          <div class="md-field">
-            <label>Mode</label>
-            <select id="md-exec-mode" onchange="onExecModeChange()">
-              <option value="github-actions">github-actions</option>
-              <option value="fly-machines">fly-machines</option>
-            </select>
-          </div>
-          <div class="md-field">
-            <label>Session Mode</label>
-            <select id="md-session-mode">
-              <option value="autonomous">autonomous</option>
-              <option value="interactive">interactive</option>
-              <option value="hybrid">hybrid</option>
-            </select>
-          </div>
-          <div id="md-fly-fields" class="hidden">
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
-              <div class="md-field" style="margin-bottom:0"><label>CPUs</label><input id="md-cpus" type="number" min="1" value="2"></div>
-              <div class="md-field" style="margin-bottom:0"><label>Memory (MB)</label><input id="md-mem" type="number" min="256" step="256" value="4096"></div>
+        </div>
+      </div>
+      <div data-md-panel="execution" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Execution</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Where runs execute, and what the runner process receives.</p>
+        <div style="display:grid;gap:12px">
+          <div id="md-local-docker-note" class="alert info hidden">
+            <div class="alert-icon">&#8505;</div>
+            <div>
+              <div class="alert-title">Filesystem tickets use local Docker</div>
+              <div class="alert-desc">With <span class="mono">RUNNER_MODE=local</span>, this project runs in the local Docker runner and still opens real GitHub PRs for review iteration. No Fly credentials are needed for this path.</div>
             </div>
           </div>
-          <div class="md-field">
-            <label>Extra Env (KEY=VALUE, one per line)</label>
-            <textarea id="md-env" rows="4" placeholder="KEY=VALUE&#10;ANOTHER=value"></textarea>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="field">
+              <label class="field-label">Mode</label>
+              <select class="select" id="md-exec-mode" onchange="onExecModeChange()">
+                <option value="github-actions">github-actions</option>
+                <option value="fly-machines">fly-machines</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field-label">Session Mode</label>
+              <select class="select" id="md-session-mode">
+                <option value="autonomous">autonomous</option>
+                <option value="interactive">interactive</option>
+                <option value="hybrid">hybrid</option>
+              </select>
+            </div>
           </div>
-        </fieldset>
-      </div>
-      <fieldset>
-        <legend>Planning</legend>
-        <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
-          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-planning" type="checkbox" style="width:auto" onchange="onPlanningChange()"> Enabled</label>
-          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-approve" type="checkbox" style="width:auto" checked> Auto-approve</label>
-          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-merge" type="checkbox" style="width:auto"> Auto-merge child PRs</label>
-          <div id="md-planning-wf-wrap" class="md-field hidden" style="flex:1;min-width:160px;margin-bottom:0">
-            <label>Planning Workflow File</label><input id="md-planning-wf" value="claude-plan.yml">
+          <div id="md-fly-fields" class="hidden" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+            <div class="field">
+              <label class="field-label">CPUs</label>
+              <input class="input" id="md-cpus" type="number" min="1" value="2">
+            </div>
+            <div class="field">
+              <label class="field-label">Memory (MB)</label>
+              <input class="input" id="md-mem" type="number" min="256" step="256" value="4096">
+            </div>
+            <div class="field">
+              <label class="field-label" for="md-cpu-kind">CPU kind</label>
+              <select class="select" id="md-cpu-kind">
+                <option value="shared">shared</option>
+                <option value="performance">performance</option>
+              </select>
+              <div class="field-hint">Fly limits a shared CPU. Use performance for a project whose tests use the CPU for more than some minutes. Performance needs 2048 MB or more for each CPU.</div>
+            </div>
           </div>
-        </div>
-      </fieldset>
-      <fieldset>
-        <legend>Claude Provider</legend>
-        <div style="display:flex;gap:20px;align-items:flex-end;flex-wrap:wrap">
-          <div class="md-field" style="margin-bottom:0;min-width:140px">
-            <label>Provider</label>
-            <select id="md-provider" onchange="onProviderChange()">
-              <option value="anthropic">anthropic</option>
-              <option value="bedrock">bedrock</option>
+          <div class="field">
+            <label class="field-label">Review process</label>
+            <select class="select" id="md-review-process">
+              <option value="ai-implement">AI-Implement</option>
+              <option value="claude-code-review">Claude Code Review</option>
+              <option value="codex-code-review">Codex Code Review</option>
+              <option value="claude-code-review-repository-fix">Claude Code Review, repository auto-fix</option>
             </select>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Applies to every project; Restate coordinates AI-Implement fix attempts on every backend.</div>
           </div>
-          <div id="md-aws-region-wrap" class="md-field hidden" style="flex:1;min-width:180px;margin-bottom:0">
-            <label>AWS Region</label><input id="md-aws-region" placeholder="us-west-2">
+          <div class="field">
+            <label class="field-label">Trusted Review Authors</label>
+            <textarea class="textarea" id="md-trusted-review-authors" rows="3" placeholder="topia-ai-implement-bot[bot]"></textarea>
+            <div class="field-hint">Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Extra Env</label>
+            <textarea class="textarea" id="md-env" rows="4" placeholder="LOG_LEVEL=debug&#10;FEATURE_FLAG=on"></textarea>
+            <div class="field-hint">One KEY=VALUE per line. Unlike secrets, these reach the model process and are visible to the agent.</div>
           </div>
         </div>
-      </fieldset>
-    </div>
-    <div class="md-footer">
-      <div id="md-error" class="error hidden" style="margin-bottom:8px"></div>
-      <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button class="btn btn-ghost" onclick="closeMappingDialog()">Cancel</button>
-        <button id="md-save" class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
       </div>
+      <div data-md-panel="capacity" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Capacity</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">How much work this project may have running, and how long each run may take. Every cap applies to re-dispatches as well as initial runs.</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="field">
+            <label class="field-label">Max AI Issues</label>
+            <input class="input" id="md-max-ai" type="number" min="1" value="3">
+            <div class="field-hint">Issues in flight at once for this project. Required.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Max Turns</label>
+            <input class="input" id="md-max-turns" type="number" min="1" step="1" placeholder="50">
+            <div class="field-hint">Claude turns per implement pass. Blank = 50.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Max Iterations</label>
+            <input class="input" id="md-max-iter" type="number" min="1" step="1" placeholder="3">
+            <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">PR Dispatch Budget</label>
+            <input class="input" id="md-pr-budget" type="number" min="1" step="1" placeholder="4">
+            <div class="field-hint">Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.</div>
+          </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Reviewers</label>
+            <div id="md-reviewer-list"></div>
+            <div style="display:flex;gap:8px;align-items:flex-end;margin-top:8px">
+              <input class="input mono" id="md-reviewer-id" placeholder="reviewer id" style="flex:1;min-width:0">
+              <button class="btn btn-sm" type="button" onclick="addProjectReviewer()">Add reviewer</button>
+            </div>
+            <div class="field-hint">Blank = gap-analysis and code-review both run and gate. Reviewer Max turns blank = inherit the reviewer default or global limit.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Job Timeout (min)</label>
+            <input class="input" id="md-max-job-min" type="number" min="1" step="1" placeholder="90">
+            <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
+          </div>
+        </div>
+      </div>
+      <div data-md-panel="guardrails" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Guardrails</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Files a run is refused permission to push. AI-Implement already blocks a built-in list; these two settings extend it and carve holes in it.</p>
+        <div style="display:grid;gap:12px">
+          <div class="field">
+            <label class="field-label">Additional protected files</label>
+            <textarea class="textarea" id="md-sensitive-add" rows="3" placeholder="infra/**&#10;*.pem&#10;deploy/production.yml"></textarea>
+            <div class="field-hint">One file pattern per line, on top of the built-in list. <span class="mono">*</span> matches within one path segment, <span class="mono">**</span> matches across segments. Blank = none.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Exceptions to those rules</label>
+            <textarea class="textarea" id="md-sensitive-allow" rows="3" placeholder="infra/README.md&#10;deploy/example.yml"></textarea>
+            <div class="field-hint">One file pattern per line. Same syntax as above.</div>
+          </div>
+          <div class="alert warn">
+            <div class="alert-icon">&#9888;</div>
+            <div>
+              <div class="alert-title">Exceptions win over every other rule</div>
+              <div class="alert-desc">A file matching an exception is pushed even when it also matches the built-in list or a pattern added above.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div data-md-panel="provider" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Provider</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Which Claude backend runs this project, and whether it plans before implementing.</p>
+        <div style="display:grid;gap:18px">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="field">
+              <label class="field-label">Provider</label>
+              <select class="select" id="md-provider" onchange="onProviderChange()">
+                <option value="anthropic">anthropic</option>
+                <option value="bedrock">bedrock</option>
+              </select>
+              <div class="field-hint">Bedrock requires the GitHub Actions execution mode.</div>
+            </div>
+            <div id="md-aws-region-wrap" class="field hidden">
+              <label class="field-label">AWS Region</label>
+              <input class="input mono" id="md-aws-region" placeholder="us-west-2">
+              <div class="field-hint">Where your Bedrock inference profile is deployed.</div>
+            </div>
+          </div>
+          <div>
+            <div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:10px">Planning</div>
+            <label class="checkbox-row"><input id="md-planning" type="checkbox" onchange="onPlanningChange()"> Enabled &mdash; Claude posts a plan to the ticket before implementing</label>
+            <label class="checkbox-row"><input id="md-auto-approve" type="checkbox" checked> Auto-approve plans</label>
+            <label class="checkbox-row"><input id="md-auto-merge" type="checkbox"> Auto-merge child PRs into their grouping branch</label>
+            <div id="md-planning-wf-wrap" class="field hidden" style="max-width:260px;margin-top:10px">
+              <label class="field-label">Planning Workflow File</label>
+              <input class="input mono" id="md-planning-wf" value="claude-plan.yml">
+            </div>
+          </div>
+        </div>
+      </div>
+      <div data-md-panel="agents" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Agents</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 12px">Each field inherits the orchestrator default or overrides it for this project only. Legacy runs ignore these overrides until the project becomes configured.</p>
+        <div id="md-agents-new" class="field-hint hidden">Save the mapping first. Agent settings attach to an existing project key.</div>
+        <div id="md-agents-body">
+          <div id="md-agents-mode" class="field-hint"></div>
+          <div id="md-agents-profiles" style="margin:12px 0"></div>
+          <div id="md-agents-stages"></div>
+          <div class="field-hint" style="margin-top:12px">Changes apply to the next run only; runs already in flight keep their settings. Prompts and review rules stay in the repository, and there is no per-issue override. Agent settings are saved with their own button, separately from the mapping.</div>
+          <div id="md-agents-error" class="error hidden" role="alert" style="margin-top:10px"></div>
+          <div id="md-agents-ok" class="field-hint hidden" style="margin-top:10px"></div>
+          <div style="margin-top:12px"><button type="button" id="md-agents-save" class="btn btn-accent" onclick="saveAgentConfig()">Save agent settings</button></div>
+        </div>
+      </div>
+    </div>
+    <div id="md-error" class="error hidden" style="margin:0 20px"></div>
+    <div class="md-footer">
+      <button class="btn btn-ghost" onclick="closeMappingDialog()">Cancel</button>
+      <button id="md-save" class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
     </div>
   </dialog>
+
+  ${stepperHtml}
 </section>
 `;
 
@@ -237,14 +436,87 @@ export const projectsScript = `
   let currentSecretsTeam = null;
   let pendingJiraRepoFieldValue = '';
   let jiraFieldsLoaded = false;
+  let reviewerDraft = [];
+  let reviewerDefaultUntouched = true;
+
+  // The stored setup-check run as { run }, its run null before the first run, or null while it cannot be read.
+  async function loadSetupRun() {
+    try {
+      const res = await window.api('/api/setup-checks');
+      if (!res.ok) return null;
+      return { run: (await res.json()).run || null };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // One marker for a set of a project's rows: their verdict, with how many to look at in its title.
+  // The page's one notice links to the Setup page, rather than each marker, since Setup lists every project.
+  function setupMarker(rows, checked) {
+    const verdict = window.setupVerdict(rows);
+    if (!verdict) return '<span class="text-tertiary" title="No optional feature applies to this project">—</span>';
+    const title = verdict.toLook ? verdict.toLook + ' ' + (verdict.toLook === 1 ? 'check' : 'checks') + ' to look at. ' + checked : checked;
+    return '<span title="' + window.escAttr(title) + '">' + window.statusBadge(verdict.kind, verdict.label) + '</span>';
+  }
+
+  // A project's own rows in the stored run, empty for a project no run has checked.
+  function ownSetupRows(key, stored) {
+    return stored && stored.run ? stored.run.results.filter(function (row) { return row.project === key; }) : [];
+  }
+
+  // A project's two setup cells from the stored run: the checks its configuration requires (core and mode tiers),
+  // then its optional features. A row that does not apply, or a check that can never be verified, moves neither.
+  // Null for a project no run has checked yet, which gets a button to check it instead.
+  function setupCells(key, stored) {
+    if (!stored) {
+      return ['<span class="text-tertiary" title="The stored setup checks cannot be read right now, so this project\\'s setup is unknown">Unavailable</span>', ''];
+    }
+    const own = ownSetupRows(key, stored);
+    if (!own.length) return null;
+    // Dated by the project's oldest row, since a recheck refreshes one row at a time.
+    const checked = 'Checked ' + window.fmtAgo(Math.min.apply(null, own.map(function (row) { return row.checkedAt || stored.run.checkedAt; })));
+    return [
+      setupMarker(own.filter(function (row) { return row.tier !== 'feature'; }), checked),
+      setupMarker(own.filter(function (row) { return row.tier === 'feature'; }), checked),
+    ];
+  }
+
+  // The page's one pointer to the Setup page, shown while any checked project has a marker that does not pass.
+  function renderSetupNote(keys, stored) {
+    const note = document.getElementById('projects-setup-note');
+    if (!note) return;
+    const toLook = keys.filter(function (key) {
+      const own = ownSetupRows(key, stored);
+      const verdict = own.length ? window.setupVerdict(own) : null;
+      return verdict && verdict.toLook > 0;
+    }).length;
+    note.hidden = toLook === 0;
+    document.getElementById('projects-setup-note-count').textContent = toLook === 1
+      ? '1 project has a setup check that does not pass.'
+      : toLook + ' projects have setup checks that do not pass.';
+  }
+
+  // Runs the checks of a project no run has checked yet, then redraws the table with its markers.
+  async function checkProjectSetup(key, button) {
+    button.disabled = true;
+    button.textContent = 'Checking…';
+    if (await runProjectSetupChecks(key)) {
+      await loadMappings();
+      return;
+    }
+    button.disabled = false;
+    button.textContent = 'Check setup';
+    alert('The setup checks for ' + key + ' could not run. Try again shortly.');
+  }
 
   async function loadMappings() {
-    const res = await window.api('/api/mappings');
+    const [res, storedSetup] = await Promise.all([window.api('/api/mappings'), loadSetupRun()]);
     mappingsData = await res.json();
     const tbody = document.getElementById('mappings-body');
     const emptyEl = document.getElementById('mappings-empty');
     tbody.innerHTML = '';
     const keys = Object.keys(mappingsData);
+    renderSetupNote(keys, storedSetup);
     if (keys.length === 0) {
       if (emptyEl) emptyEl.classList.remove('hidden');
       return;
@@ -268,15 +540,25 @@ export const projectsScript = `
         ? '<span class="badge warn">paused</span>'
         : '<span class="badge success">active</span>';
       const pauseLabel = m.paused ? 'Resume' : 'Pause';
+      const setup = setupCells(key, storedSetup);
       tr.innerHTML = '<td class="mono">' + ek + '</td>'
         + '<td class="mono">' + window.esc(m.owner) + '/' + window.esc(m.repo) + '</td>'
         + '<td>' + execBadge + '</td>'
-        + '<td style="color:#666;font-size:0.85em">' + window.esc(m.sessionMode || 'autonomous') + '</td>'
+        + '<td style="color:var(--fg-tertiary);font-size:0.85em">' + window.esc(m.sessionMode || 'autonomous') + '</td>'
         + '<td style="text-align:center">' + window.esc(String(m.maxInProgressAiIssues ?? 3)) + '</td>'
         + '<td>' + planBadge + '</td>'
         + '<td>' + providerBadge + '</td>'
         + '<td>' + statusBadge + '</td>'
+        + '<td class="setup-required" style="white-space:nowrap">' + (setup ? setup[0] : '') + '</td>'
+        + '<td style="white-space:nowrap">' + (setup ? setup[1] : '') + '</td>'
         + '<td style="white-space:nowrap"></td>';
+      if (!setup) {
+        const checkBtn = document.createElement('button');
+        checkBtn.className = 'btn btn-sm';
+        checkBtn.textContent = 'Check setup';
+        checkBtn.addEventListener('click', function () { checkProjectSetup(key, checkBtn); });
+        tr.querySelector('.setup-required').appendChild(checkBtn);
+      }
       const actionCell = tr.lastElementChild;
       const pauseBtn = document.createElement('button');
       pauseBtn.className = 'btn btn-sm';
@@ -325,6 +607,579 @@ export const projectsScript = `
     }
   }
 
+  // Staged like the Access page's allowlist: nothing is written until Save.
+  var refRepoDraft = [];
+
+  // Shown as owner/repo, matching the projects table; the stored URL rides the title.
+  function refRepoLabel(repo) {
+    var host = 'https://github.com/';
+    return repo.indexOf(host) === 0 ? repo.slice(host.length) : repo;
+  }
+
+  // Rows mirror the add row's flex proportions, which is what makes column headers
+  // unnecessary. Shared with the stepper, which passes its own draft and remove handler.
+  function refRepoRowsHtml(draft, removeFn) {
+    var cell = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    return draft.map(function (e, i) {
+      return '<div style="display:flex;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)">'
+        + '<span class="mono" style="flex:2;' + cell + '" title="' + window.escAttr(e.repo) + '">' + window.esc(refRepoLabel(e.repo)) + '</span>'
+        + '<span class="mono" style="flex:2;' + cell + '" title="' + window.escAttr(e.path) + '">'
+        + window.esc(e.path) + '</span>'
+        + '<span class="mono" style="flex:1;color:var(--fg-tertiary);' + cell + '"'
+        + (e.ref ? ' title="' + window.escAttr(e.ref) + '"' : '') + '>'
+        + (e.ref ? window.esc(e.ref) : '&mdash;') + '</span>'
+        + '<button class="btn btn-icon btn-danger" style="flex:none" onclick="'
+        + window.escAttr(removeFn) + '(' + i + ')" title="Remove">&times;</button>'
+        + '</div>';
+    }).join('');
+  }
+  window.refRepoRowsHtml = refRepoRowsHtml;
+
+  function renderRefRepos() {
+    document.getElementById('md-refrepo-list').innerHTML = refRepoRowsHtml(refRepoDraft, 'removeRefRepo');
+  }
+
+  const BUILT_IN_REVIEWERS = ['gap-analysis', 'code-review'];
+
+  function defaultReviewerDraft() {
+    return BUILT_IN_REVIEWERS.map(function (id) {
+      return { id: id, runs: true, gates: true, maxTurns: '', builtin: true };
+    });
+  }
+
+  function reviewerRowsFromSelection(selection) {
+    if (!Array.isArray(selection)) return defaultReviewerDraft();
+    var rows = BUILT_IN_REVIEWERS.map(function (id) {
+      return { id: id, runs: false, gates: true, maxTurns: '', builtin: true };
+    });
+    for (var i = 0; i < selection.length; i++) {
+      var entry = selection[i] || {};
+      if (typeof entry.id !== 'string' || !entry.id) continue;
+      var existing = rows.find(function (row) { return row.id === entry.id; });
+      var maxTurns = Number.isInteger(entry.maxTurns) ? String(entry.maxTurns) : '';
+      if (existing) {
+        existing.runs = true;
+        existing.gates = entry.gates === true;
+        existing.maxTurns = maxTurns;
+      } else {
+        rows.push({ id: entry.id, runs: true, gates: entry.gates === true, maxTurns: maxTurns, builtin: false });
+      }
+    }
+    return rows;
+  }
+
+  function renderProjectReviewers() {
+    var list = document.getElementById('md-reviewer-list');
+    var rowStyle = 'display:grid;grid-template-columns:minmax(0,1fr)92px 92px minmax(120px,150px)34px;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)';
+    list.innerHTML = reviewerDraft.map(function (reviewer, i) {
+      var remove = reviewer.builtin
+        ? '<span></span>'
+        : '<button class="btn btn-icon btn-danger" type="button" onclick="removeProjectReviewer(' + i + ')" title="Remove reviewer">&times;</button>';
+      return '<div style="' + rowStyle + '">'
+        + '<span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + window.escAttr(reviewer.id) + '">' + window.esc(reviewer.id) + '</span>'
+        + '<label class="checkbox-row" style="margin:0"><input type="checkbox" aria-label="Runs ' + window.escAttr(reviewer.id) + '" onchange="setProjectReviewerRuns(' + i + ', this.checked)"' + (reviewer.runs ? ' checked' : '') + '> Runs</label>'
+        + '<label class="checkbox-row" style="margin:0"><input type="checkbox" aria-label="Gates ' + window.escAttr(reviewer.id) + '" onchange="setProjectReviewerGates(' + i + ', this.checked)"' + (reviewer.gates ? ' checked' : '') + '> Gates</label>'
+        + '<label style="display:grid;gap:2px;margin:0;font-size:11px;color:var(--fg-tertiary)">Max turns<input class="input" type="number" min="1" max="200" step="1" placeholder="inherit" aria-label="Max turns for ' + window.escAttr(reviewer.id) + ', blank inherits reviewer default or global limit" value="' + window.escAttr(reviewer.maxTurns || '') + '" onchange="setProjectReviewerMaxTurns(' + i + ', this.value)" style="height:30px;padding:4px 8px"></label>'
+        + remove
+        + '</div>';
+    }).join('');
+  }
+
+  function markProjectReviewersTouched() {
+    reviewerDefaultUntouched = false;
+  }
+
+  function setProjectReviewerRuns(i, checked) {
+    if (!reviewerDraft[i]) return;
+    reviewerDraft[i].runs = checked;
+    markProjectReviewersTouched();
+  }
+  window.setProjectReviewerRuns = setProjectReviewerRuns;
+
+  function setProjectReviewerGates(i, checked) {
+    if (!reviewerDraft[i]) return;
+    reviewerDraft[i].gates = checked;
+    markProjectReviewersTouched();
+  }
+  window.setProjectReviewerGates = setProjectReviewerGates;
+
+  function setProjectReviewerMaxTurns(i, value) {
+    if (!reviewerDraft[i]) return;
+    reviewerDraft[i].maxTurns = String(value || '').trim();
+    markProjectReviewersTouched();
+  }
+  window.setProjectReviewerMaxTurns = setProjectReviewerMaxTurns;
+
+  function stageProjectReviewer() {
+    var input = document.getElementById('md-reviewer-id');
+    var id = input.value.trim();
+    if (!id) return 'Reviewer id is required.';
+    if (reviewerDraft.some(function (reviewer) { return reviewer.id === id; })) {
+      return 'Reviewer ' + id + ' is already listed.';
+    }
+    reviewerDraft.push({ id: id, runs: true, gates: true, maxTurns: '', builtin: false });
+    input.value = '';
+    markProjectReviewersTouched();
+    renderProjectReviewers();
+    return null;
+  }
+
+  function addProjectReviewer() {
+    var problem = stageProjectReviewer();
+    if (problem) showMappingError(problem, 'capacity');
+    else document.getElementById('md-error').classList.add('hidden');
+  }
+  window.addProjectReviewer = addProjectReviewer;
+
+  function removeProjectReviewer(i) {
+    if (!reviewerDraft[i] || reviewerDraft[i].builtin) return;
+    reviewerDraft.splice(i, 1);
+    markProjectReviewersTouched();
+    renderProjectReviewers();
+  }
+  window.removeProjectReviewer = removeProjectReviewer;
+
+  function pendingProjectReviewer() {
+    return document.getElementById('md-reviewer-id').value.trim() !== '';
+  }
+
+  function reviewerValue() {
+    if (reviewerDefaultUntouched) return null;
+    return reviewerDraft
+      .filter(function (reviewer) { return reviewer.runs; })
+      .map(function (reviewer) {
+        var value = { id: reviewer.id, gates: reviewer.gates === true };
+        var maxTurnsText = String(reviewer.maxTurns || '').trim();
+        if (maxTurnsText !== '') value.maxTurns = Number(maxTurnsText);
+        return value;
+      });
+  }
+
+  function projectReviewerProblem() {
+    for (var i = 0; i < reviewerDraft.length; i++) {
+      var reviewer = reviewerDraft[i];
+      if (!reviewer || !reviewer.runs) continue;
+      var maxTurnsText = String(reviewer.maxTurns || '').trim();
+      if (maxTurnsText === '') continue;
+      var maxTurns = Number(maxTurnsText);
+      if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 200) {
+        return 'Reviewer ' + reviewer.id + ' Max turns must be blank or an integer from 1 to 200.';
+      }
+    }
+    return null;
+  }
+
+  // A looser echo of the server's rules, so a mistyped entry fails at the row rather than
+  // at Save. selfIndex is the draft position being re-checked, or -1 for a new entry.
+  function refRepoProblem(repo, path, draft, selfIndex) {
+    if (selfIndex < 0 && draft.length >= 10) return 'Up to ten reference repositories per project.';
+    if (!repo || !path) return 'A reference repository needs both a repository and a workspace path.';
+    // Lowercased for the test only: the server compares a parsed, lowercased hostname.
+    var isUrl = repo.toLowerCase().indexOf('https://github.com/') === 0;
+    var isShorthand = repo.split('/').length === 2 && repo.indexOf(':') === -1
+      && repo.indexOf('@') === -1 && repo.charAt(0) !== '/' && repo.charAt(repo.length - 1) !== '/';
+    if (!isUrl && !isShorthand) {
+      return 'Repository must be owner/repo or an https://github.com/owner/repo URL, with no credentials in it.';
+    }
+    // A drive letter, matching the server's [A-Za-z]: rather than any second-character colon.
+    var head = path.charAt(0);
+    var isDrive = path.charAt(1) === ':' && ((head >= 'a' && head <= 'z') || (head >= 'A' && head <= 'Z'));
+    if (head === '/' || isDrive) return 'Path must be relative to the workspace, not absolute.';
+    // Four backslashes here yield one in the emitted script: this module is a template literal.
+    if (path.indexOf('\\\\') !== -1) return 'Path must use forward slashes.';
+    if (path === '..' || path.indexOf('../') === 0 || path.indexOf('/../') !== -1) {
+      return 'Path must stay inside the workspace.';
+    }
+    if (path === '.git' || path.indexOf('.git/') === 0) return 'Path must not write into the repository .git directory.';
+    for (var j = 0; j < draft.length; j++) {
+      if (j !== selfIndex && draft[j].path === path) return 'Another entry already uses the path ' + path + '.';
+    }
+    return null;
+  }
+  window.refRepoProblem = refRepoProblem;
+
+  // Stored entries never pass through the add row, so a value saved before a rule tightened
+  // is only caught here.
+  function refRepoDraftProblem() {
+    for (var i = 0; i < refRepoDraft.length; i++) {
+      var problem = refRepoProblem(refRepoDraft[i].repo, refRepoDraft[i].path, refRepoDraft, i);
+      if (problem) return refRepoLabel(refRepoDraft[i].repo) + ' → ' + refRepoDraft[i].path + ': ' + problem;
+    }
+    return null;
+  }
+
+  // Shared with the stepper, which reads its own inputs and passes raw values so the
+  // trailing-slash rule stays in one place. Returns a problem message, or null on success.
+  function refRepoStage(values, draft) {
+    var repo = (values.repo || '').trim();
+    var path = (values.path || '').trim();
+    while (path.length > 1 && path.charAt(path.length - 1) === '/') path = path.slice(0, -1);
+    var ref = (values.ref || '').trim();
+    var problem = refRepoProblem(repo, path, draft, -1);
+    if (problem) return problem;
+    draft.push(ref ? { repo: repo, path: path, ref: ref } : { repo: repo, path: path });
+    return null;
+  }
+  window.refRepoStage = refRepoStage;
+
+  function stageRefRepo() {
+    var problem = refRepoStage({
+      repo: document.getElementById('md-refrepo-repo').value,
+      path: document.getElementById('md-refrepo-path').value,
+      ref: document.getElementById('md-refrepo-ref').value,
+    }, refRepoDraft);
+    if (problem) return problem;
+    clearRefRepoInputs();
+    renderRefRepos();
+    return null;
+  }
+
+  function addRefRepo() {
+    var problem = stageRefRepo();
+    // No tab argument: switching scrolls the body to the top, moving the row out of view.
+    if (problem) showMappingError(problem);
+    else document.getElementById('md-error').classList.add('hidden');
+  }
+  window.addRefRepo = addRefRepo;
+
+  var REFREPO_INPUTS = ['md-refrepo-repo', 'md-refrepo-path', 'md-refrepo-ref'];
+
+  function clearRefRepoInputs() {
+    for (var k = 0; k < REFREPO_INPUTS.length; k++) document.getElementById(REFREPO_INPUTS[k]).value = '';
+  }
+
+  function pendingRefRepo() {
+    for (var k = 0; k < REFREPO_INPUTS.length; k++) {
+      if (document.getElementById(REFREPO_INPUTS[k]).value.trim()) return true;
+    }
+    return false;
+  }
+
+  function removeRefRepo(i) {
+    refRepoDraft.splice(i, 1);
+    renderRefRepos();
+  }
+  window.removeRefRepo = removeRefRepo;
+
+  function refRepoValue() {
+    return refRepoDraft.length ? refRepoDraft : null;
+  }
+
+
+  // ---- Agents tab: mode and inherited stage settings (AII-968) ----
+  var AG_STAGES = ['planning', 'implementation', 'review'];
+  var AG_FIELDS = ['agent', 'provider', 'model', 'fallbackModel', 'accountProfileId', 'invocationTimeoutMs'];
+  var AG_LABELS = { agent: 'Agent', provider: 'Provider', model: 'Model', fallbackModel: 'Fallback model', accountProfileId: 'Account profile', invocationTimeoutMs: 'Invocation timeout (ms)' };
+  var AG_ERRORS = {
+    resolution_failed: 'These settings do not resolve to a usable configuration. Check that every stage has an agent, provider, model, profile and timeout.',
+    readiness_unavailable: 'Readiness could not be checked right now. Nothing was changed; try again later.',
+    stale_inputs: 'Defaults, a profile or this project changed while saving. The view was refreshed; review it and save again.',
+    runner_incompatible: 'The project runner is not compatible with configured agents yet.',
+    retired_workflow_present: 'The project still carries a retired workflow file.',
+    delivery_unreadable: 'The workflow files could not be read. Run the workflow sync and try again.'
+  };
+  var agentState = null;
+  var agentLoadPromise = Promise.resolve();
+
+  function agText(v) { return v === undefined || v === null ? '' : String(v); }
+
+  function agStoredValue(stage, field) {
+    var st = agentState.stored[stage];
+    var v = st ? st[field] : undefined;
+    return v === undefined || v === null ? undefined : v;
+  }
+
+  function agDefaultValue(stage, field) {
+    var st = agentState.defaults[stage];
+    var v = st ? st[field] : undefined;
+    return v === undefined || v === null ? undefined : v;
+  }
+
+  function agDraft(stage, field) { return agentState.draft[stage][field]; }
+
+  function agEffective(stage, field) {
+    var d = agDraft(stage, field);
+    if (d.mode === 'override' && agText(d.value) !== '') return { value: d.value, source: 'project' };
+    var dv = agDefaultValue(stage, field);
+    return dv === undefined ? { value: undefined, source: 'unset' } : { value: dv, source: 'orchestrator default' };
+  }
+
+  function agEligibleProfiles(stage) {
+    var agent = agEffective(stage, 'agent').value;
+    var provider = agEffective(stage, 'provider').value;
+    return agentState.accounts.filter(function (a) {
+      return a.profileStatus === 'active'
+        && a.agent === agent && a.provider === provider;
+    });
+  }
+
+  function agStageProblem(stage) {
+    var profile = agEffective(stage, 'accountProfileId').value;
+    if (profile === undefined) return 'No account profile is selected for ' + stage + '.';
+    var ok = agEligibleProfiles(stage).some(function (a) { return a.profileId === profile; });
+    return ok ? '' : 'The profile for ' + stage + ' is not active, or does not match the agent and provider.';
+  }
+
+  function agPreviewText(stage, field) {
+    var e = agEffective(stage, field);
+    return 'Effective: ' + (e.value === undefined ? 'not set' : String(e.value)) + ' (source: ' + e.source + ')';
+  }
+
+  function agValueControl(stage, field) {
+    var d = agDraft(stage, field);
+    var dis = d.mode === 'inherit' ? ' disabled' : '';
+    var attrs = ' data-ag-value data-stage="' + window.escAttr(stage) + '" data-field="' + window.escAttr(field) + '" aria-label="' + window.escAttr(AG_LABELS[field] + ' for ' + stage) + '"' + dis;
+    if (field === 'agent' || field === 'provider') {
+      var opts = field === 'agent' ? ['claude', 'codex'] : ['anthropic', 'bedrock', 'openai', 'openrouter'];
+      var shown = d.mode === 'inherit' ? agText(agDefaultValue(stage, field)) : agText(d.value);
+      return '<select class="select"' + attrs + '><option value=""' + (opts.indexOf(shown) === -1 ? ' selected' : '') + ' disabled>Inherited</option>' + opts.map(function (o) {
+        return '<option value="' + window.escAttr(o) + '"' + (shown === o ? ' selected' : '') + '>' + window.esc(o) + '</option>';
+      }).join('') + '</select>';
+    }
+    if (field === 'accountProfileId') {
+      var eligible = agEligibleProfiles(stage);
+      var html = '<select class="select"' + attrs + '><option value=""></option>';
+      html += eligible.map(function (a) {
+        return '<option value="' + window.escAttr(a.profileId) + '"' + (String(d.value) === a.profileId ? ' selected' : '') + '>' + window.esc(a.identity + ' (' + a.profileId + ')') + '</option>';
+      }).join('');
+      return html + '</select>';
+    }
+    return '<input class="input mono"' + (field === 'invocationTimeoutMs' ? ' inputmode="numeric"' : '') + attrs + ' value="' + window.escAttr(agText(d.value)) + '">';
+  }
+
+  function agRenderProfiles() {
+    var el = document.getElementById('md-agents-profiles');
+    var rows = agentState.accounts.filter(function (a) {
+      return a.profileStatus === 'active';
+    });
+    if (!rows.length) {
+      el.innerHTML = '<div class="field-hint">No active account profile exists. Add one under model accounts first.</div>';
+      return;
+    }
+    el.innerHTML = '<div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:6px">Active account profiles</div>' + rows.map(function (a) {
+      var acct = a.account || {};
+      var line = a.identity + ' (' + a.profileId + ') · ' + a.agent + '/' + a.provider + ' · ' + a.authMode + ' · readiness: ' + agText(acct.readiness || 'unknown');
+      if (acct.failureCode) line += ' (' + acct.failureCode + ')';
+      return '<div class="field-hint" data-ag-profile="' + window.escAttr(a.profileId) + '">' + window.esc(line) + '</div>';
+    }).join('');
+  }
+
+  function agRender() {
+    if (!agentState) return;
+    document.getElementById('md-agents-mode').textContent = 'Mode: ' + agentState.mode + '. An admin changes it with the tool set_project_agent_mode.';
+    agRenderProfiles();
+    document.getElementById('md-agents-stages').innerHTML = AG_STAGES.map(function (stage) {
+      var rows = AG_FIELDS.map(function (field) {
+        var d = agDraft(stage, field);
+        var sel = '<select class="select" data-ag-mode data-stage="' + window.escAttr(stage) + '" data-field="' + window.escAttr(field) + '" aria-label="' + window.escAttr(AG_LABELS[field] + ' mode for ' + stage) + '">'
+          + '<option value="inherit"' + (d.mode === 'inherit' ? ' selected' : '') + '>Inherit</option>'
+          + '<option value="override"' + (d.mode === 'override' ? ' selected' : '') + '>Override</option></select>';
+        return '<div style="display:grid;grid-template-columns:150px 110px 1fr;gap:8px;align-items:center;margin-bottom:6px">'
+          + '<label class="field-label" style="margin:0">' + window.esc(AG_LABELS[field]) + '</label>' + sel
+          + '<div>' + agValueControl(stage, field) + (field === 'fallbackModel' ? '<div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div>' : '') + '<div class="field-hint" data-ag-preview="' + window.escAttr(stage + '.' + field) + '">' + window.esc(agPreviewText(stage, field)) + '</div></div></div>';
+      }).join('');
+      if (stage === 'implementation') rows += '<label><input type="checkbox" id="md-agents-open-model"' + (agentState.preferOpenModel ? ' checked' : '') + '> Use the open model for implementation</label><div class="field-hint">Not active yet. The value is saved, and no run uses it.</div>';
+      var problem = agStageProblem(stage);
+      return '<div style="margin-bottom:14px"><div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:8px">' + window.esc(stage) + '</div>' + rows
+        + (problem ? '<div class="field-hint" data-ag-problem="' + window.escAttr(stage) + '">' + window.esc(problem) + '</div>' : '') + '</div>';
+    }).join('');
+  }
+
+  function agUpdatePreviews() {
+    for (var i = 0; i < AG_STAGES.length; i++) {
+      for (var j = 0; j < AG_FIELDS.length; j++) {
+        var el = document.querySelector('[data-ag-preview="' + AG_STAGES[i] + '.' + AG_FIELDS[j] + '"]');
+        if (el) el.textContent = agPreviewText(AG_STAGES[i], AG_FIELDS[j]);
+      }
+    }
+  }
+
+  function agBuildState(key, cfg, defaults, accounts) {
+    var stored = (cfg && cfg.stages && typeof cfg.stages === 'object') ? cfg.stages : {};
+    var defs = (defaults && defaults.stages && typeof defaults.stages === 'object') ? defaults.stages : {};
+    agentState = { key: key, mode: cfg && cfg.mode === 'configured' ? 'configured' : 'legacy', stored: stored, defaults: defs, accounts: Array.isArray(accounts) ? accounts : [], draft: {} };
+    agentState.preferOpenModel = !!(stored.implementation && stored.implementation.preferOpenModel);
+    AG_STAGES.forEach(function (stage) {
+      agentState.draft[stage] = {};
+      AG_FIELDS.forEach(function (field) {
+        var v = agStoredValue(stage, field);
+        agentState.draft[stage][field] = v === undefined ? { mode: 'inherit', value: '' } : { mode: 'override', value: v };
+      });
+    });
+  }
+
+  async function agFetchJson(url) {
+    var res = await window.api(url);
+    if (!res.ok) throw new Error('http ' + res.status);
+    return res.json();
+  }
+
+  function agShowLoadError() {
+    agentState = null;
+    var err = document.getElementById('md-agents-error');
+    err.textContent = 'Agent settings could not be loaded. Close and reopen the project to retry.';
+    err.classList.remove('hidden');
+    document.getElementById('md-agents-save').disabled = true;
+  }
+
+  async function loadAgentConfig(key) {
+    agentState = null;
+    document.getElementById('md-agents-stages').innerHTML = '';
+    document.getElementById('md-agents-profiles').innerHTML = '';
+    var err = document.getElementById('md-agents-error');
+    err.classList.add('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+    document.getElementById('md-agents-save').disabled = true;
+    try {
+      var results = await Promise.all([
+        agFetchJson('/api/mappings/' + encodeURIComponent(key) + '/agent-config'),
+        agFetchJson('/api/agent-defaults'),
+        agFetchJson('/api/model-accounts')
+      ]);
+      if (document.getElementById('md-team-key-orig').value !== key) return;
+      agBuildState(key, results[0], results[1], results[2].accounts);
+      document.getElementById('md-agents-save').disabled = false;
+      agRender();
+    } catch (_) {
+      if (document.getElementById('md-team-key-orig').value === key) agShowLoadError();
+    }
+  }
+  window.loadAgentConfig = loadAgentConfig;
+  window.agentConfigLoaded = function () { return agentLoadPromise; };
+
+  function agDiff() {
+    var body = {};
+    var stages = {};
+    AG_STAGES.forEach(function (stage) {
+      AG_FIELDS.forEach(function (field) {
+        var d = agDraft(stage, field);
+        var stored = agStoredValue(stage, field);
+        var next;
+        if (d.mode === 'inherit') {
+          if (stored === undefined) return;
+          next = null;
+        } else {
+          next = field === 'invocationTimeoutMs' ? Number(d.value) : String(d.value).trim();
+          if (stored === next) return;
+        }
+        stages[stage] = stages[stage] || {};
+        stages[stage][field] = next;
+      });
+    });
+    if (agentState.preferOpenModel !== !!agStoredValue('implementation', 'preferOpenModel')) {
+      stages.implementation = stages.implementation || {};
+      stages.implementation.preferOpenModel = agentState.preferOpenModel;
+    }
+    if (Object.keys(stages).length) body.stages = stages;
+    return body;
+  }
+
+  function agOverrideProblem() {
+    for (var i = 0; i < AG_STAGES.length; i++) {
+      for (var j = 0; j < AG_FIELDS.length; j++) {
+        var d = agDraft(AG_STAGES[i], AG_FIELDS[j]);
+        if (d.mode !== 'override') continue;
+        var raw = String(d.value == null ? '' : d.value).trim();
+        if (AG_FIELDS[j] === 'invocationTimeoutMs') {
+          var n = Number(raw);
+          if (!raw || !Number.isInteger(n) || n <= 0) return AG_STAGES[i] + ': ' + AG_LABELS[AG_FIELDS[j]] + ' must be a positive whole number, or switch it to Inherit.';
+        } else if (!raw) {
+          return AG_STAGES[i] + ': ' + AG_LABELS[AG_FIELDS[j]] + ' is blank. Enter a value or switch it to Inherit.';
+        }
+      }
+    }
+    return '';
+  }
+
+  function agShowError(message) {
+    var err = document.getElementById('md-agents-error');
+    err.textContent = message;
+    err.classList.remove('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+  }
+
+  async function saveAgentConfig() {
+    if (!agentState) return;
+    var key = agentState.key;
+    var saveBtn = document.getElementById('md-agents-save');
+    if (saveBtn.disabled) return;
+    document.getElementById('md-agents-error').classList.add('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+    var overrideProblem = agOverrideProblem();
+    if (overrideProblem) { agShowError(overrideProblem); return; }
+    var body = agDiff();
+    if (!Object.keys(body).length) { agShowError('Nothing to save: no agent setting changed.'); return; }
+    saveBtn.disabled = true;
+    var res, data = {};
+    try {
+      res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/agent-config', { method: 'PUT', body: JSON.stringify(body) });
+      try { data = await res.json(); } catch (_) {}
+    } catch (_) {
+      saveBtn.disabled = false;
+      agRender();
+      agShowError('Could not confirm the save. Reload and check the project before retrying.');
+      return;
+    }
+    saveBtn.disabled = false;
+    if (!res.ok) {
+      var code = data && typeof data.code === 'string' ? data.code : '';
+      var msg = AG_ERRORS[code]
+        || (data && typeof data.error === 'string' ? data.error : (res.status === 400 ? AG_ERRORS.resolution_failed : 'Could not save agent settings (HTTP ' + res.status + ').'));
+      if (code === 'stale_inputs') await loadAgentConfig(key);
+      else agRender();
+      agShowError(msg + (data && typeof data.action === 'string' ? ' ' + data.action : ''));
+      return;
+    }
+    await loadAgentConfig(key);
+    var ok = document.getElementById('md-agents-ok');
+    ok.textContent = 'Agent settings saved. They apply to the next run.';
+    ok.classList.remove('hidden');
+  }
+  window.saveAgentConfig = saveAgentConfig;
+
+  function agPrepareTab(isNew, key) {
+    var tab = document.getElementById('md-tab-agents');
+    tab.disabled = isNew;
+    document.getElementById('md-agents-new').classList.toggle('hidden', !isNew);
+    document.getElementById('md-agents-body').classList.toggle('hidden', isNew);
+    agentState = null;
+    agentLoadPromise = isNew ? Promise.resolve() : loadAgentConfig(key);
+  }
+
+  (function wireAgentPanel() {
+    var panel = document.getElementById('md-agents-body');
+    if (!panel) return;
+    panel.addEventListener('change', function (ev) {
+      if (!agentState) return;
+      var t = ev.target;
+      if (t.id === 'md-agents-open-model') {
+        agentState.preferOpenModel = t.checked;
+        return;
+      }
+      var stage = t.dataset.stage, field = t.dataset.field;
+      if (!stage || !field) return;
+      var d = agDraft(stage, field);
+      if (t.hasAttribute('data-ag-mode')) {
+        if (t.value === 'inherit') { d.mode = 'inherit'; d.value = ''; }
+        else {
+          d.mode = 'override';
+          var seed = agStoredValue(stage, field);
+          d.value = seed !== undefined ? seed : agText(agDefaultValue(stage, field));
+        }
+      } else if (t.hasAttribute('data-ag-value')) {
+        d.value = t.value;
+      }
+      agRender();
+    });
+    panel.addEventListener('input', function (ev) {
+      if (!agentState) return;
+      var t = ev.target;
+      if (!t.hasAttribute || !t.hasAttribute('data-ag-value') || t.tagName !== 'INPUT') return;
+      agDraft(t.dataset.stage, t.dataset.field).value = t.value;
+      agUpdatePreviews();
+    });
+  })();
+
   function openMappingDialog(key) {
     const isNew = !key;
     document.getElementById('md-title').textContent = isNew ? 'Add Mapping' : 'Edit Mapping: ' + key;
@@ -334,12 +1189,13 @@ export const projectsScript = `
 
     const m = key ? (mappingsData[key] || {}) : {};
     document.getElementById('md-team-key').value = key || '';
-    document.getElementById('md-github-repo').value = (m.owner && m.repo) ? (m.owner + '/' + m.repo) : (m.owner || m.repo || '');
+    document.getElementById('md-github-repo').value = m.owner && m.repo ? m.owner + '/' + m.repo : '';
     document.getElementById('md-wf').value = m.workflowFile || 'claude-implement.yml';
     document.getElementById('md-branch').value = m.defaultBranch || '';
     document.getElementById('md-max-ai').value = String(m.maxInProgressAiIssues ?? 3);
     document.getElementById('md-exec-mode').value = m.executionMode || 'github-actions';
     document.getElementById('md-session-mode').value = m.sessionMode || 'autonomous';
+    document.getElementById('md-cpu-kind').value = m.machineCpuKind ?? 'shared';
     document.getElementById('md-cpus').value = String(m.machineCpus ?? 2);
     document.getElementById('md-mem').value = String(m.machineMemoryMb ?? 4096);
     document.getElementById('md-env').value = envToText(m.extraEnv);
@@ -351,36 +1207,55 @@ export const projectsScript = `
     document.getElementById('md-aws-region').value = m.awsRegion || '';
     document.getElementById('md-max-turns').value = m.maxTurns == null ? '' : String(m.maxTurns);
     document.getElementById('md-max-iter').value = m.maxIterations == null ? '' : String(m.maxIterations);
+    document.getElementById('md-pr-budget').value = m.prDispatchBudget == null ? '' : String(m.prDispatchBudget);
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
+    reviewerDraft = reviewerRowsFromSelection(m.reviewers);
+    reviewerDefaultUntouched = !Array.isArray(m.reviewers);
+    document.getElementById('md-reviewer-id').value = '';
+    renderProjectReviewers();
     document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
     document.getElementById('md-skills-repo').value = m.skillsRepo || '';
     document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
     document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
     document.getElementById('md-dep-token-scope').value = m.dependencyTokenScope || '';
+    document.getElementById('md-review-process').value = m.reviewProcess || 'ai-implement';
+    document.getElementById('md-trusted-review-authors').value = (m.trustedReviewAuthors || []).join('\\n');
+    // slice() so editing the draft never mutates the cached mapping behind it.
+    refRepoDraft = (m.referenceRepos || []).slice();
+    // The add row survives a Cancel, so an abandoned attempt would reappear on the next open.
+    clearRefRepoInputs();
+    renderRefRepos();
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
-    document.getElementById('md-ticketing-provider').value = tp;
+    const ticketingProviderEl = document.getElementById('md-ticketing-provider');
+    ticketingProviderEl.value = tp;
+    ticketingProviderEl.dataset.openedProvider = tp;
     const tc = (m.ticketingConfig && typeof m.ticketingConfig === 'object') ? m.ticketingConfig : {};
     document.getElementById('md-jira-mapping-id').value = (tp === 'jira' && tc.kind === 'jira') ? (key || '') : '';
     document.getElementById('md-jira-jql').value = (tp === 'jira' && tc.kind === 'jira' && tc.jql) ? tc.jql : '';
+    document.getElementById('md-filesystem-directory').value = (tp === 'filesystem' && tc.kind === 'filesystem' && tc.directory) ? tc.directory : '';
     const pendingStatus = (tp === 'jira' && tc.statusFieldOverride) ? tc.statusFieldOverride : '';
     const pendingRepoFld = (tp === 'jira' && tc.repoFieldOverride) ? tc.repoFieldOverride : '';
     const pendingProfilesFld = (tp === 'jira' && tc.profilesFieldOverride) ? tc.profilesFieldOverride : '';
+    const pendingBaseBranchFld = (tp === 'jira' && tc.baseBranchFieldOverride) ? tc.baseBranchFieldOverride : '';
     const statusFldEl = document.getElementById('md-jira-status-field');
     const repoFldEl = document.getElementById('md-jira-repo-field');
     const profilesFldEl = document.getElementById('md-jira-profiles-field');
+    const baseBranchFldEl = document.getElementById('md-jira-base-branch-field');
     statusFldEl.dataset.pendingValue = pendingStatus;
     repoFldEl.dataset.pendingValue = pendingRepoFld;
     profilesFldEl.dataset.pendingValue = pendingProfilesFld;
+    baseBranchFldEl.dataset.pendingValue = pendingBaseBranchFld;
     statusFldEl.value = pendingStatus;
     repoFldEl.value = pendingRepoFld;
     profilesFldEl.value = pendingProfilesFld;
+    baseBranchFldEl.value = pendingBaseBranchFld;
     // Repo field value: stash for after the dropdown loads
     const pendingRepoVal = (tp === 'jira' && tc.kind === 'jira' && tc.repoFieldValue) ? tc.repoFieldValue : '';
     const sel = document.getElementById('md-jira-repo-value');
     const txt = document.getElementById('md-jira-repo-value-text');
-    sel.innerHTML = '<option value="">Select a Repo Field first</option>';
+    sel.innerHTML = '<option value="">(none, matches the repository)</option>';
     sel.value = '';
     txt.value = pendingRepoVal;
     sel.classList.toggle('hidden', tp === 'jira' && !!pendingRepoVal);
@@ -392,10 +1267,51 @@ export const projectsScript = `
     onProviderChange();
     onPlanningChange();
     onTicketingProviderChange();
+    agPrepareTab(isNew, key);
+    switchMappingTab('ticketing');
 
     document.getElementById('mapping-dialog').showModal();
   }
   window.openMappingDialog = openMappingDialog;
+
+  function switchMappingTab(name) {
+    for (const panel of document.querySelectorAll('[data-md-panel]')) {
+      panel.hidden = panel.dataset.mdPanel !== name;
+    }
+    for (const btn of document.querySelectorAll('#md-tabs [data-md-tab]')) {
+      btn.classList.toggle('active', btn.dataset.mdTab === name);
+    }
+    // a tall panel leaves the body scrolled; the next one would open part-way down
+    const body = document.querySelector('#mapping-dialog .md-body');
+    if (body) body.scrollTop = 0;
+  }
+  window.switchMappingTab = switchMappingTab;
+
+  // Blank means "use the built-in default", which the payload carries as null. Number()
+  // rather than parseInt so "1.5" fails validation instead of truncating to 1.
+  function optionalCap(id) {
+    const v = document.getElementById(id).value.trim();
+    return v === '' ? null : Number(v);
+  }
+
+  const CAP_FIELDS = [
+    ['Max Turns', 'maxTurns'],
+    ['Max Iterations', 'maxIterations'],
+    ['PR Dispatch Budget', 'prDispatchBudget'],
+    ['Job Timeout', 'maxJobMinutes'],
+  ];
+
+  function badCap(value) {
+    return value !== null && (!Number.isInteger(value) || value < 1);
+  }
+
+  // Several save rules span two tabs, so the offending field may be on a hidden panel.
+  function showMappingError(message, tab) {
+    if (tab) switchMappingTab(tab);
+    const errEl = document.getElementById('md-error');
+    errEl.textContent = message;
+    errEl.classList.remove('hidden');
+  }
 
   function closeMappingDialog() {
     document.getElementById('mapping-dialog').close();
@@ -421,14 +1337,30 @@ export const projectsScript = `
   window.onPlanningChange = onPlanningChange;
 
   function onTicketingProviderChange() {
-    const provider = document.getElementById('md-ticketing-provider').value;
+    const providerEl = document.getElementById('md-ticketing-provider');
+    const provider = providerEl.value;
     const jiraFields = document.getElementById('md-jira-fields');
+    const filesystemFields = document.getElementById('md-filesystem-fields');
+    const localDockerNote = document.getElementById('md-local-docker-note');
     if (provider === 'jira') {
       jiraFields.classList.remove('hidden');
+      filesystemFields.classList.add('hidden');
+      localDockerNote.classList.add('hidden');
       loadJiraFields();
       preloadRepoFieldOptions();
+    } else if (provider === 'filesystem') {
+      jiraFields.classList.add('hidden');
+      filesystemFields.classList.remove('hidden');
+      localDockerNote.classList.remove('hidden');
+      if (providerEl.dataset.openedProvider !== 'filesystem') {
+        document.getElementById('md-exec-mode').value = 'github-actions';
+        document.getElementById('md-session-mode').value = 'autonomous';
+        onExecModeChange();
+      }
     } else {
       jiraFields.classList.add('hidden');
+      filesystemFields.classList.add('hidden');
+      localDockerNote.classList.add('hidden');
     }
   }
   window.onTicketingProviderChange = onTicketingProviderChange;
@@ -437,6 +1369,7 @@ export const projectsScript = `
     const statusSel = document.getElementById('md-jira-status-field');
     const repoSel = document.getElementById('md-jira-repo-field');
     const profilesSel = document.getElementById('md-jira-profiles-field');
+    const baseBranchSel = document.getElementById('md-jira-base-branch-field');
     if (jiraFieldsLoaded) return;
     try {
       const res = await window.api('/api/jira/fields');
@@ -448,15 +1381,19 @@ export const projectsScript = `
       const prevStatus = statusSel ? (statusSel.value || statusSel.dataset.pendingValue || '') : '';
       const prevRepo = repoSel ? (repoSel.value || repoSel.dataset.pendingValue || '') : '';
       const prevProfiles = profilesSel ? (profilesSel.value || profilesSel.dataset.pendingValue || '') : '';
+      const prevBaseBranch = baseBranchSel ? (baseBranchSel.value || baseBranchSel.dataset.pendingValue || '') : '';
       const statusPlaceholder = statusSel && statusSel.options[0] ? statusSel.options[0] : null;
       const repoPlaceholder = repoSel && repoSel.options[0] ? repoSel.options[0] : null;
       const profilesPlaceholder = profilesSel && profilesSel.options[0] ? profilesSel.options[0] : null;
+      const baseBranchPlaceholder = baseBranchSel && baseBranchSel.options[0] ? baseBranchSel.options[0] : null;
       if (statusSel) statusSel.innerHTML = '';
       if (repoSel) repoSel.innerHTML = '';
       if (profilesSel) profilesSel.innerHTML = '';
+      if (baseBranchSel) baseBranchSel.innerHTML = '';
       if (statusSel && statusPlaceholder) statusSel.appendChild(statusPlaceholder);
       if (repoSel && repoPlaceholder) repoSel.appendChild(repoPlaceholder);
       if (profilesSel && profilesPlaceholder) profilesSel.appendChild(profilesPlaceholder);
+      if (baseBranchSel && baseBranchPlaceholder) baseBranchSel.appendChild(baseBranchPlaceholder);
       for (const f of fields) {
         const labelText = f.name + ' (' + f.id + ')';
         if (statusSel) {
@@ -477,11 +1414,18 @@ export const projectsScript = `
           o3.textContent = labelText;
           profilesSel.appendChild(o3);
         }
+        if (baseBranchSel) {
+          const o4 = document.createElement('option');
+          o4.value = f.id;
+          o4.textContent = labelText;
+          baseBranchSel.appendChild(o4);
+        }
       }
       // Restore previously set values (e.g. from openMappingDialog before fields loaded)
       if (statusSel && prevStatus) statusSel.value = prevStatus;
       if (repoSel && prevRepo) repoSel.value = prevRepo;
       if (profilesSel && prevProfiles) profilesSel.value = prevProfiles;
+      if (baseBranchSel && prevBaseBranch) baseBranchSel.value = prevBaseBranch;
       jiraFieldsLoaded = true;
     } catch (err) {
       console.error('loadJiraFields failed:', err);
@@ -521,10 +1465,9 @@ export const projectsScript = `
         if (pendingJiraRepoFieldValue) text.value = pendingJiraRepoFieldValue;
         return;
       }
-      let html = '<option value="">(select)</option>';
+      let html = '<option value="">(none, matches the repository)</option>';
       for (const o of options) {
-        const v = window.esc(o.value);
-        html += '<option value="' + v + '">' + v + '</option>';
+        html += '<option value="' + window.escAttr(o.value) + '">' + window.esc(o.value) + '</option>';
       }
       select.innerHTML = html;
       select.classList.remove('hidden');
@@ -553,7 +1496,7 @@ export const projectsScript = `
     const select = document.getElementById('md-jira-repo-value');
     const text = document.getElementById('md-jira-repo-value-text');
     if (!fieldId) {
-      select.innerHTML = '<option value="">Select a Repo Field first</option>';
+      select.innerHTML = '<option value="">(none, matches the repository)</option>';
       select.classList.remove('hidden');
       text.classList.add('hidden');
       return;
@@ -562,67 +1505,9 @@ export const projectsScript = `
   }
   window.onRepoFieldChange = onRepoFieldChange;
 
-  // Parses the single "owner/repo" input into its two stored halves. Returns null
-  // when the value isn't exactly one slash with both sides non-empty, so callers
-  // can treat "unparseable" and "empty" the same way. A pasted GitHub URL is
-  // accepted, since that is what a browser hands you when you copy a repo.
-  function splitGithubRepo(raw) {
-    let v = String(raw == null ? '' : raw).trim();
-    v = v.replace(/^https?:\\/\\/(?:www\\.)?github\\.com\\//i, '').replace(/\\.git$/i, '');
-    v = v.replace(/^\\/+/, '').replace(/\\/+$/, '');
-    const parts = v.split('/');
-    if (parts.length !== 2) return null;
-    const owner = parts[0].trim();
-    const repo = parts[1].trim();
-    if (!owner || !repo) return null;
-    return { owner: owner, repo: repo };
-  }
-
-  function detectRepoFilterInJql(jql, repoFieldOverride) {
-    // Returns a warning string if the JQL looks like it references the AI-Implement Repo
-    // field. Candidate matching is done client-side, so a JQL "=" clause on the repo field
-    // is unnecessary for selection and can silently drop issues when the field is text-typed
-    // (the "=" won't match the same values readRepoFieldValue does).
-    if (/ai[\\s\\-_]?implement[\\s\\-_]?repo/i.test(jql)) {
-      return 'JQL appears to reference the AI-Implement Repo field. ' +
-        'The orchestrator matches the repo field itself for candidate selection, and a JQL "=" ' +
-        'clause can silently drop issues when the field is text-typed. Note: if several mappings ' +
-        'share this JQL, the clause also scopes the in-flight capacity count.';
-    }
-    if (repoFieldOverride) {
-      const idPattern = new RegExp('\\\\b' + repoFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
-      if (idPattern.test(jql)) {
-        return 'JQL appears to reference customfield ' + repoFieldOverride + ' (your repo field). ' +
-          'The orchestrator matches the repo field itself for candidate selection; a JQL "=" clause ' +
-          'here can silently drop issues when the field is text-typed.';
-      }
-    }
-    return null;
-  }
-
-  function detectStatusFilterInJql(jql, statusFieldOverride) {
-    // Returns a warning string if the JQL looks like it references the AI-Implement Status
-    // field. The orchestrator wraps the user's JQL with its own status filter, so any
-    // status clause here will conflict with status transitions.
-    if (/ai[\\s\\-_]?implement[\\s\\-_]?status/i.test(jql)) {
-      return 'JQL appears to reference the AI-Implement Status field. ' +
-        'The orchestrator adds its own status filter at query time — including one in ' +
-        'your JQL will prevent the issue from being picked up after status transitions ' +
-        '(e.g. Plan Approved → Implementing won\\'t flow). Remove status filters from this JQL.';
-    }
-    if (statusFieldOverride) {
-      const idPattern = new RegExp('\\\\b' + statusFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
-      if (idPattern.test(jql)) {
-        return 'JQL appears to reference customfield ' + statusFieldOverride + ' (your status field). ' +
-          'The orchestrator adds its own status filter at query time — remove the status clause here.';
-      }
-    }
-    return null;
-  }
-
   async function validateJqlButton() {
     const jql = document.getElementById('md-jira-jql').value;
-    const statusFieldOverride = document.getElementById('md-jira-status-field').value;
+    const fields = { statusField: document.getElementById('md-jira-status-field').value, repoField: document.getElementById('md-jira-repo-field').value };
     const status = document.getElementById('md-jira-jql-status');
     status.textContent = 'Validating...';
     status.style.color = '';
@@ -640,14 +1525,13 @@ export const projectsScript = `
         return;
       }
       await res.json();
-      const repoFieldOverride = document.getElementById('md-jira-repo-field').value.trim();
-      const warning = detectStatusFilterInJql(jql, statusFieldOverride) || detectRepoFilterInJql(jql, repoFieldOverride);
+      const warning = window.jqlScopeWarning(jql, fields);
       if (warning) {
-        status.textContent = '⚠ Valid but: ' + warning;
+        status.textContent = '⚠ Valid. ' + warning;
         status.style.color = 'var(--st-warn-fg, #c80)';
       } else {
         status.textContent = 'Valid';
-        status.style.color = 'var(--st-ok-fg, #2a8)';
+        status.style.color = 'var(--st-success-fg)';
       }
     } catch (err) {
       status.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
@@ -661,7 +1545,6 @@ export const projectsScript = `
       const res = await window.api('/api/admin/config-status');
       if (!res.ok) return;
       const status = await res.json();
-      if (status.jiraSiteUrl) window.jiraSiteUrl = status.jiraSiteUrl;
       const select = document.getElementById('md-ticketing-provider');
       for (const opt of Array.from(select.options)) {
         if (opt.value === 'linear' && !status.linear) {
@@ -684,24 +1567,46 @@ export const projectsScript = `
 
     const origKey = document.getElementById('md-team-key-orig').value;
     const isNew = !origKey;
-    const teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
+    let teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
     const defaultBranch = document.getElementById('md-branch').value.trim();
     if (!defaultBranch) {
-      errEl.textContent = 'Default Branch is required.';
-      errEl.classList.remove('hidden');
+      showMappingError('Default Branch is required.', 'source');
       return;
     }
 
-    const ghParts = splitGithubRepo(document.getElementById('md-github-repo').value);
+    // A filled-in add row is staged rather than discarded. Ahead of the payload so
+    // refRepoValue() below picks it up.
+    if (pendingRefRepo()) {
+      const pending = stageRefRepo();
+      if (pending) { showMappingError(pending, 'context'); return; }
+    }
+    const staleRefRepo = refRepoDraftProblem();
+    if (staleRefRepo) {
+      showMappingError(staleRefRepo + ' Remove the entry and add it again.', 'context');
+      return;
+    }
+    if (pendingProjectReviewer()) {
+      const pending = stageProjectReviewer();
+      if (pending) { showMappingError(pending, 'capacity'); return; }
+    }
+    const reviewerProblem = projectReviewerProblem();
+    if (reviewerProblem) {
+      showMappingError(reviewerProblem, 'capacity');
+      return;
+    }
+
+    const githubRepoText = document.getElementById('md-github-repo').value.trim();
+    const githubRepo = window.splitGithubRepo(githubRepoText);
     const body = {
       teamKey,
-      owner: ghParts ? ghParts.owner : '',
-      repo: ghParts ? ghParts.repo : '',
+      owner: githubRepo ? githubRepo.owner : '',
+      repo: githubRepo ? githubRepo.repo : '',
       workflowFile: document.getElementById('md-wf').value.trim(),
       defaultBranch,
-      maxInProgressAiIssues: parseInt(document.getElementById('md-max-ai').value, 10),
+      maxInProgressAiIssues: Number(document.getElementById('md-max-ai').value.trim() || NaN),
       executionMode: document.getElementById('md-exec-mode').value,
       sessionMode: document.getElementById('md-session-mode').value,
+      machineCpuKind: document.getElementById('md-cpu-kind').value,
       machineCpus: parseInt(document.getElementById('md-cpus').value, 10),
       machineMemoryMb: parseInt(document.getElementById('md-mem').value, 10),
       planningEnabled: document.getElementById('md-planning').checked,
@@ -711,14 +1616,19 @@ export const projectsScript = `
       extraEnv: parseEnvText(document.getElementById('md-env').value),
       provider: document.getElementById('md-provider').value,
       awsRegion: document.getElementById('md-aws-region').value.trim() || null,
-      maxTurns: (function(){ var v = document.getElementById('md-max-turns').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
-      maxIterations: (function(){ var v = document.getElementById('md-max-iter').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
-      maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      maxTurns: optionalCap('md-max-turns'),
+      maxIterations: optionalCap('md-max-iter'),
+      prDispatchBudget: optionalCap('md-pr-budget'),
+      maxJobMinutes: optionalCap('md-max-job-min'),
       branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
       skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
       dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
+      reviewProcess: document.getElementById('md-review-process').value,
+      trustedReviewAuthors: (function(){ var l = document.getElementById('md-trusted-review-authors').value.split('\\n').map(function(x){ return x.trim(); }).filter(Boolean); return l.length ? l : null; })(),
+      referenceRepos: refRepoValue(),
+      reviewers: reviewerValue(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
@@ -729,50 +1639,72 @@ export const projectsScript = `
       const jql = document.getElementById('md-jira-jql').value;
       const sel = document.getElementById('md-jira-repo-value');
       const txt = document.getElementById('md-jira-repo-value-text');
-      const rawRepoFieldValue = sel.classList.contains('hidden') ? txt.value.trim() : sel.value.trim();
-      // Blank means "derive from owner/repo" - the orchestrator resolves it at read time.
-      const repoFieldValue = rawRepoFieldValue === '' ? null : rawRepoFieldValue;
+      const repoFieldValue = sel.classList.contains('hidden') ? txt.value.trim() : sel.value.trim();
       const statusFieldOverride = document.getElementById('md-jira-status-field').value.trim() || null;
       const repoFieldOverride = document.getElementById('md-jira-repo-field').value.trim() || null;
       const profilesFieldOverride = document.getElementById('md-jira-profiles-field').value.trim() || null;
+      const baseBranchFieldOverride = document.getElementById('md-jira-base-branch-field').value.trim() || null;
       body.ticketingConfig = {
         kind: 'jira',
         jql: jql,
-        repoFieldValue: repoFieldValue,
+        repoFieldValue: repoFieldValue || null,
         statusFieldOverride: statusFieldOverride,
         repoFieldOverride: repoFieldOverride,
         profilesFieldOverride: profilesFieldOverride,
+        baseBranchFieldOverride: baseBranchFieldOverride,
       };
+    } else if (ticketingProvider === 'filesystem') {
+      const directory = document.getElementById('md-filesystem-directory').value.trim();
+      body.ticketingConfig = { kind: 'filesystem', directory: directory };
+      if (isNew && !teamKey) {
+        teamKey = 'filesystem_' + body.owner + '_' + body.repo;
+        body.teamKey = teamKey;
+      }
     }
 
     if (!body.teamKey) {
-      errEl.textContent = 'Team Key is required.';
-      errEl.classList.remove('hidden');
+      showMappingError('Mapping Key is required.', 'ticketing');
       return;
     }
-    if (!body.owner || !body.repo) {
-      errEl.textContent = 'GitHub Repository is required, as owner/repo (e.g. acme-corp/backend).';
-      errEl.classList.remove('hidden');
+    if (ticketingProvider === 'filesystem') {
+      const directory = body.ticketingConfig && body.ticketingConfig.directory ? body.ticketingConfig.directory : '';
+      if (!directory) {
+        showMappingError('Ticket Directory is required for filesystem ticketing.', 'ticketing');
+        return;
+      }
+      if (directory.charAt(0) !== '/') {
+        showMappingError('Ticket Directory must be an absolute path.', 'ticketing');
+        return;
+      }
+    }
+    if (!githubRepoText) {
+      showMappingError('GitHub Repository is required, as owner/repo.', 'source');
       return;
     }
-    if (!Number.isFinite(body.maxInProgressAiIssues) || body.maxInProgressAiIssues < 1) {
-      errEl.textContent = 'Max AI Issues must be a positive integer.';
-      errEl.classList.remove('hidden');
+    if (!githubRepo) {
+      showMappingError('GitHub Repository must be owner/repo, such as acme-corp/backend, or its GitHub address.', 'source');
       return;
+    }
+    if (!Number.isInteger(body.maxInProgressAiIssues) || body.maxInProgressAiIssues < 1) {
+      showMappingError('Max AI Issues must be a positive integer.', 'capacity');
+      return;
+    }
+    for (const cap of CAP_FIELDS) {
+      if (badCap(body[cap[1]])) {
+        showMappingError(cap[0] + ' must be a positive integer, or blank for the default.', 'capacity');
+        return;
+      }
     }
     if (body.provider === 'bedrock' && body.executionMode === 'fly-machines') {
-      errEl.textContent = 'Bedrock provider is not supported with fly-machines execution mode.';
-      errEl.classList.remove('hidden');
+      showMappingError('Bedrock is not supported with the fly-machines execution mode. Change one of them.', 'provider');
       return;
     }
     if (body.provider === 'bedrock' && !body.awsRegion) {
-      errEl.textContent = 'AWS Region is required when provider is bedrock.';
-      errEl.classList.remove('hidden');
+      showMappingError('AWS Region is required when provider is bedrock.', 'provider');
       return;
     }
     if (body.planningEnabled && !body.planningWorkflowFile) {
-      errEl.textContent = 'Planning Workflow File is required when planning is enabled.';
-      errEl.classList.remove('hidden');
+      showMappingError('Planning Workflow File is required when planning is enabled.', 'provider');
       return;
     }
 
@@ -780,7 +1712,15 @@ export const projectsScript = `
     const origSaveLabel = saveBtn ? saveBtn.textContent : '';
     if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
 
-    const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
+    let res;
+    try {
+      res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
+    } catch (_) {
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = origSaveLabel; }
+      errEl.textContent = 'Could not confirm the save. Reload and check the project before retrying.';
+      errEl.classList.remove('hidden');
+      return;
+    }
     let data = {};
     try { data = await res.json(); } catch (_) {}
     if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = origSaveLabel; }
@@ -792,6 +1732,9 @@ export const projectsScript = `
     closeMappingDialog();
     await loadMappings();
     pollSyncStatus(teamKey, data.syncJobId);
+    if (Array.isArray(data.warnings) && data.warnings.length) {
+      setTimeout(function () { alert('Saved with warnings:\\n\\n' + data.warnings.join('\\n\\n')); }, 100);
+    }
   }
   window.saveMappingDialog = saveMappingDialog;
 
@@ -825,6 +1768,16 @@ export const projectsScript = `
   const SYNC_POLL_MS = 2000;
   const SYNC_POLL_MAX_ATTEMPTS = 60; // ~2 min, then hand off to the background safety net
 
+  // Runs one project's setup checks, which store its rows in the stored run. Answers whether they ran; a failure leaves the row as it was.
+  async function runProjectSetupChecks(teamKey) {
+    try {
+      const res = await window.api('/api/setup-checks/project', { method: 'POST', body: JSON.stringify({ project: teamKey }) });
+      return res.ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
   // Poll GET /api/mappings/:teamKey/sync-status/:jobId until the job is terminal
   function pollSyncStatus(teamKey, jobId) {
     if (!jobId) return;
@@ -853,6 +1806,8 @@ export const projectsScript = `
         if (job.status === 'pending' || job.status === 'running') return; // keep waiting
 
         stopSyncPoll(teamKey);
+        // An ended sync changes what the project's checks read, so its row shows them again before it redraws.
+        await runProjectSetupChecks(teamKey);
         if (job.status === 'completed') {
           noteSyncResult(teamKey, { ok: true, result: job.result });
           await loadMappings();

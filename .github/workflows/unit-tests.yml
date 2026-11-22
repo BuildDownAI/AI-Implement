@@ -1,0 +1,68 @@
+# Unit-test gate for AI-Implement PRs (AII-449).
+#
+# Named unit-tests.yml deliberately: the claude-*.yml files here are TEMPLATES
+# synced to target repos by the orchestrator. This file is a repository-only
+# test gate and must never be distributed by sync.
+#
+# Operator step after first merge: mark the "unit-tests" check REQUIRED on the
+# testing branch (Settings → Branches). The branch is unprotected today, so the
+# check is advisory until that click.
+#
+# Grouping branches (ai-implement/feature/**, ai-implement/multi-issue/**) are
+# listed so child PRs in feature-branch grouping runs get the unit-test check
+# before their changes merge into the feature branch (AII-467).
+name: unit-tests
+
+on:
+  # Every PR, whatever its base.
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # vitest exits non-zero on test failures AND on unhandled errors
+      # (verified on AII-448: 28 unhandled rejections alone produced exit 1
+      # while all tests passed — the exact signal this gate exists to catch).
+      #
+      # No unset step: the suite deletes ambient variables itself, the same way here as on any machine.
+      # Its allowlist, with the reason for each entry, is src/__tests__/setup/ambient-env.ts.
+      - run: npm test
+      - run: npm run typecheck
+
+  # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts on the
+  # `restate-server` binary from node_modules — the runtime the orchestrator sidecar
+  # and a dispatched runner use (AII-1195); no Docker. No `on:` block here on
+  # purpose — a job inherits the workflow's triggers only by staying in this file,
+  # which is what gets it onto ai-implement/feature/** PRs (AII-467 pattern). No
+  # `needs:` either: it runs in parallel with `unit-tests`. The suite runs three times
+  # (AII-993 flake detector: a scenario that fails one run in three must fail
+  # the PR that adds it), and each pass is split into two shards (vitest `--shard`,
+  # which divides the files by a hash of their paths), so six jobs run side by side
+  # and the wall time is that of the slower shard, not of the whole suite.
+  # fail-fast is off so the evidence of which passes failed survives.
+  # Checks: `restate-tests-binary (<pass>, <shard>)`, for example `restate-tests-binary (1, 2)`.
+  restate-tests-binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pass: [1, 2, 3]
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: npm run test:restate pass ${{ matrix.pass }} of 3, shard ${{ matrix.shard }} of 2
+        run: npm run test:restate -- --shard=${{ matrix.shard }}/2
