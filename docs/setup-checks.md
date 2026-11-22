@@ -191,7 +191,7 @@ The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracke
 | [`tracker.jira.fields`](ticketing-providers.md#custom-fields) | A required field that matches no field or several by name, which stops every Jira project; a warning for an optional field named twice |
 | [`tracker.jira.field-cache`](ticketing-providers.md#field-cache) | Field IDs the poll cached before the project's fields changed in Jira |
 | [`tracker.jira.status-options`](ticketing-providers.md#the-ai-implement-status-options) | A status field that is not a select field, or lacks an option the project uses |
-| [`tracker.jira.repo-option`](ticketing-providers.md#repo-option) | A select repo field with no option equal to the project's Repo Field Value |
+| [`tracker.jira.repo-option`](ticketing-providers.md#repo-option) | A select repo field with no option equal to the value the project matches: its Repo Field Value, or its repository as `owner/repo` when that is blank |
 | [`tracker.jira.jql`](ticketing-providers.md#jql) | The project's JQL refused by Jira as the poll runs it |
 | [`tracker.filesystem.directory`](ticketing-providers.md#filesystem-setup) | A ticket directory that is missing, is not a directory, or that the orchestrator cannot write and search |
 

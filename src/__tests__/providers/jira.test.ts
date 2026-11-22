@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
+import Database from "better-sqlite3";
+import type * as ConfigModule from "../../config.js";
+import type * as IssueStatusesModule from "../../issue-statuses.js";
+import type * as MergeUpModule from "../../merge-up.js";
 import { JiraProvider, adfToPlainText, createJiraProviderFromConfig } from "../../providers/jira.js";
 import { JiraApiError, JiraClient, type JiraIssue } from "../../providers/jira-client.js";
 import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
@@ -8,6 +12,7 @@ import { validateIssueBaseBranch } from "../../base-branch.js";
 import type { RepoMapping } from "../../config.js";
 import { makeIssue, makeMapping } from "../helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type ReplyInit, type Routes } from "../helpers/fake-fetch.js";
+import { testDb } from "../helpers/test-db.js";
 import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
 
 // The client reaches Jira through the OAuth gateway for cloud id "c", so every request path starts here.
@@ -2280,5 +2285,208 @@ describe("JiraProvider unmerged close guards", () => {
     const p = makeProvider({ cacheScope: "close-error", mappings: { "acme/x": jiraMapping() } });
     await expect(p.markPrClosedUnmerged("10001", "acme/x", "url")).rejects.toThrow();
     expect(fake.calls.map((c) => c.method)).toEqual(["GET", "GET"]);
+  });
+});
+
+// Every read of a project's Repo field value, from the projects as the store reads them back:
+// acme/backend as main stores a project saved without a Repo Field Value (#336), which matches its owner/repo,
+// and acme/frontend saved with an explicit value unlike its owner/repo. Both share one JQL, as sibling repositories do.
+describe("JiraProvider reads for a project saved without a Repo Field Value", () => {
+  const MAIN_ROW = '{"kind":"jira","jql":"project = P","repoFieldValue":null,"statusFieldOverride":null,"repoFieldOverride":null,"profilesFieldOverride":null}';
+
+  let config: typeof ConfigModule;
+  let issueStatuses: typeof IssueStatusesModule;
+  let mergeUp: typeof MergeUpModule;
+
+  beforeEach(async () => {
+    clearFieldCache();
+    const db = await testDb({ modules: {
+      config: () => import("../../config.js"),
+      issueStatuses: () => import("../../issue-statuses.js"),
+      mergeUp: () => import("../../merge-up.js"),
+    } });
+    ({ config, issueStatuses, mergeUp } = db.modules);
+    config.upsertMapping("acme/backend", makeMapping({ owner: "acme", repo: "backend" }));
+    const raw = new Database(db.path);
+    raw.prepare("UPDATE mappings SET ticketing_provider = 'jira', ticketing_config = ? WHERE team_key = ?").run(MAIN_ROW, "acme/backend");
+    raw.close();
+    config.upsertMapping("acme/frontend", makeMapping({
+      owner: "acme",
+      repo: "frontend",
+      ticketingProvider: "jira",
+      ticketingConfig: validateTicketingConfig("jira", { kind: "jira", jql: "project = P", repoFieldValue: "Frontend Service" }),
+    }));
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const provider = (cacheScope: string, onRepoFieldMismatch = vi.fn()) => new JiraProvider({
+    client: stubClient(), cacheScope, siteUrl: "https://x", getMappings: () => config.getMappings(), onRepoFieldMismatch,
+  });
+
+  // An issue with every field any of these reads requests. Jira sends an unset custom field as null.
+  const issue = (key: string, repo: { value: string } | null, extra: { status?: string; parentKey?: string; summary?: string } = {}): JiraIssue => ({
+    id: `id-${key}`,
+    key,
+    fields: {
+      summary: extra.summary ?? key,
+      description: null,
+      updated: "2026-11-15T12:00:00.000Z",
+      status: { name: "To Do", statusCategory: { key: "indeterminate" } },
+      labels: [],
+      project: { name: "P" },
+      parent: extra.parentKey ? { key: extra.parentKey } : null,
+      issuelinks: [],
+      assignee: null,
+      comment: { total: 0, comments: [] },
+      customfield_10100: { value: extra.status ?? "Ready" },
+      customfield_10101: repo,
+    },
+  });
+
+  it("the poll matches each project on its own value, and reports only a value no Jira project matches", async () => {
+    // A Linear project whose owner/repo is the typo claims nothing on Jira.
+    config.upsertMapping("LIN", makeMapping({ owner: "acme", repo: "typo" }));
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(issue("P-1", { value: "acme/backend" }), issue("P-2", { value: "Frontend Service" }), issue("P-3", { value: "acme/typo" }), issue("P-4", null)),
+        children(),
+        inFlight(),
+      ),
+    }).install();
+    const onRepoFieldMismatch = vi.fn();
+
+    const snap = await provider("reads-poll", onRepoFieldMismatch).fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => [i.scopeKey, i.identifier]).sort()).toEqual([["acme/backend", "P-1"], ["acme/frontend", "P-2"]]);
+    expect(onRepoFieldMismatch.mock.calls.sort()).toEqual([
+      ["acme/backend", "P-3", "acme/typo"],
+      ["acme/backend", "P-4", ""],
+      ["acme/frontend", "P-3", "acme/typo"],
+      ["acme/frontend", "P-4", ""],
+    ]);
+  });
+
+  it("logs an unmatched value with the value each project matches, derived or explicit", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fakeFetch({ [FIELDS]: FIELDS_REPLY, [SEARCH]: jqlSearch(ready(issue("P-3", { value: "acme/typo" })), inFlight()) }).install();
+
+    await createJiraProviderFromConfig({ jiraToken: "t", jiraCloudId: "c", jiraSiteUrl: "https://x" }, () => config.getMappings())
+      .fetchAIImplementSnapshot();
+
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((line) => line.includes("P-3"));
+    expect(lines).toHaveLength(2);
+    for (const [project, expected] of [["acme/backend", "acme/backend"], ["acme/frontend", "Frontend Service"]]) {
+      expect(lines.filter((line) => line.includes('"acme/typo"') && line.includes(`project ${project} `) && line.includes(`"${expected}"`)))
+        .toHaveLength(1);
+    }
+  });
+
+  // The in-progress count (the Issues page, the poll's diagnostic line) runs the shared JQL too, so it matches as the poll does.
+  it("the in-progress count counts only each project's own issues, and reports none", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(),
+        inFlight(
+          issue("P-50", { value: "acme/backend" }, { status: "Implementing" }),
+          issue("P-51", { value: "acme/backend" }, { status: "Planning" }),
+          issue("P-52", { value: "Frontend Service" }, { status: "Implementing" }),
+          issue("P-53", { value: "acme/typo" }, { status: "Planning" }),
+          issue("P-54", null, { status: "Implementing" }),
+        ),
+      ),
+    }).install();
+    const onRepoFieldMismatch = vi.fn();
+
+    const snap = await provider("reads-in-progress", onRepoFieldMismatch).fetchAIImplementSnapshot();
+
+    expect(snap.inProgressCountsByScope).toEqual({ "acme/backend": 2, "acme/frontend": 1 });
+    expect(onRepoFieldMismatch).not.toHaveBeenCalled();
+  });
+
+  it("feature-branch enrichment holds a parent whose in-flight child carries the derived value", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        ready(issue("P-10", { value: "acme/backend" })),
+        children(issue("P-11", { value: "acme/backend" }, { status: "Implementing", parentKey: "P-10" })),
+        inFlight(),
+      ),
+    }).install();
+
+    const snap = await provider("reads-enrichment").fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning).toEqual([]);
+    expect(log.mock.calls.map((c) => c[0])).toContainEqual(
+      expect.stringContaining("Skipping P-10: grouping parent waiting on in-flight AI-Implement children: P-11"),
+    );
+  });
+
+  it("roll-up discovery finds a completed feature node by the derived value", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        completed(issue("P-20", { value: "acme/backend" }, { status: "PR Ready" })),
+        children(issue("P-21", { value: "acme/backend" }, { status: "Merged", parentKey: "P-20" })),
+      ),
+    }).install();
+
+    expect(await provider("reads-rollups").fetchFeatureNodeRollUps()).toEqual([
+      { issueId: "id-P-20", identifier: "P-20", scopeKey: "acme/backend", mode: "feature", parent: null, childIdentifiers: ["P-21"] },
+    ]);
+  });
+
+  // The knowledge-graph export (TrackerExport) and the poll's roll-up review reconciliation both pass the stored mapping with its team key.
+  it("the knowledge-graph export and roll-up review children list the project's issues by the derived value", async () => {
+    const reviewChild = issue("P-30", { value: "acme/backend" }, { parentKey: "P-29", summary: "[roll-up-review] acme/backend#5 abc123" });
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch(
+        { when: /summary ~ "roll-up-review"/, issues: [reviewChild] },
+        { when: /^\(project = P\)$/, issues: [reviewChild, issue("P-31", { value: "Frontend Service" }), issue("P-32", { value: "acme/typo" })] },
+      ),
+    }).install();
+    const onRepoFieldMismatch = vi.fn();
+    const p = provider("reads-pages", onRepoFieldMismatch);
+    const mapping = { ...config.getMappings()["acme/backend"], teamKey: "acme/backend" };
+
+    expect((await p.listIssuesPage(mapping, null)).issues.map((i) => i.identifier)).toEqual(["P-30"]);
+    expect((await mergeUp.listRollupReviewChildren(p, mapping)).map((i) => i.identifier)).toEqual(["P-30"]);
+    expect(onRepoFieldMismatch.mock.calls).toEqual([["acme/backend", "P-32", "acme/typo"]]);
+  });
+
+  it("list_issue_statuses lists each project's issues by its own value", async () => {
+    fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [issue("P-40", { value: "acme/backend" }), issue("P-41", { value: "Frontend Service" })] }),
+    }).install();
+    const p = provider("reads-statuses");
+
+    const entries = await issueStatuses.listIssueStatuses({ providerFor: async () => p, now: () => Date.parse("2026-11-16T00:00:00.000Z") });
+
+    expect(entries.map((e) => [e.teamKey, e.issue.identifier])).toEqual([["acme/backend", "P-40"], ["acme/frontend", "P-41"]]);
+  });
+
+  it.each([
+    ["acme/backend", "acme/backend", true],
+    ["acme/frontend", "Frontend Service", true],
+    ["acme/frontend", "acme/frontend", false],
+  ])("a roll-up review child under project %s, whose parent's Repo is %s, is created: %s", async (scopeKey, parentRepo, created) => {
+    const fake = fakeFetch({
+      [FIELDS]: FIELDS_REPLY,
+      [`GET ${API}/issue/parent`]: { json: { id: "parent", key: "P-1", fields: {
+        project: { id: "p" }, issuetype: { subtask: false, hierarchyLevel: 0 }, customfield_10101: { value: parentRepo },
+      } } },
+      [`GET ${API}/issue/createmeta/p/issuetypes`]: { json: { issueTypes: [{ id: "s", subtask: true }], total: 1 } },
+      [`POST ${API}/issue`]: { json: { id: "child", key: "P-2" } },
+    }).install();
+
+    const result = provider(`reads-child-${scopeKey}-${parentRepo}`).createChildIssue("parent", scopeKey, { title: "Child", body: "Body" });
+
+    if (created) await expect(result).resolves.toEqual({ id: "child", identifier: "P-2" });
+    else await expect(result).rejects.toThrow("Jira parent Repo does not match the mapping");
+    expect(fake.calls.filter((c) => c.method === "POST")).toHaveLength(created ? 1 : 0);
   });
 });

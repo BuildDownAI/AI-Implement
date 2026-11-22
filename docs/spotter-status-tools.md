@@ -91,7 +91,7 @@ For noncompleted issues, the deciding label is first in `raw.labels`, followed b
 
 ### Jira
 
-[src/providers/jira.ts](../src/providers/jira.ts) combines the mapping's JQL with a nonempty AI-Implement status field. `Merged`, `Planning Failed`, and `Implementation Failed` require an update within seven days; other values have no age cutoff. Results must also match the configured repository field value. This is the custom AI-Implement field, rather than Jira's ordinary workflow status.
+[src/providers/jira.ts](../src/providers/jira.ts) combines the mapping's JQL with a nonempty AI-Implement status field. `Merged`, `Planning Failed`, and `Implementation Failed` require an update within seven days; other values have no age cutoff. Results must also match the repository field value the mapping resolves to: its Repo Field Value, or its repository as `owner/repo` when that is blank ([ticketing-providers.md](ticketing-providers.md#choosing-a-provider-per-mapping)). This is the custom AI-Implement field, rather than Jira's ordinary workflow status.
 
 | AI-Implement status | State | Phase |
 |---|---|---|

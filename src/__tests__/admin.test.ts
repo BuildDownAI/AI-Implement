@@ -12,6 +12,8 @@ import type { SelfDeployClient } from "../restate/self-deploy.js";
 import { SETUP_CHECK_GROUP_LABELS, setupCommandFor, type SetupCheckProgress, type SetupCheckRun } from "../setup-checks/index.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
+import { resolveRepoFieldValue } from "../providers/ticketing-config.js";
+import type { RepoMapping } from "../config.js";
 import type { AIImplementSnapshot } from "../providers/types.js";
 import { makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
@@ -6013,6 +6015,36 @@ describe("per-page grants", () => {
       ] as [Record<string, unknown>, AdminModule.MappingRefusalField][])("names %j's refusal as %s", async (overrides, field) => {
         const res = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, { ...BODY, ...overrides });
         expectRefusal(res, field);
+      });
+
+      // owner/repo is the Repo field value a Jira project saved without one matches, so stray whitespace would match nothing.
+      it("stores owner and repo trimmed, and refuses one that is only whitespace", async () => {
+        const saved = await requestWithDeps("/api/mappings", "POST", adminSsoSession(), {}, { ...BODY, owner: " org ", repo: "app\n" });
+        expect(saved.statusCode).toBe(202);
+        expect(config.getMappings().APP).toMatchObject({ owner: "org", repo: "app" });
+        for (const [overrides, field] of [[{ owner: "  " }, "owner"], [{ repo: "\t" }, "repo"]] as const) {
+          const res = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, { ...BODY, ...overrides });
+          expect([res.statusCode, JSON.parse(res.body)]).toEqual([400, { field, error: `${admin.MAPPING_FIELD_LABELS[field]} is required.` }]);
+        }
+      });
+
+      // The stepper sends no Repo Field Value, and the Edit dialog sends a blank one as "".
+      it.each([
+        ["without a Repo Field Value", { kind: "jira", jql: "project = APP" }],
+        ["with a blank Repo Field Value", { ...JIRA, repoFieldValue: "" }],
+      ])("accepts a Jira project %s, checks it as matching its owner/repo, and stores no value", async (_label, ticketingConfig) => {
+        const body = { ...BODY, owner: " org ", ticketingProvider: "jira", ticketingConfig };
+        const validate = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, body);
+        expect([validate.statusCode, JSON.parse(validate.body)]).toEqual([200, { valid: true }]);
+
+        const run = vi.fn(async () => RUN);
+        await requestWithDeps("/api/setup-checks/candidate", "POST", adminSsoSession(), { runCandidateChecks: run }, body);
+        const [, candidate] = run.mock.calls[0] as unknown as [string, RepoMapping];
+        expect(resolveRepoFieldValue(candidate)).toBe("org/app");
+
+        expect((await requestWithDeps("/api/mappings", "POST", adminSsoSession(), {}, body)).statusCode).toBe(202);
+        expect(config.getMappings().APP.ticketingConfig).toMatchObject({ kind: "jira", repoFieldValue: null });
+        expect(resolveRepoFieldValue(config.getMappings().APP)).toBe("org/app");
       });
 
       it("names a Filesystem project's malformed key as teamKey, under the local runner mode Filesystem needs", async () => {

@@ -16,7 +16,7 @@ The orchestrator talks to issue trackers through one interface, `TicketingProvid
 
 ## Choosing a provider per mapping
 
-Every project mapping carries `ticketingProvider` and a matching `ticketingConfig` (`ticketing-config.ts`). Linear needs no config. Jira needs `jql` (scope) and `repoFieldValue` (the `AI-Implement Repo` option), plus optional `*FieldOverride` ids.
+Every project mapping carries `ticketingProvider` and a matching `ticketingConfig` (`ticketing-config.ts`). Linear needs no config. Jira needs `jql` (scope), plus optional `*FieldOverride` ids and an optional `repoFieldValue`, the `AI-Implement Repo` value its issues carry. `resolveRepoFieldValue` returns the stored value, or the project's repository as `owner/repo` when it is `null`, which is what a blank **Repo Field Value** saves, so a project whose Repo field options name repositories as `owner/repo` sets none. The validator stores an explicit value trimmed, and a blank or non-string one as `null`. Every reader goes through the resolver (the Jira provider and `tracker.jira.repo-option`), because comparing a string with a stored `null` compiles and matches nothing; a test in `src/__tests__/providers/ticketing-config.test.ts` fails on a read of the stored value anywhere outside it and the admin UI's forms.
 
 `ProviderRegistry` (`registry.ts`) resolves a provider from a mapping. It caches **one instance per provider id**: a single Linear provider and a single Jira provider serve every mapping of that kind. The cache is dropped when an admin saves or deletes a mapping. `forAllMappings` returns one provider per distinct id in use, skipping any whose construction fails; the poll loop iterates that set. The setup check `tracker.provider` names a provider that cannot be built, and one that has no setup checks of its own ([setup-checks.md § tracker](setup-checks.md#tracker)).
 
@@ -30,7 +30,7 @@ Every project mapping carries `ticketingProvider` and a matching `ticketingConfi
 `listIssuesPage(mapping, cursor)` returns one page of a mapping's issues as `TrackerIssueRecord`s; the `TrackerExport` handler stamps `sourceSystem` and `team`, never the provider. A missing credential or mapping config throws `TrackerUnavailableError`; any other error propagates so Restate retries it.
 
 - **Linear** pages `issues(filter: team)` 50 at a time; the cursor is the GraphQL `endCursor`.
-- **Jira** runs `(<mapping jql>)` through `JiraClient.searchJqlPage`, one page of up to 100 issues; the cursor is Jira's `nextPageToken` (`null` is the first page). Issues whose repo field is not the mapping's `repoFieldValue` are dropped after the search, so a page can hold fewer issues, or none, while `hasNextPage` is true. `searchJql` (the poll's all-pages call) is unchanged.
+- **Jira** runs `(<mapping jql>)` through `JiraClient.searchJqlPage`, one page of up to 100 issues; the cursor is Jira's `nextPageToken` (`null` is the first page). Issues whose repo field is not the value the mapping resolves to are dropped after the search, and logged as the poll logs them ("Custom fields", below), so a page can hold fewer issues, or none, while `hasNextPage` is true. `searchJql` (the poll's all-pages call) is unchanged.
 
 Jira field mapping: `identifier` is the issue key; `state` is `{ status.name, statusCategory.key }`; `description` and comment bodies go through `adfToPlainText`; `parent` is the native `parent`, else the Epic Link field; `branchName` is absent. Links from `issuelinks`: an outward `Blocks` link is `blocks`, an outward `Duplicate` is `duplicate`, every other outward link is `related`. An **inward** link is always `related`, because `blocks` and `duplicate` are directed from the record's own issue and the other issue's record carries that edge.
 
@@ -135,12 +135,12 @@ The account lists fields, searches, reads issues and comments, sets the status f
 | Field | Required | What the code reads | Override (the project's setting on `/admin#projects`) |
 |---|---|---|---|
 | `AI-Implement Status` | yes | single-select option value | `statusFieldOverride` (**Status Field**) |
-| `AI-Implement Repo` | yes | single-select or text matching `repoFieldValue` | `repoFieldOverride` (**Repo Field**) |
+| `AI-Implement Repo` | yes | single-select option value or trimmed text, equal to the value the project resolves to ([Repo option](#repo-option)) | `repoFieldOverride` (**Repo Field**) |
 | `AI-Implement Profiles` | no | multi-select option values | `profilesFieldOverride` (**Profiles Field**) |
 | `AI-Implement Base Branch` | no | non-blank text | `baseBranchFieldOverride` (**Base Branch Field**) |
 | `Epic Link` | no | classic-project epic key | none |
 
-`resolveCustomFieldIds` matches exact, case-sensitive names. A required field that matches no field or several throws `JiraFieldResolutionError`, which fails the whole Jira snapshot, every Jira project included ("When one tracker's snapshot fails", below), and `tracker.jira.fields` fails the project, naming the setting that picks the field instead. An optional field that is absent or matches several stays off, and `tracker.jira.fields` warns of a duplicated one, naming the feature it leaves off. Epic Link takes the first match. Overrides are IDs of letters, digits and underscores, used as given and never checked against Jira. With all four overrides set, the field list is never read and Epic Link is not resolved. A repo mismatch drops the issue with one warning per issue.
+`resolveCustomFieldIds` matches exact, case-sensitive names. A required field that matches no field or several throws `JiraFieldResolutionError`, which fails the whole Jira snapshot, every Jira project included ("When one tracker's snapshot fails", below), and `tracker.jira.fields` fails the project, naming the setting that picks the field instead. An optional field that is absent or matches several stays off, and `tracker.jira.fields` warns of a duplicated one, naming the feature it leaves off. Epic Link takes the first match. Overrides are IDs of letters, digits and underscores, used as given and never checked against Jira. With all four overrides set, the field list is never read and Epic Link is not resolved. An issue whose repo field holds a value other than the one its project resolves to is dropped. The drop is logged once per issue and project while the process runs, unless another Jira project on the orchestrator resolves to that value, since the issue is then a sibling repository's under a shared JQL; an empty repo field is always logged. The line names what the project matches, derived or explicit: `[jira] Issue P-3 has repo field "acme/typo", which matches no project on this orchestrator, so project acme/backend leaves it out. That project matches "acme/backend".`
 
 ### Field cache
 
@@ -170,11 +170,13 @@ Without a Merged option, merge reconciliation retries once per poll and dead-let
 
 ### Repo option
 
-`tracker.jira.repo-option` requires the repo field to have an option spelled exactly as the project's **Repo Field Value** (`repoFieldValue`). The poll drops every issue whose repo field holds another value, so without that option it finds none of the project's issues. A text repo field has no options, so the check does not apply to it; the poll compares its text instead (`readRepoFieldValue`). Reading the options needs the permission in "Credentials", above.
+`tracker.jira.repo-option` requires the repo field to have an option spelled exactly as the value the project resolves to: its **Repo Field Value** when one is set, otherwise its repository as `owner/repo`. The poll drops every issue whose repo field holds another value, so without that option it finds none of the project's issues. When the value is the repository, the row says so, and its fix adds that a blank Repo Field Value matches the repository, so a project whose options name repositories another way sets its Repo Field Value on `/admin#projects`; an explicit value's fix names the repository a blank would match. A text repo field has no options, so the check does not apply to it; the poll compares its trimmed text instead (`readRepoFieldValue`). Reading the options needs the permission in "Credentials", above.
 
 ### JQL
 
-`tracker.jira.jql` runs the project's JQL as the poll runs it, `(<project jql>) AND <status field> in (Ready, "Plan Approved")` from `buildBucketQuery`, with a `customfield_N` status field written as `cf[N]`, asking for one result. A query Jira refuses fails the check with Jira's status and error. It also fails the whole Jira snapshot, as a missing field does, so the fix is the project's **JQL** on `/admin#projects`, leaving the status filter to the poll. The check runs the search, not `validateJql`'s parse endpoint, so it judges the query Jira will actually run.
+`tracker.jira.jql` runs the project's JQL as the poll runs it, `(<project jql>) AND <status field> in (Ready, "Plan Approved")` from `buildBucketQuery`, with a `customfield_N` status field written as `cf[N]`, asking for one result. A query Jira refuses fails the check with Jira's status and error. It also fails the whole Jira snapshot, as a missing field does, so the fix is the project's **JQL** on `/admin#projects`, leaving the status clause to the poll. The check runs the search, not `validateJql`'s parse endpoint, so it judges the query Jira will actually run.
+
+Both project forms warn after **Validate** when the JQL names the status or the repo field, by the field's default name or by the ID chosen as the project's **Status Field** or **Repo Field**, written `customfield_N` or `cf[N]` (`jqlScopeWarning`, `src/admin-ui/helpers.ts`), the status clause first. A status clause stops issues being picked up once the orchestrator changes their status. A repo clause is never needed: every search that runs a project's JQL keeps only the issues whose repo field holds the value the project resolves to, the in-progress count included, so several projects can share one JQL without one. That count feeds only the Issues page and the poll's log line, while dispatch capacity is each project's own reservation count (`count`, `src/dispatch-admission.ts`), which no JQL reaches.
 
 ## Filesystem setup
 
@@ -216,8 +218,9 @@ and parent association; tracker failures propagate to the caller.
 Linear reads the effective pickup label from settings on each call and requires
 an exact-name team or workspace label. Jira resolves the mapping's custom field
 IDs, sets AI-Implement Status to `Ready`, and inherits the parent's AI-Implement
-Repo value (text or select). It requires that Repo to match the mapping and
-chooses a creatable child type using the project issue-type hierarchy. Epic
+Repo value (text or select). It requires that Repo to equal the value the
+mapping resolves to ("Repo option", above) and chooses a creatable child type
+using the project issue-type hierarchy. Epic
 children use Epic Link in company-managed projects where that field exists,
 and native parent links otherwise. Unsupported hierarchies or required-field
 restrictions fail explicitly. A label does not replace Jira's

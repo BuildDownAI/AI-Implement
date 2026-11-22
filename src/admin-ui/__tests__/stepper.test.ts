@@ -48,7 +48,7 @@ describe("new-project stepper", () => {
     // np-teamKey lives inside np-linear-config (data-step="1"), not data-step="2".
     const linearCfgIdx = stepperHtml.indexOf('id="np-linear-config"');
     const teamKeyIdx = stepperHtml.indexOf('id="np-teamKey"');
-    const ownerIdx = stepperHtml.indexOf('id="np-owner"');
+    const ownerIdx = stepperHtml.indexOf('id="np-github-repo"');
     expect(linearCfgIdx).toBeGreaterThan(-1);
     expect(teamKeyIdx).toBeGreaterThan(linearCfgIdx);
     expect(teamKeyIdx).toBeLessThan(ownerIdx);
@@ -69,7 +69,7 @@ describe("new-project stepper", () => {
   });
 
   it("declares the input ids the script reads", () => {
-    for (const id of ["np-teamKey", "np-owner", "np-repo", "np-defaultBranch", "np-sessionMode", "np-awsRegion", "np-maxAi"]) {
+    for (const id of ["np-teamKey", "np-github-repo", "np-defaultBranch", "np-sessionMode", "np-awsRegion", "np-maxAi"]) {
       expect(stepperHtml).toContain(`id="${id}"`);
     }
   });
@@ -135,8 +135,7 @@ describe("new-project stepper — filesystem ticketing behavior", () => {
     await win.stepperNext();
     (doc.getElementById("np-filesystem-directory") as HTMLInputElement).value = "/private/tmp/filesystem-local-tickets";
     await win.stepperNext();
-    (doc.getElementById("np-owner") as HTMLInputElement).value = "BuildDownAI";
-    (doc.getElementById("np-repo") as HTMLInputElement).value = "AI-Implement";
+    (doc.getElementById("np-github-repo") as HTMLInputElement).value = "BuildDownAI/AI-Implement";
     (doc.getElementById("np-defaultBranch") as HTMLInputElement).value = "testing";
     for (let step = 2; step < 7; step++) await win.stepperNext();
     (doc.getElementById("np-review-process") as HTMLSelectElement).value = reviewProcess;
@@ -279,7 +278,7 @@ describe("new-project stepper — field placement", () => {
   };
 
   it.each([
-    ["np-owner", 2],
+    ["np-github-repo", 2],
     ["np-defaultBranch", 2],
     ["np-branch-prefix", 2],
     ["np-sensitive-add", 2],
@@ -378,7 +377,7 @@ const result = (id: string, state: string, extra: Body = {}) => ({ id, group: "g
  * The stepper mounted as the Projects page mounts it, with the candidate checks answering `candidate` and the save's
  * validation answering `validate` (by default no rows, and accepted), and a record of what each route was sent.
  */
-function mountStepper(options: { candidate?: (body: Body) => Answer; validate?: (body: Body) => Answer; save?: (body: Body) => Answer } = {}) {
+function mountStepper(options: { candidate?: (body: Body) => Answer; validate?: (body: Body) => Answer; save?: (body: Body) => Answer; jira?: (url: string, body: Body) => Answer } = {}) {
   const candidates: Body[] = [];
   const validations: Body[] = [];
   const saves: Body[] = [];
@@ -401,6 +400,7 @@ function mountStepper(options: { candidate?: (body: Body) => Answer; validate?: 
         saves.push(body);
         return options.save ? options.save(body) : reply(200, { syncJobId: null });
       }
+      if (options.jira && url.startsWith("/api/jira/")) return options.jira(url, body);
       throw new Error(`unexpected api call ${url}`);
     },
     // These come from the Projects page, which the stepper is mounted inside.
@@ -430,8 +430,7 @@ function mountStepper(options: { candidate?: (body: Body) => Answer; validate?: 
     await next();
     input("np-teamKey", "AII");
     await next();
-    input("np-owner", "acme");
-    input("np-repo", "widgets");
+    input("np-github-repo", "acme/widgets");
     input("np-defaultBranch", "main");
   }
   /** Walks on from Source to Review, as Continue does. */
@@ -666,7 +665,7 @@ describe("new-project stepper — Review's setup checks", () => {
     await m.next();
     expect(m.candidates).toHaveLength(1);
     m.win.changeReviewSection("source");
-    m.input("np-repo", "gadgets");
+    m.input("np-github-repo", "acme/gadgets");
     await m.next();
     await m.settled();
     expect(m.candidates.map((c) => c.repo)).toEqual(["widgets", "gadgets"]);
@@ -720,7 +719,7 @@ describe("new-project stepper — Review's Change", () => {
     await m.toReview();
     m.win.changeReviewSection("source");
     expect(m.shownStep()).toBe(2);
-    expect(m.el<HTMLInputElement>("np-repo").value).toBe("widgets");
+    expect(m.el<HTMLInputElement>("np-github-repo").value).toBe("acme/widgets");
     expect(m.el("np-next").textContent).toBe("Back to review");
     expect(m.el("np-next").hidden).toBe(false);
   });
@@ -740,7 +739,7 @@ describe("new-project stepper — Review's Change", () => {
     const m = mountStepper();
     await m.toReview();
     m.win.changeReviewSection("source");
-    m.input("np-repo", "");
+    m.input("np-github-repo", "");
     await m.next();
     expect(m.shownStep()).toBe(2);
     expect(m.error()).not.toBeNull();
@@ -803,7 +802,7 @@ describe("new-project stepper — Continue asks the save", () => {
     await m.next();
     expect(m.shownStep()).toBe(0);
     expect(m.error()).toBe("Filesystem tickets require local runner mode");
-    expect(m.el<HTMLInputElement>("np-repo").value).toBe("widgets");
+    expect(m.el<HTMLInputElement>("np-github-repo").value).toBe("acme/widgets");
   });
 
   it("shows a refusal of a field no step holds on the step it came from", async () => {
@@ -879,7 +878,65 @@ describe("new-project stepper — Jira repository values", () => {
     field.innerHTML = '<option value="customfield_1">Repo</option>';
     await win.onStepperRepoFieldChange();
     const options = Array.from((doc.getElementById("np-jira-repo-value") as HTMLSelectElement).options);
-    expect(options.map((o) => [o.value, o.textContent])).toEqual([["", "(select)"], [VALUE, VALUE]]);
+    expect(options.map((o) => [o.value, o.textContent])).toEqual([["", "(none, matches the repository)"], [VALUE, VALUE]]);
+  });
+});
+
+describe("new-project stepper — a Jira project's repository", () => {
+  /** Opens the stepper on Jira with JQL `jql` and its Repo Field Value left blank, Continuing to Source. */
+  async function toJiraSource(jql = "project = APP") {
+    const m = mountStepper({ jira: (url) => reply(200, url.startsWith("/api/jira/validate-jql") ? { valid: true } : []) });
+    m.win.openNewProjectStepper();
+    m.el<HTMLSelectElement>("np-ticketing-provider").value = "jira";
+    m.win.onStepperTicketingProviderChange();
+    await m.next();
+    m.input("np-jira-jql", jql);
+    await m.next();
+    return m;
+  }
+
+  it("leaves the Repo Field Value blank, reads a pasted GitHub address as owner/repo, and sends the value as null", async () => {
+    const m = await toJiraSource();
+    expect([m.shownStep(), m.error()]).toEqual([2, null]);
+    m.input("np-github-repo", "https://github.com/acme/widgets.git");
+    m.input("np-defaultBranch", "main");
+    for (let step = 2; step < 8; step++) await m.next();
+    expect(m.shownStep()).toBe(8);
+    expect(m.validations.at(-1)).toMatchObject({ owner: "acme", repo: "widgets", ticketingConfig: { kind: "jira", repoFieldValue: null } });
+    expect(m.doc.body.textContent).toContain("repo=acme/widgets (the repository)");
+  });
+
+  it("offers the same blank choice once reopened", async () => {
+    const m = await toJiraSource();
+    m.win.closeNewProjectStepper();
+    m.win.openNewProjectStepper();
+    expect(Array.from(m.el<HTMLSelectElement>("np-jira-repo-value").options, (o) => [o.value, o.textContent])).toEqual([["", "(none, matches the repository)"]]);
+  });
+
+  it.each([["widgets"], ["acme/widgets/src"]])("refuses %j as the repository, naming the shapes it takes", async (value) => {
+    const m = await toJiraSource();
+    m.input("np-github-repo", value);
+    m.input("np-defaultBranch", "main");
+    await m.next();
+    expect(m.shownStep()).toBe(2);
+    expect(m.error()).toContain("must be owner/repo");
+  });
+
+  it("warns after Validate when the JQL names the repo field", async () => {
+    const m = await toJiraSource('project = APP AND "AI-Implement Repo" = "acme/widgets"');
+    m.win.stepperBack();
+    await m.win.stepperValidateJql();
+    expect(m.el("np-jira-jql-status").textContent).toMatch(/^⚠ Valid\. The JQL names the AI-Implement Repo field\./);
+  });
+
+  it("warns after Validate when the JQL names the chosen repo field by its ID", async () => {
+    const m = await toJiraSource('project = APP AND cf[10101] = "acme/widgets"');
+    m.win.stepperBack();
+    const repoField = m.el<HTMLSelectElement>("np-jira-repo-field");
+    repoField.innerHTML = '<option value="customfield_10101">Repo</option>';
+    repoField.value = "customfield_10101";
+    await m.win.stepperValidateJql();
+    expect(m.el("np-jira-jql-status").textContent).toMatch(/^⚠ Valid\. The JQL names the AI-Implement Repo field\./);
   });
 });
 
@@ -916,8 +973,7 @@ describe("new-project Fly CPU kind", () => {
       await next();
       field("np-teamKey").value = "AII";
       await next();
-      field("np-owner").value = "BuildDownAI";
-      field("np-repo").value = "AI-Implement";
+      field("np-github-repo").value = "BuildDownAI/AI-Implement";
       field("np-defaultBranch").value = "testing";
       await next();
       await next();

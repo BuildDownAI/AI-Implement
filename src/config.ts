@@ -55,7 +55,7 @@ export interface RepoMapping {
   provider: ClaudeProvider;
   /** Ticketing provider this mapping uses. Filesystem is available in local runner mode. Default 'linear'. */
   ticketingProvider: ProviderId;
-  /** Per-mapping ticketing config (Linear is trivial; Jira carries jql, repoFieldValue, optional overrides). */
+  /** Per-mapping ticketing config (Linear is trivial; Jira carries jql, an optional repoFieldValue and optional overrides). */
   ticketingConfig: TicketingMappingConfig;
   /** AWS region for Bedrock. Required when provider='bedrock'. */
   awsRegion: string | null;
