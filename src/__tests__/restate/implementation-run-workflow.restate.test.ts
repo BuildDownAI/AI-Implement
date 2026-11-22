@@ -1,4 +1,5 @@
 import * as http2 from "node:http2";
+import { RUNNER_SERVICE_RETRY_POLICY } from "../../runner-service.js";
 import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { registerRunnerDeployment, removeDeployment } from "../../restate/endpoint.js";
@@ -370,17 +371,21 @@ describe("ImplementationRun durable workflow", () => {
     }, 60_000,
   );
 
-  it.each(labels.flatMap(label => ["success", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
+  it.each(labels.flatMap(label => ["success", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
     "local serve $mode $label waits on one registered call", async ({ label, mode }) => {
       const launchGate = gate("local serve");
       const finishGate = gate("local serve");
       const envs = mode === "timeout" ? deadline : serveRuns;
-      const w = begin(envs, label, { launchGate, row: makeJob({ status: "dispatched", approved: ["success", "long", "confirm"].includes(mode) }) }, { backend: "local-docker" });
+      const w = begin(envs, label, { launchGate, row: makeJob({ status: "dispatched", approved: ["success", "delayed discovery", "long", "confirm"].includes(mode) }) }, { backend: "local-docker" });
+      if (mode === "delayed discovery") {
+        w.sc.launchResult = { outcome: "unknown" };
+        w.sc.runId = null;
+      }
       const env = envs.get(label)!;
       const sessions = new Set<http2.ServerHttp2Session>();
       const runner = restate.service({
         name: `Runner_${w.dispatchId}`,
-        options: { explicitCancellation: true, inactivityTimeout: 60_000, abortTimeout: 120_000 },
+        options: { retryPolicy: RUNNER_SERVICE_RETRY_POLICY, explicitCancellation: true, inactivityTimeout: 60_000, abortTimeout: 120_000 },
         handlers: {
           run: async (ctx: restate.Context, input: { workflowKey: string }) => {
             expect(input.workflowKey).toBe(w.dispatchId);
@@ -394,7 +399,6 @@ describe("ImplementationRun durable workflow", () => {
                   throw new restate.TerminalError("Cancelled", { errorCode: 409 });
                 }),
               ]);
-              if (mode === "failure") throw new restate.TerminalError("runner killed");
               return {};
             } finally { w.sc.runnerOpen = false; }
           },
@@ -403,14 +407,28 @@ describe("ImplementationRun durable workflow", () => {
       const server = http2.createServer(createEndpointHandler({ services: [runner] }));
       server.on("session", session => { sessions.add(session); session.on("close", () => sessions.delete(session)); });
       await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      let endpointClosed = false;
+      const closeEndpoint = async () => {
+        if (endpointClosed) return;
+        endpointClosed = true;
+        await new Promise<void>(resolve => { server.close(() => resolve()); for (const session of sessions) session.destroy(); });
+        // The endpoint process is gone; its in-process gated handler cannot
+        // represent a live container after its transport has been destroyed.
+        w.sc.runnerOpen = false;
+      };
       onTestFinished(async () => {
         finishGate.release(); launchGate.release();
-        await new Promise<void>(resolve => { server.close(() => resolve()); for (const session of sessions) session.destroy(); });
+        await closeEndpoint();
       });
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("runner has no port");
       w.sc.runnerUri = `http://127.0.0.1:${address.port}`;
       launchGate.release();
+      if (mode === "delayed discovery") {
+        await eventually(() => w.sc.findCalls, calls => calls >= 3, { label: "repeated discovery after ambiguous launch" });
+        expect(w.sc.runnerStarted).not.toBe(true);
+        w.sc.runId = `job-${w.dispatchId}`;
+      }
       await eventually(() => w.sc.runnerStarted && w.sc.row.status === "running", Boolean);
       expect(w.sc.readCalls).toBe(0);
       if (mode === "long") {
@@ -446,22 +464,37 @@ describe("ImplementationRun durable workflow", () => {
         expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "workflow_cancelled" });
         expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
       } else {
-        if (mode !== "timeout") finishGate.release();
+        if (mode === "failure") await closeEndpoint();
+        else if (mode !== "timeout") finishGate.release();
         expect(await w.done).toMatchObject({ reason: mode === "timeout" ? "deadline_exceeded" : "finalized" });
       }
       if (mode === "failure") {
         expect(storedRows(w.dispatchId)).toHaveLength(1);
+        expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
+        expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
         expect(w.sc.closeCalls).toContainEqual(["failed", "ended_without_callback", { skipAdmissionRelease: true }]);
         expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "ended_without_callback" });
       }
+      expect(w.sc.launchCalls).toBe(1);
       expect(w.sc.deploymentRemoved).toBe(true);
       expect(w.sc.runnerOpen).toBe(false);
       if (mode === "timeout" || mode === "cancel") expect(w.sc.runnerAborted).toBe(true);
       if (mode === "timeout") expect(w.sc.stuckCalls).toEqual(["ttl_expired"]);
-      if (["success", "long", "confirm"].includes(mode)) expect(w.sc.closeCalls).toContainEqual(["completed", "success", { skipAdmissionRelease: true }]);
+      if (["success", "delayed discovery", "long", "confirm"].includes(mode)) expect(w.sc.closeCalls).toContainEqual(["completed", "success", { skipAdmissionRelease: true }]);
       expect(w.sc.readCalls).toBe(0);
       const calls = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'Runner_${w.dispatchId}' AND target_handler_name = 'run'`);
       expect(calls).toHaveLength(1);
+      if (mode === "failure") {
+        expect(calls[0]!.completion_result).toBe("failure");
+        const response = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: sys_journal_events read, not an invocation lookup
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({ query: `SELECT * FROM sys_journal_events WHERE id = '${calls[0]!.id}'` }),
+        });
+        expect(response.ok).toBe(true);
+        const { rows } = await response.json() as { rows: Array<{ event_type: string }> };
+        expect(rows.filter(row => row.event_type === "TransientError")).toHaveLength(RUNNER_SERVICE_RETRY_POLICY.maxAttempts - 1);
+      }
     }, 60_000,
   );
 

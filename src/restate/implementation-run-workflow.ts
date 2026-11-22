@@ -443,7 +443,15 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
       }
 
       if (serve) {
-        if (jobId === null || !deps.runnerRegistration) throw new restate.TerminalError("local runner registration requires a container id and readers");
+        // An ambiguous launch can become discoverable later. Adopt it without
+        // launching again, sharing the original bootstrap budget with registration.
+        while (jobId === null) {
+          const remaining = Math.min(bootstrapDeadlineAt, totalDeadlineAt) - await ctx.date.now();
+          if (remaining <= 0) return await deadlinePath();
+          await readStatus();
+          if (jobId === null) await ctx.sleep(Math.min(tickMs, remaining));
+        }
+        if (!deps.runnerRegistration) throw new restate.TerminalError("local runner registration requires readers");
         const registered = await registerRunnerDeploymentWithRetry(ctx, {
           ...deps.runnerRegistration(input, jobId),
           bootstrapDeadlineAt: Math.min(bootstrapDeadlineAt, totalDeadlineAt),
