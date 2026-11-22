@@ -14,6 +14,7 @@ export interface LocalGapfillIssue {
 }
 
 export interface DispatchLocalGapfillInput {
+  serve?: StartLocalContainerInput["serve"];
   runName?: string;
   dispatchId?: string;
   reviewOnly?: RunConfigV1["reviewOnly"];
@@ -127,7 +128,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
   };
   // Reserved extraEnv names and legacy credentials fail here, before onBeforeLaunch.
   if (protectedModelAuth) validateProtectedLocalInput(localInput, protectedModelAuth);
-  const container = await startLocalRunnerContainer(localInput);
+  const container = await startLocalRunnerContainer({ ...localInput, ...(input.serve ? { serve: input.serve } : {}) });
 
   return {
     containerId: container.containerId,

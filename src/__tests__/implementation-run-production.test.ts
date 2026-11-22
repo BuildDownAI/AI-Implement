@@ -381,6 +381,7 @@ describe("production deps", () => {
       const readStatus = vi.fn().mockResolvedValue("ended");
       const workflow = createImplementationRunWorkflow({
         ...d, readModelPrices: undefined, retentionMs: 1000, readStatus,
+        runnerRegistration: () => ({ readUri: () => null, readContainerState: () => "ended" }),
         finishJob: async () => ({}), cleanup: async () => {}, onOutcome: async () => {},
       });
       const routes = (workflow as unknown as { workflow: {
@@ -392,7 +393,8 @@ describe("production deps", () => {
         promise: () => ({ get: () => ({ map: () => new Promise(() => {}) }) }),
       };
       expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "finalized" });
-      expect(readStatus).toHaveBeenCalledWith({ ...INPUT, backend }, "prior-run");
+      if (backend === "local-docker") expect(readStatus).not.toHaveBeenCalled();
+      else expect(readStatus).toHaveBeenCalledWith({ ...INPUT, backend }, "prior-run");
       expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
       expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
       expect(listMachines).not.toHaveBeenCalled();
@@ -568,8 +570,12 @@ describe("production deps", () => {
     });
 
     it.each(["fly-machines", "local-docker"] as const)("%s: records the row with the machine id and nonce", async (backend) => {
-      const { input, d } = compose();
+      const { input, d } = compose({ restateIdentityKey: "public-identity-key" });
       await d.launch({ ...INPUT, backend });
+      const launch = backend === "local-docker" ? input.launchImplementationLocalSession : input.launchImplementationFlySession;
+      const args = vi.mocked(launch).mock.calls[0]![0];
+      if (backend === "local-docker") expect(args).toMatchObject({ serve: { identityKey: "public-identity-key", runnerId: INPUT.dispatchId } });
+      else expect(args).not.toHaveProperty("serve");
       expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({
         dispatchId: "d-1", executionMode: backend, machineId: backend === "fly-machines" ? "m-1" : "c-1", machineNonce: "MACHINE-NONCE",
       }));
