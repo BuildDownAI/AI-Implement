@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
@@ -107,7 +107,12 @@ export function getDiff(workspaceDir: string, base?: string): string {
     if (existsSync(realIndexPath)) {
       // Seed the disposable index from the real one so existing staged changes
       // remain visible in the diff. The real index is only read here — never written.
+      // Keep the real index's times on the copy: git trusts an index entry when
+      // its timestamp is older than the index file, so a fresh copy timestamp
+      // would hide a same-size change made in the entry's timestamp second.
+      const realIndexTimes = statSync(realIndexPath);
       copyFileSync(realIndexPath, tmpIndexPath);
+      utimesSync(tmpIndexPath, realIndexTimes.atime, realIndexTimes.mtime);
     } else {
       // No real index (nothing staged yet): initialize the disposable index
       // from HEAD so that git diff HEAD sees the full working-tree delta.
