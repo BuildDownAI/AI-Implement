@@ -147,3 +147,17 @@ A builder makes a value a test passes in. A harness makes something the code und
 No job unsets anything before running tests: the scrub gives CI the same environment as every other machine.
 
 The `testing` and `main` rulesets do not require these checks, so a red check does not block a merge. Auto-merge of a child PR into a grouping branch does wait: `autoMergeRepo` in `src/auto-merge.ts` skips a PR whose checks failed and holds one whose checks are pending.
+
+## Docker test runs
+
+Run `npm run test:docker` before a merge, or when a local macOS run fails, to check the suites in Linux with the builder's pinned Node 24 image and CI's tools and command order:
+
+```bash
+npm run test:docker              # npm ci, npm test, npm run typecheck, npm run test:restate
+npm run test:docker -- unit      # npm ci, npm test, npm run typecheck
+npm run test:docker -- restate   # npm ci, npm run test:restate
+```
+
+Only Docker is required on the host (with its engine running and network access for apt/npm). Each run does a clean `npm ci`, including Linux native modules, and prints a PASS/FAIL result for each executed step; a failure stops the run with a nonzero exit. Restate runs once, without CI's repeats or shards.
+
+The command mounts a regular clone read-only and copies it, including `.git` and uncommitted/untracked files, into the disposable container. Linked worktrees with a `.git` pointer file are rejected; use a regular clone. Host `node_modules` is excluded, and the host tree and dependencies remain unchanged. Tests run as the non-root `node` user. No host environment variables or credentials are forwarded.
