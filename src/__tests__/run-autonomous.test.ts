@@ -897,6 +897,27 @@ describe("runAutonomous", () => {
     expect(body.comments.some((c: { body: string }) => c.body.includes("Run stats"))).toBe(true);
   });
 
+  it.each(["success", "failure"] as const)("delivers the %s callback body to a sink without HTTP credentials", async outcome => {
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const make = () => makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: outcome === "success" ? vi.fn().mockResolvedValue(openedPr(1)) : vi.fn().mockRejectedValue(new Error("push failed")) }],
+    ]);
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    await runAutonomous({ workspaceDir, ...make(), reporter: new NoopStepReporter(), llmExecutor: makeExecutor(), fetchImpl: fake.fetch });
+    const expected = resultBody(fake);
+    const sink = vi.fn();
+    const recording = fakeFetch({});
+    vi.stubEnv("RUN_TOKEN", "");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "");
+    await runAutonomous({ workspaceDir, ...make(), reporter: new NoopStepReporter(), llmExecutor: makeExecutor(), fetchImpl: recording.fetch, resultSink: sink });
+    expect(recording.calls).toEqual([]);
+    expect(sink).toHaveBeenCalledTimes(1);
+    // Run stats contain durations; every other field is identical to HTTP delivery.
+    expect(sink.mock.calls[0][0]).toEqual({ ...expected, comments: expect.any(Array) });
+  });
+
   it("posts the implementation callback using the AI_IMPLEMENT_RUN_CONFIG envelope's runnerCallbackUrl (GHA mode, RUNNER_CALLBACK_URL unset)", async () => {
     // GHA workflows never set RUNNER_CALLBACK_URL directly — only RUN_TOKEN — and carry the
     // callback URL inside the envelope. Regression test for the bug where postRunnerResult

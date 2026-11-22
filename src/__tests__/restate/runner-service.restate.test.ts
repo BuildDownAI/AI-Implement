@@ -20,7 +20,7 @@ import path from "node:path";
 import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } from "@restatedev/restate-sdk";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { toRecordedUsage } from "../../agent-usage.js";
 import { getDb } from "../../dedup.js";
 import { listJobAccounting } from "../../job-accounting.js";
@@ -36,6 +36,13 @@ import {
   createRunnerService,
   runnerServiceName,
 } from "../../runner-service.js";
+import { runAutonomous } from "../../run-autonomous.js";
+import { encodeRunConfig } from "../../run-config.js";
+import { PipelineRunner } from "../../pipeline/runner.js";
+import { NoopStepReporter } from "../../pipeline/reporter.js";
+import { makeReviewFixRunConfig, makeFeedbackLoopOutputs, makeExecutor } from "../helpers/builders.js";
+import { fakeFetch } from "../helpers/fake-fetch.js";
+import { noPlanningContext } from "../helpers/replies/orchestrator.js";
 import type { RunAutonomousResult } from "../../run-autonomous.js";
 import {
   VARIANTS,
@@ -402,7 +409,7 @@ function implementationWorkflow(seams: Partial<ImplementationRunDependencies> = 
 }
 
 describe("Runner_<runId> Restate service (AII-2034)", () => {
-  it.each(VARIANTS)("a signed call to Runner_<runId>.run returns the fake pipeline result (%s)", async (label) => {
+  it.each(VARIANTS)("a signed call to Runner_<runId>.run settles without a result body (%s)", async (label) => {
     const env = envs.get(label)!;
     const runId = randomUUID();
     const state = fakeState({ exitCode: 3 });
@@ -410,10 +417,92 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
     const endpoint = await registerRunner(env, createRunnerService({ runId, runAutonomous: fakePipeline(state) }));
     endpoints.push(endpoint);
     const result = await callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(runId), "run", { workflowKey: "workflow-key" });
-    expect(result).toEqual({ exitCode: 3 });
+    expect(result).toBeNull();
     expect(state.starts).toBe(1);
     const invocation = await waitForInvocation(env, runnerServiceName(runId));
     expect(await journalEntryNames(env.adminAPIBaseUrl(), String(invocation.id))).toContain("ev-0");
+  });
+
+  it.each(VARIANTS)("returns the last result body after settlement, including across restart (%s)", async label => {
+    const env = envs.get(label)!;
+    const runId = randomUUID();
+    const finish = gate("result pipeline settlement");
+    const body = { phase: "implementation" as const, outcome: "failure" as const, comments: [{ body: "summary" }], failureReason: "failed" };
+    let starts = 0;
+    const endpoint = await registerRunner(env, createRunnerService({ runId, runAutonomous: async options => {
+      starts++;
+      await options.resultSink?.({ ...body, failureReason: "earlier result" });
+      await finish.wait();
+      await options.resultSink?.(body);
+      return { exitCode: 1 };
+    } }));
+    endpoints.push(endpoint);
+    void callService(env.baseUrl(), runnerServiceName(runId), "run", { workflowKey: "workflow-key" }).catch(() => undefined);
+    await finish.reached();
+    const invocation = await waitForInvocation(env, runnerServiceName(runId));
+    await env.startedRestateServer.restart();
+    finish.release();
+    const attached = await fetch(`${env.baseUrl()}/restate/invocation/${invocation.id}/attach`);
+    expect(attached.ok).toBe(true);
+    expect(await attached.json()).toEqual(body);
+    expect(starts).toBe(1);
+    const names = await journalEntryNames(env.adminAPIBaseUrl(), String(invocation.id));
+    expect(names.filter(name => /^ev-/.test(name))).toEqual(["ev-0", "ev-1", "ev-2"]);
+  }, 60_000);
+
+  it.each(VARIANTS.flatMap(([label]) => (["success", "failure"] as const).map(outcome => ({ label, outcome }))))(
+    "serve pipeline returns its $outcome body without posting a result ($label)", async ({ label, outcome }) => {
+      const env = envs.get(label)!;
+      const runId = randomUUID();
+      const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "runner-result-"));
+      const recording = fakeFetch({});
+      for (const [name, value] of Object.entries({ ISSUE_ID: "i", ISSUE_IDENTIFIER: "ENG-1", ISSUE_TITLE: "Implement", ISSUE_DESCRIPTION: "test",
+        GITHUB_DEFAULT_BRANCH: "main", GITHUB_OWNER: "acme", GITHUB_REPO: "app", GITHUB_TOKEN: "synthetic-token", RUN_TOKEN: "synthetic-result-token", RUNNER_CALLBACK_URL: "https://orchestrator.example" })) vi.stubEnv(name, value);
+      try {
+        const runner = new PipelineRunner()
+          .register("feedback-loop", { run: async () => makeFeedbackLoopOutputs() })
+          .register("push", { run: async () => {
+            if (outcome === "failure") throw new Error("synthetic push failure");
+            return { prUrl: "https://github.com/acme/app/pull/1", branchPushed: true, prNumber: 1, commitSha: "a".repeat(40) };
+          } });
+        const endpoint = await registerRunner(env, createRunnerService({ runId, runAutonomous: options => runAutonomous({ ...options,
+          workspaceDir, fetchImpl: recording.fetch, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(), runner,
+          pipeline: { id: "result", steps: ["feedback-loop", "push"].map(id => ({ id, type: "custom", moduleId: id })) },
+        }) }));
+        endpoints.push(endpoint);
+        expect(await callService(env.baseUrl(), runnerServiceName(runId), "run", { workflowKey: runId }))
+          .toMatchObject({ phase: "implementation", outcome, comments: expect.any(Array) });
+        expect(recording.calls).toEqual([]);
+      } finally {
+        vi.unstubAllEnvs();
+        await rm(workspaceDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(VARIANTS)("a pilot no-result settles the call without a deadline or result callback (%s)", async label => {
+    const env = envs.get(label)!;
+    const runId = randomUUID();
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "runner-no-result-"));
+    const recording = fakeFetch({ "GET /runner/planning-context": noPlanningContext });
+    for (const [name, value] of Object.entries({ GITHUB_OWNER: "acme", GITHUB_REPO: "app", GITHUB_TOKEN: "synthetic-token", GITHUB_DEFAULT_BRANCH: "main" })) vi.stubEnv(name, value);
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig({ version: 1,
+      attemptId: runId, installationId: 12345, repository: "acme/app", prNumber: 42, deadlineAt: Date.now() + 60_000 })));
+    try {
+      const endpoint = await registerRunner(env, createRunnerService({ runId, runAutonomous: options => runAutonomous({ ...options,
+        workspaceDir, fetchImpl: recording.fetch, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        pipeline: { id: "no-result", steps: [{ id: "feedback-loop", type: "custom", moduleId: "feedback-loop" }] },
+        runner: new PipelineRunner().register("feedback-loop", { run: async () => makeFeedbackLoopOutputs({ approved: false }) }),
+      }) }));
+      endpoints.push(endpoint);
+      expect(await callService(env.baseUrl(), runnerServiceName(runId), "run", { workflowKey: runId })).toBeNull();
+      expect(recording.calls.some(call => call.path === "/runner/result")).toBe(false);
+      const invocation = await waitForInvocation(env, runnerServiceName(runId));
+      expect((await journalEntryNames(env.adminAPIBaseUrl(), String(invocation.id))).filter(name => /^ev-/.test(name))).toEqual(["ev-0"]);
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
   });
 
   it.each(VARIANTS)("an unsigned or invalidly signed request is rejected before the pipeline runs (%s)", async (label) => {
@@ -519,7 +608,7 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
     expect(state.starts).toBe(1);
     const releasedAt = Date.now();
     state.gate.release();
-    expect(await pending).toEqual({ exitCode: 0 });
+    expect(await pending).toBeNull();
     expect(releasedAt - enteredAt!).toBeGreaterThanOrEqual(SERVER_INACTIVITY_TIMEOUT_MS + 1_000);
     expect(steps.counts.get(0)).toBe(1);
     const terminal = await waitForTerminal(env, String(invocation.id));
@@ -543,8 +632,8 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
       callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(firstId), "run", { workflowKey: "one" }),
       callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(secondId), "run", { workflowKey: "two" }),
     ]);
-    expect(firstResult).toEqual({ exitCode: 11 });
-    expect(secondResult).toEqual({ exitCode: 22 });
+    expect(firstResult).toBeNull();
+    expect(secondResult).toBeNull();
     expect(first.starts).toBe(1);
     expect(second.starts).toBe(1);
     expect(await invocationRows(env, runnerServiceName(firstId))).toHaveLength(1);
@@ -702,7 +791,7 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
     expect(await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "run", input)).toEqual({ reason: "finalized" });
     state.gate.release();
     expect(await callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(dispatchId), "run", { workflowKey: dispatchId }))
-      .toEqual({ exitCode: 0 });
+      .toBeNull();
     await eventually(() => storedInvocations(dispatchId), (found) => found.length === 2, { label: "two invocation rows" });
     await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report", {
       usage: toRecordedUsage({ invocations: records }),

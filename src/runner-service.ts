@@ -51,14 +51,15 @@ export type RunnerRunInput = z.infer<typeof runnerRunInputSchema>;
 
 export type RunnerEvent =
   | { kind: "invocation"; record: InvocationRecordV1 }
-  | { kind: "result"; result: RunAutonomousResult }
+  | { kind: "result"; result: import("./runner-callback.js").RunnerResultBody }
+  | { kind: "settled" }
   | { kind: "failed"; message: string };
 
 export interface RunnerServiceDeps {
   /** The dispatch id this service is named for. */
   runId: string;
   /** The pipeline. Tests pass a fake; production leaves it unset. */
-  runAutonomous?: () => Promise<RunAutonomousResult>;
+  runAutonomous?: (options: import("./run-autonomous.js").RunAutonomousOptions) => Promise<RunAutonomousResult>;
   /**
    * Observes each execution of an `ev-i` step's callback. The engine does not run a
    * callback whose completion is already journaled, so a count above one proves the
@@ -119,7 +120,7 @@ export class RunnerFlight {
   private cancelled: Error | undefined;
 
   constructor(
-    private readonly run: () => Promise<RunAutonomousResult>,
+    private readonly run: (options: import("./run-autonomous.js").RunAutonomousOptions) => Promise<RunAutonomousResult>,
     private readonly env: NodeJS.ProcessEnv = process.env,
   ) {
     // Installed for this flight, not for the process: `runAutonomous()` resets the
@@ -137,7 +138,8 @@ export class RunnerFlight {
 
   private async execute(): Promise<void> {
     try {
-      this.push({ kind: "result", result: await this.run() });
+      await this.run({ resultSink: (result) => { this.push({ kind: "result", result }); } });
+      this.push({ kind: "settled" });
     } catch (err) {
       this.push({ kind: "failed", message: sanitizeRunnerFailure(err, this.env) });
     } finally {
@@ -149,7 +151,7 @@ export class RunnerFlight {
     if (this.terminal) return;
     const index = this.events.length;
     this.events.push(event);
-    if (event.kind === "result" || event.kind === "failed") this.terminal = true;
+    if (event.kind === "settled" || event.kind === "failed") this.terminal = true;
     const waiting = this.waiters.get(index);
     if (waiting) {
       this.waiters.delete(index);
@@ -187,7 +189,7 @@ export function runnerServiceName(runId: string): string {
 export function createRunnerService(deps: RunnerServiceDeps): ServiceDefinition<string, unknown> {
   const runId = deps.runId.trim();
   if (!runId) throw new Error(`${RUNNER_ID_ENV} is required to name a runner service`);
-  const runPipeline = deps.runAutonomous ?? (() => runAutonomous());
+  const runPipeline = deps.runAutonomous ?? runAutonomous;
   const env = deps.env ?? process.env;
   const flights = new Map<string, RunnerFlight>();
 
@@ -201,7 +203,7 @@ export function createRunnerService(deps: RunnerServiceDeps): ServiceDefinition<
     return flight;
   };
 
-  async function run(ctx: restate.Context, input: RunnerRunInput): Promise<RunAutonomousResult> {
+  async function run(ctx: restate.Context, input: RunnerRunInput): Promise<import("./runner-callback.js").RunnerResultBody | null> {
     if (!input?.workflowKey?.trim()) throw new restate.TerminalError("workflowKey is required");
     const invocationId = ctx.request().id;
     const flight = flightFor(invocationId);
@@ -213,6 +215,7 @@ export function createRunnerService(deps: RunnerServiceDeps): ServiceDefinition<
         throw new restate.TerminalError("Cancelled", { errorCode: 409 });
       });
 
+    let result: import("./runner-callback.js").RunnerResultBody | null = null;
     for (let i = 0; ; i++) {
       const event = await restate.RestatePromise.race([
         ctx.run(`ev-${i}`, () => {
@@ -221,7 +224,8 @@ export function createRunnerService(deps: RunnerServiceDeps): ServiceDefinition<
         }),
         cancellation(),
       ]);
-      if (event.kind === "result") return event.result;
+      if (event.kind === "result") result = event.result;
+      if (event.kind === "settled") return result;
       if (event.kind === "failed") throw new restate.TerminalError(event.message);
       if (event.kind === "invocation") {
         ctx.genericSend({

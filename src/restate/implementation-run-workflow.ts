@@ -130,6 +130,8 @@ export interface ImplementationRunDependencies {
   ensureOwner?(input: ImplementationRunInput): void;
   recordTerminationIntent?(input: ImplementationRunInput, outcome: ImplementationFinishOutcome): void;
   reconcile?(dispatchId: string): Promise<ImplementationRunResult>;
+  /** Shared callback lifecycle intake, without forwarding back to this workflow. */
+  acceptRunnerResult?(input: ImplementationRunInput, body: import("../runner-callback.js").RunnerResultBody): Promise<void>;
   /** Test seams: production leaves every one of these unset. */
   tickMs?: number;
   confirmTickMs?: number;
@@ -384,6 +386,20 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
        *  and does what the callback has not done yet. */
       async function endedPath(): Promise<ImplementationRunResult> {
         runEnded = true;
+        if (serve && runnerCall) {
+          let body: unknown;
+          try { body = await runnerCall; } catch (err) {
+            if (restate.internal.isSuspendedError(err)) throw err;
+          }
+          if (body && typeof body === "object" && "phase" in body) {
+            const result = body as import("../runner-callback.js").RunnerResultBody;
+            await ctx.run("accept-runner-result", async () => {
+              if (!deps.acceptRunnerResult) throw new Error("runner result intake unavailable");
+              await deps.acceptRunnerResult(input, result);
+            }, { maxRetryAttempts: 3 });
+            await report(ctx, { usage: toRecordedUsage(result) });
+          }
+        }
         pendingReason = "finalized";
         rowCloseTried = true;
         const finished = await ctx.run("finish-job", async () => {

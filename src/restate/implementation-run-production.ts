@@ -1,3 +1,4 @@
+import { acceptRunnerCallResult } from "../runner-callback.js";
 import * as restate from "@restatedev/restate-sdk";
 import { requireImplementationRunOwner, updateImplementationRunOwner, readImplementationRunOwner, releaseImplementationRunOwner, claimImplementationStuckAttempt, completeImplementationStuckCleanup } from "./implementation-run-owner.js";
 import { getCommentGapfillLaunch } from "../comment-gapfill-queue.js";
@@ -94,6 +95,7 @@ const GHA_BACKEND = "github-actions";
 type ContainerBackend = "fly-machines" | "local-docker";
 
 export interface ImplementationRunProductionInput {
+  submitLateExternalReview?: import("../runner-callback.js").HandleRunnerResultInput["submitLateExternalReview"];
   /** The full config: the launch functions read from it. */
   config: AppConfig;
   /** The Restate request-identity public key (`restateSidecar.identityKey`), the same value
@@ -722,6 +724,14 @@ export function createProductionImplementationRunServices(input: ImplementationR
     if (!owner.mapping) updateImplementationRunOwner({ ...owner, mapping: recoveryMapping(mapping), flyApp: null });
   });
   const deps: ImplementationRunDependencies = {
+    acceptRunnerResult: async (run, body) => {
+      const job = getJobByDispatchId(run.dispatchId);
+      if (!job) throw new Error("runner result job missing");
+      const result = await acceptRunnerCallResult({ body, resolveProvider: () => providerForJob(job), watchdogConfig, submitLateExternalReview: input.submitLateExternalReview },
+        { dispatchId: run.dispatchId, issueId: run.issueId, teamKey: run.teamKey,
+          phase: run.gapFill ? "gap-analysis" : "implementation" });
+      if (result.status >= 300) throw new Error(`runner result intake failed: ${result.status}`);
+    },
     ensureOwner: (run) => {
       const admission = readAdmission(run.dispatchId);
       if (admission?.releasedAt === null) requireImplementationRunOwner(run);
