@@ -6,7 +6,16 @@ This is the reference for `src/runner-tokens.ts`, `src/runner-callback.ts`, `src
 
 The blast-radius section exists because of AII-567: a test suite inside a dispatched runner posted to the live orchestrator and burned every run's result token for three days. The learning record is [docs/solutions/workflow-patterns/runner-test-suite-burned-the-run-token.md](solutions/workflow-patterns/runner-test-suite-burned-the-run-token.md). This page records the structure that made it possible, so the next change to this path starts from the census below.
 
+Local serve-mode runs deliver the last `result` event body through the Restate runner call,
+rather than posting `/runner/result`. The workflow applies the shared callback lifecycle
+intake and owned-run accounting before finalizing. Pipeline settlement also ends the call
+when the pilot emits no result. Step progress still uses callbacks. Runs outside serve
+mode (currently Fly and GitHub Actions) retain result and progress callbacks.
+
 ## The path
+
+The diagram shows callback delivery for runs outside serve mode. Local serve-mode
+results use the Restate call described above; their progress follows the diagram.
 
 ```mermaid
 sequenceDiagram

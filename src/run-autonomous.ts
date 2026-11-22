@@ -28,7 +28,7 @@ import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } fro
 import { runHookScript } from "./pipeline/steps/hooks.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
-import { fetchPlanningContextFromOrchestrator, postRunnerCycleSummary, postRunnerResult } from "./runner-result.js";
+import { buildRunnerResultBody, fetchPlanningContextFromOrchestrator, postRunnerCycleSummary, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
 import { classifyThrown, isFailureRecord } from "./pipeline/failure-classification.js";
@@ -226,6 +226,8 @@ export function resolveActivityReporting(
 type RunAutopsyPasses = StatsPass[];
 
 export interface RunAutonomousOptions {
+  /** Serve-mode terminal delivery; absent callers retain HTTP callbacks. */
+  resultSink?: (body: import("./runner-callback.js").RunnerResultBody) => void | Promise<void>;
   workspaceDir?: string;
   reporter?: StepReporter;
   llmExecutor?: LLMExecutor;
@@ -601,6 +603,7 @@ async function reportRunnerResult(
   outputCommit: string | null,
   env: NodeJS.ProcessEnv,
   params: Omit<Parameters<typeof postRunnerResult>[0], "reviewFix" | "cycleSummaries">,
+  resultSink?: RunAutonomousOptions["resultSink"],
 ): Promise<void> {
   const recorded = identity ? readCycleSummaries(params.workspaceDir) : [];
   // After a successful push, one distinct publication record carries the real pushed commit and the
@@ -633,11 +636,13 @@ async function reportRunnerResult(
     );
     return;
   }
-  await postRunnerResult({
+  const delivery = {
     ...params,
     ...(resolution.kind === "attached" && cycleSummaries.length > 0 ? { cycleSummaries } : {}),
     reviewFix: resolution.kind === "attached" ? resolution.reviewFix : undefined,
-  });
+  };
+  if (resultSink) await resultSink(buildRunnerResultBody(delivery));
+  else await postRunnerResult(delivery);
 }
 
 
@@ -1434,7 +1439,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         reviewOnly: true, internalFindings: review.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[],
         rollupReview: review.rollupReview as import("./runner-result.js").RollupReviewResult,
         callbackUrl, retryPolicy, fetchImpl: opts.fetchImpl,
-      });
+      }, opts.resultSink);
       runCompleted = true;
       return { exitCode: 0 };
     }
@@ -1489,7 +1494,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         callbackUrl,
         retryPolicy,
         fetchImpl: opts.fetchImpl,
-      });
+      }, opts.resultSink);
       runCompleted = true;
       return { exitCode: 0, ...attributionField(finalAttribution()) };
     }
@@ -1548,7 +1553,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           callbackUrl,
           retryPolicy,
           fetchImpl: opts.fetchImpl,
-        });
+        }, opts.resultSink);
         return { exitCode: 0, ...attributionField(finalAttribution()) };
       }
 
@@ -1601,7 +1606,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         callbackUrl,
         retryPolicy,
         fetchImpl: opts.fetchImpl,
-      });
+      }, opts.resultSink);
       runCompleted = true;
       return { exitCode: 0, ...attributionField(finalAttribution()) };
     }
@@ -1773,7 +1778,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       callbackUrl,
       retryPolicy,
       fetchImpl: opts.fetchImpl,
-    });
+    }, opts.resultSink);
     return { exitCode: 0, ...attributionField(finalAttribution()) };
   } catch (err) {
     console.error(`Pipeline failed: ${err}`);
@@ -1810,7 +1815,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       callbackUrl,
       retryPolicy,
       fetchImpl: opts.fetchImpl,
-    });
+    }, opts.resultSink);
     return { exitCode: 1, ...attributionField(errorAttribution(err) ?? finalAttribution()) };
   } finally {
     try {

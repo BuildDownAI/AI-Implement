@@ -6387,6 +6387,47 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     });
   }
 
+  it.each(["success", "failure"] as const)("runner call and callback share %s job, PR and usage intake", async outcome => {
+    const accounting = await import("../agent-usage.js");
+    const config = await import("../config.js");
+    config.initMappingsTable();
+    config.upsertMapping("ENG", makeMapping());
+    (await import("../pr-links.js")).listLinksByOutcome("open");
+    const rows = [];
+    for (const transport of ["callback", "call"] as const) {
+      const dispatchId = `parity-${transport}`;
+      const pr = transport === "call" ? 102 : 101;
+      const { token } = runnerTokens.mintRunToken({ dispatchId, issueId: "i", mappingTeamKey: "ENG", phase: "implementation", ttlSeconds: 3600, secret: SECRET });
+      dispatchAdmission.acquire({ dispatchId, mappingKey: "ENG", scope: { kind: "issue", issueScope: "ENG", issueId: "i" }, kind: "implementation", backend: "local-docker", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 2 });
+      log.appendLog(makeAppendLogEntry({ issueId: "i", teamKey: "ENG", repo: "o/r", dispatchId, phase: "implementation", status: "running" }));
+      storeSnapshot(dispatchId, `snap-${dispatchId}`);
+      const body = { phase: "implementation" as const, outcome, comments: [{ body: "result" }], prUrl: `https://github.com/o/r/pull/${pr}`,
+        invocations: [{ attribution: claim({ invocationId: `${dispatchId}-inv`, snapshotId: `snap-${dispatchId}` }) }], pushedCommits: ["a".repeat(40)] };
+      const provider = new FakeProvider({ recordCalls: true });
+      const resolveProvider = makeResolve(provider);
+      if (transport === "callback") {
+        expect((await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET, body: body as never, resolveProvider,
+          checkImplementationAdmissionTermination: async (_id, usage) => { accounting.recordUsage(dispatchId, usage!); return { status: "accepted" }; } })).status).toBe(200);
+      } else {
+        const identity = { dispatchId, issueId: "i", teamKey: "ENG", phase: "implementation" as const };
+        expect((await runnerCallback.acceptRunnerCallResult({ body: body as never, resolveProvider }, identity)).status).toBe(200);
+        accounting.recordUsage(dispatchId, accounting.toRecordedUsage(body));
+        const effects = provider.recordedCalls().length;
+        expect((await runnerCallback.acceptRunnerCallResult({ body: body as never, resolveProvider }, identity)).status).toBe(200);
+        expect(provider.recordedCalls()).toHaveLength(effects);
+      }
+      const job = log.getJobByDispatchId(dispatchId)!;
+      expect(job.prUrl).toBe(body.prUrl);
+      const link = dedup.getDb().prepare("SELECT role, source, outcome FROM pull_request_link WHERE repository = 'o/r' AND number = ?").get(pr);
+      const usage = dedup.getDb().prepare("SELECT usage_json FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId);
+      rows.push({ status: job.status, conclusion: job.conclusion, link, usage });
+      dispatchAdmission.releaseByDispatchId(dispatchId, "finalized");
+    }
+    expect(rows[1]).toEqual(rows[0]);
+    expect(rows[0].link).toMatchObject({ role: "implementation", source: "result" });
+    expect(rows[0].usage).toHaveLength(1);
+  });
+
   async function managedResult() {
     const attemptId = "attempt-managed-attr";
     const token = preparedResultToken(attemptId);

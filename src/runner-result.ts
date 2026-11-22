@@ -244,57 +244,7 @@ export async function postRunnerResult(params: {
     }
     return;
   }
-  let comments: Array<{ body: string }> = [];
-  try {
-    comments = collectRunnerComments(params.workspaceDir);
-  } catch (err) {
-    console.warn("[runner-callback] comment collection failed:", err);
-  }
-  const body: Record<string, unknown> = { phase: params.phase, outcome: params.outcome, comments };
-  if (params.prUrl) body.prUrl = params.prUrl;
-  if (params.failureReason) body.failureReason = params.failureReason;
-  if (params.failureCode) body.failureCode = params.failureCode;
-  if (params.failure) body.failure = params.failure;
-  if (params.noWork) body.noWork = params.noWork;
-  if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
-    body.referenceRepoResults = params.referenceRepoResults;
-  }
-  if (params.reviewOnly) body.reviewOnly = true;
-  if (params.rollupReview) body.rollupReview = params.rollupReview;
-  if (params.internalFindings) body.internalFindings = params.internalFindings;
-  if (params.findingDispositions && params.findingDispositions.length > 0) {
-    body.findingDispositions = params.findingDispositions;
-  }
-  if (params.cycleSummaries && params.cycleSummaries.length > 0) {
-    body.cycleSummaries = params.cycleSummaries;
-  }
-  if (params.attribution !== undefined) {
-    const attribution = sanitizeAttribution(params.attribution);
-    if (attribution) body.attribution = attribution;
-    else console.warn("[runner-callback] dropping invalid attribution before delivery");
-  }
-  // Job accounting (AII-1562): every model invocation and the pushed SHAs, beside the legacy single
-  // `attribution`. Defaults to what this runner process collected, so every result path reports them.
-  const invocations = sanitizeInvocationRecords(params.invocations ?? collectedInvocations());
-  if (invocations.dropped > 0) console.warn(`[runner-callback] dropping ${invocations.dropped} invalid invocation record(s) before delivery`);
-  if (invocations.valid.length > 0) body.invocations = invocations.valid;
-  // The orchestrator cannot see a cut or a drop, so the runner says so: the job's usage is then `partial`.
-  if (invocations.dropped > 0) body.invocationsDropped = invocations.dropped;
-  const pushedCommits = sanitizePushedCommits(params.pushedCommits ?? collectedPushedCommits());
-  if (pushedCommits) body.pushedCommits = pushedCommits;
-  if (params.externalReviewPending) body.externalReviewPending = params.externalReviewPending;
-  if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
-  if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
-  if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
-  if (params.guardVerdict) body.guardVerdict = params.guardVerdict;
-  if (params.partTable) body.partTable = params.partTable;
-  if (params.cause) body.cause = params.cause;
-  if (params.failedTeams) body.failedTeams = params.failedTeams;
-  if (params.sources) body.sources = params.sources;
-  if (params.acceptBlocked) body.acceptBlocked = params.acceptBlocked;
-  if (params.lostTeams) body.lostTeams = params.lostTeams;
-  if (params.warnings) body.warnings = params.warnings;
-  if (params.reviewFix) body.reviewFix = params.reviewFix;
+  const body = buildRunnerResultBody(params);
   const url = `${callbackUrl.replace(/\/$/, "")}/runner/result`;
   const headers = { "Content-Type": "application/json", Authorization: `Bearer ${runToken}` };
   // Built once and reused verbatim on every delivery attempt, including retries — a lost-ACK
@@ -362,4 +312,60 @@ export async function postRunnerResult(params: {
     console.error(`[runner-callback] POST retry after attempt ${attempt} status=${status ?? "transport_error"} reason=${lastReason}${attemptContext}`);
     await sleepFn(Math.min(backoff, remaining));
   }
+}
+
+/** Builds the same sanitized terminal body for HTTP and serve-mode delivery. */
+export function buildRunnerResultBody(params: Parameters<typeof postRunnerResult>[0]): import("./runner-callback.js").RunnerResultBody {
+  let comments: Array<{ body: string }> = [];
+  try {
+    comments = collectRunnerComments(params.workspaceDir);
+  } catch (err) {
+    console.warn("[runner-callback] comment collection failed:", err);
+  }
+  const body: Record<string, unknown> = { phase: params.phase, outcome: params.outcome, comments };
+  if (params.prUrl) body.prUrl = params.prUrl;
+  if (params.failureReason) body.failureReason = params.failureReason;
+  if (params.failureCode) body.failureCode = params.failureCode;
+  if (params.failure) body.failure = params.failure;
+  if (params.noWork) body.noWork = params.noWork;
+  if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
+    body.referenceRepoResults = params.referenceRepoResults;
+  }
+  if (params.reviewOnly) body.reviewOnly = true;
+  if (params.rollupReview) body.rollupReview = params.rollupReview;
+  if (params.internalFindings) body.internalFindings = params.internalFindings;
+  if (params.findingDispositions && params.findingDispositions.length > 0) {
+    body.findingDispositions = params.findingDispositions;
+  }
+  if (params.cycleSummaries && params.cycleSummaries.length > 0) {
+    body.cycleSummaries = params.cycleSummaries;
+  }
+  if (params.attribution !== undefined) {
+    const attribution = sanitizeAttribution(params.attribution);
+    if (attribution) body.attribution = attribution;
+    else console.warn("[runner-callback] dropping invalid attribution before delivery");
+  }
+  // Job accounting (AII-1562): every model invocation and the pushed SHAs, beside the legacy single
+  // `attribution`. Defaults to what this runner process collected, so every result path reports them.
+  const invocations = sanitizeInvocationRecords(params.invocations ?? collectedInvocations());
+  if (invocations.dropped > 0) console.warn(`[runner-callback] dropping ${invocations.dropped} invalid invocation record(s) before delivery`);
+  if (invocations.valid.length > 0) body.invocations = invocations.valid;
+  // The orchestrator cannot see a cut or a drop, so the runner says so: the job's usage is then `partial`.
+  if (invocations.dropped > 0) body.invocationsDropped = invocations.dropped;
+  const pushedCommits = sanitizePushedCommits(params.pushedCommits ?? collectedPushedCommits());
+  if (pushedCommits) body.pushedCommits = pushedCommits;
+  if (params.externalReviewPending) body.externalReviewPending = params.externalReviewPending;
+  if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
+  if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
+  if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
+  if (params.guardVerdict) body.guardVerdict = params.guardVerdict;
+  if (params.partTable) body.partTable = params.partTable;
+  if (params.cause) body.cause = params.cause;
+  if (params.failedTeams) body.failedTeams = params.failedTeams;
+  if (params.sources) body.sources = params.sources;
+  if (params.acceptBlocked) body.acceptBlocked = params.acceptBlocked;
+  if (params.lostTeams) body.lostTeams = params.lostTeams;
+  if (params.warnings) body.warnings = params.warnings;
+  if (params.reviewFix) body.reviewFix = params.reviewFix;
+  return body as unknown as import("./runner-callback.js").RunnerResultBody;
 }

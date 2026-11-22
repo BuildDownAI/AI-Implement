@@ -1,3 +1,14 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { runAutonomous } from "../../run-autonomous.js";
+import { PipelineRunner } from "../../pipeline/runner.js";
+import { NoopStepReporter } from "../../pipeline/reporter.js";
+import { makeFeedbackLoopOutputs, makeExecutor } from "../helpers/builders.js";
+import { fakeFetch } from "../helpers/fake-fetch.js";
+import { initStepLogTable } from "../../step-log.js";
+import { recordUsage } from "../../agent-usage.js";
+import { handleRunnerResult } from "../../runner-callback.js";
 import * as http2 from "node:http2";
 import { createRunnerService, RUNNER_SERVICE_RETRY_POLICY } from "../../runner-service.js";
 import * as restate from "@restatedev/restate-sdk";
@@ -12,10 +23,13 @@ import { registerRunnerDeployment, removeDeployment } from "../../restate/endpoi
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
 import { getDb } from "../../dedup.js";
-import { initMappingsTable } from "../../config.js";
+import { initMappingsTable, upsertMapping } from "../../config.js";
 import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import { initSettingsTable, setFlyProcessLevelSecrets } from "../../runner-mode.js";
-import { initLogTable } from "../../log.js";
+import { acceptRunnerCallResult } from "../../runner-callback.js";
+import { FakeProvider } from "../providers/fake.js";
+import { findLinkByPr } from "../../pr-links.js";
+import { appendLog, initLogTable } from "../../log.js";
 import { toRecordedUsage } from "../../agent-usage.js";
 import type { OwnedRunReportResult } from "../../restate/owned-run-lifecycle.js";
 import type { RestateEnvironment } from "./harness.js";
@@ -78,6 +92,7 @@ interface Scenario {
   stopCalls: string[];
   finishCalls: ImplementationFinishOutcome[];
   finishThrows: boolean;
+  resultIntakeThrows?: boolean;
   status: OwnedRunStatus;
   /** Parks the first status read or id lookup (the workflow's first tick). */
   tickGate?: Gate;
@@ -137,6 +152,15 @@ async function holdAtTick(sc: Scenario): Promise<void> {
 function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
   return {
     ...seams,
+    async acceptRunnerResult(input, body) {
+      const sc = scenarioOf(input.dispatchId);
+      sc.calls.push("accept-result");
+      if (sc.resultIntakeThrows) throw new Error("runner result intake rejected: mapping_not_found");
+      expect(body).toMatchObject({ phase: "implementation", outcome: expect.stringMatching(/^(success|failure)$/) });
+      const result = await acceptRunnerCallResult({ body, resolveProvider: async () => new FakeProvider() },
+        { dispatchId: input.dispatchId, issueId: input.issueId, teamKey: input.teamKey, phase: "implementation" });
+      expect(result.status).toBe(200);
+    },
     async reserve(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.calls.push("reserve");
@@ -440,6 +464,83 @@ describe("ImplementationRun durable workflow", () => {
     expect(events).toEqual(["status", "remove"]);
   }, 120_000);
 
+  it.each(labels.flatMap(label => (["success", "failure"] as const).map(outcome => ({ label, outcome }))))(
+    "local returned $outcome matches callback job, PR and usage intake ($label)", async ({ label, outcome }) => {
+      const launchGate = gate("result parity launch");
+      const w = begin(serveRuns, label, { launchGate }, { backend: "local-docker" });
+      const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "workflow-result-"));
+      const recording = fakeFetch({});
+      const sessions = new Set<http2.ServerHttp2Session>();
+      upsertMapping("ENG", makeMapping());
+      const seed = (dispatchId: string) => {
+        expect(admission.acquire({ dispatchId, mappingKey: "ENG",
+          scope: { kind: "issue", issueScope: "ENG", issueId: `issue-${dispatchId}` }, kind: "implementation", backend: "local-docker",
+          lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10 }).ok).toBe(true);
+        appendLog({ dispatchId, issueId: `issue-${dispatchId}`, issueIdentifier: "ENG-1", issueTitle: "Implement", teamKey: "ENG",
+          repo: `o/${dispatchId}`, phase: "implementation", status: "running" });
+      };
+      initStepLogTable();
+      expect(findLinkByPr(`o/${w.dispatchId}`, 1)).toBeNull();
+      seed(w.dispatchId);
+      const callbackId = `${w.dispatchId}-callback`;
+      seed(callbackId);
+      for (const [name, value] of Object.entries({ ISSUE_ID: `issue-${w.dispatchId}`, ISSUE_IDENTIFIER: "ENG-1", ISSUE_TITLE: "Implement", ISSUE_DESCRIPTION: "test",
+        GITHUB_DEFAULT_BRANCH: "main", GITHUB_OWNER: "o", GITHUB_REPO: w.dispatchId, GITHUB_TOKEN: "synthetic-token",
+        RUN_TOKEN: "synthetic-result-token", RUNNER_CALLBACK_URL: "https://orchestrator.example" })) vi.stubEnv(name, value);
+      const prUrl = `https://github.com/o/${w.dispatchId}/pull/1`;
+      const runner = createRunnerService({ runId: w.dispatchId, runAutonomous: async options => {
+        w.sc.runnerOpen = true;
+        try {
+          return await runAutonomous({ ...options, workspaceDir, fetchImpl: recording.fetch, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+            runner: new PipelineRunner()
+              .register("feedback-loop", { run: async () => makeFeedbackLoopOutputs({ approved: outcome === "success" }) })
+              .register("push", { run: async () => ({ prUrl, branchPushed: true, prNumber: 1, commitSha: "a".repeat(40) }) }),
+            pipeline: { id: "parity", steps: ["feedback-loop", "push"].map(id => ({ id, type: "custom", moduleId: id })) },
+            resultSink: async body => {
+              expect(body.outcome).toBe(outcome);
+              const callbackBody = { ...body, prUrl: `https://github.com/o/${callbackId}/pull/1`, invocations: seedUsage(callbackId).records };
+              const secret = "parity-secret";
+              const { token } = runnerTokens.mintRunToken({ dispatchId: callbackId, issueId: `issue-${callbackId}`, mappingTeamKey: "ENG", phase: "implementation", ttlSeconds: 3600, secret });
+              expect((await handleRunnerResult({ authorization: `Bearer ${token}`, secret, body: callbackBody,
+                resolveProvider: async () => new FakeProvider(),
+                checkImplementationAdmissionTermination: async (_id, usage) => { recordUsage(callbackId, usage!); return { status: "accepted" }; },
+              })).status).toBe(200);
+              await options.resultSink?.({ ...body, invocations: seedUsage(w.dispatchId).records });
+            },
+          });
+        } finally { w.sc.runnerOpen = false; }
+      } });
+      const server = http2.createServer(createEndpointHandler({ services: [runner] }));
+      server.on("session", session => { sessions.add(session); session.on("close", () => sessions.delete(session)); });
+      onTestFinished(async () => {
+        launchGate.release();
+        await new Promise<void>(resolve => { server.close(() => resolve()); for (const session of sessions) session.destroy(); });
+        vi.unstubAllEnvs();
+        admission.releaseByDispatchId(w.dispatchId, "finalized");
+        admission.releaseByDispatchId(callbackId, "finalized");
+        await rm(workspaceDir, { recursive: true, force: true });
+      });
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("runner has no port");
+      w.sc.runnerUri = `http://127.0.0.1:${address.port}`;
+      launchGate.release();
+      expect(await w.done).toEqual({ reason: "finalized" });
+      expect(recording.calls.filter(call => call.path === "/runner/result")).toEqual([]);
+      expect(w.sc.calls.filter(call => call === "accept-result")).toHaveLength(1);
+      const rows = (dispatchId: string) => {
+        const job = getJobByDispatchId(dispatchId)!;
+        expect(job.prUrl).toBe(`https://github.com/o/${dispatchId}/pull/1`);
+        return { status: job.status, conclusion: job.conclusion,
+          link: getDb().prepare("SELECT role, source, outcome FROM pull_request_link WHERE repository = ? AND number = 1").get(`o/${dispatchId}`),
+          usage: getDb().prepare("SELECT usage_json FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id").all(dispatchId) };
+      };
+      expect(rows(w.dispatchId)).toEqual(rows(callbackId));
+      expect(rows(w.dispatchId).link).toMatchObject({ role: "implementation", source: "result" });
+      expect(rows(w.dispatchId).usage).toHaveLength(2);
+    }, 60_000,
+  );
+
   it.each(labels.flatMap(label => ["exited", "rejected", "bootstrap timeout"].map(mode => ({ label, mode }))))(
     "local registration $mode $label finalizes the launched run", async ({ label, mode }) => {
       const w = begin(mode === "bootstrap timeout" ? deadline : serveRuns, label, {
@@ -454,26 +555,37 @@ describe("ImplementationRun durable workflow", () => {
     }, 60_000,
   );
 
-  it.each(labels.flatMap(label => ["success", "restart", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
+  it.each(labels.flatMap(label => ["success", "restart", "intake failure", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
     "local serve $mode $label waits on one registered call", async ({ label, mode }) => {
       const launchGate = gate("local serve");
       const finishGate = gate("local serve");
       const envs = mode === "timeout" ? deadline : serveRuns;
       const w = begin(envs, label, { launchGate, row: makeJob({ status: "dispatched", approved: ["success", "restart", "delayed discovery", "long", "confirm"].includes(mode) }) }, { backend: "local-docker" });
+      w.sc.resultIntakeThrows = mode === "intake failure";
       if (mode === "delayed discovery") {
         w.sc.launchResult = { outcome: "unknown" };
         w.sc.runId = null;
       }
       const env = envs.get(label)!;
+      if (mode === "restart") {
+        upsertMapping("ENG", makeMapping());
+        expect(findLinkByPr(`o/${w.dispatchId}`, 1)).toBeNull();
+        expect(admission.acquire({ dispatchId: w.dispatchId, mappingKey: "ENG",
+          scope: { kind: "issue", issueScope: "ENG", issueId: `issue-${w.dispatchId}` }, kind: "implementation", backend: "local-docker",
+          lifecycleOwner: { kind: "restate", attemptId: w.dispatchId }, cap: 10 }).ok).toBe(true);
+        appendLog({ dispatchId: w.dispatchId, issueId: `issue-${w.dispatchId}`, issueIdentifier: "ENG-1", issueTitle: "Implement", teamKey: "ENG", repo: `o/${w.dispatchId}`, phase: "implementation", status: "running" });
+      }
       let pipelineRuns = 0;
       const sessions = new Set<http2.ServerHttp2Session>();
-      const runner = mode === "restart" ? createRunnerService({
+      const runner = ["restart", "intake failure"].includes(mode) ? createRunnerService({
         runId: w.dispatchId,
-        runAutonomous: async () => {
+        runAutonomous: async options => {
           expect(w.sc.savedDeploymentId).toBe(w.sc.deploymentId);
           pipelineRuns++; w.sc.runnerStarted = true; w.sc.runnerOpen = true;
           await finishGate.wait();
           w.sc.runnerOpen = false;
+          await options.resultSink?.({ phase: "implementation", outcome: "success", comments: [],
+            prUrl: `https://github.com/o/${w.dispatchId}/pull/1`, invocations: seedUsage(w.dispatchId).records });
           return { exitCode: 0 };
         },
       }) : restate.service({
@@ -562,6 +674,18 @@ describe("ImplementationRun durable workflow", () => {
         expect(w.sc.finishCalls).toContainEqual({ kind: "cancelled" });
         expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "workflow_cancelled" });
         expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
+      } else if (mode === "intake failure") {
+        finishGate.release();
+        await expect(w.done).rejects.toThrow();
+        await waitForStep(w.read, "termination_unconfirmed");
+        expect(w.sc.calls.filter(call => call === "accept-result")).toHaveLength(3);
+        expect(w.sc.finishCalls).toEqual([]);
+        expect(w.sc.finalizeCalls).toEqual([]);
+        expect(w.sc.events).toEqual([]);
+        expect(releasesOf(w.dispatchId)).toEqual([]);
+        expect(w.sc.deploymentRemoved).not.toBe(true);
+        expect(w.sc.stopCalls).toEqual([]);
+        return;
       } else {
         if (mode === "failure") await closeEndpoint();
         else if (mode !== "timeout") finishGate.release();
@@ -573,6 +697,14 @@ describe("ImplementationRun durable workflow", () => {
         expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
         expect(w.sc.closeCalls).toContainEqual(["failed", "ended_without_callback", { skipAdmissionRelease: true }]);
         expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "ended_without_callback" });
+      }
+      if (mode === "restart") {
+        expect(w.sc.calls.filter(call => call === "accept-result")).toHaveLength(1);
+        expect(storedRows(w.dispatchId)).toHaveLength(2);
+        expect(getJobByDispatchId(w.dispatchId)?.prUrl).toBe(`https://github.com/o/${w.dispatchId}/pull/1`);
+        expect(findLinkByPr(`o/${w.dispatchId}`, 1)?.source).toBe("result");
+        expect(getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(w.dispatchId)).toEqual({ invocations_complete: 1 });
+        admission.releaseByDispatchId(w.dispatchId, "finalized");
       }
       expect(pipelineRuns).toBe(1);
       expect(w.sc.launchCalls).toBe(1);
