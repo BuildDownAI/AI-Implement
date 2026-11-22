@@ -1,3 +1,8 @@
+import * as http2 from "node:http2";
+import { RUNNER_SERVICE_RETRY_POLICY } from "../../runner-service.js";
+import * as restate from "@restatedev/restate-sdk";
+import { createEndpointHandler } from "@restatedev/restate-sdk/node";
+import { registerRunnerDeployment, removeDeployment } from "../../restate/endpoint.js";
 // Real Restate coverage for the ImplementationRun workflow (AII-1553). Every dependency is an in-process
 // fake keyed by dispatch id; each scenario holds the workflow at a named step with `gate` and
 // `waitForStep` from harness.ts, never a sleep. Three seam sets serve the scenarios: `slow` (long
@@ -54,6 +59,14 @@ const WINDOW = { ...SLOW, confirmWindowMs: 400 };
 const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 600, totalMs: 1_200, stopMarginMs: 500, escapeWaitMs: 4_000, escapeTickMs: 100 };
 
 interface Scenario {
+  registrationRejected?: boolean;
+  runnerUri?: string;
+  adminUrl?: string;
+  runnerOpen?: boolean;
+  runnerAborted?: boolean;
+  runnerStarted?: boolean;
+  deploymentRemoved?: boolean;
+  deploymentId?: string;
   launchResult: ImplementationLaunchResult;
   /** What `findExistingRun` answers once a launch happened; `null` models a backend that never shows an id. */
   runId: string | null;
@@ -148,6 +161,27 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
       if (sc.launchGate) await sc.launchGate.wait();
       sc.launched = true;
       return sc.launchImpl ? sc.launchImpl(input) : sc.launchResult;
+    },
+    runnerRegistration: (input) => {
+      const sc = scenarioOf(input.dispatchId);
+      return {
+        readUri: () => sc.runnerUri ?? null,
+        readContainerState: () => sc.status,
+        register: async uri => {
+          if (sc.registrationRejected) return { ok: false, reason: "rejected", status: 400 };
+          const result = await registerRunnerDeployment(uri, { adminBaseUrl: sc.adminUrl });
+          if (result.ok) sc.deploymentId = result.deploymentId;
+          return result;
+        },
+      };
+    },
+    markStarted: input => { scenarioOf(input.dispatchId).row.status = "running"; },
+    removeRunnerDeployment: async id => {
+      const sc = [...scenarios.values()].find(sc => sc.deploymentId === id);
+      if (!sc) throw new Error("missing registered runner");
+      expect(sc.runnerOpen).toBe(false);
+      await removeDeployment(id, { adminBaseUrl: sc.adminUrl });
+      sc.deploymentRemoved = true;
     },
     async readStatus(input) {
       const sc = scenarioOf(input.dispatchId);
@@ -268,6 +302,7 @@ describe("ImplementationRun durable workflow", () => {
   let slow: Map<string, RestateEnvironment>;
   let window: Map<string, RestateEnvironment>;
   let deadline: Map<string, RestateEnvironment>;
+  let serveRuns: Map<string, RestateEnvironment>;
   let counter = 0;
 
   beforeAll(async () => {
@@ -276,15 +311,16 @@ describe("ImplementationRun durable workflow", () => {
     initDispatchBreakerTable();
     initSettingsTable();
     initMappingsTable();
-    [slow, window, deadline] = await Promise.all([
+    [slow, window, deadline, serveRuns] = await Promise.all([
       startVariants([createImplementationRunWorkflow(makeDeps(SLOW))]),
       startVariants([createImplementationRunWorkflow(makeDeps(WINDOW))]),
       startVariants([createImplementationRunWorkflow(makeDeps(DEADLINE))]),
+      startVariants([createImplementationRunWorkflow(makeDeps({ ...SLOW, bootstrapMs: 600 }))]),
     ]);
   }, 180_000);
 
   afterAll(async () => {
-    await Promise.all([stopAll(slow), stopAll(window), stopAll(deadline)]);
+    await Promise.all([stopAll(slow), stopAll(window), stopAll(deadline), stopAll(serveRuns)]);
   });
 
   const labels = VARIANTS.map(([label]) => label);
@@ -307,6 +343,7 @@ describe("ImplementationRun durable workflow", () => {
       prMerged: false, events: [],
       ...overrides,
     };
+    sc.adminUrl = envs.get(label)!.adminAPIBaseUrl();
     scenarios.set(dispatchId, sc);
     const url = baseUrl(envs, label);
     const input: ImplementationRunInput = {
@@ -319,6 +356,147 @@ describe("ImplementationRun durable workflow", () => {
     const report = () => callWorkflow(url, "ImplementationRun", dispatchId, "report");
     return { dispatchId, sc, done, read, report };
   }
+
+  it.each(labels.flatMap(label => ["exited", "rejected", "bootstrap timeout"].map(mode => ({ label, mode }))))(
+    "local registration $mode $label finalizes the launched run", async ({ label, mode }) => {
+      const w = begin(mode === "bootstrap timeout" ? deadline : serveRuns, label, {
+        status: mode === "exited" ? "ended" : "started",
+        runnerUri: mode === "rejected" ? "http://127.0.0.1:1" : undefined,
+        registrationRejected: mode === "rejected", endOnStop: true,
+      }, { backend: "local-docker" });
+      expect(await w.done).toEqual({ reason: mode === "exited" ? "finalized" : mode === "rejected" ? "launch_rejected" : "deadline_exceeded" });
+      expect(w.sc.finishCalls).toHaveLength(1);
+      expect(w.sc.events).toContain("cleanup");
+      expect(w.sc.stopCalls).toHaveLength(mode === "exited" ? 0 : 1);
+    }, 60_000,
+  );
+
+  it.each(labels.flatMap(label => ["success", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
+    "local serve $mode $label waits on one registered call", async ({ label, mode }) => {
+      const launchGate = gate("local serve");
+      const finishGate = gate("local serve");
+      const envs = mode === "timeout" ? deadline : serveRuns;
+      const w = begin(envs, label, { launchGate, row: makeJob({ status: "dispatched", approved: ["success", "delayed discovery", "long", "confirm"].includes(mode) }) }, { backend: "local-docker" });
+      if (mode === "delayed discovery") {
+        w.sc.launchResult = { outcome: "unknown" };
+        w.sc.runId = null;
+      }
+      const env = envs.get(label)!;
+      const sessions = new Set<http2.ServerHttp2Session>();
+      const runner = restate.service({
+        name: `Runner_${w.dispatchId}`,
+        options: { retryPolicy: RUNNER_SERVICE_RETRY_POLICY, explicitCancellation: true, inactivityTimeout: 60_000, abortTimeout: 120_000 },
+        handlers: {
+          run: async (ctx: restate.Context, input: { workflowKey: string }) => {
+            expect(input.workflowKey).toBe(w.dispatchId);
+            w.sc.runnerStarted = true;
+            w.sc.runnerOpen = true;
+            try {
+              await restate.RestatePromise.race([
+                ctx.run("gated-run", () => finishGate.wait()),
+                (ctx as unknown as restate.internal.ContextInternal).cancellation().map((): never => {
+                  w.sc.runnerAborted = true;
+                  throw new restate.TerminalError("Cancelled", { errorCode: 409 });
+                }),
+              ]);
+              return {};
+            } finally { w.sc.runnerOpen = false; }
+          },
+        },
+      });
+      const server = http2.createServer(createEndpointHandler({ services: [runner] }));
+      server.on("session", session => { sessions.add(session); session.on("close", () => sessions.delete(session)); });
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      let endpointClosed = false;
+      const closeEndpoint = async () => {
+        if (endpointClosed) return;
+        endpointClosed = true;
+        await new Promise<void>(resolve => { server.close(() => resolve()); for (const session of sessions) session.destroy(); });
+        // The endpoint process is gone; its in-process gated handler cannot
+        // represent a live container after its transport has been destroyed.
+        w.sc.runnerOpen = false;
+      };
+      onTestFinished(async () => {
+        finishGate.release(); launchGate.release();
+        await closeEndpoint();
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("runner has no port");
+      w.sc.runnerUri = `http://127.0.0.1:${address.port}`;
+      launchGate.release();
+      if (mode === "delayed discovery") {
+        await eventually(() => w.sc.findCalls, calls => calls >= 3, { label: "repeated discovery after ambiguous launch" });
+        expect(w.sc.runnerStarted).not.toBe(true);
+        w.sc.runId = `job-${w.dispatchId}`;
+      }
+      await eventually(() => w.sc.runnerStarted && w.sc.row.status === "running", Boolean);
+      expect(w.sc.readCalls).toBe(0);
+      if (mode === "long") {
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`);
+        // Keep the runner gated until the workflow has journaled ticks spanning more
+        // than its bootstrap window. The latest timer is still pending, so subtract
+        // one tick to prove time already elapsed rather than a future wake-up time.
+        await eventually(async () => {
+          const entries = await journalEntries(env.adminAPIBaseUrl(), String(rows[0]!.id));
+          const wakes = entries.filter(entry => entry.entry_type === "Command: Sleep").map(entry => {
+            const command = JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
+            return command.Command.Sleep.wake_up_time;
+          });
+          return Math.max(...wakes) - Math.min(...wakes) - SLOW.tickMs;
+        }, elapsed => elapsed > DEADLINE.bootstrapMs, { label: "workflow ticks past bootstrap while runner is gated" });
+        expect(w.sc.runnerOpen).toBe(true);
+        expect(w.sc.stopCalls).toEqual([]);
+        expect(w.sc.row.status).toBe("running");
+      }
+      if (mode === "failure") {
+        const record = seedUsage(w.dispatchId, 12, 1, [1]).records[0];
+        await callWorkflow(env.baseUrl(), "ImplementationRun", w.dispatchId, "recordInvocation", record);
+        expect(storedRows(w.dispatchId)).toHaveLength(1);
+      }
+      if (mode === "confirm") { await w.report(); await waitForStep(w.read, "confirm"); }
+      if (mode === "cancel") {
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`);
+        await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0]!.id));
+        await expect(w.done).rejects.toThrow();
+        await eventually(() => releasesOf(w.dispatchId), reasons => reasons.includes("cancelled"));
+        expect(w.sc.events).toContain("cleanup");
+        expect(w.sc.finishCalls).toContainEqual({ kind: "cancelled" });
+        expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "workflow_cancelled" });
+        expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
+      } else {
+        if (mode === "failure") await closeEndpoint();
+        else if (mode !== "timeout") finishGate.release();
+        expect(await w.done).toMatchObject({ reason: mode === "timeout" ? "deadline_exceeded" : "finalized" });
+      }
+      if (mode === "failure") {
+        expect(storedRows(w.dispatchId)).toHaveLength(1);
+        expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
+        expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
+        expect(w.sc.closeCalls).toContainEqual(["failed", "ended_without_callback", { skipAdmissionRelease: true }]);
+        expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "ended_without_callback" });
+      }
+      expect(w.sc.launchCalls).toBe(1);
+      expect(w.sc.deploymentRemoved).toBe(true);
+      expect(w.sc.runnerOpen).toBe(false);
+      if (mode === "timeout" || mode === "cancel") expect(w.sc.runnerAborted).toBe(true);
+      if (mode === "timeout") expect(w.sc.stuckCalls).toEqual(["ttl_expired"]);
+      if (["success", "delayed discovery", "long", "confirm"].includes(mode)) expect(w.sc.closeCalls).toContainEqual(["completed", "success", { skipAdmissionRelease: true }]);
+      expect(w.sc.readCalls).toBe(0);
+      const calls = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'Runner_${w.dispatchId}' AND target_handler_name = 'run'`);
+      expect(calls).toHaveLength(1);
+      if (mode === "failure") {
+        expect(calls[0]!.completion_result).toBe("failure");
+        const response = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: sys_journal_events read, not an invocation lookup
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({ query: `SELECT * FROM sys_journal_events WHERE id = '${calls[0]!.id}'` }),
+        });
+        expect(response.ok).toBe(true);
+        const { rows } = await response.json() as { rows: Array<{ event_type: string }> };
+        expect(rows.filter(row => row.event_type === "TransientError")).toHaveLength(RUNNER_SERVICE_RETRY_POLICY.maxAttempts - 1);
+      }
+    }, 60_000,
+  );
 
   it.each(labels.flatMap(label =>
     (["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend =>

@@ -37,7 +37,7 @@ import {
 } from "../log.js";
 import { trackerAccounting } from "../job-accounting.js";
 import { generateMachineNonce, generateSessionToken, listMachines, getMachine, machineNeverStarted } from "../fly-machines.js";
-import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
+import { findLocalContainerIdByName, removeLocalContainer, readPublishedPort } from "../local-docker.js";
 import { markDispatched } from "../dedup.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
 import type { SetupCheckId } from "../setup-checks/contract.js";
@@ -96,7 +96,7 @@ export interface ImplementationRunProductionInput {
   /** The full config: the launch functions read from it. */
   config: AppConfig;
   /** The Restate request-identity public key (`restateSidecar.identityKey`), the same value
-   *  `startRestateEndpoint` receives. Stored only; AII-2036 reads it to launch a local runner in
+   *  `startRestateEndpoint` receives. Launches local ImplementationRun runners in
    *  serve mode. It is the public half, not a secret. */
   restateIdentityKey?: string;
   /** Maps a team key to its mapping. Defaults to `getMappings()[teamKey]`. */
@@ -434,7 +434,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       };
       launched = execPath === "fly-machines"
         ? await input.launchImplementationFlySession({ ...args, shadow: false, implementationSandbox: decideImplementationSandbox({ protectedLaunch: ctx.managedDecision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }) })
-        : await input.launchImplementationLocalSession(args);
+        : await input.launchImplementationLocalSession({ ...args, serve: { identityKey: input.restateIdentityKey ?? "", runnerId: run.dispatchId } });
     } catch (err) {
       const outcome = classifyLaunchError(execPath, launchAttempted, err);
       settleLaunch(ctx.managedDecision, outcome, ctx.managedRuntime);
@@ -842,6 +842,17 @@ export function createProductionImplementationRunServices(input: ImplementationR
       const reason = finished.finishResult?.release ?? (finished.finishOutcome?.kind === "deadline" ? "deadline_exceeded" : finished.finishOutcome?.kind === "cancelled" ? "cancelled" : "finalized");
       releaseImplementationRunOwner(dispatchId, reason);
       return { reason };
+    },
+    runnerRegistration: (_run, jobId) => ({
+      readUri: async () => {
+        const port = await readPublishedPort(jobId, 9080);
+        return port === null ? null : `http://127.0.0.1:${port}`;
+      },
+      readContainerState: () => classifyLocalContainer(jobId),
+    }),
+    markStarted: (run) => {
+      const job = getJobByDispatchId(run.dispatchId);
+      if (job?.status === "dispatched") updateJobStatus(job.id, "running");
     },
     readStatus,
     stop,

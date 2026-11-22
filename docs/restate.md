@@ -729,3 +729,5 @@ Only admin HTTP handlers call its timed ingress helpers. Inputs contain a destin
 (or `{}` for clear), never a secret. PUT fails closed if binding conflicts or ingress is
 unavailable; DELETE removes the secret before clearing. See [Stored key safety](key-safety.md)
 for the schema, handler contract, legacy behavior and adoption rules.
+
+Local Docker `ImplementationRun` runners launch in serve mode. The workflow registers the runner with Restate and waits on one `Runner_<dispatchId>.run` call instead of polling the container. Result callbacks still supply the outcome; cleanup removes the deployment after the call ends.

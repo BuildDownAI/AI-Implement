@@ -340,6 +340,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           } else {
             const modelAuthUrl = config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? "";
             const result = await dispatchLocalGapfill({ ...common,
+              serve: { identityKey: input.restateIdentityKey ?? "", runnerId: run.dispatchId },
               issue: { id: issue.issueId, identifier: issue.issueIdentifier, title: issue.issueTitle ?? issue.issueId,
                 description: issue.issueTitle ?? issue.issueId },
               image: localImage, orchestratorUrl: modelAuthUrl,

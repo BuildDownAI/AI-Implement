@@ -23,6 +23,8 @@ import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import type { InvocationRecordV1 } from "../pipeline/types.js";
 import { acceptOwnedRunReport, type OwnedRunReportResult, readBoundedOwnedRun, readOwnedRunStatus } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
+import { registerRunnerDeploymentWithRetry, type RunnerDeploymentRegistrationOptions } from "./runner-registration.js";
+import { removeDeployment } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 
 /** How often the wait reads the run's status. */
@@ -106,6 +108,12 @@ export interface ImplementationRunDependencies {
   launch(input: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult>;
   /** The status of the exact run or machine. Marks the row `running` on the first `started` read; the write must be idempotent. */
   readStatus(input: ImplementationRunInput, jobId: string): Promise<OwnedRunStatus>;
+  /** Local serve readers; the shared helper owns registration retries. */
+  runnerRegistration?(input: ImplementationRunInput, jobId: string): Pick<RunnerDeploymentRegistrationOptions, "readUri" | "readContainerState" | "register">;
+  /** Successful registration is started evidence, independent of container polling. */
+  markStarted?(input: ImplementationRunInput): void | Promise<void>;
+  /** Test seam; production uses removeDeployment. */
+  removeRunnerDeployment?: typeof removeDeployment;
   /** Stops the exact run or machine. */
   stop(input: ImplementationRunInput, jobId: string): Promise<boolean>;
   /** Finishes the job of this dispatch through the shared finalizer (`finishImplementationJob`). It reads the
@@ -197,6 +205,9 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     }
     ctx.set("step", "dispatch");
 
+    const serve = input.backend === "local-docker";
+    let runnerCall: restate.InvocationPromise<unknown> | undefined;
+    let deploymentId: string | undefined;
     let suspended = false;
     // Set when the `dispatch` step started and did not return `rejected`: a run may exist.
     let mayHaveLaunched = false;
@@ -222,6 +233,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         await ctx.run("cleanup", async () => {
           deps.ensureOwner?.(input);
           await deps.cleanup(input, id);
+          if (serve && deploymentId) await (deps.removeRunnerDeployment ?? removeDeployment)(deploymentId);
         }, { maxRetryAttempts: 3 });
         cleanupCompleted = true;
       }
@@ -280,8 +292,19 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         }
       }
       if (id !== null && !runEnded) {
-        const status = await readOwnedRunStatus(ctx, "read-escape-terminal", () => deps.readStatus(input, id));
-        runEnded = status === "ended";
+        if (serve && runnerCall) {
+          try {
+            await runnerCall;
+          } catch (err) {
+            // Either call result confirms termination. Suspension must still replay
+            // this await before cleanup can remove the runner deployment.
+            if (restate.internal.isSuspendedError(err)) throw err;
+          }
+          runEnded = true;
+        } else {
+          const status = await readOwnedRunStatus(ctx, "read-escape-terminal", () => deps.readStatus(input, id));
+          runEnded = status === "ended";
+        }
       }
       if (!runEnded) return;
       if (!rowCloseTried) {
@@ -375,6 +398,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
       async function deadlinePath(): Promise<ImplementationRunResult> {
         pendingReason = "deadline_exceeded";
         ctx.set("step", "stop");
+        if (serve && runnerCall) ctx.cancel(await runnerCall.invocationId);
         if (jobId !== null) {
           const id = jobId;
           try {
@@ -395,13 +419,13 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           const marginEnd = (await ctx.date.now()) + stopMarginMs;
           const stoppedRun = await awaitOwnedRun(ctx, {
             signals: [],
-            resultSignal: "report",
+            resultSignal: serve ? "runner-stop" : "report",
             totalDeadlineAt: marginEnd,
             tickMs: confirmTickMs,
             startedSeen: true,
-            readStatus,
+            ...(serve && runnerCall ? { callArm: runnerCall } : { readStatus }),
           });
-          runEnded = stoppedRun.kind === "status" && stoppedRun.status === "ended";
+          runEnded = stoppedRun.kind === "call_ended" || stoppedRun.kind === "call_failed" || (stoppedRun.kind === "status" && stoppedRun.status === "ended");
         }
         if (!runEnded) {
           if (jobId === null && deps.recordTerminationIntent) {
@@ -418,20 +442,53 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         return wrapUpAndRelease("deadline_exceeded");
       }
 
+      if (serve) {
+        // An ambiguous launch can become discoverable later. Adopt it without
+        // launching again, sharing the original bootstrap budget with registration.
+        while (jobId === null) {
+          const remaining = Math.min(bootstrapDeadlineAt, totalDeadlineAt) - await ctx.date.now();
+          if (remaining <= 0) return await deadlinePath();
+          await readStatus();
+          if (jobId === null) await ctx.sleep(Math.min(tickMs, remaining));
+        }
+        if (!deps.runnerRegistration) throw new restate.TerminalError("local runner registration requires readers");
+        const registered = await registerRunnerDeploymentWithRetry(ctx, {
+          ...deps.runnerRegistration(input, jobId),
+          bootstrapDeadlineAt: Math.min(bootstrapDeadlineAt, totalDeadlineAt),
+          sleepMs: tickMs,
+        });
+        if (!registered.ok) {
+          if (registered.reason === "exited") return await endedPath();
+          if (registered.reason === "bootstrap timeout") return await deadlinePath();
+          pendingReason = "launch_rejected";
+          await escape();
+          return runEnded && rowFinalized ? await wrapUpAndRelease("launch_rejected") : retain();
+        }
+        deploymentId = registered.deploymentId;
+        runnerCall = ctx.genericCall({
+          service: `Runner_${dispatchId}`, method: "run", parameter: { workflowKey: ctx.key },
+          inputSerde: restate.serde.json, outputSerde: restate.serde.json,
+        });
+        await ctx.run("runner-started", async () => { await deps.markStarted?.(input); });
+        startedSeen = true;
+      }
+
       for (;;) {
         ctx.set("step", "wait");
         // Once `report` is resolved it must leave `signals`: a resolved promise would win every call at once.
         const event = await awaitOwnedRun(ctx, {
           signals: reported ? [] : ["report"],
-          resultSignal: "report",
+          // A consumed report must not mask settlement of the retained runner call.
+          resultSignal: serve && reported ? "runner-ended" : "report",
           bootstrapDeadlineAt,
           totalDeadlineAt,
           tickMs,
           startedSeen,
-          readStatus,
+          ...(serve ? { callArm: runnerCall } : { readStatus }),
         });
 
         if (event.kind === "bootstrap_timeout" || event.kind === "total_timeout") return await deadlinePath();
+        if (event.kind === "call_ended" || event.kind === "call_failed") return await endedPath();
         if (event.kind === "status") {
           if (event.status === "started") {
             startedSeen = true;
@@ -456,12 +513,13 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         const confirmEnd = Math.min((await ctx.date.now()) + confirmWindowMs, totalDeadlineAt);
         const confirmed = await awaitOwnedRun(ctx, {
           signals: [],
-          resultSignal: "report",
+          resultSignal: serve ? "runner-ended" : "report",
           totalDeadlineAt: confirmEnd,
           tickMs: confirmTickMs,
           startedSeen: true,
-          readStatus,
+          ...(serve ? { callArm: runnerCall } : { readStatus }),
         });
+        if (confirmed.kind === "call_ended" || confirmed.kind === "call_failed") return await endedPath();
         if (confirmed.kind === "status" && confirmed.status === "ended") return await endedPath();
         // Any other event is the window ending (a peeked `report` at its deadline): back to `wait`.
       }

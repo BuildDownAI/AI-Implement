@@ -76,6 +76,9 @@ for (const { backend, prefix, dispatchId } of CASES) {
       reserve: async () => true,
       findExistingRun: async () => null,
       launch: async () => ({ outcome: "accepted", jobId: `job-${prefix}` }),
+      // Production supplies these for every backend; their presence must not enable serve mode.
+      runnerRegistration: () => { throw new Error("non-local run registered a runner"); },
+      markStarted: () => { throw new Error("non-local run used serve started evidence"); },
       readStatus: async () => {
         if (holdReads) await readGate.wait();
         return status;
