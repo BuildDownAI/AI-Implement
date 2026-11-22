@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -367,6 +367,37 @@ describe("getDiff from the run start commit", () => {
     writeFileSync(join(repo, "code.ts"), "export const a = 2;\n");
     writeFileSync(join(repo, "new.ts"), "export const n = 1;\n");
     expect(getDiff(repo, start)).toBe(getDiff(repo));
+  });
+
+  it("includes a same-size change written in the index entry's timestamp second", () => {
+    const pinned = testDir("diff-pinned-time");
+    git(pinned, ["init", "-q"]);
+    git(pinned, ["config", "user.email", "t@t.com"]);
+    git(pinned, ["config", "user.name", "t"]);
+    git(pinned, ["config", "core.checkStat", "minimal"]);
+    git(pinned, ["config", "core.trustctime", "false"]);
+
+    const filePath = join(pinned, "code.ts");
+    const pinnedTime = new Date("2020-01-01T00:00:00Z");
+    writeFileSync(filePath, "export const a = 1;\n");
+    utimesSync(filePath, pinnedTime, pinnedTime);
+    git(pinned, ["add", "-A"]);
+    git(pinned, ["commit", "-qm", "seed"]);
+    const pinnedStart = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: pinned,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).stdout.toString().trim();
+
+    writeFileSync(filePath, "export const a = 2;\n");
+    utimesSync(filePath, pinnedTime, pinnedTime);
+    const indexResult = spawnSync("git", ["rev-parse", "--git-path", "index"], {
+      cwd: pinned,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const indexPath = join(pinned, indexResult.stdout.toString().trim());
+    utimesSync(indexPath, pinnedTime, pinnedTime);
+
+    expect(getDiff(pinned, pinnedStart)).toContain("+export const a = 2;");
   });
 
   it("falls back to HEAD for an empty base", () => {
