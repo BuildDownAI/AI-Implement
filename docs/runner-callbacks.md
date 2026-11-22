@@ -9,13 +9,15 @@ The blast-radius section exists because of AII-567: a test suite inside a dispat
 Local serve-mode runs deliver the last `result` event body through the Restate runner call,
 rather than posting `/runner/result`. The workflow applies the shared callback lifecycle
 intake and owned-run accounting before finalizing. Pipeline settlement also ends the call
-when the pilot emits no result. Step progress still uses callbacks. Runs outside serve
-mode (currently Fly and GitHub Actions) retain result and progress callbacks.
+when the pilot emits no result. Local serve-mode implementation runs also send step
+progress through the runner's journaled event loop to `ImplementationRun.step`,
+rather than posting `/runner/progress`. Runs outside serve mode (currently Fly and
+GitHub Actions) retain result and progress callbacks.
 
 ## The path
 
 The diagram shows callback delivery for runs outside serve mode. Local serve-mode
-results use the Restate call described above; their progress follows the diagram.
+results and implementation step progress use the Restate call described above.
 
 ```mermaid
 sequenceDiagram
