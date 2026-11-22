@@ -198,6 +198,8 @@ npm run typecheck # tsc --noEmit, then tsc --noEmit -p tsconfig.tests.json (test
 npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — one runtime, the `restate-server` binary from node_modules (the one production runs); Docker is not needed; not part of npm test
 ```
 
+Use `npm run test:docker` before a merge and when a local macOS run fails. It runs a clean `npm ci`, `npm test`, `npm run typecheck`, then one full `npm run test:restate` in Linux with the builder's pinned Node 24 image. Each run installs dependencies afresh. Only Docker is required on the host; see [Docker test runs](docs/unit-tests.md#docker-test-runs) for suite selection and checkout requirements.
+
 **Vitest strips types without checking them, so `npm run typecheck` is what catches a type error in a test file.** Its second pass, `tsconfig.tests.json`, checks every `src/**/*.ts` file, test files included. A new test file is checked from the day it is added; never add a file to its `exclude` list, and keep the empty `exclude` key, since without it `extends` inherits `src/__tests__` from `tsconfig.json`.
 
 **`npm test` leaves out the Restate tier, so also run `npm run test:restate` whenever a change touches a Restate handler or code a Restate-tier test drives.** CI runs the tier as jobs of their own, and a change green under `npm test` can still break what a Restate-tier test pins, such as a tool's exact answer keys or a handler's journaled steps.
