@@ -367,10 +367,11 @@ describe("production deps", () => {
       }
     });
 
-    it.each(["fly-machines", "local-docker"] as const)("%s: workflow adopts a recorded run after configuration becomes ineligible", async (backend) => {
+    it.each((["fly-machines", "local-docker"] as const).flatMap(backend => [undefined, false, true].map(serve => ({ backend, serve }))))("$backend: adopts a recorded run using frozen serve=$serve after configuration becomes ineligible", async ({ backend, serve }) => {
       const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
       vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ machineId: "prior-run" }));
       intents.set(`owner:${INPUT.dispatchId}`, { snapshot: { input: { ...INPUT, backend }, mapping: MAPPING, flyApp: "original-app" }, done: false });
+      intents.set(INPUT.dispatchId, { snapshot: { serve, context: { mapping: MAPPING }, flyApp: "original-app" }, done: true });
       // Even without admission evidence, a recorded job must prevent the first-dispatch shortcut.
       vi.mocked(readAdmission).mockReturnValue(null);
       vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
@@ -393,7 +394,7 @@ describe("production deps", () => {
         promise: () => ({ get: () => ({ map: () => new Promise(() => {}) }) }),
       };
       expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "finalized" });
-      if (backend === "local-docker") expect(readStatus).not.toHaveBeenCalled();
+      if (backend === "local-docker" && serve === true) expect(readStatus).not.toHaveBeenCalled();
       else expect(readStatus).toHaveBeenCalledWith({ ...INPUT, backend }, "prior-run");
       expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
       expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
@@ -571,7 +572,23 @@ describe("production deps", () => {
 
     it.each(["fly-machines", "local-docker"] as const)("%s: records the row with the machine id and nonce", async (backend) => {
       const { input, d } = compose({ restateIdentityKey: "public-identity-key" });
+      if (backend === "local-docker") {
+        const launch = vi.mocked(input.launchImplementationLocalSession);
+        const implementation = launch.getMockImplementation()!;
+        launch.mockImplementationOnce(async args => {
+          args.input.markLaunchAttempted?.();
+          return implementation(args);
+        });
+      } else {
+        const launch = vi.mocked(input.launchImplementationFlySession);
+        const implementation = launch.getMockImplementation()!;
+        launch.mockImplementationOnce(async args => {
+          args.input.markLaunchAttempted?.();
+          return implementation(args);
+        });
+      }
       await d.launch({ ...INPUT, backend });
+      expect(d.readLaunchServe?.({ ...INPUT, backend })).toBe(backend === "local-docker");
       const launch = backend === "local-docker" ? input.launchImplementationLocalSession : input.launchImplementationFlySession;
       const args = vi.mocked(launch).mock.calls[0]![0];
       if (backend === "local-docker") expect(args).toMatchObject({ serve: { identityKey: "public-identity-key", runnerId: INPUT.dispatchId } });

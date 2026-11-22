@@ -74,6 +74,8 @@ export type ImplementationRunInput = z.infer<typeof implementationRunInputSchema
 export interface ImplementationLaunchResult {
   outcome: "accepted" | "rejected" | "unknown";
   jobId?: string;
+  /** Frozen launch-time mode; absent in historical dispatch journals. */
+  serve?: boolean;
 }
 
 export type ImplementationFinishOutcome = { kind: "run_ended" } | { kind: "deadline" } | { kind: "cancelled" };
@@ -106,6 +108,8 @@ export interface ImplementationRunDependencies {
   /** The run or machine id of a launch that already happened for this dispatch, or `null`.
    *  `dispatchedAt` is the journaled dispatch time (epoch ms): a run created before it is not this launch. */
   findExistingRun(input: ImplementationRunInput, dispatchedAt: number): Promise<string | null>;
+  /** Called only inside dispatch, so legacy replay adds no command. */
+  readLaunchServe?(input: ImplementationRunInput): boolean | undefined;
   readModelPrices?(): Promise<RunModelPrices | undefined>;
   launch(input: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult>;
   /** The status of the exact run or machine. Marks the row `running` on the first `started` read; the write must be idempotent. */
@@ -211,7 +215,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     }
     ctx.set("step", "dispatch");
 
-    const serve = input.backend === "local-docker";
+    let serve = false;
     let runnerCall: restate.InvocationPromise<unknown> | undefined;
     let deploymentId: string | undefined;
     let suspended = false;
@@ -339,13 +343,16 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           deps.ensureOwner?.(input);
           // Reconcile first: a retry after a committed-but-unacknowledged launch must adopt that run.
           const existing = await deps.findExistingRun(input, dispatchedAt);
-          if (existing !== null) return { outcome: "accepted", jobId: existing };
+          if (existing !== null) return { outcome: "accepted", jobId: existing, ...(deps.readLaunchServe?.(input) === true ? { serve: true } : {}) };
           const result = await deps.launch(input, modelPrices ?? undefined);
-          return result.jobId === undefined ? { outcome: result.outcome } : { outcome: result.outcome, jobId: result.jobId };
+          return { outcome: result.outcome, ...(result.jobId === undefined ? {} : { jobId: result.jobId }),
+            ...(result.serve === true || deps.readLaunchServe?.(input) === true ? { serve: true } : {}) };
         },
         { maxRetryAttempts: 3 },
       );
 
+      // Old dispatch results deliberately retain the polling/callback command sequence.
+      serve = input.backend === "local-docker" && launched.serve === true;
       if (launched.outcome === "rejected") {
         mayHaveLaunched = false;
         return await release("launch_rejected");
