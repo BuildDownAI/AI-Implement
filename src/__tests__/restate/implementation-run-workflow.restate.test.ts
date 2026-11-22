@@ -92,6 +92,7 @@ interface Scenario {
   stopCalls: string[];
   finishCalls: ImplementationFinishOutcome[];
   finishThrows: boolean;
+  resultIntakeThrows?: boolean;
   status: OwnedRunStatus;
   /** Parks the first status read or id lookup (the workflow's first tick). */
   tickGate?: Gate;
@@ -154,6 +155,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
     async acceptRunnerResult(input, body) {
       const sc = scenarioOf(input.dispatchId);
       sc.calls.push("accept-result");
+      if (sc.resultIntakeThrows) throw new Error("runner result intake rejected: mapping_not_found");
       expect(body).toMatchObject({ phase: "implementation", outcome: expect.stringMatching(/^(success|failure)$/) });
       const result = await acceptRunnerCallResult({ body, resolveProvider: async () => new FakeProvider() },
         { dispatchId: input.dispatchId, issueId: input.issueId, teamKey: input.teamKey, phase: "implementation" });
@@ -553,12 +555,13 @@ describe("ImplementationRun durable workflow", () => {
     }, 60_000,
   );
 
-  it.each(labels.flatMap(label => ["success", "restart", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
+  it.each(labels.flatMap(label => ["success", "restart", "intake failure", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
     "local serve $mode $label waits on one registered call", async ({ label, mode }) => {
       const launchGate = gate("local serve");
       const finishGate = gate("local serve");
       const envs = mode === "timeout" ? deadline : serveRuns;
       const w = begin(envs, label, { launchGate, row: makeJob({ status: "dispatched", approved: ["success", "restart", "delayed discovery", "long", "confirm"].includes(mode) }) }, { backend: "local-docker" });
+      w.sc.resultIntakeThrows = mode === "intake failure";
       if (mode === "delayed discovery") {
         w.sc.launchResult = { outcome: "unknown" };
         w.sc.runId = null;
@@ -574,7 +577,7 @@ describe("ImplementationRun durable workflow", () => {
       }
       let pipelineRuns = 0;
       const sessions = new Set<http2.ServerHttp2Session>();
-      const runner = mode === "restart" ? createRunnerService({
+      const runner = ["restart", "intake failure"].includes(mode) ? createRunnerService({
         runId: w.dispatchId,
         runAutonomous: async options => {
           expect(w.sc.savedDeploymentId).toBe(w.sc.deploymentId);
@@ -671,6 +674,18 @@ describe("ImplementationRun durable workflow", () => {
         expect(w.sc.finishCalls).toContainEqual({ kind: "cancelled" });
         expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "workflow_cancelled" });
         expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
+      } else if (mode === "intake failure") {
+        finishGate.release();
+        await expect(w.done).rejects.toThrow();
+        await waitForStep(w.read, "termination_unconfirmed");
+        expect(w.sc.calls.filter(call => call === "accept-result")).toHaveLength(3);
+        expect(w.sc.finishCalls).toEqual([]);
+        expect(w.sc.finalizeCalls).toEqual([]);
+        expect(w.sc.events).toEqual([]);
+        expect(releasesOf(w.dispatchId)).toEqual([]);
+        expect(w.sc.deploymentRemoved).not.toBe(true);
+        expect(w.sc.stopCalls).toEqual([]);
+        return;
       } else {
         if (mode === "failure") await closeEndpoint();
         else if (mode !== "timeout") finishGate.release();

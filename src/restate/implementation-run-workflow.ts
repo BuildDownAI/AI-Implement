@@ -386,6 +386,9 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
        *  and does what the callback has not done yet. */
       async function endedPath(): Promise<ImplementationRunResult> {
         runEnded = true;
+        // Result intake is part of normal finalization. Retain recovery authority
+        // if it fails rather than letting escape rewrite the outcome as cancelled.
+        rowCloseTried = true;
         if (serve && runnerCall) {
           let body: unknown;
           try { body = await runnerCall; } catch (err) {
@@ -401,7 +404,6 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           }
         }
         pendingReason = "finalized";
-        rowCloseTried = true;
         const finished = await ctx.run("finish-job", async () => {
           deps.ensureOwner?.(input);
           return (await deps.finishJob(dispatchId, { kind: "run_ended" })) ?? {};
