@@ -37,12 +37,13 @@ function seedLink(prNumber: number, issueId = "i1", identifier: string | null = 
  * Uses appendLog (creates the row with status='dispatched') then updateJobStatus
  * to set it to 'completed' with a prUrl.
  */
-function seedCompletedJob(prNumber: number) {
+function seedCompletedJob(prNumber: number, dispatchedAt?: number) {
   seedLink(prNumber);
   const jobId = log.appendLog({
     issueId: "i1",
     issueIdentifier: "ENG-1",
     repo: "o/r",
+    dispatchedAt,
   });
   log.updateJobStatus(jobId, "completed", "success", `https://github.com/o/r/pull/${prNumber}`);
 }
@@ -340,7 +341,7 @@ describe("detectMergedPrs", () => {
       seedLink(prNumber, opts.issueId ?? "p1", "ENG-40");
       const jobId = log.appendLog({
         issueId: opts.issueId ?? "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m",
-        groupingParent: opts.groupingParent ?? true,
+        groupingParent: opts.groupingParent ?? true, dispatchedAt: 1000,
       });
       log.updateJobStatus(jobId, "review_failed", "review_unapproved", url(prNumber));
     }
@@ -369,8 +370,11 @@ describe("detectMergedPrs", () => {
 
     it("still applies when a newer gap-fill row has groupingParent false", async () => {
       seedParent(7);
-      const gap = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m", groupingParent: false });
+      const gap = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m", groupingParent: false, dispatchedAt: 2000 });
       log.updateJobStatus(gap, "completed", "success", url(7));
+      expect(db.prepare("SELECT dispatched_at FROM dispatch_log WHERE issue_id = 'p1' ORDER BY id").all())
+        .toEqual([{ dispatched_at: 1000 }, { dispatched_at: 2000 }]);
+      expect(links.findLinkByPr("o/r", 7)?.jobDispatchedAt).toBe(2000);
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).toHaveBeenCalledTimes(1);
@@ -381,7 +385,7 @@ describe("detectMergedPrs", () => {
 
     it("finds grouping ownership beyond the newest 500 rows", async () => {
       seedParent(7);
-      for (let i = 0; i < 501; i++) seedCompletedJob(100 + i);
+      for (let i = 0; i < 501; i++) seedCompletedJob(100 + i, 2000 + i);
       const deps = makeDeps(async () => true);
       deps.getPullRequestState.mockImplementation(async (_t, _o, _r, n) => n === 7 ? closed : null);
       await mod.detectMergedPrs(deps);
@@ -410,7 +414,7 @@ describe("detectMergedPrs", () => {
 
     it("finalizes only the replacement when both PRs close before polling after pruning", async () => {
       const job = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40",
-        repo: "o/r", teamKey: "m", groupingParent: true });
+        repo: "o/r", teamKey: "m", groupingParent: true, dispatchedAt: 2000 });
       log.updateJobPrUrl(job, url(7));
       log.updateJobPrUrl(job, url(8));
       db.exec("DELETE FROM dispatch_log");
@@ -451,7 +455,7 @@ describe("detectMergedPrs", () => {
 
     it("writes nothing while a run for the issue is in flight", async () => {
       seedParent(7);
-      log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m" }); // status dispatched
+      log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m", dispatchedAt: 2000 }); // status dispatched
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
@@ -461,13 +465,31 @@ describe("detectMergedPrs", () => {
 
     it("tombstones without finalizing when the closed PR is not the issue's latest", async () => {
       seedParent(7);
-      const newer = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m", groupingParent: true });
+      const newer = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m", groupingParent: true, dispatchedAt: 2000 });
       log.updateJobStatus(newer, "completed", "success", url(8));
+      expect(links.findLinkByPr("o/r", 7)?.jobDispatchedAt).toBe(1000);
+      expect(links.findLinkByPr("o/r", 8)?.jobDispatchedAt).toBe(2000);
       const deps = makeDeps(async () => true);
       deps.getPullRequestState.mockImplementation(async (_t, _o, _r, n) =>
         n === 7 ? closed : { merged: false, state: "open" as const });
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
+      expect(recon.hasReconciliationForPr("o/r", 7)).toBe(true);
+    });
+
+    it("finalizes when the second PR's job was dispatched before the closed PR's job", async () => {
+      seedParent(7);
+      const older = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", teamKey: "m",
+        groupingParent: true, dispatchedAt: 500 });
+      log.updateJobStatus(older, "completed", "success", url(8));
+      expect(links.findLinkByPr("o/r", 7)?.jobDispatchedAt).toBe(1000);
+      expect(links.findLinkByPr("o/r", 8)?.jobDispatchedAt).toBe(500);
+      const deps = makeDeps(async () => true);
+      deps.getPullRequestState.mockImplementation(async (_t, _o, _r, n) =>
+        n === 7 ? closed : { merged: false, state: "open" as const });
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ number: 7 }));
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(true);
     });
 
@@ -491,7 +513,7 @@ describe("detectMergedPrs", () => {
     it("roll-up exclusion wins over grouping ownership and an in-flight run", async () => {
       seedLink(7, "p1", "ENG-40", "roll-up");
       seedParent(7);
-      log.appendLog({ issueId: "p1", repo: "o/r" });
+      log.appendLog({ issueId: "p1", repo: "o/r", dispatchedAt: 2000 });
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
@@ -506,7 +528,7 @@ describe("detectMergedPrs", () => {
       seedParent(7);
       links.setLinkOutcome("o/r", 7, "closed-unmerged", 1);
       seedLink(8, "p1", "ENG-40");
-      log.appendLog({ issueId: "p1", repo: "o/r" });
+      log.appendLog({ issueId: "p1", repo: "o/r", dispatchedAt: 2000 });
       const deps = makeDeps(async () => true);
       deps.getPullRequestState.mockResolvedValue({ merged: false, state: "open" });
       await mod.detectMergedPrs(deps);
