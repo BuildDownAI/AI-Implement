@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { JSDOM } from "jsdom";
 import { kgPipelinesHtml, kgPipelinesScript } from "../admin-ui/pages/kg-pipelines.js";
-import type { FakeApi } from "./helpers/fixtures/admin-ui.js";
+import { mountAdminPage, type FakeApi } from "./helpers/fixtures/admin-ui.js";
 
 interface ApiCall {
   url: string;
@@ -102,7 +102,7 @@ describe("KG page — Graph source card", () => {
     expect(doc.getElementById("kg-graph-customer-repo-note")?.hidden).toBe(true);
     expect(doc.body.textContent).toContain("Stardog bills each query.");
     expect(doc.body.textContent).not.toContain("Dataset");
-    expect(doc.body.textContent).toContain("Graph details");
+    expect(doc.body.textContent).not.toContain("Graph details");
     expect((doc.getElementById("kg-namespace") as HTMLInputElement).value).toBe("");
     expect((doc.getElementById("kg-graph-name") as HTMLInputElement).value).toBe("");
   });
@@ -364,25 +364,34 @@ describe("KG page — Stardog values", () => {
   it("saves the non-secret fields, sends the token once, and leaves no token in the DOM", async () => {
     const calls: ApiCall[] = [];
     const token = "SENTINEL-stardog-token-page-test";
-    const { win } = mount(async (url, init) => {
+    const { win } = mountAdminPage({ html: kgPipelinesHtml, script: kgPipelinesScript, route: "kg-pipelines", api: async (url, init) => {
       calls.push({ url, init });
       if (url === "/api/settings" && !init) return response(200, SETTINGS);
       if (url === "/api/settings" && init?.method === "POST") return response(200, SETTINGS);
       if (url === "/api/kg/stardog" && init?.method === "POST") return response(200, { tokenSet: true });
       throw new Error(`unexpected api call ${url}`);
-    });
+    } });
     await win.loadKgGraphSettings();
     const doc = win.document as Document;
     (doc.getElementById("kg-stardog-db") as HTMLInputElement).value = "new-db";
     (doc.getElementById("kg-stardog-endpoint") as HTMLInputElement).value = "https://new.stardog.run/kg";
     (doc.getElementById("kg-stardog-console") as HTMLInputElement).value = "https://new.stardog.run";
     (doc.getElementById("kg-stardog-import-host") as HTMLInputElement).value = "https://new-import.stardog.run";
+    for (const [id, value] of [["kg-namespace", "https://new.example/"], ["kg-graph-name", "new-graph"], ["kg-code-repo", "Org/repo"], ["kg-graph-label", "New label"]]) {
+      (doc.getElementById(id) as HTMLInputElement).value = " " + value + " ";
+    }
     (doc.getElementById("kg-stardog-token") as HTMLInputElement).value = token;
 
-    await win.saveKgStardog();
+    (doc.getElementById("btn-kg-stardog-save") as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(doc.getElementById("kg-stardog-save-status")?.textContent).toBe("Saved, including the token."));
 
+    expect(calls.filter((c) => c.url === "/api/settings" && c.init?.method === "POST")).toHaveLength(1);
     const settingsPost = calls.find((c) => c.url === "/api/settings" && c.init?.method === "POST");
     expect(JSON.parse(settingsPost!.init!.body!)).toEqual({
+      kg_namespace: "https://new.example/",
+      kg_graph_name: "new-graph",
+      kg_code_repo: "Org/repo",
+      kg_graph_label: "New label",
       kg_stardog_db: "new-db",
       kg_stardog_run_endpoint: "https://new.stardog.run/kg",
       kg_stardog_run_console: "https://new.stardog.run",
@@ -390,6 +399,7 @@ describe("KG page — Stardog values", () => {
     });
     const tokenCalls = calls.filter((c) => c.url === "/api/kg/stardog");
     expect(tokenCalls).toHaveLength(1);
+    expect(calls.indexOf(tokenCalls[0]!)).toBeGreaterThan(calls.indexOf(settingsPost!));
     expect(JSON.parse(tokenCalls[0]!.init!.body!)).toEqual({ token });
     expect((doc.getElementById("kg-stardog-token") as HTMLInputElement).value).toBe("");
     expect(doc.getElementById("kg-stardog-token-status")?.textContent).toBe("Token set");

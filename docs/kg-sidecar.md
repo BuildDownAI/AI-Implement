@@ -107,7 +107,7 @@ platform defaults to `https://app.stardog.run`, distinct from the console host;
 an empty `kg_stardog_run_console` uses `https://console.stardog.run`. There is no
 import-host environment variable; the row default is enough.
 
-The page's **Graph details** card sets the namespace and graph name, plus two
+The page's **Graph source** card sets the namespace and graph name, plus two
 rows that have no environment seed: `kg_code_repo` (an `owner/name` GitHub
 repository) and `kg_graph_label` (free text, at most 200 characters). Namespace
 and graph name use the shared `kg_namespace` and `kg_graph_name` rows;
