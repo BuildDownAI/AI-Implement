@@ -6,7 +6,9 @@ The sessions app and region live in the `RunnerBackend/fly-machines` Restate obj
 
 ## Optional runner service
 
-`buildSessionMachineConfig`, `launchImplementationFlySession`, and `dispatchFlyGapfill` accept an optional `serve` payload using `LocalRunnerServeInput` (`identityKey`, `runnerId`). It sets `AI_IMPLEMENT_RUNNER_SERVE=1`, `AI_IMPLEMENT_RUNNER_ID`, and `RESTATE_IDENTITY_KEY` after mapping environment overrides. No caller enables it yet (AII-2081); existing launches keep their behavior.
+`buildSessionMachineConfig`, `launchImplementationFlySession`, and `dispatchFlyGapfill` accept an optional `serve` payload using `LocalRunnerServeInput` (`identityKey`, `runnerId`). It sets `AI_IMPLEMENT_RUNNER_SERVE=1`, `AI_IMPLEMENT_RUNNER_ID`, and `RESTATE_IDENTITY_KEY` after mapping environment overrides. Fly first-run `ImplementationRun` launches enable it with the Restate identity key and dispatch id. Local Docker uses the same workflow serve path: register `Runner_<runId>`, call `run`, save and accept the returned result, then finalize and remove the machine and deployment. Fly gap-fill launches keep polling until AII-2085. Serve mode comes only from the journaled launch result; older runs without its marker continue polling.
+
+Owner recovery for Fly and local Docker serve runs removes the machine or container first, confirms `ended`, removes the saved deployment, and replays saved result intake and usage before finalization and admission release. Failed removal, uncertain termination, or failed intake retains admission. A dead machine still ends the run with its model-call rows kept.
 
 Session configs omit `services` in both modes, keeping port 9080 off the public Fly proxy. `getMachineRunnerAddress` reads the machine through the Machines API and returns `http://<machineId>.vm.<appName>.internal:9080`, or `null` while no private address is assigned. The Fly hostname is required because Restate server 1.7 cannot register a bracketed IPv6 address. API errors propagate; an address does not establish service readiness.
 

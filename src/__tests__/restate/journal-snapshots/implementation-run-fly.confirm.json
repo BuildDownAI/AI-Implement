@@ -32,16 +32,24 @@
     "name": ""
   },
   {
-    "type": "SetState",
-    "name": ""
-  },
-  {
-    "type": "GetPromise",
+    "type": "Run",
     "name": ""
   },
   {
     "type": "Run",
-    "name": "read-0"
+    "name": "register-1"
+  },
+  {
+    "type": "Run",
+    "name": "record-runner-deployment"
+  },
+  {
+    "type": "Call",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "runner-started"
   },
   {
     "type": "SetState",
@@ -69,6 +77,10 @@
   },
   {
     "type": "Run",
-    "name": "read-1"
+    "name": ""
+  },
+  {
+    "type": "Sleep",
+    "name": ""
   }
 ]
