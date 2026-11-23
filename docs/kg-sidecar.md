@@ -127,7 +127,15 @@ of that: true with the marker, else when the row is `stardog_run`.
 ### Switching the source
 
 `set_kg_graph_source` (admin, `src/restate/tools.ts`) is the only writer of
-`kg_graph_source`. For `stardog_run` it first sends one real COUNT query with the
+`kg_graph_source`. Before testing `stardog_run`, it refuses with
+`no-stardog-query-code` if the image lacks `kg_query/stardog_search.py`. Older
+customer KG repos have no Stardog store and silently answer from the local graph;
+update the KG repo from the base KG repo, then deploy again. This refusal runs
+before checking values or billing a query, saves no row, and does not restart the
+sidecar. Missing Database, Namespace or token returns `stardog-values-missing`
+with “Enter Database, Namespace and the token, then save.”
+
+With query code and values present, it sends one real COUNT query with the
 stored values (`src/stardog-client.ts`: the console `POST /api/token` exchange,
 then the edge's `/edge/token`), retrying for up to 6 minutes because a sleeping
 endpoint takes 2–5 minutes to wake. Only a passing test saves the row and restarts
