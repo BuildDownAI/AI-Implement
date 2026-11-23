@@ -1,3 +1,22 @@
+import { createImplementationRunWorkflow as createLegacyImplementationRunWorkflow } from "./fixtures/legacy-implementation-run.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { runAutonomous } from "../../run-autonomous.js";
+import { PipelineRunner } from "../../pipeline/runner.js";
+import { NoopStepReporter } from "../../pipeline/reporter.js";
+import { makeFeedbackLoopOutputs, makeExecutor } from "../helpers/builders.js";
+import { fakeFetch } from "../helpers/fake-fetch.js";
+import { getStepsByJobId, initStepLogTable } from "../../step-log.js";
+import { implementationIntentStore } from "../../restate/implementation-launch-intent.js";
+import { recordUsage } from "../../agent-usage.js";
+import type { Step } from "../../pipeline/types.js";
+import { handleRunnerProgress, handleRunnerResult } from "../../runner-callback.js";
+import * as http2 from "node:http2";
+import { createRunnerService, RUNNER_SERVICE_RETRY_POLICY } from "../../runner-service.js";
+import * as restate from "@restatedev/restate-sdk";
+import { createEndpointHandler } from "@restatedev/restate-sdk/node";
+import { registerRunnerDeployment, removeDeployment } from "../../restate/endpoint.js";
 // Real Restate coverage for the ImplementationRun workflow (AII-1553). Every dependency is an in-process
 // fake keyed by dispatch id; each scenario holds the workflow at a named step with `gate` and
 // `waitForStep` from harness.ts, never a sleep. Three seam sets serve the scenarios: `slow` (long
@@ -7,10 +26,13 @@
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
 import { getDb } from "../../dedup.js";
-import { initMappingsTable } from "../../config.js";
+import { initMappingsTable, upsertMapping } from "../../config.js";
 import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import { initSettingsTable, setFlyProcessLevelSecrets } from "../../runner-mode.js";
-import { initLogTable } from "../../log.js";
+import { acceptRunnerCallResult } from "../../runner-callback.js";
+import { FakeProvider } from "../providers/fake.js";
+import { findLinkByPr } from "../../pr-links.js";
+import { appendLog, initLogTable } from "../../log.js";
 import { toRecordedUsage } from "../../agent-usage.js";
 import type { OwnedRunReportResult } from "../../restate/owned-run-lifecycle.js";
 import type { RestateEnvironment } from "./harness.js";
@@ -29,7 +51,7 @@ import * as managedAuth from "../../managed-dispatch-auth.js";
 import * as admission from "../../dispatch-admission.js";
 import * as github from "../../github.js";
 import { enqueueCommentGapfill, enqueueConflictResolution, getCommentGapfillItem } from "../../comment-gapfill-queue.js";
-import { getJobByDispatchId } from "../../log.js";
+import { getInvocationAttribution, getJobByDispatchId } from "../../log.js";
 import { makeMapping } from "../helpers/builders.js";
 import { makeJob } from "../helpers/builders.js";
 import { finishImplementationJob } from "../../restate/implementation-run-finish.js";
@@ -44,7 +66,7 @@ import {
   type ImplementationRunStatusResult,
 } from "../../restate/implementation-run-workflow.js";
 import {
-  VARIANTS, callWorkflow, cancelInvocation, crashAfterFirstCall, eventually, gate, journalEntries, journalText, queryInvocations, replaceEndpoint,
+  VARIANTS, attachWorkflow, callWorkflow, cancelInvocation, crashAfterFirstCall, eventually, gate, journalEntries, journalText, queryInvocations, replaceEndpoint,
   startRetryEnabled, startVariants, stopAll, waitForStep, type Gate,
 } from "./harness.js";
 import { registerOwnedRunContract, type OwnedRunAdapter, type OwnedRunFaults } from "./owned-run-contract.js";
@@ -54,6 +76,15 @@ const WINDOW = { ...SLOW, confirmWindowMs: 400 };
 const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 600, totalMs: 1_200, stopMarginMs: 500, escapeWaitMs: 4_000, escapeTickMs: 100 };
 
 interface Scenario {
+  registrationRejected?: boolean;
+  runnerUri?: string;
+  adminUrl?: string;
+  runnerOpen?: boolean;
+  runnerAborted?: boolean;
+  runnerStarted?: boolean;
+  deploymentRemoved?: boolean;
+  deploymentId?: string;
+  savedDeploymentId?: string;
   launchResult: ImplementationLaunchResult;
   /** What `findExistingRun` answers once a launch happened; `null` models a backend that never shows an id. */
   runId: string | null;
@@ -64,6 +95,8 @@ interface Scenario {
   stopCalls: string[];
   finishCalls: ImplementationFinishOutcome[];
   finishThrows: boolean;
+  resultIntakeThrows?: boolean;
+  resultSaveThrows?: boolean;
   status: OwnedRunStatus;
   /** Parks the first status read or id lookup (the workflow's first tick). */
   tickGate?: Gate;
@@ -123,6 +156,16 @@ async function holdAtTick(sc: Scenario): Promise<void> {
 function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
   return {
     ...seams,
+    async acceptRunnerResult(input, body) {
+      const sc = scenarioOf(input.dispatchId);
+      sc.calls.push("accept-result");
+      if (sc.resultIntakeThrows) throw new Error("runner result intake rejected: mapping_not_found");
+      expect(body).toMatchObject({ phase: "implementation", outcome: expect.stringMatching(/^(success|failure)$/) });
+      const result = await acceptRunnerCallResult({ body, resolveProvider: async () => new FakeProvider() },
+        { dispatchId: input.dispatchId, issueId: input.issueId, teamKey: input.teamKey, phase: "implementation" });
+      expect(result.status).toBe(200);
+    },
+    readLaunchServe: input => input.backend === "local-docker",
     async reserve(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.calls.push("reserve");
@@ -148,6 +191,34 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
       if (sc.launchGate) await sc.launchGate.wait();
       sc.launched = true;
       return sc.launchImpl ? sc.launchImpl(input) : sc.launchResult;
+    },
+    runnerRegistration: (input) => {
+      const sc = scenarioOf(input.dispatchId);
+      return {
+        readUri: () => sc.runnerUri ?? null,
+        readContainerState: () => sc.status,
+        register: async uri => {
+          if (sc.registrationRejected) return { ok: false, reason: "rejected", status: 400 };
+          const result = await registerRunnerDeployment(uri, { adminBaseUrl: sc.adminUrl });
+          if (result.ok) sc.deploymentId = result.deploymentId;
+          return result;
+        },
+      };
+    },
+    recordRunnerResult: (input, body) => {
+      if (scenarioOf(input.dispatchId).resultSaveThrows) throw new Error("intent unavailable");
+      const store = implementationIntentStore();
+      store.write(input.dispatchId, { serve: true });
+      store.recordRunnerResult(input.dispatchId, body);
+    },
+    recordRunnerDeployment: (input, id) => { scenarioOf(input.dispatchId).savedDeploymentId = id; },
+    markStarted: input => { scenarioOf(input.dispatchId).row.status = "running"; },
+    removeRunnerDeployment: async id => {
+      const sc = [...scenarios.values()].find(sc => sc.deploymentId === id);
+      if (!sc) throw new Error("missing registered runner");
+      expect(sc.runnerOpen).toBe(false);
+      await removeDeployment(id, { adminBaseUrl: sc.adminUrl });
+      sc.deploymentRemoved = true;
     },
     async readStatus(input) {
       const sc = scenarioOf(input.dispatchId);
@@ -268,6 +339,7 @@ describe("ImplementationRun durable workflow", () => {
   let slow: Map<string, RestateEnvironment>;
   let window: Map<string, RestateEnvironment>;
   let deadline: Map<string, RestateEnvironment>;
+  let serveRuns: Map<string, RestateEnvironment>;
   let counter = 0;
 
   beforeAll(async () => {
@@ -276,15 +348,16 @@ describe("ImplementationRun durable workflow", () => {
     initDispatchBreakerTable();
     initSettingsTable();
     initMappingsTable();
-    [slow, window, deadline] = await Promise.all([
+    [slow, window, deadline, serveRuns] = await Promise.all([
       startVariants([createImplementationRunWorkflow(makeDeps(SLOW))]),
       startVariants([createImplementationRunWorkflow(makeDeps(WINDOW))]),
       startVariants([createImplementationRunWorkflow(makeDeps(DEADLINE))]),
+      startVariants([createImplementationRunWorkflow(makeDeps({ ...SLOW, bootstrapMs: 600 }))]),
     ]);
   }, 180_000);
 
   afterAll(async () => {
-    await Promise.all([stopAll(slow), stopAll(window), stopAll(deadline)]);
+    await Promise.all([stopAll(slow), stopAll(window), stopAll(deadline), stopAll(serveRuns)]);
   });
 
   const labels = VARIANTS.map(([label]) => label);
@@ -307,6 +380,7 @@ describe("ImplementationRun durable workflow", () => {
       prMerged: false, events: [],
       ...overrides,
     };
+    sc.adminUrl = envs.get(label)!.adminAPIBaseUrl();
     scenarios.set(dispatchId, sc);
     const url = baseUrl(envs, label);
     const input: ImplementationRunInput = {
@@ -319,6 +393,435 @@ describe("ImplementationRun durable workflow", () => {
     const report = () => callWorkflow(url, "ImplementationRun", dispatchId, "report");
     return { dispatchId, sc, done, read, report };
   }
+
+  it.each(labels.flatMap(label => ["absent", "failed", "accepted"].map(intake => ({ label, intake }))))("production owner recovery removes a serve container before checking termination ($label, $intake)", async ({ label, intake }) => {
+    const { createProductionImplementationRunServices } = await import("../../restate/implementation-run-production.js");
+    const { implementationIntentStore } = await import("../../restate/implementation-launch-intent.js");
+    const owners = await import("../../restate/implementation-run-owner.js");
+    const docker = await import("../../local-docker.js");
+    const endpoint = await import("../../restate/endpoint.js");
+    const { acquireDispatch } = await import("../../dispatch-gate.js");
+    const run: ImplementationRunInput = { dispatchId: `serve-recovery-${counter++}`, teamKey: "ENG", issueId: `recovery-${counter}`, issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "local-docker" };
+    const events: string[] = [];
+    let removed = false;
+    let failRemoval = true;
+    let unknownStatus = false;
+    let failDeployment = true;
+    let legacyEnded = false;
+    onTestFinished(() => { vi.restoreAllMocks(); });
+    vi.spyOn(docker, "removeLocalContainer").mockImplementation(async () => {
+      events.push("remove");
+      if (failRemoval) throw new Error("daemon unavailable");
+      if (removed) throw new Error("No such container");
+      removed = true;
+    });
+    vi.spyOn(docker, "inspectLocalContainer").mockImplementation(async () => {
+      events.push("status");
+      if (unknownStatus) throw new Error("daemon unavailable");
+      if (removed) throw new Error("No such container");
+      return { status: legacyEnded ? "exited" : "running", running: !legacyEnded, exitCode: legacyEnded ? 0 : null };
+    });
+    vi.spyOn(endpoint, "removeDeployment").mockImplementation(async id => {
+      expect(id).toBe("recovery-deployment");
+      events.push("deployment");
+      if (failDeployment) throw new Error("admin unavailable");
+    });
+    vi.spyOn(auth, "getInstallationToken").mockResolvedValue("test-token");
+    vi.spyOn(github, "getPullRequestState").mockResolvedValue({ merged: false } as never);
+    let failIntake = false;
+    const provider = new FakeProvider();
+    const finalized = vi.fn(async () => {});
+    const { services } = createProductionImplementationRunServices({ config: {}, getMapping: () => makeMapping(),
+      resolveProvider: async () => { if (failIntake) throw new Error("mapping unavailable"); return provider; },
+      finalizeImplementation: finalized, reportTerminalJob: async () => {},
+    } as unknown as ImplementationRunProductionInput);
+    const environments = await startVariants(services);
+    onTestFinished(() => stopAll(environments));
+    const env = environments.get(label)!;
+    expect(acquireDispatch({ dispatchId: run.dispatchId, issueId: run.issueId, issueIdentifier: run.issueIdentifier, kind: "implementation", teamKey: run.teamKey, backend: run.backend, maxInProgressAiIssues: 100, lifecycleOwner: { kind: "restate", attemptId: run.dispatchId } }).ok).toBe(true);
+    const owner = owners.requireImplementationRunOwner(run);
+    owners.updateImplementationRunOwner({ ...owner, state: "launching", jobId: "serve-container" });
+    const store = implementationIntentStore();
+    store.write(run.dispatchId, { serve: true, context: { mapping: makeMapping(), issue: { scopeKey: "ENG" } }, flyApp: null });
+    store.complete(run.dispatchId);
+    store.recordRunnerDeployment(run.dispatchId, "recovery-deployment");
+    const body = { phase: "implementation" as const, outcome: "success" as const,
+      comments: [{ body: "Recovered result" }], prUrl: `https://github.com/o/${run.dispatchId}/pull/1`,
+      invocations: seedUsage(run.dispatchId).records };
+    if (intake !== "absent") {
+      expect(findLinkByPr(`o/${run.dispatchId}`, 1)).toBeNull();
+      upsertMapping("ENG", makeMapping());
+      appendLog({ dispatchId: run.dispatchId, issueId: run.issueId, issueIdentifier: run.issueIdentifier,
+        teamKey: "ENG", repo: `o/${run.dispatchId}`, phase: "implementation", status: "running", executionMode: "local-docker" });
+      store.recordRunnerResult(run.dispatchId, body);
+      expect(store.read<{ runnerResult: unknown }>(run.dispatchId)?.snapshot.runnerResult).toEqual(body);
+      if (intake === "accepted") {
+        expect((await acceptRunnerCallResult({ body, resolveProvider: async () => provider },
+          { dispatchId: run.dispatchId, issueId: run.issueId, teamKey: "ENG", phase: "implementation" })).status).toBe(200);
+        recordUsage(run.dispatchId, toRecordedUsage(body));
+      }
+    }
+    const beforeComments = provider.commentsFor(run.issueId).length;
+    const beforeUsage = storedRows(run.dispatchId);
+    const beforeLink = intake === "accepted" ? findLinkByPr(`o/${run.dispatchId}`, 1) : null;
+    expect(store.read(run.dispatchId)?.done).toBe(true);
+    const recover = () => callWorkflow<ImplementationRunResult>(env.baseUrl(), "ImplementationRunRecovery", run.dispatchId, "reconcile");
+    expect(await recover()).toEqual({ reason: "termination_unconfirmed" });
+    expect(events).toEqual(["remove"]);
+    expect(admission.read(run.dispatchId)?.releasedAt).toBeNull();
+    failRemoval = false;
+    unknownStatus = true;
+    expect(await recover()).toEqual({ reason: "termination_unconfirmed" });
+    expect(admission.read(run.dispatchId)?.releasedAt).toBeNull();
+    unknownStatus = false;
+    await expect(recover()).rejects.toThrow();
+    expect(admission.read(run.dispatchId)?.releasedAt).toBeNull();
+    failDeployment = false;
+    if (intake === "failed") {
+      failIntake = true;
+      expect(await recover()).toEqual({ reason: "termination_unconfirmed" });
+      expect(admission.read(run.dispatchId)?.releasedAt).toBeNull();
+      expect(owners.readImplementationRunOwner(run.dispatchId)?.finalized).not.toBe(true);
+      expect(finalized).not.toHaveBeenCalled();
+      failIntake = false;
+    }
+    events.length = 0;
+    expect(await recover()).toEqual({ reason: "finalized" });
+    expect(events).toEqual(["remove", "status", "deployment"]);
+    if (intake !== "absent") {
+      expect(getJobByDispatchId(run.dispatchId)).toMatchObject({ status: "completed", prUrl: body.prUrl });
+      expect(findLinkByPr(`o/${run.dispatchId}`, 1)).toMatchObject({ source: "result" });
+      expect(storedRows(run.dispatchId)).toHaveLength(2);
+      if (intake === "accepted") {
+        expect(provider.commentsFor(run.issueId)).toHaveLength(beforeComments);
+        expect(storedRows(run.dispatchId)).toEqual(beforeUsage);
+        expect(findLinkByPr(`o/${run.dispatchId}`, 1)).toEqual(beforeLink);
+      }
+    }
+    expect(owners.readImplementationRunOwner(run.dispatchId)?.finalized).toBe(true);
+    expect(admission.read(run.dispatchId)?.releasedAt).not.toBeNull();
+    events.length = 0;
+    expect(await recover()).toEqual({ reason: "finalized" });
+    expect(events).toEqual([]);
+
+    // An older local intent lacks serve evidence and must wait for termination.
+    const legacy = { ...run, dispatchId: `${run.dispatchId}-legacy`, issueId: `${run.issueId}-legacy` };
+    expect(acquireDispatch({ dispatchId: legacy.dispatchId, issueId: legacy.issueId, issueIdentifier: legacy.issueIdentifier, kind: "implementation", teamKey: legacy.teamKey, backend: legacy.backend, maxInProgressAiIssues: 100, lifecycleOwner: { kind: "restate", attemptId: legacy.dispatchId } }).ok).toBe(true);
+    owners.updateImplementationRunOwner({ ...owners.requireImplementationRunOwner(legacy), state: "launching", jobId: "legacy-container" });
+    store.write(legacy.dispatchId, { context: { mapping: makeMapping() }, flyApp: null });
+    removed = false;
+    const recoverLegacy = () => callWorkflow(env.baseUrl(), "ImplementationRunRecovery", legacy.dispatchId, "reconcile");
+    expect(await recoverLegacy()).toEqual({ reason: "termination_unconfirmed" });
+    expect(events).toEqual(["status"]);
+    expect(admission.read(legacy.dispatchId)?.releasedAt).toBeNull();
+    events.length = 0;
+    legacyEnded = true;
+    expect(await recoverLegacy()).toEqual({ reason: "finalized" });
+    expect(events).toEqual(["status", "remove"]);
+  }, 120_000);
+
+  it.each(labels.flatMap(label => (["success", "failure"] as const).map(outcome => ({ label, outcome }))))(
+    "local returned $outcome matches callback job, PR and usage intake ($label)", async ({ label, outcome }) => {
+      const launchGate = gate("result parity launch");
+      const w = begin(serveRuns, label, { launchGate }, { backend: "local-docker" });
+      const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "workflow-result-"));
+      const recording = fakeFetch({});
+      const sessions = new Set<http2.ServerHttp2Session>();
+      upsertMapping("ENG", makeMapping());
+      const seed = (dispatchId: string) => {
+        expect(admission.acquire({ dispatchId, mappingKey: "ENG",
+          scope: { kind: "issue", issueScope: "ENG", issueId: `issue-${dispatchId}` }, kind: "implementation", backend: "local-docker",
+          lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10 }).ok).toBe(true);
+        appendLog({ dispatchId, issueId: `issue-${dispatchId}`, issueIdentifier: "ENG-1", issueTitle: "Implement", teamKey: "ENG",
+          repo: `o/${dispatchId}`, phase: "implementation", status: "running" });
+      };
+      initStepLogTable();
+      expect(findLinkByPr(`o/${w.dispatchId}`, 1)).toBeNull();
+      seed(w.dispatchId);
+      const callbackId = `${w.dispatchId}-callback`;
+      seed(callbackId);
+      for (const [name, value] of Object.entries({ ISSUE_ID: `issue-${w.dispatchId}`, ISSUE_IDENTIFIER: "ENG-1", ISSUE_TITLE: "Implement", ISSUE_DESCRIPTION: "test",
+        GITHUB_DEFAULT_BRANCH: "main", GITHUB_OWNER: "o", GITHUB_REPO: w.dispatchId, GITHUB_TOKEN: "synthetic-token",
+        RUN_TOKEN: "synthetic-result-token", RUNNER_CALLBACK_URL: "https://orchestrator.example" })) vi.stubEnv(name, value);
+      const prUrl = `https://github.com/o/${w.dispatchId}/pull/1`;
+      const runner = createRunnerService({ runId: w.dispatchId, runAutonomous: async options => {
+        w.sc.runnerOpen = true;
+        try {
+          return await runAutonomous({ ...options, workspaceDir, fetchImpl: recording.fetch, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+            runner: new PipelineRunner()
+              .register("feedback-loop", { run: async () => makeFeedbackLoopOutputs({ approved: outcome === "success" }) })
+              .register("push", { run: async () => ({ prUrl, branchPushed: true, prNumber: 1, commitSha: "a".repeat(40) }) }),
+            pipeline: { id: "parity", steps: ["feedback-loop", "push"].map(id => ({ id, type: "custom", moduleId: id })) },
+            resultSink: async body => {
+              expect(body.outcome).toBe(outcome);
+              const callbackBody = { ...body, prUrl: `https://github.com/o/${callbackId}/pull/1`, invocations: seedUsage(callbackId).records };
+              const secret = "parity-secret";
+              const { token } = runnerTokens.mintRunToken({ dispatchId: callbackId, issueId: `issue-${callbackId}`, mappingTeamKey: "ENG", phase: "implementation", ttlSeconds: 3600, secret });
+              expect((await handleRunnerResult({ authorization: `Bearer ${token}`, secret, body: callbackBody,
+                resolveProvider: async () => new FakeProvider(),
+                checkImplementationAdmissionTermination: async (_id, usage) => { recordUsage(callbackId, usage!); return { status: "accepted" }; },
+              })).status).toBe(200);
+              await options.resultSink?.({ ...body, invocations: seedUsage(w.dispatchId).records });
+            },
+          });
+        } finally { w.sc.runnerOpen = false; }
+      } });
+      const server = http2.createServer(createEndpointHandler({ services: [runner] }));
+      server.on("session", session => { sessions.add(session); session.on("close", () => sessions.delete(session)); });
+      onTestFinished(async () => {
+        launchGate.release();
+        await new Promise<void>(resolve => { server.close(() => resolve()); for (const session of sessions) session.destroy(); });
+        vi.unstubAllEnvs();
+        admission.releaseByDispatchId(w.dispatchId, "finalized");
+        admission.releaseByDispatchId(callbackId, "finalized");
+        await rm(workspaceDir, { recursive: true, force: true });
+      });
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("runner has no port");
+      w.sc.runnerUri = `http://127.0.0.1:${address.port}`;
+      launchGate.release();
+      expect(await w.done).toEqual({ reason: "finalized" });
+      expect(recording.calls.filter(call => call.path === "/runner/result")).toEqual([]);
+      expect(JSON.stringify(implementationIntentStore().read(w.dispatchId)?.snapshot)).not.toMatch(/synthetic-token|synthetic-result-token/);
+      expect(w.sc.calls.filter(call => call === "accept-result")).toHaveLength(1);
+      const rows = (dispatchId: string) => {
+        const job = getJobByDispatchId(dispatchId)!;
+        expect(job.prUrl).toBe(`https://github.com/o/${dispatchId}/pull/1`);
+        return { status: job.status, conclusion: job.conclusion,
+          link: getDb().prepare("SELECT role, source, outcome FROM pull_request_link WHERE repository = ? AND number = 1").get(`o/${dispatchId}`),
+          usage: getDb().prepare("SELECT usage_json FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id").all(dispatchId) };
+      };
+      expect(rows(w.dispatchId)).toEqual(rows(callbackId));
+      expect(rows(w.dispatchId).link).toMatchObject({ role: "implementation", source: "result" });
+      expect(rows(w.dispatchId).usage).toHaveLength(2);
+    }, 60_000,
+  );
+
+  it.each(labels.flatMap(label => ["exited", "rejected", "bootstrap timeout"].map(mode => ({ label, mode }))))(
+    "local registration $mode $label finalizes the launched run", async ({ label, mode }) => {
+      const w = begin(mode === "bootstrap timeout" ? deadline : serveRuns, label, {
+        status: mode === "exited" ? "ended" : "started",
+        runnerUri: mode === "rejected" ? "http://127.0.0.1:1" : undefined,
+        registrationRejected: mode === "rejected", endOnStop: true,
+      }, { backend: "local-docker" });
+      expect(await w.done).toEqual({ reason: mode === "exited" ? "finalized" : mode === "rejected" ? "launch_rejected" : "deadline_exceeded" });
+      expect(w.sc.finishCalls).toHaveLength(1);
+      expect(w.sc.events).toContain("cleanup");
+      expect(w.sc.stopCalls).toHaveLength(mode === "exited" ? 0 : 1);
+    }, 60_000,
+  );
+
+  it.each(labels.flatMap(label => ["success", "restart", "intake failure", "save failure", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
+    "local serve $mode $label waits on one registered call", async ({ label, mode }) => {
+      const launchGate = gate("local serve");
+      const finishGate = gate("local serve");
+      const envs = mode === "timeout" ? deadline : serveRuns;
+      const w = begin(envs, label, { launchGate, row: makeJob({ status: "dispatched", approved: ["success", "restart", "delayed discovery", "long", "confirm"].includes(mode) }) }, { backend: "local-docker" });
+      w.sc.resultIntakeThrows = mode === "intake failure";
+      w.sc.resultSaveThrows = mode === "save failure";
+      if (mode === "delayed discovery") {
+        w.sc.launchResult = { outcome: "unknown" };
+        w.sc.runId = null;
+      }
+      const env = envs.get(label)!;
+      if (mode === "restart") {
+        upsertMapping("ENG", makeMapping());
+        expect(findLinkByPr(`o/${w.dispatchId}`, 1)).toBeNull();
+        expect(admission.acquire({ dispatchId: w.dispatchId, mappingKey: "ENG",
+          scope: { kind: "issue", issueScope: "ENG", issueId: `issue-${w.dispatchId}` }, kind: "implementation", backend: "local-docker",
+          lifecycleOwner: { kind: "restate", attemptId: w.dispatchId }, cap: 10 }).ok).toBe(true);
+        appendLog({ dispatchId: w.dispatchId, issueId: `issue-${w.dispatchId}`, issueIdentifier: "ENG-1", issueTitle: "Implement", teamKey: "ENG", repo: `o/${w.dispatchId}`, phase: "implementation", status: "running" });
+      }
+      let pipelineRuns = 0;
+      const sessions = new Set<http2.ServerHttp2Session>();
+      const runner = ["restart", "intake failure", "save failure"].includes(mode) ? createRunnerService({
+        runId: w.dispatchId,
+        runAutonomous: async options => {
+          expect(w.sc.savedDeploymentId).toBe(w.sc.deploymentId);
+          pipelineRuns++; w.sc.runnerStarted = true; w.sc.runnerOpen = true;
+          await finishGate.wait();
+          w.sc.runnerOpen = false;
+          await options.resultSink?.({ phase: "implementation", outcome: "success", comments: [],
+            prUrl: `https://github.com/o/${w.dispatchId}/pull/1`, invocations: seedUsage(w.dispatchId).records });
+          return { exitCode: 0 };
+        },
+      }) : restate.service({
+        name: `Runner_${w.dispatchId}`,
+        options: { retryPolicy: RUNNER_SERVICE_RETRY_POLICY, explicitCancellation: true, inactivityTimeout: 60_000, abortTimeout: 120_000 },
+        handlers: {
+          run: async (ctx: restate.Context, input: { workflowKey: string }) => {
+            expect(input.workflowKey).toBe(w.dispatchId);
+            expect(w.sc.savedDeploymentId).toBe(w.sc.deploymentId);
+            w.sc.runnerStarted = true;
+            w.sc.runnerOpen = true;
+            try {
+              await restate.RestatePromise.race([
+                ctx.run("gated-run", () => { pipelineRuns++; return finishGate.wait(); }),
+                (ctx as unknown as restate.internal.ContextInternal).cancellation().map((): never => {
+                  w.sc.runnerAborted = true;
+                  throw new restate.TerminalError("Cancelled", { errorCode: 409 });
+                }),
+              ]);
+              return {};
+            } finally { w.sc.runnerOpen = false; }
+          },
+        },
+      });
+      const server = http2.createServer(createEndpointHandler({ services: [runner] }));
+      server.on("session", session => { sessions.add(session); session.on("close", () => sessions.delete(session)); });
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      let endpointClosed = false;
+      const closeEndpoint = async () => {
+        if (endpointClosed) return;
+        endpointClosed = true;
+        await new Promise<void>(resolve => { server.close(() => resolve()); for (const session of sessions) session.destroy(); });
+        // The endpoint process is gone; its in-process gated handler cannot
+        // represent a live container after its transport has been destroyed.
+        w.sc.runnerOpen = false;
+      };
+      onTestFinished(async () => {
+        finishGate.release(); launchGate.release();
+        await closeEndpoint();
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("runner has no port");
+      w.sc.runnerUri = `http://127.0.0.1:${address.port}`;
+      launchGate.release();
+      if (mode === "delayed discovery") {
+        await eventually(() => w.sc.findCalls, calls => calls >= 3, { label: "repeated discovery after ambiguous launch" });
+        expect(w.sc.runnerStarted).not.toBe(true);
+        w.sc.runId = `job-${w.dispatchId}`;
+      }
+      await eventually(() => w.sc.runnerStarted && w.sc.row.status === "running", Boolean);
+      expect(w.sc.readCalls).toBe(0);
+      if (mode === "restart") {
+        await finishGate.reached();
+        await env.startedRestateServer.restart();
+        await waitForStep(w.read, "wait");
+      }
+      if (mode === "long") {
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`);
+        // Keep the runner gated until the workflow has journaled ticks spanning more
+        // than its bootstrap window. The latest timer is still pending, so subtract
+        // one tick to prove time already elapsed rather than a future wake-up time.
+        await eventually(async () => {
+          const entries = await journalEntries(env.adminAPIBaseUrl(), String(rows[0]!.id));
+          const wakes = entries.filter(entry => entry.entry_type === "Command: Sleep").map(entry => {
+            const command = JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
+            return command.Command.Sleep.wake_up_time;
+          });
+          return Math.max(...wakes) - Math.min(...wakes) - SLOW.tickMs;
+        }, elapsed => elapsed > DEADLINE.bootstrapMs, { label: "workflow ticks past bootstrap while runner is gated" });
+        expect(w.sc.runnerOpen).toBe(true);
+        expect(w.sc.stopCalls).toEqual([]);
+        expect(w.sc.row.status).toBe("running");
+      }
+      if (mode === "failure") {
+        const record = seedUsage(w.dispatchId, 12, 1, [1]).records[0];
+        await callWorkflow(env.baseUrl(), "ImplementationRun", w.dispatchId, "recordInvocation", record);
+        expect(storedRows(w.dispatchId)).toHaveLength(1);
+      }
+      if (mode === "confirm") { await w.report(); await waitForStep(w.read, "confirm"); }
+      if (mode === "cancel") {
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`);
+        await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0]!.id));
+        await expect(w.done).rejects.toThrow();
+        await eventually(() => releasesOf(w.dispatchId), reasons => reasons.includes("cancelled"));
+        expect(w.sc.events).toContain("cleanup");
+        expect(w.sc.finishCalls).toContainEqual({ kind: "cancelled" });
+        expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "workflow_cancelled" });
+        expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
+      } else if (mode === "intake failure" || mode === "save failure") {
+        finishGate.release();
+        await expect(w.done).rejects.toThrow();
+        await waitForStep(w.read, "termination_unconfirmed");
+        expect(w.sc.calls.filter(call => call === "accept-result")).toHaveLength(mode === "save failure" ? 0 : 3);
+        if (mode === "intake failure") expect(implementationIntentStore().read<{ runnerResult: unknown }>(w.dispatchId)?.snapshot.runnerResult).toMatchObject({
+          phase: "implementation", outcome: "success", prUrl: `https://github.com/o/${w.dispatchId}/pull/1`,
+        });
+        expect(w.sc.finishCalls).toEqual([]);
+        expect(w.sc.finalizeCalls).toEqual([]);
+        expect(w.sc.events).toEqual([]);
+        expect(releasesOf(w.dispatchId)).toEqual([]);
+        expect(w.sc.deploymentRemoved).not.toBe(true);
+        expect(w.sc.stopCalls).toEqual([]);
+        if (mode === "intake failure") {
+          const { createProductionImplementationRunServices } = await import("../../restate/implementation-run-production.js");
+          const owners = await import("../../restate/implementation-run-owner.js");
+          const { acquireDispatch } = await import("../../dispatch-gate.js");
+          const docker = await import("../../local-docker.js");
+          const endpoint = await import("../../restate/endpoint.js");
+          const run: ImplementationRunInput = { dispatchId: w.dispatchId, issueId: `issue-${w.dispatchId}`,
+            issueIdentifier: "ENG-1", teamKey: "ENG", launchContext: {}, maxJobMinutes: 90, backend: "local-docker" };
+          upsertMapping("ENG", makeMapping());
+          expect(acquireDispatch({ ...run, kind: "implementation", maxInProgressAiIssues: 100,
+            lifecycleOwner: { kind: "restate", attemptId: run.dispatchId } }).ok).toBe(true);
+          expect(findLinkByPr(`o/${run.dispatchId}`, 1)).toBeNull();
+          appendLog({ dispatchId: run.dispatchId, issueId: run.issueId, issueIdentifier: "ENG-1", teamKey: "ENG",
+            repo: `o/${run.dispatchId}`, phase: "implementation", status: "running", executionMode: "local-docker" });
+          owners.updateImplementationRunOwner({ ...owners.requireImplementationRunOwner(run), state: "launching", jobId: w.sc.runId });
+          vi.spyOn(docker, "removeLocalContainer").mockResolvedValue(undefined);
+          vi.spyOn(docker, "inspectLocalContainer").mockRejectedValue(new Error("No such container"));
+          vi.spyOn(endpoint, "removeDeployment").mockResolvedValue(undefined);
+          vi.spyOn(auth, "getInstallationToken").mockResolvedValue("test-token");
+          vi.spyOn(github, "getPullRequestState").mockResolvedValue({ merged: false } as never);
+          onTestFinished(() => { vi.restoreAllMocks(); });
+          const { services } = createProductionImplementationRunServices({ config: {}, getMapping: () => makeMapping(),
+            resolveProvider: async () => new FakeProvider(), finalizeImplementation: async () => {}, reportTerminalJob: async () => {},
+          } as unknown as ImplementationRunProductionInput);
+          const recoveryEnvs = await startVariants(services);
+          onTestFinished(() => stopAll(recoveryEnvs));
+          expect(await callWorkflow(recoveryEnvs.get(label)!.baseUrl(), "ImplementationRunRecovery", run.dispatchId, "reconcile")).toEqual({ reason: "finalized" });
+          expect(getJobByDispatchId(run.dispatchId)).toMatchObject({ status: "completed", prUrl: `https://github.com/o/${run.dispatchId}/pull/1` });
+          expect(findLinkByPr(`o/${run.dispatchId}`, 1)).toMatchObject({ source: "result" });
+          expect(storedRows(run.dispatchId)).toHaveLength(2);
+          expect(admission.read(run.dispatchId)?.releasedAt).not.toBeNull();
+        }
+        return;
+      } else {
+        if (mode === "failure") await closeEndpoint();
+        else if (mode !== "timeout") finishGate.release();
+        expect(await (mode === "restart" ? attachWorkflow<ImplementationRunResult>(env.baseUrl(), "ImplementationRun", w.dispatchId) : w.done)).toMatchObject({ reason: mode === "timeout" ? "deadline_exceeded" : "finalized" });
+      }
+      if (mode === "failure") {
+        expect(storedRows(w.dispatchId)).toHaveLength(1);
+        expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
+        expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
+        expect(w.sc.closeCalls).toContainEqual(["failed", "ended_without_callback", { skipAdmissionRelease: true }]);
+        expect(w.sc.finalizeCalls).toContainEqual({ kind: "failed", conclusion: "ended_without_callback" });
+      }
+      if (mode === "restart") {
+        expect(w.sc.calls.filter(call => call === "accept-result")).toHaveLength(1);
+        expect(storedRows(w.dispatchId)).toHaveLength(2);
+        expect(getJobByDispatchId(w.dispatchId)?.prUrl).toBe(`https://github.com/o/${w.dispatchId}/pull/1`);
+        expect(findLinkByPr(`o/${w.dispatchId}`, 1)?.source).toBe("result");
+        expect(getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(w.dispatchId)).toEqual({ invocations_complete: 1 });
+        admission.releaseByDispatchId(w.dispatchId, "finalized");
+      }
+      expect(pipelineRuns).toBe(1);
+      expect(w.sc.launchCalls).toBe(1);
+      expect(w.sc.deploymentRemoved).toBe(true);
+      expect(w.sc.runnerOpen).toBe(false);
+      if (mode === "timeout" || mode === "cancel") expect(w.sc.runnerAborted).toBe(true);
+      if (mode === "timeout") expect(w.sc.stuckCalls).toEqual(["ttl_expired"]);
+      if (["success", "restart", "delayed discovery", "long", "confirm"].includes(mode)) expect(w.sc.closeCalls).toContainEqual(["completed", "success", { skipAdmissionRelease: true }]);
+      expect(w.sc.readCalls).toBe(0);
+      const calls = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'Runner_${w.dispatchId}' AND target_handler_name = 'run'`);
+      expect(calls).toHaveLength(1);
+      if (mode === "failure") {
+        expect(calls[0]!.completion_result).toBe("failure");
+        const response = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: sys_journal_events read, not an invocation lookup
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({ query: `SELECT * FROM sys_journal_events WHERE id = '${calls[0]!.id}'` }),
+        });
+        expect(response.ok).toBe(true);
+        const { rows } = await response.json() as { rows: Array<{ event_type: string }> };
+        expect(rows.filter(row => row.event_type === "TransientError")).toHaveLength(RUNNER_SERVICE_RETRY_POLICY.maxAttempts - 1);
+      }
+    }, 60_000,
+  );
 
   it.each(labels.flatMap(label =>
     (["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend =>
@@ -545,6 +1048,71 @@ describe("ImplementationRun durable workflow", () => {
     expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
     // `report` carries no job outcome, so the finish step still runs once, after the ended read.
     expect(w.sc.finishCalls).toEqual([{ kind: "run_ended" }]);
+  }, 60_000);
+
+  it.each(labels)("step uses the same rows and updates as the progress callback (%s)", async label => {
+    const url = baseUrl(slow, label);
+    const dispatchId = `step-parity-${label}`;
+    const callbackId = `${dispatchId}-callback`;
+    initStepLogTable();
+    for (const id of [dispatchId, callbackId]) appendLog({ dispatchId: id, issueId: `issue-${id}`,
+      issueIdentifier: "ENG-1", issueTitle: "Implement", teamKey: "ENG", repo: "o/r", phase: "implementation", status: "running" });
+    const secret = "synthetic-progress-secret";
+    const { token } = runnerTokens.mintRunToken({ dispatchId: callbackId, issueId: `issue-${callbackId}`,
+      mappingTeamKey: "ENG", phase: "implementation", audience: "progress", ttlSeconds: 3600, secret });
+    const initial: Step = { id: "child", type: "custom", status: "running", started_at: "2026-11-01T00:00:00Z",
+      ended_at: null, parent_step_id: "parent", inputs: { value: 1 }, outputs: {}, logs_url: null };
+    for (const step of [initial, { ...initial, status: "passed" as const, ended_at: "2026-11-01T00:01:00Z",
+      outputs: { value: 2 }, logs_url: "https://logs.example/child" }, initial]) {
+      expect((await handleRunnerProgress({ authorization: `Bearer ${token}`, secret, body: { step } })).status).toBe(200);
+      await callWorkflow(url, "ImplementationRun", dispatchId, "step", step);
+      const read = (id: string) => getStepsByJobId(getJobByDispatchId(id)!.id)
+        .map(({ id: _id, jobId: _jobId, ...row }) => row);
+      expect(read(dispatchId)).toEqual(read(callbackId));
+      expect(read(dispatchId)).toHaveLength(1);
+    }
+    expect(getStepsByJobId(getJobByDispatchId(dispatchId)!.id)[0]).toMatchObject({
+      status: "passed", endedAt: "2026-11-01T00:01:00Z",
+      outputsJson: JSON.stringify({ value: 2 }), logsUrl: "https://logs.example/child",
+    });
+    await expect(callWorkflow(url, "ImplementationRun", `${dispatchId}-missing`, "step", initial)).rejects.toThrow(/job_not_found/);
+  });
+
+  it.each(labels)("recordInvocation stores each sent call once and never marks the list complete (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started" });
+    await waitForStep(w.read, "wait");
+    const record = seedUsage(w.dispatchId, 12, 1, [1]).records[0];
+    const send = () => callWorkflow(baseUrl(slow, label), "ImplementationRun", w.dispatchId, "recordInvocation", record);
+    await send();
+    await eventually(() => storedRows(w.dispatchId), (rows) => rows.length === 1, { label: "the first invocation row" });
+    await send();
+    expect(storedRows(w.dispatchId)).toHaveLength(1);
+    const report = getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?")
+      .get(w.dispatchId) as { invocations_complete: number } | undefined;
+    expect(report?.invocations_complete ?? 0).toBe(0);
+
+    w.sc.status = "ended";
+    await w.done;
+  }, 60_000);
+
+  it.each(labels)("final attribution selects implementation after live review (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started" });
+    await waitForStep(w.read, "wait");
+    appendLog({ dispatchId: w.dispatchId, issueId: w.dispatchId, issueIdentifier: "ENG-1",
+      teamKey: "ENG", repo: "o/r", phase: "implementation", status: "running" });
+    const usage = seedUsage(w.dispatchId);
+    usage.records[1].attribution.stage = "review";
+    const attribution = usage.records[0].attribution;
+    for (const record of usage.records) {
+      await callWorkflow(baseUrl(slow, label), "ImplementationRun", w.dispatchId, "recordInvocation", record);
+    }
+    expect(getInvocationAttribution(w.dispatchId)?.stage).toBe("review");
+    await callWorkflow(baseUrl(slow, label), "ImplementationRun", w.dispatchId, "report",
+      { usage: { ...usage, attribution } });
+    expect(getInvocationAttribution(w.dispatchId)?.invocationId).toBe(attribution.invocationId);
+    expect(getJobByDispatchId(w.dispatchId)?.attribution?.invocationId).toBe(attribution.invocationId);
+    w.sc.status = "ended";
+    await w.done;
   }, 60_000);
 
   it.each(labels)("ended with no report finishes the job and releases one time each (%s)", async (label) => {
@@ -947,8 +1515,9 @@ describe("ImplementationRun durable workflow", () => {
   }, 60_000);
 
   // A crash replay in the middle of the wait: the endpoint is replaced and the server restarted on its disk journal.
-  it("a restart during the wait replays without a second reserve, launch or release", async () => {
-    const env = await startRetryEnabled([createImplementationRunWorkflow(makeDeps(SLOW))]);
+  it.each(["wait", "confirm"])("a pre-serve local journal resumes at %s without registration or duplicate effects", async point => {
+    const replaySeams = { ...SLOW, tickMs: 3_600_000, confirmTickMs: 3_600_000 };
+    const env = await startRetryEnabled([createLegacyImplementationRunWorkflow(makeDeps(replaySeams))]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
       const dispatchId = `implementation-replay-${counter++}`;
@@ -959,15 +1528,30 @@ describe("ImplementationRun durable workflow", () => {
         finalizeCalls: [], closeCalls: [], stuckCalls: [], clearCalls: 0, prMerged: false, events: [],
       };
       scenarios.set(dispatchId, sc);
-      const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "i", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "github-actions" };
+      const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "i", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "local-docker" };
       const original = callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "run", input);
       void original.catch(() => undefined); // ingress may disconnect during the restart
       const read = () => callWorkflow<ImplementationRunStatusResult>(env.baseUrl(), "ImplementationRun", dispatchId, "status");
       await waitForStep(read, "wait");
-      replacement = await replaceEndpoint(env, [createImplementationRunWorkflow(makeDeps(SLOW))]);
+      await eventually(async () => {
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${dispatchId}' AND target_handler_name = 'run'`);
+        if (rows.length !== 1) return false;
+        const entries = await journalEntries(env.adminAPIBaseUrl(), String(rows[0]!.id));
+        return entries.some(entry => entry.entry_type === "Command: Sleep");
+      }, Boolean, { label: "legacy polling journal suspended on its wait sleep" });
+      if (point === "confirm") {
+        sc.readGate = gate("legacy confirm");
+        await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report");
+        await sc.readGate.reached();
+      }
+      const upgraded = makeDeps(replaySeams);
+      upgraded.runnerRegistration = () => { throw new Error("legacy run must not register"); };
+      upgraded.readLaunchServe = () => { throw new Error("replay must not read mode"); };
+      replacement = await replaceEndpoint(env, [createImplementationRunWorkflow(upgraded)]);
       await env.startedRestateServer.restart();
-      await waitForStep(read, "wait");
+      await waitForStep(read, point);
       sc.status = "ended";
+      sc.readGate?.release();
       await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report");
       await eventually(() => releasesOf(dispatchId), (r) => r.length >= 1, { label: "the release after the replay" });
       expect(sc.calls.filter((c) => c === "reserve")).toHaveLength(1);

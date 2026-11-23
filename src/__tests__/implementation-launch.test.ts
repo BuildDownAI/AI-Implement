@@ -355,6 +355,20 @@ describe("implementation session launches", () => {
     expectNoToken(result);
   });
 
+  it("local: forwards an optional serve payload to the container input", async () => {
+    vi.mocked(startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+    const serve = { identityKey: "publickeyv1_abc", runnerId: "dispatch-42" };
+    await launchImplementationLocalSession({ ...args, serve });
+    expect(startLocalRunnerContainer).toHaveBeenCalledWith(expect.objectContaining({ serve }));
+  });
+
+  it("local: omits serve when the caller does not pass it", async () => {
+    vi.mocked(startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+    await launchImplementationLocalSession(args);
+    const localInput = vi.mocked(startLocalRunnerContainer).mock.calls.at(-1)![0];
+    expect(localInput).not.toHaveProperty("serve");
+  });
+
   it("local: preparation failure leaves the launch marker uncalled", async () => {
     vi.mocked(startLocalRunnerContainer).mockRejectedValueOnce(new Error("env preparation failed"));
     await expect(launchImplementationLocalSession(args)).rejects.toThrow("env preparation failed");

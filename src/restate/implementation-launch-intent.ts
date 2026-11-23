@@ -26,6 +26,14 @@ export function implementationIntentStore() {
       if (!dispatchId.startsWith("owner:")) throw new Error("invalid private owner key");
       db.prepare("UPDATE implementation_launch_intent SET snapshot = ? WHERE dispatch_id = ?").run(JSON.stringify(snapshot), dispatchId);
     },
+    recordRunnerDeployment(dispatchId: string, deploymentId: string) {
+      const result = db.prepare("UPDATE implementation_launch_intent SET snapshot = json_set(snapshot, '$.runnerDeploymentId', ?) WHERE dispatch_id = ?").run(deploymentId, dispatchId);
+      if (result.changes !== 1) throw new Error(`missing implementation launch intent: ${dispatchId}`);
+    },
+    recordRunnerResult(dispatchId: string, body: import("../runner-callback.js").RunnerResultBody) {
+      const result = db.prepare("UPDATE implementation_launch_intent SET snapshot = json_set(snapshot, '$.runnerResult', json(?)) WHERE dispatch_id = ?").run(JSON.stringify(body), dispatchId);
+      if (result.changes !== 1) throw new Error(`missing implementation launch intent: ${dispatchId}`);
+    },
     accept(dispatchId: string) {
       db.prepare("UPDATE implementation_launch_intent SET snapshot = json_set(snapshot, '$.accepted', json('true')) WHERE dispatch_id = ?").run(dispatchId);
     },

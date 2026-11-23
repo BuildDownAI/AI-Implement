@@ -61,6 +61,8 @@ function checkSnapshot(prefix: string, point: string, actual: JournalCommand[]):
 
 const CASES = [
   { backend: "github-actions", prefix: "implementation-run", dispatchId: "implementation-journal-snapshot" },
+  // Legacy local polling must retain exactly the same pre-serve commands.
+  { backend: "local-docker", prefix: "implementation-run", dispatchId: "implementation-journal-snapshot-local" },
   { backend: "fly-machines", prefix: "implementation-run-fly", dispatchId: "implementation-journal-snapshot-fly" },
 ] as const satisfies ReadonlyArray<{ backend: ImplementationRunInput["backend"]; prefix: string; dispatchId: string }>;
 
@@ -76,6 +78,9 @@ for (const { backend, prefix, dispatchId } of CASES) {
       reserve: async () => true,
       findExistingRun: async () => null,
       launch: async () => ({ outcome: "accepted", jobId: `job-${prefix}` }),
+      // Production supplies these for every backend; their presence must not enable serve mode.
+      runnerRegistration: () => { throw new Error("non-local run registered a runner"); },
+      markStarted: () => { throw new Error("non-local run used serve started evidence"); },
       readStatus: async () => {
         if (holdReads) await readGate.wait();
         return status;

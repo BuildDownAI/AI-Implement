@@ -581,6 +581,7 @@ it.each(containerBackends)("%s accepted launch records compute privately and ret
   const helper = backend === "fly-machines" ? dispatchFlyGapfill : dispatchLocalGapfill;
   expect(helper).toHaveBeenCalledWith(expect.objectContaining({ runName: "gap-fill-dispatch", dispatchId: "dispatch", githubToken: "TOKEN-SENTINEL" }));
   expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ executionMode: backend, machineId: "machine", machineNonce: "NONCE-SENTINEL", computeStartedAt: expect.any(Number), sessionImage: backend === "fly-machines" ? "resolved-image" : "local-image" }));
+  if (backend === "local-docker") expect(ordinaryIntents.get(run.dispatchId)?.snapshot).toMatchObject({ serve: true });
   expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "dispatched");
   expect(JSON.stringify(result)).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|BOOTSTRAP-SENTINEL/);
 });

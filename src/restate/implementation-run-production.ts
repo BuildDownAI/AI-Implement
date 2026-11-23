@@ -1,3 +1,5 @@
+import { recordUsage, toRecordedUsage } from "../agent-usage.js";
+import { acceptRunnerCallResult } from "../runner-callback.js";
 import * as restate from "@restatedev/restate-sdk";
 import { requireImplementationRunOwner, updateImplementationRunOwner, readImplementationRunOwner, releaseImplementationRunOwner, claimImplementationStuckAttempt, completeImplementationStuckCleanup } from "./implementation-run-owner.js";
 import { getCommentGapfillLaunch } from "../comment-gapfill-queue.js";
@@ -6,6 +8,7 @@ import { createHash } from "node:crypto";
 import { implementationIntentStore } from "./implementation-launch-intent.js";
 import { modelPricesResponseSchema } from "./model-prices.js";
 import type { RunModelPrices } from "../run-config.js";
+import { removeDeployment } from "./endpoint.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 /** Production composition for the `ImplementationRun` service (AII-1557): the real deps for
  * `createImplementationRunWorkflow` on GitHub Actions, Fly Machines and local Docker. Sibling of
@@ -37,7 +40,7 @@ import {
 } from "../log.js";
 import { trackerAccounting } from "../job-accounting.js";
 import { generateMachineNonce, generateSessionToken, listMachines, getMachine, machineNeverStarted } from "../fly-machines.js";
-import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
+import { findLocalContainerIdByName, removeLocalContainer, readPublishedPort } from "../local-docker.js";
 import { markDispatched } from "../dedup.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
 import type { SetupCheckId } from "../setup-checks/contract.js";
@@ -93,8 +96,13 @@ const GHA_BACKEND = "github-actions";
 type ContainerBackend = "fly-machines" | "local-docker";
 
 export interface ImplementationRunProductionInput {
+  submitLateExternalReview?: import("../runner-callback.js").HandleRunnerResultInput["submitLateExternalReview"];
   /** The full config: the launch functions read from it. */
   config: AppConfig;
+  /** The Restate request-identity public key (`restateSidecar.identityKey`), the same value
+   *  `startRestateEndpoint` receives. Launches local ImplementationRun runners in
+   *  serve mode. It is the public half, not a secret. */
+  restateIdentityKey?: string;
   /** Maps a team key to its mapping. Defaults to `getMappings()[teamKey]`. */
   getMapping?: (teamKey: string) => RepoMapping | undefined;
   /** The provider lookup (`ProviderRegistry.forMapping`). */
@@ -219,12 +227,15 @@ export function createProductionImplementationRunServices(input: ImplementationR
 
   type LaunchMetadata = Parameters<typeof recordLaunch>[2];
   type Intent = {
-    context: Pick<Prelaunch, "mapping" | "issue" | "generation" | "baseBranch" | "baseBranchFieldValue" | "runnerMode">;
+    context?: Pick<Prelaunch, "mapping" | "issue" | "generation" | "baseBranch" | "baseBranchFieldValue" | "runnerMode">;
     metadata: Omit<LaunchMetadata, "ghToken">;
     accounting: ReturnType<typeof trackerAccounting>;
     groupingParent: boolean;
     dispatchedAt: number;
     flyApp: string | null;
+    serve?: boolean;
+    runnerDeploymentId?: string;
+    runnerResult?: import("../runner-callback.js").RunnerResultBody;
   };
   // Recovery only: never copy launch configuration (especially arbitrary extraEnv values).
   // These are the fields consumed by provider selection, bookkeeping and backend lookup.
@@ -242,13 +253,14 @@ export function createProductionImplementationRunServices(input: ImplementationR
   function saveIntent(run: ImplementationRunInput, ctx: Prelaunch, metadata: Omit<LaunchMetadata, "ghToken">) {
     implementationIntentStore().write(run.dispatchId, {
       context: { mapping: recoveryMapping(ctx.mapping), issue: ctx.issue, generation: ctx.generation, baseBranch: ctx.baseBranch, baseBranchFieldValue: ctx.baseBranchFieldValue, runnerMode: ctx.runnerMode },
+      ...(run.backend === "local-docker" ? { serve: true } : {}),
       metadata, accounting: trackerAccounting(ctx.mapping, ctx.provider, ctx.issue), groupingParent: ctx.groupingParent,
       dispatchedAt: readAdmission(run.dispatchId)?.createdAt ?? Date.now(), flyApp: config.flySessionsApp,
     } satisfies Intent);
   }
 
   function frozenMapping(run: ImplementationRunInput): RepoMapping {
-    const mapping = implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.context.mapping ?? implementationIntentStore().readPreparation(run.dispatchId)?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
+    const mapping = implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.context?.mapping ?? implementationIntentStore().readPreparation(run.dispatchId)?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
     if (!mapping) throw new Error(`missing frozen implementation target: ${run.dispatchId}`);
     return mapping;
   }
@@ -430,7 +442,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       };
       launched = execPath === "fly-machines"
         ? await input.launchImplementationFlySession({ ...args, shadow: false, implementationSandbox: decideImplementationSandbox({ protectedLaunch: ctx.managedDecision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }) })
-        : await input.launchImplementationLocalSession(args);
+        : await input.launchImplementationLocalSession({ ...args, serve: { identityKey: input.restateIdentityKey ?? "", runnerId: run.dispatchId } });
     } catch (err) {
       const outcome = classifyLaunchError(execPath, launchAttempted, err);
       settleLaunch(ctx.managedDecision, outcome, ctx.managedRuntime);
@@ -714,6 +726,14 @@ export function createProductionImplementationRunServices(input: ImplementationR
     if (!owner.mapping) updateImplementationRunOwner({ ...owner, mapping: recoveryMapping(mapping), flyApp: null });
   });
   const deps: ImplementationRunDependencies = {
+    acceptRunnerResult: async (run, body) => {
+      const job = getJobByDispatchId(run.dispatchId);
+      if (!job) throw new Error("runner result job missing");
+      const result = await acceptRunnerCallResult({ body, resolveProvider: () => providerForJob(job), watchdogConfig, submitLateExternalReview: input.submitLateExternalReview },
+        { dispatchId: run.dispatchId, issueId: run.issueId, teamKey: run.teamKey,
+          phase: run.gapFill ? "gap-analysis" : "implementation" });
+      if (result.status >= 300) throw new Error(`runner result intake failed: ${result.status}`);
+    },
     ensureOwner: (run) => {
       const admission = readAdmission(run.dispatchId);
       if (admission?.releasedAt === null) requireImplementationRunOwner(run);
@@ -727,6 +747,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       if (held === true) requireImplementationRunOwner(run);
       return held;
     },
+    readLaunchServe: run => implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.serve === true,
     findExistingRun: async (run, dispatchedAt) => {
       if (readAdmission(run.dispatchId)?.releasedAt === null) {
         const owner = requireImplementationRunOwner(run);
@@ -747,7 +768,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
           throw new Error(`managed preparation identity mismatch: ${run.dispatchId}`);
         }
       }
-      const frozenMapping = stored?.snapshot.context.mapping ?? preparation?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
+      const frozenMapping = stored?.snapshot.context?.mapping ?? preparation?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
       const flyApp = backendConfig(run).flySessionsApp;
       const find = createImplementationFindExistingRun({ getMapping: () => {
         if (!frozenMapping) throw new Error(`missing frozen implementation target: ${run.dispatchId}`);
@@ -768,6 +789,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
         // Exact adoption confirms acceptance but never remints a previously revoked grant.
         implementationIntentStore().accept(run.dispatchId);
         const { context, metadata } = stored.snapshot;
+        if (!context) throw new Error(`missing ordinary launch context: ${run.dispatchId}`);
         await recordLaunch(run, { ...context, provider: await input.resolveProvider(context.mapping, run.teamKey) }, {
           ...metadata, ghToken: run.backend === GHA_BACKEND ? await getToken(context.mapping.owner) : "",
           ...(run.backend === "fly-machines" && metadata.statusComment ? { statusComment: { ...metadata.statusComment, logsUrl: `https://fly.io/apps/${stored.snapshot.flyApp}/machines/${id}` } } : {}),
@@ -827,17 +849,43 @@ export function createProductionImplementationRunServices(input: ImplementationR
       let id: string | null;
       try {
         id = owner.jobId ?? await deps.findExistingRun(owner.input, owner.createdAt);
+        if (id !== null && owner.input.backend === "local-docker" && intent?.snapshot.serve) await cleanup(owner.input, id);
         if (id === null || await readStatus(owner.input, id) !== "ended") return { reason: "termination_unconfirmed" };
       } catch {
         return { reason: "termination_unconfirmed" };
       }
+      const serveRecovery = owner.input.backend === "local-docker" && intent?.snapshot.serve;
+      if (serveRecovery && intent.snapshot.runnerDeploymentId) await removeDeployment(intent.snapshot.runnerDeploymentId);
+      if (serveRecovery && intent.snapshot.runnerResult) {
+        console.log(`[implementation-run] replaying saved runner result intake: ${dispatchId}`);
+        try {
+          await deps.acceptRunnerResult!(owner.input, intent.snapshot.runnerResult);
+          recordUsage(dispatchId, toRecordedUsage(intent.snapshot.runnerResult));
+        } catch (error) {
+          console.error(`[implementation-run] saved runner result intake replay failed: ${dispatchId}`, error);
+          return { reason: "termination_unconfirmed" };
+        }
+      }
       await finishJob(dispatchId, readImplementationRunOwner(dispatchId)?.finishOutcome ?? { kind: "run_ended" });
-      await cleanup(owner.input, id);
+      if (!serveRecovery) await cleanup(owner.input, id);
       await onOutcome(dispatchId);
       const finished = readImplementationRunOwner(dispatchId)!;
       const reason = finished.finishResult?.release ?? (finished.finishOutcome?.kind === "deadline" ? "deadline_exceeded" : finished.finishOutcome?.kind === "cancelled" ? "cancelled" : "finalized");
       releaseImplementationRunOwner(dispatchId, reason);
       return { reason };
+    },
+    recordRunnerResult: (run, body) => { implementationIntentStore().recordRunnerResult(run.dispatchId, body); },
+    recordRunnerDeployment: (run, deploymentId) => { implementationIntentStore().recordRunnerDeployment(run.dispatchId, deploymentId); },
+    runnerRegistration: (_run, jobId) => ({
+      readUri: async () => {
+        const port = await readPublishedPort(jobId, 9080);
+        return port === null ? null : `http://127.0.0.1:${port}`;
+      },
+      readContainerState: () => classifyLocalContainer(jobId),
+    }),
+    markStarted: (run) => {
+      const job = getJobByDispatchId(run.dispatchId);
+      if (job?.status === "dispatched") updateJobStatus(job.id, "running");
     },
     readStatus,
     stop,

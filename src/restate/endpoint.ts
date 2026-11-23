@@ -115,6 +115,7 @@ export interface RegisterDeps {
 }
 
 const META0004_CONFLICT = "META0004";
+const META0003_UNREACHABLE = "META0003";
 
 /** Registration bound (AII-728): a hung admin API must not hang boot indefinitely. Applies to both the no-force call and the forced retry, and (AII-721) the invocation-count query run in between. */
 const REGISTER_TIMEOUT_MS = 10_000;
@@ -323,6 +324,61 @@ function postDeployment(
     body: JSON.stringify(force ? { uri, force: true } : { uri }),
     signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
   });
+}
+
+/** Result of one `POST /deployments` attempt for a runner's Restate endpoint. */
+export type RegisterRunnerDeploymentResult =
+  | { ok: true; deploymentId: string }
+  | { ok: false; reason: "unreachable" }
+  | { ok: false; reason: "rejected"; status: number };
+
+/**
+ * Registers a runner's Restate deployment in one attempt. The caller retries with
+ * `ctx.sleep` between attempts: a retry loop inside one `ctx.run` is one long step that
+ * the invoker inactivity timeout can stop (AII-2036).
+ *
+ * On restate-server 1.7.10 a deployment whose URI is not serving yet answers HTTP 500
+ * with `restate_code: "META0003"` (checked 2026-11-19). Anything else that refuses the
+ * request is `rejected`; the caller decides whether to retry it.
+ */
+export async function registerRunnerDeployment(
+  uri: string,
+  deps: Pick<RegisterDeps, "adminBaseUrl" | "fetchImpl"> = {},
+): Promise<RegisterRunnerDeploymentResult> {
+  const adminBaseUrl = deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL;
+  const fetchImpl = deps.fetchImpl ?? fetch;
+
+  const response = await postDeployment(fetchImpl, adminBaseUrl, uri, false);
+  if (response.ok) {
+    const body = await safeJson(response);
+    const deploymentId = typeof body?.id === "string" ? body.id : undefined;
+    if (!deploymentId) return { ok: false, reason: "rejected", status: response.status };
+    return { ok: true, deploymentId };
+  }
+
+  const body = await safeJson(response);
+  if (body?.restate_code === META0003_UNREACHABLE) return { ok: false, reason: "unreachable" };
+  return { ok: false, reason: "rejected", status: response.status };
+}
+
+/**
+ * Removes one Restate deployment, forcing removal so the admin API does not answer 501.
+ * A 404 is success: the deployment is already gone, and a cleanup must stay idempotent.
+ */
+export async function removeDeployment(
+  deploymentId: string,
+  deps: Pick<RegisterDeps, "adminBaseUrl" | "fetchImpl"> = {},
+): Promise<void> {
+  const adminBaseUrl = deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL;
+  const fetchImpl = deps.fetchImpl ?? fetch;
+
+  const response = await fetchImpl(`${adminBaseUrl}/deployments/${encodeURIComponent(deploymentId)}?force=true`, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
+  });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`admin API removal of deployment ${deploymentId} failed: HTTP ${response.status}`);
+  }
 }
 
 async function safeJson(response: Response): Promise<Record<string, unknown> | undefined> {

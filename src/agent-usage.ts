@@ -1,6 +1,6 @@
 import { loadStoredAccountFallbacks, loadStoredFallbackModels, loadStoredSnapshot } from "./agent-run-preparation.js";
 import { getDb } from "./dedup.js";
-import { recordInvocationAttribution, recordPushedCommits, recordInvocationsComplete } from "./log.js";
+import { promoteInvocationAttribution, recordInvocationAttribution, recordPushedCommits, recordInvocationsComplete } from "./log.js";
 import { isFailureRecord } from "./pipeline/failure-classification.js";
 import type { AccountAuthMode, StageName } from "./agent-config.js";
 import type { AccountFallbacks, ResolvedAgentSnapshotV1 } from "./run-config.js";
@@ -328,7 +328,7 @@ export type { InvocationAttributionV1 };
 /**
  * Stores every invocation of a job result (AII-1562), one row per invocation id, plus the legacy single
  * `attribution`. List records go in first and the legacy attribution last, so the "latest row per dispatch"
- * read keeps resolving to the same row it did before the list existed (insert-or-ignore never reorders).
+ * read resolves to the final attribution, including when live records arrived earlier.
  * An invocation with no usage is stored with availability "unavailable" and null cost, never dropped or zeroed.
  * Returns how many records were not stored (not matching the dispatch snapshot, or without an invocation id).
  */
@@ -359,15 +359,20 @@ function recordResultInvocations(
       ...(record ? { attempts: record.attempts } : {}),
     }, accountFallbacks, fallbackModels);
     // A row with no invocation id cannot be stored, so it counts as unstored; a repeat of a stored row does not.
-    if (row && row.invocationId !== null && opts.accepts(row)) recordInvocationAttribution(dispatchId, row, { timedOut });
+    if (row && row.invocationId !== null && opts.accepts(row)) {
+      recordInvocationAttribution(dispatchId, row, { timedOut });
+      if (attribution === legacy) promoteInvocationAttribution(dispatchId, row.invocationId);
+    }
     else mismatched++;
   };
-  const legacyRecord = legacy ? records.find((r) => r.attribution.invocationId === legacy.invocationId) : undefined;
-  for (const record of records) {
-    if (legacy && record.attribution.invocationId === legacy.invocationId) continue;
-    store(record.attribution, record, false);
-  }
-  if (legacy) store(legacy, legacyRecord, opts.timedOut);
+  getDb().transaction(() => {
+    const legacyRecord = legacy ? records.find((r) => r.attribution.invocationId === legacy.invocationId) : undefined;
+    for (const record of records) {
+      if (legacy && record.attribution.invocationId === legacy.invocationId) continue;
+      store(record.attribution, record, false);
+    }
+    if (legacy) store(legacy, legacyRecord, opts.timedOut);
+  })();
   return mismatched;
 }
 

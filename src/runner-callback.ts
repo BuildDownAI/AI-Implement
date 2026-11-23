@@ -838,17 +838,7 @@ export async function handleRunnerResult(input: HandleRunnerResultInput): Promis
     console.warn(`[runner-callback] forward failed kind=${input.body.phase} dispatch=${verified.claims.dispatchId}`);
     return bad(503, "owned_result_intake_unavailable");
   }
-  const result = await withCallbackLifecycleLock(verified.claims.dispatchId, async () => {
-    const result = await handleRunnerResultInternal({
-      ...input,
-      checkPlanningAdmissionTermination: undefined,
-      checkImplementationAdmissionTermination: undefined,
-    });
-    // Persist before releasing the lock and before the fallible forward. A retry
-    // skips lifecycle effects but still delivers its report through workflow intake.
-    if (result.status < 300) markCallbackLifecycleCompleted(verified.claims.dispatchId);
-    return result;
-  });
+  const result = await acceptOwnedRunnerResultLifecycle(input, verified.claims.dispatchId);
   if (result.status >= 300) return result;
   // Restate uses the dispatch id as the report idempotency key, even after a lost ACK.
   try {
@@ -862,11 +852,40 @@ export async function handleRunnerResult(input: HandleRunnerResultInput): Promis
   }
 }
 
+/** Trusted result from the workflow-owned runner call. No recursive report forwarding. */
+export async function acceptRunnerCallResult(
+  input: Omit<HandleRunnerResultInput, "authorization" | "secret">,
+  identity: { dispatchId: string; issueId: string; teamKey: string; phase: "implementation" | "gap-analysis" },
+): Promise<HandleRunnerResultOutput> {
+  if (input.body.reviewFix !== undefined || input.body.phase !== identity.phase ||
+      readAdmission(identity.dispatchId)?.lifecycleOwner.kind !== "restate") return bad(400, "invalid_owned_result");
+  return acceptOwnedRunnerResultLifecycle({ ...input, authorization: undefined, secret: "" }, identity.dispatchId, {
+    ok: true, claims: { issueId: identity.issueId, phase: identity.phase, dispatchId: identity.dispatchId, audience: "result", exp: 0 },
+    mappingTeamKey: identity.teamKey, consumedAt: null,
+  });
+}
+
+/** Persist lifecycle completion before either transport attempts its accounting intake. */
+async function acceptOwnedRunnerResultLifecycle(
+  input: HandleRunnerResultInput,
+  dispatchId: string,
+  trusted?: Extract<ReturnType<typeof verifyRunToken>, { ok: true }>,
+): Promise<HandleRunnerResultOutput> {
+  return withCallbackLifecycleLock(dispatchId, async () => {
+    const result = await handleRunnerResultInternal({ ...input,
+      checkPlanningAdmissionTermination: undefined, checkImplementationAdmissionTermination: undefined }, trusted);
+    // A lost ACK retries accounting, while persisted completion skips lifecycle effects.
+    if (result.status < 300) markCallbackLifecycleCompleted(dispatchId);
+    return result;
+  });
+}
+
 async function handleRunnerResultInternal(
   input: HandleRunnerResultInput,
+  trusted?: Extract<ReturnType<typeof verifyRunToken>, { ok: true }>,
 ): Promise<HandleRunnerResultOutput> {
   const bearerToken = parseBearerToken(input.authorization);
-  if (!bearerToken) return bad(401, "missing_bearer");
+  if (!bearerToken && !trusted) return bad(401, "missing_bearer");
 
   // Validate body shape BEFORE consuming the token. A malformed body would
   // otherwise burn a one-time-use token and lose any chance of retry from
@@ -930,7 +949,7 @@ async function handleRunnerResultInternal(
     // repository/prNumber/installationId/deadlineAt against the stored attempt
     // row, so a caller holding a genuine token still cannot smuggle a forged
     // scope through the marker.
-    const authenticated = verifyPreparedReviewFixToken(bearerToken, input.secret, "result");
+    const authenticated = verifyPreparedReviewFixToken(bearerToken!, input.secret, "result");
     if (!authenticated.ok || authenticated.claims.attemptId !== validated.value.attemptId) {
       const reason = authenticated.ok ? "reviewfix_wrong_attempt" : authenticated.reason;
       console.warn(
@@ -977,7 +996,7 @@ async function handleRunnerResultInternal(
   // consumed, and the report goes to the KgRefresh workflow, which absorbs a duplicate under
   // the dispatch id and refuses a conflicting body. A retried identical body is therefore safe.
   if (body.phase === "kg-refresh") {
-    const kgVerified = verifyRunToken(bearerToken, input.secret, "result", { consume: false });
+    const kgVerified = verifyRunToken(bearerToken!, input.secret, "result", { consume: false });
     if (!kgVerified.ok) {
       console.warn(
         `[runner-callback] result refused dispatch=${kgVerified.claims?.dispatchId ?? "unknown"} ` +
@@ -1024,7 +1043,7 @@ async function handleRunnerResultInternal(
   // Authenticate without consuming, then run every check that needs only the
   // claims and body, so a rejected request leaves the single-use token usable
   // for a corrected retry. The consume below stays atomic and decides races.
-  const preflight = verifyRunToken(bearerToken, input.secret, "result", { consume: false });
+  const preflight = trusted ?? verifyRunToken(bearerToken!, input.secret, "result", { consume: false });
   if (!preflight.ok) {
     console.warn(
       `[runner-callback] result refused dispatch=${preflight.claims?.dispatchId ?? "unknown"} ` +
@@ -1061,7 +1080,7 @@ async function handleRunnerResultInternal(
   // if a provider outage caused dropped comments.
   const owned = readAdmission(preflight.claims.dispatchId)?.lifecycleOwner.kind === "restate";
   // Review-only delivery retains its credential while discovery or a saved notice needs retry.
-  const verified = owned || body.reviewOnly === true ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
+  const verified = owned || body.reviewOnly === true ? preflight : verifyAndConsumeRunToken(bearerToken!, input.secret);
   if (!verified.ok) {
     console.warn(
       `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
@@ -1199,7 +1218,7 @@ async function handleRunnerResultInternal(
       warn("roll-up-review", err);
       if (!trackerWriteReserved || err instanceof RollupNoticeDeliveryError) return { status: 503, body: { error: "Roll-up review follow-up unavailable", warnings } };
     }
-    if (!owned) verifyAndConsumeRunToken(bearerToken, input.secret);
+    if (!owned) verifyAndConsumeRunToken(bearerToken!, input.secret);
     if (job) updateJobStatus(job.id, body.outcome === "success" ? "completed" : "failed", "rollup_review", undefined, { skipAdmissionRelease: true });
     await sendImplementationReport();
     return { status: 200, body: { acknowledged: true, warnings } };

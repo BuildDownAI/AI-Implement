@@ -18,10 +18,15 @@ import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import { recordUsage, type RecordedUsage } from "../agent-usage.js";
+import { recordUsage, toRecordedUsage, type RecordedUsage } from "../agent-usage.js";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
+import { getJobByDispatchId } from "../log.js";
+import { upsertStepRecord } from "../step-log.js";
+import type { Step, InvocationRecordV1 } from "../pipeline/types.js";
 import { acceptOwnedRunReport, type OwnedRunReportResult, readBoundedOwnedRun, readOwnedRunStatus } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
+import { registerRunnerDeploymentWithRetry, type RunnerDeploymentRegistrationOptions } from "./runner-registration.js";
+import { removeDeployment } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 
 /** How often the wait reads the run's status. */
@@ -69,6 +74,8 @@ export type ImplementationRunInput = z.infer<typeof implementationRunInputSchema
 export interface ImplementationLaunchResult {
   outcome: "accepted" | "rejected" | "unknown";
   jobId?: string;
+  /** Frozen launch-time mode; absent in historical dispatch journals. */
+  serve?: boolean;
 }
 
 export type ImplementationFinishOutcome = { kind: "run_ended" } | { kind: "deadline" } | { kind: "cancelled" };
@@ -101,10 +108,20 @@ export interface ImplementationRunDependencies {
   /** The run or machine id of a launch that already happened for this dispatch, or `null`.
    *  `dispatchedAt` is the journaled dispatch time (epoch ms): a run created before it is not this launch. */
   findExistingRun(input: ImplementationRunInput, dispatchedAt: number): Promise<string | null>;
+  /** Called only inside dispatch, so legacy replay adds no command. */
+  readLaunchServe?(input: ImplementationRunInput): boolean | undefined;
   readModelPrices?(): Promise<RunModelPrices | undefined>;
   launch(input: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult>;
   /** The status of the exact run or machine. Marks the row `running` on the first `started` read; the write must be idempotent. */
   readStatus(input: ImplementationRunInput, jobId: string): Promise<OwnedRunStatus>;
+  /** Local serve readers; the shared helper owns registration retries. */
+  runnerRegistration?(input: ImplementationRunInput, jobId: string): Pick<RunnerDeploymentRegistrationOptions, "readUri" | "readContainerState" | "register">;
+  recordRunnerResult?(input: ImplementationRunInput, body: import("../runner-callback.js").RunnerResultBody): void | Promise<void>;
+  recordRunnerDeployment?(input: ImplementationRunInput, deploymentId: string): void | Promise<void>;
+  /** Successful registration is started evidence, independent of container polling. */
+  markStarted?(input: ImplementationRunInput): void | Promise<void>;
+  /** Test seam; production uses removeDeployment. */
+  removeRunnerDeployment?: typeof removeDeployment;
   /** Stops the exact run or machine. */
   stop(input: ImplementationRunInput, jobId: string): Promise<boolean>;
   /** Finishes the job of this dispatch through the shared finalizer (`finishImplementationJob`). It reads the
@@ -120,6 +137,8 @@ export interface ImplementationRunDependencies {
   ensureOwner?(input: ImplementationRunInput): void;
   recordTerminationIntent?(input: ImplementationRunInput, outcome: ImplementationFinishOutcome): void;
   reconcile?(dispatchId: string): Promise<ImplementationRunResult>;
+  /** Shared callback lifecycle intake, without forwarding back to this workflow. */
+  acceptRunnerResult?(input: ImplementationRunInput, body: import("../runner-callback.js").RunnerResultBody): Promise<void>;
   /** Test seams: production leaves every one of these unset. */
   tickMs?: number;
   confirmTickMs?: number;
@@ -196,6 +215,9 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     }
     ctx.set("step", "dispatch");
 
+    let serve = false;
+    let runnerCall: restate.InvocationPromise<unknown> | undefined;
+    let deploymentId: string | undefined;
     let suspended = false;
     // Set when the `dispatch` step started and did not return `rejected`: a run may exist.
     let mayHaveLaunched = false;
@@ -221,6 +243,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         await ctx.run("cleanup", async () => {
           deps.ensureOwner?.(input);
           await deps.cleanup(input, id);
+          if (serve && deploymentId) await (deps.removeRunnerDeployment ?? removeDeployment)(deploymentId);
         }, { maxRetryAttempts: 3 });
         cleanupCompleted = true;
       }
@@ -279,8 +302,19 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         }
       }
       if (id !== null && !runEnded) {
-        const status = await readOwnedRunStatus(ctx, "read-escape-terminal", () => deps.readStatus(input, id));
-        runEnded = status === "ended";
+        if (serve && runnerCall) {
+          try {
+            await runnerCall;
+          } catch (err) {
+            // Either call result confirms termination. Suspension must still replay
+            // this await before cleanup can remove the runner deployment.
+            if (restate.internal.isSuspendedError(err)) throw err;
+          }
+          runEnded = true;
+        } else {
+          const status = await readOwnedRunStatus(ctx, "read-escape-terminal", () => deps.readStatus(input, id));
+          runEnded = status === "ended";
+        }
       }
       if (!runEnded) return;
       if (!rowCloseTried) {
@@ -309,13 +343,16 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           deps.ensureOwner?.(input);
           // Reconcile first: a retry after a committed-but-unacknowledged launch must adopt that run.
           const existing = await deps.findExistingRun(input, dispatchedAt);
-          if (existing !== null) return { outcome: "accepted", jobId: existing };
+          if (existing !== null) return { outcome: "accepted", jobId: existing, ...(deps.readLaunchServe?.(input) === true ? { serve: true } : {}) };
           const result = await deps.launch(input, modelPrices ?? undefined);
-          return result.jobId === undefined ? { outcome: result.outcome } : { outcome: result.outcome, jobId: result.jobId };
+          return { outcome: result.outcome, ...(result.jobId === undefined ? {} : { jobId: result.jobId }),
+            ...(result.serve === true || deps.readLaunchServe?.(input) === true ? { serve: true } : {}) };
         },
         { maxRetryAttempts: 3 },
       );
 
+      // Old dispatch results deliberately retain the polling/callback command sequence.
+      serve = input.backend === "local-docker" && launched.serve === true;
       if (launched.outcome === "rejected") {
         mayHaveLaunched = false;
         return await release("launch_rejected");
@@ -359,8 +396,27 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
        *  and does what the callback has not done yet. */
       async function endedPath(): Promise<ImplementationRunResult> {
         runEnded = true;
-        pendingReason = "finalized";
+        // Result intake is part of normal finalization. Retain recovery authority
+        // if it fails rather than letting escape rewrite the outcome as cancelled.
         rowCloseTried = true;
+        if (serve && runnerCall) {
+          let body: unknown;
+          try { body = await runnerCall; } catch (err) {
+            if (restate.internal.isSuspendedError(err)) throw err;
+          }
+          if (body && typeof body === "object" && "phase" in body) {
+            const result = body as import("../runner-callback.js").RunnerResultBody;
+            await ctx.run("record-runner-result", async () => {
+              await deps.recordRunnerResult?.(input, result);
+            }, { maxRetryAttempts: 3 });
+            await ctx.run("accept-runner-result", async () => {
+              if (!deps.acceptRunnerResult) throw new Error("runner result intake unavailable");
+              await deps.acceptRunnerResult(input, result);
+            }, { maxRetryAttempts: 3 });
+            await report(ctx, { usage: toRecordedUsage(result) });
+          }
+        }
+        pendingReason = "finalized";
         const finished = await ctx.run("finish-job", async () => {
           deps.ensureOwner?.(input);
           return (await deps.finishJob(dispatchId, { kind: "run_ended" })) ?? {};
@@ -374,6 +430,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
       async function deadlinePath(): Promise<ImplementationRunResult> {
         pendingReason = "deadline_exceeded";
         ctx.set("step", "stop");
+        if (serve && runnerCall) ctx.cancel(await runnerCall.invocationId);
         if (jobId !== null) {
           const id = jobId;
           try {
@@ -394,13 +451,13 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           const marginEnd = (await ctx.date.now()) + stopMarginMs;
           const stoppedRun = await awaitOwnedRun(ctx, {
             signals: [],
-            resultSignal: "report",
+            resultSignal: serve ? "runner-stop" : "report",
             totalDeadlineAt: marginEnd,
             tickMs: confirmTickMs,
             startedSeen: true,
-            readStatus,
+            ...(serve && runnerCall ? { callArm: runnerCall } : { readStatus }),
           });
-          runEnded = stoppedRun.kind === "status" && stoppedRun.status === "ended";
+          runEnded = stoppedRun.kind === "call_ended" || stoppedRun.kind === "call_failed" || (stoppedRun.kind === "status" && stoppedRun.status === "ended");
         }
         if (!runEnded) {
           if (jobId === null && deps.recordTerminationIntent) {
@@ -417,20 +474,54 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         return wrapUpAndRelease("deadline_exceeded");
       }
 
+      if (serve) {
+        // An ambiguous launch can become discoverable later. Adopt it without
+        // launching again, sharing the original bootstrap budget with registration.
+        while (jobId === null) {
+          const remaining = Math.min(bootstrapDeadlineAt, totalDeadlineAt) - await ctx.date.now();
+          if (remaining <= 0) return await deadlinePath();
+          await readStatus();
+          if (jobId === null) await ctx.sleep(Math.min(tickMs, remaining));
+        }
+        if (!deps.runnerRegistration) throw new restate.TerminalError("local runner registration requires readers");
+        const registered = await registerRunnerDeploymentWithRetry(ctx, {
+          ...deps.runnerRegistration(input, jobId),
+          bootstrapDeadlineAt: Math.min(bootstrapDeadlineAt, totalDeadlineAt),
+          sleepMs: tickMs,
+        });
+        if (!registered.ok) {
+          if (registered.reason === "exited") return await endedPath();
+          if (registered.reason === "bootstrap timeout") return await deadlinePath();
+          pendingReason = "launch_rejected";
+          await escape();
+          return runEnded && rowFinalized ? await wrapUpAndRelease("launch_rejected") : retain();
+        }
+        deploymentId = registered.deploymentId;
+        await ctx.run("record-runner-deployment", async () => { await deps.recordRunnerDeployment?.(input, registered.deploymentId); });
+        runnerCall = ctx.genericCall({
+          service: `Runner_${dispatchId}`, method: "run", parameter: { workflowKey: ctx.key },
+          inputSerde: restate.serde.json, outputSerde: restate.serde.json,
+        });
+        await ctx.run("runner-started", async () => { await deps.markStarted?.(input); });
+        startedSeen = true;
+      }
+
       for (;;) {
         ctx.set("step", "wait");
         // Once `report` is resolved it must leave `signals`: a resolved promise would win every call at once.
         const event = await awaitOwnedRun(ctx, {
           signals: reported ? [] : ["report"],
-          resultSignal: "report",
+          // A consumed report must not mask settlement of the retained runner call.
+          resultSignal: serve && reported ? "runner-ended" : "report",
           bootstrapDeadlineAt,
           totalDeadlineAt,
           tickMs,
           startedSeen,
-          readStatus,
+          ...(serve ? { callArm: runnerCall } : { readStatus }),
         });
 
         if (event.kind === "bootstrap_timeout" || event.kind === "total_timeout") return await deadlinePath();
+        if (event.kind === "call_ended" || event.kind === "call_failed") return await endedPath();
         if (event.kind === "status") {
           if (event.status === "started") {
             startedSeen = true;
@@ -455,12 +546,13 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         const confirmEnd = Math.min((await ctx.date.now()) + confirmWindowMs, totalDeadlineAt);
         const confirmed = await awaitOwnedRun(ctx, {
           signals: [],
-          resultSignal: "report",
+          resultSignal: serve ? "runner-ended" : "report",
           totalDeadlineAt: confirmEnd,
           tickMs: confirmTickMs,
           startedSeen: true,
-          readStatus,
+          ...(serve ? { callArm: runnerCall } : { readStatus }),
         });
+        if (confirmed.kind === "call_ended" || confirmed.kind === "call_failed") return await endedPath();
         if (confirmed.kind === "status" && confirmed.status === "ended") return await endedPath();
         // Any other event is the window ending (a peeked `report` at its deadline): back to `wait`.
       }
@@ -504,6 +596,24 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     return { ...result, fingerprint: ownedRunReportFingerprint(body ?? {}) };
   }
 
+  /**
+   * One finished model call, sent by the runner while the run is still live (AII-2035).
+   * A singleton list is not a whole list: only the final result may mark usage complete.
+   */
+  async function recordInvocation(ctx: WorkflowSharedContext, record: InvocationRecordV1): Promise<void> {
+    await ctx.run("record-invocation", () => {
+      recordUsage(ctx.key, { ...toRecordedUsage({ invocations: [record] }), listWhole: false });
+    });
+  }
+
+  async function step(ctx: WorkflowSharedContext, value: Step): Promise<void> {
+    await ctx.run("write-step", () => {
+      const job = getJobByDispatchId(ctx.key);
+      if (!job) throw new restate.TerminalError("job_not_found", { errorCode: 404 });
+      upsertStepRecord(job.id, value);
+    });
+  }
+
   async function status(ctx: WorkflowSharedContext): Promise<ImplementationRunStatusResult> {
     const [step, dispatchId, jobId] = await Promise.all([
       ctx.get<string>("step"),
@@ -524,6 +634,10 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         journalRetention: retentionMs,
         idempotencyRetention: retentionMs,
       }, report),
+      recordInvocation: restate.handlers.workflow.shared<void, InvocationRecordV1>({
+        journalRetention: retentionMs,
+      }, recordInvocation),
+      step: restate.handlers.workflow.shared<void, Step>({ journalRetention: retentionMs }, step),
       status: restate.handlers.workflow.shared(status),
     },
     options: {

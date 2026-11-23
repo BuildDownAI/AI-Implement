@@ -5511,7 +5511,9 @@ async function main(): Promise<void> {
   }).services;
   // The ImplementationRun workflow (AII-1557): registered; the poll submits first-time implementations for every project; comment gap-fill also submits this workflow.
   const implementationRunServices = createProductionImplementationRunServices({
+    submitLateExternalReview: lateExternalReviewSubmitHook,
     config,
+    restateIdentityKey: restateSidecar.identityKey,
     resolveProvider: (mapping, recoveryScopeKey) => recoveryScopeKey ? registry.forRecovery(mapping, recoveryScopeKey) : registry.forMapping(mapping),
     resolveRunnerImage: resolveDispatchRunnerImage,
     isGroupingParentDispatch,

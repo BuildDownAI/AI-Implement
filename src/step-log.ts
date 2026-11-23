@@ -37,6 +37,8 @@ export function initStepLogTable(): void {
 
 export function upsertStepRecord(jobId: number, step: Step): void {
   const db = getDb();
+  // Shared Restate handlers may deliver a start after completion; guard in the
+  // write itself so concurrent deliveries cannot erase terminal progress.
   db.prepare(`
     INSERT INTO step_log
       (job_id, step_id, step_type, status, started_at, ended_at, parent_step_id, inputs_json, outputs_json, logs_url)
@@ -47,6 +49,7 @@ export function upsertStepRecord(jobId: number, step: Step): void {
       ended_at       = excluded.ended_at,
       outputs_json   = excluded.outputs_json,
       logs_url       = excluded.logs_url
+    WHERE step_log.status = 'running' OR excluded.status <> 'running'
   `).run({
     jobId,
     stepId: step.id,

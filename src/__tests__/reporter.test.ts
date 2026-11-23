@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { HttpStepReporter, TokenStepReporter } from "../pipeline/reporter.js";
+import { HttpStepReporter, TokenStepReporter, RestateStepReporter } from "../pipeline/reporter.js";
 import type { Step } from "../pipeline/types.js";
 import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
 
@@ -134,5 +134,19 @@ describe("TokenStepReporter", () => {
 
     await expect(reporter.report(STEP)).resolves.toBeUndefined();
     expect(orchestrator.calls).toHaveLength(2);
+  });
+});
+
+describe("RestateStepReporter", () => {
+  it("queues exactly one redacted event per report without mutating the step", async () => {
+    const push = vi.fn();
+    const reporter = new RestateStepReporter(push);
+    const step = { ...STEP, inputs: { githubToken: "secret", value: "kept" } };
+    await reporter.report(step);
+    await reporter.report({ ...STEP, status: "passed" });
+    expect(push).toHaveBeenCalledTimes(2);
+    expect(push.mock.calls[0][0]).toEqual({ kind: "step", step: { ...step, inputs: { value: "kept" } } });
+    expect(push.mock.calls[1][0]).toEqual({ kind: "step", step: { ...STEP, status: "passed" } });
+    expect(step.inputs.githubToken).toBe("secret");
   });
 });
