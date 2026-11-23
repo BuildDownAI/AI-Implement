@@ -50,6 +50,8 @@ export interface ReviewerPromptInput {
   diff: string;
   /** Formatted findings from previous passes, for follow-up review context. */
   previousFindings: string;
+  /** JSON-encoded PR comments from trusted people, or undefined when none were read. */
+  humanComments?: string;
 }
 
 /**

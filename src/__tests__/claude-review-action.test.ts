@@ -7,7 +7,7 @@ import { extractReviewFindingsBlock } from "../pipeline/review-ledger.js";
 import { testDir } from "./helpers/test-dir.js";
 
 const action = parse(readFileSync(".github/actions/claude-review/action.yml", "utf8"));
-const steps = action.runs.steps as Array<{ name: string; id?: string; run?: string; with?: { claude_args?: string } }>;
+const steps = action.runs.steps as Array<{ name: string; id?: string; run?: string; with?: { claude_args?: string; prompt?: string } }>;
 
 function getStep(name: string) {
   const step = steps.find((candidate) => candidate.name === name);
@@ -99,6 +99,16 @@ describe("Claude review action", () => {
     expect(Object.keys(schema.properties).at(-1)).toBe("summary");
     expect(schema.required.at(-1)).toBe("summary");
     expect(schema.required).toEqual(expect.arrayContaining(["verdict", "findings", "summary"]));
+  });
+
+  it("tells Claude to suppress repeated minor findings but repeat blocking findings", () => {
+    const prompt = getStep("Run Claude review").with?.prompt?.replace(/\s+/g, " ");
+
+    expect(prompt).toContain("gh pr view --comments");
+    expect(prompt).toContain("Do not report a `minor` finding again");
+    expect(prompt).toContain("already reported it and it still applies");
+    expect(prompt).toContain("Report each `blocking` finding on every pass while it applies");
+    expect(prompt).not.toContain("unless the code changed");
   });
 
   it("renders an approving verdict into the human text and the machine block", () => {
