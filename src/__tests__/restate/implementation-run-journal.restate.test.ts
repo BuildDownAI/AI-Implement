@@ -103,8 +103,8 @@ for (const { backend, prefix, dispatchId } of CASES) {
     });
 
     it("matches the committed journal at the wait and the confirm pause points", async () => {
-      const env = envs.get("disableRetries");
-      if (!env) throw new Error("missing Restate variant disableRetries");
+      const env = envs.get("strict");
+      if (!env) throw new Error("missing Restate variant strict");
       const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "issue-journal", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend };
       const done = callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "run", input);
       done.catch(() => undefined);

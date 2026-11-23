@@ -38,6 +38,7 @@ import {
   createRunnerService,
   runnerServiceName,
 } from "../../runner-service.js";
+import type { GhSpawn } from "../../pipeline/review-ledger.js";
 import { runAutonomous } from "../../run-autonomous.js";
 import { encodeRunConfig } from "../../run-config.js";
 import { PipelineRunner } from "../../pipeline/runner.js";
@@ -626,18 +627,21 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
     const env = envs.get(label)!;
     const runId = randomUUID();
     const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "runner-no-result-"));
+    const ghSpawn = vi.fn<GhSpawn>(() => ({ stdout: "", stderr: "", exitCode: 1 }));
     const recording = fakeFetch({ "GET /runner/planning-context": noPlanningContext });
     for (const [name, value] of Object.entries({ GITHUB_OWNER: "acme", GITHUB_REPO: "app", GITHUB_TOKEN: "synthetic-token", GITHUB_DEFAULT_BRANCH: "main" })) vi.stubEnv(name, value);
     vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig({ version: 1,
       attemptId: runId, installationId: 12345, repository: "acme/app", prNumber: 42, deadlineAt: Date.now() + 60_000 })));
     try {
       const endpoint = await registerRunner(env, createRunnerService({ runId, runAutonomous: options => runAutonomous({ ...options,
-        workspaceDir, fetchImpl: recording.fetch, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        workspaceDir, ghSpawn, fetchImpl: recording.fetch, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
         pipeline: { id: "no-result", steps: [{ id: "feedback-loop", type: "custom", moduleId: "feedback-loop" }] },
         runner: new PipelineRunner().register("feedback-loop", { run: async () => makeFeedbackLoopOutputs({ approved: false }) }),
       }) }));
       endpoints.push(endpoint);
       expect(await callService(env.baseUrl(), runnerServiceName(runId), "run", { workflowKey: runId })).toBeNull();
+      expect(ghSpawn).toHaveBeenCalled();
+      expect(ghSpawn.mock.calls[0]?.[0].slice(0, 2)).toEqual(["api", "graphql"]);
       expect(recording.calls.some(call => call.path === "/runner/result")).toBe(false);
       const invocation = await waitForInvocation(env, runnerServiceName(runId));
       expect((await journalEntryNames(env.adminAPIBaseUrl(), String(invocation.id))).filter(name => /^ev-/.test(name))).toEqual(["ev-0"]);
@@ -1063,7 +1067,7 @@ describe("runner-service process entry (AII-2034)", () => {
   }, 60_000);
 
   it("exits with an error when AI_IMPLEMENT_RUNNER_ID or RESTATE_IDENTITY_KEY is missing", () => {
-    const publicKey = envs.get("alwaysReplay")!.identityKey()!;
+    const publicKey = envs.get("strict")!.identityKey()!;
     for (const env of [{ [RUNNER_IDENTITY_KEY_ENV]: publicKey }, { [RUNNER_ID_ENV]: randomUUID() }]) {
       const result = spawnSync(process.execPath, [entry], { env: childEnv(env), timeout: 15_000, stdio: "pipe" });
       expect(result.error).toBeUndefined();

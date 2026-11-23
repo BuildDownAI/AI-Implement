@@ -19,10 +19,10 @@ import { VARIANTS, callWorkflow, eventually, crashAfterFirstCall, startRetryEnab
 
 const SHA = "a".repeat(40);
 const OTHER_SHA = "b".repeat(40);
-const INTERVAL_MS = 50;
-const DEADLINE_MS = 1_500;
+const INTERVAL_MS = 25;
+const DEADLINE_MS = 1_000;
 // Allow journal/replay round trips on a busy CI worker before the second tick.
-const HEAD_GRACE_MS = 2_000;
+const HEAD_GRACE_MS = 1_200;
 
 interface Scenario {
   /** One tick per read; the last one repeats. */

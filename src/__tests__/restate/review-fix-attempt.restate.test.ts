@@ -294,7 +294,7 @@ describe("ReviewFixAttempt durable workflow", () => {
 
   it("usage storage failure propagates and a retry records usage once", async () => {
     const key = `usage-failure-${randomUUID()}`;
-    const env = envFor("disableRetries");
+    const env = envFor("strict");
     const url = env.baseUrl();
     // Observe durable promise state directly: the adapter's done is synthetic
     // and cannot prove that the result handler withheld the workflow wake.
@@ -476,7 +476,7 @@ describe("ReviewFixAttempt durable workflow", () => {
   }, 20_000);
 
   it("advertises independent seven-day workflow, journal and handler idempotency retention", async () => {
-    const env = envFor("alwaysReplay");
+    const env = envFor("strict");
     const fake = newFake("rejected");
     attempts.set(fake.prepared.attemptId, fake);
     const rejected = await callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,

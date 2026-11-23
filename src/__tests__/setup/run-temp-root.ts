@@ -3,7 +3,7 @@
 // Each test file then gets a directory of its own inside it, which the scrub points TMPDIR, TMP and TEMP at, so whatever a test or a process it starts writes under os.tmpdir() lands there.
 // A directory with anything left in it fails its test file, or the run when the file never ran its own check, and is kept for inspection.
 // Reference: docs/unit-tests.md § Isolation from the machine.
-import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { TestProject } from "vitest/node";
@@ -19,11 +19,42 @@ export function startFileTempRoot(runTempRoot: string, testFile: string): string
   return mkdtempSync(join(runTempRoot, `${basename(testFile)}-`));
 }
 
+// List leaf paths (including empty directories and links), with a separate budget per top entry.
+function describeLeftovers(root: string, entries: string[]): string {
+  return entries.sort().map(top => {
+    const paths: string[] = [];
+    function walk(relative: string): boolean {
+      if (paths.length === 20) return true;
+      const absolute = join(root, relative);
+      let children: string[] | undefined;
+      try {
+        if (lstatSync(absolute).isDirectory()) children = readdirSync(absolute).sort();
+      } catch {
+        paths.push(`${relative}: unreadable entry`);
+        return false;
+      }
+      if (children) {
+        if (children.length > 0) {
+          for (const child of children) {
+            if (walk(join(relative, child))) return true;
+          }
+          return false;
+        }
+      }
+      paths.push(relative);
+      return false;
+    }
+    const more = walk(top);
+    if (more) paths.push(`${top}: more paths exist`);
+    return paths.join(", ");
+  }).join(", ");
+}
+
 /** Removes a test file's temp directory when it is empty; otherwise throws, naming each entry, and keeps it. */
 export function endFileTempRoot(dir: string): void {
   const left = readdirSync(dir);
   if (left.length > 0) {
-    throw new Error(`Left in this test file's temp directory, which is kept at ${dir} for inspection: ${left.join(", ")}`);
+    throw new Error(`Left in this test file's temp directory, which is kept at ${dir} for inspection: ${describeLeftovers(dir, left)}`);
   }
   rmSync(dir, { recursive: true, force: true });
 }
@@ -37,15 +68,19 @@ export default function setupRunTempRoot(project: Pick<TestProject, "provide">):
     // Empty, it held nothing; anything else is a file that left something behind, named by its directory.
     for (const entry of readdirSync(root)) {
       const dir = join(root, entry);
-      if (statSync(dir).isDirectory() && readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true });
+      try {
+        if (lstatSync(dir).isDirectory() && readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Keep unreadable entries for the failing leftover check and its diagnostics below.
+      }
     }
     const left = readdirSync(root);
     if (left.length === 0) {
       rmSync(root, { recursive: true, force: true });
       return;
     }
-    console.error(`Left in the test run's temp directory, which is kept at ${root} for inspection: ${left.join(", ")}`);
-    // vitest only logs a throwing global teardown and still exits 0 (4.1.11), so the exit code is set directly.
+    // vitest only logs a throwing global teardown and still exits 0 (4.1.11), so set the exit code before formatting diagnostics.
     process.exitCode = 1;
+    console.error(`Left in the test run's temp directory, which is kept at ${root} for inspection: ${describeLeftovers(root, left)}`);
   };
 }

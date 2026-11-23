@@ -135,7 +135,7 @@ import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
 import { mintPreparedReviewFixToken, mintRunToken } from "../../runner-tokens.js";
 import { handleRunnerResult } from "../../runner-callback.js";
-import { VARIANTS, journalEntries, journalEntryNames, journalText, journaledRunResult, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+import { VARIANTS, journalEntries, journalEntryNames, journalText, journaledRunResult, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startRetryEnabled, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 const OWNER = "TestOrg";
 const REPO = "test-repo";
@@ -1246,7 +1246,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         runnerCallbackBaseUrl: "http://callback.test", runnerTokenSecret: TOKEN_SECRET,
       } as never;
       sim.timing = SLOW;
-      tokenEnvironments = await startVariants(createProductionPlanningRunServices({
+      const tokenServices = createProductionPlanningRunServices({
         config,
         resolveProvider: async () => provider as never,
         resolveRunnerImage: async () => undefined,
@@ -1289,7 +1289,12 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         }) as never,
         reportTerminalJob: async (job) => { await reportTerminalJob(outcomeConfig, outcomeRegistry, job, { ownerCall: true }); },
         sessionDeps: {} as never,
-      }).services);
+      }).services;
+      const [variants, retryEnv] = await Promise.all([
+        startVariants(tokenServices),
+        startRetryEnabled(tokenServices, { variant: "alwaysReplay", storage: "memory" }),
+      ]);
+      tokenEnvironments = new Map([...variants, ["retry", retryEnv]]);
     }, 60_000);
 
     afterAll(async () => { await stopAll(tokenEnvironments); });
@@ -1330,10 +1335,10 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       }, 60_000);
     });
 
-    // Depends on a retry (docs/restate-testing.md), so alwaysReplay only. disableRetries fails the invocation at once.
-    it("a launch that throws after the mint is retried, mints again, and the workflow does not end launch_rejected (alwaysReplay)", async () => {
+    // Depends on a retry (docs/restate-testing.md), so retry-enabled server only.
+    it("a launch that throws after the mint is retried, mints again, and the workflow does not end launch_rejected (retry-enabled)", async () => {
       throwAfterMint = true;
-      const w = await dispatch("alwaysReplay", "PLT-61", "github-actions", tokenEnvironments);
+      const w = await dispatch("retry", "PLT-61", "github-actions", tokenEnvironments);
       await waitForStep(w.read, "wait");
       expect(received).toHaveLength(2);
       expect(received[1].audiences.sort()).toEqual(["progress", "result"]);

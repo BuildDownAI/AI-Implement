@@ -38,7 +38,7 @@ const page = (nums: number[], endCursor: string | null): TrackerIssuePage => ({
   issues: nums.map(record), pageInfo: { hasNextPage: endCursor !== null, endCursor },
 });
 
-type Variant = "alwaysReplay" | "disableRetries" | "retry";
+type Variant = "strict" | "retry";
 
 export interface TrackerExportCase {
   name: string;
@@ -69,7 +69,7 @@ function expectStamped(p: TrackerIssuePage, entry: FakeProviderEntry, team: stri
 export const TRACKER_EXPORT_CASES: TrackerExportCase[] = [
   {
     name: "two pages then end",
-    variant: "alwaysReplay",
+    variant: "strict",
     scenario: () => ({ pages: [page([1, 2], "c1"), page([3], null)] }),
     async run(call, sc, entry, team) {
       const first = await call({ team, cursor: null });
@@ -87,7 +87,7 @@ export const TRACKER_EXPORT_CASES: TrackerExportCase[] = [
   },
   {
     name: "an empty page is a normal answer",
-    variant: "alwaysReplay",
+    variant: "strict",
     scenario: () => ({ pages: [page([], null)] }),
     async run(call, _sc, _entry, team) {
       expect(await call({ team, cursor: null })).toEqual({ issues: [], pageInfo: { hasNextPage: false, endCursor: null } });
@@ -106,7 +106,7 @@ export const TRACKER_EXPORT_CASES: TrackerExportCase[] = [
   },
   {
     name: "no credential is tracker-unavailable after one provider call",
-    variant: "disableRetries",
+    variant: "strict",
     scenario: () => ({ pages: [], noCredential: true }),
     async run(call, sc, _entry, team) {
       expect(await codeOf(call({ team, cursor: null }))).toBe("tracker-unavailable");
@@ -115,7 +115,7 @@ export const TRACKER_EXPORT_CASES: TrackerExportCase[] = [
   },
   {
     name: "always failing is tracker-failed",
-    variant: "disableRetries",
+    variant: "strict",
     scenario: () => ({ pages: [], alwaysFail: true }),
     async run(call, sc, _entry, team) {
       expect(await codeOf(call({ team, cursor: null }))).toBe("tracker-failed");
@@ -124,7 +124,7 @@ export const TRACKER_EXPORT_CASES: TrackerExportCase[] = [
   },
   {
     name: "an unknown team is tracker-unavailable with no provider call",
-    variant: "disableRetries",
+    variant: "strict",
     scenario: () => ({ pages: [] }),
     async run(call, sc) {
       expect(await codeOf(call({ team: "NOPE", cursor: null }))).toBe("tracker-unavailable");

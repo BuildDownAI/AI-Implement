@@ -13,7 +13,7 @@ import {
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   setObjectStates, VARIANTS, callService, journaledRunResult, journalEntries, journalText,
-  awaitSentInvocations, callObject, cancelInvocationIfLive, eventually, gate, queryInvocations, startVariants, stopAll,
+  awaitSentInvocations, callObject, cancelInvocationIfLive, eventually, gate, queryInvocations, startRetryEnabled, startVariants, stopAll,
 } from "./harness.js";
 import type { RestateEnvironment } from "./harness.js";
 import { KG_GRAPH_SOURCE_SETTING_KEY, setKgGraphSource, setStardogValues, type KgGraphSource } from "../../kg-graph-source.js";
@@ -76,8 +76,8 @@ function kgGraphSourceDeps(overrides: Partial<KgGraphSourceToolDeps> = {}): KgGr
     stardogQueryCodePresent: () => true,
     sidecarGraphPresent: () => fixture.sidecarPresent,
     effectiveSource: () => fixture.source,
-    testPauseMs: 0,
-    testMaxRetryDurationMs: 2_000,
+    testPauseMs: 50,
+    testMaxRetryDurationMs: 400,
     log: (from: KgGraphSource, to: KgGraphSource, ok: boolean) => fixture.logs.push(`[kg] graph source ${from} -> ${to}: ${ok ? "ok" : "failed"}`),
     ...overrides,
   };
@@ -134,6 +134,7 @@ function resultBody(result: ToolResult): Record<string, unknown> {
 
 describe("set_kg_graph_source (Restate)", () => {
   let environments: Map<string, RestateEnvironment>;
+  let retryEnv: RestateEnvironment;
   const originalSecret = process.env.RUNNER_TOKEN_SECRET;
 
   beforeAll(async () => {
@@ -142,7 +143,11 @@ describe("set_kg_graph_source (Restate)", () => {
     process.env.RUNNER_TOKEN_SECRET = "kg-graph-source-restate-test-key";
     bindRefreshDeps();
     bindFixture();
-    environments = await startVariants([orchestratorTools, createKgRepo({ workflowName: FAKE_REFRESH_NAME }), fakeKgRefresh]);
+    const services = [orchestratorTools, createKgRepo({ workflowName: FAKE_REFRESH_NAME }), fakeKgRefresh];
+    [environments, retryEnv] = await Promise.all([
+      startVariants(services),
+      startRetryEnabled(services, { variant: "alwaysReplay", storage: "memory" }),
+    ]);
   }, 60_000);
 
   beforeEach(() => {
@@ -151,7 +156,7 @@ describe("set_kg_graph_source (Restate)", () => {
   });
 
   afterEach(async () => {
-    for (const env of environments.values()) {
+    for (const env of [...environments.values(), retryEnv]) {
       await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", REPO_KEY, { inFlight: null, held: null }).catch(() => undefined);
     }
     bindRefreshDeps();
@@ -163,7 +168,7 @@ describe("set_kg_graph_source (Restate)", () => {
     setKgGraphSourceToolDeps(null);
     if (originalSecret === undefined) delete process.env.RUNNER_TOKEN_SECRET;
     else process.env.RUNNER_TOKEN_SECRET = originalSecret;
-    await stopAll(environments);
+    await Promise.all([stopAll(environments), retryEnv?.stop()]);
   });
 
   it.each(VARIANTS.map(([label]) => label))("refuses absent Stardog query code before values or effects and releases the lock (%s)", async (label) => {
@@ -197,8 +202,8 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.logs).toEqual(["[kg] graph source sidecar -> stardog_run: ok"]);
   });
 
-  it("a fake that fails twice, then passes, switches (alwaysReplay)", async () => {
-    const env = environments.get("alwaysReplay")!;
+  it("a fake that fails twice, then passes, switches (retry-enabled)", async () => {
+    const env = retryEnv;
     fixture = newFixture({ tries: ["fail", "fail", "pass"] });
     const result = await switchSource(env, "stardog_run");
     expect(result.isError).not.toBe(true);
@@ -208,8 +213,8 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.restarts).toBe(1);
   });
 
-  it("a switch suspended on a failing Stardog test keeps the lock until it ends (alwaysReplay)", async () => {
-    const env = environments.get("alwaysReplay")!;
+  it("a switch suspended on a failing Stardog test keeps the lock until it ends (retry-enabled)", async () => {
+    const env = retryEnv;
     const retry = gate("the Stardog test's second attempt");
     setKgGraphSourceToolDeps(kgGraphSourceDeps({
       countTriples: async () => {
