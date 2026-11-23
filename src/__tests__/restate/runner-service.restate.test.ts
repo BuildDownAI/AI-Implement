@@ -177,6 +177,31 @@ async function registerRunner(env: RestateEnvironment, services: DeploymentServi
   };
 }
 
+/** Observe ingress without awaiting it: restart may disconnect an otherwise durable call. */
+function observeRunnerCall<T>(call: Promise<T>) {
+  let outcome = "pending";
+  const pending = call.then(
+    (value) => {
+      outcome = `fulfilled: ${JSON.stringify(value)}`;
+      return value;
+    },
+    (error: unknown) => {
+      outcome = `rejected: ${error instanceof Error ? error.stack ?? error.message : String(error)}`;
+      return error;
+    },
+  );
+  return {
+    pending,
+    async during<R>(wait: () => Promise<R>): Promise<R> {
+      try {
+        return await wait();
+      } catch (error) {
+        throw new Error(`${error instanceof Error ? error.message : String(error)}; runner call ${outcome}`, { cause: error });
+      }
+    },
+  };
+}
+
 function base64url(value: string | Buffer): string {
   return Buffer.from(value).toString("base64url");
 }
@@ -411,6 +436,20 @@ function implementationWorkflow(seams: Partial<ImplementationRunDependencies> = 
     ...seams,
   });
 }
+
+describe("runner call diagnostics", () => {
+  it.each([
+    { state: "pending", call: () => new Promise<never>(() => {}), expected: "pending" },
+    { state: "rejected", call: () => Promise.reject(new Error('Runner/run failed: 503 {"message":"unavailable"}')), expected: 'rejected: Error: Runner/run failed: 503 {"message":"unavailable"}' },
+    { state: "fulfilled", call: () => Promise.resolve(null), expected: "fulfilled: null" },
+  ])("preserves the first row wait failure with a $state call", async ({ call, expected }) => {
+    const observed = observeRunnerCall(call());
+    const failure = new Error("eventually timed out after 10000ms waiting for the first two invocation rows; last value: []");
+    const result = observed.during(async () => { throw failure; });
+    await expect(result).rejects.toThrow(`${failure.message}; runner call ${expected}`);
+    await expect(result).rejects.toHaveProperty("cause", failure);
+  });
+});
 
 describe("Runner_<runId> Restate service (AII-2034)", () => {
   it("scrubs nested queued payloads without changing source objects or formatting", async () => {
@@ -852,12 +891,12 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
     ]);
     endpoints.push(endpoint);
     // Restarting the server closes the ingress socket; the durable journal and the rows are what this proves.
-    const pending = callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(dispatchId), "run", { workflowKey: dispatchId }).catch((error: Error) => error);
-    await eventually(() => storedInvocations(dispatchId), (found) => found.length === 2, { label: "the first two invocation rows" });
+    const call = observeRunnerCall(callService<RunAutonomousResult>(env.baseUrl(), runnerServiceName(dispatchId), "run", { workflowKey: dispatchId }));
+    await call.during(() => eventually(() => storedInvocations(dispatchId), (found) => found.length === 2, { label: "the first two invocation rows" }));
     await env.startedRestateServer.restart();
     afterRestart.release();
     state.gate.release();
-    await pending;
+    await call.pending;
     const rows = await eventually(() => storedInvocations(dispatchId), (found) => found.length === 4, { label: "all four invocation rows" });
     expect(rows.map((row) => ({ invocationId: row.invocation_id, usage: JSON.parse(row.usage_json) }))).toEqual(
       [1, 2, 3, 4].map((index) => ({
