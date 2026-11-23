@@ -849,6 +849,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
       let id: string | null;
       try {
         id = owner.jobId ?? await deps.findExistingRun(owner.input, owner.createdAt);
+        // Serve containers do not stop by themselves, and no workflow owns them during recovery,
+        // so remove before reading status; see docs/restate.md § "Owner recovery".
         if (id !== null && owner.input.backend === "local-docker" && intent?.snapshot.serve) await cleanup(owner.input, id);
         if (id === null || await readStatus(owner.input, id) !== "ended") return { reason: "termination_unconfirmed" };
       } catch {
