@@ -254,3 +254,16 @@ it.each([
     cpu_kind: machineCpuKind, cpus: 4, memory_mb: 8192,
   });
 });
+
+it.each([false, true])("passes optional serve through the Fly gap-fill launch (%s)", async (enabled) => {
+  const serve = { identityKey: "publickeyv1_abc", runnerId: "run-42" };
+  await dispatchFlyGapfill(input(enabled ? { serve } : {}));
+  const config = mocks.create.mock.calls.at(-1)![2].config;
+  expect(config).not.toHaveProperty("services");
+  for (const [key, value] of Object.entries({
+    AI_IMPLEMENT_RUNNER_SERVE: "1", AI_IMPLEMENT_RUNNER_ID: serve.runnerId, RESTATE_IDENTITY_KEY: serve.identityKey,
+  })) {
+    if (enabled) expect(config.env).toHaveProperty(key, value);
+    else expect(config.env).not.toHaveProperty(key);
+  }
+});

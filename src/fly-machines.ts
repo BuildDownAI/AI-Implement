@@ -1,5 +1,6 @@
 import type { ImplementationSandbox } from "./implementation-launch.js";
 import crypto from "node:crypto";
+import type { LocalRunnerServeInput } from "./local-docker.js";
 
 import {
   MODEL_AUTH_BACKENDS,
@@ -87,6 +88,7 @@ export interface Machine {
   state: string;
   /** The current VM instance; an `update` answers with the new one (the replace target). */
   instance_id?: string;
+  private_ip?: string;
   region: string;
   created_at: string;
   updated_at: string;
@@ -168,6 +170,16 @@ export async function getMachine(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** The runner's private IPv6 endpoint, once Fly has assigned its address. */
+export async function getMachineRunnerAddress(
+  token: string,
+  appName: string,
+  machineId: string,
+): Promise<string | null> {
+  const machine = await getMachine(token, appName, machineId);
+  return machine.private_ip ? `http://[${machine.private_ip}]:9080` : null;
 }
 
 export async function listMachines(
@@ -689,6 +701,7 @@ function validateProtectedInput(input: SessionMachineInput, p: ProtectedModelBoo
 }
 
 export interface SessionMachineInput {
+  serve?: LocalRunnerServeInput;
   image: string;
   issueId: string;
   issueIdentifier: string;
@@ -804,6 +817,11 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
   if (input.extraEnv) {
     Object.assign(env, input.extraEnv);
+  }
+  if (input.serve) {
+    env.AI_IMPLEMENT_RUNNER_SERVE = "1";
+    env.AI_IMPLEMENT_RUNNER_ID = input.serve.runnerId;
+    env.RESTATE_IDENTITY_KEY = input.serve.identityKey;
   }
   if (protectedBootstrap) {
     env[MODEL_AUTH_ENV.dispatchId] = protectedBootstrap.sealed.dispatchId;

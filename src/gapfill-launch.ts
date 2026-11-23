@@ -1,3 +1,4 @@
+import type { LocalRunnerServeInput } from "./local-docker.js";
 import type { ImplementationSandbox } from "./implementation-launch.js";
 import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
 import type { RunCredentialsV1 } from "./run-config.js";
@@ -12,6 +13,7 @@ import { resolveSessionImage } from "./repo-image.js";
 import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
 
 export interface DispatchFlyGapfillInput {
+  serve?: LocalRunnerServeInput;
   implementationSandbox?: ImplementationSandbox;
   runName?: string;
   dispatchId?: string;
@@ -143,6 +145,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
   }
 
   const machineConfig = buildSessionMachineConfig({
+    ...(input.serve ? { serve: input.serve } : {}),
     implementationSandbox,
     machineName: input.runName,
     dispatchId: input.dispatchId ?? protectedLaunch?.dispatchId,
