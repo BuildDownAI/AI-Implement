@@ -18,9 +18,36 @@ on:
   pull_request:
 
 jobs:
-  unit-tests:
+  typecheck:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Run both tsconfig graphs concurrently and report errors from both.
+      - name: npm run typecheck (parallel)
+        run: |
+          npx tsc --noEmit &
+          p1=$!
+          npx tsc --noEmit -p tsconfig.tests.json &
+          p2=$!
+          s1=0
+          s2=0
+          wait "$p1" || s1=$?
+          wait "$p2" || s2=$?
+          exit $((s1 | s2))
+
+  unit-tests-shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,28 +61,81 @@ jobs:
       #
       # No unset step: the suite deletes ambient variables itself, the same way here as on any machine.
       # Its allowlist, with the reason for each entry, is src/__tests__/setup/ambient-env.ts.
-      - run: npm test
-      - run: npm run typecheck
+      - name: npm run test:db-isolation
+        if: matrix.shard == 1
+        run: npm run test:db-isolation
+      - name: vitest run shard ${{ matrix.shard }} of 3
+        run: npx vitest run --shard=${{ matrix.shard }}/3
+
+  # Rollup check preserving the exact required "unit-tests" check context for the testing branch ruleset.
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [typecheck, unit-tests-shard]
+    if: always()
+    steps:
+      - name: Verify typecheck and all unit-test shards passed
+        run: |
+          echo "typecheck: ${{ needs.typecheck.result }}"
+          echo "unit-tests-shard: ${{ needs.unit-tests-shard.result }}"
+          if [ "${{ needs.typecheck.result }}" != "success" ] || [ "${{ needs.unit-tests-shard.result }}" != "success" ]; then
+            exit 1
+          fi
+
+  # Determines whether the Restate suite needs the 3-pass flake detector (AII-993) or a
+  # single pass. PRs touching Restate runtime/tests, shared test harnesses, dependencies,
+  # or this workflow run all 3 passes; unrelated PRs still run the full suite once (2 shards).
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      restate_passes: ${{ steps.detect.outputs.restate_passes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: detect
+        name: Decide Restate pass count
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            echo "restate_passes=[1,2,3]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"; then
+            echo "restate_passes=[1,2,3]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Changed files:"
+          echo "$changed"
+          if echo "$changed" | grep -Eq '^(src/restate/|src/__tests__/restate/|src/__tests__/setup/|src/__tests__/helpers/test-(db|dir)\.ts|vitest\.restate\.config\.ts|package(-lock)?\.json|\.github/workflows/unit-tests\.yml)'; then
+            echo "Restate-related changes detected — running 3 flake-detector passes."
+            echo "restate_passes=[1,2,3]" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Restate-related changes detected — running 1 pass."
+            echo "restate_passes=[1]" >> "$GITHUB_OUTPUT"
+          fi
 
   # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts on the
   # `restate-server` binary from node_modules — the runtime the orchestrator sidecar
   # and a dispatched runner use (AII-1195); no Docker. No `on:` block here on
   # purpose — a job inherits the workflow's triggers only by staying in this file,
-  # which is what gets it onto ai-implement/feature/** PRs (AII-467 pattern). No
-  # `needs:` either: it runs in parallel with `unit-tests`. The suite runs three times
-  # (AII-993 flake detector: a scenario that fails one run in three must fail
-  # the PR that adds it), and each pass is split into two shards (vitest `--shard`,
-  # which divides the files by a hash of their paths), so six jobs run side by side
-  # and the wall time is that of the slower shard, not of the whole suite.
+  # which is what gets it onto ai-implement/feature/** PRs (AII-467 pattern).
+  # Each pass is split into two shards (vitest `--shard`, which divides the files by
+  # a hash of their paths), so shards run side by side and the wall time is that of
+  # the slower shard, not of the whole suite.
   # fail-fast is off so the evidence of which passes failed survives.
   # Checks: `restate-tests-binary (<pass>, <shard>)`, for example `restate-tests-binary (1, 2)`.
   restate-tests-binary:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: [changes]
     strategy:
       fail-fast: false
       matrix:
-        pass: [1, 2, 3]
+        pass: ${{ fromJson(needs.changes.outputs.restate_passes) }}
         shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
@@ -64,5 +144,5 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: npm run test:restate pass ${{ matrix.pass }} of 3, shard ${{ matrix.shard }} of 2
+      - name: npm run test:restate pass ${{ matrix.pass }}, shard ${{ matrix.shard }} of 2
         run: npm run test:restate -- --shard=${{ matrix.shard }}/2

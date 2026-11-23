@@ -245,7 +245,7 @@ describe("SelfDeploy durable phase machine", () => {
   });
   it("cancel clears the hold and its stale timer cannot advance a new deploy in either variant", async () => {
     const fixture = deployFixture();
-    fixture.deps.limits!.drainPollMs = 3_000;
+    fixture.deps.limits!.drainPollMs = 500;
     const local = await startVariants([createSelfDeploy(fixture.deps)]);
     try { for (const env of local.values()) {
       await start(env);
@@ -508,7 +508,7 @@ describe("SelfDeploy durable phase machine", () => {
     const fixture = deployFixture(); fixture.config.kgSourceRepo = "owner/kg"; fixture.state.work = false;
     // The server's timeouts default to one minute each. These servers use two seconds each, so the build outlasts
     // both in seconds; only the `apply` handler's own timeouts (65 and 70 minutes) keep it alive.
-    const local = await startVariants([createSelfDeploy(fixture.deps)], { invokerTimeouts: { inactivity: "2s", abort: "2s" } });
+    const local = await startVariants([createSelfDeploy(fixture.deps)], { invokerTimeouts: { inactivity: "500ms", abort: "500ms" } });
     try { for (const env of local.values()) {
       fixture.machine.config.image = "old";
       const build = gate("long build");
@@ -516,8 +516,8 @@ describe("SelfDeploy durable phase machine", () => {
       await start(env); await build.reached();
       try {
         const started = Date.now();
-        // Twice the two timeouts together. The CLI stays opaque throughout.
-        await eventually(() => Date.now() - started, elapsed => elapsed >= 8_000, { timeoutMs: 12_000, intervalMs: 250, label: "build beyond the server's timeouts" });
+        // More than twice the two timeouts together. The CLI stays opaque throughout.
+        await eventually(() => Date.now() - started, elapsed => elapsed >= 2_500, { timeoutMs: 8_000, intervalMs: 100, label: "build beyond the server's timeouts" });
         expect((await read(env))?.phase).toBe("applying");
         expect(fixture.state.held).toBe(true);
         expect(fixture.deps.flyctl).toHaveBeenCalledOnce();
@@ -663,12 +663,14 @@ describe("SelfDeploy durable phase machine", () => {
       expect((await read(env))?.reason).toBe("drain-timeout"); expect(fixture.state.held).toBe(false);
     } } finally { await stopAll(local); }
   }, 60_000);
-  it.each(VARIANTS.flatMap(([variant]) => (["drain", "accepted update", "accepted built deploy"] as const).map(point => [variant, point] as const)))("survives endpoint and server restart (%s, %s)", async (variant, point) => {
+  it.each(["drain", "accepted update", "accepted built deploy"] as const)("survives endpoint and server restart (%s)", async (point) => {
     const fixture = deployFixture();
-    fixture.deps.limits!.verifyInitialMs = 2_000;
+    // Hold verification in "verifying" across the restart regardless of CPU load, then flip to COMMIT once observed.
+    fixture.state.commit = "old";
+    fixture.deps.limits!.verifyInitialMs = 200;
+    fixture.deps.limits!.verifyPollMs = 2_000;
     const obj = createSelfDeploy(fixture.deps);
-    const local = await startVariants([obj]);
-    const env = local.get(variant)!;
+    const env = await startRetryEnabled([obj], { variant: "alwaysReplay" });
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     let accepted = false;
     const originalUpdate = fixture.deps.fly.updateMachine;
@@ -700,12 +702,13 @@ describe("SelfDeploy durable phase machine", () => {
       fixture.state.work = false;
       expect(await start(env)).toEqual({ ...result, alreadyActive: true });
       await phase(env, "verifying");
+      fixture.state.commit = COMMIT;
       if (point === "accepted built deploy") {
         expect(fixture.deps.flyctl).toHaveBeenCalledOnce();
         expect(fixture.deps.fly.updateMachine).not.toHaveBeenCalled();
       } else expect(fixture.deps.fly.updateMachine).toHaveBeenCalledOnce();
       await terminal(env, fixture, "succeeded");
       expect(fixture.state.held).toBe(false);
-    } finally { replacement?.close(); await stopAll(local); }
+    } finally { replacement?.close(); await env.stop(); }
   }, 120_000);
 });

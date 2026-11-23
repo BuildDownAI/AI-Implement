@@ -146,7 +146,7 @@ let unrouted: FakeFetch;
 
 beforeEach(async () => {
   ({ dedup, log, reconciliation, links, webhook, reviewStore, reviewFixQueue, commentGapfillQueue } =
-    (await testDb({ modules: loaders })).modules);
+    (await testDb({ modules: loaders, mode: "memory" })).modules);
 
   // Reset hoisted mocks to safe defaults for each test
   hoisted.getMappings.mockReturnValue({});

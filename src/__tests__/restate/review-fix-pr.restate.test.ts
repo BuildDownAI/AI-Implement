@@ -48,7 +48,7 @@ describe("ReviewFixPR durable coordination", () => {
   function makePR(): PRState {
     const scope = { installationId: 7, repository: "BuildDownAI/AI-Implement", prNumber: nextPr++ };
     const state: PRState = { scope, pending: [], active: null, closed: false, prepared: [], admissionCalls: 0,
-      launches: 0, windowMs: REVIEW_FIX_COLLECTION_WINDOW_MS, fixer: "ai-implement", delegated: 0 };
+      launches: 0, windowMs: 250, fixer: "ai-implement", delegated: 0 };
     prs.set(reviewFixPRKey(scope), state);
     return state;
   }
@@ -223,18 +223,19 @@ describe("ReviewFixPR durable coordination", () => {
   }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("one fixed feedback window and one active attempt (%s)", async (label) => {
+    expect(REVIEW_FIX_COLLECTION_WINDOW_MS).toBe(5_000);
     const env = envFor(label);
     const pr = makePR();
-    pr.windowMs = 2_000;
+    pr.windowMs = 1_200;
     const started = Date.now();
     await feedback(env, pr, 1);
-    await settle(400);
+    await settle(250);
     pr.windowMs = 4_000; // a changed setting cannot extend the scheduled window
     await feedback(env, pr, 2);
-    await settle(700);
+    await settle(300);
     expect(pr.launches).toBe(0);
     await eventually(() => pr.launches === 1, Boolean, { timeoutMs: 5_000, label: "pr.launches === 1" });
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(2_500);
     expect(pr.prepared[0].findings).toHaveLength(3);
     expect(pr.admissionCalls).toBe(1);
     await finish(env, pr, 0);

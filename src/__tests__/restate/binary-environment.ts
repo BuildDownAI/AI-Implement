@@ -16,8 +16,6 @@ import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } from "@restatedev/restate-sdk";
 import { stopChildWithBackstop } from "../../process-stop.js";
 import {
-  RESTATE_DEFAULT_NUM_PARTITIONS,
-  RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
   ensureRequestIdentityKey,
   resolvePlatformBinary,
 } from "../../restate/server.js";
@@ -26,11 +24,13 @@ type RestateServices = Array<
   ServiceDefinition<string, unknown> | VirtualObjectDefinition<string, unknown> | WorkflowDefinition<string, unknown>
 >;
 
+export type BinaryEnvironmentVariant = "strict" | "alwaysReplay" | "disableRetries";
+
 export interface BinaryEnvironmentOptions {
   services: RestateServices;
-  variant?: "alwaysReplay" | "disableRetries";
+  variant?: BinaryEnvironmentVariant;
   /** Accepted for call-site clarity; the binary always keeps its state on disk. */
-  storage?: "disk";
+  storage?: "disk" | "memory";
   /** Sign the server's calls with a fresh request identity key and have the endpoint verify it (AII-976). */
   requestIdentity?: boolean;
   /**
@@ -70,8 +70,15 @@ export class RestateBinaryNotFoundError extends Error {
 }
 
 const READY_TIMEOUT_MS = 60_000;
-const POLL_INTERVAL_MS = 200;
+const POLL_INTERVAL_MS = 25;
 const STOP_TIMEOUT_MS = 10_000;
+// Test environments only serve single-process loopback scenarios; 1 partition cuts startup latency,
+// RocksDB memory/file churn, and multi-worker contention compared to production's 4 partitions.
+const TEST_NUM_PARTITIONS = "1";
+const TEST_ROCKSDB_TOTAL_MEMORY_SIZE = "64 MB";
+// Short graceful-shutdown window so SIGTERM restarts don't stall waiting for idle/parked HTTP/2
+// streams to drain before flushing RocksDB and exiting.
+const TEST_SHUTDOWN_TIMEOUT = "100ms";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -142,8 +149,9 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     // TCP only: the default unix sockets live under <base dir>/<node name>/ and macOS's long
     // os.tmpdir() overflows SUN_LEN (104), so the server would fail to bind at startup.
     RESTATE_LISTEN_MODE: "tcp",
-    RESTATE_DEFAULT_NUM_PARTITIONS,
-    RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
+    RESTATE_DEFAULT_NUM_PARTITIONS: TEST_NUM_PARTITIONS,
+    RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: TEST_ROCKSDB_TOTAL_MEMORY_SIZE,
+    RESTATE_SHUTDOWN_TIMEOUT: TEST_SHUTDOWN_TIMEOUT,
     // Unset, the invoker creates one spill directory per partition under TMPDIR at start and never removes them.
     RESTATE_WORKER__INVOKER__TMP_DIR: path.join(root, "invoker"),
   });
@@ -158,7 +166,11 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     childEnv.RESTATE_WORKER__INVOKER__ABORT_TIMEOUT = options.invokerTimeouts.abort;
   }
   // Same values the variant hooks set on a server.
-  if (options.variant === "alwaysReplay") {
+  if (options.variant === "strict") {
+    if (!options.invokerTimeouts) childEnv.RESTATE_WORKER__INVOKER__INACTIVITY_TIMEOUT = "0s";
+    childEnv.RESTATE_DEFAULT_RETRY_POLICY__MAX_ATTEMPTS = "1";
+    childEnv.RESTATE_DEFAULT_RETRY_POLICY__ON_MAX_ATTEMPTS = "kill";
+  } else if (options.variant === "alwaysReplay") {
     childEnv.RESTATE_WORKER__INVOKER__INACTIVITY_TIMEOUT = "0s";
   } else if (options.variant === "disableRetries") {
     childEnv.RESTATE_DEFAULT_RETRY_POLICY__MAX_ATTEMPTS = "1";
@@ -284,6 +296,7 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     startedRestateServer: {
       restart: async () => {
         if (child) await stopChildWithBackstop(child, STOP_TIMEOUT_MS);
+        for (const session of sessions) session.destroy();
         await spawnChild();
         await waitForIngress();
       },
