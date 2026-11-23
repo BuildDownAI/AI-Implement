@@ -114,7 +114,7 @@ export interface ImplementationRunDependencies {
   launch(input: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult>;
   /** The status of the exact run or machine. Marks the row `running` on the first `started` read; the write must be idempotent. */
   readStatus(input: ImplementationRunInput, jobId: string): Promise<OwnedRunStatus>;
-  /** Local serve readers; the shared helper owns registration retries. */
+  /** Serve readers; the shared helper owns registration retries. */
   runnerRegistration?(input: ImplementationRunInput, jobId: string): Pick<RunnerDeploymentRegistrationOptions, "readUri" | "readContainerState" | "register">;
   recordRunnerResult?(input: ImplementationRunInput, body: import("../runner-callback.js").RunnerResultBody): void | Promise<void>;
   recordRunnerDeployment?(input: ImplementationRunInput, deploymentId: string): void | Promise<void>;
@@ -352,7 +352,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
       );
 
       // Old dispatch results deliberately retain the polling/callback command sequence.
-      serve = input.backend === "local-docker" && launched.serve === true;
+      serve = launched.serve === true;
       if (launched.outcome === "rejected") {
         mayHaveLaunched = false;
         return await release("launch_rejected");
@@ -483,7 +483,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           await readStatus();
           if (jobId === null) await ctx.sleep(Math.min(tickMs, remaining));
         }
-        if (!deps.runnerRegistration) throw new restate.TerminalError("local runner registration requires readers");
+        if (!deps.runnerRegistration) throw new restate.TerminalError("runner registration requires readers");
         const registered = await registerRunnerDeploymentWithRetry(ctx, {
           ...deps.runnerRegistration(input, jobId),
           bootstrapDeadlineAt: Math.min(bootstrapDeadlineAt, totalDeadlineAt),
