@@ -535,6 +535,15 @@ auto-merge), the cascade self-heals without operator intervention:
    orchestrator logs and fires a standard notification, then leaves the PR for a human to
    resolve. No labels are changed.
 
+The repair merges `origin/<feature>` into the PR branch and finishes with
+`if git rev-parse -q --verify MERGE_HEAD >/dev/null; then git commit --no-edit; fi`: git
+leaves `MERGE_HEAD` only when the merge stopped on a conflict, and a clean merge already
+committed itself, so the guard exits 0 either way.
+
+The review diff of a conflict repair starts at the run-start commit, so it holds the
+changes from the merged branch and the resolution. A PR line that the resolution dropped
+shows as a removed line.
+
 ### Dispatch guard (declared-file overlap)
 
 Before dispatching a same-feature-node sibling (another leaf or child issue targeting the

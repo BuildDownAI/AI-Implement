@@ -227,6 +227,24 @@ incomplete verdicts keep the existing wait pending until its time limit. This in
 fails closed for sticky comments created before the current review; inline threads
 retain their separate head-commit filtering.
 
+## Repeated findings on later passes
+
+Claude reads the PR's earlier review comments with `gh pr view --comments` before
+the current review. If an earlier review comment already reported a `minor`
+finding on this PR and it still applies, Claude does not report it again. Every
+`blocking` finding is still reported on every pass while it applies, because the
+merge gate needs it. This policy does not change the schema or either severity
+value; it only changes which already-reported findings the prompt asks Claude to
+repeat.
+
+The rule is not conditioned on intervening code changes. Claude sees only the
+full PR diff, and earlier review comments do not record the head they reviewed,
+so it cannot tell which code changed after an earlier review.
+
+`.github/workflows/claude-review.yml` loads this composite action from the
+default branch, `main`. The rule therefore reaches PRs only after `testing` is
+promoted to `main`.
+
 ## When the in-run step reads the outside verdict
 
 The `post-push-review` step starts its outside-review wait after the internal
