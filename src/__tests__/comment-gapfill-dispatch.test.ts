@@ -35,7 +35,7 @@ const submit = vi.fn<ImplementationRunIngressClient["submit"]>();
 let acquireSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(async () => {
-  ({ queue, log, breaker, drain, admission, config, gapfill } = (await testDb({ modules })).modules);
+  ({ queue, log, breaker, drain, admission, config, gapfill } = (await testDb({ modules, mode: "memory" })).modules);
   submit.mockReset().mockResolvedValue({ status: "accepted" });
   acquireSpy = vi.spyOn(admission, "acquire");
   fakeFetch({ "GET /repos/acme/billing/pulls/42": openPrWithHead("ai-implement/aii-1554-caller-switch") }).install();

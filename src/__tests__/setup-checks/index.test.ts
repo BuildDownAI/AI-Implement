@@ -14,9 +14,16 @@ let dedup: typeof DedupModule;
 let checks: typeof SetupChecksModule;
 
 beforeEach(async () => {
-  ({ dedup, checks } = (await testDb({
-    modules: { dedup: () => import("../../dedup.js"), checks: () => import("../../setup-checks/index.js") },
-  })).modules);
+  const loaded = (await testDb({
+    mode: "memory",
+    modules: {
+      dedup: () => import("../../dedup.js"),
+      checks: () => import("../../setup-checks/index.js"),
+      githubAuth: () => import("../../github-app-auth.js"),
+    },
+  })).modules;
+  loaded.githubAuth.clearTokenCache();
+  ({ dedup, checks } = loaded);
 });
 
 function fakeCheck(overrides: Partial<SetupCheck> = {}): SetupCheck {

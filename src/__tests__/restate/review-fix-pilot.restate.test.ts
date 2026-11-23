@@ -93,13 +93,13 @@ import {
 // so a negative fractional value is the only way to get a deadline seconds, not
 // tens of minutes, away without editing the production constant.
 // ---------------------------------------------------------------------------
-const SHORT_DEADLINE_MS = 3_000;
+const SHORT_DEADLINE_MS = 2_500;
 const SHORT_DEADLINE_JOB_TIMEOUT_MINUTES = SHORT_DEADLINE_MS / 60_000 - REVIEW_FIX_DEADLINE_BUFFER_MINUTES;
 const LONG_DEADLINE_JOB_TIMEOUT_MINUTES = 90;
 
 // The deadline for the "GitHub success without a stored result" scenario. The attempt ends
 // at its first status read that sees the run ended (AII-1273), or at this deadline.
-const SUCCESS_NO_RESULT_DEADLINE_MS = 6_000;
+const SUCCESS_NO_RESULT_DEADLINE_MS = 1_500;
 const SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES = SUCCESS_NO_RESULT_DEADLINE_MS / 60_000 - REVIEW_FIX_DEADLINE_BUFFER_MINUTES;
 
 // The uncertain-launch alert threshold defaults to a real two minutes
@@ -108,10 +108,10 @@ const SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES = SUCCESS_NO_RESULT_DEADLINE_MS / 60
 // so the alert fires deterministically inside the short waits used below instead
 // of requiring a real two-minute test. Only one scenario (the uncertain-launch
 // one) ever leaves the reconcile-empty-search loop running long enough to matter.
-const SHORT_UNKNOWN_LAUNCH_ALERT_MS = 1_000;
+const SHORT_UNKNOWN_LAUNCH_ALERT_MS = 500;
 // Leave a partial final backoff so the completion bound detects an uncapped sleep.
-const SHORT_UNKNOWN_LAUNCH_GRACE_MS = 6_500;
-const SHORT_POST_DEADLINE_RECONCILE_MS = 5_000;
+const SHORT_UNKNOWN_LAUNCH_GRACE_MS = 3_000;
+const SHORT_POST_DEADLINE_RECONCILE_MS = 2_000;
 
 function sha(seed: string): string {
   return createHash("sha256").update(seed).digest("hex").slice(0, 40);
@@ -515,14 +515,18 @@ const attemptWorkflow = createReviewFixAttempt({
 // ---------------------------------------------------------------------------
 describe("Restate review-fix pilot: production-composition fault matrix", () => {
   let environments: Map<string, RestateEnvironment>;
+  let retryEnv: RestateEnvironment;
   beforeAll(async () => {
     getDb();
     initMappingsTable();
     initDispatchBreakerTable();
     initLogTable();
-    environments = await startVariants([pr, attemptWorkflow]);
+    [environments, retryEnv] = await Promise.all([
+      startVariants([pr, attemptWorkflow]),
+      startRetryEnabled([pr, attemptWorkflow], { variant: "alwaysReplay", storage: "memory" }),
+    ]);
   }, 60_000);
-  afterAll(async () => { if (environments) await stopAll(environments); });
+  afterAll(async () => { await Promise.all([stopAll(environments), retryEnv?.stop()]); });
 
   it.each([
     ["default", "fly-machines", {}, false, "admit"],
@@ -981,8 +985,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   // catch in review-fix-pr.ts, so recovery depends on the engine retrying the
   // step. disableRetries would fail the whole invocation instead of retrying it.
   // -------------------------------------------------------------------------
-  it("admission commit before journal: an engine retry of a crashed admit converges on one reservation (alwaysReplay)", async () => {
-    const env = envFor("alwaysReplay");
+  it("admission commit before journal: an engine retry of a crashed admit converges on one reservation (retry-enabled)", async () => {
+    const env = retryEnv;
     const fixture = freshScenario("admit-crash");
     fixture.admitOverride = crashAfterFirstCall((request: ReviewFixAdmissionRequest) => sqliteStore.admit(request));
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
@@ -1107,7 +1111,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const finalSleep = postDeadline.at(-1)!;
     expect(finalSleep.wakeAt).toBeGreaterThanOrEqual(graceBoundary);
     expect(finalSleep.wakeAt).toBeLessThan(graceBoundary + 2_000);
-    expect(finalSleep.remaining).toBeLessThan(SHORT_POST_DEADLINE_RECONCILE_MS - 2_000);
+    expect(finalSleep.remaining).toBeLessThan(SHORT_POST_DEADLINE_RECONCILE_MS - 500);
     // Keep the external lookup evidence too: waits actually space the searches
     // out, and neither phase degenerates into a busy loop.
     const preLookups = fixture.lookupTimes.filter((time) => time < prepared.deadlineAt);
@@ -1396,8 +1400,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   // Crash window #4 (result commit before ACK) — alwaysReplay only, same
   // reasoning as window #2: recordResult's ctx.run has no internal catch.
   // -------------------------------------------------------------------------
-  it("result commit before ACK: an engine retry of a crashed result intake converges on one stored result (alwaysReplay)", async () => {
-    const env = envFor("alwaysReplay");
+  it("result commit before ACK: an engine retry of a crashed result intake converges on one stored result (retry-enabled)", async () => {
+    const env = retryEnv;
     const fixture = freshScenario("result-crash");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
@@ -1413,13 +1417,13 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   }, 25_000);
 
   // -------------------------------------------------------------------------
-  // Crash window #5 (final effect before acknowledgement) — alwaysReplay only:
+  // Crash window #5 (final effect before acknowledgement) — retry-enabled:
   // the GitHub write inside ctx.run("apply-approval-once") lands, then the step
   // crashes. The engine retries the step, and the adapter's upsert makes the
   // repeat write a no-op (AII-1186).
   // -------------------------------------------------------------------------
-  it("a crash after the approval write is retried by the engine and leaves exactly one approval (alwaysReplay)", async () => {
-    const env = envFor("alwaysReplay");
+  it("a crash after the approval write is retried by the engine and leaves exactly one approval (retry-enabled)", async () => {
+    const env = retryEnv;
     const fixture = freshScenario("effect-crash");
     fixture.applyApprovalEffectOverride = crashAfterFirstCall(rawGithub.applyApprovalEffect.bind(rawGithub));
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
@@ -1436,7 +1440,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   // AII-1414: the push starts CI on the pushed head, so the merge policy is false at finalize; the late review
   // (which does the waiting) must still be submitted, and the approval comment must not be posted.
   it("a succeeded attempt whose checks are still running at finalize submits the late review once and posts no approval", async () => {
-    const env = envFor("alwaysReplay");
+    const env = envFor("strict");
     const fixture = freshScenario("checks-running");
     fixture.checks = [{ status: "in_progress", conclusion: null }];
     const jobId = appendLog({ issueId: "issue-checks-running", repo: fixture.scope.repository, dispatchId: "d-checks-running" });
@@ -1572,7 +1576,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   }, 25_000);
 
   it("authenticated activity intake preserves gaps, enforces both byte caps, and leaves cycle evidence independent", async () => {
-    const env = envFor("alwaysReplay");
+    const env = envFor("strict");
     const secret = "activity-fault-matrix-secret";
     const producerId = "runner-tools";
     const overhead = Buffer.byteLength(JSON.stringify({ payload: "", truncated: false }), "utf8");

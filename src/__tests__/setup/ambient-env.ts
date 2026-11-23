@@ -39,6 +39,8 @@ export const BASE_ENV_ALLOWLIST: EnvAllowlist = {
       "An operator switch, not machine state. " +
       "Set to 1, implementation-run-journal.restate.test.ts rewrites its journal snapshots instead of comparing against them. " +
       "Deleted, a regeneration run only compares.",
+    RESTATE_LOGGING:
+      "vitest.restate.config.ts sets it through test.env (defaulting to WARN) so the Restate SDK does not flood CI logs with INFO lines per invocation step.",
   },
   prefixes: {},
   pinned: {

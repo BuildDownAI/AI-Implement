@@ -98,6 +98,7 @@ beforeEach(async () => {
     reviewStore, reviewFixQueue, commentGapfillQueue, reviewFixEvidence,
     reviewFixAttemptStore,
   } = (await testDb({
+    mode: "memory",
     modules: {
       dedup: () => import("../dedup.js"),
       log: () => import("../log.js"),

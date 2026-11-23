@@ -216,9 +216,10 @@ beforeEach(async () => {
   fakeFetch({}).install();
   // Armed per test by the KG-manifest tests; reset so one test's answers never reach the next.
   for (const mock of [getScopedInstallationTokenMock, getRepoDefaultBranchMock, fetchRepoTarballMock, extractSourceMock]) mock.mockReset();
-  db = await testDb({ modules: loaders });
+  db = await testDb({ modules: loaders, mode: "memory" });
   modules = db.modules;
   ({ admin, config, dedup, log, queue, adminSession, accessEntries, accessAudit, accessGrants } = modules);
+  modules.orchestratorSettings.resetRunnerBackendCache();
   provider = new FakeProvider();
   // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
   // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.

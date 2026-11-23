@@ -13,6 +13,9 @@ export interface DatabasePath {
 
 function resolveDbPath(): DatabasePath {
   const configured = process.env.DEDUP_DB_PATH || "/data/dedup.sqlite";
+  if (configured === ":memory:") {
+    return { path: configured, configured, fellBack: false };
+  }
   try {
     mkdirSync(dirname(configured), { recursive: true });
     return { path: configured, configured, fellBack: false };
@@ -42,6 +45,21 @@ let readOnly = false;
 export function useReadOnlyDb(): void {
   if (db) throw new Error("useReadOnlyDb() must run before the database is opened");
   readOnly = true;
+}
+
+/**
+ * Replaces the active SQLite handle for tests without resetting the ESM module registry.
+ * Passing `null` clears the handle so the next `getDb()` opens `nextPath` (or re-resolves
+ * `DEDUP_DB_PATH` when `nextPath` is omitted) and runs schema initialization.
+ */
+export function setTestDb(nextDb: Database.Database | null, nextPath?: string): void {
+  if (db) {
+    db.close();
+    db = null;
+  }
+  readOnly = false;
+  resolvedPath = nextPath !== undefined ? { path: nextPath, configured: nextPath, fellBack: false } : null;
+  db = nextDb;
 }
 
 function ensureDispatchedColumns(): void {
@@ -405,8 +423,11 @@ export function getDb(): Database.Database {
     }
   }
   if (!db) {
-    db = new Database(dbPath().path);
-    db.pragma("journal_mode = WAL");
+    const targetPath = dbPath().path;
+    db = new Database(targetPath);
+    if (targetPath !== ":memory:") {
+      db.pragma("journal_mode = WAL");
+    }
     db.exec(`
       CREATE TABLE IF NOT EXISTS dispatched (
         issue_id TEXT PRIMARY KEY,

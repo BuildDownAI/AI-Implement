@@ -16,6 +16,7 @@ import { scrubOperatorLegacyTokens } from "../../restate/operator-legacy-scrub.j
 import { operatorObject, RestateRefreshAuthority } from "../../restate/operator-object.js";
 import { getEffectiveAllowlist, matchAccessEntryOrOrgClaim } from "../../access-entries.js";
 import { VARIANTS, callObject, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { startBinaryEnvironment } from "./binary-environment.js";
 
 // Mocked so RestateRefreshAuthority.rotate's allowlist re-check and auth-event emission
 // don't need the access_entries/mcp_auth_events tables in this container-only suite, which
@@ -292,38 +293,38 @@ describe("Operator object", () => {
       };
     }
 
-    const alwaysReplayEnv = environments.get("alwaysReplay");
-    const disableRetriesEnv = environments.get("disableRetries");
-    if (!alwaysReplayEnv || !disableRetriesEnv) throw new Error("both environments must be started");
+    const withReplayEnv = environments.get("strict");
+    if (!withReplayEnv) throw new Error('environment "strict" did not start');
+    const withoutReplayEnv = await startBinaryEnvironment({ services: [operatorObject], variant: "disableRetries" });
+    try {
+      const withReplay = await runSequence(withReplayEnv);
+      const withoutReplay = await runSequence(withoutReplayEnv);
 
-    const withReplay = await runSequence(alwaysReplayEnv);
-    const withoutReplay = await runSequence(disableRetriesEnv);
-
-    expect(withReplay).toEqual({
-      rotateStatus: "ok",
-      concurrentStatus: "ok",
-      concurrentEqualsRotation: true,
-      journalsHoldNoRawToken: true,
-    });
-    expect(withoutReplay).toEqual(withReplay);
+      expect(withReplay).toEqual({
+        rotateStatus: "ok",
+        concurrentStatus: "ok",
+        concurrentEqualsRotation: true,
+        journalsHoldNoRawToken: true,
+      });
+      expect(withoutReplay).toEqual(withReplay);
+    } finally {
+      await withoutReplayEnv.stop();
+    }
   });
 
   // AII-727: the coverage gap this closes is "describe during an in-flight exclusive
   // refresh" (docs/restate-testing.md) — only a real exclusive-handler queue can prove a
   // shared handler is genuinely non-blocking against a suspended exclusive one, not a fake.
-  // Run against disableRetries only: alwaysReplay forces the server to replay the handler's
-  // journal at every suspension point, which is an unrelated axis from the wall-clock
-  // assertion here and would only add timing noise to it.
   it(
     "describe (shared) answers while a refresh (exclusive) is suspended on ctx.sleep, on the same key (AII-727)",
     async () => {
-      const env = environments.get("disableRetries");
-      if (!env) throw new Error('environment "disableRetries" did not start');
+      const env = environments.get("strict");
+      if (!env) throw new Error('environment "strict" did not start');
       const key = randomUUID();
       const hash = sha256(randomUUID());
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash, email: "sleep-test@eudoxus.ai" }));
 
-      const sleepMs = 8_000;
+      const sleepMs = 2_000;
       const inFlight = callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", {
         presentedHash: hash, nextHash: nextOf(hash),
         sleepMs,
@@ -344,7 +345,7 @@ describe("Operator object", () => {
       expect(description.email).toBe("sleep-test@eudoxus.ai");
       // A bounded wait, not a timing race: describe must resolve well before the sleep's
       // own deadline, not merely before some arbitrary long test timeout.
-      expect(elapsed).toBeLessThan(sleepMs - 2_000);
+      expect(elapsed).toBeLessThan(sleepMs - 500);
 
       const refreshed = await inFlight;
       expect(refreshed.status).toBe("ok");
@@ -359,8 +360,8 @@ describe("Operator object", () => {
   it(
     "RestateRefreshAuthority.rotate: a deauthorized identity is denied and revoke is called exactly once against the real ingress; describe returns all-null afterward",
     async () => {
-      const env = environments.get("disableRetries");
-      if (!env) throw new Error('environment "disableRetries" did not start');
+      const env = environments.get("strict");
+      if (!env) throw new Error('environment "strict" did not start');
       const key = randomUUID();
       const raw = randomUUID();
       const hash = sha256(raw);
