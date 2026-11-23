@@ -991,6 +991,12 @@ describe("migrated read handlers (AII-711)", () => {
         expect(calls).not.toContain("KgRefresh.status");
       });
 
+      it("a base hold exposes a null snapshot PR URL", async () => {
+        const status = await stageFor({ inFlight: { ...inFlight, held: { ...held, snapshotPr: null } } });
+        expect(status.currentRun.held.snapshotPr).toBeNull();
+        expect(status.currentRun.held.snapshotPrUrl).toBeNull();
+      });
+
       it("a blocked hold offers cancel only", async () => {
         const status = await stageFor({ inFlight: { ...inFlight, held: { ...held, acceptBlocked: true } } });
         expect(status.currentRun.decisions).toEqual(["cancel"]);

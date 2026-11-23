@@ -361,3 +361,20 @@ describe("model-auth refusal", () => {
     expect(result.outcome).toBe("accepted");
   });
 });
+
+describe("base-mode senders", () => {
+  it.each(["fly-machines", "local-docker"] as const)("%s uses only code repo boot credentials and the configured image", async backend => {
+    const { deps, created } = makeDeps({}, { kgSourceRepo: "acme/code" });
+    await createKgRefreshSenders(deps)[backend](makeInput({ envelope: { ...envelope, kgSourceRepo: "acme/code", kgBaseMode: true } }));
+    expect(deps.getScopedInstallationToken).toHaveBeenCalledExactlyOnceWith("1", "key", "acme", { repositories: ["code"] });
+    expect(deps.getInstallationToken).not.toHaveBeenCalled();
+    expect(deps.fetchDefaultBranch).not.toHaveBeenCalled();
+    expect(deps.resolveRunnerImage).not.toHaveBeenCalled();
+    if (backend === "fly-machines") {
+      expect(created[0].config.image).toBe("img");
+      expect(created[0].config.env).toMatchObject({ AI_IMPLEMENT_WORKSPACE_MODE: "kg-base" });
+    } else {
+      expect(deps.startLocalRunnerContainer).toHaveBeenCalledWith(expect.objectContaining({ image: "local:img", extraEnv: expect.objectContaining({ AI_IMPLEMENT_WORKSPACE_MODE: "kg-base" }) }));
+    }
+  });
+});

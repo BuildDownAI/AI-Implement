@@ -618,3 +618,18 @@ describe("kg-refresh production wiring (AII-901)", () => {
     expect(logMod.getJobById(kgJob)?.status).not.toBe("timed_out");
   });
 });
+
+describe("base refresh preflight", () => {
+  it.each([undefined, "installation"] as const)("requires installation scope (%s) without reading a manifest", async scope => {
+    const fetchTarball = vi.fn();
+    const fetchDefaultBranch = vi.fn();
+    const probeRepo = vi.fn(async () => ({ ok: true, status: 200 }));
+    const mintToken = vi.fn(async () => ({ token: "dep", expiresAt: "2099-01-01T00:00:00Z", installationId: 1 }));
+    const result = await runKgRefreshPreflight({ githubAppId: "1", githubAppPrivateKey: "key", kgSourceRepo: "acme/code", kgBaseMode: true, dependencyTokenScope: scope, fetchTarball, fetchDefaultBranch, probeRepo, mintToken });
+    expect(result.ok).toBe(scope === "installation");
+    if (!scope) expect(result.results[0]).toMatchObject({ grant: "base-mode-needs-installation-scope", hint: expect.stringContaining("Dependency Token Scope") });
+    else expect(probeRepo).toHaveBeenCalledWith("dep", "acme/code", "contents");
+    expect(fetchTarball).not.toHaveBeenCalled();
+    expect(fetchDefaultBranch).not.toHaveBeenCalled();
+  });
+});

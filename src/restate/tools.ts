@@ -1,3 +1,4 @@
+import { kgRefreshRunRepo, getBootKgRefreshSource } from "../kg-refresh-source.js";
 import { listParked, unpark } from "../dispatch-breaker.js";
 import { resolveDefaultRunnerImage } from "../repo-image.js";
 import { STAGE_NAMES } from "../agent-config.js";
@@ -247,12 +248,14 @@ export const getTenantHealth = tool(
         agentMode: isProjectConfigured(teamKey) ? "configured" : "legacy",
       })),
     };
-    const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
+    const kgSourceRepo = kgRefreshRunRepo(readKgSourceRepo(process.env.KG_SOURCE_REPO));
     const kgRefreshPreflight = kgSourceRepo
       ? await runKgRefreshPreflight({
           githubAppId: process.env.GITHUB_APP_ID ?? "",
           githubAppPrivateKey: process.env.GITHUB_APP_PRIVATE_KEY ?? "",
           kgSourceRepo,
+          kgBaseMode: getBootKgRefreshSource()?.mode === "base",
+          dependencyTokenScope: Object.values(getMappings()).find(m => `${m.owner}/${m.repo}` === kgSourceRepo)?.dependencyTokenScope ?? undefined,
           kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         })
       : null;
@@ -350,7 +353,7 @@ export const getProjectBinding = tool(
     // kg.* reflects orchestrator-wide config, not the mapping — the KG is one graph, not
     // per-project, so every result shares the same kg object regardless of which project
     // (or how many) matched.
-    const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
+    const kgSourceRepo = kgRefreshRunRepo(readKgSourceRepo(process.env.KG_SOURCE_REPO));
     const kg = {
       present: kgSourceRepo !== null,
       orchestratorUrl: process.env.RUNNER_CALLBACK_BASE_URL || null,
@@ -1022,7 +1025,7 @@ export const getKgStatusTool = tool(
           triggerId: inFlight.triggerId,
           step: "decision",
           decisions: held.acceptBlocked ? ["cancel"] : ["accept", "cancel"],
-          held: { ...held, snapshotPrUrl: `https://github.com/${toolDeps.kgSourceRepo}/pull/${held.snapshotPr}` },
+          held: { ...held, snapshotPrUrl: held.snapshotPr === null ? null : `https://github.com/${toolDeps.kgSourceRepo}/pull/${held.snapshotPr}` },
         };
         stage = "awaiting-decision";
       } else {
@@ -1285,7 +1288,7 @@ function mcpAdminConfig(): AdminConfig {
     githubAppId: process.env.GITHUB_APP_ID ?? "",
     githubAppPrivateKey: process.env.GITHUB_APP_PRIVATE_KEY ?? "",
     notifyWebhookUrl: process.env.NOTIFY_WEBHOOK_URL || null,
-    kgSourceRepo: readKgSourceRepo(process.env.KG_SOURCE_REPO),
+    kgSourceRepo: kgRefreshRunRepo(readKgSourceRepo(process.env.KG_SOURCE_REPO)),
   };
 }
 

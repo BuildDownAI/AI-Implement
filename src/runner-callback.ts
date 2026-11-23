@@ -263,7 +263,7 @@ export interface HandleRunnerResultInput {
    * verify-only and hands the report here (AII-899). Absent → 503 so the runner retries.
    */
   kgRefreshClient?: KgRefreshIngressClient;
-  /** `KG_SOURCE_REPO`, from which the `KgRepo` key is derived. Null/absent → 503. */
+  /** Boot-resolved runRepo (customer KG repo or base-mode code repo). Null/absent → 503. */
   kgSourceRepo?: string | null;
   /**
    * Reports planning completion and usage to the workflow for a Restate-owned admission.

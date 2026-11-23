@@ -4,6 +4,12 @@ Which container image a run executes in, how a target repo overrides it, the pub
 
 Reference for `src/repo-image.ts`, the `runner_image` handling in the synced workflows, and `.github/workflows/build-runner.yml`. `CLAUDE.md` carries the summary and points here.
 
+## Baked base KG code
+
+`Dockerfile.session` downloads the `main` tar archive of `KG_BASE_REPO` (default `BuildDownAI/bd-knowledge-graph-base`) with remote `ADD`, which revalidates content on every image build. It extracts code to `/opt/kg-base` without `.git`, removes the shipped snapshot, installs `/opt/kg-base/.venv`, and records the tar pax `comment` commit in `.base-commit`. Base code updates reach refreshes at the next runner image build; the Actions build can also be started manually.
+
+A base-mode refresh on Fly always uses the orchestrator's configured session image and ignores the code repo's `.ai-implement/image.yml`, which may name an implement image without base KG code. Local Docker uses `localRunnerImage`. The `kg-base` entrypoint gives the workspace to `coder`, logs its commit, and fails with `the runner image has no base KG code (/opt/kg-base)` if the code is absent. It clones no base repo at runtime.
+
 ## The resolution ladder
 
 Both execution modes resolve the image the same way, highest priority first.

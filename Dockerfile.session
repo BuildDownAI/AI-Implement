@@ -62,6 +62,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git lfs install --system \
     && rm -rf /var/lib/apt/lists/*
 
+# Bake base KG code without a repository clone. Remote ADD revalidates main on every build.
+ARG KG_BASE_REPO=BuildDownAI/bd-knowledge-graph-base
+ADD https://codeload.github.com/${KG_BASE_REPO}/tar.gz/refs/heads/main /tmp/kg-base.tgz
+RUN mkdir -p /opt/kg-base \
+    && python3 -c 'import sys,tarfile;print(tarfile.open(sys.argv[1]).pax_headers["comment"])' /tmp/kg-base.tgz > /opt/kg-base/.base-commit \
+    && tar -xzf /tmp/kg-base.tgz -C /opt/kg-base --strip-components=1 \
+    && rm -rf /opt/kg-base/snapshot /tmp/kg-base.tgz \
+    && python3 -m venv /opt/kg-base/.venv \
+    && cd /opt/kg-base && .venv/bin/pip install -r requirements.txt
+
 # yq (mikefarah, single binary) — Debian's yq is a Python impl with a different CLI, so install upstream.
 RUN ARCH=$(dpkg --print-architecture) \
     && curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH}" \

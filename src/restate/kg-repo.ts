@@ -65,6 +65,7 @@ interface PendingDryRun {
 }
 
 export interface KgRepoDependencies {
+  baseMode?: boolean;
   /** The Restate service name of the workflow this object starts — "KgRefresh" in production. */
   workflowName: string;
 }
@@ -143,8 +144,9 @@ function oldestPendingKey(pending: Record<string, PendingDryRun>): string | unde
 export function buildRunParameter(
   opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget; resume?: KgRefreshResume },
   triggerId: string,
+  baseMode = false,
 ): KgRefreshRunInput {
-  return { ...opts, triggerId };
+  return { ...opts, triggerId, ...(baseMode ? { baseMode: true } : {}) };
 }
 
 export function createKgRepo(deps: KgRepoDependencies) {
@@ -156,7 +158,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
   /** Marks a new refresh in flight, hands it to `KgRefresh.run` by one-way send, and starts the `watch` that frees the lock when the run invocation ends. */
   async function submit(ctx: ObjectContext, now: number, opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget }, resume?: KgRefreshResume): Promise<string> {
     const triggerId = ctx.rand.uuidv4();
-    const handle = ctx.workflowSendClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, triggerId).run(buildRunParameter({ ...opts, ...(resume ? { resume } : {}) }, triggerId));
+    const handle = ctx.workflowSendClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, triggerId).run(buildRunParameter({ ...opts, ...(resume ? { resume } : {}) }, triggerId, deps.baseMode));
     const invocationId = await handle.invocationId;
     ctx.set<InFlightMarker>("inFlight", { triggerId, startedAt: now, invocationId });
     ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).watch({ triggerId, invocationId });
