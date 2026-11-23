@@ -230,5 +230,46 @@ export const helpersJs = `
       + '<thead><tr><th>Check</th><th>State</th><th>What was found</th><th>Fix</th></tr></thead><tbody>' + body + '</tbody></table>';
   }
   window.setupCheckTable = setupCheckTable;
+
+  // A GitHub repository as an operator types or pastes it: owner/repo, a github.com address, a trailing .git or slash,
+  // and surrounding whitespace. Null unless exactly two parts remain, neither empty nor holding whitespace.
+  function splitGithubRepo(raw) {
+    let v = String(raw == null ? '' : raw).trim();
+    v = v.replace(/^https?:\\/\\/(?:www\\.)?github\\.com\\//i, '').replace(/\\/+$/, '').replace(/\\.git$/i, '').replace(/^\\/+/, '');
+    const parts = v.split('/');
+    if (parts.length !== 2) return null;
+    const owner = parts[0].trim();
+    const repo = parts[1].trim();
+    if (!owner || !repo || /\\s/.test(owner + repo)) return null;
+    return { owner: owner, repo: repo };
+  }
+  window.splitGithubRepo = splitGithubRepo;
+
+  // The warning for a JQL clause on a field the orchestrator handles itself, the AI-Implement Status or Repo field,
+  // named by its name or by its override's ID (written customfield_N or cf[N]). Null when the JQL has none.
+  function jqlScopeWarning(jql, fields) {
+    const text = String(jql || '');
+    function namesId(id) {
+      const clean = String(id || '').replace(/[^a-zA-Z0-9_]/g, '');
+      if (!clean) return false;
+      const custom = /^customfield_(\\d+)$/.exec(clean);
+      return new RegExp('\\\\b' + clean + '\\\\b').test(text) || (custom !== null && text.toLowerCase().indexOf('cf[' + custom[1] + ']') !== -1);
+    }
+    if (/ai[\\s\\-_]?implement[\\s\\-_]?status/i.test(text)) {
+      return 'The JQL names the AI-Implement Status field. '
+        + 'The orchestrator adds its own status clause when it searches, so a status clause here stops issues being picked up after their status changes (Plan Approved → Implementing). '
+        + 'Remove the status clause.';
+    }
+    if (fields && namesId(fields.statusField)) {
+      return 'The JQL names ' + fields.statusField + ', your status field. '
+        + 'The orchestrator adds its own status clause when it searches, so remove the status clause here.';
+    }
+    if (/ai[\\s\\-_]?implement[\\s\\-_]?repo/i.test(text) || (fields && namesId(fields.repoField))) {
+      return 'The JQL names the AI-Implement Repo field. '
+        + "The orchestrator matches each issue's repo field itself, so this project does not need a repo clause, and an = clause can drop issues when the field is a text field.";
+    }
+    return null;
+  }
+  window.jqlScopeWarning = jqlScopeWarning;
 })();
 `;

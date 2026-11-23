@@ -15,8 +15,11 @@ export interface JiraMappingConfig {
   kind: "jira";
   /** Scope JQL clause; orchestrator wraps with the AI-Implement Status filter. */
   jql: string;
-  /** Option value of the AI-Implement Repo field that this mapping matches (e.g. "owner/repo"). */
-  repoFieldValue: string;
+  /**
+   * Option value of the AI-Implement Repo field that this mapping matches, or null to match the
+   * mapping's own owner/repo. Read it through resolveRepoFieldValue, never directly.
+   */
+  repoFieldValue: string | null;
   /** Optional explicit customfield_NNNNN override for the status field. */
   statusFieldOverride?: string | null;
   /** Optional explicit customfield_NNNNN override for the repo field. */
@@ -32,8 +35,8 @@ export type TicketingMappingConfig = LinearMappingConfig | JiraMappingConfig | F
 export const DEFAULT_TICKETING_CONFIG: LinearMappingConfig = { kind: "linear" };
 
 /**
- * Normalizes a `*FieldOverride` value from untrusted JSON: anything that is not a
- * non-blank string becomes null, and a non-blank string is trimmed.
+ * Normalizes a `*FieldOverride` value or the repoFieldValue from untrusted JSON:
+ * anything not a non-blank string becomes null, and a non-blank string is trimmed.
  *
  * Without this, a blank-but-present override survives validation and is then read
  * as a literal Jira field id by resolveCustomFieldIds (src/providers/jira-fields.ts):
@@ -97,13 +100,10 @@ export function validateTicketingConfig(
     if (typeof obj.jql !== "string" || obj.jql.trim() === "") {
       throw new TicketingConfigError(`${subject("jql")} is required for Jira.`, "jql");
     }
-    if (typeof obj.repoFieldValue !== "string" || obj.repoFieldValue.trim() === "") {
-      throw new TicketingConfigError(`${subject("repoFieldValue")} is required for Jira.`, "repoFieldValue");
-    }
     return {
       kind: "jira",
       jql: obj.jql,
-      repoFieldValue: obj.repoFieldValue,
+      repoFieldValue: normalizeFieldOverride(obj.repoFieldValue),
       statusFieldOverride: normalizeFieldOverride(obj.statusFieldOverride),
       repoFieldOverride: normalizeFieldOverride(obj.repoFieldOverride),
       profilesFieldOverride: normalizeFieldOverride(obj.profilesFieldOverride),
@@ -111,4 +111,14 @@ export function validateTicketingConfig(
     };
   }
   throw new TicketingConfigError(`Unknown provider for ticketingConfig: ${provider}`);
+}
+
+/**
+ * The AI-Implement Repo field value a mapping matches issues on: its stored repoFieldValue,
+ * or its owner/repo when none is stored. Takes the mapping's shape rather than RepoMapping,
+ * since config.ts imports this module.
+ */
+export function resolveRepoFieldValue(mapping: { owner: string; repo: string; ticketingConfig: TicketingMappingConfig }): string {
+  const cfg = mapping.ticketingConfig;
+  return cfg.kind === "jira" && cfg.repoFieldValue !== null ? cfg.repoFieldValue : `${mapping.owner}/${mapping.repo}`;
 }

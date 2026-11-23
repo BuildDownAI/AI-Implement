@@ -1136,7 +1136,50 @@ describe("the Edit dialog's Jira repository values", () => {
     field.innerHTML = '<option value="customfield_1">Repo</option>';
     await win.onRepoFieldChange();
     const options = Array.from((doc.getElementById("md-jira-repo-value") as HTMLSelectElement).options);
-    expect(options.map((o) => [o.value, o.textContent])).toEqual([["", "(select)"], [VALUE, VALUE]]);
+    expect(options.map((o) => [o.value, o.textContent])).toEqual([["", "(none, matches the repository)"], [VALUE, VALUE]]);
+  });
+});
+
+describe("the Edit dialog's repository", () => {
+  const JIRA = { kind: "jira" as const, jql: "project = APP", statusFieldOverride: null, repoFieldOverride: null, profilesFieldOverride: null, baseBranchFieldOverride: null };
+  async function open(mapping: RepoMapping) {
+    const m = mountProjects(mapping);
+    await m.win.loadMappings();
+    m.win.openMappingDialog("AII");
+    return m;
+  }
+  const field = (m: Awaited<ReturnType<typeof open>>, id: string) => m.doc.getElementById(id) as HTMLInputElement;
+
+  it("shows owner/repo in one box, and saves a pasted address as its two parts", async () => {
+    const m = await open(makeMapping({ owner: "acme", repo: "widgets" }));
+    expect(field(m, "md-github-repo").value).toBe("acme/widgets");
+    field(m, "md-github-repo").value = "https://github.com/acme/gadgets/";
+    await save(m.win);
+    expect(m.posts[0]).toMatchObject({ owner: "acme", repo: "gadgets" });
+  });
+
+  it.each([["gadgets", "must be owner/repo"], ["", "is required"]])("refuses %j as the repository, and saves nothing", async (value, message) => {
+    const m = await open(makeMapping({ owner: "acme", repo: "widgets" }));
+    field(m, "md-github-repo").value = value;
+    await save(m.win);
+    expect(m.posts).toHaveLength(0);
+    expect(m.doc.getElementById("md-error")!.textContent).toContain(message);
+  });
+
+  it.each([
+    ["a blank one as null", null, null],
+    ["an explicit one as entered", "Frontend Service", "Frontend Service"],
+  ])("saves a Jira project's Repo Field Value, %s", async (_label, stored, saved) => {
+    const m = await open(makeMapping({ owner: "acme", repo: "widgets", ticketingProvider: "jira", ticketingConfig: { ...JIRA, repoFieldValue: stored } }));
+    await save(m.win);
+    expect(m.posts[0]).toMatchObject({ ticketingProvider: "jira", ticketingConfig: { kind: "jira", repoFieldValue: saved } });
+  });
+
+  it("warns after Validate when the JQL names the repo field", async () => {
+    const m = await open(makeMapping({ ticketingProvider: "jira", ticketingConfig: { ...JIRA, repoFieldValue: null } }));
+    field(m, "md-jira-jql").value = 'project = APP AND "AI-Implement Repo" = "acme/widgets"';
+    await m.win.validateJqlButton();
+    expect(m.doc.getElementById("md-jira-jql-status")!.textContent).toMatch(/^⚠ Valid\. The JQL names the AI-Implement Repo field\./);
   });
 });
 

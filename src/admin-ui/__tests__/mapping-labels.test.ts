@@ -43,4 +43,13 @@ describe.each(FORMS)("%s's setting labels", (_form, html, root) => {
     const unmarked = allLabels(html, root).filter(([field, text]) => field === undefined && settingLabels.has(text)).map(([, text]) => text);
     expect(unmarked).toEqual([]);
   });
+
+  // One box takes the repository as owner/repo, so a refusal of either half goes there, named by the box's label.
+  it("places a refusal of the owner or the repo at the repository box, under its label", () => {
+    const doc = new JSDOM(`<!DOCTYPE html><body>${html}</body>`).window.document;
+    const box = doc.querySelector(`${root} [data-setting="owner"]`);
+    const label = box?.querySelector(".field-label[data-setting='repo']")?.textContent?.trim();
+    expect(box?.querySelector("input[id$='github-repo']")).not.toBeNull();
+    expect([MAPPING_FIELD_LABELS.owner, MAPPING_FIELD_LABELS.repo]).toEqual([label, label]);
+  });
 });

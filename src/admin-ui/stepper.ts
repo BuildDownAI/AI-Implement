@@ -79,12 +79,12 @@ export const stepperHtml = `
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Base Branch&rdquo;. Otherwise pick the text field that holds the branch an issue's PR should target instead of the repo's default branch.</div>
           </div>
           <div class="field">
-            <label class="field-label" data-setting="ticketingConfig.repoFieldValue">Repo Field Value</label>
+            <label class="field-label" data-setting="ticketingConfig.repoFieldValue">Repo Field Value <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <select class="input" id="np-jira-repo-value" onchange="updateStepperNextButton()">
-              <option value="">Select a Repo Field first</option>
+              <option value="">(none, matches the repository)</option>
             </select>
-            <input class="input mono hidden" id="np-jira-repo-value-text" type="text" placeholder="owner/repo" oninput="updateStepperNextButton()">
-            <div class="field-hint">The option-list value on the AI-Implement Repo field that matches issues for this mapping.</div>
+            <input class="input mono hidden" id="np-jira-repo-value-text" type="text" placeholder="Blank matches the repository" oninput="updateStepperNextButton()">
+            <div class="field-hint">Leave blank to match issues whose Repo field holds this project's repository as owner/repo, which you enter on the next step. Pick a value only when the Repo field's options name repositories another way.</div>
           </div>
         </div>
 
@@ -108,15 +108,10 @@ export const stepperHtml = `
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Source</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Connect to the GitHub repository this mapping dispatches against.</p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-          <div class="field">
-            <label class="field-label" data-setting="owner">GitHub Owner</label>
-            <input class="input mono" id="np-owner" placeholder="acme-corp" autocomplete="off" oninput="updateStepperNextButton()">
-            <div class="field-hint">Org or user that owns the repo.</div>
-          </div>
-          <div class="field">
-            <label class="field-label" data-setting="repo">Repository Name</label>
-            <input class="input mono" id="np-repo" placeholder="backend" autocomplete="off" oninput="updateStepperNextButton()">
-            <div class="field-hint">Repository name only (no owner prefix).</div>
+          <div class="field" style="grid-column:1 / -1" data-setting="owner">
+            <label class="field-label" data-setting="repo">GitHub Repository</label>
+            <input class="input mono" id="np-github-repo" placeholder="acme-corp/backend or https://github.com/acme-corp/backend" autocomplete="off" oninput="updateStepperNextButton()">
+            <div class="field-hint">The repository as owner/repo, or paste its GitHub address.</div>
           </div>
           <div class="field" style="grid-column:1 / -1">
             <label class="field-label" data-setting="defaultBranch">Default Branch</label>
@@ -552,7 +547,7 @@ export const stepperScript = `
     jiraRepoFieldOverride: '',
     jiraProfilesFieldOverride: '',
     jiraBaseBranchFieldOverride: '',
-    teamKey: '', owner: '', repo: '', defaultBranch: '', branchPrefix: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
+    teamKey: '', githubRepo: '', owner: '', repo: '', defaultBranch: '', branchPrefix: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
     skillsRepo: '', referenceRepos: [], dependencyTokenScope: null,
     executionMode: 'github-actions', machineCpuKind: 'shared', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
@@ -585,6 +580,7 @@ export const stepperScript = `
     data.jiraProfilesFieldOverride = '';
     data.jiraBaseBranchFieldOverride = '';
     data.teamKey = '';
+    data.githubRepo = '';
     data.owner = '';
     data.repo = '';
     data.defaultBranch = '';
@@ -614,7 +610,7 @@ export const stepperScript = `
     data.secrets = [];
 
     // Clear inputs. Not derived from the initializer above — a new field needs both.
-    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-prDispatchBudget', 'np-maxJobMinutes', 'np-trusted-review-authors'];
+    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-github-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-prDispatchBudget', 'np-maxJobMinutes', 'np-trusted-review-authors'];
     const depScopeEl = document.getElementById('np-dep-token-scope');
     if (depScopeEl) depScopeEl.value = '';
     const reviewProcessEl = document.getElementById('np-review-process');
@@ -670,7 +666,7 @@ export const stepperScript = `
     if (jqlEl) jqlEl.value = '';
     const repoValSel = document.getElementById('np-jira-repo-value');
     if (repoValSel) {
-      repoValSel.innerHTML = '<option value="">Select a Repo Field first</option>';
+      repoValSel.innerHTML = '<option value="">(none, matches the repository)</option>';
       repoValSel.classList.remove('hidden');
     }
     const repoValTxt = document.getElementById('np-jira-repo-value-text');
@@ -799,10 +795,7 @@ export const stepperScript = `
       const provider = provEl ? provEl.value : 'linear';
       if (provider === 'jira') {
         const jql = (document.getElementById('np-jira-jql') || {}).value || '';
-        const sel = document.getElementById('np-jira-repo-value');
-        const txt = document.getElementById('np-jira-repo-value-text');
-        const repoVal = (sel && !sel.classList.contains('hidden')) ? sel.value : (txt ? txt.value : '');
-        if (!jql.trim() || !repoVal.trim()) ok = false;
+        if (!jql.trim()) ok = false;
       } else if (provider === 'filesystem') {
         const dir = (document.getElementById('np-filesystem-directory') || {}).value || '';
         if (!dir.trim()) ok = false;
@@ -811,10 +804,9 @@ export const stepperScript = `
         if (!tk.trim()) ok = false;
       }
     } else if (step === 2) {
-      const ow = (document.getElementById('np-owner') || {}).value || '';
-      const rp = (document.getElementById('np-repo') || {}).value || '';
+      const gh = (document.getElementById('np-github-repo') || {}).value || '';
       const br = (document.getElementById('np-defaultBranch') || {}).value || '';
-      if (!ow.trim() || !rp.trim() || !br.trim()) ok = false;
+      if (!gh.trim() || !br.trim()) ok = false;
     }
     if (ok) nextBtn.removeAttribute('disabled');
     else nextBtn.setAttribute('disabled', '');
@@ -1153,14 +1145,17 @@ export const stepperScript = `
         if (tkEl) data.teamKey = tkEl.value.trim();
       }
     } else if (n === 2) {
-      const owEl = document.getElementById('np-owner');
-      const reEl = document.getElementById('np-repo');
+      const ghEl = document.getElementById('np-github-repo');
       const brEl = document.getElementById('np-defaultBranch');
       const bpEl = document.getElementById('np-branch-prefix');
       const saEl = document.getElementById('np-sensitive-add');
       const salEl = document.getElementById('np-sensitive-allow');
-      if (owEl) data.owner = owEl.value.trim();
-      if (reEl) data.repo = reEl.value.trim();
+      if (ghEl) {
+        const parsed = window.splitGithubRepo(ghEl.value);
+        data.githubRepo = ghEl.value.trim();
+        data.owner = parsed ? parsed.owner : '';
+        data.repo = parsed ? parsed.repo : '';
+      }
       if (brEl) data.defaultBranch = brEl.value.trim();
       if (bpEl) data.branchPrefix = bpEl.value.trim();
       if (saEl) data.sensitiveAddPatterns = saEl.value.trim();
@@ -1236,7 +1231,6 @@ export const stepperScript = `
     } else if (n === 1) {
       if (data.ticketingProvider === 'jira') {
         if (!data.jiraJql.trim()) { showError('JQL is required for Jira.'); return false; }
-        if (!data.jiraRepoFieldValue.trim()) { showError('Repo Field Value is required for Jira.'); return false; }
       } else if (data.ticketingProvider === 'filesystem') {
         if (!data.filesystemDirectory) { showError('Ticket Directory is required for filesystem ticketing.'); return false; }
         if (data.filesystemDirectory.charAt(0) !== '/') { showError('Ticket Directory must be an absolute path.'); return false; }
@@ -1244,8 +1238,8 @@ export const stepperScript = `
         if (!data.teamKey) { showError('Linear Team Key is required.'); return false; }
       }
     } else if (n === 2) {
-      if (!data.owner) { showError('GitHub Owner is required.'); return false; }
-      if (!data.repo) { showError('Repository Name is required.'); return false; }
+      if (!data.githubRepo) { showError('GitHub Repository is required, as owner/repo.'); return false; }
+      if (!data.owner || !data.repo) { showError('GitHub Repository must be owner/repo, such as acme-corp/backend, or its GitHub address.'); return false; }
       if (!data.defaultBranch) { showError('Default Branch is required.'); return false; }
     } else if (n === 3) {
       // Every Context setting is optional; only an add row that cannot be staged blocks.
@@ -1302,7 +1296,8 @@ export const stepperScript = `
     let cfgText;
     if (data.ticketingProvider === 'jira') {
       const jqlPreview = data.jiraJql.length > 80 ? data.jiraJql.substring(0, 80) + '...' : data.jiraJql;
-      cfgText = 'JQL: ' + (window.esc(jqlPreview) || '&mdash;') + ' &middot; repo=' + (window.esc(data.jiraRepoFieldValue) || '&mdash;');
+      const repoMatch = data.jiraRepoFieldValue || (data.owner && data.repo ? data.owner + '/' + data.repo + ' (the repository)' : '');
+      cfgText = 'JQL: ' + (window.esc(jqlPreview) || '&mdash;') + ' &middot; repo=' + (window.esc(repoMatch) || '&mdash;');
       if (data.jiraStatusFieldOverride) cfgText += ' &middot; statusField=' + window.esc(data.jiraStatusFieldOverride);
       if (data.jiraRepoFieldOverride) cfgText += ' &middot; repoField=' + window.esc(data.jiraRepoFieldOverride);
       if (data.jiraProfilesFieldOverride) cfgText += ' &middot; profilesField=' + window.esc(data.jiraProfilesFieldOverride);
@@ -1549,7 +1544,7 @@ export const stepperScript = `
         updateStepperNextButton();
         return;
       }
-      let html = '<option value="">(select)</option>';
+      let html = '<option value="">(none, matches the repository)</option>';
       for (const o of options) {
         html += '<option value="' + window.escAttr(o.value) + '">' + window.esc(o.value) + '</option>';
       }
@@ -1572,7 +1567,7 @@ export const stepperScript = `
     const text = document.getElementById('np-jira-repo-value-text');
     if (!fieldId) {
       if (select) {
-        select.innerHTML = '<option value="">Select a Repo Field first</option>';
+        select.innerHTML = '<option value="">(none, matches the repository)</option>';
         select.classList.remove('hidden');
       }
       if (text) text.classList.add('hidden');
@@ -1582,33 +1577,14 @@ export const stepperScript = `
     await stepperPopulateRepoValueOptions(fieldId);
   }
 
-  function detectStatusFilterInJql(jql, statusFieldOverride) {
-    // Returns a warning string if the JQL looks like it references the AI-Implement Status
-    // field. The orchestrator wraps the user's JQL with its own status filter, so any
-    // status clause here will conflict with status transitions.
-    if (/ai[\\s\\-_]?implement[\\s\\-_]?status/i.test(jql)) {
-      return 'JQL appears to reference the AI-Implement Status field. ' +
-        'The orchestrator adds its own status filter at query time — including one in ' +
-        'your JQL will prevent the issue from being picked up after status transitions ' +
-        '(e.g. Plan Approved → Implementing won\\'t flow). Remove status filters from this JQL.';
-    }
-    if (statusFieldOverride) {
-      const idPattern = new RegExp('\\\\b' + statusFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
-      if (idPattern.test(jql)) {
-        return 'JQL appears to reference customfield ' + statusFieldOverride + ' (your status field). ' +
-          'The orchestrator adds its own status filter at query time — remove the status clause here.';
-      }
-    }
-    return null;
-  }
-
   async function stepperValidateJql() {
     const jqlEl = document.getElementById('np-jira-jql');
     const statusFieldEl = document.getElementById('np-jira-status-field');
+    const repoFieldEl = document.getElementById('np-jira-repo-field');
     const status = document.getElementById('np-jira-jql-status');
     if (!jqlEl || !status) return;
     const jql = jqlEl.value;
-    const statusFieldOverride = statusFieldEl ? statusFieldEl.value : '';
+    const fields = { statusField: statusFieldEl ? statusFieldEl.value : '', repoField: repoFieldEl ? repoFieldEl.value : '' };
     status.textContent = 'Validating...';
     status.style.color = '';
     try {
@@ -1625,9 +1601,9 @@ export const stepperScript = `
         return;
       }
       await res.json();
-      const warning = detectStatusFilterInJql(jql, statusFieldOverride);
+      const warning = window.jqlScopeWarning(jql, fields);
       if (warning) {
-        status.textContent = '⚠ Valid but: ' + warning;
+        status.textContent = '⚠ Valid. ' + warning;
         status.style.color = 'var(--st-warn-fg, #c80)';
       } else {
         status.textContent = 'Valid';
@@ -1703,7 +1679,7 @@ export const stepperScript = `
         ? {
             kind: 'jira',
             jql: data.jiraJql,
-            repoFieldValue: data.jiraRepoFieldValue,
+            repoFieldValue: data.jiraRepoFieldValue || null,
             statusFieldOverride: data.jiraStatusFieldOverride || null,
             repoFieldOverride: data.jiraRepoFieldOverride || null,
             profilesFieldOverride: data.jiraProfilesFieldOverride || null,

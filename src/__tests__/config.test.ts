@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import type * as ConfigModule from "../config.js";
 import type { ReviewerSelection } from "../config.js";
+import { resolveRepoFieldValue } from "../providers/ticketing-config.js";
 import { makeMapping } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -447,6 +448,55 @@ describe("config", () => {
       expect(all["JIR-BAD"]).toBeUndefined();
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("JIR-BAD"));
       warn.mockRestore();
+    });
+
+    // The row main's single repository entry (#336) stores for a project saved without a
+    // Repo Field Value: the value is null, derived from owner/repo when read.
+    it("keeps a Jira mapping stored with a null repoFieldValue", () => {
+      config.initMappingsTable();
+      config.upsertMapping("acme/backend", makeMapping({ owner: "acme", repo: "backend" }));
+      const db = new Database(dbPath);
+      db.prepare("UPDATE mappings SET ticketing_provider = 'jira', ticketing_config = ? WHERE team_key = ?").run(
+        '{"kind":"jira","jql":"project = TEST","repoFieldValue":null,"statusFieldOverride":null,"repoFieldOverride":null,"profilesFieldOverride":null}',
+        "acme/backend",
+      );
+      db.close();
+
+      const m = config.getMappings()["acme/backend"];
+      expect(m?.ticketingConfig).toEqual({
+        kind: "jira",
+        jql: "project = TEST",
+        repoFieldValue: null,
+        statusFieldOverride: null,
+        repoFieldOverride: null,
+        profilesFieldOverride: null,
+        baseBranchFieldOverride: null,
+      });
+      expect(resolveRepoFieldValue(m!)).toBe("acme/backend");
+    });
+
+    // v1.1.0 always stored an explicit value, and no baseBranchFieldOverride key.
+    it("reads a Jira mapping stored at v1.1.0 as before", () => {
+      config.initMappingsTable();
+      config.upsertMapping("acme/backend", makeMapping({ owner: "acme", repo: "backend" }));
+      const db = new Database(dbPath);
+      db.prepare("UPDATE mappings SET ticketing_provider = 'jira', ticketing_config = ? WHERE team_key = ?").run(
+        '{"kind":"jira","jql":"project = TEST","repoFieldValue":"Backend Service","statusFieldOverride":"customfield_10042","repoFieldOverride":null,"profilesFieldOverride":null}',
+        "acme/backend",
+      );
+      db.close();
+
+      const m = config.getMappings()["acme/backend"];
+      expect(m?.ticketingConfig).toEqual({
+        kind: "jira",
+        jql: "project = TEST",
+        repoFieldValue: "Backend Service",
+        statusFieldOverride: "customfield_10042",
+        repoFieldOverride: null,
+        profilesFieldOverride: null,
+        baseBranchFieldOverride: null,
+      });
+      expect(resolveRepoFieldValue(m!)).toBe("Backend Service");
     });
   });
 

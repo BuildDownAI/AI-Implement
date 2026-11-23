@@ -456,8 +456,8 @@ export const MAPPING_FIELD_LABELS: Record<MappingRefusalField, string> = {
   "ticketingConfig.profilesFieldOverride": "Profiles Field",
   "ticketingConfig.baseBranchFieldOverride": "Base Branch Field",
   teamKey: "Project Mapping Key",
-  owner: "GitHub Owner",
-  repo: "Repository Name",
+  owner: "GitHub Repository",
+  repo: "GitHub Repository",
   defaultBranch: "Default Branch",
   workflowFile: "Workflow File",
   branchPrefix: "Branch Prefix",
@@ -3669,9 +3669,12 @@ export function buildMappingFromBody(
 ): { key: string; mapping: RepoMapping; warnings: string[] } | { status: number; body: Record<string, unknown> } {
   // A body parsed from JSON can be any value, and only an object can describe a project.
   if (typeof body !== "object" || body === null || Array.isArray(body)) return { status: 400, body: { error: "Invalid request body" } };
+  // owner/repo is also the Repo field value a Jira project without one matches, so stray whitespace must not reach it.
+  const owner = typeof body.owner === "string" ? body.owner.trim() : "";
+  const repo = typeof body.repo === "string" ? body.repo.trim() : "";
   if (!body.teamKey) return refuse("teamKey", `${label("teamKey")} is required.`);
-  if (!body.owner) return refuse("owner", `${label("owner")} is required.`);
-  if (!body.repo) return refuse("repo", `${label("repo")} is required.`);
+  if (!owner) return refuse("owner", `${label("owner")} is required.`);
+  if (!repo) return refuse("repo", `${label("repo")} is required.`);
 
   const existingMapping = getOwnMapping(body.teamKey);
   const defaultBranch = typeof body.defaultBranch === "string"
@@ -3923,8 +3926,8 @@ export function buildMappingFromBody(
     return refuse("reviewProcess", `${label("reviewProcess")} must be ai-implement, claude-code-review, claude-code-review-repository-fix or codex-code-review.`);
   }
   const mapping: RepoMapping = {
-    owner: body.owner,
-    repo: body.repo,
+    owner,
+    repo,
     workflowFile,
     defaultBranch,
     maxInProgressAiIssues,
