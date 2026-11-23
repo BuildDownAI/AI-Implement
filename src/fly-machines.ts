@@ -172,14 +172,14 @@ export async function getMachine(
   }
 }
 
-/** The runner's private IPv6 endpoint, once Fly has assigned its address. */
+/** The runner's Fly hostname endpoint, once Fly has assigned a private IP. */
 export async function getMachineRunnerAddress(
   token: string,
   appName: string,
   machineId: string,
 ): Promise<string | null> {
   const machine = await getMachine(token, appName, machineId);
-  return machine.private_ip ? `http://[${machine.private_ip}]:9080` : null;
+  return machine.private_ip ? `http://${machineId}.vm.${appName}.internal:9080` : null;
 }
 
 export async function listMachines(
