@@ -146,7 +146,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       if (missing.length > 0) return [{
         state: "fail",
         detail: `Missing: ${missing.join(", ")}`,
-        fix: "Save the Stardog values and the Graph details on /admin#kg-pipelines.",
+        fix: "Save the Stardog values on the Graph source card of /admin#kg-pipelines.",
       }];
       return [{ state: "pass", detail: "The Stardog store values are set" }];
     },

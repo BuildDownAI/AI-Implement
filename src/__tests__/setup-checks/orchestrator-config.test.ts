@@ -130,7 +130,7 @@ describe("kg.remote-store", () => {
     } }), [check]);
     expect(result.results).toMatchObject([{ tier: "feature", state: "fail",
       detail: "Missing: KG_STARDOG_RUN_TOKEN, KG_STARDOG_DB, KG_NAMESPACE",
-      fix: "Save the Stardog values and the Graph details on /admin#kg-pipelines." }]);
+      fix: "Save the Stardog values on the Graph source card of /admin#kg-pipelines." }]);
     expect(countFailingCore(result)).toBe(0);
   });
 });
