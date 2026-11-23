@@ -1621,3 +1621,31 @@ describe("cloneStep git subprocess environment", () => {
     });
   });
 });
+
+describe("kg-base workspace", () => {
+  afterEach(() => vi.unstubAllEnvs());
+  it("primary clone returns the baked workspace without git", async () => {
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "kg-base");
+    vi.mocked(spawnSync).mockClear();
+    const result = await cloneStep.run(makeContext(), { ...BASE_INPUTS, workspaceDir: "/opt/kg-base" }, new NoopStepReporter());
+    expect(result).toMatchObject({ workspaceDir: "/opt/kg-base", repoOwner: "acme", repoRepo: "app", githubToken: "secret-token" });
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("kg-base data repository clones", () => {
+  afterEach(() => vi.unstubAllEnvs());
+  it.each([false, true])("still clones secondary repositories (multi=%s)", async multi => {
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "kg-base");
+    vi.mocked(spawnSync).mockClear();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockSpawn([{ status: 0 }, { status: 0, stdout: "abc123" }]);
+    await cloneStep.run(makeContext(), {
+      ...BASE_INPUTS,
+      workspaceDir: "/opt/kg-base",
+      ...(multi ? { targets: [{ repoOwner: "acme", repoRepo: "sibling", targetDir: "repos/sibling" }] } : { targetDir: "code-repo" }),
+    }, new NoopStepReporter());
+    expect(vi.mocked(spawnSync).mock.calls.some(([cmd, args]) => cmd === "git" && Array.isArray(args) && args[0] === "clone")).toBe(true);
+  });
+});

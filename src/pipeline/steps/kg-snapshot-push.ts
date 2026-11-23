@@ -614,6 +614,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     }
 
     const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
+    const baseMode = context.data.kgBaseMode === true;
 
     // ── Size check ───────────────────────────────────────────────────────────
     // Runs first (before the dry-run exit in guard 0b and before any commit): GitHub refuses
@@ -655,7 +656,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           .filter((t): t is string => t !== null),
       ]),
     ];
-    if ((!trackerFetched || affectedTeams.length > 0) && clonedRef && clonedRef !== "unknown") {
+    if (!baseMode && (!trackerFetched || affectedTeams.length > 0) && clonedRef && clonedRef !== "unknown") {
       const lsTreeResult = spawnSync(
         "git", ["ls-tree", "--name-only", clonedRef, "--", "snapshot/parts/"],
         { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
@@ -704,7 +705,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // by line count. Refuse if any previous part is missing, if any part drops
     // below PART_SHRINK_THRESHOLD of its previous count, or if a tracker part
     // (issue.nt / comment.nt) shrinks at all when the tracker reported a non-zero issue count.
-    if (clonedRef && clonedRef !== "unknown") {
+    if (!baseMode && clonedRef && clonedRef !== "unknown") {
       const lsAllResult = spawnSync(
         "git",
         ["ls-tree", "--name-only", "-r", clonedRef, "--", "snapshot/parts/"],
@@ -881,12 +882,12 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
 
     // ── 2. Validate snapshot/embeddings.npz ─────────────────────────────────
     const embeddingsPath = join(workspaceDir, "snapshot", "embeddings.npz");
-    if (!existsSync(embeddingsPath)) {
+    if (!baseMode && !existsSync(embeddingsPath)) {
       throw new KgSnapshotMissingError("snapshot/embeddings.npz is absent");
     }
 
     // ── 3. Validate stamp (embeddings.meta.json age_stamp; embeddings.stamp fallback) ──
-    const currentStamp = readCurrentStamp(workspaceDir);
+    const currentStamp = baseMode ? new Date(context.data.kgRunStartedAt ?? Date.now()).toISOString().replace(/\.\d{3}Z$/, "Z") : readCurrentStamp(workspaceDir);
     if (!currentStamp) {
       throw new KgSnapshotMissingError(
         "snapshot/embeddings.meta.json has no age_stamp and snapshot/embeddings.stamp is absent — the ingest did not write a stamp",
@@ -900,7 +901,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         `snapshot age stamp has unrecognised format "${currentStamp}" — expected YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM`,
       );
     }
-    const previousStamp = readPreviousStamp(workspaceDir, clonedRef);
+    const previousStamp = baseMode ? null : readPreviousStamp(workspaceDir, clonedRef);
     // previousStamp null means no prior snapshot exists: any new stamp is accepted.
     if (previousStamp !== null) {
       if (!ISO_STAMP_RE.test(previousStamp)) {
@@ -933,7 +934,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const teamCounts = Array.isArray(rawTeamCounts) ? (rawTeamCounts as Array<{ team: string; count: number }>) : [];
     // Read once and reuse for both the report and the learnings classification below,
     // so the two can never disagree about counts.
-    const secondaryRepoOutcomes = readSecondaryRepoOutcomes(workspaceDir);
+    const secondaryRepoOutcomes = baseMode ? [] : readSecondaryRepoOutcomes(workspaceDir);
     const ingestWarnings = readIngestWarnings(workspaceDir);
     const sources = mergeSources(
       parseSourceResults(trackerOutputs.teamResults),
@@ -998,6 +999,14 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           ? `> ⚠️ ${warnings.join("; ")}.`
           : undefined,
     });
+
+    if (baseMode && !dryRun) {
+      console.log(reportBody);
+      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map(row => ({ part: row.part, prev: row.prev, new: row.next })), null, null, "", heldCause, failedTeams, sources, acceptBlocked, lostTeams);
+      return { snapshotPushed: false, commitSha: null, prNumber: null, branchName: null,
+        guardVerdict: warnings.length ? "warnings" : "clean", sources,
+        ...(warnings.length ? { warnings } : {}) };
+    }
 
     // ── dry-run exit ─────────────────────────────────────────────────────────
     // All guards and validation passed. In dry-run mode (dev-harness kg-refresh)

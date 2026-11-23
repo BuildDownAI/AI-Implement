@@ -69,10 +69,11 @@ export GITHUB_OWNER GITHUB_REPO
 export PR_NUMBER="${PR_NUMBER:-}"
 _kg_r="$(if [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then run_node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(c.kgSourceRepo||'')}catch{}" 2>/dev/null; fi)"
 [ -n "${_kg_r:-}" ] && { GITHUB_OWNER="${_kg_r%%/*}"; GITHUB_REPO="${_kg_r#*/}"; }
+[ -n "${_kg_r:-}" ] && log_kg_source "$_kg_r" "$WORKSPACE_MODE"
 # ── 3. Token acquisition ─────────────────────────────────────────────────────
 export GH_TOKEN="$GITHUB_TOKEN"
-
 # ── 4. Git config + clone ────────────────────────────────────────────────────
+if [ "$WORKSPACE_MODE" = "kg-base" ]; then GITHUB_DEFAULT_BRANCH=main; fi
 if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then
   if [ -z "${_kg_r:-}" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
     GITHUB_DEFAULT_BRANCH="${GITHUB_REF_NAME}"
@@ -87,7 +88,9 @@ run_scoped "" git config --global user.name "ai-implement-bot"
 run_scoped "" git config --global user.email "ai-implement-bot@users.noreply.github.com"
 run_scoped "" git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
 
-if [ "$WORKSPACE_MODE" = "copy" ]; then
+if [ "$WORKSPACE_MODE" = "kg-base" ]; then
+  prepare_kg_base_workspace
+elif [ "$WORKSPACE_MODE" = "copy" ]; then
   copy_local_workspace "$WORKSPACE_DIR"
   cd "$WORKSPACE_DIR"
 elif [ "$WORKSPACE_MODE" = "mounted" ]; then

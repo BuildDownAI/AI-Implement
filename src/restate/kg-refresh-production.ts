@@ -4,6 +4,8 @@
  * `review-fix-production.ts` and `review-fix-client.ts`. `src/index.ts` composes and registers
  * the services; this file is the allowed SDK boundary where the orchestrator's existing
  * kg-refresh closures become Restate services. */
+import { TerminalError } from "@restatedev/restate-sdk";
+import type { KgRefreshSource } from "../kg-refresh-source.js";
 import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import { createHmac } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
@@ -242,6 +244,7 @@ export function recordKgDispatchRow(record: KgDispatchRecord): void {
 }
 
 export interface KgRefreshProductionInput {
+  source?: Exclude<KgRefreshSource, { mode: "unavailable" }>;
   kgSourceRepo: string;
   config: Pick<AppConfig,
     "githubAppId" | "githubAppPrivateKey" | "sessionImage" | "runnerImageExplicit"
@@ -319,17 +322,20 @@ export function findKgMapping(kgSourceRepo: string) {
  *  Rule: runner mode (`local`, `gha`, `fly`) wins, else the KG page's Backend setting (default: Fly when configured, else
  *  GitHub Actions). `shadow` stays on the setting's one backend: two concurrent ingests race to push the same snapshot commit.
  *  Fly without configuration falls back to GitHub Actions (retrying cannot configure Fly). */
-export function resolveKgExecutionMode(fly: Pick<AppConfig, "flySessionsToken" | "flySessionsApp">): KgBackendResolution {
+export function resolveKgExecutionMode(fly: Pick<AppConfig, "flySessionsToken" | "flySessionsApp">, baseMode = false): KgBackendResolution {
   const flyConfigured = !!(fly.flySessionsToken && fly.flySessionsApp);
-  return resolveKgBackend(getRunnerMode().mode, getKgExecutionMode(flyConfigured), flyConfigured);
+  const resolved = resolveKgBackend(getRunnerMode().mode, getKgExecutionMode(flyConfigured), flyConfigured);
+  if (baseMode && resolved.mode === "github-actions") throw new TerminalError("base-mode-needs-fly-or-local");
+  return resolved;
 }
 
 /** Builds the dispatch the workflow calls inside `ctx.run`: a lookup in the sender table keyed by the journaled
  *  `executionMode`. An unknown mode is a definitive `rejected`, since a throw would retry a value that cannot change. */
 export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispatch: KgDispatchInput) => Promise<KgDispatchResult> {
+  const runRepo = input.source?.runRepo ?? input.kgSourceRepo;
   const senders = createKgRefreshSenders({
     // Inherit from the live config: a spread would read every getter once and freeze the Fly values at boot.
-    config: Object.create(input.config, { kgSourceRepo: { value: input.kgSourceRepo, enumerable: true } }) as AppConfig,
+    config: Object.create(input.config, { kgSourceRepo: { value: runRepo, enumerable: true } }) as AppConfig,
     getInstallationToken: input.getInstallationToken,
     getScopedInstallationToken: input.getScopedInstallationToken,
     mintToken: input.mintToken,
@@ -351,13 +357,14 @@ export function createProductionKgRefreshServices(
   input: KgRefreshProductionInput,
 ): { services: RestateService[]; toolDeps: KgRefreshToolDeps } {
   const { config } = input;
+  const runRepo = input.source?.runRepo ?? input.kgSourceRepo;
   const freeBytes = () => defaultFreeBytes(DATA_ROOT);
 
   const rail: KgRailDeps = {
     sidecar: input.sidecar,
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
-    kgSourceRepo: input.kgSourceRepo,
+    kgSourceRepo: runRepo,
     dataRoot: DATA_ROOT,
     kgDir: KG_DIR,
     sidecarMcpUrl: SIDECAR_MCP_URL,
@@ -385,15 +392,15 @@ export function createProductionKgRefreshServices(
 
   const deps: KgRefreshWorkflowDependencies = {
     rail,
-    kgSourceRepo: input.kgSourceRepo,
+    kgSourceRepo: runRepo,
     mintRunTokens: ({ dispatchId, ttlSeconds }) => {
       if (!config.runnerTokenSecret) throw new Error("RUNNER_TOKEN_SECRET is not configured");
-      const mappingTeamKey = findKgMapping(input.kgSourceRepo)?.[0];
-      if (mappingTeamKey === undefined) throw new Error(`no project mapping found for kgSourceRepo=${input.kgSourceRepo}`);
+      const mappingTeamKey = findKgMapping(runRepo)?.[0];
+      if (mappingTeamKey === undefined) throw new Error(`no project mapping found for kgSourceRepo=${runRepo}`);
       // mintLaunchTokens clears the dispatch's unconsumed rows first, so a replay re-mints for the same dispatch id.
       const minted = mintLaunchTokens({
         issueId: "kg-refresh", mappingTeamKey, phase: "kg-refresh", dispatchId, ttlSeconds,
-        secret: config.runnerTokenSecret, repository: input.kgSourceRepo,
+        secret: config.runnerTokenSecret, repository: runRepo,
       });
       return {
         runToken: minted.runToken,
@@ -403,19 +410,20 @@ export function createProductionKgRefreshServices(
     },
     dispatch: createKgRefreshDispatch(input),
     buildEnvelope: (run, issueIdentifier) => buildKgRefreshRunConfig({
-      kgSourceRepo: input.kgSourceRepo,
+      kgSourceRepo: runRepo,
       issueIdentifier,
       runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      dependencyTokenScope: findKgMapping(input.kgSourceRepo)?.[1]?.dependencyTokenScope ?? undefined,
+      dependencyTokenScope: findKgMapping(runRepo)?.[1]?.dependencyTokenScope ?? undefined,
+      ...(input.source?.mode === "base" ? { ...input.source, kgBaseMode: true as const } : {}),
       dryRun: run.dryRun,
       kgSourceRef: run.kgSourceRef,
     }),
     // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
-    resolveDispatchRecord: (dispatchId) => ({
-      dispatchId, issueId: "kg-refresh", phase: "kg-refresh",
-      repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
-      executionMode: (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config).mode))(),
-    }),
+    resolveDispatchRecord: (dispatchId) => {
+      const executionMode = (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config, input.source?.mode === "base").mode))();
+      if (input.source?.mode === "base" && executionMode === "github-actions") throw new TerminalError("base-mode-needs-fly-or-local");
+      return { dispatchId, issueId: "kg-refresh", phase: "kg-refresh", repo: parseKgSourceRepo(runRepo).fullName, executionMode };
+    },
     resolveFlyApp: () => config.flySessionsApp,
     recordDispatchRow: recordKgDispatchRow,
     deriveMachineNonce: (dispatchId, attempt) => deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt),
@@ -458,10 +466,10 @@ export function createProductionKgRefreshServices(
   };
 
   const toolDeps: KgRefreshToolDeps = {
-    kgSourceRepo: input.kgSourceRepo,
+    kgSourceRepo: runRepo,
     isDeployHeld: input.isDeployHeld,
     callbackConfigured: () => Boolean(config.runnerCallbackBaseUrl && config.runnerTokenSecret),
-    mappingExists: () => findKgMapping(input.kgSourceRepo) !== undefined,
+    mappingExists: () => findKgMapping(runRepo) !== undefined,
     freeBytes,
     runPreflight: input.runPreflight,
     persistPreflightFailure: (result) => {
@@ -482,7 +490,7 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps), createPipelineSchedule({ pipelines: { "kg-refresh": createKgRefreshSchedulePipeline(input.kgSourceRepo) } }), createKgSidecarHealth({ probe: probeKgSidecarIfUnavailable })],
+    services: [createKgRepo({ workflowName: "KgRefresh", baseMode: input.source?.mode === "base" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps), createPipelineSchedule({ pipelines: { "kg-refresh": createKgRefreshSchedulePipeline(runRepo) } }), createKgSidecarHealth({ probe: probeKgSidecarIfUnavailable })],
     toolDeps,
   };
 }

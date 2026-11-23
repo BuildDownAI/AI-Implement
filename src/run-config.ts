@@ -140,8 +140,15 @@ export interface RunConfigV1 {
   prNumber?: string;
   baseBranch?: string;
   runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
-  /** KG source repo (owner/repo) to clone as workspace for kg-refresh runs. */
+  /** Refresh run identity (owner/repo): the KG repo in customer mode, the code repo in base mode. */
   kgSourceRepo?: string;
+  kgBaseMode?: true;
+  kgNamespace?: string;
+  kgCodeRepo?: string;
+  kgGraphName?: string;
+  kgGraphLabel?: string;
+  kgStardogDb?: string;
+
   /** True when this kg-refresh dispatch should run kg-snapshot-push in dry-run mode (AII-632). */
   kgDryRun?: true;
   /** Branch to check out instead of the KG source repo's default branch (AII-633 PR-triggered dry-run). Absent = unchanged default-branch clone. */
@@ -650,6 +657,13 @@ export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
 }
 
 export interface KgRefreshRunConfigInput {
+  kgBaseMode?: true;
+  kgNamespace?: string;
+  kgCodeRepo?: string;
+  kgGraphName?: string;
+  kgGraphLabel?: string;
+  kgStardogDb?: string;
+
   kgSourceRepo: string;
   /** The run title the workflow reconciles by: `KG-REFRESH · <triggerId>`. */
   issueIdentifier: string;
@@ -673,6 +687,12 @@ export function buildKgRefreshRunConfig(input: KgRefreshRunConfigInput): RunConf
     issue: { id: "kg-refresh", identifier: issueIdentifier, title: "KG ingest", description: "" },
     runnerPhase: "kg-refresh",
     kgSourceRepo,
+    ...(input.kgBaseMode !== undefined ? { kgBaseMode: input.kgBaseMode } : {}),
+    ...(input.kgNamespace !== undefined ? { kgNamespace: input.kgNamespace } : {}),
+    ...(input.kgCodeRepo !== undefined ? { kgCodeRepo: input.kgCodeRepo } : {}),
+    ...(input.kgGraphName !== undefined ? { kgGraphName: input.kgGraphName } : {}),
+    ...(input.kgGraphLabel !== undefined ? { kgGraphLabel: input.kgGraphLabel } : {}),
+    ...(input.kgStardogDb !== undefined ? { kgStardogDb: input.kgStardogDb } : {}),
     ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
     ...(dependencyTokenScope != null ? { dependencyTokenScope } : {}),
     ...(dryRun ? { kgDryRun: true as const } : {}),
@@ -707,7 +727,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
-    kgDryRun, kgSourceRef, referenceRepos,
+    kgDryRun, kgSourceRef, referenceRepos, kgBaseMode, kgNamespace, kgCodeRepo, kgGraphName, kgGraphLabel, kgStardogDb,
     reviewers, reviewProcess, trustedReviewAuthors, retryPolicy, reviewFix, agentConfig } = cfg;
   const out: RunConfigV1 = { v, issue };
   const prices = copyModelPrices(cfg.modelPrices);
@@ -741,6 +761,12 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (groupingParent !== undefined) out.groupingParent = groupingParent;
   if (dependencyTokenScope !== undefined) out.dependencyTokenScope = dependencyTokenScope;
   if (kgSourceRepo !== undefined) out.kgSourceRepo = kgSourceRepo;
+  if (kgBaseMode !== undefined) out.kgBaseMode = kgBaseMode;
+  if (kgNamespace !== undefined) out.kgNamespace = kgNamespace;
+  if (kgCodeRepo !== undefined) out.kgCodeRepo = kgCodeRepo;
+  if (kgGraphName !== undefined) out.kgGraphName = kgGraphName;
+  if (kgGraphLabel !== undefined) out.kgGraphLabel = kgGraphLabel;
+  if (kgStardogDb !== undefined) out.kgStardogDb = kgStardogDb;
   if (kgDryRun !== undefined) out.kgDryRun = kgDryRun;
   if (kgSourceRef !== undefined) out.kgSourceRef = kgSourceRef;
   if (referenceRepos !== undefined) out.referenceRepos = referenceRepos;

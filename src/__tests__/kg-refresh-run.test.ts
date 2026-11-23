@@ -15,6 +15,11 @@ import { githubFile } from "./helpers/replies/github.js";
 import { kgRefreshResultAccepted, progressAccepted } from "./helpers/replies/orchestrator.js";
 import { testDir } from "./helpers/test-dir.js";
 
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
+
 // Pass-through spy: every test keeps the real refresh unless it overrides the
 // implementation for one call.
 vi.mock("../runner-token.js", async (importOriginal) => {
@@ -2898,7 +2903,7 @@ describe("applyWiring for kg-tracker-data", () => {
 
 // ── runKgRefresh() happy and failure paths ────────────────────────────────────
 
-import { runKgRefresh, devHarnessKgCloneStep, makeDevHarnessDependencyAuthStep } from "../pipeline/kg-refresh-run.js";
+import { resolveKgRefreshInputs, runKgRefresh, devHarnessKgCloneStep, makeDevHarnessDependencyAuthStep } from "../pipeline/kg-refresh-run.js";
 import type { StepModule } from "../pipeline/types.js";
 
 function makeStepModule(outputs: Record<string, unknown> = {}, throwErr?: Error): StepModule {
@@ -6849,5 +6854,103 @@ describe("runKgRefresh stage configuration", () => {
     expect(seen2.ctx!.llmExecutor).toBe(exec);
     expect(exec.invoke).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+});
+
+describe("base-mode runner", () => {
+  it("preserves every base field through the envelope and input resolver", () => {
+    const fields = { kgBaseMode: true as const, kgNamespace: "https://kg.example/", kgCodeRepo: "acme/code", kgGraphName: "graph", kgGraphLabel: "Graph", kgStardogDb: "database" };
+    const encoded = encodeRunConfig(buildKgRefreshRunConfig({ kgSourceRepo: "acme/code", issueIdentifier: "KG", ...fields }));
+    expect(decodeRunConfig(encoded)).toMatchObject(fields);
+    expect(resolveKgRefreshInputs({ AI_IMPLEMENT_RUN_CONFIG: encoded, GITHUB_OWNER: "acme", GITHUB_REPO: "code", GITHUB_TOKEN: "token" })).toMatchObject(fields);
+  });
+  it("ingests with the baked venv and no embeddings or dependency installation", async () => {
+    const spawnImpl = vi.fn(() => makeFakeProcess(0, ['{"quads":1}']) as unknown as ChildProcess);
+    await kgIngestStep.run(makeContext(), { workspaceDir: "/opt/kg-base", kgBaseMode: true, codeRepoDir: "/opt/kg-base/code-repo", spawnImpl, mkdirSyncImpl: () => {}, writeFileSyncImpl: () => {}, existsSyncImpl: () => false }, noopReporter);
+    expect(spawnImpl).toHaveBeenCalledExactlyOnceWith("/opt/kg-base/.venv/bin/python", ["-m", "kg_ingest", "refresh", "--no-embed", "--code-repo", "/opt/kg-base/code-repo"], expect.anything());
+  });
+  it.each(["clean", "warnings"] as const)("reports a %s base snapshot without git, PR APIs, embeddings or a stamp file", async verdict => {
+    const api = fakeFetch({}).install();
+    const dir = testDir("base-snapshot");
+    mkdirSync(join(dir, "snapshot/parts"), { recursive: true });
+    writeFileSync(join(dir, "snapshot/parts/a.nt"), "<s> <p> <o> .\n");
+    const log = vi.spyOn(console, "log");
+    const git = vi.mocked(spawnSync);
+    git.mockClear();
+    const ctx = makeContext({ kgBaseMode: true, kgRunStartedAt: Date.parse("2026-11-20T12:34:56Z") });
+    if (verdict === "warnings") ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 0, failedTeams: ["EMPTY"] });
+    const result = await kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "unused", defaultBranch: "main", clonedRef: "not-a-git-repository" }, noopReporter);
+    expect(result).toMatchObject({ snapshotPushed: false, prNumber: null, guardVerdict: verdict });
+    expect(api.calls).toEqual([]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("20261120T123456Z"));
+    expect(git).not.toHaveBeenCalled();
+    git.mockClear();
+    log.mockRestore();
+  });
+  it("reconciles base identity before additions, preserving nested metadata", async () => {
+    const dir = testDir("base-scope");
+    writeFileSync(join(dir, "sources.yml"), "namespace: old\ncode_repo:\n  slug: old/code\n  path: code-repo\n  doc_globs: ['**/*.md']\nknowledge_graph:\n  name: old\n  label: Old\n  group: group\n  questions: [why]\n");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "progress");
+    try {
+      const inputs = { workspaceDir: dir, kgBaseMode: true, kgNamespace: "https://new/", kgCodeRepo: "acme/code", kgGraphName: "new", kgGraphLabel: "New", callbackUrl: "https://orch", fetchImpl: (async () => new Response("[]")) as typeof fetch };
+      await kgScopeReconcileStep.run(makeContext(), inputs, noopReporter);
+      expect(parseDocument(readFileSync(join(dir, "sources.yml"), "utf8")).toJS()).toMatchObject({ namespace: "https://new/", code_repo: { slug: "acme/code", path: "code-repo", doc_globs: ["**/*.md"] }, knowledge_graph: { name: "new", label: "New", group: "group", questions: ["why"] } });
+      await expect(kgScopeReconcileStep.run(makeContext(), { ...inputs, fetchImpl: (async () => new Response("failure", { status: 500 })) as typeof fetch }, noopReporter)).rejects.toThrow("base-mode scope fetch failed");
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
+
+describe("base-mode snapshot guard failures", () => {
+  it.each(["held", "refused"])("%s without git or a PR", async verdict => {
+    const api = fakeFetch({}).install();
+    const dir = testDir("base-guard");
+    if (verdict === "held") {
+      mkdirSync(join(dir, "snapshot/parts"), { recursive: true });
+      writeFileSync(join(dir, "snapshot/parts/a.nt"), "<s> <p> <o> .\n");
+    }
+    const ctx = makeContext({ kgBaseMode: true, kgRunStartedAt: Date.parse("2026-11-20T12:34:56Z") });
+    ctx.setOutputs("kg-ingest", { sourceResults: [{ source: "code", kind: "code", status: "failed", reason: "fetch failed", counts: {} }] });
+    const git = vi.mocked(spawnSync);
+    git.mockClear();
+    try {
+      await expect(kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "unused", defaultBranch: "main", clonedRef: "not-a-repo" }, noopReporter)).rejects.toMatchObject({ code: verdict === "held" ? "KG_SNAPSHOT_HELD" : "KG_SNAPSHOT_MISSING", ...(verdict === "held" ? { prNumber: null, commitSha: null } : {}) });
+      expect(git).not.toHaveBeenCalled();
+      expect(api.calls).toEqual([]);
+    } finally { git.mockClear(); }
+  });
+});
+
+
+describe("base scope reconcile failure contracts", () => {
+  afterEach(() => vi.unstubAllEnvs());
+  function inputs() {
+    const workspaceDir = testDir("scope-contract");
+    writeFileSync(join(workspaceDir, "sources.yml"), "code_repo:\n  slug: old/code\n  path: code-repo\n");
+    return { workspaceDir, kgBaseMode: true, kgNamespace: "https://new/", kgCodeRepo: "acme/code", kgGraphName: "graph", kgGraphLabel: "Graph", callbackUrl: "https://orch" };
+  }
+  it.each(["callback", "token"])("fails base mode with a missing %s before fetching", async missing => {
+    vi.stubEnv("RUN_PROGRESS_TOKEN", missing === "token" ? "" : "progress");
+    const fetchImpl = vi.fn<typeof fetch>();
+    await expect(kgScopeReconcileStep.run(makeContext(), { ...inputs(), callbackUrl: missing === "callback" ? null : "https://orch", fetchImpl }, noopReporter)).rejects.toThrow(missing === "callback" ? "requires a callback URL" : "requires RUN_PROGRESS_TOKEN");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+  it("keeps customer scope-fetch failures as a skip", async () => {
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "progress");
+    const input = inputs();
+    const before = readFileSync(join(input.workspaceDir, "sources.yml"), "utf8");
+    const api = fakeFetch({ "POST /api/runner/kg-scope": { status: 500 } });
+    expect(await kgScopeReconcileStep.run(makeContext(), { ...input, kgBaseMode: false, fetchImpl: api.fetch }, noopReporter)).toMatchObject({ mappedProjectCount: 0, addedRepos: 0 });
+    expect(api.calls).toHaveLength(1);
+    expect(readFileSync(join(input.workspaceDir, "sources.yml"), "utf8")).toBe(before);
+  });
+  it("leaves an absent knowledge_graph block absent while writing base identity", async () => {
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "progress");
+    const input = inputs();
+    const api = fakeFetch({ "POST /api/runner/kg-scope": { json: [] } });
+    await kgScopeReconcileStep.run(makeContext(), { ...input, fetchImpl: api.fetch }, noopReporter);
+    const written = parseDocument(readFileSync(join(input.workspaceDir, "sources.yml"), "utf8")).toJS();
+    expect(written).toMatchObject({ namespace: "https://new/", code_repo: { slug: "acme/code", path: "code-repo" } });
+    expect(written).not.toHaveProperty("knowledge_graph");
   });
 });

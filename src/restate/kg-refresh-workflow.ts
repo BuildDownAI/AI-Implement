@@ -125,6 +125,7 @@ export type KgRefreshResume = z.infer<typeof kgResumeSchema>;
 /** The `KgRefresh.run` input — `KgRepo.submit` sends `{ ...options, triggerId }`, plus `resume` for a held snapshot's decision. */
 export const kgRefreshRunInputSchema = kgRefreshOptionsSchema.extend({
   triggerId: z.string(),
+  baseMode: z.literal(true).optional(),
   report: kgDryRunReportSchema.optional(),
   resume: kgResumeSchema.optional(),
 }).strict();
@@ -206,7 +207,7 @@ export interface KgDispatchRowDetails {
 
 /** What a status reader may see of the held snapshot; the commit and branch stay inside the workflow. */
 export interface KgRefreshHeldView {
-  snapshotPr: number;
+  snapshotPr: number | null;
   partTable: Array<{ part: string; prev: string; new: string }>;
   /** Why the run waits. */
   cause: "shrink" | "tracker-missing" | "source-failed";
@@ -225,7 +226,7 @@ export interface KgRefreshHeldView {
 export function heldViewOf(hold: KgHold): KgRefreshHeldView {
   const r = hold.report;
   return {
-    snapshotPr: r.snapshotPr!,
+    snapshotPr: r.snapshotPr ?? null,
     partTable: r.partTable ?? [],
     cause: r.cause ?? "shrink",
     failedTeams: r.failedTeams ?? [],
@@ -570,6 +571,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
      * once inside the step, and a close GitHub refuses (already merged or closed) does not fail it.
      */
     async function closeHeldPr(gate: string): Promise<void> {
+      if (resume && input.baseMode) ctx.set("holdConsumed", true);
       if (!heldPr) return;
       const { number, branch } = heldPr;
       heldPr = undefined;
@@ -990,6 +992,31 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return finish(successOutcome);
       }
 
+      async function ingestOnly(): Promise<RefreshOutcome> {
+        try { await ctx.promise<string>("cancel").resolve(KG_REFRESH_COMMITTED); }
+        catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          if (!(err instanceof restate.TerminalError && err.code === 409)) throw err;
+        }
+        const cancel = await ctx.promise<string>("cancel").get();
+        if (cancel !== KG_REFRESH_COMMITTED) return cleanupCancelled("signal");
+        ctx.set("committed", true);
+        if (resume) ctx.set("holdConsumed", true);
+        ctx.set("step", "ingest-only");
+        const outcome: RefreshOutcome = {
+          ok: true, at: await ctx.date.now(), detail: "ingest-only",
+          stampBefore: null, stampAfter: null,
+          ...(stepTable.length ? { steps: stepTable } : {}),
+          ...(reportedSources.length ? { sources: reportedSources } : {}),
+          ...(reportedWarnings.length ? { warnings: reportedWarnings } : {}),
+          ...(heldGate ? { held: true } : {}),
+        };
+        await ctx.run("persist", () => deps.persistLastRefresh({ ...outcome, dispatchId }));
+        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed", reportedWarnings.length || reportedGuardVerdict === "warnings" ? "warnings" : "passed"));
+        await notifyOutcome("success", outcome);
+        return finish(outcome);
+      }
+
       /** The decision on a held snapshot, run as its own `KgRefresh` run: the commit point, `past-merge`, and `status` are the ordinary ones. */
       async function resumeFromHold(resumed: KgRefreshResume): Promise<RefreshOutcome> {
         const { hold, action, actor } = resumed;
@@ -1002,7 +1029,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         reportedWarnings = held.warnings ?? [];
         reportedGuardVerdict = held.guardVerdict;
         stepTable = hold.steps;
-        heldPr = { number: heldPrNumber, branch: held.snapshotBranch };
+        heldPr = !input.baseMode && held.snapshotPr !== undefined ? { number: heldPrNumber, branch: held.snapshotBranch } : undefined;
         heldGate = true;
         ctx.set("step", "resume");
         // Take the row back first (AII-1493): the row reads `awaiting_decision` only while a hold is open and undecided.
@@ -1013,6 +1040,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ctx.console.error(`[KgRefresh] accept refused, snapshot is accept-blocked: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
           return cleanupCancelled("signal");
         }
+        if (action === "accept" && input.baseMode) return ingestOnly();
         if (action === "accept") {
           ctx.console.log(`[KgRefresh] decided accept by ${actor ?? "unknown"}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
           // The note is best effort: the merge is what matters. The step is never interrupted by a Restate
@@ -1125,11 +1153,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }
 
       // A held dry-run never reaches here: the dry-run branch above has already returned.
-      if (!report.ok && report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr !== undefined) {
+      if (!report.ok && report.failureCode === "KG_SNAPSHOT_HELD" && (input.baseMode || report.snapshotPr !== undefined)) {
         // Decision gate: the runner opened the snapshot PR and finished. Free the machine, hand the hold to
         // `KgRepo`, and end the run: nothing waits here, so a deploy need not drain it (AII-1489).
         const heldPrNumber = report.snapshotPr;
-        heldPr = { number: heldPrNumber, branch: report.snapshotBranch };
+        heldPr = !input.baseMode && heldPrNumber !== undefined ? { number: heldPrNumber, branch: report.snapshotBranch } : undefined;
         heldGate = true;
         const heldAt = await ctx.date.now();
         const decideBy = heldAt + decisionTimeoutMs;
@@ -1187,9 +1215,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         });
       }
 
+      if (input.baseMode && report.ok) return ingestOnly();
+
       if (!report.ok || report.snapshotPr === undefined || report.snapshotCommit === undefined) {
         // A held report with no PR number still pushed its branch; nothing else will delete it.
-        if (report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr === undefined && report.snapshotBranch) {
+        if (!input.baseMode && report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr === undefined && report.snapshotBranch) {
           const branch = report.snapshotBranch;
           try {
             await ctx.run("delete-held-branch", () => deleteSnapshotBranch(deps.rail, owner, repoName, branch), { maxRetryAttempts: 3 });
@@ -1204,7 +1234,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           buildFailureOutcome(at, report.failureReason ?? "runner reported failure"),
           report.failureCode ?? "report_failed",
         );
-        if (report.snapshotPr !== undefined) {
+        if (!input.baseMode && report.snapshotPr !== undefined) {
           await ctx.run("close-snapshot-pr", () =>
             closeSnapshotPr(deps.rail, owner, repoName, report.snapshotPr!, report.failureCode ?? "failed", report.snapshotBranch));
         }

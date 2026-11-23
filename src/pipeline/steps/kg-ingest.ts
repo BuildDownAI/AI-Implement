@@ -42,6 +42,7 @@ type SpawnImplFn = (
 interface KgIngestInputs extends Record<string, unknown> {
   /** KG source repo workspace — the directory the ingest runs in. */
   workspaceDir: string;
+  kgBaseMode?: boolean;
   /** Absolute path to the cloned code repo. Omit when clone-code-repo was skipped. */
   codeRepoDir?: string;
   /** Absolute path to the repos/ directory holding secondary repo clones. Passed as --repos-root. */
@@ -218,17 +219,20 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
     const venvPython = join(workspaceDir, ".venv", "bin", "python");
     const venvPip = join(workspaceDir, ".venv", "bin", "pip");
 
-    console.log("[kg-ingest] python3 -m venv .venv");
-    await runSetup("python3", ["-m", "venv", ".venv"]);
+    if (!inputs.kgBaseMode) {
+      console.log("[kg-ingest] python3 -m venv .venv");
+      await runSetup("python3", ["-m", "venv", ".venv"]);
 
-    console.log("[kg-ingest] pip install -r requirements.txt");
-    await runSetup(venvPip, ["install", "-r", "requirements.txt"]);
+      console.log("[kg-ingest] pip install -r requirements.txt");
+      await runSetup(venvPip, ["install", "-r", "requirements.txt"]);
+    }
 
     // Reset the shared tail buffer so ingest failures only contain ingest output,
     // not leftover venv-setup or pip-install lines.
     tailBuffer.length = 0;
 
     const ingestArgs = ["-m", "kg_ingest", "refresh"];
+    if (inputs.kgBaseMode) ingestArgs.push("--no-embed");
     if (codeRepoDir) ingestArgs.push("--code-repo", codeRepoDir);
     if (reposRootDir) ingestArgs.push("--repos-root", reposRootDir);
 

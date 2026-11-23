@@ -43,17 +43,17 @@ function mapToolAnswer(result: { content: Array<{ type: string; text: string }>;
   return refused([`HTTP ${String(parsed.status)}`, error, detail].filter(Boolean).join(": "));
 }
 
-export function createKgRefreshSchedulePipeline(kgSourceRepo: string): ScheduledPipeline {
+export function createKgRefreshSchedulePipeline(runRepo: string): ScheduledPipeline {
   return {
     async busy(ctx: ObjectContext): Promise<BusyRead> {
-      const lease = await ctx.objectClient<KgRepoDefinition>(KG_REPO, kgSourceRepo).status();
+      const lease = await ctx.objectClient<KgRepoDefinition>(KG_REPO, runRepo).status();
       if (lease === null) return { busy: false };
       return { busy: true, holder: lease.triggerId, awaitingDecision: lease.held != null };
     },
 
     async replace(ctx: ObjectContext, runId: string): Promise<void> {
       // One-way, and named by hold: a decision made meanwhile leaves no hold, so the send answers 409 and is dropped.
-      ctx.objectSendClient<KgRepoDefinition>(KG_REPO, kgSourceRepo).decide({
+      ctx.objectSendClient<KgRepoDefinition>(KG_REPO, runRepo).decide({
         action: "cancel", triggerId: runId, reason: KG_REFRESH_SUPERSEDED_REASON,
       });
     },

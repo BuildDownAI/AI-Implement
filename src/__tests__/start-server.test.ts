@@ -181,3 +181,16 @@ describe("while Restate cannot serve", () => {
     });
   });
 });
+
+describe("base refresh admin wiring", () => {
+  it("serves KG status without KG_SOURCE_REPO", async () => {
+    const source = await import("../kg-refresh-source.js");
+    source.setBootKgRefreshSource(source.resolveKgRefreshSource(null, {
+      kgCodeRepo: "acme/code", kgNamespace: "https://kg.example/", kgGraphName: "graph", kgGraphLabel: "Graph", kgStardogDb: "database",
+    }));
+    fakeFetch({ "POST /orchestratorTools/get_kg_status": { json: { content: [{ type: "text", text: JSON.stringify({ inFlight: null, lastRefresh: null }) }] } } }).install();
+    const response = await admin(await serve({ kgSourceRepo: null }), "/api/kg/status");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ inFlight: null });
+  });
+});

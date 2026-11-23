@@ -683,7 +683,8 @@ describe("KgRefresh durable workflow", () => {
     totalDeadlineMs: BOOTSTRAP_ONLY_TOTAL_DEADLINE_MS,
   });
 
-  const kgRepo = createKgRepo({ workflowName: "KgRefresh" });
+  let baseMode = false;
+  const kgRepo = createKgRepo({ workflowName: "KgRefresh", get baseMode() { return baseMode; } });
   const starter = restate.service({
     name: "KgRefreshStarter",
     handlers: {
@@ -766,6 +767,79 @@ describe("KgRefresh durable workflow", () => {
     },
     30_000,
   );
+
+  // Compare observable dependency calls only after the workflow has completed.
+  function baseExternalEffects() {
+    return { merge: mergePullRequestFn.mock.calls.length, close: closePullRequestFn.mock.calls.length,
+      deleteBranch: deleteBranchFn.mock.calls.length, comment: postPrCommentFn.mock.calls.length,
+      stickyComment: postOrUpdateStickyCommentFn.mock.calls.length, fetch: fetchTarballCallCount,
+      materialize: materializeCallCount, restart: restartCallCount, gates: [...gateOrder] };
+  }
+
+  it.each(VARIANTS.map(([label]) => label))("base dry run completes without publication or rail (%s)", async label => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+    const before = baseExternalEffects();
+    const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, dryRun: true });
+    await workflowDispatched(triggerId);
+    await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true, guardVerdict: "clean" });
+    expect(await done).toMatchObject({ ok: true, dryRun: true, detail: "dry run passed" });
+    expect(baseExternalEffects()).toEqual(before);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("base clean/warnings reports succeed without a PR or rail (%s)", async label => {
+    const env = envFor(label);
+    for (const guardVerdict of ["clean", "warnings"] as const) {
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const beforeEffects = baseExternalEffects();
+      const beforeFetch = fetchTarballCallCount;
+      const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, ok => ok, { label: "base dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true, guardVerdict });
+      expect(await done).toMatchObject({ ok: true, detail: "ingest-only" });
+      expect(baseExternalEffects()).toEqual(beforeEffects);
+      expect(fetchTarballCallCount).toBe(beforeFetch);
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("base reports enter a hold without a PR and accept it (%s)", async label => {
+    const env = envFor(label);
+    baseMode = true;
+    try {
+      const trigger = await triggerViaKgRepo(env.baseUrl());
+      const triggerId = (trigger as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      const beforeEffects = baseExternalEffects();
+      const beforeFetch = fetchTarballCallCount;
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: false, failureCode: "KG_SNAPSHOT_HELD" });
+      expect(await done).toMatchObject({ held: true, conclusion: "awaiting_decision" });
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ held: { snapshotPr: null } });
+      const decided = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "decide", { triggerId, action: "accept", actor: "admin@example.com" });
+      await eventually(() => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${decided.triggerId}'`), rows => rows.length > 0, { label: "base decision run delivered" });
+      expect(await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", decided.triggerId)).toMatchObject({ ok: true, detail: "ingest-only" });
+      await eventually(() => kgRepoStatus(env.baseUrl()), value => value === null, { label: "base hold released" });
+      expect(baseExternalEffects()).toEqual(beforeEffects);
+      expect(fetchTarballCallCount).toBe(beforeFetch);
+    } finally { baseMode = false; }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("base held reports have no PR and accept/cancel/timeout without GitHub (%s)", async label => {
+    const env = envFor(label);
+    for (const action of ["accept", "cancel", "timeout"] as const) {
+      const triggerId = newTriggerId();
+      const hold = { triggerId, dispatchId: triggerId, decideBy: Date.now() + 60_000, steps: [], report: { ok: false, failureCode: "KG_SNAPSHOT_HELD" } };
+      const beforeEffects = baseExternalEffects();
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const outcome = await runWorkflow(env.baseUrl(), newTriggerId(), { baseMode: true, resume: { hold, action, actor: "admin@example.com" } });
+      expect(outcome).toMatchObject(action === "accept" ? { ok: true, detail: "ingest-only" } : { ok: false, conclusion: action === "cancel" ? "operator_cancelled" : "decision_timeout" });
+      expect(baseExternalEffects()).toEqual(beforeEffects);
+      expect(closePullRequestFn.mock.calls.length).toBe(beforeClose);
+    }
+  });
 
   // ---- W1 / W11: success report runs merge, delete-branch, the four real gates, persist,
   // close-row, one outcome call, settled, one release — each exactly once. it.each already

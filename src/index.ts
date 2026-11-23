@@ -1,5 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { resolveKgRefreshSource, setBootKgRefreshSource, kgRefreshRunRepo, getBootKgRefreshSource } from "./kg-refresh-source.js";
+import { getStardogValues } from "./kg-graph-source.js";
 import { bindKey, clearKeyBinding } from "./restate/key-binding.js";
 import { initKeyBindingsTable } from "./key-bindings.js";
 import { checkTrackerWrites } from "./tracker-write-gate.js";
@@ -169,7 +171,7 @@ import {
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
-import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { findKgMapping, createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createKgRepo } from "./restate/kg-repo.js";
 import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, IMPLEMENTATION_CONTEXT_ISSUE_MODELS_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
@@ -4395,7 +4397,8 @@ export function startServer(
   memoryProvider: MemoryProvider | null,
   memoryProviderDiagnostic: string | null,
 ): http.Server {
-  const kgRefreshAdminDeps = config.kgSourceRepo ? makeKgRefreshAdminDeps(config.kgSourceRepo, kgRefreshIngressClient) : undefined;
+  const runRepo = kgRefreshRunRepo(config.kgSourceRepo);
+  const kgRefreshAdminDeps = runRepo ? makeKgRefreshAdminDeps(runRepo, kgRefreshIngressClient) : undefined;
   const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
     credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
@@ -4405,7 +4408,7 @@ export function startServer(
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
-    kgSourceRepo: config.kgSourceRepo,
+    kgSourceRepo: runRepo,
     dryRunOutcomes: kgRefreshIngressClient,
   });
   migrateLegacyDryRunOutcomes();
@@ -4651,7 +4654,7 @@ export function startServer(
         res.end(JSON.stringify({ error: "Webhook endpoint not configured: GITHUB_WEBHOOK_SECRET is not set" }));
         return;
       }
-      handleGitHubWebhook(req, res, config.githubWebhookSecret, config.githubAppId, config.githubAppPrivateKey, config.selfDeployTarget ?? undefined, {
+      handleGitHubWebhook(req, res, config.githubWebhookSecret, config.githubAppId, config.githubAppPrivateKey, config.selfDeployTarget ?? undefined, getBootKgRefreshSource()?.mode === "base" ? undefined : {
         kgSourceRepo: config.kgSourceRepo,
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
@@ -4754,7 +4757,7 @@ export function startServer(
           submitLateExternalReview: lateExternalReviewSubmitHook,
           onReviewFixResult,
           kgRefreshClient: kgRefreshIngressClient,
-          kgSourceRepo: config.kgSourceRepo,
+          kgSourceRepo: runRepo,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
@@ -4834,7 +4837,7 @@ export function startServer(
           body: parsed,
           secret: config.runnerTokenSecret,
           kgRefreshClient: kgRefreshIngressClient,
-          kgSourceRepo: config.kgSourceRepo,
+          kgSourceRepo: runRepo,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
@@ -5398,7 +5401,15 @@ async function main(): Promise<void> {
   await restateSidecar.start();
 
   const config = loadConfig();
-  if (!config.kgSourceRepo) console.log("[kg] KG_SOURCE_REPO not set — knowledge graph disabled");
+  const graph = getStardogValues();
+  const stored = getOrchestratorSettings();
+  const refreshSource = resolveKgRefreshSource(config.kgSourceRepo, {
+    kgCodeRepo: stored.kgCodeRepo, kgNamespace: graph.namespace, kgGraphName: graph.graphName,
+    kgGraphLabel: stored.kgGraphLabel, kgStardogDb: graph.db,
+  });
+  setBootKgRefreshSource(refreshSource);
+  console.log(refreshSource.mode === "unavailable" ? `[kg-refresh] ${refreshSource.reason}` : `KG source: ${refreshSource.runRepo} (${refreshSource.mode})`);
+  if (refreshSource.mode === "unavailable") console.log("[kg] KG refresh unavailable");
 
   // Resolved once here (rather than inside startServer) so its boot-time liveness probe can
   // run, and complete, before postBootNotice below decides the deploy outcome (AII-648). The
@@ -5438,13 +5449,14 @@ async function main(): Promise<void> {
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
   const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config),
     (mapping, issueId, subject, repo, prNumber, budget) => parkRestatePrBudget(config, registry, mapping, issueId, subject, repo, prNumber, budget));
-  // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
-  // tool handlers then answer 501 from their unset deps.
-  const kgSourceRepo = config.kgSourceRepo;
+  // Register refresh services when boot resolved a customer or base run identity.
+  const kgSourceRepo = kgRefreshRunRepo(config.kgSourceRepo);
+  const source = getBootKgRefreshSource();
   const kgSlug = kgSourceRepo ? parseKgSourceRepo(kgSourceRepo) : null;
   const kgWorkflowToken = () => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, kgSlug!.owner);
   const kgComposition = kgSourceRepo && kgSlug
     ? createProductionKgRefreshServices({
+      source: source?.mode !== "unavailable" ? source : undefined,
       kgSourceRepo,
       config,
       mintToken: getScopedInstallationToken,
@@ -5484,6 +5496,8 @@ async function main(): Promise<void> {
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
         kgSourceRepo,
+        kgBaseMode: source?.mode === "base",
+        dependencyTokenScope: findKgMapping(kgSourceRepo)?.[1]?.dependencyTokenScope ?? undefined,
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
       }),
     })
