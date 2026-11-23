@@ -4,7 +4,7 @@
 // step and the wait between attempts is a `ctx.sleep`: a retry loop inside one `ctx.run`
 // would be one long step that the invoker inactivity timeout can stop (AII-2036).
 //
-// This module has no production caller yet. The caller supplies the URI and container
+// The local serve launch calls this module. The caller supplies the URI and container
 // state readers, because those belong to local Docker; this helper owns only the bounded
 // attempt sequence. Pattern anchors: `registerRunnerDeployment` in endpoint.ts and the
 // tick loop of `awaitOwnedRun` in owned-run-wait.ts.

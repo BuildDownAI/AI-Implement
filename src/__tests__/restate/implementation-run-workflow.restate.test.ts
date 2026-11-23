@@ -51,7 +51,7 @@ import * as managedAuth from "../../managed-dispatch-auth.js";
 import * as admission from "../../dispatch-admission.js";
 import * as github from "../../github.js";
 import { enqueueCommentGapfill, enqueueConflictResolution, getCommentGapfillItem } from "../../comment-gapfill-queue.js";
-import { getJobByDispatchId } from "../../log.js";
+import { getInvocationAttribution, getJobByDispatchId } from "../../log.js";
 import { makeMapping } from "../helpers/builders.js";
 import { makeJob } from "../helpers/builders.js";
 import { finishImplementationJob } from "../../restate/implementation-run-finish.js";
@@ -1091,6 +1091,26 @@ describe("ImplementationRun durable workflow", () => {
       .get(w.dispatchId) as { invocations_complete: number } | undefined;
     expect(report?.invocations_complete ?? 0).toBe(0);
 
+    w.sc.status = "ended";
+    await w.done;
+  }, 60_000);
+
+  it.each(labels)("final attribution selects implementation after live review (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started" });
+    await waitForStep(w.read, "wait");
+    appendLog({ dispatchId: w.dispatchId, issueId: w.dispatchId, issueIdentifier: "ENG-1",
+      teamKey: "ENG", repo: "o/r", phase: "implementation", status: "running" });
+    const usage = seedUsage(w.dispatchId);
+    usage.records[1].attribution.stage = "review";
+    const attribution = usage.records[0].attribution;
+    for (const record of usage.records) {
+      await callWorkflow(baseUrl(slow, label), "ImplementationRun", w.dispatchId, "recordInvocation", record);
+    }
+    expect(getInvocationAttribution(w.dispatchId)?.stage).toBe("review");
+    await callWorkflow(baseUrl(slow, label), "ImplementationRun", w.dispatchId, "report",
+      { usage: { ...usage, attribution } });
+    expect(getInvocationAttribution(w.dispatchId)?.invocationId).toBe(attribution.invocationId);
+    expect(getJobByDispatchId(w.dispatchId)?.attribution?.invocationId).toBe(attribution.invocationId);
     w.sc.status = "ended";
     await w.done;
   }, 60_000);

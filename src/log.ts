@@ -1330,6 +1330,19 @@ export function recordInvocationAttribution(
   return info.changes > 0;
 }
 
+/** Make an accepted final attribution the dispatch's latest row without replacing stored usage.
+ * The caller's result transaction includes both insertion and promotion. Already-last rows
+ * stay in place on replay; invocation ids belonging to another dispatch cannot be promoted.
+ */
+export function promoteInvocationAttribution(dispatchId: string, invocationId: string): void {
+  getDb().prepare(`
+    UPDATE model_invocation_attribution
+    SET rowid = (SELECT MAX(rowid) + 1 FROM model_invocation_attribution)
+    WHERE dispatch_id = ? AND invocation_id = ?
+      AND rowid < (SELECT MAX(rowid) FROM model_invocation_attribution WHERE dispatch_id = ?)
+  `).run(dispatchId, invocationId, dispatchId);
+}
+
 /** Best-effort parse: a malformed or pre-migration row reads as "no failure" rather than throwing. */
 export function parseFailureJson(raw: string | null): FailureRecord | null {
   if (!raw) return null;
