@@ -861,8 +861,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
         try {
           await deps.acceptRunnerResult!(owner.input, intent.snapshot.runnerResult);
           recordUsage(dispatchId, toRecordedUsage(intent.snapshot.runnerResult));
-        } catch {
-          console.error(`[implementation-run] saved runner result intake replay failed: ${dispatchId}`);
+        } catch (error) {
+          console.error(`[implementation-run] saved runner result intake replay failed: ${dispatchId}`, error);
           return { reason: "termination_unconfirmed" };
         }
       }

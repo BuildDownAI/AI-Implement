@@ -6,9 +6,10 @@ import { testDb } from "./helpers/test-db.js";
 
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
+let usage: typeof import("../agent-usage.js");
 
 beforeEach(async () => {
-  ({ dedup, log } = (await testDb({ modules: { dedup: () => import("../dedup.js"), log: () => import("../log.js") } })).modules);
+  ({ dedup, log, usage } = (await testDb({ modules: { dedup: () => import("../dedup.js"), log: () => import("../log.js"), usage: () => import("../agent-usage.js") } })).modules);
 });
 
 afterEach(() => {
@@ -136,5 +137,70 @@ describe("selected invocation attribution through the Job read model", () => {
     const selected = log.getJobByDispatchId("d-selected")!.attribution;
     expect(selected).toMatchObject({ invocationId: "inv-new", model: "model-new", usage: { tokensIn: 20, costUsd: null } });
     expect(log.getJobByDispatchId("d-other")!.attribution).toMatchObject({ invocationId: "inv-other", model: "model-other" });
+  });
+});
+
+describe("final result attribution order", () => {
+  function seed(dispatchId: string) {
+    job(dispatchId);
+    const selection = { agent: "codex", provider: "openai", model: "m", accountProfileId: "p", invocationTimeoutMs: 60_000 };
+    const profile = { id: "p", identity: "account", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key" };
+    dedup.getDb().prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(dispatchId, dispatchId,
+        JSON.stringify({ stages: { planning: selection, implementation: selection, review: selection }, profiles: { planning: profile, implementation: profile, review: profile } }),
+        JSON.stringify(Object.fromEntries(["planning", "implementation", "review"].map(stage => [stage, Object.fromEntries(Object.keys(selection).map(field => [field, "project"]))]))),
+        JSON.stringify({ orchestratorDefault: { configRevisionId: "r1", revision: 1 }, project: { configRevisionId: "r2", revision: 1 } }));
+    const records = ["implementation", "review"].map(stage => ({ attribution: {
+      version: 1, invocationId: `${dispatchId}-${stage}`, snapshotId: dispatchId, stage,
+      agent: "codex", provider: "openai", model: "m", profileId: "p", authMode: "openai-api-key",
+      limit: null, outcome: "success",
+      usage: { availability: "complete", tokensIn: 12, tokensOut: 2, costUsd: 1, costStatus: "reported" },
+    } }));
+    return usage.toRecordedUsage({ invocations: records, attribution: records[0].attribution });
+  }
+
+  const rows = (id: string) => dedup.getDb().prepare(
+    "SELECT rowid, * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY rowid",
+  ).all(id) as Array<{ rowid: number; invocation_id: string; stage: string; status: string; usage_json: string }>;
+
+  it("matches final-only order and attribution, and replay leaves rows untouched", () => {
+    const live = seed("live");
+    for (const record of live.records) usage.recordUsage("live", { ...live, records: [record], attribution: null, listWhole: false });
+    usage.recordUsage("live", live);
+    const final = seed("final");
+    usage.recordUsage("final", final);
+    for (const id of ["live", "final"]) {
+      expect(rows(id).map(r => r.stage)).toEqual(["review", "implementation"]);
+      expect(log.getInvocationAttribution(id)).toMatchObject({ invocationId: `${id}-implementation` });
+      expect(log.getJobByDispatchId(id)?.attribution).toEqual(log.getInvocationAttribution(id));
+      const before = rows(id);
+      usage.recordUsage(id, id === "live" ? live : final);
+      expect(rows(id)).toEqual(before);
+    }
+  });
+
+  it("preserves timeout status and all persisted contents when promoting", () => {
+    const result = seed("timeout");
+    usage.recordUsage("timeout", { ...result, records: [result.records[0]], timedOut: true, listWhole: false });
+    const before = rows("timeout")[0];
+    usage.recordUsage("timeout", { ...result, records: [result.records[1]], attribution: null, listWhole: false });
+    usage.recordUsage("timeout", result);
+    const after = rows("timeout")[1];
+    expect(after.status).toBe("timed_out");
+    expect({ ...after, rowid: 0 }).toEqual({ ...before, rowid: 0 });
+  });
+
+  it("cannot promote an invocation owned by another dispatch or a rejected claim", () => {
+    const owner = seed("owner");
+    usage.recordUsage("owner", owner);
+    const before = rows("owner");
+    const other = seed("other");
+    usage.recordUsage("other", { ...other, attribution: owner.attribution });
+    expect(rows("owner")).toEqual(before);
+    expect(log.getInvocationAttribution("other")?.stage).toBe("review");
+    usage.recordUsage("other", { ...other, attribution: { ...other.attribution!, invocationId: owner.attribution!.invocationId } });
+    expect(rows("owner")).toEqual(before);
+    expect(log.getInvocationAttribution("other")?.stage).toBe("review");
   });
 });
