@@ -33,6 +33,8 @@ A test result must not depend on the machine that runs it — a laptop, a CI run
 | The temp directory | Each test file gets its own inside the run's, which the scrub points `TMPDIR`, `TMP` and `TEMP` at; anything left in it fails that file | Every run, on every OS |
 | Runner credentials (`RUN_TOKEN`, `RUNNER_CALLBACK_URL`, `RUN_PROGRESS_TOKEN`, `RUN_PUBLICATION_TOKEN`, `GIT_KG_PUSH_TOKEN_FILE`) | `clear-runner-credentials.ts` deletes them again before each test | Every run |
 
+The temp directory check lists the contents of each left directory as sorted relative paths, limited to 20 paths per top entry with a notice when more exist, without following symbolic links.
+
 ### The environment scrub
 
 Each config lists a scrub file first in `setupFiles`. vitest runs setup files inside each test file's worker, before it imports the test file, so the scrub's top-level code runs before any test or module under test reads `process.env`. The scrub deletes every variable the allowlist does not cover, sets each pinned value, then points the temp-root variables at the run's temp directory (below). Names match in any case, on every OS, because Windows names variables case-insensitively and lists `PATH` as `Path`.

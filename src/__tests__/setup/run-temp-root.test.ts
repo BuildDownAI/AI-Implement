@@ -1,5 +1,5 @@
 // The test run's temp directory and its checks (run-temp-root.ts), called directly rather than through vitest's globalSetup and the scrub.
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
@@ -97,5 +97,56 @@ describe("a test file's temp directory", () => {
     expect(() => endFileTempRoot(dir)).toThrow(dir);
     expect(() => endFileTempRoot(dir)).toThrow("left-behind.txt");
     expect(existsSync(join(dir, "left-behind.txt"))).toBe(true);
+  });
+});
+
+// Both teardown paths use the same bounded listing, relative to the checked root.
+describe.each(["file", "run"] as const)("%s leftover diagnostics", scope => {
+  function fixture() {
+    const { root, teardown } = startRun();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    onTestFinished(() => error.mockRestore());
+    return { root, message: () => {
+      if (scope === "run") {
+        teardown();
+        expect(process.exitCode).toBe(1);
+        return String(error.mock.calls[0]?.[0]).split("for inspection: ")[1];
+      }
+      expect(() => endFileTempRoot(root)).toThrow("Left in this test file's temp directory");
+      try { endFileTempRoot(root); } catch (cause) {
+        return (cause as Error).message.split("for inspection: ")[1];
+      }
+      throw new Error("Expected leftovers to fail");
+    } };
+  }
+
+  it("lists sorted nested paths and does not follow symbolic links", () => {
+    const { root, message } = fixture();
+    mkdirSync(join(root, "left", "nested"), { recursive: true });
+    mkdirSync(join(root, "left", "empty"));
+    writeFileSync(join(root, "left", "z.txt"), "");
+    writeFileSync(join(root, "left", "nested", "b.txt"), "");
+    writeFileSync(join(root, "left", "nested", "a.txt"), "");
+    symlinkSync(join(root, "left"), join(root, "link"), "junction");
+    writeFileSync(join(root, "plain.txt"), "");
+    expect(message()).toBe([
+      join("left", "empty"), join("left", "nested", "a.txt"),
+      join("left", "nested", "b.txt"), join("left", "z.txt"), "link", "plain.txt",
+    ].join(", "));
+    expect(existsSync(join(root, "left", "z.txt"))).toBe(true);
+  });
+
+  it.each([20, 21])("limits each top entry independently with %i files", count => {
+    const { root, message } = fixture();
+    const expected: string[] = [];
+    for (const top of ["first", "second"]) {
+      mkdirSync(join(root, top));
+      for (let index = count - 1; index >= 0; index--) {
+        writeFileSync(join(root, top, `${String(index).padStart(2, "0")}.txt`), "");
+      }
+      for (let index = 0; index < 20; index++) expected.push(join(top, `${String(index).padStart(2, "0")}.txt`));
+      if (count > 20) expected.push(`${top}: more paths exist`);
+    }
+    expect(message()).toBe(expected.join(", "));
   });
 });
