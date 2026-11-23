@@ -1067,7 +1067,7 @@ describe("runner-service process entry (AII-2034)", () => {
   }, 60_000);
 
   it("exits with an error when AI_IMPLEMENT_RUNNER_ID or RESTATE_IDENTITY_KEY is missing", () => {
-    const publicKey = envs.get("alwaysReplay")!.identityKey()!;
+    const publicKey = envs.get("strict")!.identityKey()!;
     for (const env of [{ [RUNNER_IDENTITY_KEY_ENV]: publicKey }, { [RUNNER_ID_ENV]: randomUUID() }]) {
       const result = spawnSync(process.execPath, [entry], { env: childEnv(env), timeout: 15_000, stdio: "pipe" });
       expect(result.error).toBeUndefined();

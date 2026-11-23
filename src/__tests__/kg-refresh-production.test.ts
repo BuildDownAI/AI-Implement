@@ -179,6 +179,7 @@ describe("createProductionKgRefreshServices", () => {
     expect(deps.bootstrapDeadlineMs).toBeUndefined();
     expect(deps.totalDeadlineMs).toBeUndefined();
     expect(deps.watchIntervalMs).toBeUndefined();
+    expect(deps.dispatchRetryInitialIntervalMs).toBeUndefined();
   });
 
   it("persists a failed preflight as a preflight-gate outcome", () => {

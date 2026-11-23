@@ -2,7 +2,9 @@
 // first use, so a test gets its own database only by pointing the path elsewhere and then importing
 // every database module again after a registry reset. testDb() does both, in that order, and
 // cleans up when the test finishes. See README.md in this directory.
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { onTestFinished, vi } from "vitest";
 import type * as DedupModule from "../../dedup.js";
 import { testDir } from "./test-dir.js";
@@ -26,6 +28,30 @@ const BOOT_TABLE_INITS: ReadonlyArray<() => Promise<void>> = [
   async () => (await vi.importActual<typeof import("../../review-fix-evidence.js")>("../../review-fix-evidence.js")).initReviewFixEvidenceTable(),
 ];
 
+const TEMPLATE_KEY = Symbol.for("ai-implement.testDbSchemaTemplate");
+
+async function getSchemaTemplate(): Promise<Buffer> {
+  const store = globalThis as Record<symbol, Buffer | undefined>;
+  const cached = store[TEMPLATE_KEY];
+  if (cached) return cached;
+
+  const dedupActual = await vi.importActual<typeof DedupModule>("../../dedup.js");
+  const savedPath = process.env.DEDUP_DB_PATH;
+  process.env.DEDUP_DB_PATH = ":memory:";
+  try {
+    dedupActual.setTestDb(null, ":memory:");
+    const handle = dedupActual.getDb();
+    for (const init of BOOT_TABLE_INITS) await init();
+    const buf = handle.serialize();
+    dedupActual.setTestDb(null);
+    store[TEMPLATE_KEY] = buf;
+    return buf;
+  } finally {
+    if (savedPath === undefined) delete process.env.DEDUP_DB_PATH;
+    else process.env.DEDUP_DB_PATH = savedPath;
+  }
+}
+
 type Loaders = Record<string, () => Promise<unknown>>;
 
 /** Each loader's module, as its `import()` resolved. */
@@ -38,26 +64,31 @@ export interface TestDbOptions<L extends Loaders> {
   /** `"all"` (the default) creates every table boot creates. `"none"` leaves the file unopened,
    *  for a test of a missing table or of upgrading an older schema. */
   tables?: "all" | "none";
+  /** `"disk"` (the default) creates a fresh SQLite file in a temp dir and resets the Vitest module
+   *  registry. `"memory"` swaps a fresh `:memory:` clone of the boot schema into `dedup.ts` without
+   *  calling `vi.resetModules()` or touching the filesystem, which is orders of magnitude faster
+   *  for suites whose modules keep state in SQLite rather than module globals. */
+  mode?: "disk" | "memory";
 }
 
 export interface TestDb<L extends Loaders> {
-  /** The database file. Nothing exists at this path until a module opens it. */
+  /** The database file, or `":memory:"` when `mode: "memory"` is used. */
   path: string;
-  /** The requested modules, imported after the reset, so each reads this database. */
+  /** The requested modules, imported after the reset (or from cache in `mode: "memory"`). */
   modules: LoadedModules<L>;
-  /** A process restart against the same file: closes the database, resets the registry, creates
+  /** A process restart against the same database: closes the handle, resets the registry, creates
    *  tables as the first call did, and returns freshly imported modules. */
   reopen(): Promise<LoadedModules<L>>;
 }
 
-/** Points the database at a new file in a temporary directory, resets the module registry, and
- *  imports the requested modules. When the test finishes, the database is closed, the previous
- *  `DEDUP_DB_PATH` restored, and the directory removed. Call it from a test or a `beforeEach`. */
+/** Points the database at a fresh isolated SQLite instance and imports the requested modules.
+ *  When the test finishes, the database is closed, `DEDUP_DB_PATH` restored, and any temp directory
+ *  removed. Call it from a test or a `beforeEach`. */
 export async function testDb<L extends Loaders = Record<never, never>>(
   options: TestDbOptions<L> = {},
 ): Promise<TestDb<L>> {
-  // Cleanups run last-registered first: close the database, restore the path, then remove the directory.
-  const path = join(testDir("db"), "dedup.sqlite");
+  const mode = options.mode ?? "disk";
+  const path = mode === "memory" ? ":memory:" : join(testDir("db"), "dedup.sqlite");
 
   const previousPath = process.env.DEDUP_DB_PATH;
   onTestFinished(() => {
@@ -68,24 +99,71 @@ export async function testDb<L extends Loaders = Record<never, never>>(
 
   // Reassigned by reopen(), so the cleanup closes whichever instance is current when the test ends.
   let dedup: typeof DedupModule | undefined;
-  onTestFinished(() => dedup?.closeDb());
+  onTestFinished(() => {
+    if (mode === "memory") dedup?.setTestDb(null);
+    else dedup?.closeDb();
+  });
 
-  async function load(): Promise<LoadedModules<L>> {
-    vi.resetModules();
-    dedup = await import("../../dedup.js");
-    if (options.tables !== "none") for (const init of BOOT_TABLE_INITS) await init();
+  async function importRequested(): Promise<LoadedModules<L>> {
     const loaded: Record<string, unknown> = {};
     for (const [name, loader] of Object.entries(options.modules ?? {})) loaded[name] = await loader();
     // Built key by key from L's own entries, so the mapped type describes it exactly.
     return loaded as LoadedModules<L>;
   }
 
+  async function loadInitial(): Promise<LoadedModules<L>> {
+    if (mode === "memory") {
+      const template = options.tables === "none" ? null : await getSchemaTemplate();
+      dedup = await import("../../dedup.js");
+      if (template) {
+        dedup.setTestDb(new Database(template), ":memory:");
+      } else {
+        dedup.setTestDb(null, ":memory:");
+      }
+      return importRequested();
+    }
+
+    vi.resetModules();
+    if (options.tables !== "none") {
+      const template = await getSchemaTemplate();
+      writeFileSync(path, template);
+      dedup = await import("../../dedup.js");
+      const handle = new Database(path);
+      handle.pragma("journal_mode = WAL");
+      dedup.setTestDb(handle, path);
+    } else {
+      dedup = await import("../../dedup.js");
+    }
+    return importRequested();
+  }
+
+  async function loadReopen(): Promise<LoadedModules<L>> {
+    if (mode === "memory") {
+      const snapshot = dedup ? dedup.getDb().serialize() : null;
+      dedup?.setTestDb(null);
+      vi.resetModules();
+      dedup = await import("../../dedup.js");
+      if (snapshot) {
+        dedup.setTestDb(new Database(snapshot), ":memory:");
+      } else {
+        dedup.setTestDb(null, ":memory:");
+      }
+      if (options.tables !== "none") for (const init of BOOT_TABLE_INITS) await init();
+      return importRequested();
+    }
+
+    dedup?.closeDb();
+    vi.resetModules();
+    dedup = await import("../../dedup.js");
+    if (options.tables !== "none") for (const init of BOOT_TABLE_INITS) await init();
+    return importRequested();
+  }
+
   return {
     path,
-    modules: await load(),
+    modules: await loadInitial(),
     async reopen() {
-      dedup?.closeDb();
-      return load();
+      return loadReopen();
     },
   };
 }

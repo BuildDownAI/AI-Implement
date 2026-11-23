@@ -97,8 +97,8 @@ describe("ReviewFixAttempt journal at its pause points", () => {
   afterAll(async () => { reportGate.release(); await stopAll(envs); });
 
   it("matches the committed journal at the reconcile, wait and inspect pause points", async () => {
-    const env = envs.get("disableRetries");
-    if (!env) throw new Error("missing Restate variant disableRetries");
+    const env = envs.get("strict");
+    if (!env) throw new Error("missing Restate variant strict");
     const commands = async (key: string): Promise<JournalCommand[]> => {
       const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${key}' AND target_handler_name = 'run'`);
       if (rows.length !== 1) return [];

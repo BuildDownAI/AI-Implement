@@ -164,7 +164,7 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
         hash,
         expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
       });
-      const sleepMs = 8_000;
+      const sleepMs = 3_000;
       const inFlight = callObject(ingressBaseUrl, "Operator", key, "refresh", { presentedHash: hash, sleepMs });
       // Attach this immediately so an assertion failure during registration cannot
       // turn the still-pending request into an unhandled rejection during cleanup.
