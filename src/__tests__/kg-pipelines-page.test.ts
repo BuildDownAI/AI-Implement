@@ -78,7 +78,7 @@ describe("KG page — Graph source card", () => {
     expect(refreshCard).not.toContain('id="kg-graph-source"');
   });
 
-  it("loads the effective source and Stardog values without adding graph-details fields", async () => {
+  it("loads the effective source, Stardog values and graph details", async () => {
     const { win } = mount(async (url) => {
       if (url === "/api/settings") return response(200, SETTINGS);
       throw new Error(`unexpected api call ${url}`);
@@ -102,8 +102,9 @@ describe("KG page — Graph source card", () => {
     expect(doc.getElementById("kg-graph-customer-repo-note")?.hidden).toBe(true);
     expect(doc.body.textContent).toContain("Stardog bills each query.");
     expect(doc.body.textContent).not.toContain("Dataset");
-    expect(doc.body.textContent).not.toContain("Graph name");
-    expect(doc.body.textContent).not.toContain("Namespace");
+    expect(doc.body.textContent).toContain("Graph details");
+    expect((doc.getElementById("kg-namespace") as HTMLInputElement).value).toBe("");
+    expect((doc.getElementById("kg-graph-name") as HTMLInputElement).value).toBe("");
   });
 
   it("defaults an empty import host and shows the customer-repo note when set", async () => {

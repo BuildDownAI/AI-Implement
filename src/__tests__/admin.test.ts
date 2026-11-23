@@ -2729,6 +2729,92 @@ describe("admin settings", () => {
       expect(settings).not.toHaveProperty("token");
     });
 
+    it("POST /api/settings stores and returns the graph details and namespace rows", async () => {
+      const token = await login("secret");
+      const res = await request("/api/settings", "POST", "secret", {
+        kg_namespace: "https://kg.builddown.dev/",
+        kg_graph_name: "builddown-kg",
+        kg_code_repo: "BuildDownAI/bd-knowledge-graph",
+        kg_graph_label: "Builddown KG",
+      } as never, token);
+      expect(res.statusCode).toBe(200);
+      const settings = await getSettings(token);
+      expect(settings).toMatchObject({
+        kg_namespace: "https://kg.builddown.dev/",
+        kg_graph_name: "builddown-kg",
+        kg_code_repo: "BuildDownAI/bd-knowledge-graph",
+        kg_graph_label: "Builddown KG",
+      });
+    });
+
+    it("POST /api/settings clears an empty graph detail row and preserves an omitted one", async () => {
+      const token = await login("secret");
+      await request("/api/settings", "POST", "secret", {
+        kg_namespace: "https://kg.builddown.dev/",
+        kg_graph_name: "builddown-kg",
+        kg_code_repo: "BuildDownAI/bd-knowledge-graph",
+        kg_graph_label: "Builddown KG",
+      } as never, token);
+      const res = await request("/api/settings", "POST", "secret", {
+        kg_namespace: "",
+        kg_graph_label: "Renamed",
+      } as never, token);
+      expect(res.statusCode).toBe(200);
+      const settings = await getSettings(token);
+      expect(settings).toMatchObject({
+        kg_namespace: "",
+        kg_graph_name: "builddown-kg",
+        kg_code_repo: "BuildDownAI/bd-knowledge-graph",
+        kg_graph_label: "Renamed",
+      });
+    });
+
+    it.each([
+      ["kg_namespace", "not-a-url"],
+      ["kg_namespace", "javascript:alert(1)"],
+      ["kg_graph_name", "bad/name"],
+      ["kg_graph_name", "bad name"],
+      ["kg_code_repo", "no-slash"],
+      ["kg_code_repo", "owner/name/extra"],
+      ["kg_code_repo", "-owner/name"],
+      ["kg_graph_label", "bad\nlabel"],
+      ["kg_graph_label", "Label\n"],
+      ["kg_graph_label", "\nLabel"],
+      ["kg_graph_label", "x".repeat(201)],
+      ["kg_graph_label", ` ${"x".repeat(200)} `],
+      ["kg_graph_label", `${"x".repeat(200)}\n`],
+    ])("POST /api/settings answers 400 for a bad %s and stores nothing", async (field, value) => {
+      const token = await login("secret");
+      await request("/api/settings", "POST", "secret", {
+        kg_stardog_db: "builddown-kg",
+        kg_namespace: "https://kg.builddown.dev/",
+        kg_graph_name: "builddown-kg",
+        kg_code_repo: "BuildDownAI/bd-knowledge-graph",
+        kg_graph_label: "Builddown KG",
+      } as never, token);
+      const res = await request("/api/settings", "POST", "secret", {
+        kg_stardog_db: "changed-db",
+        kg_graph_label: "Changed label",
+        [field]: value,
+      } as never, token);
+      expect(res.statusCode).toBe(400);
+      expect(await getSettings(token)).toMatchObject({
+        kg_stardog_db: "builddown-kg",
+        kg_namespace: "https://kg.builddown.dev/",
+        kg_graph_name: "builddown-kg",
+        kg_code_repo: "BuildDownAI/bd-knowledge-graph",
+        kg_graph_label: "Builddown KG",
+      });
+    });
+
+    it("POST /api/settings accepts a 200-character graph label", async () => {
+      const token = await login("secret");
+      const label = "x".repeat(200);
+      const res = await request("/api/settings", "POST", "secret", { kg_graph_label: label } as never, token);
+      expect(res.statusCode).toBe(200);
+      expect((await getSettings(token)).kg_graph_label).toBe(label);
+    });
+
     it("POST /api/settings with kgGraphSource does not change the source", async () => {
       const token = await login("secret");
       const res = await request("/api/settings", "POST", "secret", { kgGraphSource: "stardog_run" } as never, token);

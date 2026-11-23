@@ -90,12 +90,17 @@ function validate(field: keyof typeof keys, value: string): void {
   }
 }
 
-/** Partial updates are atomic, including the encrypted token. Errors never contain supplied values. */
-export function setStardogValues(values: StardogValuesUpdate): void {
+/** Validates a partial update without writing, so a caller can reject a whole request before touching rows. */
+export function validateStardogValues(values: StardogValuesUpdate): void {
   for (const field of Object.keys(keys) as Array<keyof typeof keys>) {
     if (values[field] !== undefined) validate(field, values[field]);
   }
   if (values.token !== undefined && typeof values.token !== "string") throw new Error("Invalid Stardog token");
+}
+
+/** Partial updates are atomic, including the encrypted token. Errors never contain supplied values. */
+export function setStardogValues(values: StardogValuesUpdate): void {
+  validateStardogValues(values);
   getDb().transaction(() => {
     if (values.token !== undefined) {
       const store = createModelProtectedSecrets();
@@ -119,6 +124,7 @@ export function stardogDataset(): string | undefined {
 /** Contains plaintext credentials: only pass this to the sidecar child, never log or expose it. */
 export function stardogChildEnv(): NodeJS.ProcessEnv {
   const values = getStardogValues();
+  const runToken = token();
   return {
     KG_BACKEND: getKgGraphSource(),
     KG_STARDOG_DB: values.db,
@@ -126,7 +132,9 @@ export function stardogChildEnv(): NodeJS.ProcessEnv {
     KG_STARDOG_RUN_CONSOLE: values.runConsole,
     KG_STARDOG_RUN_PLATFORM: values.runPlatform,
     KG_STARDOG_DATASET: stardogDataset(),
-    KG_STARDOG_RUN_TOKEN: token() ?? "",
+    // Omitted, not empty: the child env starts from process.env, so a stored token that
+    // cannot be read must not replace a working KG_STARDOG_RUN_TOKEN from the environment.
+    ...(runToken !== undefined ? { KG_STARDOG_RUN_TOKEN: runToken } : {}),
     KG_NAMESPACE: values.namespace,
   };
 }

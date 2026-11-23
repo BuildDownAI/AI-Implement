@@ -99,20 +99,26 @@ KG repo is needed.
 `src/kg-graph-source.ts` holds the stored values the sidecar reads at start. The
 environment above seeds them at first boot only. From then on, change the graph
 source and the database, endpoint, console, import-host and token values on the
-KG page; `KG_NAMESPACE` and the graph name remain settings rows with no field
-there yet. `kg_graph_source` defaults to
-`sidecar`; the non-secret rows are
-`kg_stardog_db`, `kg_stardog_run_endpoint`, `kg_stardog_run_console`, and
-`kg_stardog_run_platform`. The import platform defaults to
-`https://app.stardog.run`, distinct from the console host; an empty
-`kg_stardog_run_console` uses `https://console.stardog.run`. There is no import-host
-environment variable; the row default is enough. Namespace and graph name use the
-shared `kg_namespace` and `kg_graph_name` rows; this page deliberately adds no
-fields for them. `KG_NAMESPACE` seeds `kg_namespace` at first boot and has no
-admin-UI field yet. Names accept letters,
-digits, underscores and hyphens, beginning with a letter or digit; namespaces and
-endpoint/console/platform values must be absolute HTTP(S) URLs without userinfo.
-Empty fields clear their rows, and partial updates preserve omitted fields.
+KG page. `kg_graph_source` defaults to
+`sidecar`; the non-secret Stardog rows are
+`kg_stardog_db`, `kg_stardog_run_endpoint`, `kg_stardog_run_console`,
+`kg_stardog_run_platform`, `kg_namespace` and `kg_graph_name`. The import
+platform defaults to `https://app.stardog.run`, distinct from the console host;
+an empty `kg_stardog_run_console` uses `https://console.stardog.run`. There is no
+import-host environment variable; the row default is enough.
+
+The page's **Graph details** card sets the namespace and graph name, plus two
+rows that have no environment seed: `kg_code_repo` (an `owner/name` GitHub
+repository) and `kg_graph_label` (free text, at most 200 characters). Namespace
+and graph name use the shared `kg_namespace` and `kg_graph_name` rows;
+`KG_NAMESPACE` seeds `kg_namespace` at first boot, and a stored graph name
+derives the Stardog dataset. The sidecar reads Namespace and Graph name when it
+starts. Select the graph source again, or restart the orchestrator, to apply a
+change to them. A change to KG code repo or Graph label needs no restart.
+Names accept letters, digits, underscores and hyphens, beginning with a letter
+or digit; namespaces and endpoint/console/platform values must be absolute
+HTTP(S) URLs without userinfo. Empty fields clear their rows, and partial updates
+preserve omitted fields.
 
 With the `/app/kg/.base-only` marker there is no local graph, so the remote store
 is the effective source whatever the row says. `isRemoteKgStore()` is the one test

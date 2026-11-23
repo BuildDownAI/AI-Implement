@@ -125,6 +125,34 @@ export const kgPipelinesHtml = `
         <div id="kg-stardog-error" class="error" hidden></div>
       </div>
     </div>
+
+    <div class="card" id="kg-graph-details-card">
+      <div class="card-header"><h2 class="card-title">Graph details</h2></div>
+      <div class="card-body">
+        <div class="field">
+          <label for="kg-namespace">Namespace</label>
+          <input class="input" id="kg-namespace" placeholder="https://kg.builddown.dev/">
+        </div>
+        <div class="field">
+          <label for="kg-graph-name">Graph name</label>
+          <input class="input" id="kg-graph-name" placeholder="builddown-kg">
+        </div>
+        <div class="field">
+          <label for="kg-code-repo">KG code repo</label>
+          <input class="input" id="kg-code-repo" placeholder="owner/name">
+        </div>
+        <div class="field">
+          <label for="kg-graph-label">Graph label</label>
+          <input class="input" id="kg-graph-label" maxlength="200">
+        </div>
+        <div style="margin-top:12px">
+          <button class="btn btn-primary btn-sm" id="btn-kg-graph-details-save" onclick="window.saveKgGraphDetails()" disabled>Save</button>
+          <span class="kpi-trend text-secondary" id="kg-graph-details-save-status"></span>
+        </div>
+        <div id="kg-graph-details-error" class="error" hidden></div>
+        <div class="kpi-trend text-secondary">The sidecar reads Namespace and Graph name when it starts. Select the graph source again, or restart the orchestrator, to apply a change to them. A change to KG code repo or Graph label needs no restart.</div>
+      </div>
+    </div>
     ${dispatchLogHtml("kglog", { title: "Runs", emptyText: "No knowledge-graph refresh runs in the selected time range" })}
   </div>
 </section>
@@ -464,6 +492,8 @@ export const kgPipelinesScript = `
   let kgGraphSettingsLoaded = false;
   let kgStardogBusy = false;
   let kgStardogSaved = null;
+  let kgGraphDetailsBusy = false;
+  let kgGraphDetailsSaved = null;
 
   function kgGraphSourceLabel(value) {
     return value === 'stardog_run' ? 'Stardog' : 'Sidecar graph';
@@ -505,6 +535,26 @@ export const kgPipelinesScript = `
     document.getElementById('btn-kg-stardog-save').disabled = kgStardogBusy || !kgGraphSettingsLoaded;
   }
 
+  function kgGraphDetailsInputs() {
+    return {
+      namespace: document.getElementById('kg-namespace').value,
+      graphName: document.getElementById('kg-graph-name').value,
+      codeRepo: document.getElementById('kg-code-repo').value,
+      graphLabel: document.getElementById('kg-graph-label').value,
+    };
+  }
+
+  function kgGraphDetailsDirty() {
+    if (!kgGraphDetailsSaved) return false;
+    const now = kgGraphDetailsInputs();
+    return now.namespace !== kgGraphDetailsSaved.namespace || now.graphName !== kgGraphDetailsSaved.graphName
+      || now.codeRepo !== kgGraphDetailsSaved.codeRepo || now.graphLabel !== kgGraphDetailsSaved.graphLabel;
+  }
+
+  function kgPaintGraphDetailsSave() {
+    document.getElementById('btn-kg-graph-details-save').disabled = kgGraphDetailsBusy || !kgGraphSettingsLoaded;
+  }
+
   async function loadKgGraphSettings() {
     try {
       const res = await window.api('/api/settings');
@@ -521,11 +571,19 @@ export const kgPipelinesScript = `
         importHost.value = data.kg_stardog_run_platform || 'https://app.stardog.run';
         kgStardogSaved = kgStardogInputs();
       }
+      if (!kgGraphDetailsDirty()) {
+        document.getElementById('kg-namespace').value = data.kg_namespace || '';
+        document.getElementById('kg-graph-name').value = data.kg_graph_name || '';
+        document.getElementById('kg-code-repo').value = data.kg_code_repo || '';
+        document.getElementById('kg-graph-label').value = data.kg_graph_label || '';
+        kgGraphDetailsSaved = kgGraphDetailsInputs();
+      }
       document.getElementById('kg-stardog-token-status').textContent =
         data.stardogTokenSet ? 'Token set' : 'Token not set';
       document.getElementById('kg-graph-customer-repo-note').hidden = !data.kgCustomerRepo;
       kgGraphSettingsLoaded = true;
       kgPaintStardogSave();
+      kgPaintGraphDetailsSave();
       if (!kgGraphSourceBusy) kgPaintGraphSource(source);
     } catch (e) { /* transient — next poll retries */ }
   }
@@ -659,6 +717,47 @@ export const kgPipelinesScript = `
     } finally {
       kgStardogBusy = false;
       kgPaintStardogSave();
+    }
+  };
+
+  window.saveKgGraphDetails = async function () {
+    const status = document.getElementById('kg-graph-details-save-status');
+    const error = document.getElementById('kg-graph-details-error');
+    if (kgGraphDetailsBusy) return;
+    if (!kgGraphSettingsLoaded) {
+      status.textContent = '';
+      error.textContent = 'Load the graph details before saving.';
+      error.hidden = false;
+      return;
+    }
+    const values = kgGraphDetailsInputs();
+    error.hidden = true;
+    error.textContent = '';
+    status.textContent = 'Saving\\u2026';
+    kgGraphDetailsBusy = true;
+    kgPaintGraphDetailsSave();
+    try {
+      const res = await window.api('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({
+          kg_namespace: values.namespace.trim(),
+          kg_graph_name: values.graphName.trim(),
+          kg_code_repo: values.codeRepo.trim(),
+          kg_graph_label: values.graphLabel.trim(),
+        }),
+      });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(data.error || String(res.status));
+      kgGraphDetailsSaved = null;
+      await loadKgGraphSettings();
+      status.textContent = 'Saved.';
+    } catch (err) {
+      status.textContent = '';
+      error.textContent = 'Could not save the graph details \\u2014 ' + String(err);
+      error.hidden = false;
+    } finally {
+      kgGraphDetailsBusy = false;
+      kgPaintGraphDetailsSave();
     }
   };
 

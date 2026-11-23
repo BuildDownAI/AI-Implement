@@ -940,6 +940,53 @@ describe("stored graph configuration", () => {
     expect(process.env.KG_SIDECAR_URL).toBeUndefined();
   });
 
+  it.each(["missing", "unreadable"] as const)("keeps the environment token when the stored token is %s", async (state) => {
+    const { modules: { kg, sidecar: module } } = await storedFixture();
+    const kgDir = makeKgDir();
+    kg.setKgGraphSource("stardog_run");
+    kg.setStardogValues({ db: "stored-db", namespace: "https://stored.example/", token: "stored-token-sentinel" });
+    if (state === "missing") kg.setStardogValues({ token: "" });
+    else vi.stubEnv("RUNNER_TOKEN_SECRET", "rotated-key");
+    vi.stubEnv("KG_STARDOG_RUN_TOKEN", "ambient-token-sentinel");
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+    let env: NodeJS.ProcessEnv | undefined;
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    const sidecar = new module.KgSidecar({ kgDir }, {
+      httpGet: async () => true,
+      spawn: (cmd, args, opts) => {
+        env = (opts as { env: NodeJS.ProcessEnv }).env;
+        return testSpawn(cmd, args, opts);
+      },
+    });
+    try {
+      await sidecar.start();
+      expect(env?.KG_STARDOG_RUN_TOKEN).toBe("ambient-token-sentinel");
+      expect(JSON.stringify(logs.mock.calls)).not.toContain("ambient-token-sentinel");
+    } finally { await sidecar.stop(); }
+  });
+
+  it("a resolved stored token replaces the environment token", async () => {
+    const { modules: { kg, sidecar: module } } = await storedFixture();
+    const kgDir = makeKgDir();
+    kg.setKgGraphSource("stardog_run");
+    kg.setStardogValues({ db: "stored-db", namespace: "https://stored.example/", token: "stored-token-sentinel" });
+    vi.stubEnv("KG_STARDOG_RUN_TOKEN", "ambient-token-sentinel");
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+    let env: NodeJS.ProcessEnv | undefined;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const sidecar = new module.KgSidecar({ kgDir }, {
+      httpGet: async () => true,
+      spawn: (cmd, args, opts) => {
+        env = (opts as { env: NodeJS.ProcessEnv }).env;
+        return testSpawn(cmd, args, opts);
+      },
+    });
+    try {
+      await sidecar.start();
+      expect(env?.KG_STARDOG_RUN_TOKEN).toBe("stored-token-sentinel");
+    } finally { await sidecar.stop(); }
+  });
+
   it("getServedNamespace reads the stored namespace for a remote store, ignoring KG_NAMESPACE and sources.yml", async () => {
     const { modules: { kg, sidecar: module } } = await storedFixture();
     const kgDir = makeKgDir();
