@@ -5,6 +5,28 @@ import { basename, dirname, join } from "node:path";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import setupRunTempRoot, { endFileTempRoot, startFileTempRoot } from "./run-temp-root.js";
 
+// The scrub imports the helper before this test; reload it with the filesystem mocks.
+const fsFailure = vi.hoisted(() => {
+  vi.resetModules();
+  return { path: "", operation: "" };
+});
+
+// Inject filesystem failures deterministically, including when tests run as root.
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readdirSync: vi.fn(actual.readdirSync).mockImplementation((...args) => {
+      if (args[0] === fsFailure.path && fsFailure.operation === "read") throw new Error("EACCES: permission denied");
+      return actual.readdirSync(...args);
+    }),
+    lstatSync: vi.fn(actual.lstatSync).mockImplementation((...args) => {
+      if (args[0] === fsFailure.path && fsFailure.operation === "stat") throw new Error("EACCES: permission denied");
+      return actual.lstatSync(...args);
+    }),
+  };
+});
+
 function startRun(): { root: string; teardown: () => void } {
   const provided = new Map<string, string>();
   const teardown = setupRunTempRoot({ provide: (key, value) => void provided.set(key, value) });
@@ -43,6 +65,16 @@ describe("the run's temp directory", () => {
     expect(message).toContain(root);
     expect(message).toContain("left-behind.txt");
     expect(existsSync(join(root, "left-behind.txt"))).toBe(true);
+  });
+
+  it("fails the run even when emitting diagnostics throws", () => {
+    const { root, teardown } = startRun();
+    writeFileSync(join(root, "left-behind.txt"), "");
+    const error = vi.spyOn(console, "error").mockImplementation(() => { throw new Error("diagnostic failure"); });
+    onTestFinished(() => error.mockRestore());
+
+    expect(teardown).toThrow("diagnostic failure");
+    expect(process.exitCode).toBe(1);
   });
 
   it("removes the empty directory of a file that never ran its check, and keeps one with something in it", () => {
@@ -110,7 +142,9 @@ describe.each(["file", "run"] as const)("%s leftover diagnostics", scope => {
       if (scope === "run") {
         teardown();
         expect(process.exitCode).toBe(1);
-        return String(error.mock.calls[0]?.[0]).split("for inspection: ")[1];
+        const message = String(error.mock.calls[0]?.[0]);
+        expect(message).toContain("Left in the test run's temp directory");
+        return message.split("for inspection: ")[1];
       }
       expect(() => endFileTempRoot(root)).toThrow("Left in this test file's temp directory");
       try { endFileTempRoot(root); } catch (cause) {
@@ -119,6 +153,21 @@ describe.each(["file", "run"] as const)("%s leftover diagnostics", scope => {
       throw new Error("Expected leftovers to fail");
     } };
   }
+
+  describe.each(["left", join("left", "nested")])("unreadable %s", relative => {
+    it.each(["read", "stat"] as const)("keeps the failure prefix and relative path when a %s fails", operation => {
+      const { root, message } = fixture();
+      const unreadable = join(root, relative);
+      mkdirSync(unreadable, { recursive: true });
+      writeFileSync(join(root, "left", "z.txt"), "");
+      fsFailure.path = unreadable;
+      fsFailure.operation = operation;
+      onTestFinished(() => { fsFailure.path = ""; fsFailure.operation = ""; });
+
+      expect(message()).toBe(relative === "left" ? "left: unreadable entry" : `${relative}: unreadable entry, ${join("left", "z.txt")}`);
+      expect(existsSync(unreadable)).toBe(true);
+    });
+  });
 
   it("lists sorted nested paths and does not follow symbolic links", () => {
     const { root, message } = fixture();

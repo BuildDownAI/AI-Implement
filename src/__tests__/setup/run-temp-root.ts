@@ -26,8 +26,14 @@ function describeLeftovers(root: string, entries: string[]): string {
     function walk(relative: string): boolean {
       if (paths.length === 20) return true;
       const absolute = join(root, relative);
-      if (lstatSync(absolute).isDirectory()) {
-        const children = readdirSync(absolute).sort();
+      let children: string[] | undefined;
+      try {
+        if (lstatSync(absolute).isDirectory()) children = readdirSync(absolute).sort();
+      } catch {
+        paths.push(`${relative}: unreadable entry`);
+        return false;
+      }
+      if (children) {
         if (children.length > 0) {
           for (const child of children) {
             if (walk(join(relative, child))) return true;
@@ -62,15 +68,19 @@ export default function setupRunTempRoot(project: Pick<TestProject, "provide">):
     // Empty, it held nothing; anything else is a file that left something behind, named by its directory.
     for (const entry of readdirSync(root)) {
       const dir = join(root, entry);
-      if (lstatSync(dir).isDirectory() && readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true });
+      try {
+        if (lstatSync(dir).isDirectory() && readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Keep unreadable entries for the failing leftover check and its diagnostics below.
+      }
     }
     const left = readdirSync(root);
     if (left.length === 0) {
       rmSync(root, { recursive: true, force: true });
       return;
     }
-    console.error(`Left in the test run's temp directory, which is kept at ${root} for inspection: ${describeLeftovers(root, left)}`);
-    // vitest only logs a throwing global teardown and still exits 0 (4.1.11), so the exit code is set directly.
+    // vitest only logs a throwing global teardown and still exits 0 (4.1.11), so set the exit code before formatting diagnostics.
     process.exitCode = 1;
+    console.error(`Left in the test run's temp directory, which is kept at ${root} for inspection: ${describeLeftovers(root, left)}`);
   };
 }
