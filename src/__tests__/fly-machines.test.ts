@@ -145,10 +145,10 @@ describe("createMachine", () => {
 });
 
 describe("getMachineRunnerAddress", () => {
-  it.each(["fdaa:0:1234::2", undefined])("reads the private runner address (%s)", async (private_ip) => {
+  it.each(["fdaa:0:1234::2", undefined])("returns the Fly hostname once a private IP is assigned (%s)", async (private_ip) => {
     const fly = fakeFetch({ [`GET ${MACHINE}`]: { json: { ...mockMachine, private_ip } } }).install();
     expect(await getMachineRunnerAddress(TOKEN, APP, "machine-123"))
-      .toBe(private_ip ? `http://[${private_ip}]:9080` : null);
+      .toBe(private_ip ? `http://machine-123.vm.${APP}.internal:9080` : null);
     expect(fly.calls).toHaveLength(1);
   });
 

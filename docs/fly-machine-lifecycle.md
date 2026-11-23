@@ -8,7 +8,7 @@ The sessions app and region live in the `RunnerBackend/fly-machines` Restate obj
 
 `buildSessionMachineConfig`, `launchImplementationFlySession`, and `dispatchFlyGapfill` accept an optional `serve` payload using `LocalRunnerServeInput` (`identityKey`, `runnerId`). It sets `AI_IMPLEMENT_RUNNER_SERVE=1`, `AI_IMPLEMENT_RUNNER_ID`, and `RESTATE_IDENTITY_KEY` after mapping environment overrides. No caller enables it yet (AII-2081); existing launches keep their behavior.
 
-Session configs omit `services` in both modes, keeping port 9080 off the public Fly proxy. `getMachineRunnerAddress` reads the machine through the Machines API and returns `http://[<private_ip>]:9080`, or `null` while no private address is assigned. API errors propagate; an address does not establish service readiness.
+Session configs omit `services` in both modes, keeping port 9080 off the public Fly proxy. `getMachineRunnerAddress` reads the machine through the Machines API and returns `http://<machineId>.vm.<appName>.internal:9080`, or `null` while no private address is assigned. The Fly hostname is required because Restate server 1.7 cannot register a bracketed IPv6 address. API errors propagate; an address does not establish service readiness.
 
 ## Why a kept machine
 

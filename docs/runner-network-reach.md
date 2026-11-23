@@ -32,7 +32,22 @@ reachable.
 
 ## Fly
 
-To be written by AII-2038 from its probe.
+The [AII-2038 probe](https://linear.app/eudoxus/issue/AII-2038/decide-aii-2028-and-prove-that-the-orchestrator-can-call-a-fly-session)
+(2026-11-23) verified the following behavior. A session machine has no `services` entry;
+port 9080 is reachable only on the Fly private network. The orchestrator and its sessions
+app are on one Fly private network. A request with no signature gets `401`.
+
+The orchestrator registers the runner at `http://<machineId>.vm.<appName>.internal:9080`.
+Restate server 1.7 cannot register a bracketed IPv6 address: its admin returns
+`META0003 … h2 pool connection error: unknown host name`. The probe registered and called
+the same machine using the Fly hostname. After a hard stop of the machine, the caller
+received its terminal failure in about 10 seconds; this is a probe observation, not a
+runtime guarantee.
+
+For new pairs, a new orchestrator and its sessions app share their own Fly network
+([AII-2056](https://linear.app/eudoxus/issue/AII-2056/plan-a-new-orchestrator-and-its-fly-runners-share-their-own-private)).
+The testing orchestrator stays on the default network until
+[CON-149](https://linear.app/eudoxus/issue/CON-149/move-the-testing-orchestrator-to-its-own-network-then-explore-the).
 
 ## GitHub Actions
 
