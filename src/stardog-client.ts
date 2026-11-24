@@ -286,7 +286,7 @@ async function startImport(fetchImpl: typeof fetch, packageDir: string, files: s
   const auth = await importAuth(fetchImpl, signal);
   const form = new FormData();
   for (const file of files) {
-    if (file === "package.json" || !/^(kit\.yaml|ontology\.ttl|data\/[A-Za-z0-9._-]+\.nt)$/.test(file) || file.includes("..")) {
+    if (!/^(kit\.yaml|ontology\.ttl|data\/[A-Za-z0-9._-]+\.nt)$/.test(file) || file.includes("..")) {
       throw new Error("Stardog Run import file is not allowed");
     }
     form.append("files", new Blob([await readFile(join(packageDir, file))]), `${basename(packageDir)}/${file}`);
