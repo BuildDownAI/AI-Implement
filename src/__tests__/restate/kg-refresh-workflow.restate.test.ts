@@ -2,7 +2,7 @@
 import { getDb } from "../../dedup.js";
 import { appendLog, initLogTable } from "../../log.js";
 import { JobAccountingPageSchema } from "../../job-accounting.js";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RestateEnvironment } from "./harness.js";
@@ -135,7 +135,7 @@ describe("KgRefresh durable workflow", () => {
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true, guardVerdict, partCounts: { issues: 42 } });
       expect(await done).toMatchObject({ ok: true, detail: "Stardog import verified" });
       expect(await readBaseline(env)).toEqual({ parts: { issues: 42 }, triggerId, at: expect.any(Number) });
-      expect(stardog.startImport.mock.calls.slice(importsBefore)).toEqual([[dir, ["kit.yaml", "data/issues.nt"], frozenTarget]]);
+      expect(stardog.startImport.mock.calls.slice(importsBefore)).toEqual([[dir, ["kit.yaml", "ontology.ttl", "data/issues.nt"], frozenTarget]]);
       expect(stardog.countTriples.mock.calls.at(-1)).toEqual([frozenTarget]);
       expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
       const entries = await journalEntries(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
@@ -152,6 +152,23 @@ describe("KgRefresh durable workflow", () => {
 
       expect(baseExternalEffects()).toEqual(beforeEffects);
       expect(state.fetchTarballCallCount).toBe(beforeFetch);
+    }
+  });
+
+  it.each(baseVariants.map(([label]) => label))("base rejects malformed kit data before importing (%s)", async label => {
+    const env = baseEnvFor(label);
+    for (const entry of ["data/issues.nt", {}, { file: "../x.nt" }, null, [], { file: 42 }, { file: "data/a..nt" }, { file: "other.ttl" }]) {
+      stardog.startImport.mockClear();
+      const triggerId = newTriggerId();
+      const dir = packageFixture(triggerId);
+      writeFileSync(join(dir, "kit.yaml"), JSON.stringify({ data: [entry] }));
+      const outcome = await runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
+        hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+      } });
+      expect(outcome).toMatchObject({ ok: false, conclusion: "stardog-import-failed", detail: expect.stringContaining("kit.yaml has an invalid data list") });
+      expect(outcome.detail).not.toContain("no good graph");
+      expect(stardog.startImport).not.toHaveBeenCalled();
+      expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
     }
   });
 
@@ -178,7 +195,9 @@ describe("KgRefresh durable workflow", () => {
       const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
         hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
       } });
-      expect(await done).toMatchObject({ ok: false, conclusion: "stardog-import-failed", detail: expect.stringContaining("no good graph") });
+      const outcome = await done;
+      expect(outcome).toMatchObject({ ok: false, conclusion: "stardog-import-failed" });
+      expect(outcome.detail?.includes("no good graph")).toBe(failure !== "post" && failure !== "missing");
       expect(stardog.startImport).toHaveBeenCalledTimes(failure === "missing" ? 0 : 1);
       expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
       const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));

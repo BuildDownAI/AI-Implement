@@ -81,7 +81,7 @@ describe("KgRefresh durable workflow — decision hold", () => {
         expect(await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", decided.triggerId)).toMatchObject({ ok: true, detail: "Stardog import verified" });
         await eventually(() => kgRepoStatus(env.baseUrl()), value => value === null, { label: "base hold released" });
         expect(await readBaseline(env)).toEqual({ parts: { issues: 37, projects: 5 }, triggerId: decided.triggerId, at: expect.any(Number) });
-        expect(stardog.startImport.mock.calls).toEqual([[dir, ["kit.yaml", "data/issues.nt"], frozenTarget]]);
+        expect(stardog.startImport.mock.calls).toEqual([[dir, ["kit.yaml", "ontology.ttl", "data/issues.nt"], frozenTarget]]);
         expect(stardog.countTriples.mock.calls.at(-1)).toEqual([frozenTarget]);
         expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
         expect(baseExternalEffects()).toEqual(beforeEffects);

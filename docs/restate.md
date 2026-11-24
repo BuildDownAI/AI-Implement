@@ -749,8 +749,11 @@ The boot-resolved refresh identity uses the code repo's `KgRepo` key in base mod
 
 `KgRefresh` shares one cancellation commit point before merge or Stardog import.
 `stardog-import` uses `maxRetryAttempts: 1`: it checks the manifest, metadata and
-listed data files and posts only `kit.yaml` and the data list. Its saved result
-contains only `{ kitId, publishId, expectedTriples }`. A lost acknowledgement
+listed files and posts `kit.yaml` followed by each `data` entry's `file`, in list
+order. The `kit.yaml` `data` list contains objects with a string `file` field:
+`ontology.ttl` or `data/[A-Za-z0-9._-]+\.nt`, with no `..`. Plain string entries
+are rejected. The step leaves `graph` fields for Stardog to read from `kit.yaml`.
+Its saved result contains `{ kitId, publishId, expectedTriples, target }`. A lost acknowledgement
 across a restart can repeat the POST; `replace=true` replaces the earlier import.
 `stardog-wait` reads at most four minutes per attempt and throws when no terminal
 event arrives. Its options are `maxRetryDuration: 1200000`,
@@ -759,7 +762,9 @@ Setting both intervals avoids the SDK's default ten-second cap. Restate owns the
 retries and restart recovery; the workflow has no polling loop or clock deadline.
 `stardog-verify` uses `maxRetryAttempts: 3` and compares a billed COUNT query with
 `expectedTriples`. Only then does `baseline` record the report's part counts.
-Failures end `stardog-import-failed` without changing the baseline.
+Failures end `stardog-import-failed` without changing the baseline. Only failures
+after `stardog-import` returns (wait or verify) include the warning that Stardog
+has no good graph until a new import passes.
 
 The import wait budget is twenty minutes. Deploy drain counts all open
 invocations and waits at most 75 minutes, including runner time; import attempts
