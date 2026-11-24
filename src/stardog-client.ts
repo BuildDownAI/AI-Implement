@@ -25,11 +25,16 @@ export const STARDOG_COUNT_TRIPLES_QUERY = "SELECT (COUNT(*) AS ?count) WHERE { 
 
 export type StardogImportEvent = "done" | { failed: string } | null;
 
+export interface StardogTarget {
+  db: string;
+  graphName: string;
+}
+
 export interface StardogClient {
-  startImport(packageDir: string, files: string[]): Promise<{ kitId: string; publishId: string }>;
+  startImport(packageDir: string, files: string[], target: StardogTarget): Promise<{ kitId: string; publishId: string }>;
   readEvents(kitId: string, publishId: string, options: { maxMs: number }): Promise<StardogImportEvent>;
-  /** Signs in and runs one COUNT query. Reads the stored values and token on every call. */
-  countTriples(): Promise<number>;
+  /** Signs in and runs one COUNT query. An explicit target freezes identity; credentials are read on every call. */
+  countTriples(target?: StardogTarget): Promise<number>;
 }
 
 export interface StardogClientDeps {
@@ -224,18 +229,18 @@ async function signIn(fetchImpl: typeof fetch, deadline: AbortSignal): Promise<{
   };
 }
 
-async function countTriples(fetchImpl: typeof fetch): Promise<number> {
+async function countTriples(fetchImpl: typeof fetch, target?: StardogTarget): Promise<number> {
   // One deadline for the whole attempt: the four requests cannot stack their own 30 s.
   const deadline = AbortSignal.timeout(STARDOG_REQUEST_TIMEOUT_MS);
   const values = getStardogValues();
   const { bearer, endpoint } = await signIn(fetchImpl, deadline);
   const form = new URLSearchParams({ query: STARDOG_COUNT_TRIPLES_QUERY });
-  const dataset = stardogDataset();
+  const dataset = target ? `tag:stardog:kit:alias:${target.graphName.replaceAll("-", "_")}` : stardogDataset();
   if (dataset) form.set("default-graph-uri", dataset);
 
   const body = await fetchJson(
     fetchImpl,
-    `${endpoint}/${encodeURIComponent(values.db)}/query`,
+    `${endpoint}/${encodeURIComponent(target ? target.db : values.db)}/query`,
     {
       method: "POST",
       headers: {
@@ -276,7 +281,7 @@ function safeDetail(text: string, secrets: string[]): string {
     .replace(/Bearer\s+[^\s"',}]+/gi, "[redacted]").slice(0, 2000);
 }
 
-async function startImport(fetchImpl: typeof fetch, packageDir: string, files: string[]) {
+async function startImport(fetchImpl: typeof fetch, packageDir: string, files: string[], target: StardogTarget) {
   const signal = AbortSignal.timeout(STARDOG_REQUEST_TIMEOUT_MS);
   const auth = await importAuth(fetchImpl, signal);
   const form = new FormData();
@@ -286,7 +291,7 @@ async function startImport(fetchImpl: typeof fetch, packageDir: string, files: s
     }
     form.append("files", new Blob([await readFile(join(packageDir, file))]), `${basename(packageDir)}/${file}`);
   }
-  const query = new URLSearchParams({ replace: "true", endpoint: auth.endpoint, database: getStardogValues().db });
+  const query = new URLSearchParams({ replace: "true", endpoint: auth.endpoint, database: target.db });
   const body = await fetchJson(fetchImpl, `${auth.platform}/voicebox/kits/import?${query}`, {
     method: "POST", headers: { Authorization: `Bearer ${auth.bearer}`, "X-Voicebox-Auth": `Bearer ${auth.apiToken}` }, body: form,
   }, "import", signal);
@@ -356,8 +361,8 @@ async function readEvents(fetchImpl: typeof fetch, kitId: string, publishId: str
 export function createStardogClient(deps: StardogClientDeps = {}): StardogClient {
   const fetchImpl = deps.fetchImpl ?? fetch;
   return {
-    countTriples: () => countTriples(fetchImpl),
-    startImport: (dir, files) => startImport(fetchImpl, dir, files),
+    countTriples: (target) => countTriples(fetchImpl, target),
+    startImport: (dir, files, target) => startImport(fetchImpl, dir, files, target),
     readEvents: (kit, publish, options) => readEvents(fetchImpl, kit, publish, options),
   };
 }

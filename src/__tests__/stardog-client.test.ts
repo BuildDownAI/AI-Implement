@@ -83,6 +83,26 @@ describe("Stardog client", () => {
     expect(fake.calls.at(-1)?.path).toBe("/other-db/query");
   });
 
+  it("keeps an explicit package target while settings and credentials rotate", async () => {
+    const { modules } = await fixture();
+    const target = { db: "builddown-kg", graphName: "original-graph" };
+    const dir = testDir("stardog-target");
+    writeFileSync(join(dir, "kit.yaml"), "data: []");
+    const fake = routes({ "POST /voicebox/kits/import": { json: { kit_id: "kit-1", publish_id: "pub-1" } } });
+    const client = modules.client.createStardogClient({ fetchImpl: fake.fetch });
+    modules.kg.setStardogValues({ db: "other-db", graphName: "other-graph", token: "rotated-token" });
+    const handle = await client.startImport(dir, ["kit.yaml"], target);
+    expect(handle).toEqual({ kitId: "kit-1", publishId: "pub-1" });
+    expect(fake.calls.at(-1)!.url.searchParams.get("database")).toBe(target.db);
+    expect(fake.calls.at(-1)!.headers.get("x-voicebox-auth")).toBe("Bearer rotated-token");
+    modules.kg.setStardogValues({ db: "third-db", graphName: "third-graph", token: "next-token" });
+    expect(await client.countTriples(target)).toBe(1234);
+    const query = fake.calls.at(-1)!;
+    expect(query.path).toBe("/builddown-kg/query");
+    expect(new URLSearchParams(query.body).get("default-graph-uri")).toBe("tag:stardog:kit:alias:original_graph");
+    expect(fake.calls.filter(c => c.path === "/api/token").at(-1)!.headers.get("authorization")).toBe("Bearer next-token");
+  });
+
   it("accepts a direct token reply without an edge exchange", async () => {
     const { modules } = await fixture();
     const fake = fakeFetch({
@@ -198,7 +218,7 @@ describe("Stardog import client", () => {
     mkdirSync(join(dir, "data"), { recursive: true });
     for (const file of ["kit.yaml", "package.json", "data/issues.nt", "data/old.nt"]) writeFileSync(join(dir, file), file);
     const fake = routes({ "POST /voicebox/kits/import": { json: { kit_id: "kit-1", publish_id: "pub-1", database: "builddown-kg" } } });
-    expect(await modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml", "data/issues.nt"]))
+    expect(await modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml", "data/issues.nt"], { db: "builddown-kg", graphName: "builddown-kg" }))
       .toEqual({ kitId: "kit-1", publishId: "pub-1" });
     const call = fake.calls.at(-1)!;
     expect(call.url.origin).toBe("https://import.stardog.run");
@@ -262,7 +282,7 @@ describe("Stardog import client", () => {
     const dir = testDir("stardog");
     writeFileSync(join(dir, "kit.yaml"), "data: []");
     const fake = routes({ "POST /voicebox/kits/import": { status: 500, text: `Authorization: Bearer ${TOKEN}` } });
-    await expect(modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml"]))
+    await expect(modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml"], { db: "builddown-kg", graphName: "builddown-kg" }))
       .rejects.toThrow("Stardog Run import answered HTTP 500");
   });
 });
