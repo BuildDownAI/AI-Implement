@@ -838,6 +838,8 @@ export interface KgGraphSourceToolDeps {
   restartSidecar(): Promise<void>;
   /** False when the image carries the `/app/kg/.base-only` marker, so there is no sidecar graph. */
   sidecarGraphPresent(): boolean;
+  /** True when the image includes query code with a Stardog store. */
+  stardogQueryCodePresent(): boolean;
   /** The effective source for the log line: `isRemoteKgStore()`, not the raw row. Defaults to the real test. */
   effectiveSource?(): KgGraphSource;
   /** Pause between test tries in production; 0 in tests. */
@@ -2005,8 +2007,9 @@ export const setKgGraphSourceTool = tool(
 
       let triples: number | undefined;
       if (to === "stardog_run") {
+        if (!deps.stardogQueryCodePresent()) return await failLogged("no-stardog-query-code", "The query code in this image has no Stardog store. Update the KG repo from the base KG repo, then deploy again.");
         const values = getStardogValues();
-        if (!values.db || !values.namespace || !values.tokenSet) return await failLogged("stardog-values-missing");
+        if (!values.db || !values.namespace || !values.tokenSet) return await failLogged("stardog-values-missing", "Enter Database, Namespace and the token, then save.");
         try {
           // One journaled step: Restate repeats it within the budget, and the pause between
           // tries is bounded by maxRetryInterval (15 s in production, not the SDK's 10 s cap).

@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   createMachine,
   getMachine,
+  getMachineRunnerAddress,
   listMachines,
   stopMachine,
   startMachine,
@@ -140,6 +141,20 @@ describe("createMachine", () => {
 
     await expect(createMachine(TOKEN, APP, session))
       .rejects.toThrow("Failed to create machine in ai-implement-sessions-test (422): invalid config");
+  });
+});
+
+describe("getMachineRunnerAddress", () => {
+  it.each(["fdaa:0:1234::2", undefined])("returns the Fly hostname once a private IP is assigned (%s)", async (private_ip) => {
+    const fly = fakeFetch({ [`GET ${MACHINE}`]: { json: { ...mockMachine, private_ip } } }).install();
+    expect(await getMachineRunnerAddress(TOKEN, APP, "machine-123"))
+      .toBe(private_ip ? `http://machine-123.vm.${APP}.internal:9080` : null);
+    expect(fly.calls).toHaveLength(1);
+  });
+
+  it("propagates Fly API failures", async () => {
+    fakeFetch({ [`GET ${MACHINE}`]: { status: 503, text: "unavailable" } }).install();
+    await expect(getMachineRunnerAddress(TOKEN, APP, "machine-123")).rejects.toThrow(/503/);
   });
 });
 
@@ -354,6 +369,26 @@ describe("app secrets through Machines REST", () => {
 });
 
 describe("buildSessionMachineConfig", () => {
+  it.each([false, true])("keeps runner service private with serve=%s", (enabled) => {
+    const serve = { identityKey: "publickeyv1_abc", runnerId: "run-42" };
+    const result = buildSessionMachineConfig({ ...baseInput, ...(enabled ? { serve } : {}) });
+    expect(result.config).not.toHaveProperty("services");
+    for (const [key, value] of Object.entries({
+      AI_IMPLEMENT_RUNNER_SERVE: "1", AI_IMPLEMENT_RUNNER_ID: serve.runnerId, RESTATE_IDENTITY_KEY: serve.identityKey,
+    })) {
+      if (enabled) expect(result.config.env).toHaveProperty(key, value);
+      else expect(result.config.env).not.toHaveProperty(key);
+    }
+  });
+
+  it("makes serve values authoritative over extraEnv", () => {
+    const env = buildSessionMachineConfig({ ...baseInput,
+      serve: { identityKey: "identity", runnerId: "run-42" },
+      extraEnv: { AI_IMPLEMENT_RUNNER_SERVE: "0", AI_IMPLEMENT_RUNNER_ID: "other", RESTATE_IDENTITY_KEY: "other" },
+    }).config.env;
+    expect(env).toMatchObject({ AI_IMPLEMENT_RUNNER_SERVE: "1", AI_IMPLEMENT_RUNNER_ID: "run-42", RESTATE_IDENTITY_KEY: "identity" });
+  });
+
   it("maps issue metadata to env vars", () => {
     const result = buildSessionMachineConfig(baseInput);
     const env = result.config.env!;

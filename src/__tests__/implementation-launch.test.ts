@@ -355,6 +355,15 @@ describe("implementation session launches", () => {
     expectNoToken(result);
   });
 
+  it.each([false, true])("fly: forwards serve only when supplied (%s)", async (enabled) => {
+    vi.mocked(createMachine).mockResolvedValueOnce({ id: "m", name: "m" } as never);
+    const serve = { identityKey: "publickeyv1_abc", runnerId: "dispatch-42" };
+    await launchImplementationFlySession({ ...args, shadow: false, ...(enabled ? { serve } : {}) });
+    const machineInput = vi.mocked(buildSessionMachineConfig).mock.calls.at(-1)![0];
+    if (enabled) expect(machineInput.serve).toEqual(serve);
+    else expect(machineInput).not.toHaveProperty("serve");
+  });
+
   it("local: forwards an optional serve payload to the container input", async () => {
     vi.mocked(startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
     const serve = { identityKey: "publickeyv1_abc", runnerId: "dispatch-42" };

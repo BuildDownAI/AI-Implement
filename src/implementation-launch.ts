@@ -331,6 +331,7 @@ export interface LaunchLocalImplementationSessionArgs extends LaunchImplementati
 }
 
 export interface FlyImplementationSessionArgs extends LaunchImplementationSessionArgs {
+  serve?: LocalRunnerServeInput;
   implementationSandbox?: ImplementationSandbox;
   /** The shadow Fly run of "both" mode: tags the log line and posts no status comment. */
   shadow: boolean;
@@ -418,6 +419,7 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
   }
 
   const machineConfig = buildSessionMachineConfig({
+    ...(args.serve ? { serve: args.serve } : {}),
     implementationSandbox,
     image: resolvedImage,
     issueId: issue.id,

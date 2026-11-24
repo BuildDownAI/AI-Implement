@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { makeSnapshot } from "../helpers/fixtures/configured-run.js";
 import { makeIssue, makeMapping, makeProvider } from "../helpers/builders.js";
 import { testTempRoot } from "../helpers/test-dir.js";
 import { testDb } from "../helpers/test-db.js";
 import { callWorkflow, cancelInvocation, waitForStep, gate, type Gate, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled, startVariants, type RestateEnvironment } from "./harness.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../../restate/implementation-run-workflow.js";
+import * as production from "../../restate/implementation-run-production.js";
 import type { ImplementationRunProductionInput } from "../../restate/implementation-run-production.js";
 
 const captured = vi.hoisted(() => ({ crash: false, crashed: false, recovered: false, deps: null as ImplementationRunDependencies | null, deadline: false, stopGate: undefined as Gate | undefined, wrapGate: undefined as Gate | undefined, wrapEffect: "", historical: false }));
@@ -13,38 +14,111 @@ vi.mock("../../restate/implementation-run-workflow.js", async (original) => {
   const actual = await original<typeof import("../../restate/implementation-run-workflow.js")>();
   return { ...actual, createImplementationRunWorkflow: (deps: ImplementationRunDependencies) => {
     captured.deps = deps;
-    return actual.createImplementationRunWorkflow({ ...deps,
-      // These values stand in for already-recorded historical effect outcomes. Their
-      // production callbacks did not run and therefore wrote no new owner/target data.
-      ...(captured.historical ? { reserve: async () => true, findExistingRun: async () => "historical-machine", launch: async () => ({ outcome: "accepted" as const, jobId: "historical-machine" }) } : {}),
-      ...(captured.crash ? { findExistingRun: async (...args: Parameters<ImplementationRunDependencies["findExistingRun"]>) => {
+    const wrapped: ImplementationRunDependencies = {
+      ...deps,
+      reserve: async (...args) => captured.historical ? true : deps.reserve(...args),
+      findExistingRun: async (...args) => {
+        if (captured.historical) return "historical-machine";
         const existing = await deps.findExistingRun(...args);
-        if (captured.crashed && existing !== null) captured.recovered = true;
+        if (captured.crash && captured.crashed && existing !== null) captured.recovered = true;
         return existing;
-      }, launch: async (...args: Parameters<ImplementationRunDependencies["launch"]>) => {
+      },
+      launch: async (...args) => {
+        if (captured.historical) return { outcome: "accepted" as const, jobId: "historical-machine" };
         const result = await deps.launch(...args);
-        if (!captured.crashed) { captured.crashed = true; throw new Error("machine created before dispatch journal write"); }
+        if (captured.crash && !captured.crashed) { captured.crashed = true; throw new Error("machine created before dispatch journal write"); }
         return result;
-      } } : {}),
+      },
       readModelPrices: async () => undefined,
       cleanup: async (run, id) => { if (captured.wrapEffect === "cleanup") await captured.wrapGate!.wait(); return deps.cleanup(run, id); },
       onOutcome: async (id) => { if (captured.wrapEffect === "outcome") await captured.wrapGate!.wait(); return deps.onOutcome(id); },
       stop: async (run, id) => { if (captured.stopGate) await captured.stopGate.wait(); return deps.stop(run, id); },
-      retentionMs: 86_400_000, tickMs: 50, confirmTickMs: 50, bootstrapMs: 120_000, totalMs: captured.deadline ? 1_200 : 240_000, stopMarginMs: 200,
-    });
+      retentionMs: 86_400_000, tickMs: 25, confirmTickMs: 25, bootstrapMs: 120_000,
+      get totalMs() { return captured.deadline ? 400 : 240_000; },
+      stopMarginMs: 100,
+    };
+    return actual.createImplementationRunWorkflow(wrapped);
+  } };
+});
+// These lost-acceptance fixtures model pre-serve Fly launch intents. Their fake
+// machine has no runner endpoint; new Fly serve/recovery is exercised with a real
+// fake endpoint in implementation-run-workflow.restate.test.ts.
+vi.mock("../../restate/implementation-launch-intent.js", async original => {
+  const actual = await original<typeof import("../../restate/implementation-launch-intent.js")>();
+  return { ...actual, implementationIntentStore: () => {
+    const store = actual.implementationIntentStore();
+    return { ...store, write: (id: string, snapshot: unknown) => {
+      const intent = snapshot as { metadata?: { executionMode?: string }; serve?: boolean };
+      if (intent.metadata?.executionMode === "fly-machines") {
+        const { serve: _serve, ...legacy } = intent;
+        store.write(id, legacy);
+      } else store.write(id, snapshot);
+    } };
   } };
 });
 vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "test-installation-token", getScopedInstallationToken: async () => ({ token: "test-scoped-token" }) }));
 vi.mock("node:child_process", async (original) => ({ ...(await original<typeof import("node:child_process")>()), execFile: vi.fn() }));
 
-let env: RestateEnvironment | undefined;
-afterEach(async () => { captured.historical = false; captured.stopGate?.release(); captured.wrapGate?.release(); await env?.stop(); env = undefined; vi.restoreAllMocks(); });
+let currentInput: ImplementationRunProductionInput = {
+  config: { githubAppId: "1", githubAppPrivateKey: "test", anthropicApiKey: "test-api", flySessionsToken: "test-fly", flySessionsApp: "sessions", localRunnerImage: "runner:local", runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: "test-secret" } as ImplementationRunProductionInput["config"],
+} as ImplementationRunProductionInput;
+
+const configProxy = new Proxy({} as ImplementationRunProductionInput["config"], {
+  get: (_t, key) => Reflect.get(currentInput.config, key),
+  set: (_t, key, value) => Reflect.set(currentInput.config, key, value),
+  has: (_t, key) => Reflect.has(currentInput.config, key),
+  ownKeys: () => Reflect.ownKeys(currentInput.config),
+  getOwnPropertyDescriptor: (_t, key) => Reflect.getOwnPropertyDescriptor(currentInput.config, key),
+});
+
+const productionProxy = new Proxy({} as ImplementationRunProductionInput, {
+  get: (_t, key) => {
+    if (key === "config") return configProxy;
+    if (key === "getMapping") return (teamKey: string) => currentInput.getMapping?.(teamKey);
+    return Reflect.get(currentInput, key);
+  },
+});
+
+let strictEnv: RestateEnvironment;
+let alwaysReplayEnv: RestateEnvironment;
+let defaultEnv: RestateEnvironment;
+let caseSeq = 0;
+
+beforeAll(async () => {
+  const { services } = production.createProductionImplementationRunServices(productionProxy);
+  const [strictMap, alwaysReplay, defaultRetry] = await Promise.all([
+    startVariants(services),
+    startRetryEnabled(services, { variant: "alwaysReplay", storage: "memory" }),
+    startRetryEnabled(services, { storage: "memory" }),
+  ]);
+  strictEnv = strictMap.get("strict")!;
+  alwaysReplayEnv = alwaysReplay;
+  defaultEnv = defaultRetry;
+}, 90_000);
+
+afterAll(async () => {
+  await Promise.all([strictEnv?.stop(), alwaysReplayEnv?.stop(), defaultEnv?.stop()]);
+});
+
+afterEach(() => {
+  captured.crash = false;
+  captured.crashed = false;
+  captured.recovered = false;
+  captured.historical = false;
+  captured.deadline = false;
+  captured.wrapEffect = "";
+  captured.stopGate?.release();
+  captured.stopGate = undefined;
+  captured.wrapGate?.release();
+  captured.wrapGate = undefined;
+  vi.restoreAllMocks();
+});
 
 // Real production admission/log/intent/finder/callback/finalizer composition against the pinned Restate binary.
 // Only backend I/O and tracker writes are simulated; the local finder and docker launcher are real.
 describe("implementation lost acceptance recovery", () => {
   it.each((["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend => (backend === "fly-machines" ? ["normal", "cancelled", "deadline", "cleanup", "outcome", "historical"] : ["normal", "cancelled", "deadline", "cleanup", "outcome"]).map(mode => ({ backend, mode, protectedLaunch: false, secrets: true, variant: "" }))).concat(
-    ["alwaysReplay", "disableRetries"].flatMap(variant => [true, false].flatMap(protectedLaunch => [true, false].map(secrets => ({ backend: "fly-machines" as const, mode: "normal", protectedLaunch, secrets, variant }))))))("$backend $mode protected=$protectedLaunch secrets=$secrets $variant: adopts once and finalizes the exact retained owner", async ({ backend, mode, protectedLaunch, secrets, variant }) => {
+    ["alwaysReplay", "strict"].flatMap(variant => [true, false].flatMap(protectedLaunch => [true, false].map(secrets => ({ backend: "fly-machines" as const, mode: "normal", protectedLaunch, secrets, variant }))))))("$backend $mode protected=$protectedLaunch secrets=$secrets $variant: adopts once and finalizes the exact retained owner", async ({ backend, mode, protectedLaunch, secrets, variant }) => {
     captured.crash = variant === "alwaysReplay" && protectedLaunch && secrets;
     captured.crashed = false;
     captured.recovered = false;
@@ -58,10 +132,9 @@ describe("implementation lost acceptance recovery", () => {
     captured.deadline = deadline || historical;
     captured.stopGate = cancelled ? gate("escape stop before retained status") : undefined;
     testTempRoot("implementation-recovery");
-    const db = await testDb({ modules: {
+    const db = await testDb({ mode: "memory", modules: {
       managed: () => import("../../managed-dispatch-auth.js"),
       runnerMode: () => import("../../runner-mode.js"),
-      production: () => import("../../restate/implementation-run-production.js"),
       log: () => import("../../log.js"),
       admission: () => import("../../dispatch-admission.js"),
       launch: () => import("../../implementation-launch.js"),
@@ -69,8 +142,7 @@ describe("implementation lost acceptance recovery", () => {
       tokens: () => import("../../runner-tokens.js"),
       watchdog: () => import("../../stuck-watchdog.js"),
     } });
-    const { production, log, admission, launch, callback, tokens } = db.modules;
-    db.modules.runnerMode.initSettingsTable();
+    const { log, admission, launch, callback, tokens } = db.modules;
     db.modules.runnerMode.setFlyProcessLevelSecrets(secrets);
     vi.spyOn(db.modules.managed, "isManagedProject").mockReturnValue(protectedLaunch);
     if (protectedLaunch) {
@@ -78,7 +150,7 @@ describe("implementation lost acceptance recovery", () => {
       vi.spyOn(db.modules.managed, "settleLaunch").mockImplementation(() => ({ revoked: false }));
     }
 
-    const run: ImplementationRunInput = { dispatchId: `recover-${backend}`, issueId: "issue-1", issueIdentifier: "ENG-1", teamKey: "ENG", backend, maxJobMinutes: 60, launchContext: { runnerMode: "default" } };
+    const run: ImplementationRunInput = { dispatchId: `recover-${++caseSeq}-${backend}`, issueId: "issue-1", issueIdentifier: "ENG-1", teamKey: "ENG", backend, maxJobMinutes: 60, launchContext: { runnerMode: "default" } };
     const issue = makeIssue({ id: run.issueId, identifier: run.issueIdentifier, scopeKey: run.teamKey, maxTurns: 17, maxIterations: 3 });
     const mapping = makeMapping({ owner: "Org", repo: "repo", maxInProgressAiIssues: 5 });
     const provider = makeProvider({ findByKey: vi.fn(async () => issue) });
@@ -148,9 +220,9 @@ describe("implementation lost acceptance recovery", () => {
         args.input.markLaunchAttempted({ sessionImage: "runner:fly", machineSize: { cpuKind: "shared", cpus: 2, memoryMb: 1024 }, computeStartedAt: Date.now() });
         nonce = args.input.machineNonce; runToken = args.input.runToken;
         launches++; accepted = true; changeConfiguration();
-        // The no-retry variant exercises a successful launch. Only retry-enabled
+        // The strict (no-retry) variant exercises a successful launch. Only retry-enabled
         // cases inject failures, either here or after production records success.
-        if (captured.crash || variant === "disableRetries") return {
+        if (captured.crash || variant === "strict") return {
           machineId: "machine-1", sessionImage: "runner:fly", executionMode: "fly-machines",
           statusComment: null, computeStartedAt: Date.now(),
         };
@@ -162,17 +234,13 @@ describe("implementation lost acceptance recovery", () => {
       },
       postDispatch, finalizeImplementation: finalize, remediateStuckJob: backend === "fly-machines" && deadline ? vi.fn(db.modules.watchdog.remediateStuckJob) : remediate, reportTerminalJob,
     };
-    const { services } = production.createProductionImplementationRunServices(productionInput);
+    currentInput = productionInput;
     if (historical) {
       const { acquireDispatch } = await import("../../dispatch-gate.js");
       expect(acquireDispatch({ dispatchId: run.dispatchId, issueId: run.issueId, issueIdentifier: run.issueIdentifier, kind: "implementation", teamKey: run.teamKey, backend, maxInProgressAiIssues: 5, lifecycleOwner: { kind: "restate", attemptId: run.dispatchId } }).ok).toBe(true);
       productionInput.config.flySessionsApp = "replacement-app";
     }
-    if (variant) {
-      const environments = await startVariants(services);
-      env = environments.get(variant)!;
-      await Promise.all([...environments].filter(([key]) => key !== variant).map(([, other]) => other.stop()));
-    } else env = await startRetryEnabled(services);
+    const env = variant === "strict" ? strictEnv : variant === "alwaysReplay" ? alwaysReplayEnv : defaultEnv;
     const pending = callWorkflow<{ reason: string }>(env.baseUrl(), "ImplementationRun", run.dispatchId, "run", run);
     if (historical) {
       expect(await pending).toEqual({ reason: "termination_unconfirmed" });

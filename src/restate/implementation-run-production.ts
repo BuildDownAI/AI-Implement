@@ -39,7 +39,7 @@ import {
   type MachineSize,
 } from "../log.js";
 import { trackerAccounting } from "../job-accounting.js";
-import { generateMachineNonce, generateSessionToken, listMachines, getMachine, machineNeverStarted } from "../fly-machines.js";
+import { generateMachineNonce, generateSessionToken, listMachines, getMachine, getMachineRunnerAddress, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer, readPublishedPort } from "../local-docker.js";
 import { markDispatched } from "../dedup.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
@@ -253,7 +253,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
   function saveIntent(run: ImplementationRunInput, ctx: Prelaunch, metadata: Omit<LaunchMetadata, "ghToken">) {
     implementationIntentStore().write(run.dispatchId, {
       context: { mapping: recoveryMapping(ctx.mapping), issue: ctx.issue, generation: ctx.generation, baseBranch: ctx.baseBranch, baseBranchFieldValue: ctx.baseBranchFieldValue, runnerMode: ctx.runnerMode },
-      ...(run.backend === "local-docker" ? { serve: true } : {}),
+      ...(run.backend !== GHA_BACKEND ? { serve: true } : {}),
       metadata, accounting: trackerAccounting(ctx.mapping, ctx.provider, ctx.issue), groupingParent: ctx.groupingParent,
       dispatchedAt: readAdmission(run.dispatchId)?.createdAt ?? Date.now(), flyApp: config.flySessionsApp,
     } satisfies Intent);
@@ -441,7 +441,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
         },
       };
       launched = execPath === "fly-machines"
-        ? await input.launchImplementationFlySession({ ...args, shadow: false, implementationSandbox: decideImplementationSandbox({ protectedLaunch: ctx.managedDecision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }) })
+        ? await input.launchImplementationFlySession({ ...args, serve: { identityKey: input.restateIdentityKey ?? "", runnerId: run.dispatchId }, shadow: false, implementationSandbox: decideImplementationSandbox({ protectedLaunch: ctx.managedDecision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }) })
         : await input.launchImplementationLocalSession({ ...args, serve: { identityKey: input.restateIdentityKey ?? "", runnerId: run.dispatchId } });
     } catch (err) {
       const outcome = classifyLaunchError(execPath, launchAttempted, err);
@@ -849,12 +849,14 @@ export function createProductionImplementationRunServices(input: ImplementationR
       let id: string | null;
       try {
         id = owner.jobId ?? await deps.findExistingRun(owner.input, owner.createdAt);
-        if (id !== null && owner.input.backend === "local-docker" && intent?.snapshot.serve) await cleanup(owner.input, id);
+        // Serve containers do not stop by themselves, and no workflow owns them during recovery,
+        // so remove before reading status; see docs/restate.md § "Owner recovery".
+        if (id !== null && intent?.snapshot.serve === true) await cleanup(owner.input, id);
         if (id === null || await readStatus(owner.input, id) !== "ended") return { reason: "termination_unconfirmed" };
       } catch {
         return { reason: "termination_unconfirmed" };
       }
-      const serveRecovery = owner.input.backend === "local-docker" && intent?.snapshot.serve;
+      const serveRecovery = intent?.snapshot.serve === true;
       if (serveRecovery && intent.snapshot.runnerDeploymentId) await removeDeployment(intent.snapshot.runnerDeploymentId);
       if (serveRecovery && intent.snapshot.runnerResult) {
         console.log(`[implementation-run] replaying saved runner result intake: ${dispatchId}`);
@@ -876,7 +878,13 @@ export function createProductionImplementationRunServices(input: ImplementationR
     },
     recordRunnerResult: (run, body) => { implementationIntentStore().recordRunnerResult(run.dispatchId, body); },
     recordRunnerDeployment: (run, deploymentId) => { implementationIntentStore().recordRunnerDeployment(run.dispatchId, deploymentId); },
-    runnerRegistration: (_run, jobId) => ({
+    runnerRegistration: (run, jobId) => run.backend === "fly-machines" ? {
+      readUri: () => {
+        const config = backendConfig(run);
+        return getMachineRunnerAddress(config.flySessionsToken!, config.flySessionsApp!, jobId);
+      },
+      readContainerState: () => classifyFlyMachine(backendConfig(run), jobId),
+    } : ({
       readUri: async () => {
         const port = await readPublishedPort(jobId, 9080);
         return port === null ? null : `http://127.0.0.1:${port}`;

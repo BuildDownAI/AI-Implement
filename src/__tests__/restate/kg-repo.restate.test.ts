@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoSwitchAdmission, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import type { KgRepoDefinition } from "../../restate/kg-refresh-types.js";
-import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callService, cancelInvocation, eventually, gate, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll, type Gate } from "./harness.js";
+import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callService, cancelInvocation, eventually, gate, killInvocation, queryInvocations, setObjectState, setObjectStates, settle, startVariants, stopAll, type Gate } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 const MARKER_AGE_WAIT_MS = 1_500;
@@ -438,19 +438,27 @@ describe("KgRepo durable single-flight lock", () => {
     },
   );
 
+  async function seedFullPendingQueue(env: RestateEnvironment, slug: string): Promise<void> {
+    await trigger(env.baseUrl(), slug);
+    const status = (await repoStatus(env.baseUrl(), slug))!;
+    const pending: Record<string, { ref: string; report: ReturnType<typeof reportFor>; enqueuedAt: number }> = {};
+    for (let i = 1; i <= MAX_TRACKED_PRS; i++) {
+      pending[`org/kg-source#${i}`] = { ref: `br${i}`, report: reportFor(i, `sha-br${i}`), enqueuedAt: i };
+    }
+    await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", slug, {
+      inFlight: { triggerId: status.triggerId, startedAt: status.startedAt, invocationId: status.invocationId },
+      "sha:org/kg-source#1": "sha-br1",
+      pending,
+    });
+  }
+
   it.each(VARIANTS.map(([label]) => label))(
     "Q5: past MAX_TRACKED_PRS the oldest pending key is evicted and status shows the cap (%s)",
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
-      await trigger(env.baseUrl(), slug);
-
-      // #1 alone first so it is the oldest entry; the rest go concurrently so the whole
-      // loop finishes well inside FRESH_WINDOW_MS (sequential calls outlast the marker).
-      await enqueue(env.baseUrl(), slug, 1, "br1");
-      await Promise.all(
-        Array.from({ length: MAX_TRACKED_PRS }, (_, i) => enqueue(env.baseUrl(), slug, i + 2, `br${i + 2}`)),
-      );
+      await seedFullPendingQueue(env, slug);
+      await enqueue(env.baseUrl(), slug, MAX_TRACKED_PRS + 1, `br${MAX_TRACKED_PRS + 1}`);
 
       const pending = (await repoStatus(env.baseUrl(), slug))!.pending;
       expect(pending).toHaveLength(MAX_TRACKED_PRS);
@@ -465,11 +473,9 @@ describe("KgRepo durable single-flight lock", () => {
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
-      await trigger(env.baseUrl(), slug);
-      await enqueue(env.baseUrl(), slug, 1, "br1");
-      await Promise.all(
-        Array.from({ length: MAX_TRACKED_PRS }, (_, i) => enqueue(env.baseUrl(), slug, i + 2, `br${i + 2}`)),
-      );
+      await seedFullPendingQueue(env, slug);
+      expect(await enqueue(env.baseUrl(), slug, 1, "br1")).toEqual({ duplicate: true });
+      await enqueue(env.baseUrl(), slug, MAX_TRACKED_PRS + 1, `br${MAX_TRACKED_PRS + 1}`);
       expect((await repoStatus(env.baseUrl(), slug))!.pending).not.toContain("org/kg-source#1");
 
       expect(await enqueue(env.baseUrl(), slug, 1, "br1")).not.toHaveProperty("duplicate");

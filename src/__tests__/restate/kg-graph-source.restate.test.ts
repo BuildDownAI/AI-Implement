@@ -13,7 +13,7 @@ import {
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   setObjectStates, VARIANTS, callService, journaledRunResult, journalEntries, journalText,
-  awaitSentInvocations, callObject, cancelInvocationIfLive, eventually, gate, queryInvocations, startVariants, stopAll,
+  awaitSentInvocations, callObject, cancelInvocationIfLive, eventually, gate, queryInvocations, startRetryEnabled, startVariants, stopAll,
 } from "./harness.js";
 import type { RestateEnvironment } from "./harness.js";
 import { KG_GRAPH_SOURCE_SETTING_KEY, setKgGraphSource, setStardogValues, type KgGraphSource } from "../../kg-graph-source.js";
@@ -73,10 +73,11 @@ function kgGraphSourceDeps(overrides: Partial<KgGraphSourceToolDeps> = {}): KgGr
       fixture.restarts += 1;
       if (!fixture.sidecarPresent) throw new Error("sidecar did not start");
     },
+    stardogQueryCodePresent: () => true,
     sidecarGraphPresent: () => fixture.sidecarPresent,
     effectiveSource: () => fixture.source,
-    testPauseMs: 0,
-    testMaxRetryDurationMs: 2_000,
+    testPauseMs: 50,
+    testMaxRetryDurationMs: 400,
     log: (from: KgGraphSource, to: KgGraphSource, ok: boolean) => fixture.logs.push(`[kg] graph source ${from} -> ${to}: ${ok ? "ok" : "failed"}`),
     ...overrides,
   };
@@ -133,6 +134,7 @@ function resultBody(result: ToolResult): Record<string, unknown> {
 
 describe("set_kg_graph_source (Restate)", () => {
   let environments: Map<string, RestateEnvironment>;
+  let retryEnv: RestateEnvironment;
   const originalSecret = process.env.RUNNER_TOKEN_SECRET;
 
   beforeAll(async () => {
@@ -141,7 +143,11 @@ describe("set_kg_graph_source (Restate)", () => {
     process.env.RUNNER_TOKEN_SECRET = "kg-graph-source-restate-test-key";
     bindRefreshDeps();
     bindFixture();
-    environments = await startVariants([orchestratorTools, createKgRepo({ workflowName: FAKE_REFRESH_NAME }), fakeKgRefresh]);
+    const services = [orchestratorTools, createKgRepo({ workflowName: FAKE_REFRESH_NAME }), fakeKgRefresh];
+    [environments, retryEnv] = await Promise.all([
+      startVariants(services),
+      startRetryEnabled(services, { variant: "alwaysReplay", storage: "memory" }),
+    ]);
   }, 60_000);
 
   beforeEach(() => {
@@ -150,7 +156,7 @@ describe("set_kg_graph_source (Restate)", () => {
   });
 
   afterEach(async () => {
-    for (const env of environments.values()) {
+    for (const env of [...environments.values(), retryEnv]) {
       await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", REPO_KEY, { inFlight: null, held: null }).catch(() => undefined);
     }
     bindRefreshDeps();
@@ -162,7 +168,27 @@ describe("set_kg_graph_source (Restate)", () => {
     setKgGraphSourceToolDeps(null);
     if (originalSecret === undefined) delete process.env.RUNNER_TOKEN_SECRET;
     else process.env.RUNNER_TOKEN_SECRET = originalSecret;
-    await stopAll(environments);
+    await Promise.all([stopAll(environments), retryEnv?.stop()]);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("refuses absent Stardog query code before values or effects and releases the lock (%s)", async (label) => {
+    const env = environments.get(label)!;
+    setKgGraphSource("sidecar");
+    const before = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(KG_GRAPH_SOURCE_SETTING_KEY);
+    setStardogValues({ namespace: "" });
+    setKgGraphSourceToolDeps(kgGraphSourceDeps({ stardogQueryCodePresent: () => false }));
+    const result = await switchSource(env, "stardog_run");
+    expect(result.isError).not.toBe(true);
+    expect(resultBody(result)).toEqual({
+      switched: false, error: "no-stardog-query-code",
+      message: "The query code in this image has no Stardog store. Update the KG repo from the base KG repo, then deploy again.",
+    });
+    expect(fixture.calls).toBe(0);
+    expect(fixture.saves).toEqual([]);
+    expect(fixture.restarts).toBe(0);
+    expect(fixture.logs).toEqual(["[kg] graph source sidecar -> stardog_run: failed"]);
+    expect(getDb().prepare("SELECT value FROM settings WHERE key = ?").get(KG_GRAPH_SOURCE_SETTING_KEY)).toEqual(before);
+    expectRefreshAdmitted(await triggerRefresh(env));
   });
 
   it.each(VARIANTS.map(([label]) => label))("a passing test query saves stardog_run and restarts once (%s)", async (label) => {
@@ -176,8 +202,8 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.logs).toEqual(["[kg] graph source sidecar -> stardog_run: ok"]);
   });
 
-  it("a fake that fails twice, then passes, switches (alwaysReplay)", async () => {
-    const env = environments.get("alwaysReplay")!;
+  it("a fake that fails twice, then passes, switches (retry-enabled)", async () => {
+    const env = retryEnv;
     fixture = newFixture({ tries: ["fail", "fail", "pass"] });
     const result = await switchSource(env, "stardog_run");
     expect(result.isError).not.toBe(true);
@@ -187,8 +213,8 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.restarts).toBe(1);
   });
 
-  it("a switch suspended on a failing Stardog test keeps the lock until it ends (alwaysReplay)", async () => {
-    const env = environments.get("alwaysReplay")!;
+  it("a switch suspended on a failing Stardog test keeps the lock until it ends (retry-enabled)", async () => {
+    const env = retryEnv;
     const retry = gate("the Stardog test's second attempt");
     setKgGraphSourceToolDeps(kgGraphSourceDeps({
       countTriples: async () => {
@@ -382,6 +408,7 @@ describe("set_kg_graph_source (Restate)", () => {
     const env = environments.get(label)!;
     fixture = newFixture({ source: "stardog_run" });
     resetStoredValues("stardog_run");
+    setKgGraphSourceToolDeps(kgGraphSourceDeps({ stardogQueryCodePresent: () => { throw new Error("sidecar must not read Stardog capability"); } }));
     const result = await switchSource(env, "sidecar");
     expect(resultBody(result)).toEqual({ switched: true, source: "sidecar" });
     expect(fixture.calls).toBe(0);
@@ -404,6 +431,7 @@ describe("set_kg_graph_source (Restate)", () => {
     const env = environments.get(label)!;
     fixture = newFixture({ source: "stardog_run", sidecarPresent: false });
     resetStoredValues("stardog_run");
+    setKgGraphSourceToolDeps(kgGraphSourceDeps({ stardogQueryCodePresent: () => { throw new Error("sidecar must not read Stardog capability"); } }));
     const result = await switchSource(env, "sidecar");
     expect(result.isError).not.toBe(true);
     expect(resultBody(result)).toEqual({ switched: false, error: "no-sidecar-graph" });
@@ -444,15 +472,16 @@ describe("set_kg_graph_source (Restate)", () => {
     expect(fixture.restarts).toBe(0);
   });
 
-  it.each(VARIANTS.map(([label]) => label))("refuses stardog_run when stored values are missing (%s)", async (label) => {
+  it.each(VARIANTS.flatMap(([label]) => ["db", "namespace", "token"].map((missing) => ({ label, missing }))))("refuses stardog_run with missing $missing ($label)", async ({ label, missing }) => {
     const env = environments.get(label)!;
-    setStardogValues({ token: "" });
-    getDb().prepare("DELETE FROM settings WHERE key = 'kg_stardog_db'").run();
+    setStardogValues({ [missing]: "" });
     const result = await switchSource(env, "stardog_run");
     expect(result.isError).not.toBe(true);
-    expect(resultBody(result)).toEqual({ switched: false, error: "stardog-values-missing" });
+    expect(resultBody(result)).toEqual({ switched: false, error: "stardog-values-missing", message: "Enter Database, Namespace and the token, then save." });
     expect(fixture.calls).toBe(0);
+    expect(fixture.saves).toEqual([]);
     expect(fixture.restarts).toBe(0);
+    expect(getDb().prepare("SELECT value FROM settings WHERE key = ?").get(KG_GRAPH_SOURCE_SETTING_KEY)).toBeUndefined();
   });
 
   it.each(VARIANTS.map(([label]) => label))("refuses stardog_run when only the namespace is missing (%s)", async (label) => {
@@ -460,7 +489,7 @@ describe("set_kg_graph_source (Restate)", () => {
     setStardogValues({ namespace: "" });
     const result = await switchSource(env, "stardog_run");
     expect(result.isError).not.toBe(true);
-    expect(resultBody(result)).toEqual({ switched: false, error: "stardog-values-missing" });
+    expect(resultBody(result)).toEqual({ switched: false, error: "stardog-values-missing", message: "Enter Database, Namespace and the token, then save." });
     expect(fixture.calls).toBe(0);
     expect(fixture.restarts).toBe(0);
 

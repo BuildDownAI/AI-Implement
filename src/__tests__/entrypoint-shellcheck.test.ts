@@ -687,17 +687,22 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
   const configuredEnvelope = () => encode({ v: 1, issue, prNumber: "7", agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: grant } });
 
   let distDir = "";
-  beforeAll(() => {
-    // Real trusted decoder, compiled once; the shell imports it from AI_IMPLEMENT_DIST_DIR.
+  beforeAll(async () => {
+    // Real trusted decoder, compiled once; session/lib.sh imports only run-config.js and local/session.js from AI_IMPLEMENT_DIST_DIR.
     distDir = join(process.cwd(), "node_modules", ".cache", "aii951-entrypoint-dist");
-    // tsc enables Node's compile cache, which goes under os.tmpdir() unless NODE_COMPILE_CACHE names a directory.
-    const compileCache = join(process.cwd(), "node_modules", ".cache", "aii951-entrypoint-compile-cache");
-    const r = spawnSync("npx", ["tsc", "--outDir", distDir], {
-      encoding: "utf8",
-      env: { ...process.env, NODE_COMPILE_CACHE: compileCache },
+    const { build } = await import("esbuild");
+    await build({
+      entryPoints: {
+        "run-config": join(process.cwd(), "src", "run-config.ts"),
+        "local/session": join(process.cwd(), "src", "local", "session.ts"),
+      },
+      outdir: distDir,
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      packages: "external",
     });
-    expect(r.status, r.stdout + r.stderr).toBe(0);
-  }, 120_000);
+  }, 30_000);
 
   function run(env: Record<string, string>, opts: { failClone?: boolean; handoff?: boolean; launcherHome?: string | "fake-root"; kgBase?: "present" | "missing" } = {}) {
     const root = testDir("entrypoint-configured");

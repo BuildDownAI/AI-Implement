@@ -370,6 +370,8 @@ export interface KgRefreshWorkflowDependencies {
   watchIntervalMs?: number;
   /** Overrides `KG_REFRESH_DECISION_TIMEOUT_MS` for a deterministic decision-timeout test. Production leaves this unset. */
   decisionTimeoutMs?: number;
+  /** Overrides `DISPATCH_RETRY_INITIAL_INTERVAL` for fast dispatch-retry tests. Production leaves this unset. */
+  dispatchRetryInitialIntervalMs?: number;
   /** Invoked, via its own `ctx.run` entry, once the "stage" gate's own result is already
    *  durable — before "swap" begins. A fault-injection test uses this to simulate a process
    *  crash in that exact window: the four gate functions convert any dependency throw into a
@@ -752,7 +754,13 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           };
         },
         // Spaced so the retries can outlast a Fly replace window (AII-1192): 3 s, then 6 s.
-        { maxRetryAttempts: 3, initialRetryInterval: DISPATCH_RETRY_INITIAL_INTERVAL, retryIntervalFactor: 2 },
+        {
+          maxRetryAttempts: 3,
+          initialRetryInterval: deps.dispatchRetryInitialIntervalMs !== undefined
+            ? { milliseconds: deps.dispatchRetryInitialIntervalMs }
+            : DISPATCH_RETRY_INITIAL_INTERVAL,
+          retryIntervalFactor: 2,
+        },
       );
 
       dispatched = dispatchResult;

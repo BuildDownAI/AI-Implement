@@ -3188,7 +3188,7 @@ async function handlePostSettings(
     return;
   }
 
-  // Graph details and the Stardog rows are validated before any write in this handler, so a
+  // The graph values and the Stardog rows are validated before any write in this handler, so a
   // request that mixes valid and invalid values answers 400 and stores nothing.
   const stardogPatch: Parameters<typeof setStardogValues>[0] = {};
   const stardogFields = {

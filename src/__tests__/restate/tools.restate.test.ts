@@ -33,7 +33,7 @@ import { EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EPHEMERAL_FULL_ACCESS_ASSERTION } from
 import { setKgMemoryProvider, type KgToolResult, type MemoryProvider } from "../../kg-provider.js";
 import { createSetupChecks } from "../../restate/setup-checks.js";
 import type { SetupCheckRun } from "../../setup-checks/index.js";
-import { VARIANTS, journalEntries, journalText, callObject, callService, gate, queryInvocations, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, journalEntries, journalText, callObject, callService, gate, queryInvocations, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 // Supply valid inputs so registry-wide grant checks reach authorization even for
 // strict schemas, which reject unrelated shared fixture fields at ingress.
@@ -1185,17 +1185,17 @@ describe("orchestratorTools (Restate)", () => {
     },
   );
 
-  it("alwaysReplay: ctx.run runs its closure once while the code outside it re-executes on replay (AII-717)", async () => {
-    const env = environments.get("alwaysReplay");
-    if (!env) throw new Error('environment "alwaysReplay" did not start');
+  it("strict (alwaysReplay): ctx.run runs its closure once while the code outside it re-executes on replay (AII-717)", async () => {
+    const env = environments.get("strict");
+    if (!env) throw new Error('environment "strict" did not start');
     replayInsideCounter = 0;
     replayOutsideCounter = 0;
 
     await callService(env.baseUrl(), "replayCounterTools", "increment", { caller: SYSTEM, args: {} });
 
     // insideCounter is journaled by ctx.run: recovered from the journal on every replay after
-    // the first, never re-run. outsideCounter runs again on each replay the alwaysReplay
-    // container forces at the handler's one durable step — this is the same mechanism that
+    // the first, never re-run. outsideCounter runs again on each replay the strict (0s inactivity)
+    // server forces at the handler's one durable step — this is the same mechanism that
     // would double-run a bare admin action call outside ctx.run after a real crash (AII-717's
     // concrete failure: a replayed clear_dispatch_dedup deleting a dedup row the first poll
     // had just written).
@@ -1204,7 +1204,7 @@ describe("orchestratorTools (Restate)", () => {
   });
 
   it("imports an environment account through one secret-free journal step", async () => {
-    const env = environments.get("alwaysReplay")!;
+    const env = environments.get("strict")!;
     const names = ["RUNNER_TOKEN_SECRET", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] as const;
     const previous = names.map(name => process.env[name]);
     const token = "SENTINEL-RESTATE-ENV-IMPORT";
@@ -1268,8 +1268,8 @@ describe("orchestratorTools (Restate)", () => {
   });
 
   it("pause_project: a second ingress call with the same idempotency key attaches to the first result instead of running pauseProjectAction again", async () => {
-    const env = environments.get("alwaysReplay");
-    if (!env) throw new Error('environment "alwaysReplay" did not start');
+    const env = environments.get("strict");
+    if (!env) throw new Error('environment "strict" did not start');
     const key = "pause-project-dedup-test";
 
     const first = await callService<ToolCallResult>(
@@ -1296,35 +1296,38 @@ describe("orchestratorTools (Restate)", () => {
     expect(getMappings().BDS?.paused).toBe(true);
   });
 
-  // Runs only against alwaysReplay: the disableRetries variant is built to fail a throwing
-  // handler immediately (its own docstring above), so it cannot demonstrate a retry
-  // succeeding — see idempotentTools' comment for why this bypasses tool() to prove it.
+  // Uses a retry-enabled server: the strict variant kills a throwing handler on its first
+  // attempt, so it cannot demonstrate a retry succeeding — see idempotentTools' comment
+  // for why this bypasses tool() to prove it.
   it(
     "throws_once_then_succeeds: Restate retries the raw handler until it succeeds, then a second call with the same idempotency key doesn't run it a third time",
     async () => {
-      const env = environments.get("alwaysReplay");
-      if (!env) throw new Error('environment "alwaysReplay" did not start');
-      const key = "throws-once-dedup-test";
+      const env = await startRetryEnabled([idempotentTools], { variant: "alwaysReplay", storage: "memory" });
+      try {
+        const key = "throws-once-dedup-test";
 
-      const first = await callService<{ attempt: number }>(
-        env.baseUrl(),
-        "idempotentTools",
-        "throws_once_then_succeeds",
-        {},
-        { "idempotency-key": key },
-      );
-      expect(first).toEqual({ attempt: 2 });
-      expect(idempotentAttempts).toBe(2);
+        const first = await callService<{ attempt: number }>(
+          env.baseUrl(),
+          "idempotentTools",
+          "throws_once_then_succeeds",
+          {},
+          { "idempotency-key": key },
+        );
+        expect(first).toEqual({ attempt: 2 });
+        expect(idempotentAttempts).toBe(2);
 
-      const second = await callService<{ attempt: number }>(
-        env.baseUrl(),
-        "idempotentTools",
-        "throws_once_then_succeeds",
-        {},
-        { "idempotency-key": key },
-      );
-      expect(second).toEqual({ attempt: 2 });
-      expect(idempotentAttempts).toBe(2);
+        const second = await callService<{ attempt: number }>(
+          env.baseUrl(),
+          "idempotentTools",
+          "throws_once_then_succeeds",
+          {},
+          { "idempotency-key": key },
+        );
+        expect(second).toEqual({ attempt: 2 });
+        expect(idempotentAttempts).toBe(2);
+      } finally {
+        await env.stop();
+      }
     },
     30_000,
   );

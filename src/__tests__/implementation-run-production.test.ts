@@ -58,10 +58,10 @@ vi.mock("../dispatch-breaker.js", () => ({ recordDispatchFailure: vi.fn().mockRe
 vi.mock("../base-branch.js", () => ({ postBranchComment: vi.fn() }));
 vi.mock("../status-events.js", () => ({ postStatusComment: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../fly-machines.js", () => ({
-  machineNeverStarted: vi.fn().mockReturnValue(false), getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn(),
+  getMachineRunnerAddress: vi.fn(), machineNeverStarted: vi.fn().mockReturnValue(false), getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn(),
   generateSessionToken: () => "SESSION-TOKEN", generateMachineNonce: () => "MACHINE-NONCE",
 }));
-vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), removeLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn().mockResolvedValue(null) }));
+vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), removeLocalContainer: vi.fn(), readPublishedPort: vi.fn(), findLocalContainerIdByName: vi.fn().mockResolvedValue(null) }));
 vi.mock("../dispatch-admission.js", () => ({ read: vi.fn(), release: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../runner-tokens.js", () => ({
@@ -85,8 +85,8 @@ import { APP_TOKEN_STEP, cancelWorkflowRun, getFailedRunStepJob, getPullRequestS
 import { appendLogIfAbsent, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
 import { markDispatched } from "../dedup.js";
 import { read as readAdmission, release as releaseAdmission } from "../dispatch-admission.js";
-import { destroyMachine, getMachine, listMachines, machineNeverStarted } from "../fly-machines.js";
-import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer } from "../local-docker.js";
+import { getMachineRunnerAddress, destroyMachine, getMachine, listMachines, machineNeverStarted } from "../fly-machines.js";
+import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer, readPublishedPort } from "../local-docker.js";
 import { classifyLaunchError, isManagedProject, prepareManagedDispatch, settleLaunch } from "../managed-dispatch-auth.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
 import {
@@ -290,6 +290,28 @@ describe("production deps", () => {
     });
   });
 
+  it.each(["fly-machines", "local-docker"] as const)("%s: registration reads the original backend target after settings change", async backend => {
+    const { d, input } = compose();
+    const run = { ...INPUT, backend };
+    intents.set(INPUT.dispatchId, { snapshot: { flyApp: "original-app" }, done: true });
+    input.config.flySessionsApp = "changed-app";
+    vi.mocked(getMachineRunnerAddress).mockResolvedValue("http://m-1.vm.original-app.internal:9080");
+    vi.mocked(getMachine).mockResolvedValue({ state: "started" } as never);
+    vi.mocked(readPublishedPort).mockResolvedValue(12345);
+    vi.mocked(inspectLocalContainer).mockResolvedValue({ running: true } as never);
+    const readers = d.runnerRegistration!(run, "m-1");
+    expect(await readers.readUri()).toBe(backend === "fly-machines" ? "http://m-1.vm.original-app.internal:9080" : "http://127.0.0.1:12345");
+    expect(await readers.readContainerState()).toBe("started");
+    if (backend === "fly-machines") {
+      expect(getMachineRunnerAddress).toHaveBeenCalledWith("fly-token", "original-app", "m-1");
+      expect(getMachine).toHaveBeenCalledWith("fly-token", "original-app", "m-1");
+      expect(readPublishedPort).not.toHaveBeenCalled();
+    } else {
+      expect(readPublishedPort).toHaveBeenCalledWith("m-1", 9080);
+      expect(getMachineRunnerAddress).not.toHaveBeenCalled();
+    }
+  });
+
   describe("reserve", () => {
     const grant = { ok: true, admissionGeneration: 1, release: () => {} };
 
@@ -394,7 +416,7 @@ describe("production deps", () => {
         promise: () => ({ get: () => ({ map: () => new Promise(() => {}) }) }),
       };
       expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "finalized" });
-      if (backend === "local-docker" && serve === true) expect(readStatus).not.toHaveBeenCalled();
+      if (serve === true) expect(readStatus).not.toHaveBeenCalled();
       else expect(readStatus).toHaveBeenCalledWith({ ...INPUT, backend }, "prior-run");
       expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
       expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
@@ -588,11 +610,10 @@ describe("production deps", () => {
         });
       }
       await d.launch({ ...INPUT, backend });
-      expect(d.readLaunchServe?.({ ...INPUT, backend })).toBe(backend === "local-docker");
+      expect(d.readLaunchServe?.({ ...INPUT, backend })).toBe(true);
       const launch = backend === "local-docker" ? input.launchImplementationLocalSession : input.launchImplementationFlySession;
       const args = vi.mocked(launch).mock.calls[0]![0];
-      if (backend === "local-docker") expect(args).toMatchObject({ serve: { identityKey: "public-identity-key", runnerId: INPUT.dispatchId } });
-      else expect(args).not.toHaveProperty("serve");
+      expect(args).toMatchObject({ serve: { identityKey: "public-identity-key", runnerId: INPUT.dispatchId } });
       expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({
         dispatchId: "d-1", executionMode: backend, machineId: backend === "fly-machines" ? "m-1" : "c-1", machineNonce: "MACHINE-NONCE",
       }));

@@ -772,7 +772,7 @@ describe("kg current run card (AII-1260)", () => {
   });
 });
 
-describe("kg graph details card (AII-1991)", () => {
+describe("kg graph source settings (AII-2077)", () => {
   const settings = {
     kgGraphSource: "sidecar",
     kg_stardog_db: "",
@@ -806,13 +806,25 @@ describe("kg graph details card (AII-1991)", () => {
   }
 
   it("declares the card and its four fields with the specified placeholders", () => {
-    for (const id of ["kg-graph-details-card", "kg-namespace", "kg-graph-name", "kg-code-repo", "kg-graph-label", "btn-kg-graph-details-save"]) {
+    for (const id of ["kg-namespace", "kg-graph-name", "kg-code-repo", "kg-graph-label", "btn-kg-stardog-save"]) {
       expect(kgPipelinesHtml).toContain(`id="${id}"`);
     }
     expect(kgPipelinesHtml).toContain('placeholder="https://kg.builddown.dev/"');
     expect(kgPipelinesHtml).toContain('placeholder="builddown-kg"');
     expect(kgPipelinesHtml).toContain("The sidecar reads Namespace and Graph name when it starts. Select the graph source again, or restart the orchestrator, to apply a change to them. A change to KG code repo or Graph label needs no restart.");
-    expect(kgPipelinesHtml).toContain("Graph details");
+    expect(kgPipelinesHtml).not.toContain("Graph details");
+    const { el } = mount();
+    expect(el("kg-graph-details-card")).toBeNull();
+    const card = el("kg-graph-source-card");
+    for (const id of ["kg-namespace", "kg-graph-name", "kg-code-repo", "kg-graph-label"]) {
+      expect(card.contains(el(id))).toBe(true);
+    }
+    const fields = Array.from(card.querySelectorAll(".field input")).map((input) => input.id);
+    expect(fields.slice(0, 3)).toEqual(["kg-stardog-db", "kg-namespace", "kg-graph-name"]);
+    expect(el("btn-kg-stardog-save").textContent).toBe("Save");
+    for (const id of ["btn-kg-graph-details-save", "kg-graph-details-save-status", "kg-graph-details-error"]) {
+      expect(el(id)).toBeNull();
+    }
   });
 
   it("loads the four fields from GET /api/settings", async () => {
@@ -823,36 +835,45 @@ describe("kg graph details card (AII-1991)", () => {
     expect(el("kg-graph-name").value).toBe("builddown-kg");
     expect(el("kg-code-repo").value).toBe("BuildDownAI/bd-knowledge-graph");
     expect(el("kg-graph-label").value).toBe("Builddown KG");
-    expect(el("btn-kg-graph-details-save").disabled).toBe(false);
+    expect(el("btn-kg-stardog-save").disabled).toBe(false);
   });
 
-  it("posts one body with all four values and reloads", async () => {
+  it("posts one body with all eight values and reloads", async () => {
     const { win, el, calls } = mount();
     await win.loadKgGraphSettings();
     el("kg-namespace").value = "https://new.example/";
     el("kg-graph-name").value = "new-kg";
     el("kg-code-repo").value = "Org/new-repo";
     el("kg-graph-label").value = "New label";
-    await win.saveKgGraphDetails();
+    await win.saveKgStardog();
     const save = calls.find((c) => c.url === "/api/settings" && c.body);
     expect(save?.body).toEqual({
+      kg_stardog_db: "",
+      kg_stardog_run_endpoint: "",
+      kg_stardog_run_console: "",
+      kg_stardog_run_platform: "https://app.stardog.run",
       kg_namespace: "https://new.example/",
       kg_graph_name: "new-kg",
       kg_code_repo: "Org/new-repo",
       kg_graph_label: "New label",
     });
-    expect(el("kg-graph-details-save-status").textContent).toBe("Saved.");
+    expect(el("kg-stardog-save-status").textContent).toBe("Saved.");
   });
 
   it("keeps an edited value through a poll and shows a 400's error", async () => {
-    const { win, el } = mount({ save: { status: 400, body: { error: "Invalid KG graph name" } } });
+    const { win, el, calls } = mount({ save: { status: 400, body: { error: "Invalid KG graph name <b>refused</b>" } } });
     await win.loadKgGraphSettings();
-    el("kg-graph-name").value = "half-typed";
+    el("kg-namespace").value = "half-typed";
+    el("kg-stardog-token").value = "secret";
     await win.loadKgGraphSettings();
-    expect(el("kg-graph-name").value).toBe("half-typed");
-    await win.saveKgGraphDetails();
-    expect(el("kg-graph-details-error").textContent).toContain("Invalid KG graph name");
-    expect(el("kg-graph-details-error").hidden).toBe(false);
+    expect(el("kg-namespace").value).toBe("half-typed");
+    await win.saveKgStardog();
+    expect(el("kg-stardog-error").textContent).toContain("Invalid KG graph name");
+    expect(el("kg-stardog-error").hidden).toBe(false);
+    expect(el("kg-stardog-error").textContent).toContain("<b>refused</b>");
+    expect(el("kg-stardog-error").querySelector("b")).toBeNull();
+    expect(el("kg-stardog-token").value).toBe("");
+    expect(calls.filter((c) => c.url === "/api/kg/stardog")).toHaveLength(0);
   });
 
   it("renders a hostile label as input value text, never as markup", async () => {

@@ -162,7 +162,7 @@ describe("AccessBinding object", () => {
   });
 
   it("clearAccessBindingsViaObject clears through the object, and with the ingress down throws without deleting", async () => {
-    const env = environments.get("disableRetries")!;
+    const env = environments.get("strict")!;
     const key = `${randomUUID()}@eudoxus.ai`;
     saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }, { kind: "address", value: key, role: "user" }], null);
     bindStep(key, "google", "g-1");
@@ -174,7 +174,7 @@ describe("AccessBinding object", () => {
   }, 30_000);
 
   it("already-bound refreshes a stale cache, so the next sign-in makes zero ingress calls", async () => {
-    const env = environments.get("disableRetries")!;
+    const env = environments.get("strict")!;
     const addr = `${randomUUID()}@eudoxus.ai`;
     saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }, { kind: "address", value: addr, role: "user" }], null);
     // The binding lands behind the cache (another process bound it); the cache is stale.
@@ -192,8 +192,8 @@ describe("AccessBinding object", () => {
   }, 30_000);
 
   it("Operator.refresh (RestateRefreshAuthority.rotate) admits a builddown family after the entry also has a google binding, and denies a mismatched sub", async () => {
-    const env = environments.get("disableRetries");
-    if (!env) throw new Error('environment "disableRetries" did not start');
+    const env = environments.get("strict");
+    if (!env) throw new Error('environment "strict" did not start');
     saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
     expect(bindStep("ada@eudoxus.ai", "builddown", "u-9")).toBe("bound");
     expect(bindStep("ada@eudoxus.ai", "google", "g-1")).toBe("bound");
@@ -220,8 +220,8 @@ describe("AccessBinding object", () => {
   }, 30_000);
 
   it("a claim-only identity's refresh succeeds before the role expires and is denied after, until it signs in again", async () => {
-    const env = environments.get("disableRetries");
-    if (!env) throw new Error('environment "disableRetries" did not start');
+    const env = environments.get("strict");
+    if (!env) throw new Error('environment "strict" did not start');
     const email = `${randomUUID()}@eudoxus.ai`;
     saveAccessEntries([{ kind: "address", value: "unrelated@example.com", role: "admin" }], null);
     refreshEffectiveAllowlist();

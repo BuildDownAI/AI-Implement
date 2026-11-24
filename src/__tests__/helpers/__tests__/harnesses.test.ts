@@ -230,6 +230,50 @@ describe("testDb", () => {
       "BOOT_TABLE_INITS in test-db.ts must create the tables main() in src/index.ts creates; add or remove the call in both",
     ).toEqual(boot);
   });
+
+  describe("mode: \"memory\"", () => {
+    let firstHandle: Database.Database;
+    let firstLogModule: typeof import("../../../log.js");
+
+    it("uses an isolated :memory: database with all boot tables and reuses loaded modules", async () => {
+      const { path, modules } = await testDb({
+        mode: "memory",
+        modules: { log: () => import("../../../log.js"), dedup: () => import("../../../dedup.js") },
+      });
+      expect(path).toBe(":memory:");
+      expect(modules.dedup.getDb().name).toBe(":memory:");
+      expect(tableNames(modules.dedup.getDb())).toEqual(expect.arrayContaining(["mappings", "settings", "review_fix_evidence_tombstones", "dispatched"]));
+      modules.log.appendLog({ issueId: "mem-1" });
+      expect(modules.log.listLog()).toHaveLength(1);
+      firstHandle = modules.dedup.getDb();
+      firstLogModule = modules.log;
+    });
+
+    it("gives the next test an empty :memory: database without resetting modules and closed the previous handle", async () => {
+      const { modules } = await testDb({
+        mode: "memory",
+        modules: { log: () => import("../../../log.js"), dedup: () => import("../../../dedup.js") },
+      });
+      expect(firstHandle.open).toBe(false);
+      expect(modules.log).toBe(firstLogModule);
+      expect(modules.log.listLog()).toEqual([]);
+    });
+
+    it("supports reopen() by snapshotting in-memory rows across a module reset", async () => {
+      const db = await testDb({
+        mode: "memory",
+        modules: { log: () => import("../../../log.js"), dedup: () => import("../../../dedup.js") },
+      });
+      db.modules.log.appendLog({ issueId: "mem-reopen" });
+      const before = db.modules.dedup.getDb();
+
+      const reopened = await db.reopen();
+
+      expect(before.open).toBe(false);
+      expect(reopened.log).not.toBe(db.modules.log);
+      expect(reopened.log.listLog().map((entry) => entry.issueId)).toEqual(["mem-reopen"]);
+    });
+  });
 });
 
 describe("fakeFetch", () => {

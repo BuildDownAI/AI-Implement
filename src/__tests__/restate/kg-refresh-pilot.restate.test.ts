@@ -659,7 +659,7 @@ describe("Restate kg-refresh pilot: Fly sessions settings use the refreshed Runn
     setKgRefreshToolDeps(composed.toolDeps);
     environments = await startVariants([...composed.services, runnerBackend, orchestratorTools]);
     // Populate the object after composition, then refresh through the real Restate ingress.
-    const env = environments.get("disableRetries")!;
+    const env = environments.get("strict")!;
     expect(getFlySessionsConfig().app).toBeNull();
     await callObject(env.baseUrl(), "RunnerBackend", "fly-machines", "seed", { app: "late-app", region: null });
     await refreshRunnerBackendCache({
@@ -678,7 +678,7 @@ describe("Restate kg-refresh pilot: Fly sessions settings use the refreshed Runn
   });
 
   it("P10: RunnerBackend seeded and refreshed after composition resolves fly-machines and supplies the Fly app", async () => {
-    const env = environments.get("disableRetries");
+    const env = environments.get("strict");
     if (!env) throw new Error("missing Restate variant");
     const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
     if (answer.status !== "ok") throw new Error("trigger_kg_refresh unavailable");

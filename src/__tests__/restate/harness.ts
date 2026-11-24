@@ -16,10 +16,12 @@ type RestateServices = Array<
   ServiceDefinition<string, unknown> | VirtualObjectDefinition<string, unknown> | WorkflowDefinition<string, unknown>
 >;
 
-// Both variants are proven for AII-683: each environment boots the same services with
-// one of the two server options (see startBinaryEnvironment's `variant`). Each entry is a
-// one-element tuple, `[label]`, which is the shape the scenario files destructure.
-export const VARIANTS = [["alwaysReplay"], ["disableRetries"]] as const satisfies ReadonlyArray<readonly ["alwaysReplay" | "disableRetries"]>;
+// Single strict variant: combines immediate journal replay (INACTIVITY_TIMEOUT="0s")
+// with fail-fast error surfacing (MAX_ATTEMPTS="1", ON_MAX_ATTEMPTS="kill") in one
+// restate-server process. Scenarios that explicitly exercise engine retries use
+// `startRetryEnabled` instead. Each entry is a one-element tuple, `[label]`, which
+// is the shape the scenario files destructure.
+export const VARIANTS = [["strict"]] as const satisfies ReadonlyArray<readonly ["strict"]>;
 
 export async function startVariants(
   services: RestateServices,
@@ -31,10 +33,14 @@ export async function startVariants(
   return new Map(started);
 }
 
-/** Fault-injection scenarios need the engine's normal retry policy. The binary keeps
- * its journal on disk across a restart of the server. */
-export async function startRetryEnabled(services: RestateServices): Promise<RestateEnvironment> {
-  return startBinaryEnvironment({ services, storage: "disk" });
+/** Fault-injection scenarios need the engine's normal retry policy. Defaults to on-disk
+ * storage so journal state survives a server restart; pass `storage: "memory"` when no
+ * restart is exercised. */
+export async function startRetryEnabled(
+  services: RestateServices,
+  options: Pick<BinaryEnvironmentOptions, "variant" | "storage" | "invokerTimeouts" | "requestIdentity"> = {},
+): Promise<RestateEnvironment> {
+  return startBinaryEnvironment({ storage: "disk", ...options, services });
 }
 
 /** Replace only the SDK endpoint, keeping the Restate server and its journal.
