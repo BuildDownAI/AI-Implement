@@ -371,6 +371,13 @@ The callback is verify-only: it checks the signature and row but never consumes 
 
 ## 6. Lifecycle
 
+In base mode, the cancellation commit point precedes `stardog-import`. The saved
+steps are `stardog-import` → `stardog-wait` → `stardog-verify` → `baseline`;
+merge and the four sidecar gates do not run. Every final base-mode outcome runs
+`package-cleanup`, removing `<dataRoot>/stardog/` before releasing the lock.
+A gate ending `awaiting_decision` preserves the package for the decision run.
+
+
 The workflow key is the dispatch id (`KgRepo` mints it as the trigger id), so the runner callback addresses `KgRefresh/{dispatchId}` directly from the verified token claims.
 
 The three run tokens (result, progress, publication) are minted inside the workflow's one journaled `dispatch` step, so the mint and the dispatch are one unit and a replay never re-mints for a dispatch that already committed; the tokens never enter the journal; the publication token is bound to the KG source repo and exchanged for a scoped GitHub token at push time.
@@ -493,9 +500,9 @@ The `kg-ingest` step writes every line of the ingest subprocess's stdout and std
 
 ## 8. Outcomes
 
-A first base-mode load is held with `cause: "no-baseline"`. An operator can accept after checking counts unless tracker teams failed or were skipped, or a non-tracker source failed. Ingest-only completion does not update the baseline: only a successful Stardog import (AII-1994) may record it; refused, cancelled and failed runs never do.
+A first base-mode load is held with `cause: "no-baseline"`. An operator can accept after checking counts unless tracker teams failed or were skipped, or a non-tracker source failed. Only a successful, verified Stardog import records the baseline; refused, cancelled and failed runs never do.
 
-Base-mode snapshot validation runs without embeddings or age-stamp checks, uses the run start time for the report stamp, and never invokes git, pushes, or opens a PR. It receives the last successfully loaded counts from `KgRepo` state in the envelope baseline; absent state holds the first load for review. A clean or warnings report with no snapshot PR succeeds with detail `ingest-only`, without merge or sidecar rail gates. A held report has `snapshotPr: null` and `snapshotPrUrl: null`; acceptance also ends `ingest-only`, while cancellation or decision expiry follows the ordinary cancellation path without PR cleanup. Dry runs keep their existing outcome and send no package. Stardog package delivery is a subsequent change (AII-1994).
+Base-mode snapshot validation runs without embeddings or age-stamp checks, uses the run start time for the report stamp, and never invokes git, pushes, or opens a PR. It receives the last successfully loaded counts from `KgRepo` state in the envelope baseline; absent state holds the first load for review. A clean or warnings report with no snapshot PR imports the uploaded package into Stardog, waits for completion, verifies the triple count and records the new baseline. A held report has `snapshotPr: null` and `snapshotPrUrl: null`; acceptance runs the same steps using the held dispatch's package and stored part counts. Cancellation or decision expiry follows the ordinary cancellation path without PR cleanup. Dry runs keep their existing outcome and send no package. A `stardog-import-failed` outcome leaves the baseline unchanged and warns that Stardog has no good graph until a new import passes: the import removes the previous graph first.
 
 ### Classification
 
