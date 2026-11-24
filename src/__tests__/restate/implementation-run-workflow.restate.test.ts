@@ -76,6 +76,7 @@ const WINDOW = { ...SLOW, confirmWindowMs: 400 };
 const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 600, totalMs: 1_200, stopMarginMs: 500, escapeWaitMs: 4_000, escapeTickMs: 100 };
 
 interface Scenario {
+  serve?: boolean;
   registrationRejected?: boolean;
   runnerUri?: string;
   adminUrl?: string;
@@ -165,7 +166,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
         { dispatchId: input.dispatchId, issueId: input.issueId, teamKey: input.teamKey, phase: "implementation" });
       expect(result.status).toBe(200);
     },
-    readLaunchServe: input => input.backend === "local-docker",
+    readLaunchServe: input => input.backend === "local-docker" || scenarioOf(input.dispatchId).serve === true,
     async reserve(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.calls.push("reserve");
@@ -208,7 +209,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
     recordRunnerResult: (input, body) => {
       if (scenarioOf(input.dispatchId).resultSaveThrows) throw new Error("intent unavailable");
       const store = implementationIntentStore();
-      store.write(input.dispatchId, { serve: true });
+      store.write(input.dispatchId, { serve: true, ...(input.backend === "fly-machines" ? { flyApp: "app" } : {}) });
       store.recordRunnerResult(input.dispatchId, body);
     },
     recordRunnerDeployment: (input, id) => { scenarioOf(input.dispatchId).savedDeploymentId = id; },
@@ -394,14 +395,14 @@ describe("ImplementationRun durable workflow", () => {
     return { dispatchId, sc, done, read, report };
   }
 
-  it.each(labels.flatMap(label => ["absent", "failed", "accepted"].map(intake => ({ label, intake }))))("production owner recovery removes a serve container before checking termination ($label, $intake)", async ({ label, intake }) => {
+  it.each(labels.flatMap(label => (["local-docker", "fly-machines"] as const).flatMap(backend => ["absent", "failed", "accepted"].map(intake => ({ label, intake, backend })))))("production owner recovery removes a serve runner before checking termination ($backend, $label, $intake)", async ({ label, intake, backend }) => {
     const { createProductionImplementationRunServices } = await import("../../restate/implementation-run-production.js");
     const { implementationIntentStore } = await import("../../restate/implementation-launch-intent.js");
     const owners = await import("../../restate/implementation-run-owner.js");
     const docker = await import("../../local-docker.js");
     const endpoint = await import("../../restate/endpoint.js");
     const { acquireDispatch } = await import("../../dispatch-gate.js");
-    const run: ImplementationRunInput = { dispatchId: `serve-recovery-${counter++}`, teamKey: "ENG", issueId: `recovery-${counter}`, issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "local-docker" };
+    const run: ImplementationRunInput = { dispatchId: `serve-recovery-${counter++}`, teamKey: "ENG", issueId: `recovery-${counter}`, issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend };
     const events: string[] = [];
     let removed = false;
     let failRemoval = true;
@@ -421,6 +422,22 @@ describe("ImplementationRun durable workflow", () => {
       if (removed) throw new Error("No such container");
       return { status: legacyEnded ? "exited" : "running", running: !legacyEnded, exitCode: legacyEnded ? 0 : null };
     });
+    const fly = await import("../../fly-machines.js");
+    const backendRun = await import("../../backend-run.js");
+    vi.spyOn(backendRun, "destroyMachineRecorded").mockImplementation(async (config, id) => {
+      await fly.destroyMachine(config.flySessionsToken!, config.flySessionsApp!, id);
+    });
+    vi.spyOn(fly, "destroyMachine").mockImplementation(async (_token, app) => {
+      expect(app).toBe("frozen-app");
+      events.push("remove");
+      if (failRemoval) throw new Error("API unavailable");
+      removed = true;
+    });
+    vi.spyOn(fly, "getMachine").mockImplementation(async () => {
+      events.push("status");
+      if (unknownStatus) throw new Error("API unavailable");
+      return { state: removed || legacyEnded ? "destroyed" : "started" } as never;
+    });
     vi.spyOn(endpoint, "removeDeployment").mockImplementation(async id => {
       expect(id).toBe("recovery-deployment");
       events.push("deployment");
@@ -431,7 +448,7 @@ describe("ImplementationRun durable workflow", () => {
     let failIntake = false;
     const provider = new FakeProvider();
     const finalized = vi.fn(async () => {});
-    const { services } = createProductionImplementationRunServices({ config: {}, getMapping: () => makeMapping(),
+    const { services } = createProductionImplementationRunServices({ config: { flySessionsToken: "token", flySessionsApp: "changed-app" }, getMapping: () => makeMapping(),
       resolveProvider: async () => { if (failIntake) throw new Error("mapping unavailable"); return provider; },
       finalizeImplementation: finalized, reportTerminalJob: async () => {},
     } as unknown as ImplementationRunProductionInput);
@@ -442,7 +459,7 @@ describe("ImplementationRun durable workflow", () => {
     const owner = owners.requireImplementationRunOwner(run);
     owners.updateImplementationRunOwner({ ...owner, state: "launching", jobId: "serve-container" });
     const store = implementationIntentStore();
-    store.write(run.dispatchId, { serve: true, context: { mapping: makeMapping(), issue: { scopeKey: "ENG" } }, flyApp: null });
+    store.write(run.dispatchId, { serve: true, context: { mapping: makeMapping(), issue: { scopeKey: "ENG" } }, flyApp: "frozen-app" });
     store.complete(run.dispatchId);
     store.recordRunnerDeployment(run.dispatchId, "recovery-deployment");
     const body = { phase: "implementation" as const, outcome: "success" as const,
@@ -452,7 +469,7 @@ describe("ImplementationRun durable workflow", () => {
       expect(findLinkByPr(`o/${run.dispatchId}`, 1)).toBeNull();
       upsertMapping("ENG", makeMapping());
       appendLog({ dispatchId: run.dispatchId, issueId: run.issueId, issueIdentifier: run.issueIdentifier,
-        teamKey: "ENG", repo: `o/${run.dispatchId}`, phase: "implementation", status: "running", executionMode: "local-docker" });
+        teamKey: "ENG", repo: `o/${run.dispatchId}`, phase: "implementation", status: "running", executionMode: backend });
       store.recordRunnerResult(run.dispatchId, body);
       expect(store.read<{ runnerResult: unknown }>(run.dispatchId)?.snapshot.runnerResult).toEqual(body);
       if (intake === "accepted") {
@@ -504,11 +521,11 @@ describe("ImplementationRun durable workflow", () => {
     expect(await recover()).toEqual({ reason: "finalized" });
     expect(events).toEqual([]);
 
-    // An older local intent lacks serve evidence and must wait for termination.
+    // An older intent lacks serve evidence and must wait for termination.
     const legacy = { ...run, dispatchId: `${run.dispatchId}-legacy`, issueId: `${run.issueId}-legacy` };
     expect(acquireDispatch({ dispatchId: legacy.dispatchId, issueId: legacy.issueId, issueIdentifier: legacy.issueIdentifier, kind: "implementation", teamKey: legacy.teamKey, backend: legacy.backend, maxInProgressAiIssues: 100, lifecycleOwner: { kind: "restate", attemptId: legacy.dispatchId } }).ok).toBe(true);
     owners.updateImplementationRunOwner({ ...owners.requireImplementationRunOwner(legacy), state: "launching", jobId: "legacy-container" });
-    store.write(legacy.dispatchId, { context: { mapping: makeMapping() }, flyApp: null });
+    store.write(legacy.dispatchId, { context: { mapping: makeMapping() }, flyApp: "frozen-app" });
     removed = false;
     const recoverLegacy = () => callWorkflow(env.baseUrl(), "ImplementationRunRecovery", legacy.dispatchId, "reconcile");
     expect(await recoverLegacy()).toEqual({ reason: "termination_unconfirmed" });
@@ -598,13 +615,13 @@ describe("ImplementationRun durable workflow", () => {
     }, 60_000,
   );
 
-  it.each(labels.flatMap(label => ["exited", "rejected", "bootstrap timeout"].map(mode => ({ label, mode }))))(
-    "local registration $mode $label finalizes the launched run", async ({ label, mode }) => {
+  it.each(labels.flatMap(label => (["local-docker", "fly-machines"] as const).flatMap(backend => ["exited", "rejected", "bootstrap timeout"].map(mode => ({ label, mode, backend })))))(
+    "$backend registration $mode $label finalizes the launched run", async ({ label, mode, backend }) => {
       const w = begin(mode === "bootstrap timeout" ? deadline : serveRuns, label, {
-        status: mode === "exited" ? "ended" : "started",
+        serve: true, status: mode === "exited" ? "ended" : "started",
         runnerUri: mode === "rejected" ? "http://127.0.0.1:1" : undefined,
         registrationRejected: mode === "rejected", endOnStop: true,
-      }, { backend: "local-docker" });
+      }, { backend });
       expect(await w.done).toEqual({ reason: mode === "exited" ? "finalized" : mode === "rejected" ? "launch_rejected" : "deadline_exceeded" });
       expect(w.sc.finishCalls).toHaveLength(1);
       expect(w.sc.events).toContain("cleanup");
@@ -612,12 +629,12 @@ describe("ImplementationRun durable workflow", () => {
     }, 60_000,
   );
 
-  it.each(labels.flatMap(label => ["success", "restart", "intake failure", "save failure", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode }))))(
-    "local serve $mode $label waits on one registered call", async ({ label, mode }) => {
+  it.each(labels.flatMap(label => (["local-docker", "fly-machines"] as const).flatMap(backend => ["success", "restart", "intake failure", "save failure", "delayed discovery", "long", "confirm", "failure", "timeout", "cancel"].map(mode => ({ label, mode, backend })))))(
+    "$backend serve $mode $label waits on one registered call", async ({ label, mode, backend }) => {
       const launchGate = gate("local serve");
       const finishGate = gate("local serve");
       const envs = mode === "timeout" ? deadline : serveRuns;
-      const w = begin(envs, label, { launchGate, row: makeJob({ status: "dispatched", approved: ["success", "restart", "delayed discovery", "long", "confirm"].includes(mode) }) }, { backend: "local-docker" });
+      const w = begin(envs, label, { serve: true, launchGate, row: makeJob({ status: "dispatched", approved: ["success", "restart", "delayed discovery", "long", "confirm"].includes(mode) }) }, { backend });
       w.sc.resultIntakeThrows = mode === "intake failure";
       w.sc.resultSaveThrows = mode === "save failure";
       if (mode === "delayed discovery") {
@@ -629,7 +646,7 @@ describe("ImplementationRun durable workflow", () => {
         upsertMapping("ENG", makeMapping());
         expect(findLinkByPr(`o/${w.dispatchId}`, 1)).toBeNull();
         expect(admission.acquire({ dispatchId: w.dispatchId, mappingKey: "ENG",
-          scope: { kind: "issue", issueScope: "ENG", issueId: `issue-${w.dispatchId}` }, kind: "implementation", backend: "local-docker",
+          scope: { kind: "issue", issueScope: "ENG", issueId: `issue-${w.dispatchId}` }, kind: "implementation", backend,
           lifecycleOwner: { kind: "restate", attemptId: w.dispatchId }, cap: 10 }).ok).toBe(true);
         appendLog({ dispatchId: w.dispatchId, issueId: `issue-${w.dispatchId}`, issueIdentifier: "ENG-1", issueTitle: "Implement", teamKey: "ENG", repo: `o/${w.dispatchId}`, phase: "implementation", status: "running" });
       }
@@ -753,21 +770,24 @@ describe("ImplementationRun durable workflow", () => {
           const docker = await import("../../local-docker.js");
           const endpoint = await import("../../restate/endpoint.js");
           const run: ImplementationRunInput = { dispatchId: w.dispatchId, issueId: `issue-${w.dispatchId}`,
-            issueIdentifier: "ENG-1", teamKey: "ENG", launchContext: {}, maxJobMinutes: 90, backend: "local-docker" };
+            issueIdentifier: "ENG-1", teamKey: "ENG", launchContext: {}, maxJobMinutes: 90, backend };
           upsertMapping("ENG", makeMapping());
           expect(acquireDispatch({ ...run, kind: "implementation", maxInProgressAiIssues: 100,
             lifecycleOwner: { kind: "restate", attemptId: run.dispatchId } }).ok).toBe(true);
           expect(findLinkByPr(`o/${run.dispatchId}`, 1)).toBeNull();
           appendLog({ dispatchId: run.dispatchId, issueId: run.issueId, issueIdentifier: "ENG-1", teamKey: "ENG",
-            repo: `o/${run.dispatchId}`, phase: "implementation", status: "running", executionMode: "local-docker" });
+            repo: `o/${run.dispatchId}`, phase: "implementation", status: "running", executionMode: backend });
           owners.updateImplementationRunOwner({ ...owners.requireImplementationRunOwner(run), state: "launching", jobId: w.sc.runId });
           vi.spyOn(docker, "removeLocalContainer").mockResolvedValue(undefined);
           vi.spyOn(docker, "inspectLocalContainer").mockRejectedValue(new Error("No such container"));
+          const fly = await import("../../fly-machines.js");
+          vi.spyOn(fly, "destroyMachine").mockResolvedValue(undefined);
+          vi.spyOn(fly, "getMachine").mockResolvedValue({ state: "destroyed" } as never);
           vi.spyOn(endpoint, "removeDeployment").mockResolvedValue(undefined);
           vi.spyOn(auth, "getInstallationToken").mockResolvedValue("test-token");
           vi.spyOn(github, "getPullRequestState").mockResolvedValue({ merged: false } as never);
           onTestFinished(() => { vi.restoreAllMocks(); });
-          const { services } = createProductionImplementationRunServices({ config: {}, getMapping: () => makeMapping(),
+          const { services } = createProductionImplementationRunServices({ config: { flySessionsToken: "token", flySessionsApp: "app" }, getMapping: () => makeMapping(),
             resolveProvider: async () => new FakeProvider(), finalizeImplementation: async () => {}, reportTerminalJob: async () => {},
           } as unknown as ImplementationRunProductionInput);
           const recoveryEnvs = await startVariants(services);
@@ -1515,7 +1535,7 @@ describe("ImplementationRun durable workflow", () => {
   }, 60_000);
 
   // A crash replay in the middle of the wait: the endpoint is replaced and the server restarted on its disk journal.
-  it.each(["wait", "confirm"])("a pre-serve local journal resumes at %s without registration or duplicate effects", async point => {
+  it.each((["local-docker", "fly-machines"] as const).flatMap(backend => ["wait", "confirm"].map(point => ({ backend, point }))))("a pre-serve $backend journal resumes at $point without registration or duplicate effects", async ({ backend, point }) => {
     const replaySeams = { ...SLOW, tickMs: 3_600_000, confirmTickMs: 3_600_000 };
     const env = await startRetryEnabled([createLegacyImplementationRunWorkflow(makeDeps(replaySeams))]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
@@ -1528,7 +1548,7 @@ describe("ImplementationRun durable workflow", () => {
         finalizeCalls: [], closeCalls: [], stuckCalls: [], clearCalls: 0, prMerged: false, events: [],
       };
       scenarios.set(dispatchId, sc);
-      const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "i", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "local-docker" };
+      const input: ImplementationRunInput = { dispatchId, teamKey: "ENG", issueId: "i", issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend };
       const original = callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "run", input);
       void original.catch(() => undefined); // ingress may disconnect during the restart
       const read = () => callWorkflow<ImplementationRunStatusResult>(env.baseUrl(), "ImplementationRun", dispatchId, "status");

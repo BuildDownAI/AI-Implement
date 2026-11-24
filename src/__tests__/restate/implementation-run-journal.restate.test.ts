@@ -8,10 +8,13 @@
 //
 // Pause points: `wait` (the durable sleep that races the `report` promise) and `confirm` (the first status read after
 // `report`, held by a gate). The tick seams are huge, so no tick adds a `read-N` entry while a capture is read.
-// Both runner backends that AII and CON use are captured: GitHub Actions and Fly Machines. They share the same workflow
-// commands today, but separate snapshots make a later backend-specific journal change fail here.
+// GitHub Actions and legacy local Docker capture polling; Fly captures the serve path with a gated runner call.
+// Legacy Fly polling replay is covered in implementation-run-workflow.restate.test.ts.
 //
 // Regenerate only with UPDATE_JOURNAL_SNAPSHOTS=1; a missing snapshot fails. Run with `npm run test:restate`.
+import * as http2 from "node:http2";
+import * as restate from "@restatedev/restate-sdk";
+import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -21,6 +24,7 @@ import {
   type ImplementationRunInput,
   type ImplementationRunStatusResult,
 } from "../../restate/implementation-run-workflow.js";
+import { registerRunnerDeployment } from "../../restate/endpoint.js";
 import type { OwnedRunStatus } from "../../restate/owned-run-wait.js";
 import {
   callWorkflow, eventually, gate, journalEntries, queryInvocations, startVariants, stopAll, waitForStep, type RestateEnvironment,
@@ -72,15 +76,23 @@ for (const { backend, prefix, dispatchId } of CASES) {
     let status: OwnedRunStatus = "started";
     const readGate = gate("confirm read");
     let holdReads = false;
+    const runnerGate = gate("runner result");
+    let runnerUri = "";
+    let runnerServer: http2.Http2Server | undefined;
+    const sessions = new Set<http2.ServerHttp2Session>();
 
     const deps: ImplementationRunDependencies = {
       ...SEAMS,
       reserve: async () => true,
       findExistingRun: async () => null,
-      launch: async () => ({ outcome: "accepted", jobId: `job-${prefix}` }),
+      launch: async () => ({ outcome: "accepted", jobId: `job-${prefix}`, ...(backend === "fly-machines" ? { serve: true } : {}) }),
       // Production supplies these for every backend; their presence must not enable serve mode.
-      runnerRegistration: () => { throw new Error("non-local run registered a runner"); },
-      markStarted: () => { throw new Error("non-local run used serve started evidence"); },
+      runnerRegistration: () => {
+        if (backend !== "fly-machines") throw new Error("legacy run registered a runner");
+        return { readUri: () => runnerUri, readContainerState: () => "started", register: uri => registerRunnerDeployment(uri, { adminBaseUrl: envs.get("strict")!.adminAPIBaseUrl() }) };
+      },
+      markStarted: () => { if (backend !== "fly-machines") throw new Error("legacy run used serve started evidence"); },
+      removeRunnerDeployment: async () => {},
       readStatus: async () => {
         if (holdReads) await readGate.wait();
         return status;
@@ -93,13 +105,26 @@ for (const { backend, prefix, dispatchId } of CASES) {
     };
 
     beforeAll(async () => {
+      if (backend === "fly-machines") {
+        const runner = restate.service({ name: `Runner_${dispatchId}`, handlers: {
+          run: async (ctx: restate.Context) => { await ctx.run("result", () => runnerGate.wait()); return {}; },
+        } });
+        runnerServer = http2.createServer(createEndpointHandler({ services: [runner] }));
+        runnerServer.on("session", session => { sessions.add(session); session.on("close", () => sessions.delete(session)); });
+        await new Promise<void>(resolve => runnerServer!.listen(0, "127.0.0.1", resolve));
+        const address = runnerServer.address();
+        if (!address || typeof address === "string") throw new Error("missing runner address");
+        runnerUri = `http://127.0.0.1:${address.port}`;
+      }
       envs = await startVariants([createImplementationRunWorkflow(deps)]);
     }, 180_000);
 
     afterAll(async () => {
       holdReads = false;
       readGate.release();
+      runnerGate.release();
       await stopAll(envs);
+      if (runnerServer) await new Promise<void>(resolve => { runnerServer!.close(() => resolve()); for (const session of sessions) session.destroy(); });
     });
 
     it("matches the committed journal at the wait and the confirm pause points", async () => {
@@ -123,12 +148,12 @@ for (const { backend, prefix, dispatchId } of CASES) {
         await waitForStep(read, "wait");
         const atWait = await eventually(commands, (c) => c.at(-1)?.type === "Sleep", { label: "the sleep of the wait pause" });
 
-        // Confirm pause: `report` wakes the wait, and the first status read of the confirm window is held.
+        // Confirm pause: `report` wakes the wait. Polling holds its first status read; serve waits on the gated call.
         holdReads = true;
         await callWorkflow(env.baseUrl(), "ImplementationRun", dispatchId, "report");
         await waitForStep(read, "confirm");
-        await readGate.reached();
-        const atConfirm = await eventually(commands, (c) => c.at(-1)?.name.startsWith("read-") === true && c.length > atWait.length, { label: "the confirm read" });
+        if (backend !== "fly-machines") await readGate.reached();
+        const atConfirm = await eventually(commands, (c) => (backend === "fly-machines" ? c.at(-1)?.type === "Sleep" : c.at(-1)?.name.startsWith("read-") === true) && c.length > atWait.length, { label: "the confirm pause" });
         expect(atConfirm.slice(0, atWait.length), "the confirm journal extends the wait journal").toEqual(atWait);
         // Both points are checked before either failure is thrown, so a change before the wait fails both.
         const failures = [checkSnapshot(prefix, "wait", atWait), checkSnapshot(prefix, "confirm", atConfirm)].filter((m): m is string => m !== null);
@@ -137,6 +162,7 @@ for (const { backend, prefix, dispatchId } of CASES) {
         holdReads = false;
         status = "ended";
         readGate.release();
+        runnerGate.release();
       }
       await done;
     }, 60_000);

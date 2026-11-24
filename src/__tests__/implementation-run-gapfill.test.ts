@@ -65,11 +65,11 @@ import { markDispatched } from "../dedup.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 vi.mock("../config.js", async original => ({ ...await original<object>(), getMappings: vi.fn(() => ({})) }));
 vi.mock("../local-gapfill.js", () => ({ dispatchLocalGapfill: vi.fn() }));
-vi.mock("../fly-machines.js", async original => ({ ...await original<object>(), listMachines: vi.fn(async () => []) }));
+vi.mock("../fly-machines.js", async original => ({ ...await original<object>(), listMachines: vi.fn(async () => []), getMachineRunnerAddress: vi.fn(async () => "http://runner.internal:9080") }));
 vi.mock("../local-docker.js", async original => ({ ...await original<object>(), findLocalContainerIdByName: vi.fn(async () => null) }));
 import { dispatchFlyGapfill } from "../gapfill-launch.js";
 import { dispatchLocalGapfill } from "../local-gapfill.js";
-import { listMachines } from "../fly-machines.js";
+import { listMachines, getMachineRunnerAddress } from "../fly-machines.js";
 import { findLocalContainerIdByName } from "../local-docker.js";
 import { setJobMachineId } from "../log.js";
 import { isManagedProject } from "../managed-dispatch-auth.js";
@@ -574,6 +574,20 @@ it.each((["github-actions", "fly-machines", "local-docker"] as const).flatMap(ba
   expect(resolveSessionImage).not.toHaveBeenCalled();
 });
 
+it.each([undefined, "restate-identity"])("Fly gap-fill persists serve evidence before launch (identity %s)", async identityKey => {
+  configureContainer();
+  input.restateIdentityKey = identityKey;
+  createProductionImplementationRunServices(input);
+  const deps = captured.deps as ImplementationRunDependencies;
+  vi.mocked(dispatchFlyGapfill).mockImplementationOnce(async args => {
+    expect(args.serve).toEqual({ identityKey: identityKey ?? "", runnerId: run.dispatchId });
+    args.onBeforeLaunch({ cpuKind: "shared", cpus: 1, memoryMb: 1024 }, "NONCE-SENTINEL", "resolved-image");
+    expect(intents.get(run.dispatchId)).toMatchObject({ flyApp: "sessions", accepted: false });
+    expect(ordinaryIntents.get(run.dispatchId)?.snapshot).toEqual({ serve: true, flyApp: "sessions" });
+    return { machine: { id: "machine", name: args.runName! }, resolvedImage: "resolved-image" };
+  });
+  expect(await deps.launch({ ...run, backend: "fly-machines" })).toEqual({ outcome: "accepted", jobId: "machine" });
+});
 it.each(containerBackends)("%s accepted launch records compute privately and returns only id", async backend => {
   configureContainer();
   const result = await d.launch({ ...run, backend });
@@ -671,6 +685,9 @@ it.each(["accepted", "lost-ack", "crash-before-row"])("Fly %s recovery keeps the
   });
   await recovered.finishJob!(req.dispatchId, { kind: "deadline" });
   expect(stopBackendRun).toHaveBeenLastCalledWith(expect.objectContaining({ flySessionsApp: "sessions" }), "fly-machines", "same-machine");
+  const registration = recovered.runnerRegistration!(req, "same-machine");
+  expect(await registration.readUri()).toBe("http://runner.internal:9080");
+  expect(getMachineRunnerAddress).toHaveBeenLastCalledWith("TOKEN-SENTINEL", "sessions", "same-machine");
   await recovered.readStatus(req, "same-machine");
   await recovered.stop(req, "same-machine");
   await recovered.cleanup(req, "same-machine");
