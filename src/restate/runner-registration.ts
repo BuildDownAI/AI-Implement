@@ -1,4 +1,4 @@
-// Durable registration of a local runner's Restate deployment (AII-2066). A serve-mode
+// Durable registration of a runner's Restate deployment (AII-2066). A serve-mode
 // runner needs time before its published port accepts HTTP/2, so the caller cannot treat
 // one `registerRunnerDeployment()` attempt as final. Each attempt is its own journaled
 // step and the wait between attempts is a `ctx.sleep`: a retry loop inside one `ctx.run`
