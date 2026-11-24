@@ -1,11 +1,11 @@
-// Durable registration of a runner's Restate deployment (AII-2066). A serve-mode
+// Durable registration of a local runner's Restate deployment (AII-2066). A serve-mode
 // runner needs time before its published port accepts HTTP/2, so the caller cannot treat
 // one `registerRunnerDeployment()` attempt as final. Each attempt is its own journaled
 // step and the wait between attempts is a `ctx.sleep`: a retry loop inside one `ctx.run`
 // would be one long step that the invoker inactivity timeout can stop (AII-2036).
 //
 // The serve launch calls this module. The caller supplies the URI and container
-// state readers, because those belong to local Docker; this helper owns only the bounded
+// state readers, because those belong to the backend (local Docker or Fly); this helper owns only the bounded
 // attempt sequence. Pattern anchors: `registerRunnerDeployment` in endpoint.ts and the
 // tick loop of `awaitOwnedRun` in owned-run-wait.ts.
 import type { WorkflowContext } from "@restatedev/restate-sdk";
