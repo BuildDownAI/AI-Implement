@@ -4281,6 +4281,7 @@ export function createKgGraphSourceToolDeps(opts: {
       }
     },
     sidecarGraphPresent: () => !existsSync(join(opts.kgDir ?? KG_DIR, ".base-only")),
+    stardogQueryCodePresent: () => existsSync(join(opts.kgDir ?? KG_DIR, "kg_query", "stardog_search.py")),
     testPauseMs: STARDOG_TEST_PAUSE_MS,
   };
 }

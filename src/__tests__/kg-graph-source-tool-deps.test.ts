@@ -3,6 +3,8 @@
 // a probed provider whose capabilities are filled, and let a kg_* call reach it — with no
 // orchestrator restart. The Stardog client is faked; the sidecar is a fake that only sets
 // KG_SIDECAR_URL, and its HTTP is a queued `http.request` mock.
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -52,6 +54,19 @@ describe("createKgGraphSourceToolDeps restart step (AII-1974)", () => {
     delete process.env.KG_SIDECAR_URL;
     delete process.env.RUNNER_TOKEN_SECRET;
     resetHealth();
+  });
+
+  function seedQueryCode(kgDir: string): void {
+    mkdirSync(join(kgDir, "kg_query"), { recursive: true });
+    writeFileSync(join(kgDir, "kg_query", "stardog_search.py"), "");
+  }
+
+  it("detects Stardog query code in the configured KG folder", () => {
+    const kgDir = testDir("kg-query-code");
+    const deps = createKgGraphSourceToolDeps({ sidecar: { restart: async () => {} }, kgDir });
+    expect(deps.stardogQueryCodePresent()).toBe(false);
+    seedQueryCode(kgDir);
+    expect(deps.stardogQueryCodePresent()).toBe(true);
   });
 
   function resetHealth(): void {
@@ -145,6 +160,7 @@ describe("createKgGraphSourceToolDeps restart step (AII-1974)", () => {
 
   it("fails the switch when the restart leaves no sidecar URL", async () => {
     const kgDir = testDir("kg-tool-deps");
+    seedQueryCode(kgDir);
     // The fake restart resolves without setting KG_SIDECAR_URL, as a failed start does.
     const deps = createKgGraphSourceToolDeps({ sidecar: { restart: async () => {} }, kgDir });
     const logs: string[] = [];
@@ -159,6 +175,7 @@ describe("createKgGraphSourceToolDeps restart step (AII-1974)", () => {
 
   it("fails the switch when the restarted sidecar is unreachable", async () => {
     const kgDir = testDir("kg-tool-deps");
+    seedQueryCode(kgDir);
     const deps = createKgGraphSourceToolDeps({
       sidecar: { restart: async () => { process.env.KG_SIDECAR_URL = SIDECAR_URL; } },
       kgDir,

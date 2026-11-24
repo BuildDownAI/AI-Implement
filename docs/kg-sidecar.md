@@ -107,7 +107,7 @@ platform defaults to `https://app.stardog.run`, distinct from the console host;
 an empty `kg_stardog_run_console` uses `https://console.stardog.run`. There is no
 import-host environment variable; the row default is enough.
 
-The page's **Graph details** card sets the namespace and graph name, plus two
+The page's **Graph source** card sets the namespace and graph name, plus two
 rows that have no environment seed: `kg_code_repo` (an `owner/name` GitHub
 repository) and `kg_graph_label` (free text, at most 200 characters). Namespace
 and graph name use the shared `kg_namespace` and `kg_graph_name` rows;
@@ -127,7 +127,15 @@ of that: true with the marker, else when the row is `stardog_run`.
 ### Switching the source
 
 `set_kg_graph_source` (admin, `src/restate/tools.ts`) is the only writer of
-`kg_graph_source`. For `stardog_run` it first sends one real COUNT query with the
+`kg_graph_source`. Before testing `stardog_run`, it refuses with
+`no-stardog-query-code` if the image lacks `kg_query/stardog_search.py`. Older
+customer KG repos have no Stardog store and silently answer from the local graph;
+update the KG repo from the base KG repo, then deploy again. This refusal runs
+before checking values or billing a query, saves no row, and does not restart the
+sidecar. Missing Database, Namespace or token returns `stardog-values-missing`
+with “Enter Database, Namespace and the token, then save.”
+
+With query code and values present, it sends one real COUNT query with the
 stored values (`src/stardog-client.ts`: the console `POST /api/token` exchange,
 then the edge's `/edge/token`), retrying for up to 6 minutes because a sleeping
 endpoint takes 2–5 minutes to wake. Only a passing test saves the row and restarts
