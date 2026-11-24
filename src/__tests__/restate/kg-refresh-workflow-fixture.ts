@@ -633,8 +633,9 @@ export function createKgRefreshFixture() {
   function packageFixture(dispatchId: string) {
     const dir = join(state.dataRoot, "stardog", dispatchId);
     mkdirSync(join(dir, "data"), { recursive: true });
-    writeFileSync(join(dir, "kit.yaml"), "data:\n  - data/issues.nt\n");
+    writeFileSync(join(dir, "kit.yaml"), "data:\n  - file: ontology.ttl\n    graph: urn:schema\n  - file: data/issues.nt\n    graph: urn:issues\n");
     writeFileSync(join(dir, "package.json"), JSON.stringify({ expectedTriples: 42 }));
+    writeFileSync(join(dir, "ontology.ttl"), "ontology");
     writeFileSync(join(dir, "data/issues.nt"), "triples");
     writeFileSync(join(dir, "data/old.nt"), "stale");
     return dir;

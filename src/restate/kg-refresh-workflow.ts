@@ -1035,6 +1035,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         const cancelled = await commitPoint();
         if (cancelled) return cancelled;
         if (resume) ctx.set("holdConsumed", true);
+        let importStartedSuccessfully = false;
         try {
           ctx.set("step", "stardog-import");
           const imported = await ctx.run("stardog-import", async () => {
@@ -1043,17 +1044,23 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             const dir = join(deps.dataRoot ?? deps.rail.dataRoot, "stardog", dispatchId);
             const kit = parseYaml(await readFile(join(dir, "kit.yaml"), "utf8"));
             const metadata = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
-            if (!Array.isArray(kit?.data) || !kit.data.every((file: unknown) => typeof file === "string" && /^data\/[A-Za-z0-9._-]+\.nt$/.test(file) && !file.includes(".."))) {
+            if (!Array.isArray(kit?.data) || !kit.data.every((entry: unknown) => {
+              if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+              const file = (entry as { file?: unknown }).file;
+              return typeof file === "string" && /^(ontology\.ttl|data\/[A-Za-z0-9._-]+\.nt)$/.test(file) && !file.includes("..");
+            })) {
               throw new Error("kit.yaml has an invalid data list");
             }
             const expectedTriples = metadata.expectedTriples;
             if (!Number.isSafeInteger(expectedTriples) || expectedTriples < 0) throw new Error("package.json has invalid expectedTriples");
             if (!report.partCounts) throw new Error("report has no partCounts");
-            const files = ["kit.yaml", ...kit.data];
+            const files = ["kit.yaml", ...kit.data.map((entry: { file: string }) => entry.file)];
             for (const file of files) if (!(await stat(join(dir, file))).isFile()) throw new Error(`package file is missing: ${file}`);
             const { kitId, publishId } = await deps.stardog.startImport(dir, files, stardogTarget);
             return { kitId, publishId, expectedTriples, target: stardogTarget };
           }, { maxRetryAttempts: 1 });
+          // Set outside the journaled callback so replay restores the same failure detail.
+          importStartedSuccessfully = true;
           ctx.console.log(`stardog import started ${imported.kitId}`);
           const importStarted = await ctx.date.now();
           ctx.set("step", "stardog-wait");
@@ -1074,7 +1081,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         } catch (err) {
           if (restate.internal.isSuspendedError(err)) throw err;
           ctx.set("step", "failed");
-          const detail = `${err instanceof Error ? err.message : String(err)}. Stardog has no good graph until a new import passes.`;
+          const message = err instanceof Error ? err.message : String(err);
+          const detail = importStartedSuccessfully ? `${message}. Stardog has no good graph until a new import passes.` : message;
           return finish(await failurePath(buildFailureOutcome(await ctx.date.now(), detail), "stardog-import-failed"));
         }
         ctx.set("step", "baseline");
