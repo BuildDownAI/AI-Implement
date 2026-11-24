@@ -4,7 +4,7 @@
 // step and the wait between attempts is a `ctx.sleep`: a retry loop inside one `ctx.run`
 // would be one long step that the invoker inactivity timeout can stop (AII-2036).
 //
-// The local serve launch calls this module. The caller supplies the URI and container
+// The serve launch calls this module. The caller supplies the URI and container
 // state readers, because those belong to local Docker; this helper owns only the bounded
 // attempt sequence. Pattern anchors: `registerRunnerDeployment` in endpoint.ts and the
 // tick loop of `awaitOwnedRun` in owned-run-wait.ts.
@@ -43,7 +43,7 @@ export type RunnerDeploymentRegistrationResult =
 const STEP_ATTEMPTS = 1;
 
 /**
- * Registers a local runner's deployment, retrying while it is unreachable until the
+ * Registers a runner's deployment, retrying while it is unreachable until the
  * bootstrap deadline. One attempt is one `register-N` step: it reads the URI and calls
  * the register function, and a throw (or a null URI) is that attempt's `unreachable`
  * answer. After an unreachable attempt, a separate `state-N` step reads the container;
