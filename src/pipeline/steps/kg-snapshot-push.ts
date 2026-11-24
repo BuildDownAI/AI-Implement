@@ -717,9 +717,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       lostTeams = affectedTeams.map(team => ({ team, servedIssues: -1 }));
       failedTeams = affectedTeams;
       if (!baseline) {
-        held = true;
-        heldCause = "no-baseline";
-        heldDetail = "first load into Stardog: no earlier load to compare with";
+        if (!dryRun) {
+          held = true;
+          heldCause = "no-baseline";
+          heldDetail = "first load into Stardog: no earlier load to compare with";
+        }
         for (const [part, count] of Object.entries(partCounts)) partRows.push({ part, prev: "missing", next: String(count), delta: "—" });
       } else if ((!trackerFetched || affectedTeams.length > 0) && Object.keys(baseline.parts).some(part => TRACKER_NT_FILES.has(part))) {
         trackerMissing = true;
@@ -805,7 +807,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           if (newPieces.length === 0) {
             partLogLines.push(`${partName} prev=${prevLines} new=missing`);
             partRows.push({ part: partName, prev: String(prevLines), next: "missing", delta: "—" });
-            if (trackerMissing && TRACKER_NT_FILES.has(partName)) {
+            if (!baseMode && trackerMissing && TRACKER_NT_FILES.has(partName)) {
               softRegressions.push(`${partName}: missing (was ${prevLines} lines; tracker data missing)`);
             } else {
               hardRegressions.push(`${partName}: missing (was ${prevLines} lines)`);

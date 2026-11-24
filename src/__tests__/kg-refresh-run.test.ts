@@ -6965,6 +6965,50 @@ describe("base scope reconcile failure contracts", () => {
 
 
 describe("base snapshot baseline", () => {
+  it.each(["issue.nt", "comment.nt"])("refuses missing %s when the tracker fetch fails without a named team", async part => {
+    const dir = testDir("baseline-missing-tracker");
+    mkdirSync(join(dir, "snapshot/parts"), { recursive: true });
+    writeFileSync(join(dir, "snapshot/parts/other.nt"), "triple\n");
+    const ctx = makeContext({ kgBaseMode: true, baseline: { parts: { [part]: 10 }, at: 123, triggerId: "last" } });
+    ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0, failedTeams: [] });
+    vi.mocked(sendStardogPackage).mockClear();
+    const error = await kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "", defaultBranch: "main", clonedRef: "ignored" }, noopReporter).catch(error => error);
+    expect(error).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(error).not.toBeInstanceOf(KgSnapshotHeldError);
+    expect(error.message).toContain(`${part}: missing (was 10 lines)`);
+    expect(error.partTable).toContainEqual({ part, prev: "10", new: "missing" });
+    expect(sendStardogPackage).not.toHaveBeenCalled();
+  });
+
+  it("holds a present but smaller tracker part after an unnamed tracker fetch failure", async () => {
+    const dir = testDir("baseline-tracker-shrink");
+    mkdirSync(join(dir, "snapshot/parts"), { recursive: true });
+    writeFileSync(join(dir, "snapshot/parts/issue.nt"), "triple\n".repeat(9));
+    const ctx = makeContext({ kgBaseMode: true, baseline: { parts: { "issue.nt": 10 }, at: 123, triggerId: "last" } });
+    ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0, failedTeams: [] });
+    vi.mocked(sendStardogPackage).mockClear();
+    await expect(kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "", defaultBranch: "main", clonedRef: "ignored" }, noopReporter)).rejects.toMatchObject({ code: "KG_SNAPSHOT_HELD", cause: "tracker-missing", acceptBlocked: false });
+    expect(sendStardogPackage).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])("holds a first load only for live runs (dryRun=%s)", async dryRun => {
+    const dir = testDir("baseline-first-load");
+    mkdirSync(join(dir, "snapshot/parts"), { recursive: true });
+    writeFileSync(join(dir, "snapshot/parts/issue.nt"), "triple\n");
+    const ctx = makeContext({ kgBaseMode: true });
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 1 });
+    const send = vi.mocked(sendStardogPackage);
+    send.mockClear();
+    const run = kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "", defaultBranch: "main", clonedRef: "ignored", dryRun }, noopReporter);
+    if (dryRun) {
+      expect(await run).toMatchObject({ guardVerdict: "clean", partTable: [{ part: "issue.nt", prev: "missing", new: "1" }] });
+      expect(send).not.toHaveBeenCalled();
+    } else {
+      await expect(run).rejects.toMatchObject({ code: "KG_SNAPSHOT_HELD", cause: "no-baseline" });
+      expect(send).toHaveBeenCalledOnce();
+    }
+  });
+
   it.each([
     { previous: undefined, count: 4, team: false, cause: "no-baseline", blocked: false },
     { previous: undefined, count: 4, team: true, cause: "no-baseline", blocked: true },
