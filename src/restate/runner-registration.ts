@@ -1,12 +1,13 @@
 // Durable registration of a runner's Restate deployment (AII-2066). A serve-mode
-// runner needs time before its published port accepts HTTP/2, so the caller cannot treat
+// runner needs time before its port accepts HTTP/2, so the caller cannot treat
 // one `registerRunnerDeployment()` attempt as final. Each attempt is its own journaled
 // step and the wait between attempts is a `ctx.sleep`: a retry loop inside one `ctx.run`
 // would be one long step that the invoker inactivity timeout can stop (AII-2036).
 //
-// The serve launch calls this module. The caller supplies the URI and container
-// state readers, because those belong to the backend (local Docker or Fly); this helper
-// owns only the bounded attempt sequence. Pattern anchors: `registerRunnerDeployment`
+// The serve launch calls this module. The caller supplies the URI and runner
+// state readers, because those belong to the backend (local Docker or Fly); this
+// helper owns only the bounded attempt sequence. Pattern anchors:
+// `registerRunnerDeployment`
 // in endpoint.ts and the tick loop of `awaitOwnedRun` in owned-run-wait.ts.
 import type { WorkflowContext } from "@restatedev/restate-sdk";
 import type { BackendRunState } from "../backend-run.js";
@@ -21,9 +22,15 @@ export type RegisterRunnerDeploymentAttempt = (
 ) => Promise<RegisterRunnerDeploymentResult>;
 
 export interface RunnerDeploymentRegistrationOptions {
-  /** The runner's Restate URI, or `null` while Docker has not published its port. */
+  /**
+   * The runner's Restate URI, or `null` while the backend has no address for the
+   * runner yet.
+   */
   readUri: () => string | null | Promise<string | null>;
-  /** Reads the container state; the caller passes `classifyLocalContainer`. */
+  /**
+   * Reads the runner state; the caller passes `classifyLocalContainer` for local Docker
+   * or `classifyFlyMachine` for Fly.
+   */
   readContainerState: () => BackendRunState | Promise<BackendRunState>;
   /** Epoch milliseconds. No attempt starts at or after this time. */
   bootstrapDeadlineAt: number;
@@ -46,9 +53,9 @@ const STEP_ATTEMPTS = 1;
  * Registers a runner's deployment, retrying while it is unreachable until the
  * bootstrap deadline. One attempt is one `register-N` step: it reads the URI and calls
  * the register function, and a throw (or a null URI) is that attempt's `unreachable`
- * answer. After an unreachable attempt, a separate `state-N` step reads the container;
- * `ended` returns `exited`. Otherwise the helper sleeps in a `sleep-N` timer and tries
- * again, unless the bootstrap deadline has arrived.
+ * answer. After an unreachable attempt, a separate `state-N` step reads the runner
+ * state; `ended` returns `exited`. Otherwise the helper sleeps in a `sleep-N` timer
+ * and tries again, unless the bootstrap deadline has arrived.
  *
  * A `rejected` answer stops at once with its HTTP status. A success returns the
  * deployment id.
@@ -69,13 +76,15 @@ export async function registerRunnerDeploymentWithRetry(
       `register-${attempt}`,
       async (): Promise<RegisterRunnerDeploymentResult> => {
         try {
-          // A URI that Docker has not published yet is one unreachable attempt too.
+          // A URI that the backend has not supplied yet is one unreachable
+          // attempt too.
           const uri = await opts.readUri();
           if (uri === null) return { ok: false, reason: "unreachable" };
           return await register(uri);
         } catch {
           // A throwing URI read or register call is one unreachable attempt, not a
-          // reason to retry this step. `readPublishedPort` throws on Docker failures.
+          // reason to retry this step. The URI reader can throw (for example
+          // `readPublishedPort` on a Docker failure, or the Fly Machines API).
           return { ok: false, reason: "unreachable" };
         }
       },
