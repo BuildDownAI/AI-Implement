@@ -19,7 +19,7 @@
 import { readFile, stat, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import type { StardogClient } from "../stardog-client.js";
+import type { StardogClient, StardogTarget } from "../stardog-client.js";
 import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import { isDeepStrictEqual } from "node:util";
 import { recordUsage, type RecordedUsage } from "../agent-usage.js";
@@ -107,6 +107,8 @@ export const kgHoldSchema = z.object({
   /** The gate run's dispatch id: the `dispatch_log` row the resumed run closes. */
   dispatchId: z.string().min(1),
   decideBy: z.number(),
+  /** Absent on legacy holds; those cannot safely import with replace=true. */
+  stardogTarget: z.object({ db: z.string().trim().min(1), graphName: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/) }).strict().optional(),
   report: z.custom<KgRefreshReportBody>((v) => typeof v === "object" && v !== null),
   /** The runner's step table, built at the gate from the gate run's step promises. */
   steps: z.array(z.custom<KgRefreshStepRecord>((v) => typeof v === "object" && v !== null)),
@@ -556,8 +558,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     let dispatched: KgDispatchResult | undefined;
     let runId: number | undefined;
     let totalDeadlineAt = 0;
-    // The snapshot PR a cancel must close: set at the decision gate, cleared once the merge starts.
+    // Resumed runs skip envelope creation and use the held package identity.
+    let stardogTarget: StardogTarget | undefined = resume?.hold.stardogTarget;
     let lockLost = false; // KgRepo.hold refused: the outer 409 catch must not read it as a Restate cancel
+    // The snapshot PR a cancel must close: set at the decision gate, cleared once the merge starts.
     let heldPr: { number: number; branch: string | undefined } | undefined;
     // Set when the runner's report arrives: the machine is finished and may already belong to another run.
     let reported = false;
@@ -690,6 +694,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const issueIdentifier = `KG-REFRESH · ${triggerId}`;
       // Journaled once: every retry of the dispatch step sends this same envelope.
       const envelope = await ctx.run("envelope", () => deps.buildEnvelope(input, issueIdentifier));
+      if (input.baseMode && envelope.kgStardogDb && envelope.kgGraphName) {
+        stardogTarget = kgHoldSchema.shape.stardogTarget.parse({ db: envelope.kgStardogDb, graphName: envelope.kgGraphName });
+      }
 
       // Tokens are minted inside the journaled step and never leave it: the step result
       // carries no secret, so none reaches the Restate journal. Minted at most once per
@@ -1024,6 +1031,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ctx.set("step", "stardog-import");
           const imported = await ctx.run("stardog-import", async () => {
             if (!deps.stardog) throw new Error("Stardog client is not configured");
+            if (!stardogTarget) throw new Error("Package has no frozen Stardog target; start a new refresh");
             const dir = join(deps.dataRoot ?? deps.rail.dataRoot, "stardog", dispatchId);
             const kit = parseYaml(await readFile(join(dir, "kit.yaml"), "utf8"));
             const metadata = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
@@ -1035,8 +1043,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             if (!report.partCounts) throw new Error("report has no partCounts");
             const files = ["kit.yaml", ...kit.data];
             for (const file of files) if (!(await stat(join(dir, file))).isFile()) throw new Error(`package file is missing: ${file}`);
-            const { kitId, publishId } = await deps.stardog.startImport(dir, files);
-            return { kitId, publishId, expectedTriples };
+            const { kitId, publishId } = await deps.stardog.startImport(dir, files, stardogTarget);
+            return { kitId, publishId, expectedTriples, target: stardogTarget };
           }, { maxRetryAttempts: 1 });
           ctx.console.log(`stardog import started ${imported.kitId}`);
           const importStarted = await ctx.date.now();
@@ -1050,7 +1058,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ctx.console.log(`stardog import done in ${((await ctx.date.now()) - importStarted) / 1000} s`);
           ctx.set("step", "stardog-verify");
           const count = await ctx.run("stardog-verify", async () => {
-            const actual = await deps.stardog!.countTriples();
+            const actual = await deps.stardog!.countTriples(imported.target);
             if (actual !== imported.expectedTriples) throw new Error(`Stardog triples ${actual} (expected ${imported.expectedTriples})`);
             return actual;
           }, { maxRetryAttempts: 3 });
@@ -1230,6 +1238,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         try {
           await ctx.objectClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).hold({
             triggerId, dispatchId, decideBy, report, steps: stepTable,
+            ...(stardogTarget ? { stardogTarget } : {}),
           });
         } catch (err) {
           if (restate.internal.isSuspendedError(err)) throw err;

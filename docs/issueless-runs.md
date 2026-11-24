@@ -194,7 +194,12 @@ Allowed names are `kit.yaml`, `ontology.ttl`, `package.json`, and
 `data/[A-Za-z0-9._-]+.nt`, with no `..`. Files are streamed into
 `/data/kg/stardog/<dispatchId>/` with atomic replacement, capped at 64 MiB per
 file and 128 MiB per dispatch folder. The runner sends `package.json` last.
-Uploads carry graph data; the Stardog credential stays on the orchestrator.
+Uploads carry graph data; the Stardog credential stays on the orchestrator. The refresh freezes the envelope's Stardog database and graph name,
+persists them on a decision hold, and uses that same target for import and triple-count
+verification (including the graph alias with hyphens replaced by underscores).
+Credentials are read inside each client call so token rotation still takes effect.
+Legacy holds without a saved target fail before import; start a new refresh to
+create a package with a known target.
 Completeness validation and end-of-run folder cleanup belong to the import workflow.
 
 ### Runner token

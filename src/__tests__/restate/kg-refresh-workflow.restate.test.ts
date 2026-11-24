@@ -617,11 +617,14 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
+  const frozenTarget = { db: "original-db", graphName: "original-graph" };
+  let configuredTarget = { ...frozenTarget };
   const buildEnvelopeInputs: KgRefreshRunInput[] = [];
   const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => {
     buildEnvelopeInputs.push(run);
     return buildKgRefreshRunConfig({
       kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
+      kgStardogDb: configuredTarget.db, kgGraphName: configuredTarget.graphName,
     });
   };
 
@@ -629,11 +632,12 @@ describe("KgRefresh durable workflow", () => {
   let beforeImportGate: Gate | undefined;
   const stardogTokensUsed: string[] = [];
   const stardog = {
-    startImport: vi.fn(async (_dir: string, _files: string[]) => ({ kitId: "kit-test", publishId: "publish-test" })),
+    startImport: vi.fn(async (_dir: string, _files: string[], _target: import("../../stardog-client.js").StardogTarget) => ({ kitId: "kit-test", publishId: "publish-test" })),
     readEvents: vi.fn<import("../../stardog-client.js").StardogClient["readEvents"]>(async () => "done"),
-    countTriples: vi.fn(async () => 42),
+    countTriples: vi.fn(async (_target?: import("../../stardog-client.js").StardogTarget) => 42),
   };
   beforeEach(() => {
+    configuredTarget = { ...frozenTarget };
     beforeImportGate = undefined;
     stardogTokensUsed.length = 0;
     stardog.startImport.mockReset().mockImplementation(async () => {
@@ -851,6 +855,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))("base clean/warnings reports succeed without a PR or rail (%s)", async label => {
     const env = envFor(label);
     for (const guardVerdict of ["clean", "warnings"] as const) {
+      configuredTarget = { ...frozenTarget };
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const beforeEffects = baseExternalEffects();
@@ -859,10 +864,17 @@ describe("KgRefresh durable workflow", () => {
       const importsBefore = stardog.startImport.mock.calls.length;
       const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true });
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, ok => ok, { label: "base dispatch" });
+      configuredTarget = { db: "changed-db", graphName: "changed-graph" };
+      stardog.startImport.mockImplementationOnce(async () => {
+        stardogTokensUsed.push("SENTINEL-stardog-token");
+        configuredTarget = { db: "third-db", graphName: "third-graph" };
+        return { kitId: "kit-test", publishId: "publish-test" };
+      });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true, guardVerdict, partCounts: { issues: 42 } });
       expect(await done).toMatchObject({ ok: true, detail: "Stardog import verified" });
       expect(await readBaseline(env)).toEqual({ parts: { issues: 42 }, triggerId, at: expect.any(Number) });
-      expect(stardog.startImport.mock.calls.slice(importsBefore)).toEqual([[dir, ["kit.yaml", "data/issues.nt"]]]);
+      expect(stardog.startImport.mock.calls.slice(importsBefore)).toEqual([[dir, ["kit.yaml", "data/issues.nt"], frozenTarget]]);
+      expect(stardog.countTriples.mock.calls.at(-1)).toEqual([frozenTarget]);
       expect(existsSync(join(dataRoot, "stardog"))).toBe(false);
       const entries = await journalEntries(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
       const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
@@ -871,7 +883,7 @@ describe("KgRefresh durable workflow", () => {
       expect(names.indexOf("stardog-wait")).toBeLessThan(names.indexOf("stardog-verify"));
       expect(names.indexOf("stardog-verify")).toBeLessThan(names.indexOf("baseline"));
       const journal = journalText(entries);
-      expect(journaledRunResult(entries, "stardog-import")).toEqual({ kitId: "kit-test", publishId: "publish-test", expectedTriples: 42 });
+      expect(journaledRunResult(entries, "stardog-import")).toEqual({ kitId: "kit-test", publishId: "publish-test", expectedTriples: 42, target: frozenTarget });
       expect(stardogTokensUsed).toContain("SENTINEL-stardog-token");
       expect(journal).toContain("publish-test");
       expect(journal).not.toContain("SENTINEL-stardog-token");
@@ -898,23 +910,39 @@ describe("KgRefresh durable workflow", () => {
       expect(existsSync(dir)).toBe(true);
       expect(stardog.startImport).not.toHaveBeenCalled();
       expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ held: { snapshotPr: null } });
+      configuredTarget = { db: "changed-db", graphName: "changed-graph" };
       const decided = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "decide", { triggerId, action: "accept", actor: "admin@example.com" });
       await eventually(() => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${decided.triggerId}'`), rows => rows.length > 0, { label: "base decision run delivered" });
       expect(await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", decided.triggerId)).toMatchObject({ ok: true, detail: "Stardog import verified" });
       await eventually(() => kgRepoStatus(env.baseUrl()), value => value === null, { label: "base hold released" });
       expect(await readBaseline(env)).toEqual({ parts: { issues: 37, projects: 5 }, triggerId: decided.triggerId, at: expect.any(Number) });
-      expect(stardog.startImport.mock.calls).toEqual([[dir, ["kit.yaml", "data/issues.nt"]]]);
+      expect(stardog.startImport.mock.calls).toEqual([[dir, ["kit.yaml", "data/issues.nt"], frozenTarget]]);
+      expect(stardog.countTriples.mock.calls.at(-1)).toEqual([frozenTarget]);
       expect(existsSync(join(dataRoot, "stardog"))).toBe(false);
       expect(baseExternalEffects()).toEqual(beforeEffects);
       expect(fetchTarballCallCount).toBe(beforeFetch);
     } finally { baseMode = false; }
   });
 
+  it.each(VARIANTS.map(([label]) => label))("refuses legacy held packages without a frozen target before importing (%s)", async label => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    packageFixture(triggerId);
+    const hold = { triggerId, dispatchId: triggerId, decideBy: Date.now() + 60_000, steps: [],
+      report: { ok: false, failureCode: "KG_SNAPSHOT_HELD", partCounts: { issues: 42 } } };
+    const before = await readBaseline(env);
+    const result = await runWorkflow(env.baseUrl(), newTriggerId(), { baseMode: true, resume: { hold, action: "accept" } });
+    expect(result).toMatchObject({ ok: false, conclusion: "stardog-import-failed" });
+    expect(result.detail).toContain("no frozen Stardog target");
+    expect(stardog.startImport).not.toHaveBeenCalled();
+    expect(await readBaseline(env)).toEqual(before);
+  });
+
   it.each(VARIANTS.map(([label]) => label))("base held reports have no PR and accept/cancel/timeout without GitHub (%s)", async label => {
     const env = envFor(label);
     for (const action of ["accept", "cancel", "timeout"] as const) {
       const triggerId = newTriggerId();
-      const hold = { triggerId, dispatchId: triggerId, decideBy: Date.now() + 60_000, steps: [], report: { ok: false, failureCode: "KG_SNAPSHOT_HELD", partCounts: { issues: 42 } } };
+      const hold = { triggerId, dispatchId: triggerId, decideBy: Date.now() + 60_000, steps: [], stardogTarget: frozenTarget, report: { ok: false, failureCode: "KG_SNAPSHOT_HELD", partCounts: { issues: 42 } } };
       packageFixture(triggerId);
       const beforeEffects = baseExternalEffects();
       const beforeClose = closePullRequestFn.mock.calls.length;
@@ -947,7 +975,7 @@ describe("KgRefresh durable workflow", () => {
       const dir = packageFixture(triggerId);
       if (failure === "missing") rmSync(join(dir, "data/issues.nt"));
       const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
-        hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+        hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
       } });
       expect(await done).toMatchObject({ ok: false, conclusion: "stardog-import-failed", detail: expect.stringContaining("no good graph") });
       expect(stardog.startImport).toHaveBeenCalledTimes(failure === "missing" ? 0 : 1);
@@ -970,7 +998,7 @@ describe("KgRefresh durable workflow", () => {
     stardog.readEvents.mockResolvedValue(null);
     try {
       const outcome = await runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
-        hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+        hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
       } });
       expect(outcome).toMatchObject({ ok: false, conclusion: "stardog-import-failed" });
       expect(stardog.startImport).toHaveBeenCalledTimes(1);
@@ -986,7 +1014,7 @@ describe("KgRefresh durable workflow", () => {
     packageFixture(triggerId);
     stardog.readEvents.mockResolvedValueOnce(null).mockResolvedValueOnce(null).mockResolvedValue("done");
     const outcome = await runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
-      hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+      hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
     } });
     expect(outcome.ok).toBe(true);
     expect(stardog.readEvents).toHaveBeenCalledTimes(3);
@@ -1039,7 +1067,7 @@ describe("KgRefresh durable workflow", () => {
     const triggerId = newTriggerId();
     beforeImportGate = gate("before Stardog commit point");
     const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
-      hold: { triggerId: heldDispatch, dispatchId: heldDispatch, decideBy: 0, steps: [], report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+      hold: { triggerId: heldDispatch, dispatchId: heldDispatch, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
     } });
     await beforeImportGate.reached();
     await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested stop" });
