@@ -911,7 +911,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
         // not apply to either failure.
         const cancelled = await commitPoint(() => {
-          // Restate cancellation leaves a fresh PR open; an operator signal still owns cleanup.
+          // On a clean, not-resumed run, Restate cancellation leaves the snapshot PR open.
+          // A resumed accept already owns heldPr and still closes it on cancellation.
+          // Assign before the promise write so an operator signal still owns cleanup.
           heldPr = report.snapshotPr !== undefined ? { number: report.snapshotPr, branch: report.snapshotBranch } : undefined;
         });
         if (cancelled) return cancelled;
