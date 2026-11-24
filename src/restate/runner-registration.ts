@@ -5,9 +5,9 @@
 // would be one long step that the invoker inactivity timeout can stop (AII-2036).
 //
 // The serve launch calls this module. The caller supplies the URI and container
-// state readers, because those belong to the backend (local Docker or Fly); this helper owns only the bounded
-// attempt sequence. Pattern anchors: `registerRunnerDeployment` in endpoint.ts and the
-// tick loop of `awaitOwnedRun` in owned-run-wait.ts.
+// state readers, because those belong to the backend (local Docker or Fly); this helper
+// owns only the bounded attempt sequence. Pattern anchors: `registerRunnerDeployment`
+// in endpoint.ts and the tick loop of `awaitOwnedRun` in owned-run-wait.ts.
 import type { WorkflowContext } from "@restatedev/restate-sdk";
 import type { BackendRunState } from "../backend-run.js";
 import {
