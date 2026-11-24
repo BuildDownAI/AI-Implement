@@ -82,6 +82,15 @@ The container runs as the unprivileged `node` user.
 
 ## Serving from a remote store
 
+Base refresh publication runs on the orchestrator in `KgRefresh`: upload package,
+import through the stored `kg_stardog_run_platform` (default
+`https://app.stardog.run`, distinct from the console), wait for the replayable SSE
+terminal event, verify the alias triple count, then record the baseline. Clean
+runs and accepted holds use the same saved steps. The runner never receives the
+Stardog token. Import replaces the old graph first: a failed import leaves no
+good graph until a new import passes; the previous baseline remains unchanged.
+
+
 The KG page (`/admin#kg-pipelines`) is the home of the graph source and the
 Stardog values. The sidecar code comes from the public base KG repo; no customer
 KG repo is needed.

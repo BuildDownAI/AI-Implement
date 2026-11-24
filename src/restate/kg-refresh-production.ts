@@ -4,6 +4,7 @@
  * `review-fix-production.ts` and `review-fix-client.ts`. `src/index.ts` composes and registers
  * the services; this file is the allowed SDK boundary where the orchestrator's existing
  * kg-refresh closures become Restate services. */
+import { createStardogClient } from "../stardog-client.js";
 import { TerminalError } from "@restatedev/restate-sdk";
 import type { KgRefreshSource } from "../kg-refresh-source.js";
 import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
@@ -392,6 +393,9 @@ export function createProductionKgRefreshServices(
 
   const deps: KgRefreshWorkflowDependencies = {
     rail,
+    stardog: createStardogClient(),
+    dataRoot: DATA_ROOT,
+    stardogPollMs: 30_000,
     kgSourceRepo: runRepo,
     mintRunTokens: ({ dispatchId, ttlSeconds }) => {
       if (!config.runnerTokenSecret) throw new Error("RUNNER_TOKEN_SECRET is not configured");

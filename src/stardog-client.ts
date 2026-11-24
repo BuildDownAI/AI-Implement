@@ -6,6 +6,8 @@
  * makes. Neither the stored token nor a header ever enters a log line or an
  * error message.
  */
+import { readFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { getStardogRunToken, getStardogValues, stardogDataset } from "./kg-graph-source.js";
 
 /**
@@ -21,7 +23,11 @@ export const DEFAULT_STARDOG_RUN_CONSOLE = "https://console.stardog.run";
 /** One real query; each try is billed, so a switch sends as few as it can. */
 export const STARDOG_COUNT_TRIPLES_QUERY = "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }";
 
+export type StardogImportEvent = "done" | { failed: string } | null;
+
 export interface StardogClient {
+  startImport(packageDir: string, files: string[]): Promise<{ kitId: string; publishId: string }>;
+  readEvents(kitId: string, publishId: string, options: { maxMs: number }): Promise<StardogImportEvent>;
   /** Signs in and runs one COUNT query. Reads the stored values and token on every call. */
   countTriples(): Promise<number>;
 }
@@ -127,7 +133,7 @@ async function consoleEndpoints(
     });
   } catch (err) {
     if (deadline.aborted) throw deadlineError("/api/cli/endpoints");
-    throw new Error(`Stardog Run endpoint list request failed: ${err instanceof Error ? err.name : "request failed"}`);
+    throw new Error(`Stardog Run endpoint list request failed: transport error`);
   }
   if (!response.ok) throw new Error(`Stardog Run endpoint list answered HTTP ${response.status}`);
   let parsed: unknown;
@@ -154,9 +160,8 @@ async function fetchJson(
     response = await fetchImpl(url, { ...init, signal: deadline });
   } catch (err) {
     if (deadline.aborted) throw deadlineError(label);
-    // A transport error's text is the fetch message, never the request headers.
-    const detail = err instanceof Error ? err.name : "request failed";
-    throw new Error(`Stardog Run ${label} request failed: ${detail}`);
+    // Even a transport error name can be supplied by an upstream adapter.
+    throw new Error(`Stardog Run ${label} request failed: transport error`);
   }
   // The body is deliberately not read into the error: an upstream echo could carry a credential.
   if (!response.ok) throw new Error(`Stardog Run ${label} answered HTTP ${response.status}`);
@@ -256,8 +261,103 @@ async function countTriples(fetchImpl: typeof fetch): Promise<number> {
   return count;
 }
 
-/** Builds the production client. Values are re-read on every `countTriples()` call. */
+/** Import credentials exist only within a call, never in the returned import handle. */
+async function importAuth(fetchImpl: typeof fetch, signal: AbortSignal) {
+  const apiToken = getStardogRunToken();
+  if (!apiToken) throw new Error("Stardog Run token is not set");
+  const { bearer, endpoint } = await signIn(fetchImpl, signal);
+  return { apiToken, bearer, endpoint, platform: httpsBase(getStardogValues().runPlatform, "platform") };
+}
+
+function safeDetail(text: string, secrets: string[]): string {
+  let result = text;
+  for (const secret of secrets) result = result.split(secret).join("[redacted]");
+  return result.replace(/(?:authorization|x-voicebox-auth)[^\r\n]*/gi, "[redacted]")
+    .replace(/Bearer\s+[^\s"',}]+/gi, "[redacted]").slice(0, 2000);
+}
+
+async function startImport(fetchImpl: typeof fetch, packageDir: string, files: string[]) {
+  const signal = AbortSignal.timeout(STARDOG_REQUEST_TIMEOUT_MS);
+  const auth = await importAuth(fetchImpl, signal);
+  const form = new FormData();
+  for (const file of files) {
+    if (file === "package.json" || !/^(kit\.yaml|ontology\.ttl|data\/[A-Za-z0-9._-]+\.nt)$/.test(file) || file.includes("..")) {
+      throw new Error("Stardog Run import file is not allowed");
+    }
+    form.append("files", new Blob([await readFile(join(packageDir, file))]), `${basename(packageDir)}/${file}`);
+  }
+  const query = new URLSearchParams({ replace: "true", endpoint: auth.endpoint, database: getStardogValues().db });
+  const body = await fetchJson(fetchImpl, `${auth.platform}/voicebox/kits/import?${query}`, {
+    method: "POST", headers: { Authorization: `Bearer ${auth.bearer}`, "X-Voicebox-Auth": `Bearer ${auth.apiToken}` }, body: form,
+  }, "import", signal);
+  const kitId = stringField(body, "kit_id", "import");
+  const publishId = stringField(body, "publish_id", "import");
+  for (const id of [kitId, publishId]) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id) || [auth.apiToken, auth.bearer].some(secret => id.includes(secret))) {
+      throw new Error("Stardog Run import returned an invalid identifier");
+    }
+  }
+  return { kitId, publishId };
+}
+
+async function readEvents(fetchImpl: typeof fetch, kitId: string, publishId: string, { maxMs }: { maxMs: number }): Promise<StardogImportEvent> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), maxMs);
+  const signal = controller.signal;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  const aborted = new Promise<null>(resolve => signal.addEventListener("abort", () => resolve(null), { once: true }));
+  try {
+    const work = async (): Promise<StardogImportEvent> => {
+      const auth = await importAuth(fetchImpl, signal);
+      let response: Response;
+      try {
+        response = await fetchImpl(`${auth.platform}/voicebox/kits/${encodeURIComponent(kitId)}/publish/${encodeURIComponent(publishId)}/events`, {
+          headers: { Authorization: `Bearer ${auth.bearer}`, "X-Voicebox-Auth": `Bearer ${auth.apiToken}`, Accept: "text/event-stream" }, signal,
+        });
+      } catch { throw new Error("Stardog Run events request failed"); }
+      if (!response.ok || !response.body) throw new Error(`Stardog Run events answered HTTP ${response.status}`);
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const parse = (block: string): StardogImportEvent => {
+        const data = block.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+        if (!data) return null;
+        let event: { type?: string; error?: unknown; message?: unknown };
+        try { event = JSON.parse(data); } catch { return null; }
+        if (event?.type === "done") return "done";
+        if (event?.type === "failed") return { failed: safeDetail(String(event.error ?? event.message ?? "import failed"), [auth.apiToken, auth.bearer]) };
+        return null;
+      };
+      while (!signal.aborted) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try { chunk = await reader.read(); }
+        catch { throw new Error("Stardog Run events stream failed"); }
+        buffer += decoder.decode(chunk.value, { stream: !chunk.done });
+        buffer = buffer.replace(/\r\n/g, "\n");
+        let boundary: number;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          const result = parse(buffer.slice(0, boundary));
+          buffer = buffer.slice(boundary + 2);
+          if (result) return result;
+        }
+        if (chunk.done) return parse(buffer);
+      }
+      return null;
+    };
+    return await Promise.race([work(), aborted]);
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+    void reader?.cancel().catch(() => {});
+  }
+}
+
+/** Builds the production client. Stored credentials are read inside every call. */
 export function createStardogClient(deps: StardogClientDeps = {}): StardogClient {
   const fetchImpl = deps.fetchImpl ?? fetch;
-  return { countTriples: () => countTriples(fetchImpl) };
+  return {
+    countTriples: () => countTriples(fetchImpl),
+    startImport: (dir, files) => startImport(fetchImpl, dir, files),
+    readEvents: (kit, publish, options) => readEvents(fetchImpl, kit, publish, options),
+  };
 }

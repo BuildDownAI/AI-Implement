@@ -1,3 +1,6 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { testDir } from "./helpers/test-dir.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
@@ -183,5 +186,83 @@ describe("Stardog client", () => {
       [`POST /builddown-kg/query`]: { json: { results: { bindings: [] } } },
     }).install();
     await expect(modules.client.createStardogClient().countTriples()).rejects.toThrow(/invalid count/);
+  });
+});
+
+
+describe("Stardog import client", () => {
+  it("sends only listed files with folder-prefixed multipart names to the stored platform", async () => {
+    const { modules } = await fixture();
+    modules.kg.setStardogValues({ runPlatform: "https://import.stardog.run" });
+    const dir = join(testDir("stardog"), "dispatch-123");
+    mkdirSync(join(dir, "data"), { recursive: true });
+    for (const file of ["kit.yaml", "package.json", "data/issues.nt", "data/old.nt"]) writeFileSync(join(dir, file), file);
+    const fake = routes({ "POST /voicebox/kits/import": { json: { kit_id: "kit-1", publish_id: "pub-1", database: "builddown-kg" } } });
+    expect(await modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml", "data/issues.nt"]))
+      .toEqual({ kitId: "kit-1", publishId: "pub-1" });
+    const call = fake.calls.at(-1)!;
+    expect(call.url.origin).toBe("https://import.stardog.run");
+    expect(Object.fromEntries(call.url.searchParams)).toEqual({ replace: "true", endpoint: ENDPOINT, database: "builddown-kg" });
+    expect(call.headers.get("authorization")).toBe(`Bearer ${BEARER}`);
+    expect(call.headers.get("x-voicebox-auth")).toBe(`Bearer ${TOKEN}`);
+    expect(call.body).toContain('name="files"; filename="dispatch-123/kit.yaml"');
+    expect(call.body).toContain('filename="dispatch-123/data/issues.nt"');
+    expect(call.body).not.toContain("package.json");
+    expect(call.body).not.toContain("old.nt");
+  });
+
+  it.each(["done", "failed"])("parses chunked replayed SSE ending in %s and redacts failures", async type => {
+    const { modules } = await fixture();
+    const payload = `data: {"type":"progress"}\r\n\r\ndata: ${JSON.stringify({ type, error: `bad ${TOKEN} ${BEARER} Authorization: Bearer secret` })}\r\n\r\n`;
+    const fake = routes({ "GET /voicebox/kits/kit-1/publish/pub-1/events": () => new Response(new ReadableStream({ start(controller) {
+      for (let i = 0; i < payload.length; i += 7) controller.enqueue(new TextEncoder().encode(payload.slice(i, i + 7)));
+      controller.close();
+    } })) });
+    const log = vi.spyOn(console, "log");
+    const client = modules.client.createStardogClient({ fetchImpl: fake.fetch });
+    const result = await client.readEvents("kit-1", "pub-1", { maxMs: 1000 });
+    expect(result).toEqual(type === "done" ? "done" : { failed: "bad [redacted] [redacted] [redacted]" });
+    for (const secret of [TOKEN, BEARER, "Authorization", "Bearer secret"]) {
+      expect(JSON.stringify(result)).not.toContain(secret);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+    }
+  });
+
+  it("returns null on EOF without a terminal event", async () => {
+    const { modules } = await fixture();
+    const fake = routes({ "GET /voicebox/kits/k/publish/p/events": { text: 'data: {"type":"progress"}\n\n' } });
+    expect(await modules.client.createStardogClient({ fetchImpl: fake.fetch }).readEvents("k", "p", { maxMs: 1000 })).toBeNull();
+  });
+
+  it("bounds a stalled stream and cancels its reader", async () => {
+    const { modules } = await fixture();
+    const cancelled = vi.fn();
+    const fake = routes({ "GET /voicebox/kits/k/publish/p/events": () => new Response(new ReadableStream({ cancel: cancelled })) });
+    vi.useFakeTimers();
+    try {
+      const pending = modules.client.createStardogClient({ fetchImpl: fake.fetch }).readEvents("k", "p", { maxMs: 240_000 });
+      // Advance virtual time; no test waits on wall-clock time.
+      await vi.advanceTimersByTimeAsync(240_000);
+      expect(await pending).toBeNull();
+      expect(cancelled).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not expose credentials or headers from a broken event stream", async () => {
+    const { modules } = await fixture();
+    const fake = routes({ "GET /voicebox/kits/k/publish/p/events": () => new Response(new ReadableStream({ start(controller) {
+      controller.error(new Error(`X-Voicebox-Auth: Bearer ${TOKEN}`));
+    } })) });
+    await expect(modules.client.createStardogClient({ fetchImpl: fake.fetch }).readEvents("k", "p", { maxMs: 1000 }))
+      .rejects.toThrow("Stardog Run events stream failed");
+  });
+
+  it("does not expose an upstream echoed credential in an import error", async () => {
+    const { modules } = await fixture();
+    const dir = testDir("stardog");
+    writeFileSync(join(dir, "kit.yaml"), "data: []");
+    const fake = routes({ "POST /voicebox/kits/import": { status: 500, text: `Authorization: Bearer ${TOKEN}` } });
+    await expect(modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml"]))
+      .rejects.toThrow("Stardog Run import answered HTTP 500");
   });
 });
