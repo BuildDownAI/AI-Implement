@@ -130,7 +130,7 @@ async function listen(server: http2.Http2Server): Promise<number> {
   return address.port;
 }
 
-async function registerDeployment(env: RestateEnvironment, uri: string, label: string, runnerServices: string[]): Promise<void> {
+async function registerDeployment(env: RestateEnvironment, uri: string, label: string): Promise<void> {
   await eventually(
     async () => {
       const response = await fetch(`${env.adminAPIBaseUrl()}/deployments`, {
@@ -144,20 +144,6 @@ async function registerDeployment(env: RestateEnvironment, uri: string, label: s
     Boolean,
     { label, timeoutMs: 30_000 },
   );
-  // Admin registration can finish before ingress receives the new service schema.
-  // Probe a missing handler: its distinct 404 proves the service is visible without
-  // starting a pipeline or adding an invocation to the journal under assertion.
-  for (const service of runnerServices) {
-    await eventually(
-      async () => {
-        const response = await fetch(`${env.baseUrl()}/${service}/__test_readiness__`, { method: "POST" });
-        const body = await response.text();
-        return response.status === 404 && body.includes(`the service '${service}' exists, but the handler`);
-      },
-      Boolean,
-      { label: `${service} visible to ingress`, timeoutMs: 30_000 },
-    );
-  }
 }
 
 /** Registers one runner service at a fresh loopback port with the variant's request-identity key. */
@@ -175,8 +161,7 @@ async function registerRunner(env: RestateEnvironment, services: DeploymentServi
   });
   const port = await listen(server);
   try {
-    const definitions = Array.isArray(services) ? services : [services];
-    await registerDeployment(env, `http://${RUNNER_HOST}:${port}`, "the runner deployment", definitions.map(service => service.name).filter(name => name.startsWith("Runner_")));
+    await registerDeployment(env, `http://${RUNNER_HOST}:${port}`, "the runner deployment");
   } catch (error) {
     server.close();
     throw error;
@@ -454,24 +439,6 @@ function implementationWorkflow(seams: Partial<ImplementationRunDependencies> = 
 }
 
 describe("runner call diagnostics", () => {
-  it("waits for ingress to see a registered runner before returning", async () => {
-    const service = runnerServiceName(randomUUID());
-    const probe = `/${service}/__test_readiness__`;
-    const fake = fakeFetch({
-      "POST /deployments": { json: { id: "deployment-ready-before-ingress" } },
-      [`POST ${probe}`]: [
-        { status: 404, json: { message: `service '${service}' not found, make sure to register the service before calling it.` } },
-        { status: 404, json: { message: `the service '${service}' exists, but the handler '__test_readiness__' was not found, check that the handler exists in the latest registered service version.` } },
-      ],
-    }).install();
-
-    await registerDeployment(envs.get("strict")!, "http://127.0.0.1:12345", "test deployment", [service]);
-
-    // Neither registration success nor the first 404 is evidence of ingress readiness.
-    // The probe must never invoke the real run handler while waiting.
-    expect(fake.calls.map(call => call.path)).toEqual(["/deployments", probe, probe]);
-  });
-
   it.each([
     { state: "pending", call: () => new Promise<never>(() => {}), expected: "pending" },
     { state: "rejected", call: () => Promise.reject(new Error('Runner/run failed: 503 {"message":"unavailable"}')), expected: 'rejected: Error: Runner/run failed: 503 {"message":"unavailable"}' },
@@ -1067,7 +1034,7 @@ describe("runner-service process entry (AII-2034)", () => {
     const runId = randomUUID();
     const service = runnerServiceName(runId);
     const proc = await startEntry(runId, identityKey);
-    await registerDeployment(env, RUNNER_PROCESS_URI, "the spawned runner deployment", [service]);
+    await registerDeployment(env, RUNNER_PROCESS_URI, "the spawned runner deployment");
 
     // The ingress call is the product path: the Restate server signs with its private
     // key, the runner verifies it, and the real `runAutonomous()` fails on the invalid
