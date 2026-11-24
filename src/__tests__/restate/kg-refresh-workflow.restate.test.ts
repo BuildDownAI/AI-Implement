@@ -261,6 +261,56 @@ describe("KgRefresh durable workflow", () => {
     expect(names).not.toContain("stardog-import");
   });
 
+  it.each(VARIANTS.map(([label]) => label))(
+    "customer clean report keeps its PR open on Restate cancel at the commit point (%s)",
+    async label => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const held = gate("customer clean report before commit point");
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "completed", conclusion: "success" }], tickGate: held,
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      try {
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ...SUCCESS_REPORT, guardVerdict: "clean" });
+        await cancelInvocation(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      } finally {
+        held.release();
+      }
+      expect(await done).toMatchObject({ ok: false, conclusion: "operator_cancelled" });
+      expect(f.closePullRequestFn).not.toHaveBeenCalled();
+      expect(deleteBranchFn).not.toHaveBeenCalled();
+      expect(mergePullRequestFn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "customer clean report closes its PR when operator cancel wins the commit point (%s)",
+    async label => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const held = gate("customer operator cancel before commit point");
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "completed", conclusion: "success" }], tickGate: held,
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      try {
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ...SUCCESS_REPORT, guardVerdict: "clean" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", {});
+      } finally {
+        held.release();
+      }
+      expect(await done).toMatchObject({ ok: false, conclusion: "operator_cancelled" });
+      expect(f.closePullRequestFn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "TestOrg", "test-kg-source", SUCCESS_REPORT.snapshotPr);
+      expect(deleteBranchFn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "TestOrg", "test-kg-source", SUCCESS_REPORT.snapshotBranch);
+      expect(mergePullRequestFn).not.toHaveBeenCalled();
+    },
+  );
+
   // ---- W1 / W11: success report runs merge, delete-branch, the four real gates, persist,
   // close-row, one outcome call, settled, one release — each exactly once. it.each already
   // covers both the alwaysReplay and disableRetries variants, so this test doubles as W11's
