@@ -97,7 +97,7 @@ export class KgSnapshotHeldError extends Error {
   readonly commitSha: string | null;
   readonly branchName: string;
   /** Why the run waits: a content shrink, or tracker data that could not be read. */
-  readonly cause: "shrink" | "tracker-missing" | "source-failed";
+  readonly cause: "shrink" | "tracker-missing" | "source-failed" | "no-baseline";
   /** Teams whose tracker fetch failed; empty for a shrink. */
   readonly failedTeams: string[];
   /** Per-source results (tracker + ingest) for the operator's decision. */
@@ -112,11 +112,12 @@ export class KgSnapshotHeldError extends Error {
     prNumber: number | null,
     commitSha: string | null,
     branchName: string,
-    cause: "shrink" | "tracker-missing" | "source-failed" = "shrink",
+    cause: "shrink" | "tracker-missing" | "source-failed" | "no-baseline" = "shrink",
     failedTeams: string[] = [],
     sources: SourceResult[] = [],
     acceptBlocked = false,
     lostTeams: LostTeam[] = [],
+    readonly partCounts?: Record<string, number>,
   ) {
     super(`KG_SNAPSHOT_HELD: ${detail}`);
     this.partTable = partTable;
@@ -199,6 +200,7 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
 }
 
 interface KgSnapshotPushOutputs extends Record<string, unknown> {
+  partCounts?: Record<string, number>;
   snapshotPushed: boolean;
   commitSha: string | null;
   /** PR number of the opened refresh PR. Null in mounted/dry-run mode or when repoOwner/repoRepo are absent. */
@@ -615,6 +617,16 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
 
     const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
     const baseMode = context.data.kgBaseMode === true;
+    const baseline = context.data.baseline;
+    const partCounts: Record<string, number> = {};
+    if (baseMode) {
+      const dir = join(workspaceDir, "snapshot", "parts");
+      for (const file of existsSync(dir) ? readdirSync(dir).filter(f => f.endsWith(".nt")) : []) {
+        const name = logicalPartName(file);
+        partCounts[name] = (partCounts[name] ?? 0) + readFileSync(join(dir, file), "utf-8").split("\n").filter(Boolean).length;
+      }
+    }
+    console.log(`[kg-snapshot-push] baseline: ${baseMode ? baseline ? `KgRepo ${baseline.at}` : "none" : clonedRef}`);
 
     // ── Size check ───────────────────────────────────────────────────────────
     // Runs first (before the dry-run exit in guard 0b and before any commit): GitHub refuses
@@ -627,7 +639,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     /** Set by guard 0b on a soft-only shrink in a real run: push and open the PR, then throw KgSnapshotHeldError. */
     let held = false;
     let heldDetail = "";
-    let heldCause: "shrink" | "tracker-missing" | "source-failed" = "shrink";
+    let heldCause: "shrink" | "tracker-missing" | "source-failed" | "no-baseline" = "shrink";
     /** Teams whose tracker fetch failed; set with heldCause "tracker-missing". */
     let failedTeams: string[] = [];
     /** True when fetched=false and the cloned snapshot has a tracker part: tracker parts may be missing or smaller. */
@@ -700,13 +712,28 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       }
     }
 
+    if (baseMode) {
+      lostTeams = affectedTeams.map(team => ({ team, servedIssues: -1 }));
+      failedTeams = affectedTeams;
+      if (!baseline) {
+        held = true;
+        heldCause = "no-baseline";
+        heldDetail = "first load into Stardog: no earlier load to compare with";
+        for (const [part, count] of Object.entries(partCounts)) partRows.push({ part, prev: "missing", next: String(count), delta: "—" });
+      } else if ((!trackerFetched || affectedTeams.length > 0) && Object.keys(baseline.parts).some(part => TRACKER_NT_FILES.has(part))) {
+        trackerMissing = true;
+        heldCause = "tracker-missing";
+        heldDetail = "tracker data is missing; served team issue counts are unknown";
+      }
+    }
+
     // ── 0b. Content-based regression guard ──────────────────────────────────
-    // Compare snapshot/parts/*.nt in the working tree against the cloned HEAD
+    // Compare snapshot/parts/*.nt against KgRepo counts in base mode, or cloned HEAD
     // by line count. Refuse if any previous part is missing, if any part drops
     // below PART_SHRINK_THRESHOLD of its previous count, or if a tracker part
     // (issue.nt / comment.nt) shrinks at all when the tracker reported a non-zero issue count.
-    if (!baseMode && clonedRef && clonedRef !== "unknown") {
-      const lsAllResult = spawnSync(
+    if ((baseMode && baseline) || (!baseMode && clonedRef && clonedRef !== "unknown")) {
+      const lsAllResult = baseMode ? { status: 0, stdout: Buffer.from(Object.keys(baseline!.parts).join("\n")), stderr: Buffer.from("") } : spawnSync(
         "git",
         ["ls-tree", "--name-only", "-r", clonedRef, "--", "snapshot/parts/"],
         { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
@@ -741,12 +768,12 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         const newFiles = existsSync(newPartsDir) ? readdirSync(newPartsDir).filter((f) => f.endsWith(".nt")) : [];
 
         for (const [partName, partPaths] of previousByPart) {
-          // git show buffers the entire file in memory — adequate for current graph scale.
+          // Customer git show buffers the entire file; base mode uses the envelope count.
           // Switch to git cat-file --batch streaming if parts grow beyond tens of MB.
-          let prevLines = 0;
+          let prevLines = baseMode ? baseline!.parts[partName] : 0;
           let prevFailure: ReturnType<typeof spawnSync> | null = null;
           let failedPath = "";
-          for (const partPath of partPaths) {
+          for (const partPath of baseMode ? [] : partPaths) {
             const prevShowResult = spawnSync(
               "git",
               ["show", `${clonedRef}:${partPath}`],
@@ -956,7 +983,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       }
     }
     const acceptBlocked =
-      held && ((heldCause === "tracker-missing" && lostTeams.length > 0) || failedSources.length > 0);
+      held && (((baseMode || heldCause === "tracker-missing") && lostTeams.length > 0) || failedSources.length > 0);
     const warnings: string[] = [];
     if (failedSources.length > 0 && dryRun) warnings.push(failedSourceText);
     if (trackerWarning && !held) {
@@ -971,7 +998,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         ? acceptBlocked
           ? "held — accepting would drop served issues of: " + lostTeams.map((t) => `${t.team} (${t.servedIssues < 0 ? "unknown" : t.servedIssues})`).join(", ")
           : "held — tracker data is missing and the run waits for an operator decision"
-        : "held — a shrink waits for an operator decision"
+        : heldCause === "no-baseline" ? "held — no earlier Stardog load to compare with" : "held — a shrink waits for an operator decision"
       : warnings.length > 0
         ? dryRun
           ? "warnings (dry-run — no push)"
@@ -1000,11 +1027,13 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           : undefined,
     });
 
-    if (baseMode && !dryRun) {
-      console.log(reportBody);
-      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map(row => ({ part: row.part, prev: row.prev, new: row.next })), null, null, "", heldCause, failedTeams, sources, acceptBlocked, lostTeams);
+    const reportWithBaseline = `${reportBody}\n\nbaseline: ${baseMode ? baseline ? `KgRepo ${baseline.at}` : "none" : clonedRef}`;
+
+    if (baseMode) {
+      console.log(reportWithBaseline);
+      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map(row => ({ part: row.part, prev: row.prev, new: row.next })), null, null, "", heldCause, failedTeams, sources, acceptBlocked, lostTeams, baseMode ? partCounts : undefined);
       return { snapshotPushed: false, commitSha: null, prNumber: null, branchName: null,
-        guardVerdict: warnings.length ? "warnings" : "clean", sources,
+        guardVerdict: warnings.length ? "warnings" : "clean", sources, partCounts, partTable: partRows.map(row => ({ part: row.part, prev: row.prev, new: row.next })),
         ...(warnings.length ? { warnings } : {}) };
     }
 
@@ -1013,8 +1042,9 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // skip the commit, push, and PR; print the report instead.
     if (dryRun) {
       console.log("[kg-snapshot-push] dry-run: all guards passed; skipping commit, push, and PR");
-      console.log(reportBody);
+      console.log(reportWithBaseline);
       return {
+        ...(baseMode ? { partCounts } : {}),
         snapshotPushed: false,
         commitSha: null,
         prNumber: null,
@@ -1103,7 +1133,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       // Dev/test scenario with no target repo identity: the branch pushed, but there is
       // nothing to build a GitHub API URL from, so the refresh PR cannot be opened.
       console.warn("[kg-snapshot-push] repoOwner/repoRepo absent — pushed the branch but skipped opening the refresh PR");
-      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), null, commitSha, branchName, heldCause, failedTeams, sources, acceptBlocked, lostTeams);
+      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), null, commitSha, branchName, heldCause, failedTeams, sources, acceptBlocked, lostTeams, baseMode ? partCounts : undefined);
       return { snapshotPushed: true, commitSha, prNumber: null, branchName, sources, ...(warnings.length > 0 ? { warnings } : {}) };
     }
 
@@ -1116,7 +1146,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       prTitle,
       branchName,
       baseBranch: defaultBranch,
-      prBody: reportBody,
+      prBody: reportWithBaseline,
       draft: false,
     });
     console.log(`[kg-snapshot-push] pr opened #${pr.number}`);
@@ -1143,7 +1173,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     }
 
     if (held) {
-      throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), pr.number, commitSha, branchName, heldCause, failedTeams, sources, acceptBlocked, lostTeams);
+      throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), pr.number, commitSha, branchName, heldCause, failedTeams, sources, acceptBlocked, lostTeams, baseMode ? partCounts : undefined);
     }
 
     return { snapshotPushed: true, commitSha, prNumber: pr.number, branchName, sources, ...(warnings.length > 0 ? { warnings } : {}) };

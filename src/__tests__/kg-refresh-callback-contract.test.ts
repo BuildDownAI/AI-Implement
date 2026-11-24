@@ -274,6 +274,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         phase: "kg-refresh",
         workspaceDir,
         outcome: "success",
+        partCounts: { "issue.nt": 25 },
         snapshotPr: 7,
         snapshotCommit: "abc",
         callbackUrl: "http://orch.test",
@@ -287,7 +288,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     expect(c.report).toHaveBeenCalledTimes(1);
     expect(c.report).toHaveBeenCalledWith(
       dispatchId,
-      expect.objectContaining({ ok: true, snapshotPr: 7, snapshotCommit: "abc" }),
+      expect.objectContaining({ ok: true, snapshotPr: 7, snapshotCommit: "abc", partCounts: { "issue.nt": 25 } }),
       { idempotencyKey: dispatchId },
     );
   });
@@ -320,6 +321,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         failureCode: "KG_SNAPSHOT_HELD",
         failureReason: "KG_SNAPSHOT_HELD: content regression detected",
         guardVerdict: "held",
+        partCounts: { "comment.nt": 3793 },
         partTable,
         cause: "tracker-missing",
         failedTeams: ["X"],
@@ -346,6 +348,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         snapshotPr: 21,
         snapshotCommit: "abc",
         snapshotBranch: "kg-refresh/20260912T100000Z",
+        partCounts: { "comment.nt": 3793 },
         partTable,
         cause: "tracker-missing",
         failedTeams: ["X"],

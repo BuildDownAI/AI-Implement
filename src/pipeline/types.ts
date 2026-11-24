@@ -119,6 +119,7 @@ export interface PipelineContextData {
   /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
   kgDryRun?: boolean;
   kgRunStartedAt?: number;
+  baseline?: import("../run-config.js").KgSnapshotBaseline;
   kgBaseMode?: true;
   kgNamespace?: string;
   kgCodeRepo?: string;

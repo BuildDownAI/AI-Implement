@@ -270,6 +270,8 @@ dispatched a runner and received no callback within the TTL self-heals at the ne
 
 ### Decision gate (AII-1248)
 
+Base refresh guards compare numeric logical-part counts against the envelope baseline from `KgRepo`, without git. Reports identify `baseline: KgRepo <at>`, `baseline: none`, or the customer clone SHA. Missing parts refuse; counts below 50% hold, as does any issue/comment shrink when issues were fetched. No baseline holds as `no-baseline`. Failed or skipped teams have unknown served counts (-1), blocking accept for every base hold cause. Customer refreshes retain the cloned HEAD guard.
+
 A snapshot shrink, or a refresh that could not read tracker data, is one decision inside the same run,
 not a failed run and a second ingest. The `held` state carries a `cause`: `shrink` (a content-shrink
 rule fired) or `tracker-missing` (`kg-tracker-data` reported `fetched: false` while the cloned snapshot

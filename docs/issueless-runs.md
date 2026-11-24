@@ -340,6 +340,8 @@ The endpoint validates that `teamKey` is present in the orchestrator's configure
 
 ### Callback
 
+Base-mode callbacks include `partCounts`, numeric line counts for every new logical snapshot part (split pieces summed). Both clean and held reports retain these counts; the hold stores the report verbatim.
+
 The runner reports completion to `POST /api/runner/result` with `{ phase: "kg-refresh", outcome: "success"|"failure", snapshotCommit?, snapshotPr?, snapshotBranch?, failureCode?, failureReason? }`. `snapshotPr` and `snapshotBranch` are set when `kg-snapshot-push` pushed the snapshot and opened the refresh PR (AII-593, below). The routing carve-out in `src/runner-callback.ts` (`handleRunnerResult`, the `body.phase === "kg-refresh"` branch, line 724):
 
 ```typescript
@@ -479,7 +481,9 @@ The `kg-ingest` step writes every line of the ingest subprocess's stdout and std
 
 ## 8. Outcomes
 
-Base-mode snapshot validation runs without embeddings or age-stamp checks, uses the run start time for the report stamp, and never invokes git, pushes, or opens a PR. It has no previous snapshot baseline yet. A clean or warnings report with no snapshot PR succeeds with detail `ingest-only`, without merge or sidecar rail gates. A held report has `snapshotPr: null` and `snapshotPrUrl: null`; acceptance also ends `ingest-only`, while cancellation or decision expiry follows the ordinary cancellation path without PR cleanup. Dry runs keep their existing outcome and send no package. Stardog package delivery is a subsequent change (AII-1994).
+A first base-mode load is held with `cause: "no-baseline"`. An operator can accept after checking counts unless tracker teams failed or were skipped, or a non-tracker source failed. Ingest-only completion does not update the baseline: only a successful Stardog import (AII-1994) may record it; refused, cancelled and failed runs never do.
+
+Base-mode snapshot validation runs without embeddings or age-stamp checks, uses the run start time for the report stamp, and never invokes git, pushes, or opens a PR. It receives the last successfully loaded counts from `KgRepo` state in the envelope baseline; absent state holds the first load for review. A clean or warnings report with no snapshot PR succeeds with detail `ingest-only`, without merge or sidecar rail gates. A held report has `snapshotPr: null` and `snapshotPrUrl: null`; acceptance also ends `ingest-only`, while cancellation or decision expiry follows the ordinary cancellation path without PR cleanup. Dry runs keep their existing outcome and send no package. Stardog package delivery is a subsequent change (AII-1994).
 
 ### Classification
 

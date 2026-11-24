@@ -6859,7 +6859,7 @@ describe("runKgRefresh stage configuration", () => {
 
 describe("base-mode runner", () => {
   it("preserves every base field through the envelope and input resolver", () => {
-    const fields = { kgBaseMode: true as const, kgNamespace: "https://kg.example/", kgCodeRepo: "acme/code", kgGraphName: "graph", kgGraphLabel: "Graph", kgStardogDb: "database" };
+    const fields = { baseline: { parts: { "a.nt": 100 }, at: 123, triggerId: "last-load" }, kgBaseMode: true as const, kgNamespace: "https://kg.example/", kgCodeRepo: "acme/code", kgGraphName: "graph", kgGraphLabel: "Graph", kgStardogDb: "database" };
     const encoded = encodeRunConfig(buildKgRefreshRunConfig({ kgSourceRepo: "acme/code", issueIdentifier: "KG", ...fields }));
     expect(decodeRunConfig(encoded)).toMatchObject(fields);
     expect(resolveKgRefreshInputs({ AI_IMPLEMENT_RUN_CONFIG: encoded, GITHUB_OWNER: "acme", GITHUB_REPO: "code", GITHUB_TOKEN: "token" })).toMatchObject(fields);
@@ -6877,7 +6877,7 @@ describe("base-mode runner", () => {
     const log = vi.spyOn(console, "log");
     const git = vi.mocked(spawnSync);
     git.mockClear();
-    const ctx = makeContext({ kgBaseMode: true, kgRunStartedAt: Date.parse("2026-11-20T12:34:56Z") });
+    const ctx = makeContext({ baseline: { parts: { "a.nt": 1 }, at: 123, triggerId: "last-load" }, kgBaseMode: true, kgRunStartedAt: Date.parse("2026-11-20T12:34:56Z") });
     if (verdict === "warnings") ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 0, failedTeams: ["EMPTY"] });
     const result = await kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "unused", defaultBranch: "main", clonedRef: "not-a-git-repository" }, noopReporter);
     expect(result).toMatchObject({ snapshotPushed: false, prNumber: null, guardVerdict: verdict });
@@ -6952,5 +6952,40 @@ describe("base scope reconcile failure contracts", () => {
     const written = parseDocument(readFileSync(join(input.workspaceDir, "sources.yml"), "utf8")).toJS();
     expect(written).toMatchObject({ namespace: "https://new/", code_repo: { slug: "acme/code", path: "code-repo" } });
     expect(written).not.toHaveProperty("knowledge_graph");
+  });
+});
+
+
+describe("base snapshot baseline", () => {
+  it.each([
+    { previous: undefined, count: 4, team: false, cause: "no-baseline", blocked: false },
+    { previous: undefined, count: 4, team: true, cause: "no-baseline", blocked: true },
+    { previous: undefined, count: 4, team: "skipped", cause: "no-baseline", blocked: true },
+    { previous: 10, count: 4, team: false, cause: "shrink", blocked: false },
+    { previous: 10, count: 9, team: false, cause: undefined, blocked: false },
+    { previous: 10, count: 9, team: true, cause: "tracker-missing", blocked: true },
+  ])("compares numeric counts: %j", async ({ previous, count, team, cause, blocked }) => {
+    const dir = testDir("baseline-guard");
+    mkdirSync(join(dir, "snapshot/parts"), { recursive: true });
+    writeFileSync(join(dir, "snapshot/parts/issue.00.nt"), "triple\n".repeat(count - 1));
+    writeFileSync(join(dir, "snapshot/parts/issue.01.nt"), "triple\n");
+    writeFileSync(join(dir, "snapshot/parts/new.nt"), "new\n");
+    const ctx = makeContext({ kgBaseMode: true, ...(previous === undefined ? {} : { baseline: { parts: { "issue.nt": previous }, at: 123, triggerId: "last" } }) });
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 0, failedTeams: team === true ? ["X"] : [], teamResults: team === "skipped" ? [{ source: "tracker:X", kind: "tracker", status: "skipped", counts: {} }] : [] });
+    const git = vi.mocked(spawnSync);
+    git.mockClear();
+    const run = kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "", defaultBranch: "main", clonedRef: "ignored" }, noopReporter);
+    if (cause) await expect(run).rejects.toMatchObject({ code: "KG_SNAPSHOT_HELD", cause, acceptBlocked: blocked, partCounts: { "issue.nt": count, "new.nt": 1 } });
+    else expect(await run).toMatchObject({ guardVerdict: "clean", partCounts: { "issue.nt": count, "new.nt": 1 } });
+    expect(git).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("refuses a missing previous part and holds tracker shrink (tracker=%s)", async tracker => {
+    const dir = testDir("baseline-missing");
+    mkdirSync(join(dir, "snapshot/parts"), { recursive: true });
+    writeFileSync(join(dir, "snapshot/parts/other.nt"), "triple\n");
+    if (tracker) writeFileSync(join(dir, "snapshot/parts/issue.nt"), "triple\n".repeat(9));
+    const ctx = makeContext({ kgBaseMode: true, baseline: { parts: { "issue.nt": 10 }, at: 123, triggerId: "last" } });
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 2 });
+    await expect(kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "", defaultBranch: "main", clonedRef: "ignored" }, noopReporter)).rejects.toMatchObject({ code: tracker ? "KG_SNAPSHOT_HELD" : "KG_SNAPSHOT_TRACKER_REGRESSION" });
   });
 });

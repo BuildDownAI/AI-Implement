@@ -171,6 +171,7 @@ export function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   maxTurns: number | undefined;
   dependencyTokenScope: "installation" | undefined;
   kgDryRun: boolean;
+  baseline?: import("../run-config.js").KgSnapshotBaseline;
   kgBaseMode?: true;
   kgNamespace?: string;
   kgCodeRepo?: string;
@@ -189,7 +190,7 @@ export function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   let maxTurns: number | undefined;
   let dependencyTokenScope: "installation" | undefined;
   let kgDryRun = false;
-  let baseFields: Pick<RunConfigV1, "kgBaseMode" | "kgNamespace" | "kgCodeRepo" | "kgGraphName" | "kgGraphLabel" | "kgStardogDb"> = {};
+  let baseFields: Pick<RunConfigV1, "baseline" | "kgBaseMode" | "kgNamespace" | "kgCodeRepo" | "kgGraphName" | "kgGraphLabel" | "kgStardogDb"> = {};
   let agentConfig: ResolvedAgentSnapshotV1 | undefined;
 
   if (rawConfig) {
@@ -205,7 +206,7 @@ export function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
       }
       dependencyTokenScope = cfg.dependencyTokenScope;
       kgDryRun = cfg.kgDryRun === true;
-      baseFields = { kgBaseMode: cfg.kgBaseMode, kgNamespace: cfg.kgNamespace, kgCodeRepo: cfg.kgCodeRepo, kgGraphName: cfg.kgGraphName, kgGraphLabel: cfg.kgGraphLabel, kgStardogDb: cfg.kgStardogDb };
+      baseFields = { baseline: cfg.baseline, kgBaseMode: cfg.kgBaseMode, kgNamespace: cfg.kgNamespace, kgCodeRepo: cfg.kgCodeRepo, kgGraphName: cfg.kgGraphName, kgGraphLabel: cfg.kgGraphLabel, kgStardogDb: cfg.kgStardogDb };
       agentConfig = cfg.agentConfig;
     } catch (err) {
       // An opted-in envelope is authoritative: malformed configured input never degrades to the legacy
@@ -261,7 +262,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     maxTurns,
     dependencyTokenScope,
     kgDryRun: kgDryRunFromConfig,
-    kgBaseMode, kgNamespace, kgCodeRepo, kgGraphName, kgGraphLabel, kgStardogDb,
+    baseline, kgBaseMode, kgNamespace, kgCodeRepo, kgGraphName, kgGraphLabel, kgStardogDb,
     agentConfig,
   } = resolveKgRefreshInputs(process.env);
 
@@ -303,7 +304,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       dependencyTokenScope,
       kgRunStartedAt: Date.now(),
       kgDryRun,
-      kgBaseMode, kgNamespace, kgCodeRepo, kgGraphName, kgGraphLabel, kgStardogDb,
+      baseline, kgBaseMode, kgNamespace, kgCodeRepo, kgGraphName, kgGraphLabel, kgStardogDb,
     },
     configured
       ? configured.createExecutor({
@@ -399,6 +400,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
             ...(held.prNumber !== null ? { snapshotPr: held.prNumber } : {}),
             ...(held.commitSha ? { snapshotCommit: held.commitSha } : {}),
             snapshotBranch: held.branchName,
+            partCounts: held.partCounts,
             cause: held.cause,
             failedTeams: held.failedTeams,
             ...(held.acceptBlocked ? { acceptBlocked: true, lostTeams: held.lostTeams } : {}),
@@ -424,6 +426,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     snapshotCommit: typeof snapshotPushOutputs.commitSha === "string" ? snapshotPushOutputs.commitSha : undefined,
     snapshotPr: typeof snapshotPushOutputs.prNumber === "number" ? snapshotPushOutputs.prNumber : undefined,
     snapshotBranch: typeof snapshotPushOutputs.branchName === "string" ? snapshotPushOutputs.branchName : undefined,
+    ...(kgBaseMode ? { partCounts: snapshotPushOutputs.partCounts as Record<string, number> } : {}),
     ...((kgDryRun || kgBaseMode) && (snapshotPushOutputs.guardVerdict === "clean" || snapshotPushOutputs.guardVerdict === "warnings")
       ? { guardVerdict: snapshotPushOutputs.guardVerdict, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
       : {}),

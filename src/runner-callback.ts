@@ -170,9 +170,10 @@ export interface RunnerResultBody {
   /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   guardVerdict?: "clean" | "warnings" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
+  partCounts?: Record<string, number>;
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Why a `KG_SNAPSHOT_HELD` run waits; absent from runners that predate the field. */
-  cause?: "shrink" | "tracker-missing" | "source-failed";
+  cause?: "shrink" | "tracker-missing" | "source-failed" | "no-baseline";
   /** Teams whose tracker fetch failed, for a `tracker-missing` hold. */
   failedTeams?: string[];
   /** True when accepting a `tracker-missing` hold would drop a skipped or failed team's served issues. */
@@ -1019,6 +1020,7 @@ async function handleRunnerResultInternal(
         snapshotPr: input.body.snapshotPr,
         snapshotCommit: input.body.snapshotCommit,
         snapshotBranch: input.body.snapshotBranch,
+        partCounts: input.body.partCounts,
         partTable: input.body.partTable,
         cause: input.body.cause,
         failedTeams: input.body.failedTeams,

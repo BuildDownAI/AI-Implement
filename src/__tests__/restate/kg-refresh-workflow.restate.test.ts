@@ -40,6 +40,7 @@ import {
   createKgRefreshWorkflow,
   DISPATCH_RETRY_INITIAL_INTERVAL,
   type KgDispatchInput,
+  type KgRefreshRunInput,
   type KgRefreshWorkflowDependencies,
   type KgDispatchRecord,
   type KgDispatchRowDetails,
@@ -615,9 +616,13 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
-  const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => buildKgRefreshRunConfig({
-    kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
-  });
+  const buildEnvelopeInputs: KgRefreshRunInput[] = [];
+  const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => {
+    buildEnvelopeInputs.push(run);
+    return buildKgRefreshRunConfig({
+      kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
+    });
+  };
 
   const TEST_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
   const workflowDeps: Omit<Parameters<typeof createKgRefreshWorkflow>[0], "bootstrapDeadlineMs" | "totalDeadlineMs"> = {
@@ -781,11 +786,13 @@ describe("KgRefresh durable workflow", () => {
     const triggerId = newTriggerId();
     makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
     const before = baseExternalEffects();
-    const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, dryRun: true });
+    const baseline = { parts: { "issue.nt": 12 }, at: 123, triggerId: "loaded" };
+    const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, dryRun: true, baseline });
     await workflowDispatched(triggerId);
     await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true, guardVerdict: "clean" });
     expect(await done).toMatchObject({ ok: true, dryRun: true, detail: "dry run passed" });
     expect(baseExternalEffects()).toEqual(before);
+    expect(buildEnvelopeInputs.find(run => run.triggerId === triggerId)?.baseline).toEqual(baseline);
   });
 
   it.each(VARIANTS.map(([label]) => label))("base clean/warnings reports succeed without a PR or rail (%s)", async label => {

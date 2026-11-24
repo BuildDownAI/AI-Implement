@@ -307,6 +307,8 @@ export const kgPipelinesScript = `
   }
 
   function heldWhy(held) {
+    if (held.acceptBlocked && Array.isArray(held.lostTeams) && held.lostTeams.length) return 'Why: tracker data could not be read for ' + held.lostTeams.map(function (t) { return t.team; }).join(', ') + '. Accept is blocked.';
+    if (held.cause === 'no-baseline') return 'Why: this is the first load into Stardog, so there is no earlier load to compare with. Check the part counts, then accept.';
     if (held.cause === 'source-failed') {
       const failed = (Array.isArray(held.sources) ? held.sources : []).filter(function (s) { return s.status === 'failed' && s.kind !== 'tracker'; }).map(function (s) { return String(s.source); });
       return 'Why: ' + (failed.length ? failed.join(', ') : 'a source') + ' failed, so the graph may be partial. Accept is blocked.';
