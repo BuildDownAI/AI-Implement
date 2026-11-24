@@ -6,17 +6,16 @@ This is the reference for `src/runner-tokens.ts`, `src/runner-callback.ts`, `src
 
 The blast-radius section exists because of AII-567: a test suite inside a dispatched runner posted to the live orchestrator and burned every run's result token for three days. The learning record is [docs/solutions/workflow-patterns/runner-test-suite-burned-the-run-token.md](solutions/workflow-patterns/runner-test-suite-burned-the-run-token.md). This page records the structure that made it possible, so the next change to this path starts from the census below.
 
-Local serve-mode runs deliver the last `result` event body through the Restate runner call,
+Fly and local Docker serve-mode runs deliver the last `result` event body through the Restate runner call,
 rather than posting `/runner/result`. The workflow applies the shared callback lifecycle
 intake and owned-run accounting before finalizing. Pipeline settlement also ends the call
-when the pilot emits no result. Local serve-mode implementation runs also send step
+when the pilot emits no result. Fly and local Docker serve-mode implementation runs also send step
 progress through the runner's journaled event loop to `ImplementationRun.step`,
-rather than posting `/runner/progress`. Runs outside serve mode (currently Fly and
-GitHub Actions) retain result and progress callbacks.
+rather than posting `/runner/progress`. Runs outside serve mode (GitHub Actions and Fly or local Docker runs whose journaled launch result lacks `serve: true`) retain result and progress callbacks.
 
 ## The path
 
-The diagram shows callback delivery for runs outside serve mode. Local serve-mode
+The diagram shows callback delivery for runs outside serve mode. Fly and local Docker serve-mode
 results and implementation step progress use the Restate call described above.
 
 ```mermaid
@@ -148,7 +147,7 @@ cannot produce a success ACK. Legacy runs do not use this route.
 
 ## The step reporter as the run signal
 
-Local serve-mode implementation runs use `RestateStepReporter`, supplied by
+Fly and local Docker serve-mode implementation runs use `RestateStepReporter`, supplied by
 `RunnerFlight` through `opts.reporter`. Each report queues one redacted `step`
 event; the runner's journaled event loop sends it one-way to the shared
 `ImplementationRun.step` handler. That handler resolves the job from the workflow

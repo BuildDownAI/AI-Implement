@@ -329,8 +329,8 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           stageCommentGapfillLaunch(run.dispatchId, { record: privateRecord,
             target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
             ...(run.backend === "fly-machines" ? { flyApp: flyApp! } : {}), accepted: false });
-          if (run.backend === "local-docker") implementationIntentStore().write(run.dispatchId, {
-            serve: true, flyApp: null,
+          implementationIntentStore().write(run.dispatchId, {
+            serve: true, flyApp: run.backend === "fly-machines" ? flyApp! : null,
           });
           launchStarted = true;
         };
@@ -344,6 +344,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           if (run.backend === "fly-machines") {
             const result = await dispatchFlyGapfill({ implementationSandbox: decideImplementationSandbox({ protectedLaunch: decision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }), ...common, issue, issueDescription, owner: mapping.owner, repo: mapping.repo,
               issueIdentifier: run.issueIdentifier, scopeKey: run.teamKey, allTeamKeys: Object.keys(getMappings()),
+              serve: { identityKey: input.restateIdentityKey ?? "", runnerId: run.dispatchId },
               flySessionsToken: config.flySessionsToken!, flySessionsApp: flyApp!,
               flySessionsRegion: config.flySessionsRegion, flyOrchestratorApp: config.flyOrchestratorApp,
               sessionImage: config.sessionImage, runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,

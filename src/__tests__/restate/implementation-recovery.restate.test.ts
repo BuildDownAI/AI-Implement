@@ -40,6 +40,22 @@ vi.mock("../../restate/implementation-run-workflow.js", async (original) => {
     return actual.createImplementationRunWorkflow(wrapped);
   } };
 });
+// These lost-acceptance fixtures model pre-serve Fly launch intents. Their fake
+// machine has no runner endpoint; new Fly serve/recovery is exercised with a real
+// fake endpoint in implementation-run-workflow.restate.test.ts.
+vi.mock("../../restate/implementation-launch-intent.js", async original => {
+  const actual = await original<typeof import("../../restate/implementation-launch-intent.js")>();
+  return { ...actual, implementationIntentStore: () => {
+    const store = actual.implementationIntentStore();
+    return { ...store, write: (id: string, snapshot: unknown) => {
+      const intent = snapshot as { metadata?: { executionMode?: string }; serve?: boolean };
+      if (intent.metadata?.executionMode === "fly-machines") {
+        const { serve: _serve, ...legacy } = intent;
+        store.write(id, legacy);
+      } else store.write(id, snapshot);
+    } };
+  } };
+});
 vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "test-installation-token", getScopedInstallationToken: async () => ({ token: "test-scoped-token" }) }));
 vi.mock("node:child_process", async (original) => ({ ...(await original<typeof import("node:child_process")>()), execFile: vi.fn() }));
 
