@@ -1,3 +1,4 @@
+import { sendStardogPackage } from "../pipeline/steps/kg-stardog-package.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, truncateSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
@@ -26,6 +27,8 @@ vi.mock("../runner-token.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../runner-token.js")>();
   return { ...actual, refreshRunnerGithubCredentials: vi.fn(actual.refreshRunnerGithubCredentials) };
 });
+
+vi.mock("../pipeline/steps/kg-stardog-package.js", () => ({ sendStardogPackage: vi.fn(async () => {}) }));
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -5867,7 +5870,7 @@ describe("kgSnapshotPushStep — refresh PR flow", () => {
     return spawnSync("git", ["for-each-ref", "refs/heads", "--format=%(refname)"], { cwd: bareDir }).stdout.toString();
   }
 
-  it("pushes to kg-refresh/<stamp> and opens a PR whose body carries the report", async () => {
+  it("publishes a live customer snapshot PR without sending a Stardog package", async () => {
     initGitRepo(tmpDir);
     execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
     execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
@@ -5886,8 +5889,11 @@ describe("kgSnapshotPushStep — refresh PR flow", () => {
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 2, teamCounts: [{ team: "AII", count: 2 }] });
 
-    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+    expect(ctx.data.kgBaseMode).not.toBe(true);
+    vi.mocked(sendStardogPackage).mockClear();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: false }), noopReporter);
 
+    expect(sendStardogPackage).not.toHaveBeenCalled();
     expect(result.snapshotPushed).toBe(true);
     expect(result.prNumber).toBe(17);
     expect(branchesOnBare()).toContain("refs/heads/kg-refresh/20260905T080000Z");
@@ -6879,8 +6885,10 @@ describe("base-mode runner", () => {
     git.mockClear();
     const ctx = makeContext({ baseline: { parts: { "a.nt": 1 }, at: 123, triggerId: "last-load" }, kgBaseMode: true, kgRunStartedAt: Date.parse("2026-11-20T12:34:56Z") });
     if (verdict === "warnings") ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 0, failedTeams: ["EMPTY"] });
+    vi.mocked(sendStardogPackage).mockClear();
     const result = await kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "unused", defaultBranch: "main", clonedRef: "not-a-git-repository" }, noopReporter);
     expect(result).toMatchObject({ snapshotPushed: false, prNumber: null, guardVerdict: verdict });
+    expect(sendStardogPackage).toHaveBeenCalledOnce();
     expect(api.calls).toEqual([]);
     expect(log).toHaveBeenCalledWith(expect.stringContaining("20261120T123456Z"));
     expect(git).not.toHaveBeenCalled();
@@ -6974,9 +6982,11 @@ describe("base snapshot baseline", () => {
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 0, failedTeams: team === true ? ["X"] : [], teamResults: team === "skipped" ? [{ source: "tracker:X", kind: "tracker", status: "skipped", counts: {} }] : [] });
     const git = vi.mocked(spawnSync);
     git.mockClear();
+    vi.mocked(sendStardogPackage).mockClear();
     const run = kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "", defaultBranch: "main", clonedRef: "ignored" }, noopReporter);
     if (cause) await expect(run).rejects.toMatchObject({ code: "KG_SNAPSHOT_HELD", cause, acceptBlocked: blocked, partCounts: { "issue.nt": count, "new.nt": 1 } });
     else expect(await run).toMatchObject({ guardVerdict: "clean", partCounts: { "issue.nt": count, "new.nt": 1 } });
+    expect(sendStardogPackage).toHaveBeenCalledOnce();
     expect(git).not.toHaveBeenCalled();
   });
   it.each([false, true])("refuses a missing previous part and holds tracker shrink (tracker=%s)", async tracker => {
@@ -6987,5 +6997,42 @@ describe("base snapshot baseline", () => {
     const ctx = makeContext({ kgBaseMode: true, baseline: { parts: { "issue.nt": 10 }, at: 123, triggerId: "last" } });
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 2 });
     await expect(kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "", defaultBranch: "main", clonedRef: "ignored" }, noopReporter)).rejects.toMatchObject({ code: tracker ? "KG_SNAPSHOT_HELD" : "KG_SNAPSHOT_TRACKER_REGRESSION" });
+  });
+});
+
+describe("Stardog package guard integration", () => {
+  it.each(["clean", "warnings", "held", "refused", "dry-run"])("publishes only accepted live base guards: %s", async verdict => {
+    const dir = testDir("package-guard");
+    mkdirSync(join(dir, "snapshot/parts"), { recursive: true });
+    writeFileSync(join(dir, "snapshot/parts/a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(dir, "snapshot/embeddings.npz"), "binary");
+    writeFileSync(join(dir, "snapshot/embeddings.stamp"), "2026-11-20T12:34:56Z");
+    const ctx = makeContext({ kgBaseMode: true, kgStardogDb: "envelope-db",
+      baseline: { parts: verdict === "refused" ? { "missing.nt": 10 } : { "a.nt": verdict === "held" ? 10 : 1 }, at: 123, triggerId: "last" } });
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 0, ...(verdict === "warnings" ? { failedTeams: ["EMPTY"] } : {}) });
+    const send = vi.mocked(sendStardogPackage);
+    send.mockClear();
+    let finish!: () => void;
+    const pendingSend = new Promise<void>(resolve => { finish = resolve; });
+    let started!: () => void;
+    const startedSend = new Promise<void>(resolve => { started = resolve; });
+    send.mockImplementationOnce(async () => { started(); await pendingSend; });
+    let settled = false;
+    const run = kgSnapshotPushStep.run(ctx, { workspaceDir: dir, githubToken: "", defaultBranch: "main", clonedRef: "unknown", callbackUrl: "https://orch", dryRun: verdict === "dry-run" }, noopReporter)
+      .then(value => { settled = true; return { value, error: undefined }; }, error => { settled = true; return { value: undefined, error }; });
+    const shouldSend = ["clean", "warnings", "held"].includes(verdict);
+    if (shouldSend) {
+      await startedSend;
+      expect(settled).toBe(false);
+      expect(send).toHaveBeenCalledWith({ workspaceDir: dir, kgStardogDb: "envelope-db", callbackUrl: "https://orch" });
+      finish();
+    }
+    const result = await run;
+    if (verdict === "held") expect(result.error).toBeInstanceOf(KgSnapshotHeldError);
+    else if (verdict === "refused") expect(result.error).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    else expect(result.error).toBeUndefined();
+    expect(send).toHaveBeenCalledTimes(shouldSend ? 1 : 0);
+    send.mockReset();
+    send.mockResolvedValue(undefined);
   });
 });

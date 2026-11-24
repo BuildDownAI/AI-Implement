@@ -1,5 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { handleKgPackageUpload } from "./kg-package-upload.js";
+import { DATA_ROOT as KG_PACKAGE_DATA_ROOT } from "./kg-refresh.js";
 import { resolveKgRefreshSource, setBootKgRefreshSource, kgRefreshRunRepo, getBootKgRefreshSource } from "./kg-refresh-source.js";
 import { getStardogValues } from "./kg-graph-source.js";
 import { bindKey, clearKeyBinding } from "./restate/key-binding.js";
@@ -4593,6 +4595,18 @@ export function startServer(
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));
         }
+      });
+      return;
+    }
+
+    if (url.startsWith("/api/runner/kg-package/") && req.method === "POST") {
+      void handleKgPackageUpload(req, res, {
+        secret: config.runnerTokenSecret ?? "",
+        baseMode: getBootKgRefreshSource()?.mode === "base",
+        dataRoot: KG_PACKAGE_DATA_ROOT,
+      }).catch(err => {
+        console.error("[kg-package] Unhandled error", err);
+        if (!res.headersSent) { res.writeHead(500); res.end(); }
       });
       return;
     }

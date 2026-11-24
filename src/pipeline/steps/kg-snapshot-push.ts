@@ -1,3 +1,4 @@
+import { sendStardogPackage } from "./kg-stardog-package.js";
 import { spawnSync } from "node:child_process";
 import { parseSourceResults } from "../../kg-source-results.js";
 import type { SourceResult } from "../../kg-source-results.js";
@@ -1030,6 +1031,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const reportWithBaseline = `${reportBody}\n\nbaseline: ${baseMode ? baseline ? `KgRepo ${baseline.at}` : "none" : clonedRef}`;
 
     if (baseMode) {
+      if (!dryRun) await sendStardogPackage({ workspaceDir, kgStardogDb: context.data.kgStardogDb, callbackUrl: inputs.callbackUrl });
       console.log(reportWithBaseline);
       if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map(row => ({ part: row.part, prev: row.prev, new: row.next })), null, null, "", heldCause, failedTeams, sources, acceptBlocked, lostTeams, baseMode ? partCounts : undefined);
       return { snapshotPushed: false, commitSha: null, prNumber: null, branchName: null,

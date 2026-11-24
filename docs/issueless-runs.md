@@ -185,6 +185,18 @@ The row lifecycle:
 
 ## 5. Credentials and data
 
+In base mode, `kg-snapshot-push` builds a Stardog package after a clean, warnings,
+or held guard and uploads it before returning or raising the hold. Dry runs and
+refused guards send nothing; customer mode retains snapshot publication through git.
+`POST /api/runner/kg-package/<name>` accepts raw binary files using the reusable
+kg-refresh progress token, only when the orchestrator resolves to base mode.
+Allowed names are `kit.yaml`, `ontology.ttl`, `package.json`, and
+`data/[A-Za-z0-9._-]+.nt`, with no `..`. Files are streamed into
+`/data/kg/stardog/<dispatchId>/` with atomic replacement, capped at 64 MiB per
+file and 128 MiB per dispatch folder. The runner sends `package.json` last.
+Uploads carry graph data; the Stardog credential stays on the orchestrator.
+Completeness validation and end-of-run folder cleanup belong to the import workflow.
+
 ### Runner token
 
 Minted by `mintRunToken()` (`src/runner-tokens.ts`) at dispatch time:
