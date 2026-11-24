@@ -414,7 +414,7 @@ export function createProductionKgRefreshServices(
       issueIdentifier,
       runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
       dependencyTokenScope: findKgMapping(runRepo)?.[1]?.dependencyTokenScope ?? undefined,
-      ...(input.source?.mode === "base" ? { ...input.source, kgBaseMode: true as const } : {}),
+      ...(input.source?.mode === "base" ? { ...input.source, kgBaseMode: true as const, ...(run.baseline ? { baseline: run.baseline } : {}) } : {}),
       dryRun: run.dryRun,
       kgSourceRef: run.kgSourceRef,
     }),

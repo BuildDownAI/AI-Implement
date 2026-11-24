@@ -126,6 +126,7 @@ export type KgRefreshResume = z.infer<typeof kgResumeSchema>;
 export const kgRefreshRunInputSchema = kgRefreshOptionsSchema.extend({
   triggerId: z.string(),
   baseMode: z.literal(true).optional(),
+  baseline: z.object({ parts: z.record(z.string(), z.number()), at: z.number(), triggerId: z.string() }).optional(),
   report: kgDryRunReportSchema.optional(),
   resume: kgResumeSchema.optional(),
 }).strict();
@@ -148,9 +149,10 @@ export interface KgRefreshReportBody {
   snapshotPr?: number;
   snapshotCommit?: string;
   snapshotBranch?: string;
+  partCounts?: Record<string, number>;
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Absent on a report from a runner that predates the field; reads as "shrink". */
-  cause?: "shrink" | "tracker-missing" | "source-failed";
+  cause?: "shrink" | "tracker-missing" | "source-failed" | "no-baseline";
   failedTeams?: string[];
   /** Absent from a runner that predates the field; reads as unblocked. */
   acceptBlocked?: boolean;
@@ -210,7 +212,7 @@ export interface KgRefreshHeldView {
   snapshotPr: number | null;
   partTable: Array<{ part: string; prev: string; new: string }>;
   /** Why the run waits. */
-  cause: "shrink" | "tracker-missing" | "source-failed";
+  cause: "shrink" | "tracker-missing" | "source-failed" | "no-baseline";
   /** Teams whose tracker fetch failed; empty for a shrink. */
   failedTeams: string[];
   /** True when accepting would publish a graph without `lostTeams`' issues; the gate then offers cancel only. */

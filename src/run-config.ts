@@ -26,6 +26,13 @@ import {
   type SealedModelAuthBootstrapV1,
 } from "./model-auth-contract.js";
 
+/** Counts from the last snapshot successfully loaded into Stardog. */
+export interface KgSnapshotBaseline {
+  parts: Record<string, number>;
+  at: number;
+  triggerId: string;
+}
+
 export const RESOLVED_AGENT_SNAPSHOT_VERSION = 1;
 
 /**
@@ -142,6 +149,7 @@ export interface RunConfigV1 {
   runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   /** Refresh run identity (owner/repo): the KG repo in customer mode, the code repo in base mode. */
   kgSourceRepo?: string;
+  baseline?: KgSnapshotBaseline;
   kgBaseMode?: true;
   kgNamespace?: string;
   kgCodeRepo?: string;
@@ -657,6 +665,7 @@ export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
 }
 
 export interface KgRefreshRunConfigInput {
+  baseline?: KgSnapshotBaseline;
   kgBaseMode?: true;
   kgNamespace?: string;
   kgCodeRepo?: string;
@@ -687,6 +696,7 @@ export function buildKgRefreshRunConfig(input: KgRefreshRunConfigInput): RunConf
     issue: { id: "kg-refresh", identifier: issueIdentifier, title: "KG ingest", description: "" },
     runnerPhase: "kg-refresh",
     kgSourceRepo,
+    ...(input.baseline !== undefined ? { baseline: input.baseline } : {}),
     ...(input.kgBaseMode !== undefined ? { kgBaseMode: input.kgBaseMode } : {}),
     ...(input.kgNamespace !== undefined ? { kgNamespace: input.kgNamespace } : {}),
     ...(input.kgCodeRepo !== undefined ? { kgCodeRepo: input.kgCodeRepo } : {}),
@@ -727,7 +737,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
-    kgDryRun, kgSourceRef, referenceRepos, kgBaseMode, kgNamespace, kgCodeRepo, kgGraphName, kgGraphLabel, kgStardogDb,
+    kgDryRun, kgSourceRef, referenceRepos, baseline, kgBaseMode, kgNamespace, kgCodeRepo, kgGraphName, kgGraphLabel, kgStardogDb,
     reviewers, reviewProcess, trustedReviewAuthors, retryPolicy, reviewFix, agentConfig } = cfg;
   const out: RunConfigV1 = { v, issue };
   const prices = copyModelPrices(cfg.modelPrices);
@@ -761,6 +771,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (groupingParent !== undefined) out.groupingParent = groupingParent;
   if (dependencyTokenScope !== undefined) out.dependencyTokenScope = dependencyTokenScope;
   if (kgSourceRepo !== undefined) out.kgSourceRepo = kgSourceRepo;
+  if (baseline !== undefined) out.baseline = baseline;
   if (kgBaseMode !== undefined) out.kgBaseMode = kgBaseMode;
   if (kgNamespace !== undefined) out.kgNamespace = kgNamespace;
   if (kgCodeRepo !== undefined) out.kgCodeRepo = kgCodeRepo;
