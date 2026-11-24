@@ -198,9 +198,10 @@ export async function postRunnerResult(params: {
   /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   guardVerdict?: "clean" | "warnings" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
+  partCounts?: Record<string, number>;
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Why a held kg-refresh waits: a content shrink or missing tracker data. */
-  cause?: "shrink" | "tracker-missing" | "source-failed";
+  cause?: "shrink" | "tracker-missing" | "source-failed" | "no-baseline";
   /** Teams whose tracker fetch failed, for a held kg-refresh. */
   failedTeams?: string[];
   /** True when accepting the held kg-refresh would drop a skipped or failed team's served issues. */
@@ -359,6 +360,7 @@ export function buildRunnerResultBody(params: Parameters<typeof postRunnerResult
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
   if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
   if (params.guardVerdict) body.guardVerdict = params.guardVerdict;
+  if (params.partCounts) body.partCounts = params.partCounts;
   if (params.partTable) body.partTable = params.partTable;
   if (params.cause) body.cause = params.cause;
   if (params.failedTeams) body.failedTeams = params.failedTeams;

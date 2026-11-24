@@ -162,6 +162,32 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     );
   });
 
+  it.each([
+    null, [], "counts", 3, true,
+    { "issue.nt": "25" }, { "issue.nt": -1 }, { "issue.nt": 1.5 },
+    { "issue.nt": NaN }, { "issue.nt": Infinity }, { "issue.nt": -Infinity },
+    { "issue.nt": null }, { "issue.nt": {} },
+    { "issue.nt": 25, "comment.nt": -1 },
+  ])("rejects malformed partCounts %j before reporting", async partCounts => {
+    const { token, dispatchId } = mint();
+    const c = client();
+    for (const outcome of ["success", "failure"]) {
+      expect(await run(token, c, {
+        phase: "kg-refresh", outcome, comments: [], partCounts,
+        failureCode: outcome === "failure" ? "KG_SNAPSHOT_HELD" : undefined,
+      } as never)).toEqual({ status: 400, body: { error: "invalid_part_counts" } });
+    }
+    expect(c.report).not.toHaveBeenCalled();
+    expect(consumedAt(dispatchId)).toBeNull();
+  });
+
+  it.each([{}, { "issue.nt": 0, "comment.nt": 25 }])("accepts valid partCounts %j", async partCounts => {
+    const { token, dispatchId } = mint();
+    const c = client();
+    expect((await run(token, c, { phase: "kg-refresh", outcome: "success", comments: [], partCounts } as never)).status).toBe(200);
+    expect(c.report).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ partCounts }), { idempotencyKey: dispatchId });
+  });
+
   it.each(["success", "failure"] as const)("forwards sanitized usage on %s and identical retries", async (outcome) => {
     const { token, dispatchId } = mint();
     const c = client();
@@ -274,6 +300,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         phase: "kg-refresh",
         workspaceDir,
         outcome: "success",
+        partCounts: { "issue.nt": 25 },
         snapshotPr: 7,
         snapshotCommit: "abc",
         callbackUrl: "http://orch.test",
@@ -287,7 +314,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     expect(c.report).toHaveBeenCalledTimes(1);
     expect(c.report).toHaveBeenCalledWith(
       dispatchId,
-      expect.objectContaining({ ok: true, snapshotPr: 7, snapshotCommit: "abc" }),
+      expect.objectContaining({ ok: true, snapshotPr: 7, snapshotCommit: "abc", partCounts: { "issue.nt": 25 } }),
       { idempotencyKey: dispatchId },
     );
   });
@@ -320,6 +347,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         failureCode: "KG_SNAPSHOT_HELD",
         failureReason: "KG_SNAPSHOT_HELD: content regression detected",
         guardVerdict: "held",
+        partCounts: { "comment.nt": 3793 },
         partTable,
         cause: "tracker-missing",
         failedTeams: ["X"],
@@ -346,6 +374,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         snapshotPr: 21,
         snapshotCommit: "abc",
         snapshotBranch: "kg-refresh/20260912T100000Z",
+        partCounts: { "comment.nt": 3793 },
         partTable,
         cause: "tracker-missing",
         failedTeams: ["X"],

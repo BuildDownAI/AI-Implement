@@ -16,7 +16,7 @@ const HOLD_MS = 24 * 60 * 60 * 1000;
 
 interface RunSend {
   key: string;
-  parameter: { triggerId: string; dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; report?: { repo: string; prNumber: number; sha: string } };
+  parameter: { baseline?: import("../../run-config.js").KgSnapshotBaseline; baseMode?: true; triggerId: string; dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; report?: { repo: string; prNumber: number; sha: string } };
 }
 
 // release, expire and recordDryRunOutcome are ingressPrivate (AII-976): only another handler
@@ -35,7 +35,7 @@ const privateCaller = restate.service({
       }),
   },
 });
-async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "hold" | "recordDryRunOutcome" | "recordAdminDryRun" | "acquireSwitch" | "releaseSwitch", body: unknown): Promise<unknown> {
+async function callPrivate(baseUrl: string, slug: string, handler: "recordBaseline" | "release" | "expire" | "hold" | "recordDryRunOutcome" | "recordAdminDryRun" | "acquireSwitch" | "releaseSwitch", body: unknown): Promise<unknown> {
   return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler, body });
 }
 
@@ -86,7 +86,8 @@ describe("KgRepo durable single-flight lock", () => {
   /** Trigger ids whose fake run reports `holdConsumed` (a resumed run that started closing the PR). */
   const consumedRuns = new Set<string>();
 
-  const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME });
+  let baseMode = false;
+  const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME, get baseMode() { return baseMode; } });
 
 
   let envs: Map<string, RestateEnvironment>;
@@ -130,6 +131,7 @@ describe("KgRepo durable single-flight lock", () => {
       await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(1);
       expect(runSends[runSends.length - 1]).toEqual({ key: triggerId, parameter: { triggerId } });
+      expect(runSends[runSends.length - 1].parameter).not.toHaveProperty("baseMode");
     },
   );
 
@@ -693,6 +695,35 @@ describe("KgRepo durable single-flight lock", () => {
     return triggerId;
   }
 
+  it.each(VARIANTS.map(([label]) => label))("records a baseline for the next base trigger (%s)", async label => {
+    const env = envFor(label);
+    const slug = newKey();
+    baseMode = true;
+    const baseline = { parts: { "issue.nt": 12, "code.nt": 40 }, at: 123, triggerId: "loaded" };
+    try {
+      await callPrivate(env.baseUrl(), slug, "recordBaseline", baseline);
+      const result = await trigger(env.baseUrl(), slug) as { triggerId: string };
+      await eventually(() => runSends.some(s => s.key === result.triggerId), ok => ok, { label: "baseline send" });
+      expect(runSends.find(s => s.key === result.triggerId)!.parameter.baseline).toEqual(baseline);
+    } finally { baseMode = false; }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("base mode survives a held decision and exposes a null PR (%s)", async label => {
+    const env = envFor(label);
+    const slug = newKey();
+    baseMode = true;
+    try {
+      const held = await triggerAndHold(env, slug, { ok: false, failureCode: "KG_SNAPSHOT_HELD" });
+      await eventually(() => runSends.some(s => s.key === held), ok => ok, { label: "base initial send" });
+      expect(runSends.find(s => s.key === held)!.parameter.baseMode).toBe(true);
+      expect(runSends.find(s => s.key === held)!.parameter).not.toHaveProperty("baseline");
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ held: { snapshotPr: null } });
+      const resumed = (await decide(env.baseUrl(), slug, { action: "accept", actor: "admin@example.com", triggerId: held }))!.triggerId;
+      await eventually(() => runSends.some(s => s.key === resumed), ok => ok, { label: "base resumed send" });
+      expect(runSends.find(s => s.key === resumed)!.parameter).toMatchObject({ baseMode: true, resume: { action: "accept" } });
+    } finally { baseMode = false; }
+  });
+
   it.each(VARIANTS.map(([label]) => label))(
     "H1: hold keeps the lock for its trigger: a release before or after it never frees it, a new trigger is refused, one timer is armed (%s)",
     async (label) => {
@@ -738,6 +769,7 @@ describe("KgRepo durable single-flight lock", () => {
       await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "the resumed run send" });
       const send = runSends[runSends.length - 1];
       expect(send.key).toBe(resumed);
+      expect(send.parameter).not.toHaveProperty("baseMode");
       expect(send.parameter).toMatchObject({ triggerId: resumed, resume: { action: "accept", actor: "ada@example.com", hold: { triggerId: held, dispatchId: held } } });
       expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: resumed, held: null });
 
@@ -1096,9 +1128,13 @@ describe("KgRepo run-held lock", () => {
 
       await killInvocation(env.adminAPIBaseUrl(), String((await runRow(env, FAKE_WORKFLOW_NAME, triggerId)).id));
       await eventually(() => sends.slice(before).filter((s) => s.parameter.kgSourceRef === "held").length, (n) => n === 1, { label: "queued dry run submitted after the release", timeoutMs: 30_000, intervalMs: 50 });
-      const marker = (await markerOf(env, slug))!;
-      expect(marker.triggerId).not.toBe(triggerId);
-      expect(marker.invocationId).toEqual(expect.any(String));
+      // The workflow can receive its send before release finishes publishing the
+      // replacement marker. Observe that state, rather than racing the shared read.
+      const marker = await eventually(() => markerOf(env, slug),
+        value => value?.triggerId !== triggerId && typeof value?.invocationId === "string",
+        { label: "queued dry run owns the marker" });
+      expect(marker!.triggerId).not.toBe(triggerId);
+      expect(marker!.invocationId).toEqual(expect.any(String));
       expect(sends.length - before).toBe(2);
     },
     60_000,

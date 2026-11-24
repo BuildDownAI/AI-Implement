@@ -20,6 +20,11 @@ interface KgScopeMapping {
 interface KgScopeReconcileInputs extends Record<string, unknown> {
   callbackUrl: string | null | undefined;
   workspaceDir: string;
+  kgBaseMode?: boolean;
+  kgNamespace?: string;
+  kgCodeRepo?: string;
+  kgGraphName?: string;
+  kgGraphLabel?: string;
   /** Dev-harness / dry-run mode: reconcile into the run's scratch clone like a live run, so later steps test the same scope; the clone is never pushed. */
   dryRun?: boolean;
   /**
@@ -255,7 +260,21 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
       writeFileSyncImpl: writeFn = writeFileSync,
     } = inputs;
 
+    if (inputs.kgBaseMode) {
+      const doc = parseDocument(readSourcesYmlRaw(workspaceDir));
+      if (doc.errors.length) throw new Error("base sources.yml is invalid");
+      doc.set("namespace", inputs.kgNamespace);
+      if (isMap(doc.get("code_repo", true))) doc.setIn(["code_repo", "slug"], inputs.kgCodeRepo);
+      else doc.set("code_repo", { slug: inputs.kgCodeRepo });
+      if (isMap(doc.get("knowledge_graph", true))) {
+        doc.setIn(["knowledge_graph", "name"], inputs.kgGraphName);
+        doc.setIn(["knowledge_graph", "label"], inputs.kgGraphLabel);
+      }
+      writeFn(join(workspaceDir, "sources.yml"), doc.toString());
+    }
+
     if (!callbackUrl) {
+      if (inputs.kgBaseMode) throw new Error("base-mode scope reconcile requires a callback URL");
       console.log("[kg-scope-reconcile] no callback URL; scope reconcile skipped");
       return EMPTY_OUTPUTS;
     }
@@ -264,6 +283,7 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
     // in step inputs, which are persisted to the step log and exposed via the admin API.
     const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
     if (!progressToken) {
+      if (inputs.kgBaseMode) throw new Error("base-mode scope reconcile requires RUN_PROGRESS_TOKEN");
       console.log("[kg-scope-reconcile] no progress token (RUN_PROGRESS_TOKEN); scope reconcile skipped");
       return EMPTY_OUTPUTS;
     }
@@ -277,12 +297,15 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
         headers: { Authorization: `Bearer ${progressToken}` },
       });
       if (!res.ok) {
+        if (inputs.kgBaseMode) throw new Error(`base-mode scope fetch failed: HTTP ${res.status}`);
         console.warn(`[kg-scope-reconcile] ${url} returned HTTP ${res.status}; scope reconcile skipped`);
         return EMPTY_OUTPUTS;
       }
       const parsed = (await res.json()) as unknown;
+      if (inputs.kgBaseMode && !Array.isArray(parsed)) throw new Error("invalid scope response");
       mappings = Array.isArray(parsed) ? (parsed as KgScopeMapping[]) : [];
     } catch (err) {
+      if (inputs.kgBaseMode) throw new Error(`base-mode scope fetch failed: ${String(err)}`);
       console.warn(
         `[kg-scope-reconcile] fetch failed: ${err instanceof Error ? err.message : String(err)}; scope reconcile skipped`,
       );

@@ -2,7 +2,7 @@
 import { getDb } from "../../dedup.js";
 import { appendLog, initLogTable } from "../../log.js";
 import { JobAccountingPageSchema } from "../../job-accounting.js";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RestateEnvironment } from "./harness.js";
@@ -16,9 +16,9 @@ import {
 } from "../../restate/kg-refresh-workflow.js";
 import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
-  VARIANTS, attachWorkflow, callService, callWorkflow, eventually, gate, queryInvocations, settle,
+  VARIANTS, callObject, cancelInvocation, attachWorkflow, callService, callWorkflow, eventually, gate, queryInvocations, settle,
   startRetryEnabled, startVariants, stopAll,
-  journalEntries, journalEntryNames, journalText,
+  journalEntries, journalEntryNames, journalText, journaledRunResult,
 } from "./harness.js";
 import {
   BOOTSTRAP_DEADLINE_MS, GENERIC_FAILURE_REPORT, KG_SOURCE_REPO, NEW_STAMP, OLD_STAMP, SNAPSHOT_SHA,
@@ -31,14 +31,17 @@ describe("KgRefresh durable workflow", () => {
   const f = createKgRefreshFixture();
   f.installHooks();
   const {
-    state, rail, mergePullRequestFn, deleteBranchFn, postOrUpdateStickyCommentFn, setCommitStatusFn, persistSnapshotShaFn, scenarios, appendJobLogCalls, resolveExecutionModeCalls, recordedDetails, armedNonces, dispatchedNonces, dispatchTimes, dispatchResults, fakeNonce, dispatchedIds, dispatchThrowAfterCommit, dispatchThrowOnce, dispatchedTokens, dispatchedEnvelopes, mintedDispatchIds, persistCalls, onOutcomeCalls, closeRowFake, markJobHeldFake, reopenHeldJobFake, closeRowsFor, closeRowFor, outcomesFor, newTriggerId, makeScenario, claimCalls, attachCalls, attachRequests, flyMachineProfile, ghaRunProfile, projectionFakes, stopCalls, machineReads, machineReadCalls, machineReadGates, dispatchFn, buildEnvelopeFn, resolveDispatchRecordFn, getWorkflowRunStatusFn, findRunByTitleFn, cancelWorkflowRunFn, readMachineRunFn, stopMachineRunFn, workflow, deadlineWorkflow, bootstrapOnlyWorkflow, kgRepo, starter, triggerViaKgRepo, kgRepoStatus, workflowDispatched, runWorkflow,
+    baseVariants, startBaseVariants, frozenTarget, buildEnvelopeInputs, stardogTokensUsed, stardog, packageFixture, readBaseline, baseExternalEffects, state, rail, mergePullRequestFn, deleteBranchFn, postOrUpdateStickyCommentFn, setCommitStatusFn, persistSnapshotShaFn, scenarios, appendJobLogCalls, resolveExecutionModeCalls, recordedDetails, armedNonces, dispatchedNonces, dispatchTimes, dispatchResults, fakeNonce, dispatchedIds, dispatchThrowAfterCommit, dispatchThrowOnce, dispatchedTokens, dispatchedEnvelopes, mintedDispatchIds, persistCalls, onOutcomeCalls, closeRowFake, markJobHeldFake, reopenHeldJobFake, closeRowsFor, closeRowFor, outcomesFor, newTriggerId, makeScenario, claimCalls, attachCalls, attachRequests, flyMachineProfile, ghaRunProfile, projectionFakes, stopCalls, machineReads, machineReadCalls, machineReadGates, dispatchFn, buildEnvelopeFn, resolveDispatchRecordFn, getWorkflowRunStatusFn, findRunByTitleFn, cancelWorkflowRunFn, readMachineRunFn, stopMachineRunFn, workflow, deadlineWorkflow, bootstrapOnlyWorkflow, kgRepo, starter, triggerViaKgRepo, kgRepoStatus, workflowDispatched, runWorkflow,
   } = f;
 
+  let baseEnvs: Awaited<ReturnType<typeof startBaseVariants>>;
+  const baseEnvFor = (label: string) => baseEnvs.get(label as "alwaysReplay" | "disableRetries")!;
   let envs: Map<string, RestateEnvironment>;
   let deadlineEnvs: Map<string, RestateEnvironment>;
   let bootstrapEnvs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     initLogTable();
+    baseEnvs = await startBaseVariants();
     [envs, deadlineEnvs, bootstrapEnvs] = await Promise.all([
       startVariants([workflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools]),
       startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]),
@@ -47,6 +50,7 @@ describe("KgRefresh durable workflow", () => {
   }, 120_000);
   afterAll(async () => {
     await Promise.all([
+      baseEnvs ? stopAll(baseEnvs) : undefined,
       envs ? stopAll(envs) : undefined,
       deadlineEnvs ? stopAll(deadlineEnvs) : undefined,
       bootstrapEnvs ? stopAll(bootstrapEnvs) : undefined,
@@ -82,6 +86,248 @@ describe("KgRefresh durable workflow", () => {
       expect(response.status).toBe(400);
     },
     30_000,
+  );
+
+  /** The run invocation's journal id, once the workflow has started. */
+  async function runInvocationId(env: ReturnType<typeof envFor>, triggerId: string): Promise<string> {
+    const rows = await eventually(
+      () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
+      (r) => r.length === 1,
+      { label: "the KgRefresh run invocation" },
+    );
+    return rows[0].id as string;
+  }
+
+  it.each(baseVariants.map(([label]) => label))("base dry run completes without publication or rail (%s)", async label => {
+    const env = baseEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "fly-machines" });
+    const before = baseExternalEffects();
+    packageFixture(triggerId);
+    const baseline = { parts: { "issue.nt": 12 }, at: 123, triggerId: "loaded" };
+    const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, dryRun: true, baseline });
+    await workflowDispatched(triggerId);
+    await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true, guardVerdict: "clean" });
+    expect(await done).toMatchObject({ ok: true, dryRun: true, detail: "dry run passed" });
+    expect(baseExternalEffects()).toEqual(before);
+    expect(buildEnvelopeInputs.find(run => run.triggerId === triggerId)?.baseline).toEqual(baseline);
+    expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+  });
+
+  it.each(baseVariants.map(([label]) => label))("base clean/warnings reports succeed without a PR or rail (%s)", async label => {
+    const env = baseEnvFor(label);
+    for (const guardVerdict of ["clean", "warnings"] as const) {
+      state.configuredTarget = { ...frozenTarget };
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "fly-machines" });
+      const beforeEffects = baseExternalEffects();
+      const beforeFetch = state.fetchTarballCallCount;
+      const dir = packageFixture(triggerId);
+      const importsBefore = stardog.startImport.mock.calls.length;
+      const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, ok => ok, { label: "base dispatch" });
+      state.configuredTarget = { db: "changed-db", graphName: "changed-graph" };
+      stardog.startImport.mockImplementationOnce(async () => {
+        stardogTokensUsed.push("SENTINEL-stardog-token");
+        state.configuredTarget = { db: "third-db", graphName: "third-graph" };
+        return { kitId: "kit-test", publishId: "publish-test" };
+      });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true, guardVerdict, partCounts: { issues: 42 } });
+      expect(await done).toMatchObject({ ok: true, detail: "Stardog import verified" });
+      expect(await readBaseline(env)).toEqual({ parts: { issues: 42 }, triggerId, at: expect.any(Number) });
+      expect(stardog.startImport.mock.calls.slice(importsBefore)).toEqual([[dir, ["kit.yaml", "ontology.ttl", "data/issues.nt"], frozenTarget]]);
+      expect(stardog.countTriples.mock.calls.at(-1)).toEqual([frozenTarget]);
+      expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+      const entries = await journalEntries(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      for (const name of ["stardog-import", "stardog-wait", "stardog-verify", "baseline"]) expect(names).toContain(name);
+      expect(names.indexOf("stardog-import")).toBeLessThan(names.indexOf("stardog-wait"));
+      expect(names.indexOf("stardog-wait")).toBeLessThan(names.indexOf("stardog-verify"));
+      expect(names.indexOf("stardog-verify")).toBeLessThan(names.indexOf("baseline"));
+      const journal = journalText(entries);
+      expect(journaledRunResult(entries, "stardog-import")).toEqual({ kitId: "kit-test", publishId: "publish-test", expectedTriples: 42, target: frozenTarget });
+      expect(stardogTokensUsed).toContain("SENTINEL-stardog-token");
+      expect(journal).toContain("publish-test");
+      expect(journal).not.toContain("SENTINEL-stardog-token");
+
+      expect(baseExternalEffects()).toEqual(beforeEffects);
+      expect(state.fetchTarballCallCount).toBe(beforeFetch);
+    }
+  });
+
+  it.each(baseVariants.map(([label]) => label))("base rejects malformed kit data before importing (%s)", async label => {
+    const env = baseEnvFor(label);
+    for (const entry of ["data/issues.nt", {}, { file: "../x.nt" }, null, [], { file: 42 }, { file: "data/a..nt" }, { file: "other.ttl" }]) {
+      stardog.startImport.mockClear();
+      const triggerId = newTriggerId();
+      const dir = packageFixture(triggerId);
+      writeFileSync(join(dir, "kit.yaml"), JSON.stringify({ data: [entry] }));
+      const outcome = await runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
+        hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+      } });
+      expect(outcome).toMatchObject({ ok: false, conclusion: "stardog-import-failed", detail: expect.stringContaining("kit.yaml has an invalid data list") });
+      expect(outcome.detail).not.toContain("no good graph");
+      expect(stardog.startImport).not.toHaveBeenCalled();
+      expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+    }
+  });
+
+  it.each(baseVariants.map(([label]) => label))("base import failures do not update the baseline (%s)", async label => {
+    const env = baseEnvFor(label);
+    for (const failure of ["post", "missing", "failed", "mismatch", "query"] as const) {
+      const prior = { parts: { prior: 123 }, at: 456, triggerId: "prior-success" };
+      await callObject(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "seedBaseline", prior);
+      stardog.startImport.mockClear();
+      stardog.startImport.mockImplementation(async () => {
+        if (failure === "post") throw new Error("POST refused");
+        return { kitId: "kit-test", publishId: "publish-test" };
+      });
+      stardog.readEvents.mockImplementation(async () => {
+        return failure === "failed" ? { failed: "load failed" } : "done";
+      });
+      stardog.countTriples.mockImplementation(async () => {
+        if (failure === "query") throw new Error("query failed");
+        return failure === "mismatch" ? 41 : 42;
+      });
+      const triggerId = newTriggerId();
+      const dir = packageFixture(triggerId);
+      if (failure === "missing") rmSync(join(dir, "data/issues.nt"));
+      const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
+        hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+      } });
+      const outcome = await done;
+      expect(outcome).toMatchObject({ ok: false, conclusion: "stardog-import-failed" });
+      expect(outcome.detail?.includes("no good graph")).toBe(failure !== "post" && failure !== "missing");
+      expect(stardog.startImport).toHaveBeenCalledTimes(failure === "missing" ? 0 : 1);
+      expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names).not.toContain("baseline");
+      expect(await readBaseline(env)).toEqual(prior);
+    }
+  });
+
+  it("base wait exhausts the retry budget under alwaysReplay without another import", async () => {
+    // A zero retry budget makes the engine exhaust it on the first plain error;
+    // no elapsed-time assertion or sleep is needed. disableRetries cannot prove retries.
+    const env = baseEnvFor("alwaysReplay");
+    const prior = { parts: { prior: 99 }, at: 123, triggerId: "prior-success" };
+    await callObject(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "seedBaseline", prior);
+    const triggerId = newTriggerId();
+    packageFixture(triggerId);
+    state.stardogWaitBudgetMs = 0;
+    stardog.readEvents.mockResolvedValue(null);
+    try {
+      const outcome = await runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
+        hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+      } });
+      expect(outcome).toMatchObject({ ok: false, conclusion: "stardog-import-failed" });
+      expect(stardog.startImport).toHaveBeenCalledTimes(1);
+      expect(stardog.readEvents).toHaveBeenCalledTimes(1);
+      expect(await readBaseline(env)).toEqual(prior);
+      expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+    } finally { state.stardogWaitBudgetMs = undefined; }
+  });
+
+  it("base wait retries null events until done under alwaysReplay", async () => {
+    const env = baseEnvFor("alwaysReplay");
+    const triggerId = newTriggerId();
+    packageFixture(triggerId);
+    stardog.readEvents.mockResolvedValueOnce(null).mockResolvedValueOnce(null).mockResolvedValue("done");
+    const outcome = await runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
+      hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+    } });
+    expect(outcome.ok).toBe(true);
+    expect(stardog.readEvents).toHaveBeenCalledTimes(3);
+    expect(stardog.readEvents).toHaveBeenLastCalledWith("kit-test", "publish-test", { maxMs: 240_000 });
+    expect(stardog.startImport).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(baseVariants.map(([label]) => label))("base refused guard cleans stale packages (%s)", async label => {
+    const env = baseEnvFor(label);
+    const triggerId = newTriggerId();
+    packageFixture("earlier-crashed-dispatch");
+    makeScenario(triggerId, { dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "fly-machines" });
+    const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true });
+    await workflowDispatched(triggerId);
+    await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: false, guardVerdict: "refused", failureCode: "KG_SOURCE_FAILED" });
+    expect((await done).ok).toBe(false);
+    expect(stardog.startImport).not.toHaveBeenCalled();
+    expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+  });
+
+  it.each(baseVariants.map(([label]) => label))("base clean run cancelled before import records cancellation and cleans packages (%s)", async label => {
+    const env = baseEnvFor(label);
+    const triggerId = newTriggerId();
+    packageFixture(triggerId);
+    const held = gate("clean report before Stardog commit point");
+    makeScenario(triggerId, {
+      dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "github-actions",
+      runStatusSequence: [{ status: "completed", conclusion: "success" }], tickGate: held,
+    });
+    const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true });
+    try {
+      await held.reached();
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true, guardVerdict: "clean", partCounts: { issues: 42 } });
+      await cancelInvocation(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+    } finally {
+      held.release();
+    }
+    expect(await done).toMatchObject({ ok: false, conclusion: "operator_cancelled" });
+    expect(stardog.startImport).not.toHaveBeenCalled();
+    expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+    const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+    expect(names).toContain("package-cleanup");
+    expect(names).not.toContain("stardog-import");
+  });
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "customer clean report keeps its PR open on Restate cancel at the commit point (%s)",
+    async label => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const held = gate("customer clean report before commit point");
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "completed", conclusion: "success" }], tickGate: held,
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      try {
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ...SUCCESS_REPORT, guardVerdict: "clean" });
+        await cancelInvocation(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      } finally {
+        held.release();
+      }
+      expect(await done).toMatchObject({ ok: false, conclusion: "operator_cancelled" });
+      expect(f.closePullRequestFn).not.toHaveBeenCalled();
+      expect(deleteBranchFn).not.toHaveBeenCalled();
+      expect(mergePullRequestFn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "customer clean report closes its PR when operator cancel wins the commit point (%s)",
+    async label => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const held = gate("customer operator cancel before commit point");
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "completed", conclusion: "success" }], tickGate: held,
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      try {
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ...SUCCESS_REPORT, guardVerdict: "clean" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", {});
+      } finally {
+        held.release();
+      }
+      expect(await done).toMatchObject({ ok: false, conclusion: "operator_cancelled" });
+      expect(f.closePullRequestFn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "TestOrg", "test-kg-source", SUCCESS_REPORT.snapshotPr);
+      expect(deleteBranchFn).toHaveBeenCalledExactlyOnceWith(expect.any(String), "TestOrg", "test-kg-source", SUCCESS_REPORT.snapshotBranch);
+      expect(mergePullRequestFn).not.toHaveBeenCalled();
+    },
   );
 
   // ---- W1 / W11: success report runs merge, delete-branch, the four real gates, persist,
@@ -791,15 +1037,6 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- AII-1150: the journal is the record; every row write is a projection of journaled values ----
   describe("AII-1150: journal projections", () => {
-    /** The run invocation's journal id, once the workflow has started. */
-    async function runInvocationId(env: ReturnType<typeof envFor>, triggerId: string): Promise<string> {
-      const rows = await eventually(
-        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
-        (r) => r.length === 1,
-        { label: "the KgRefresh run invocation" },
-      );
-      return rows[0].id as string;
-    }
 
     it.each(VARIANTS.map(([label]) => label))("a fly-machines run journals resolve, reserve, nonce-1, dispatch-1, record-dispatch-1 in order (%s)", async (label) => {
       const env = envFor(label);

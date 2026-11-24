@@ -18,6 +18,7 @@ import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js
 import {
   createKgRefreshWorkflow,
   type KgDispatchInput,
+  type KgRefreshRunInput,
   type KgRefreshWorkflowDependencies,
   type KgDispatchRecord,
   type KgDispatchRowDetails,
@@ -25,7 +26,7 @@ import {
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
 import { testDir } from "../helpers/test-dir.js";
-import { callObject, callService, eventually, gate, type Gate } from "./harness.js";
+import { callObject, callService, eventually, gate, startRetryEnabled, type Gate } from "./harness.js";
 
 export function reportedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
   const snapshotId = `snapshot-${dispatchId}`;
@@ -210,6 +211,10 @@ function getDefaultTarball(): Buffer {
 
 export function createKgRefreshFixture() {
   const state = {
+    configuredTarget: { db: "original-db", graphName: "original-graph" },
+    beforeImportGate: undefined as Gate | undefined,
+    stardogWaitBudgetMs: undefined as number | undefined,
+    baseMode: false,
     dataRoot: "",
     tarball: Buffer.alloc(0) as Buffer,
     servedStamp: OLD_STAMP,
@@ -311,6 +316,7 @@ export function createKgRefreshFixture() {
 
   function installHooks(): void {
     beforeEach(() => {
+      resetBaseMode();
       state.dataRoot = testDir("kgwfroot");
       state.tarball = getDefaultTarball();
       state.servedStamp = OLD_STAMP;
@@ -594,12 +600,51 @@ export function createKgRefreshFixture() {
     return true;
   }
 
-  const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => buildKgRefreshRunConfig({
-    kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
-  });
+  const frozenTarget = { db: "original-db", graphName: "original-graph" };
+  const buildEnvelopeInputs: KgRefreshRunInput[] = [];
+  const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => {
+    buildEnvelopeInputs.push(run);
+    return buildKgRefreshRunConfig({
+      kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
+      kgStardogDb: state.configuredTarget.db, kgGraphName: state.configuredTarget.graphName,
+    });
+  };
+
+  const stardogTokensUsed: string[] = [];
+  const stardog = {
+    startImport: vi.fn(async (_dir: string, _files: string[], _target: import("../../stardog-client.js").StardogTarget) => ({ kitId: "kit-test", publishId: "publish-test" })),
+    readEvents: vi.fn<import("../../stardog-client.js").StardogClient["readEvents"]>(async () => "done"),
+    countTriples: vi.fn(async (_target?: import("../../stardog-client.js").StardogTarget) => 42),
+  };
+  function resetBaseMode(): void {
+    state.configuredTarget = { ...frozenTarget };
+    state.beforeImportGate = undefined;
+    stardogTokensUsed.length = 0;
+    stardog.startImport.mockReset().mockImplementation(async () => {
+      stardogTokensUsed.push("SENTINEL-stardog-token");
+      return { kitId: "kit-test", publishId: "publish-test" };
+    });
+    stardog.readEvents.mockReset().mockResolvedValue("done");
+    stardog.countTriples.mockReset().mockResolvedValue(42);
+    state.baseMode = false;
+    state.stardogWaitBudgetMs = undefined;
+    buildEnvelopeInputs.length = 0;
+  }
+  function packageFixture(dispatchId: string) {
+    const dir = join(state.dataRoot, "stardog", dispatchId);
+    mkdirSync(join(dir, "data"), { recursive: true });
+    writeFileSync(join(dir, "kit.yaml"), "data:\n  - file: ontology.ttl\n    graph: urn:schema\n  - file: data/issues.nt\n    graph: urn:issues\n");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ expectedTriples: 42 }));
+    writeFileSync(join(dir, "ontology.ttl"), "ontology");
+    writeFileSync(join(dir, "data/issues.nt"), "triples");
+    writeFileSync(join(dir, "data/old.nt"), "stale");
+    return dir;
+  }
 
   const workflowDeps: Omit<Parameters<typeof createKgRefreshWorkflow>[0], "bootstrapDeadlineMs" | "totalDeadlineMs"> = {
     retentionMs: TEST_RETENTION_MS,
+    stardog,
+    stardogPollMs: 0,
     dispatchRetryInitialIntervalMs: TEST_DISPATCH_RETRY_INITIAL_INTERVAL_MS,
     rail,
     kgSourceRepo: KG_SOURCE_REPO,
@@ -623,7 +668,10 @@ export function createKgRefreshFixture() {
     },
     closeJobLog: (jobId, status, conclusion) => closeRowFake(jobId, status, conclusion),
     markJobHeld: (jobId) => markJobHeldFake(jobId),
-    reopenHeldJob: (jobId) => reopenHeldJobFake(jobId),
+    reopenHeldJob: async (jobId) => {
+      reopenHeldJobFake(jobId);
+      await state.beforeImportGate?.wait();
+    },
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
@@ -644,6 +692,7 @@ export function createKgRefreshFixture() {
 
   const workflow = createKgRefreshWorkflow({
     ...workflowDeps,
+    get stardogWaitBudgetMs() { return state.stardogWaitBudgetMs; },
     bootstrapDeadlineMs: 30_000,
     totalDeadlineMs: 60_000,
   });
@@ -659,7 +708,14 @@ export function createKgRefreshFixture() {
     totalDeadlineMs: BOOTSTRAP_ONLY_TOTAL_DEADLINE_MS,
   });
 
-  const kgRepo = createKgRepo({ workflowName: "KgRefresh" });
+  const productionKgRepo = createKgRepo({ workflowName: "KgRefresh", get baseMode() { return state.baseMode; } });
+  const kgRepo = restate.object({ name: "KgRepo", handlers: {
+    ...(productionKgRepo as typeof productionKgRepo & { object: restate.VirtualObject<typeof productionKgRepo> }).object,
+    readBaseline: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) => ctx.get("baseline")),
+    seedBaseline: async (ctx: restate.ObjectContext, value: { parts: Record<string, number>; at: number; triggerId: string }) => { ctx.set("baseline", value); },
+  } });
+  const readBaseline = (env: { baseUrl(): string }) => callObject(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "readBaseline", {});
+
   const starter = restate.service({
     name: "KgRefreshStarter",
     handlers: {
@@ -691,7 +747,25 @@ export function createKgRefreshFixture() {
     return callService<RefreshOutcome>(baseUrl, "KgRefreshStarter", "start", { triggerId, input: { triggerId, ...extra } });
   }
 
+  // Compare observable dependency calls only after the workflow has completed.
+  function baseExternalEffects() {
+    return { merge: mergePullRequestFn.mock.calls.length, close: closePullRequestFn.mock.calls.length,
+      deleteBranch: deleteBranchFn.mock.calls.length, comment: postPrCommentFn.mock.calls.length,
+      stickyComment: postOrUpdateStickyCommentFn.mock.calls.length, fetch: state.fetchTarballCallCount,
+      materialize: state.materializeCallCount, restart: state.restartCallCount, gates: [...state.gateOrder] };
+  }
+
+  // Preserve the historical base-mode matrix even though the shared default is now strict.
+  const baseVariants = [["alwaysReplay"], ["disableRetries"]] as const;
+  async function startBaseVariants() {
+    return new Map(await Promise.all(baseVariants.map(async ([variant]) => [
+      variant, await startRetryEnabled([workflow, kgRepo, starter, flyMachineProfile, ghaRunProfile], { variant, storage: "memory" }),
+    ] as const)));
+  }
+
   return {
+    baseVariants, startBaseVariants,
+    frozenTarget, buildEnvelopeInputs, stardogTokensUsed, stardog, packageFixture, readBaseline, baseExternalEffects,
     state,
     installHooks,
     rail,

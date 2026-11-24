@@ -704,7 +704,7 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
     });
   }, 30_000);
 
-  function run(env: Record<string, string>, opts: { failClone?: boolean; handoff?: boolean; launcherHome?: string | "fake-root" } = {}) {
+  function run(env: Record<string, string>, opts: { failClone?: boolean; handoff?: boolean; launcherHome?: string | "fake-root"; kgBase?: "present" | "missing" } = {}) {
     const root = testDir("entrypoint-configured");
     const binDir = join(root, "bin");
     const workspace = join(root, "workspace");
@@ -719,6 +719,30 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
       writeShim(binDir, name, `{ echo "== ${name} $*"; env; } >> '${log}'${tail}`);
     }
     for (const name of ["chown", "cp"]) writeShim(binDir, name, "true");
+    // Virtualize only the image filesystem paths; execute the unmodified entrypoint
+    // and lib helpers, retaining /opt/kg-base in variables and child arguments.
+    const shellEnv = join(root, "bash-env");
+    if (opts.kgBase) {
+      const base = join(root, "kg-base");
+      spawnSync("mkdir", ["-p", base, ...(opts.kgBase === "present" ? [join(base, "kg_ingest")] : [])]);
+      writeFileSync(join(base, ".base-commit"), `${"a1".repeat(20)}\n`);
+      writeFileSync(shellEnv, `
+[() {
+  local args=() a
+  for a in "$@"; do
+    case "$a" in /opt/kg-base*) a='${base}'"\${a#/opt/kg-base}" ;; esac
+    args+=("$a")
+  done
+  builtin [ "\${args[@]}"
+}
+cd() {
+  if builtin [ "\${1:-}" = /opt/kg-base ]; then builtin cd '${base}'; else builtin cd "$@"; fi
+}
+`);
+      writeShim(binDir, "cat", `if [ "\${1:-}" = /opt/kg-base/.base-commit ]; then exec /bin/cat '${base}/.base-commit'; else exec /bin/cat "$@"; fi`);
+      writeShim(binDir, "id", `echo coder`);
+      writeShim(binDir, "chown", `echo "== chown $*" >> '${log}'`);
+    }
     const fakeRoot = join(root, "fake-root");
     const fakeCoder = join(root, "fake-coder");
     const fillOut = join(root, "fill.log");
@@ -753,6 +777,7 @@ printf 'protocol=https\\nhost=github.com\\n\\n' | env -i PATH="$PATH" HOME='${fa
         GITHUB_OWNER: "BuildDownAI",
         GITHUB_REPO: "fixture",
         GITHUB_DEFAULT_BRANCH: "testing",
+        ...(opts.kgBase ? { BASH_ENV: shellEnv } : {}),
         ...env,
       },
     });
@@ -761,6 +786,41 @@ printf 'protocol=https\\nhost=github.com\\n\\n' | env -i PATH="$PATH" HOME='${fa
     const fill = existsSync(fillOut) ? readFileSync(fillOut, "utf8") : "";
     return { result, children, sections, output: result.stdout + result.stderr, root, fakeRoot, fakeCoder, fill };
   }
+
+  describe("kg-base workspace bootstrap", () => {
+    const baseEnv = () => ({
+      RUNNER_PHASE: "kg-refresh",
+      AI_IMPLEMENT_WORKSPACE_MODE: "kg-base",
+      // Leave the branch unresolved and include a PR so accidental fallthrough
+      // would exercise both the API lookup and PR checkout paths.
+      GITHUB_DEFAULT_BRANCH: "",
+      AI_IMPLEMENT_RUN_CONFIG: encode({ v: 1, issue, kgSourceRepo: "Acme/code", kgBaseMode: true, prNumber: "42" }),
+    });
+
+    it("uses baked code, skips remote bootstrap, and hands its workspace to coder before startup", () => {
+      const r = run(baseEnv(), { kgBase: "present" });
+      expect(r.result.status, r.output).toBe(0);
+      const commands = r.sections.map((s) => s.split("\n")[0]);
+      expect(commands.some((c) => c.startsWith("gh "))).toBe(false);
+      expect(commands.some((c) => c.startsWith("git clone "))).toBe(false);
+      const ownership = commands.indexOf("chown -R coder:coder /opt/kg-base");
+      const startup = commands.findIndex((c) => c.startsWith("dbus-run-session "));
+      expect(ownership).toBeGreaterThanOrEqual(0);
+      expect(startup).toBeGreaterThan(ownership);
+      expect(r.sections[startup]).toMatch(/^WORKSPACE_DIR=\/opt\/kg-base$/m);
+      expect(r.sections[startup]).toContain("su -p coder -c");
+      expect(r.sections[startup]).toContain("/app/dist/pipeline/kg-refresh-run.js");
+      expect(r.output).toContain("KG source: Acme/code (base)");
+      expect(r.output).toContain(`KG base code: /opt/kg-base @ ${"a1".repeat(20)}`);
+    });
+
+    it("stops before ownership and pipeline startup when the image has no kg_ingest", () => {
+      const r = run(baseEnv(), { kgBase: "missing" });
+      expect(r.result.status).not.toBe(0);
+      expect(r.output).toContain("FATAL: the runner image has no base KG code (/opt/kg-base)");
+      expect(r.children).not.toMatch(/^== (chown|dbus-run-session|gh|git clone) /m);
+    });
+  });
 
   describe("git config handoff to coder", () => {
     const check = (r: ReturnType<typeof run>) => {

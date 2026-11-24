@@ -34,6 +34,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { InvocationId, ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
+import type { KgSnapshotBaseline } from "../run-config.js";
 import { MAX_TRACKED_PRS, type KgDryRunReportTarget, type RefreshOutcome } from "../kg-refresh.js";
 import {
   heldViewOf,
@@ -65,6 +66,7 @@ interface PendingDryRun {
 }
 
 export interface KgRepoDependencies {
+  baseMode?: boolean;
   /** The Restate service name of the workflow this object starts — "KgRefresh" in production. */
   workflowName: string;
 }
@@ -143,8 +145,10 @@ function oldestPendingKey(pending: Record<string, PendingDryRun>): string | unde
 export function buildRunParameter(
   opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget; resume?: KgRefreshResume },
   triggerId: string,
+  baseMode = false,
+  baseline?: KgSnapshotBaseline,
 ): KgRefreshRunInput {
-  return { ...opts, triggerId };
+  return { ...opts, triggerId, ...(baseMode ? { baseMode: true, ...(baseline ? { baseline } : {}) } : {}) };
 }
 
 export function createKgRepo(deps: KgRepoDependencies) {
@@ -156,11 +160,17 @@ export function createKgRepo(deps: KgRepoDependencies) {
   /** Marks a new refresh in flight, hands it to `KgRefresh.run` by one-way send, and starts the `watch` that frees the lock when the run invocation ends. */
   async function submit(ctx: ObjectContext, now: number, opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget }, resume?: KgRefreshResume): Promise<string> {
     const triggerId = ctx.rand.uuidv4();
-    const handle = ctx.workflowSendClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, triggerId).run(buildRunParameter({ ...opts, ...(resume ? { resume } : {}) }, triggerId));
+    const baseline = deps.baseMode ? await ctx.get<KgSnapshotBaseline>("baseline") : null;
+    const handle = ctx.workflowSendClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, triggerId).run(buildRunParameter({ ...opts, ...(resume ? { resume } : {}) }, triggerId, deps.baseMode, baseline ?? undefined));
     const invocationId = await handle.invocationId;
     ctx.set<InFlightMarker>("inFlight", { triggerId, startedAt: now, invocationId });
     ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).watch({ triggerId, invocationId });
     return triggerId;
+  }
+
+  /** Called only after a successful Stardog import; runner callback validation owns the counts. */
+  async function recordBaseline(ctx: ObjectContext, baseline: KgSnapshotBaseline): Promise<void> {
+    ctx.set("baseline", baseline);
   }
 
   async function trigger(ctx: ObjectContext, opts: KgRepoTriggerInput = {}): Promise<KgRepoTriggerResult> {
@@ -430,6 +440,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
   return restate.object({
     name: "KgRepo",
     handlers: {
+      recordBaseline: restate.handlers.object.exclusive({ ingressPrivate: true }, recordBaseline),
       trigger: restate.handlers.object.exclusive({ input: serde.zod(triggerInputSchema) }, trigger),
       acquireSwitch: restate.handlers.object.exclusive({ input: serde.zod(switchInputSchema), ingressPrivate: true }, acquireSwitch),
       releaseSwitch: restate.handlers.object.exclusive({ input: serde.zod(switchInputSchema), ingressPrivate: true }, releaseSwitch),

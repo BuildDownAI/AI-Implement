@@ -16,6 +16,10 @@
  * asynchronously. kg-refresh has one owner, so none of the pilot's admission/selector
  * machinery is needed here — see `docs/adr/032-a-fully-migrated-run-kind-coordinates-through-a-virtual-object.md`.
  */
+import { readFile, stat, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
+import type { StardogClient, StardogTarget } from "../stardog-client.js";
 import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import { isDeepStrictEqual } from "node:util";
 import { recordUsage, type RecordedUsage } from "../agent-usage.js";
@@ -63,6 +67,11 @@ export const KG_REFRESH_WATCH_INTERVAL_MS = 60 * 1000;
 /** How long a held snapshot waits for a `decide` before the run closes the PR and records `decision_timeout`. Fixed by decision, not a setting. */
 export const KG_REFRESH_DECISION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
+/** Keep the fixed poll interval explicit: the SDK otherwise caps it at ten seconds. */
+export function stardogWaitOptions(pollMs: number, maxRetryDuration = 20 * 60 * 1000) {
+  return { maxRetryDuration, initialRetryInterval: pollMs, maxRetryInterval: pollMs, retryIntervalFactor: 1 };
+}
+
 const GHA_EXECUTION_MODE = "github-actions";
 
 /** First wait between dispatch-step attempts; doubles. Fly's replace window after an `update` lasts seconds (AII-1192). */
@@ -98,6 +107,8 @@ export const kgHoldSchema = z.object({
   /** The gate run's dispatch id: the `dispatch_log` row the resumed run closes. */
   dispatchId: z.string().min(1),
   decideBy: z.number(),
+  /** Absent on legacy holds; those cannot safely import with replace=true. */
+  stardogTarget: z.object({ db: z.string().trim().min(1), graphName: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/) }).strict().optional(),
   report: z.custom<KgRefreshReportBody>((v) => typeof v === "object" && v !== null),
   /** The runner's step table, built at the gate from the gate run's step promises. */
   steps: z.array(z.custom<KgRefreshStepRecord>((v) => typeof v === "object" && v !== null)),
@@ -125,6 +136,8 @@ export type KgRefreshResume = z.infer<typeof kgResumeSchema>;
 /** The `KgRefresh.run` input — `KgRepo.submit` sends `{ ...options, triggerId }`, plus `resume` for a held snapshot's decision. */
 export const kgRefreshRunInputSchema = kgRefreshOptionsSchema.extend({
   triggerId: z.string(),
+  baseMode: z.literal(true).optional(),
+  baseline: z.object({ parts: z.record(z.string(), z.number()), at: z.number(), triggerId: z.string() }).optional(),
   report: kgDryRunReportSchema.optional(),
   resume: kgResumeSchema.optional(),
 }).strict();
@@ -147,9 +160,10 @@ export interface KgRefreshReportBody {
   snapshotPr?: number;
   snapshotCommit?: string;
   snapshotBranch?: string;
+  partCounts?: Record<string, number>;
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Absent on a report from a runner that predates the field; reads as "shrink". */
-  cause?: "shrink" | "tracker-missing" | "source-failed";
+  cause?: "shrink" | "tracker-missing" | "source-failed" | "no-baseline";
   failedTeams?: string[];
   /** Absent from a runner that predates the field; reads as unblocked. */
   acceptBlocked?: boolean;
@@ -206,10 +220,10 @@ export interface KgDispatchRowDetails {
 
 /** What a status reader may see of the held snapshot; the commit and branch stay inside the workflow. */
 export interface KgRefreshHeldView {
-  snapshotPr: number;
+  snapshotPr: number | null;
   partTable: Array<{ part: string; prev: string; new: string }>;
   /** Why the run waits. */
-  cause: "shrink" | "tracker-missing" | "source-failed";
+  cause: "shrink" | "tracker-missing" | "source-failed" | "no-baseline";
   /** Teams whose tracker fetch failed; empty for a shrink. */
   failedTeams: string[];
   /** True when accepting would publish a graph without `lostTeams`' issues; the gate then offers cancel only. */
@@ -225,7 +239,7 @@ export interface KgRefreshHeldView {
 export function heldViewOf(hold: KgHold): KgRefreshHeldView {
   const r = hold.report;
   return {
-    snapshotPr: r.snapshotPr!,
+    snapshotPr: r.snapshotPr ?? null,
     partTable: r.partTable ?? [],
     cause: r.cause ?? "shrink",
     failedTeams: r.failedTeams ?? [],
@@ -307,6 +321,11 @@ export interface KgOutcomeMeta { failureCode?: string; timedOut?: boolean; dispa
 export interface KgRefreshWorkflowDependencies {
   /** Test seam; production leaves it unset and reads `restate_retention_days` at build time. */
   retentionMs?: number;
+  stardog?: StardogClient;
+  dataRoot?: string;
+  stardogPollMs?: number;
+  /** Test seam for deterministic budget exhaustion; production uses twenty minutes. */
+  stardogWaitBudgetMs?: number;
   rail: KgRailDeps;
   kgSourceRepo: string;
   mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
@@ -473,6 +492,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     const jobId = dispatchId;
 
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
+      if (input.baseMode && outcome.conclusion !== "awaiting_decision") {
+        await ctx.run("package-cleanup", () => rm(join(deps.dataRoot ?? deps.rail.dataRoot, "stardog"), { recursive: true, force: true }));
+      }
       ctx.set("completed", true);
       return outcome;
     }
@@ -538,8 +560,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     let dispatched: KgDispatchResult | undefined;
     let runId: number | undefined;
     let totalDeadlineAt = 0;
-    // The snapshot PR a cancel must close: set at the decision gate, cleared once the merge starts.
+    // Resumed runs skip envelope creation and use the held package identity.
+    let stardogTarget: StardogTarget | undefined = resume?.hold.stardogTarget;
     let lockLost = false; // KgRepo.hold refused: the outer 409 catch must not read it as a Restate cancel
+    // The snapshot PR a cancel must close: set at the decision gate, cleared once the merge starts.
     let heldPr: { number: number; branch: string | undefined } | undefined;
     // Set when the runner's report arrives: the machine is finished and may already belong to another run.
     let reported = false;
@@ -572,6 +596,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
      * once inside the step, and a close GitHub refuses (already merged or closed) does not fail it.
      */
     async function closeHeldPr(gate: string): Promise<void> {
+      if (resume && input.baseMode) ctx.set("holdConsumed", true);
       if (!heldPr) return;
       const { number, branch } = heldPr;
       heldPr = undefined;
@@ -671,6 +696,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const issueIdentifier = `KG-REFRESH · ${triggerId}`;
       // Journaled once: every retry of the dispatch step sends this same envelope.
       const envelope = await ctx.run("envelope", () => deps.buildEnvelope(input, issueIdentifier));
+      if (input.baseMode && envelope.kgStardogDb && envelope.kgGraphName) {
+        stardogTarget = kgHoldSchema.shape.stardogTarget.parse({ db: envelope.kgStardogDb, graphName: envelope.kgGraphName });
+      }
 
       // Tokens are minted inside the journaled step and never leave it: the step result
       // carries no secret, so none reaches the Restate journal. Minted at most once per
@@ -854,18 +882,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         }
       }
 
-      /** The merge, branch delete and four rail gates for a snapshot PR the run may land: the success path and the accepted decision both end here. */
-      async function mergeAndRunGates(report: KgRefreshReportBody): Promise<RefreshOutcome> {
-        // Success: a fresh snapshot landed. Merge it, then run the four rail gates one at a time.
-        // mergeSnapshotPr resolves "blocked"/"conflict" rather than throwing (the same contract
-        // src/kg-refresh.ts's pre-migration caller checks explicitly) — a merge conflict or an
-        // already-closed PR must fail the run, not be treated as a silent success, and must not
-        // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
-        // not apply to either failure.
-        // The commit point (AII-1296): the start of the merge is the one point of no return. A Restate
+      async function commitPoint(afterCancelCheck?: () => void): Promise<RefreshOutcome | undefined> {
+        // The commit point (AII-1296): merge or import is the point of no return. A Restate
         // cancel that arrived earlier (during the accept note, say) stops the run here.
         await checkCancelled();
-        heldPr = report.snapshotPr !== undefined ? { number: report.snapshotPr, branch: report.snapshotBranch } : undefined;
+        afterCancelCheck?.();
         // The first of this write and an operator cancel wins; the loser sees the other's value.
         try {
           await ctx.promise<string>("cancel").resolve(KG_REFRESH_COMMITTED);
@@ -879,6 +900,23 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         }
         // Durable commit point: requestCancel reads this key to answer past-merge.
         ctx.set("committed", true);
+      }
+
+      /** The merge, branch delete and four rail gates for a snapshot PR the run may land: the success path and the accepted decision both end here. */
+      async function mergeAndRunGates(report: KgRefreshReportBody): Promise<RefreshOutcome> {
+        // Success: a fresh snapshot landed. Merge it, then run the four rail gates one at a time.
+        // mergeSnapshotPr resolves "blocked"/"conflict" rather than throwing (the same contract
+        // src/kg-refresh.ts's pre-migration caller checks explicitly) — a merge conflict or an
+        // already-closed PR must fail the run, not be treated as a silent success, and must not
+        // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
+        // not apply to either failure.
+        const cancelled = await commitPoint(() => {
+          // On a clean, not-resumed run, Restate cancellation leaves the snapshot PR open.
+          // A resumed accept already owns heldPr and still closes it on cancellation.
+          // Assign before the promise write so an operator signal still owns cleanup.
+          heldPr = report.snapshotPr !== undefined ? { number: report.snapshotPr, branch: report.snapshotBranch } : undefined;
+        });
+        if (cancelled) return cancelled;
         heldPr = undefined; // merging: a cancel past here must not close the PR
         ctx.set("step", "merge");
         try {
@@ -998,6 +1036,76 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return finish(successOutcome);
       }
 
+      async function importToStardog(report: KgRefreshReportBody): Promise<RefreshOutcome> {
+        const cancelled = await commitPoint();
+        if (cancelled) return cancelled;
+        if (resume) ctx.set("holdConsumed", true);
+        let importStartedSuccessfully = false;
+        try {
+          ctx.set("step", "stardog-import");
+          const imported = await ctx.run("stardog-import", async () => {
+            if (!deps.stardog) throw new Error("Stardog client is not configured");
+            if (!stardogTarget) throw new Error("Package has no frozen Stardog target; start a new refresh");
+            const dir = join(deps.dataRoot ?? deps.rail.dataRoot, "stardog", dispatchId);
+            const kit = parseYaml(await readFile(join(dir, "kit.yaml"), "utf8"));
+            const metadata = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
+            if (!Array.isArray(kit?.data) || !kit.data.every((entry: unknown) => {
+              if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+              const file = (entry as { file?: unknown }).file;
+              return typeof file === "string" && /^(ontology\.ttl|data\/[A-Za-z0-9._-]+\.nt)$/.test(file) && !file.includes("..");
+            })) {
+              throw new Error("kit.yaml has an invalid data list");
+            }
+            const expectedTriples = metadata.expectedTriples;
+            if (!Number.isSafeInteger(expectedTriples) || expectedTriples < 0) throw new Error("package.json has invalid expectedTriples");
+            if (!report.partCounts) throw new Error("report has no partCounts");
+            const files = ["kit.yaml", ...kit.data.map((entry: { file: string }) => entry.file)];
+            for (const file of files) if (!(await stat(join(dir, file))).isFile()) throw new Error(`package file is missing: ${file}`);
+            const { kitId, publishId } = await deps.stardog.startImport(dir, files, stardogTarget);
+            return { kitId, publishId, expectedTriples, target: stardogTarget };
+          }, { maxRetryAttempts: 1 });
+          // Set outside the journaled callback so replay restores the same failure detail.
+          importStartedSuccessfully = true;
+          ctx.console.log(`stardog import started ${imported.kitId}`);
+          const importStarted = await ctx.date.now();
+          ctx.set("step", "stardog-wait");
+          const event = await ctx.run("stardog-wait", async () => {
+            const result = await deps.stardog!.readEvents(imported.kitId, imported.publishId, { maxMs: 4 * 60 * 1000 });
+            if (result === null) throw new Error("Stardog import has no end event yet");
+            return result;
+          }, stardogWaitOptions(deps.stardogPollMs ?? 30_000, deps.stardogWaitBudgetMs));
+          if (event !== "done") throw new Error(event.failed);
+          ctx.console.log(`stardog import done in ${((await ctx.date.now()) - importStarted) / 1000} s`);
+          ctx.set("step", "stardog-verify");
+          const count = await ctx.run("stardog-verify", async () => {
+            const actual = await deps.stardog!.countTriples(imported.target);
+            if (actual !== imported.expectedTriples) throw new Error(`Stardog triples ${actual} (expected ${imported.expectedTriples})`);
+            return actual;
+          }, { maxRetryAttempts: 3 });
+          ctx.console.log(`stardog triples ${count} (expected ${imported.expectedTriples})`);
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          ctx.set("step", "failed");
+          const message = err instanceof Error ? err.message : String(err);
+          const detail = importStartedSuccessfully ? `${message}. Stardog has no good graph until a new import passes.` : message;
+          return finish(await failurePath(buildFailureOutcome(await ctx.date.now(), detail), "stardog-import-failed"));
+        }
+        ctx.set("step", "baseline");
+        await ctx.objectClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordBaseline({ parts: report.partCounts!, at: await ctx.date.now(), triggerId }, restate.rpc.opts({ name: "baseline" }));
+        const outcome: RefreshOutcome = {
+          ok: true, at: await ctx.date.now(), detail: "Stardog import verified",
+          stampBefore: null, stampAfter: null,
+          ...(stepTable.length ? { steps: stepTable } : {}),
+          ...(reportedSources.length ? { sources: reportedSources } : {}),
+          ...(reportedWarnings.length ? { warnings: reportedWarnings } : {}),
+          ...(heldGate ? { held: true } : {}),
+        };
+        await ctx.run("persist", () => deps.persistLastRefresh({ ...outcome, dispatchId }));
+        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed", reportedWarnings.length || reportedGuardVerdict === "warnings" ? "warnings" : "passed"));
+        await notifyOutcome("success", outcome);
+        return finish(outcome);
+      }
+
       /** The decision on a held snapshot, run as its own `KgRefresh` run: the commit point, `past-merge`, and `status` are the ordinary ones. */
       async function resumeFromHold(resumed: KgRefreshResume): Promise<RefreshOutcome> {
         const { hold, action, actor } = resumed;
@@ -1010,7 +1118,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         reportedWarnings = held.warnings ?? [];
         reportedGuardVerdict = held.guardVerdict;
         stepTable = hold.steps;
-        heldPr = { number: heldPrNumber, branch: held.snapshotBranch };
+        heldPr = !input.baseMode && held.snapshotPr !== undefined ? { number: heldPrNumber, branch: held.snapshotBranch } : undefined;
         heldGate = true;
         ctx.set("step", "resume");
         // Take the row back first (AII-1493): the row reads `awaiting_decision` only while a hold is open and undecided.
@@ -1021,6 +1129,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ctx.console.error(`[KgRefresh] accept refused, snapshot is accept-blocked: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
           return cleanupCancelled("signal");
         }
+        if (action === "accept" && input.baseMode) return importToStardog(held);
         if (action === "accept") {
           ctx.console.log(`[KgRefresh] decided accept by ${actor ?? "unknown"}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
           // The note is best effort: the merge is what matters. The step is never interrupted by a Restate
@@ -1133,11 +1242,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }
 
       // A held dry-run never reaches here: the dry-run branch above has already returned.
-      if (!report.ok && report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr !== undefined) {
+      if (!report.ok && report.failureCode === "KG_SNAPSHOT_HELD" && (input.baseMode || report.snapshotPr !== undefined)) {
         // Decision gate: the runner opened the snapshot PR and finished. Free the machine, hand the hold to
         // `KgRepo`, and end the run: nothing waits here, so a deploy need not drain it (AII-1489).
         const heldPrNumber = report.snapshotPr;
-        heldPr = { number: heldPrNumber, branch: report.snapshotBranch };
+        heldPr = !input.baseMode && heldPrNumber !== undefined ? { number: heldPrNumber, branch: report.snapshotBranch } : undefined;
         heldGate = true;
         const heldAt = await ctx.date.now();
         const decideBy = heldAt + decisionTimeoutMs;
@@ -1150,6 +1259,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         try {
           await ctx.objectClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).hold({
             triggerId, dispatchId, decideBy, report, steps: stepTable,
+            ...(stardogTarget ? { stardogTarget } : {}),
           });
         } catch (err) {
           if (restate.internal.isSuspendedError(err)) throw err;
@@ -1195,9 +1305,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         });
       }
 
+      if (input.baseMode && report.ok) return await importToStardog(report);
+
       if (!report.ok || report.snapshotPr === undefined || report.snapshotCommit === undefined) {
         // A held report with no PR number still pushed its branch; nothing else will delete it.
-        if (report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr === undefined && report.snapshotBranch) {
+        if (!input.baseMode && report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr === undefined && report.snapshotBranch) {
           const branch = report.snapshotBranch;
           try {
             await ctx.run("delete-held-branch", () => deleteSnapshotBranch(deps.rail, owner, repoName, branch), { maxRetryAttempts: 3 });
@@ -1212,7 +1324,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           buildFailureOutcome(at, report.failureReason ?? "runner reported failure"),
           report.failureCode ?? "report_failed",
         );
-        if (report.snapshotPr !== undefined) {
+        if (!input.baseMode && report.snapshotPr !== undefined) {
           await ctx.run("close-snapshot-pr", () =>
             closeSnapshotPr(deps.rail, owner, repoName, report.snapshotPr!, report.failureCode ?? "failed", report.snapshotBranch));
         }

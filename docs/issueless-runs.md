@@ -8,6 +8,8 @@ The `kg-refresh` rail (AII-493–521) is the sole concrete implementation; this 
 
 ## 1. Mental model
 
+Refresh identity is resolved once at boot. `KG_SOURCE_REPO` selects customer mode. Without it, the stored `kg_code_repo`, `kg_namespace`, `kg_graph_name`, `kg_graph_label` and `kg_stardog_db` must all be set; missing values are named in the availability diagnostic. Base mode uses the code repo's project mapping for the lock, tokens, schedules, callbacks and dispatch row. It always targets Stardog and never changes the sidecar graph. Changes to these values apply at the next restart.
+
 A normal implementation run is anchored to a tracker issue: the dispatch creates a dedup entry keyed on the issue's UUID, the runner token encodes that UUID, and every callback writes to the issue (labels, comments, Done state). The issue is both the tracking record and the authority on lifecycle.
 
 An issueless run kind has no tracker issue. The `dispatch_log` row **is** the tracking record. It carries:
@@ -50,6 +52,8 @@ KG dispatch rows record `trigger` as `manual` for a human caller (including admi
 
 ## 3. Envelope and dispatch
 
+In base mode `kgSourceRepo` carries the resolved code repo run identity. The envelope also carries `kgBaseMode: true`, `kgNamespace`, `kgCodeRepo`, `kgGraphName`, `kgGraphLabel` and `kgStardogDb`. The boot token is scoped to the code repo. Fly uses the configured session image, ignoring the code repo's `.ai-implement/image.yml`; local Docker uses its configured local image. GHA is refused before dispatch with `base-mode-needs-fly-or-local`.
+
 The orchestrator builds a `RunConfigV1` (defined in `src/run-config.ts`) with the following fields for a kg-refresh run:
 
 ```typescript
@@ -57,7 +61,7 @@ const runConfig: RunConfigV1 = {
   v: 1,
   issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
   runnerPhase: "kg-refresh",
-  kgSourceRepo: "<owner/repo>",                // from config.kgSourceRepo
+  kgSourceRepo: "<owner/repo>",                // resolved runRepo
   runnerCallbackUrl: "<url>",                  // bare RUNNER_CALLBACK_BASE_URL — no path suffix
   dependencyTokenScope: "installation",        // present only when the KG repo mapping has this set
 };
@@ -181,6 +185,23 @@ The row lifecycle:
 
 ## 5. Credentials and data
 
+In base mode, `kg-snapshot-push` builds a Stardog package after a clean, warnings,
+or held guard and uploads it before returning or raising the hold. Dry runs and
+refused guards send nothing; customer mode retains snapshot publication through git.
+`POST /api/runner/kg-package/<name>` accepts raw binary files using the reusable
+kg-refresh progress token, only when the orchestrator resolves to base mode.
+Allowed names are `kit.yaml`, `ontology.ttl`, `package.json`, and
+`data/[A-Za-z0-9._-]+.nt`, with no `..`. Files are streamed into
+`/data/kg/stardog/<dispatchId>/` with atomic replacement, capped at 64 MiB per
+file and 128 MiB per dispatch folder. The runner sends `package.json` last.
+Uploads carry graph data; the Stardog credential stays on the orchestrator. The refresh freezes the envelope's Stardog database and graph name,
+persists them on a decision hold, and uses that same target for import and triple-count
+verification (including the graph alias with hyphens replaced by underscores).
+Credentials are read inside each client call so token rotation still takes effect.
+Legacy holds without a saved target fail before import; start a new refresh to
+create a package with a known target.
+Completeness validation and end-of-run folder cleanup belong to the import workflow.
+
 ### Runner token
 
 Minted by `mintRunToken()` (`src/runner-tokens.ts`) at dispatch time:
@@ -215,7 +236,11 @@ The third (`publication`) token is bound to the KG source repo and exchanged for
 
 ### Dependency token and code repo clone
 
-Every kg-refresh dispatch sets `dependencyTokenScope: "installation"` in the envelope. The `dependency-auth` pipeline step reads this field and calls `POST /api/runner/dependency-token` to receive a short-lived installation-wide GitHub App token scoped to `contents: read` and `pull_requests: read`. The step installs it as a git credential helper for `https://github.com` and exports it as `COMPOSER_AUTH`.
+Base mode requires Dependency Token Scope `installation` on the code repo's project; preflight refuses with `base-mode-needs-installation-scope` and names this fix. It probes code repo grants without reading a GitHub `sources.yml`. Fly token vending requires a publicly reachable orchestrator.
+
+The `kg-base` workspace is `/opt/kg-base`, baked into the runner image. No base repo is cloned and no default-branch API lookup runs. The primary clone step returns the existing workspace; code and secondary repository clones still run using the dependency token. Scope reconciliation first applies the envelope namespace, code repo slug and graph name/label, preserving other nested metadata. It requires the callback and scope fetch to succeed in base mode. Ingest uses the baked venv with `--no-embed`, without runtime pip installation.
+
+A kg-refresh dispatch copies `dependencyTokenScope: "installation"` into the envelope when enabled on its run mapping. The `dependency-auth` pipeline step reads this field and calls `POST /api/runner/dependency-token` to receive a short-lived installation-wide GitHub App token scoped to `contents: read` and `pull_requests: read`. The step installs it as a git credential helper for `https://github.com` and exports it as `COMPOSER_AUTH`.
 
 The primary workspace clone (the KG source repo itself) is cloned with **full history** (`depth: full` on the `clone` step in `pipelines/kg-refresh.yml`). `sources.yml` in the KG source repo sets `self_ingest: true`, so the ingest tool ingests its own commit graph — a shallow clone would see only 1 commit. If `session/entrypoint.sh` pre-cloned the workspace shallowly (the default), the pipeline's clone step detects shallowness and issues `git fetch --unshallow origin` before resetting.
 
@@ -332,6 +357,8 @@ The endpoint validates that `teamKey` is present in the orchestrator's configure
 
 ### Callback
 
+Base-mode callbacks include `partCounts`, numeric line counts for every new logical snapshot part (split pieces summed). Both clean and held reports retain these counts; the hold stores the report verbatim.
+
 The runner reports completion to `POST /api/runner/result` with `{ phase: "kg-refresh", outcome: "success"|"failure", snapshotCommit?, snapshotPr?, snapshotBranch?, failureCode?, failureReason? }`. `snapshotPr` and `snapshotBranch` are set when `kg-snapshot-push` pushed the snapshot and opened the refresh PR (AII-593, below). The routing carve-out in `src/runner-callback.ts` (`handleRunnerResult`, the `body.phase === "kg-refresh"` branch, line 724):
 
 ```typescript
@@ -348,6 +375,13 @@ The callback is verify-only: it checks the signature and row but never consumes 
 ---
 
 ## 6. Lifecycle
+
+In base mode, the cancellation commit point precedes `stardog-import`. The saved
+steps are `stardog-import` → `stardog-wait` → `stardog-verify` → `baseline`;
+merge and the four sidecar gates do not run. Every final base-mode outcome runs
+`package-cleanup`, removing `<dataRoot>/stardog/` before releasing the lock.
+A gate ending `awaiting_decision` preserves the package for the decision run.
+
 
 The workflow key is the dispatch id (`KgRepo` mints it as the trigger id), so the runner callback addresses `KgRefresh/{dispatchId}` directly from the verified token claims.
 
@@ -470,6 +504,10 @@ The `kg-ingest` step writes every line of the ingest subprocess's stdout and std
 ---
 
 ## 8. Outcomes
+
+A first live base-mode load is held with `cause: "no-baseline"`. An operator can accept after checking counts unless tracker teams failed or were skipped, or a non-tracker source failed. Only a successful, verified Stardog import records the baseline; refused, cancelled and failed runs never do.
+
+Base-mode snapshot validation runs without embeddings or age-stamp checks, uses the run start time for the report stamp, and never invokes git, pushes, or opens a PR. It receives the last successfully loaded counts from `KgRepo` state in the envelope baseline; absent state holds the first live load for review. A missing baseline part always refuses in base mode, including tracker parts when the tracker fetch failed. A clean or warnings report with no snapshot PR imports the uploaded package into Stardog, waits for completion, verifies the triple count and records the new baseline. A held report has `snapshotPr: null` and `snapshotPrUrl: null`; acceptance runs the same steps using the held dispatch's package and stored part counts. Cancellation or decision expiry follows the ordinary cancellation path without PR cleanup. Dry runs with no baseline still report part rows with `prev: "missing"`, finish with a clean or warnings verdict, and send no package. A `stardog-import-failed` outcome leaves the baseline unchanged and warns that Stardog has no good graph until a new import passes: the import removes the previous graph first.
 
 ### Classification
 

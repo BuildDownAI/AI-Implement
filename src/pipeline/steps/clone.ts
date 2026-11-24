@@ -295,6 +295,9 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       return { workspaceDir: effectiveDir, clonedRef, cloneMethod, repoOwner, repoRepo, branch, githubToken };
     }
 
+    if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "kg-base") {
+      return { workspaceDir, clonedRef: "unknown", cloneMethod: "mounted", repoOwner, repoRepo, branch, githubToken };
+    }
     if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
       // Workspace is bind-mounted by the dev harness — skip fetch/clone entirely.
       // Still seed scratch exclusions and resolve the current HEAD so downstream

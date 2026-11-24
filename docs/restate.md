@@ -62,6 +62,8 @@ A `declined-conflict` outcome, from either the initial `attempt()` or a later re
 
 The HTTP server opens before `waitForRestateServing`, with SIGTERM/SIGINT handlers already installed. Dispatch waits for readiness, successful registration, and completion of the hook (hydration, hold recovery, prices, sweep, scrub, awaited seed, refresh). Missing binary, sidecar exit, endpoint/admin failure, or a thrown hook stops both sidecars concurrently, closes HTTP, and exits 1 without a webhook notice or boot-notice settings writes. The five-minute `RESTATE_BOOT_DEADLINE_MS` allows late readiness after the initial 30-second timeout; expiry is fatal unless registration is `declined-conflict`, which keeps retrying without a deadline. Signals during the wait shut down normally with exit 0 and no poll. On success, `[main] Restate serving after <ms> ms` precedes Fly configuration logs, cache refresh, startup reconciliation, boot notice, first poll and interval. The KG sidecar remains non-fatal. `RESTATE_SERVICES` (`src/restate/endpoint.ts`) holds `operatorObject` and `orchestratorTools`, and `src/index.ts` appends the review-fix services (the ReviewFixAttempt workflow and the ReviewFixPR object, ADR 031) and the kg-refresh services (the `KgRepo` object, the `FlyMachineProfile` object, the `GhaRunProfile` object, and the `KgRefresh` workflow, ADR 032; `GhaRunProfile` holds each pipeline's GitHub Actions job timeout (`jobTimeoutMinutes`, 10 to 360; `kg-refresh` defaults to 240) and meets the same run-profile contract as `FlyMachineProfile` (`src/restate/run-profile.ts`: shared `get` answering `{ config, source }`, ingress-private `set` taking a strict partial patch, exclusive `seed` writing only when empty), and `set_run_profile` routes an admin patch to either; `FlyMachineProfile` holds each pipeline's Fly machine config and, from AII-1131, owns the one machine a pipeline keeps between runs through the ingress-private `claim`, `attach`, `release`, and `expire` handlers, ADR 037; `set` is ingress-private too, and nothing calls any of them yet) at boot, so both run kinds depend on the sidecar being up (see the review-fix sections below). kg-refresh is migrated: its trigger, status, callback, and cancel seams all answer `503 restate-unavailable` when the sidecar is down, instead of hanging.
 
+`KgRepo` also stores `baseline: { parts: Record<string, number>, at: number, triggerId: string }`. The exclusive, ingress-private `recordBaseline` handler stores trusted counts without I/O or `ctx.run`. Base-mode submissions carry this state into `KgRefresh.run`; absent state omits the field. The workflow passes it unchanged into the journaled envelope builder. After Stardog import and triple-count verification, the workflow awaits `recordBaseline` in the named `baseline` call, including accepted holds. Failed imports never update it.
+
 The kg-refresh production wiring lives in `src/restate/kg-refresh-production.ts`: `createProductionKgRefreshServices` composes the `KgRepo`, `FlyMachineProfile`, `GhaRunProfile`, and `KgRefresh` services plus the tool deps (`setKgRefreshToolDeps`, `src/restate/tools.ts`), `createKgRefreshDispatch` is the dispatch wrapper the workflow calls inside `ctx.run`, and `createKgRefreshIngressClient` is the never-throwing ingress client (on `@restatedev/restate-sdk-clients`) the runner callback and the operator cancel use. Sends between the two services use `ctx.workflowSendClient` / `ctx.objectSendClient` with the definition types in `src/restate/kg-refresh-types.ts`.
 
 The SDK's console logger reads `RESTATE_LOGGING` once, when `@restatedev/restate-sdk` first loads, and defaults to INFO (one line per invocation step). `src/restate/log-level-boot.ts` is a side-effect module that sets `process.env.RESTATE_LOGGING` to `resolveRestateLogLevel(...)`, so the orchestrator defaults to WARN and `RESTATE_LOGGING` overrides it. Because of the module-load constraint it must be the first import of `src/index.ts` (every later `src/restate/*` import loads the SDK) and must never import a module that imports the SDK; `src/__tests__/restate-log-level-boot.test.ts` guards the order. The resolver and its handling of unknown names live in `src/restate/log-level.ts`.
@@ -737,3 +739,35 @@ Serve mode is selected only by the journaled launch result, so runs launched bef
 Owner recovery runs outside the workflow journal. A private launch-time serve marker distinguishes these machines and containers from older polling runs. For a serve run, recovery removes the Fly machine or local container first, confirms its status is `ended`, removes the persisted deployment, then replays the saved result intake and records its usage before finalizing and releasing. Intake and usage are safe to repeat after a successful workflow intake. A failed replay keeps the run and reservation for another recovery attempt; an operator can free an irreparable run with `release_dispatch_reservation`. Serve intents without a saved result finalize and release as usual. Already-absent resources are safe to retry; failed removal or unconfirmed termination retains admission. GitHub Actions and Fly or local intents without serve evidence keep their existing recovery path.
 
 Known gap (AII-2036): a deployment can remain registered if the orchestrator dies before cleanup, especially between registration and persisting its id. Recovery can remove a deployment only when its id was saved; there is no deployment discovery sweep.
+
+### Base KG refresh holds
+
+The boot-resolved refresh identity uses the code repo's `KgRepo` key in base mode. `KgRepo.submit` includes `baseMode: true` on both new and resumed workflow inputs; customer inputs omit it. A base-mode hold has no snapshot PR: status returns `snapshotPr: null` and tools return `snapshotPrUrl: null`. Accept imports the held dispatch package into Stardog; cancel and timeout need no PR comment, close or merge. Clean and warnings reports import without invoking the sidecar rail. Dry runs keep their existing behavior.
+
+
+### Base refresh Stardog steps
+
+`KgRefresh` shares one cancellation commit point before merge or Stardog import.
+`stardog-import` uses `maxRetryAttempts: 1`: it checks the manifest, metadata and
+listed files and posts `kit.yaml` followed by each `data` entry's `file`, in list
+order. The `kit.yaml` `data` list contains objects with a string `file` field:
+`ontology.ttl` or `data/[A-Za-z0-9._-]+\.nt`, with no `..`. Plain string entries
+are rejected. The step leaves `graph` fields for Stardog to read from `kit.yaml`.
+Its saved result contains `{ kitId, publishId, expectedTriples, target }`. A lost acknowledgement
+across a restart can repeat the POST; `replace=true` replaces the earlier import.
+`stardog-wait` reads at most four minutes per attempt and throws when no terminal
+event arrives. Its options are `maxRetryDuration: 1200000`,
+`initialRetryInterval: 30000`, `maxRetryInterval: 30000`, `retryIntervalFactor: 1`.
+Setting both intervals avoids the SDK's default ten-second cap. Restate owns the
+retries and restart recovery; the workflow has no polling loop or clock deadline.
+`stardog-verify` uses `maxRetryAttempts: 3` and compares a billed COUNT query with
+`expectedTriples`. Only then does `baseline` record the report's part counts.
+Failures end `stardog-import-failed` without changing the baseline. Only failures
+after `stardog-import` returns (wait or verify) include the warning that Stardog
+has no good graph until a new import passes.
+
+The import wait budget is twenty minutes. Deploy drain counts all open
+invocations and waits at most 75 minutes, including runner time; import attempts
+stay below the twenty-minute invocation abort timeout. `package-cleanup` removes
+the entire Stardog package root on final base outcomes, preserving only packages
+handed off to a hold. Tokens are read inside client calls and never journaled.

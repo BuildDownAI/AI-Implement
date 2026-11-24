@@ -368,3 +368,17 @@ remap_team_secrets() {
   export AI_IMPLEMENT_FORWARDED_SECRETS="$forwarded"
   log "Remapped team secrets (prefix=${prefix}): ${forwarded:-none}"
 }
+
+# The base code is image-owned until bootstrap hands this workspace to coder.
+prepare_kg_base_workspace() {
+  WORKSPACE_DIR=/opt/kg-base
+  [ -d "$WORKSPACE_DIR/kg_ingest" ] || fail "the runner image has no base KG code (/opt/kg-base)"
+  log "KG base code: /opt/kg-base @ $(cat /opt/kg-base/.base-commit)"
+  cd "$WORKSPACE_DIR"
+}
+
+log_kg_source() {
+  local repo="$1" mode=customer
+  [ "$2" != "kg-base" ] || mode=base
+  log "KG source: $repo ($mode)"
+}

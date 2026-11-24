@@ -463,3 +463,25 @@ describe("KG page — Stardog values", () => {
     expect(saveButton.disabled).toBe(false);
   });
 });
+
+
+it.each([false, true])("explains a first-load hold (blocked=%s)", async blocked => {
+  const held = { cause: "no-baseline", acceptBlocked: blocked, lostTeams: blocked ? [{ team: "X", servedIssues: -1 }] : [], partTable: [], decideBy: Date.now() + 60000 };
+  const { win, doc } = mount(async () => response(200, { stage: "awaiting-decision", currentRun: { triggerId: "first", held, decisions: blocked ? ["cancel"] : ["accept", "cancel"] } }));
+  win.setStatusBadge = () => {};
+  await win.loadKgStatus();
+  const text = doc.getElementById("kg-current-run")!.textContent;
+  expect(text).not.toContain("a snapshot part shrank past the guard");
+  expect(text).toContain(blocked ? "Accept is blocked." : "Why: this is the first load into Stardog, so there is no earlier load to compare with. Check the part counts, then accept.");
+});
+
+it("explains a first-load hold blocked by a non-tracker source failure", async () => {
+  const held = { cause: "no-baseline", acceptBlocked: true, lostTeams: [], sources: [{ source: "docs", kind: "docs", status: "failed" }], partTable: [], decideBy: Date.now() + 60000 };
+  const { win, doc } = mount(async () => response(200, { stage: "awaiting-decision", currentRun: { triggerId: "first", held, decisions: ["cancel"] } }));
+  win.setStatusBadge = () => {};
+  await win.loadKgStatus();
+  const text = doc.getElementById("kg-current-run")!.textContent;
+  expect(text).toContain("Accept is blocked.");
+  expect(text).not.toContain("then accept");
+  expect(text).not.toContain("a snapshot part shrank past the guard");
+});

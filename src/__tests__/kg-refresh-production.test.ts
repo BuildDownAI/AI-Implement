@@ -1090,3 +1090,21 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
     expect(calls).toEqual(["get"]);
   });
 });
+
+
+describe("base production composition", () => {
+  it("uses the code mapping identity, values and dependency scope", () => {
+    const source = { mode: "base" as const, runRepo: "acme/kg", kgCodeRepo: "acme/kg", kgNamespace: "https://kg/", kgGraphName: "graph", kgGraphLabel: "Graph", kgStardogDb: "database" };
+    createProductionKgRefreshServices(makeInput({ source, resolveExecutionMode: () => "local-docker" }));
+    expect(capturedWorkflowDeps.current!.buildEnvelope({ triggerId: "base-dispatch", baseMode: true }, "KG")).toMatchObject({ kgSourceRepo: "acme/kg", kgBaseMode: true, kgNamespace: "https://kg/", kgCodeRepo: "acme/kg", kgGraphName: "graph", kgGraphLabel: "Graph", kgStardogDb: "database", dependencyTokenScope: "installation" });
+    expect(capturedWorkflowDeps.current!.resolveDispatchRecord("base-dispatch").repo).toBe("acme/kg");
+    const tokens = capturedWorkflowDeps.current!.mintRunTokens({ dispatchId: "base-dispatch", ttlSeconds: 600 });
+    const verified = verifyRunToken(tokens.publicationToken, "secret", "publication", { consume: false });
+    expect(verified.ok && verified.claims.repository).toBe("acme/kg");
+  });
+  it("refuses GHA before base dispatch", () => {
+    runnerMode.current = "gha";
+    try { expect(() => resolveKgExecutionMode({ flySessionsToken: "token", flySessionsApp: "app" }, true)).toThrow("base-mode-needs-fly-or-local"); }
+    finally { runnerMode.current = "default"; }
+  });
+});

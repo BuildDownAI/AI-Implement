@@ -393,6 +393,11 @@ function applyNormalWiring(step: YamlStep, options?: LoadPipelineOptions): StepD
         inputs: (ctx: PipelineContext) => ({
           callbackUrl: ctx.data.callbackUrl,
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          kgBaseMode: ctx.data.kgBaseMode,
+          kgNamespace: ctx.data.kgNamespace,
+          kgCodeRepo: ctx.data.kgCodeRepo,
+          kgGraphName: ctx.data.kgGraphName,
+          kgGraphLabel: ctx.data.kgGraphLabel,
           dryRun: ctx.data.kgDryRun === true,
           // The KG repo is mapped in the orchestrator too; it must not become its own secondary.
           selfRepoSlug: (() => {
@@ -502,6 +507,7 @@ function applyNormalWiring(step: YamlStep, options?: LoadPipelineOptions): StepD
               : undefined;
           return {
             workspaceDir,
+            kgBaseMode: ctx.data.kgBaseMode,
             ...(codeRepoDir ? { codeRepoDir } : {}),
             ...(reposRootDir !== undefined ? { reposRootDir } : {}),
             ...(ctx.data.dependencyToken ? { ghToken: ctx.data.dependencyToken } : {}),

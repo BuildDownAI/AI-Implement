@@ -118,6 +118,15 @@ export interface PipelineContextData {
   retryPolicy?: RetryPolicy;
   /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
   kgDryRun?: boolean;
+  kgRunStartedAt?: number;
+  baseline?: import("../run-config.js").KgSnapshotBaseline;
+  kgBaseMode?: true;
+  kgNamespace?: string;
+  kgCodeRepo?: string;
+  kgGraphName?: string;
+  kgGraphLabel?: string;
+  kgStardogDb?: string;
+
   /**
    * Optional runner-activity/cycle sink (AII-788). Mirrors `PipelineContext.activitySink`
    * so a context constructed from a plain `PipelineContextData` bag (e.g. the dev harness,

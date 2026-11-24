@@ -85,15 +85,18 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const repo = sourceRepo();
     // Narrow mint first: a failure aborts the launch with no fallback to the broad token.
     const bootToken = await repoBootToken(repo);
-    const ghToken = await deps.getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
-    const defaultBranch = (await deps.fetchDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+    const baseMode = input.envelope.kgBaseMode === true;
+    const defaultBranch = baseMode ? "main" : (await deps.fetchDefaultBranch(
+      await deps.getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner), repo.owner, repo.repo,
+    )) ?? "main";
     const sessionToken = generateSessionToken();
     const extraEnv: Record<string, string> = {
       AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(input.envelope),
+      ...(baseMode ? { AI_IMPLEMENT_WORKSPACE_MODE: "kg-base" } : {}),
     };
     let flySessionImage: string;
     try {
-      flySessionImage = await deps.resolveRunnerImage({
+      flySessionImage = baseMode ? config.sessionImage : await deps.resolveRunnerImage({
         owner: repo.owner,
         repo: repo.repo,
         token: bootToken,
@@ -173,11 +176,14 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const machineNonce = requireNonce(input);
     const repo = sourceRepo();
     const bootToken = await repoBootToken(repo);
-    const ghToken = await deps.getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
-    const defaultBranch = (await deps.fetchDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+    const baseMode = input.envelope.kgBaseMode === true;
+    const defaultBranch = baseMode ? "main" : (await deps.fetchDefaultBranch(
+      await deps.getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner), repo.owner, repo.repo,
+    )) ?? "main";
     const sessionToken = generateSessionToken();
     const extraEnv: Record<string, string> = {
       AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(input.envelope),
+      ...(baseMode ? { AI_IMPLEMENT_WORKSPACE_MODE: "kg-base" } : {}),
     };
     const localOrchestratorUrl =
       config.localRunnerOrchestratorUrl ??
@@ -213,6 +219,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
       return { outcome: "rejected", jobId: null, executionMode, reason: "envelope carries model authentication" };
     }
+    if (input.envelope.kgBaseMode) return { outcome: "rejected", jobId: null, executionMode, reason: "base-mode-needs-fly-or-local" };
     const repo = sourceRepo();
     const encoded = encodeRunConfig(input.envelope);
     const { token } = await deps.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);

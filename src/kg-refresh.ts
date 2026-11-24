@@ -77,7 +77,7 @@ export interface RefreshOutcome {
   dispatchId?: string;
   /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
-  cause?: "shrink" | "tracker-missing" | "source-failed";
+  cause?: "shrink" | "tracker-missing" | "source-failed" | "no-baseline";
   failedTeams?: string[];
   /** Skipped or failed teams that had served issues, when the run was held with Accept blocked. */
   lostTeams?: Array<{ team: string; servedIssues: number }>;
@@ -142,6 +142,8 @@ export interface KgPreflightInput {
    * back to sources.yml's `base_repo:`, matching pre-AII-633 behaviour.
    */
   kgBaseRepo?: string | null;
+  kgBaseMode?: boolean;
+  dependencyTokenScope?: "installation";
   mintToken?: typeof getScopedInstallationToken;
   fetchTarball?: typeof fetchRepoTarball;
   fetchDefaultBranch?: (token: string, owner: string, repo: string) => Promise<string>;
@@ -204,7 +206,7 @@ export interface KgRefreshStatus {
     triggerId: string;
     step: string | null;
     decisions: Array<"accept" | "cancel">;
-    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing" | "source-failed"; failedTeams: string[]; acceptBlocked: boolean; lostTeams: Array<{ team: string; servedIssues: number }>; sources: SourceResult[]; decideBy: number } | null;
+    held: { snapshotPr: number | null; snapshotPrUrl?: string | null; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing" | "source-failed" | "no-baseline"; failedTeams: string[]; acceptBlocked: boolean; lostTeams: Array<{ team: string; servedIssues: number }>; sources: SourceResult[]; decideBy: number } | null;
   } | null;
   /** The runner step in flight, when the workflow has one (AII-1134). */
   runnerStep?: { id: string; status: StepStatus };
@@ -369,6 +371,25 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
   const kgRepoSlug = `${repo.owner}/${repo.repo}`;
   const checkedAt = Date.now();
   const results: Array<{ repo: string; grant: string; ok: boolean; status: number; hint?: string }> = [];
+
+  if (input.kgBaseMode) {
+    if (input.dependencyTokenScope !== "installation") {
+      return { ok: false, checkedAt, results: [{ repo: kgRepoSlug, grant: "base-mode-needs-installation-scope", ok: false, status: 0,
+        hint: "set Dependency Token Scope to `installation` on the code repo's project" }] };
+    }
+    try {
+      const { token } = await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
+        permissions: { contents: "read", pull_requests: "read" },
+      });
+      for (const grant of ["contents", "pull_requests"] as const) {
+        const probe = await probeRepoFn(token, kgRepoSlug, grant);
+        results.push({ repo: kgRepoSlug, grant: `${grant}:read`, ...probe });
+      }
+    } catch {
+      results.push({ repo: kgRepoSlug, grant: "contents:read", ok: false, status: 0 });
+    }
+    return { ok: results.every(r => r.ok), checkedAt, results };
+  }
 
   // Fetch sources.yml from the KG source repo to discover code_repo and secondary_repos slugs.
   // The read token and default branch are reused below for the workflow-file probe (AII-594) —
