@@ -1,6 +1,7 @@
 // Real Restate 1.7.10 coordination tests for KgRefresh workflow (part 3/3: AII-1489 held snapshots and decisions).
 import { initLogTable } from "../../log.js";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
@@ -26,7 +27,7 @@ describe("KgRefresh durable workflow — decision hold", () => {
   const f = createKgRefreshFixture();
   f.installHooks();
   const {
-    state, mergePullRequestFn, closePullRequestFn, deleteBranchFn, postPrCommentFn, scenarios, appendJobLogCalls, persistCalls, rowState, closeRowsFor, closeRowFor, outcomesFor, makeScenario, flyMachineProfile, ghaRunProfile, stopCalls, workflowDeps, kgRepo, starter, triggerViaKgRepo, kgRepoStatus, workflowDispatched,
+    baseVariants, startBaseVariants, frozenTarget, stardog, packageFixture, readBaseline, baseExternalEffects, newTriggerId, runWorkflow, state, mergePullRequestFn, closePullRequestFn, deleteBranchFn, postPrCommentFn, scenarios, appendJobLogCalls, persistCalls, rowState, closeRowsFor, closeRowFor, outcomesFor, makeScenario, flyMachineProfile, ghaRunProfile, stopCalls, workflowDeps, kgRepo, starter, triggerViaKgRepo, kgRepoStatus, workflowDispatched,
   } = f;
 
   beforeAll(() => {
@@ -44,15 +45,97 @@ describe("KgRefresh durable workflow — decision hold", () => {
     const heldWorkflow = createKgRefreshWorkflow({
       ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: DECISION_TIMEOUT_MS,
     });
+    let baseEnvs: Awaited<ReturnType<typeof startBaseVariants>>;
+    const baseEnvFor = (label: string) => baseEnvs.get(label as "alwaysReplay" | "disableRetries")!;
     let heldEnvs: Map<string, RestateEnvironment>;
     beforeAll(async () => {
+      baseEnvs = await startBaseVariants();
       heldEnvs = await startVariants([heldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools]);
       setKgRefreshToolDeps({ kgSourceRepo: KG_SOURCE_REPO } as unknown as KgRefreshToolDeps);
     }, 120_000);
     afterAll(async () => {
       setKgRefreshToolDeps(null);
+      await stopAll(baseEnvs);
       await stopAll(heldEnvs);
     });
+    it.each(baseVariants.map(([label]) => label))("base reports enter a hold without a PR and accept it (%s)", async label => {
+      const env = baseEnvFor(label);
+      state.baseMode = true;
+      try {
+        const trigger = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (trigger as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: state.runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const beforeEffects = baseExternalEffects();
+        const beforeFetch = state.fetchTarballCallCount;
+        const dir = packageFixture(triggerId);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: false, failureCode: "KG_SNAPSHOT_HELD", partCounts: { issues: 37, projects: 5 } });
+        expect(await done).toMatchObject({ held: true, conclusion: "awaiting_decision" });
+        expect(existsSync(dir)).toBe(true);
+        expect(stardog.startImport).not.toHaveBeenCalled();
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ held: { snapshotPr: null } });
+        state.configuredTarget = { db: "changed-db", graphName: "changed-graph" };
+        const decided = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "decide", { triggerId, action: "accept", actor: "admin@example.com" });
+        await eventually(() => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${decided.triggerId}'`), rows => rows.length > 0, { label: "base decision run delivered" });
+        expect(await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", decided.triggerId)).toMatchObject({ ok: true, detail: "Stardog import verified" });
+        await eventually(() => kgRepoStatus(env.baseUrl()), value => value === null, { label: "base hold released" });
+        expect(await readBaseline(env)).toEqual({ parts: { issues: 37, projects: 5 }, triggerId: decided.triggerId, at: expect.any(Number) });
+        expect(stardog.startImport.mock.calls).toEqual([[dir, ["kit.yaml", "data/issues.nt"], frozenTarget]]);
+        expect(stardog.countTriples.mock.calls.at(-1)).toEqual([frozenTarget]);
+        expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+        expect(baseExternalEffects()).toEqual(beforeEffects);
+        expect(state.fetchTarballCallCount).toBe(beforeFetch);
+      } finally { state.baseMode = false; }
+    });
+
+    it.each(baseVariants.map(([label]) => label))("refuses legacy held packages without a frozen target before importing (%s)", async label => {
+      const env = baseEnvFor(label);
+      const triggerId = newTriggerId();
+      packageFixture(triggerId);
+      const hold = { triggerId, dispatchId: triggerId, decideBy: Date.now() + 60_000, steps: [],
+        report: { ok: false, failureCode: "KG_SNAPSHOT_HELD", partCounts: { issues: 42 } } };
+      const before = await readBaseline(env);
+      const result = await runWorkflow(env.baseUrl(), newTriggerId(), { baseMode: true, resume: { hold, action: "accept" } });
+      expect(result).toMatchObject({ ok: false, conclusion: "stardog-import-failed" });
+      expect(result.detail).toContain("no frozen Stardog target");
+      expect(stardog.startImport).not.toHaveBeenCalled();
+      expect(await readBaseline(env)).toEqual(before);
+    });
+
+    it.each(baseVariants.map(([label]) => label))("base held reports have no PR and accept/cancel/timeout without GitHub (%s)", async label => {
+      const env = baseEnvFor(label);
+      for (const action of ["accept", "cancel", "timeout"] as const) {
+        const triggerId = newTriggerId();
+        const hold = { triggerId, dispatchId: triggerId, decideBy: Date.now() + 60_000, steps: [], stardogTarget: frozenTarget, report: { ok: false, failureCode: "KG_SNAPSHOT_HELD", partCounts: { issues: 42 } } };
+        packageFixture(triggerId);
+        const beforeEffects = baseExternalEffects();
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const outcome = await runWorkflow(env.baseUrl(), newTriggerId(), { baseMode: true, resume: { hold, action, actor: "admin@example.com" } });
+        expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+        expect(outcome).toMatchObject(action === "accept" ? { ok: true, detail: "Stardog import verified" } : { ok: false, conclusion: action === "cancel" ? "operator_cancelled" : "decision_timeout" });
+        expect(baseExternalEffects()).toEqual(beforeEffects);
+        expect(closePullRequestFn.mock.calls.length).toBe(beforeClose);
+      }
+    });
+
+    it.each(baseVariants.map(([label]) => label))("base cancel before import wins at the commit point (%s)", async label => {
+      const env = baseEnvFor(label);
+      const heldDispatch = newTriggerId();
+      packageFixture(heldDispatch);
+      const triggerId = newTriggerId();
+      state.beforeImportGate = gate("before Stardog commit point");
+      const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
+        hold: { triggerId: heldDispatch, dispatchId: heldDispatch, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+      } });
+      await state.beforeImportGate.reached();
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested stop" });
+      state.beforeImportGate.release();
+      expect(await done).toMatchObject({ ok: false, conclusion: "operator_cancelled" });
+      expect(stardog.startImport).not.toHaveBeenCalled();
+      expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
+    });
+
     const LABELS = VARIANTS.map(([label]) => label);
 
     const readStatus = (baseUrl: string, triggerId: string) =>
