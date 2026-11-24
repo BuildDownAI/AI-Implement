@@ -882,10 +882,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         }
       }
 
-      async function commitPoint(): Promise<RefreshOutcome | undefined> {
+      async function commitPoint(afterCancelCheck?: () => void): Promise<RefreshOutcome | undefined> {
         // The commit point (AII-1296): merge or import is the point of no return. A Restate
         // cancel that arrived earlier (during the accept note, say) stops the run here.
         await checkCancelled();
+        afterCancelCheck?.();
         // The first of this write and an operator cancel wins; the loser sees the other's value.
         try {
           await ctx.promise<string>("cancel").resolve(KG_REFRESH_COMMITTED);
@@ -909,8 +910,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // already-closed PR must fail the run, not be treated as a silent success, and must not
         // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
         // not apply to either failure.
-        heldPr = report.snapshotPr !== undefined ? { number: report.snapshotPr, branch: report.snapshotBranch } : undefined;
-        const cancelled = await commitPoint();
+        const cancelled = await commitPoint(() => {
+          // On a clean, not-resumed run, Restate cancellation leaves the snapshot PR open.
+          // A resumed accept already owns heldPr and still closes it on cancellation.
+          // Assign before the promise write so an operator signal still owns cleanup.
+          heldPr = report.snapshotPr !== undefined ? { number: report.snapshotPr, branch: report.snapshotBranch } : undefined;
+        });
         if (cancelled) return cancelled;
         heldPr = undefined; // merging: a cancel past here must not close the PR
         ctx.set("step", "merge");
