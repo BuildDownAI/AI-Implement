@@ -241,9 +241,14 @@ The rule is not conditioned on intervening code changes. Claude sees only the
 full PR diff, and earlier review comments do not record the head they reviewed,
 so it cannot tell which code changed after an earlier review.
 
-`.github/workflows/claude-review.yml` loads this composite action from the
-default branch, `main`. The rule therefore reaches PRs only after `testing` is
-promoted to `main`.
+The orchestrator starts `.github/workflows/claude-review.yml` on its resolved deploy
+branch, or on `main` for a mapped repository when the deploy target is unknown.
+The workflow and composite action come from that branch; the maintainer
+`/claude-review` comment trigger still uses `main`.
+
+If the start fails, the head has no review check. The post-push gate reads this
+as "no reviewer" and can approve when an internal review satisfies its gates.
+A maintainer can post `/claude-review` to start the review by hand.
 
 ## Predicted type check, build or test failures
 
@@ -257,8 +262,8 @@ The rule covers TypeScript under `src/`, including claims that code does not
 compile, that a type is not narrowed, or that an import does not resolve. It
 does not cover `scripts/`, `custom/` or `session/`.
 
-The workflow loads the action from `main`, so this rule is in force only when
-the action file on `main` contains it, after promotion from `testing`.
+This rule takes effect on the orchestrator’s deploy branch as soon as the action
+change lands there; manual comment-triggered reviews still load it from `main`.
 
 ## When the in-run step reads the outside verdict
 

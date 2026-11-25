@@ -8,12 +8,17 @@ name: Claude PR review
 # upstream won't try to keep a one-size-fits-all auth matrix working here.
 
 on:
-  pull_request_target:
-    types: [opened, ready_for_review, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request to review
+        required: true
+        type: string
   issue_comment:
     types: [created]
 
 permissions:
+  checks: write
   contents: read
   pull-requests: write
   issues: write
@@ -21,39 +26,22 @@ permissions:
 
 jobs:
   claude-review:
-    # Auto-run on same-repo PRs (opened/ready_for_review/synchronize). For fork PRs and
-    # re-runs, a maintainer must post `/claude-review` as a comment — forks must not
-    # auto-run on synchronize because pull_request_target has repository-secret access
-    # and that would be a priv-esc vector.
-    #
-    # A draft PR is skipped, with one exception: a push (synchronize) by the orchestrator
-    # bot. A gap-fill run pushes to a PR that an operator may hold in Draft; if the review
-    # skipped that head, LateExternalReview would wait its full 30 minutes and end
-    # `timed-out`, and the head would get no review until a person marked the PR ready.
-    # Auto-merge skips a draft PR, so the Draft gate still holds after an approval.
-    # The login is the `actor` GitHub records on this repo's bot-pushed runs.
+    name: PR review run
+    # The orchestrator dispatches eligible same-repo PRs from its deploy branch.
+    # Maintainers can also review forks or retry with `/claude-review`.
     if: |
-      (github.event_name == 'pull_request_target' &&
-       github.event.pull_request.head.repo.full_name == github.repository &&
-       (github.event.pull_request.draft == false ||
-        (github.event.action == 'synchronize' &&
-         github.event.sender.login == 'ai-implement-orchestrator-bot[bot]'))) ||
+      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
        contains(github.event.comment.body, '/claude-review') &&
        (github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'COLLABORATOR'))
-    # Collapse rapid push bursts: cancel the superseded run and review the settled head.
-    # This MUST stay at job level, not workflow level. A workflow-level group is claimed
-    # the moment a run is created — before `if:` is evaluated — so any issue_comment (not
-    # just `/claude-review`), or a synchronize push to a draft PR, would cancel an
-    # in-flight legitimate review and then skip its own job. The killed review leaves no
-    # verdict, which the post-push gate correctly refuses, which resolves to
-    # review_failed and counts toward the dispatch breaker. At job level the group is
-    # only claimed once `if:` passes, so a skipped job cancels nothing.
+    # Cancel superseded reviews only after the job's authorization condition passes.
+    # Keep dispatch separate from the old main-branch trigger during rollout, so
+    # the two reviews cannot cancel each other before main is promoted.
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      group: ${{ github.event_name == 'workflow_dispatch' && format('claude-review-dispatch-{0}', inputs.pr_number) || format('claude-review-{0}', github.event.issue.number) }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
@@ -62,15 +50,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            if (context.eventName === 'pull_request_target') {
-              core.setOutput('sha', context.payload.pull_request.head.sha);
-              core.setOutput('number', context.payload.pull_request.number);
-              return;
-            }
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.payload.issue.number,
+              pull_number: context.eventName === 'workflow_dispatch'
+                ? context.payload.inputs.pr_number
+                : context.payload.issue.number,
             });
             core.setOutput('sha', pr.data.head.sha);
             core.setOutput('number', pr.data.number);
@@ -97,13 +82,8 @@ jobs:
       # Load the composite action from the repo's own trusted ref,
       # not from the PR-head checkout above.
       # With no `ref:`, actions/checkout gets the triggering event's ref, never the PR head.
-      # On GitHub.com, that is the default branch for both triggers.
-      # So a fork PR, reachable here via the maintainer `/claude-review` comment path,
-      # cannot rewrite the composite action to run arbitrary steps with this job's secrets
-      # by editing .github/actions/claude-review in its own diff.
-      # A change to this workflow or its action likewise reaches PRs only from there.
-      # GitHub Enterprise Server before 3.20 differs:
-      # there, pull_request_target runs from the PR's base branch.
+      # Dispatch uses the orchestrator's deploy branch; comments use main.
+      # Neither mode loads executable action code from the PR head.
       # Keep this checkout at a distinct path from the PR-head checkout above,
       # and after it (see note above).
       - name: Checkout trusted composite action
@@ -111,9 +91,44 @@ jobs:
         with:
           path: trusted-actions
 
+      - name: Create review check run
+        id: check
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+        with:
+          script: |
+            const check = await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'claude-review',
+              head_sha: process.env.HEAD_SHA,
+              status: 'in_progress',
+              started_at: new Date().toISOString(),
+            });
+            core.setOutput('id', check.data.id);
+
       - name: Run Claude review
+        id: review
         uses: ./trusted-actions/.github/actions/claude-review
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           pr_number: ${{ steps.pr.outputs.number }}
+
+      - name: Complete review check run
+        if: always() && steps.check.outputs.id != ''
+        uses: actions/github-script@v7
+        env:
+          CHECK_RUN_ID: ${{ steps.check.outputs.id }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+        with:
+          script: |
+            await github.rest.checks.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              check_run_id: process.env.CHECK_RUN_ID,
+              status: 'completed',
+              conclusion: process.env.REVIEW_OUTCOME === 'success' ? 'success' : 'failure',
+              completed_at: new Date().toISOString(),
+            });

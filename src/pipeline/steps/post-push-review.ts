@@ -145,7 +145,7 @@ const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
 const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 600_000;
 const CLAUDE_REVIEW_SUMMARY_ID = "claude-review-summary";
 // Check-run names produced by the review workflows in this repository.
-// "review" comes from claude-review.yml (pull_request_target, resolves from the default branch).
+// "claude-review" comes from claude-review.yml, dispatched on the orchestrator deploy branch.
 // "code-review-plugin" comes from claude-code-review.yml (pull_request, resolves from the PR head).
 // "claude-review", "claude code review", and "claude-code-review" cover repos running earlier
 // workflow versions. The heuristic fallback in isExternalReviewCheckName catches other variants.

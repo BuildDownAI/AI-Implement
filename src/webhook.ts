@@ -14,8 +14,9 @@ import { isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
-import { addCommentReaction, listPullRequestFiles, postPrComment } from "./github.js";
-import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import { addCommentReaction, listPullRequestFiles, postPrComment, postWorkflowDispatch } from "./github.js";
+import { refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
+import { getDeployPolicy } from "./deploy-policy.js";
 import type { KgDryRunReportTarget } from "./kg-refresh.js";
 import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
 
@@ -47,17 +48,52 @@ function verifySignature(secret: string, body: Buffer, signature: string | undef
 }
 
 interface PullRequestPayload {
+  sender?: { login?: string };
   action?: string;
   pull_request?: {
     number?: number;
     merged?: boolean;
+    draft?: boolean;
     html_url?: string;
-    head?: { ref?: string; sha?: string };
+    head?: { ref?: string; sha?: string; repo?: { full_name?: string } };
     merge_commit_sha?: string;
   };
   repository?: {
     full_name?: string;
   };
+}
+
+/** Best-effort start from trusted deploy configuration, never a PR-provided ref. */
+async function startClaudeReview(
+  payload: PullRequestPayload,
+  appId?: string,
+  privateKey?: string,
+  selfDeploy?: SelfDeployTarget,
+): Promise<void> {
+  if (!appId || !privateKey) return;
+  const prNumber = payload.pull_request?.number;
+  const fullName = payload.repository?.full_name;
+  if (!prNumber || !fullName) return;
+  if (payload.pull_request?.head?.repo?.full_name !== fullName) return;
+  if (payload.pull_request?.draft && !(payload.action === "synchronize" &&
+      payload.sender?.login === "ai-implement-orchestrator-bot[bot]")) return;
+
+  try {
+    const target = resolveDeployTarget(selfDeploy ?? null, getDeployPolicy());
+    if (target ? `${target.owner}/${target.repo}` !== fullName
+      : !Object.values(getMappings()).some((m) => `${m.owner}/${m.repo}` === fullName)) return;
+    const [owner, repo] = fullName.split("/");
+    const ref = target?.branch ?? "main";
+    const token = await getInstallationToken(appId, privateKey, owner);
+    const result = await postWorkflowDispatch({
+      token, owner, repo, workflowFile: "claude-review.yml", ref,
+      inputs: { pr_number: String(prNumber) },
+    });
+    if (!result.success) throw new Error(result.error ?? `HTTP ${result.status}`);
+    console.log(`[webhook] started Claude review for ${fullName}#${prNumber} on ${ref}`);
+  } catch (err) {
+    console.warn(`[webhook] failed to start Claude review for ${fullName}#${prNumber}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 export interface KgPrCheckConfig {
@@ -393,6 +429,13 @@ export async function handleGitHubWebhook(
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;
+  }
+
+  if (payload.action === "opened" || payload.action === "synchronize") {
+    await startClaudeReview(payload, appId, privateKey, selfDeploy);
+  }
+  if (payload.action === "ready_for_review") {
+    await startClaudeReview(payload, appId, privateKey, selfDeploy);
   }
 
   if (payload.action === "opened" || payload.action === "synchronize") {
