@@ -28,6 +28,7 @@ import { getJobByDispatchId, initLogTable } from "../../log.js";
 import { recordInvocation } from "../../pipeline/job-accounting.js";
 import type { InvocationRecordV1 } from "../../pipeline/types.js";
 import { createImplementationRunWorkflow, type ImplementationRunDependencies } from "../../restate/implementation-run-workflow.js";
+import { removeDeployment } from "../../restate/endpoint.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import {
   RunnerFlight,
@@ -130,28 +131,38 @@ async function listen(server: http2.Http2Server): Promise<number> {
   return address.port;
 }
 
-async function registerDeployment(env: RestateEnvironment, uri: string, label: string): Promise<void> {
-  await eventually(
+async function registerDeployment(env: RestateEnvironment, uri: string, expectedServices: string[], label: string): Promise<string> {
+  const deployment = await eventually(
     async () => {
       const response = await fetch(`${env.adminAPIBaseUrl()}/deployments`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ uri }),
       }).catch(() => null);
-      if (response && !response.ok) await response.text();
-      return response?.ok ?? false;
+      if (!response?.ok) {
+        await response?.text();
+        return null;
+      }
+      const deployment = await response.json() as { id: string; services: Array<{ name: string }> };
+      const listedServices = deployment.services.map((service) => service.name);
+      if (!expectedServices.every((name) => listedServices.includes(name))) {
+        throw new Error(`Deployment ${deployment.id}: expected services ${JSON.stringify(expectedServices)}, listed services ${JSON.stringify(listedServices)}`);
+      }
+      return deployment;
     },
     Boolean,
     { label, timeoutMs: 30_000 },
   );
+  return deployment!.id;
 }
 
 /** Registers one runner service at a fresh loopback port with the variant's request-identity key. */
 async function registerRunner(env: RestateEnvironment, services: DeploymentService | DeploymentService[]): Promise<RunnerEndpoint> {
   const identityKey = env.identityKey();
   if (!identityKey) throw new Error("the variant was not started with requestIdentity");
+  const normalizedServices = Array.isArray(services) ? services : [services];
   const server = http2.createServer(createEndpointHandler({
-    services: Array.isArray(services) ? services : [services],
+    services: normalizedServices,
     identityKeys: [identityKey],
   }));
   const sessions = new Set<http2.ServerHttp2Session>();
@@ -161,7 +172,8 @@ async function registerRunner(env: RestateEnvironment, services: DeploymentServi
   });
   const port = await listen(server);
   try {
-    await registerDeployment(env, `http://${RUNNER_HOST}:${port}`, "the runner deployment");
+    const id = await registerDeployment(env, `http://${RUNNER_HOST}:${port}`, normalizedServices.map((service) => service.name), "the runner deployment");
+    deployments.push({ env, id });
   } catch (error) {
     server.close();
     throw error;
@@ -354,6 +366,8 @@ const placeholder = restate.service({
 
 let envs: Map<string, RestateEnvironment>;
 const endpoints: RunnerEndpoint[] = [];
+// Independent of endpoint lifetime: dead-runner tests close their listener early.
+const deployments: Array<{ env: RestateEnvironment; id: string }> = [];
 
 beforeAll(async () => {
   initLogTable();
@@ -370,7 +384,16 @@ afterAll(async () => {
 });
 
 afterEach(async () => {
-  await Promise.all(endpoints.splice(0).map((endpoint) => endpoint.close()));
+  const results = await Promise.allSettled([
+    ...endpoints.splice(0).map((endpoint) => endpoint.close()),
+    ...deployments.splice(0).map(async ({ env, id }) => {
+      await removeDeployment(id, { adminBaseUrl: env.adminAPIBaseUrl() });
+      const response = await fetch(`${env.adminAPIBaseUrl()}/deployments/${encodeURIComponent(id)}`);
+      expect(response.status, `deployment ${id} must be removed`).toBe(404);
+    }),
+  ]);
+  const failures = results.filter((result) => result.status === "rejected");
+  if (failures.length) throw new AggregateError(failures.map((result) => result.reason), "runner cleanup failed");
 });
 
 /** A stored snapshot is required before `recordUsage` can write attribution rows. */
@@ -437,6 +460,34 @@ function implementationWorkflow(seams: Partial<ImplementationRunDependencies> = 
     ...seams,
   });
 }
+
+describe("runner deployment registration", () => {
+  it("rejects a stale deployment on the first OK response, including a partial service match", async () => {
+    const post = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
+      id: "old-deployment", services: [{ name: "RunnerA" }],
+    }));
+    try {
+      await expect(registerDeployment(envs.get("strict")!, "http://127.0.0.1:1234", ["RunnerA", "RunnerB"], "fixture"))
+        .rejects.toThrow('Deployment old-deployment: expected services ["RunnerA","RunnerB"], listed services ["RunnerA"]');
+      expect(post).toHaveBeenCalledTimes(1);
+    } finally {
+      post.mockRestore();
+    }
+  });
+
+  it("returns the deployment id when every expected service is listed", async () => {
+    const post = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
+      id: "new-deployment", services: [{ name: "RunnerA" }, { name: "RunnerB" }],
+    }));
+    try {
+      await expect(registerDeployment(envs.get("strict")!, "http://127.0.0.1:1234", ["RunnerA", "RunnerB"], "fixture"))
+        .resolves.toBe("new-deployment");
+      expect(post).toHaveBeenCalledTimes(1);
+    } finally {
+      post.mockRestore();
+    }
+  });
+});
 
 describe("runner call diagnostics", () => {
   it.each([
@@ -1034,7 +1085,8 @@ describe("runner-service process entry (AII-2034)", () => {
     const runId = randomUUID();
     const service = runnerServiceName(runId);
     const proc = await startEntry(runId, identityKey);
-    await registerDeployment(env, RUNNER_PROCESS_URI, "the spawned runner deployment");
+    const id = await registerDeployment(env, RUNNER_PROCESS_URI, [service], "the spawned runner deployment");
+    deployments.push({ env, id });
 
     // The ingress call is the product path: the Restate server signs with its private
     // key, the runner verifies it, and the real `runAutonomous()` fails on the invalid
