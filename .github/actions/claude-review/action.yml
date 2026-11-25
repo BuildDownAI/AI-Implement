@@ -58,7 +58,7 @@ runs:
         use_bedrock: ${{ inputs.use_bedrock }}
         use_vertex: ${{ inputs.use_vertex }}
         github_token: ${{ inputs.github_token }}
-        track_progress: true
+        track_progress: ${{ github.event_name != 'workflow_dispatch' }}
         prompt: |
           REPO: ${{ github.repository }}
           PR NUMBER: ${{ inputs.pr_number }}
