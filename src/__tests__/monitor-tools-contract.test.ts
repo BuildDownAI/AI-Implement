@@ -66,11 +66,15 @@ describe("recorded get_tenant_health exchanges", () => {
 
 function seedFleet() {
   const insert = dedup.getDb().prepare(`INSERT INTO dispatch_log
-    (issue_id, issue_identifier, repo, dispatched_at, phase, status)
-    VALUES (?, ?, 'acme/widgets', ?, 'implementation', ?)`);
+    (issue_id, issue_identifier, repo, dispatched_at, phase, status, dispatch_id, completed_at)
+    VALUES (?, ?, 'acme/widgets', ?, 'implementation', ?, ?, ?)`);
   // No pass/cost measurements: preserve nulls rather than inventing zeroes.
   for (const [age, status] of [[2, "completed"], [14, "failed"], [31, "completed"]] as const) {
-    insert.run(`issue-${age}`, `AII-${age}`, NOW - age * DAY, status);
+    insert.run(`issue-${age}`, `AII-${age}`, NOW - age * DAY, status, `dispatch-${age}`, NOW - age * DAY + 1000);
+    dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', 'model-a', 'test', 'succeeded', 1, ?)`)
+      .run(`call-${age}`, `dispatch-${age}`, JSON.stringify({ tokensIn: 100, tokensOut: 10, costUsd: 0.5, costStatus: "reported" }));
   }
 }
 
@@ -80,7 +84,8 @@ describe("recorded get_fleet_report exchanges", () => {
     { scenario: "seven-days", args: { days: 7 }, jobs: 1 },
   ])("$scenario", async ({ scenario, args, jobs }) => {
     seedFleet();
-    const recorded = await recordExchange("get_fleet_report", { args });
+    const recorded = await recordExchange("get_fleet_report", { args }, { objectClient: () => ({ current: async () => ({ prices: [] }) }) });
+    expect(payload(recorded).byModel).toHaveLength(1);
     expect(payload(recorded).byRepo).toEqual([{
       repo: "acme/widgets", jobs, issues: jobs, completed: 1, failed: jobs - 1,
       merged: 0, avgPasses: null, costUsd: null,

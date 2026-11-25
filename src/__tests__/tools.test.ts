@@ -1510,11 +1510,13 @@ describe("get_issue_report_card and get_fleet_report thread their arguments (AII
 
   it("get_fleet_report passes `days` through when numeric and omits it otherwise", async () => {
     (getFleetReport as ReturnType<typeof vi.fn>).mockReturnValue({ byRepo: [], oneShotPct: 1, eventualPct: 1, escapeRate: 0, runaways: [] });
-    const withDays = await getFleetReportTool(fakeContext("get_fleet_report"), { caller: system, args: { days: 7 } });
-    expect(getFleetReport).toHaveBeenLastCalledWith({ days: 7 });
+    const prices = [{ model: "fleet-model", inputUsd: "1", outputUsd: "2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
+    const ctx = { ...fakeContext("get_fleet_report"), objectClient: () => ({ current: async () => ({ prices }) }) } as unknown as restate.Context;
+    const withDays = await getFleetReportTool(ctx, { caller: system, args: { days: 7 } });
+    expect(getFleetReport).toHaveBeenLastCalledWith({ days: 7 }, prices);
     expect(Object.keys(JSON.parse(withDays.content[0].text)).sort()).toEqual(["byRepo", "escapeRate", "eventualPct", "oneShotPct", "runaways"]);
-    await getFleetReportTool(fakeContext("get_fleet_report"), { caller: system, args: {} });
-    expect(getFleetReport).toHaveBeenLastCalledWith({ days: undefined });
+    await getFleetReportTool(ctx, { caller: system, args: {} });
+    expect(getFleetReport).toHaveBeenLastCalledWith({ days: undefined }, prices);
   });
 });
 

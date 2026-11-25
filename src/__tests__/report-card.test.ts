@@ -1115,3 +1115,78 @@ describe("getReviewerScorecard", () => {
     }
   });
 });
+
+describe("fleet model grouping", () => {
+  it("deduplicates jobs, separates outcomes and measured costs, and filters dispatches", () => {
+    const now = Date.now();
+    const a = insertDispatch({ repo: "acme/repo", dispatchId: "a", dispatchedAt: now - 1000 });
+    const b = insertDispatch({ repo: "acme/repo", dispatchId: "b", status: "timed_out", dispatchedAt: now - 2000 });
+    insertDispatch({ repo: "other/repo", dispatchId: "other" });
+    insertDispatch({ repo: "test-org/repo", dispatchId: "test" });
+    insertDispatch({ repo: "acme/repo", dispatchId: "old", dispatchedAt: now - 40 * 86400000 });
+    insertDispatch({ repo: "acme/repo" }); // legacy job has no calls
+    dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = dispatched_at + 500 WHERE id = ?").run(a);
+    insertFeedbackLoopStep(a, { approved: true, iterations: 1, terminationReason: "approved", passes: [{ iteration: 1, implementOutcome: "success", reviewApproved: true, costUsd: 1 }] });
+    insertFeedbackLoopStep(b, { approved: false, iterations: 3, terminationReason: "timeout", passes: [{ iteration: 1, implementOutcome: "success", reviewApproved: false, costUsd: 3 }] });
+    const before = rc.getFleetReport();
+    const insert = dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, ?, 'test', 1, 'codex', 'openai', ?, 'test', ?, 1, ?)`);
+    let id = 0;
+    const call = (dispatch: string, model: string, usage: object, status = "succeeded", stage = "implementation") =>
+      insert.run(`call-${id++}`, dispatch, stage, model, status, JSON.stringify(usage));
+    call("a", "A", { tokensIn: 10, tokensOut: 2, costUsd: 1, costStatus: "reported" });
+    call("a", "A", { tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" }, "failed");
+    call("b", "B", { tokensIn: 20, tokensOut: 4, costUsd: 3, costStatus: "reported" }, "timed_out");
+    call("a", "B", { tokensIn: 10, tokensOut: 2 }); // same job, second model
+    call("a", "C", { tokensIn: 10, tokensOut: 2, costUsd: 999, costStatus: "unavailable" }, "succeeded", "planning");
+    call("a", "missing", {});
+    for (const dispatch of ["orphan", "other", "test", "old"]) call(dispatch, "excluded", {});
+    const prices = [{ model: "C", inputUsd: "0.1", outputUsd: "0.2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
+    const report = rc.getFleetReport({}, prices);
+    expect({ ...report, byModel: [] }).toEqual(before);
+    const [modelA, modelB, modelC, missing] = report.byModel;
+    expect(modelA).toEqual({ stage: "implementation", agent: "codex", provider: "openai", model: "A", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: 1, estimatedCostUsd: null, jobs: 1, oneShotPct: 1, avgPasses: 1, avgDurationMs: 500, stoppedJobs: 0 });
+    expect(modelB).toEqual({ ...modelA, model: "B", calls: 2, failedCalls: 0, timedOutCalls: 1, tokensIn: 30, tokensOut: 6, costUsd: 3, jobs: 2, oneShotPct: 0.5, avgPasses: 2, stoppedJobs: 1 });
+    expect(modelC).toEqual({ ...modelA, stage: "planning", model: "C", calls: 1, failedCalls: 0, costUsd: null, estimatedCostUsd: 1.4, oneShotPct: null, avgPasses: null, avgDurationMs: null, stoppedJobs: null });
+    expect(missing).toEqual({ ...modelA, model: "missing", calls: 1, failedCalls: 0, tokensIn: null, tokensOut: null, costUsd: null });
+    expect(rc.getFleetReport().byModel[2].estimatedCostUsd).toBeNull();
+    expect(rc.getFleetReport({}, []).byModel[2].estimatedCostUsd).toBeNull();
+    expect(rc.getFleetReport({ repo: "other/repo" }).byModel.map(m => m.model)).toEqual(["excluded"]);
+    expect(rc.getFleetReport({ days: 0 }).byModel).toEqual([]);
+  });
+
+  it("includes the exact cutoff, stopped conclusions, unknown statistics and measured zero", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const cutoff = now - 30 * 86400000;
+      const approved = insertDispatch({ repo: "acme/repo", dispatchId: "cutoff", dispatchedAt: cutoff });
+      insertFeedbackLoopStep(approved, { approved: true, iterations: 1, terminationReason: "approved", passes: [
+        { iteration: 1, implementOutcome: "success", reviewApproved: true, costUsd: 0 },
+      ] });
+      const unknown = insertDispatch({ repo: "acme/repo", dispatchId: "unknown", conclusion: "ended_without_callback" });
+      // Known passes but no first-pass approval measurement.
+      insertFeedbackLoopStep(unknown, { approved: false, iterations: 3, terminationReason: "stopped", passes: [] });
+      const ppr = insertDispatch({ repo: "acme/repo", dispatchId: "ppr", conclusion: "workflow_cancelled" });
+      // This invokes jobPassStats' passesKnown:false fallback.
+      insertSubStep(ppr, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.4 } });
+      insertDispatch({ repo: "acme/repo", dispatchId: "outside", dispatchedAt: cutoff - 1 });
+      const insert = dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+        (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+        VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', ?, 'test', 'succeeded', 1, ?)`);
+      for (const dispatch of ["cutoff", "unknown", "ppr", "outside"]) {
+        insert.run(dispatch, dispatch, "zero", JSON.stringify({ tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" }));
+      }
+      insert.run("unpriced", "unknown", "unpriced", JSON.stringify({ tokensIn: 10, tokensOut: 2, costStatus: "unavailable" }));
+      const prices = [{ model: "another-model", inputUsd: "1", outputUsd: "2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
+      const report = rc.getFleetReport({}, prices);
+      expect(report.byModel).toEqual([
+        { stage: "implementation", agent: "codex", provider: "openai", model: "zero", calls: 3, failedCalls: 0, timedOutCalls: 0, tokensIn: 0, tokensOut: 0, costUsd: 0, estimatedCostUsd: null, jobs: 3, oneShotPct: 1, avgPasses: 2, avgDurationMs: null, stoppedJobs: 2 },
+        { stage: "implementation", agent: "codex", provider: "openai", model: "unpriced", calls: 1, failedCalls: 0, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: null, estimatedCostUsd: null, jobs: 1, oneShotPct: null, avgPasses: 3, avgDurationMs: null, stoppedJobs: 1 },
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});

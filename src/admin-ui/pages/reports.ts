@@ -31,6 +31,16 @@ export const reportsHtml = `
       </div>
     </div>
     <div class="card">
+      <div class="card-header"><h2 class="card-title">Fleet by model</h2></div>
+      <div class="card-body tight">
+        <table class="tbl">
+          <thead><tr><th>Stage</th><th>Agent</th><th>Provider</th><th>Model</th><th>Calls</th><th>Failed calls</th><th>Timed out calls</th><th>Tokens in</th><th>Tokens out</th><th>Cost (USD)</th><th>Jobs</th><th>One-shot</th><th>Avg passes</th><th>Avg duration (ms)</th><th>Stopped jobs</th></tr></thead>
+          <tbody id="reports-model-body"></tbody>
+        </table>
+        <div id="reports-model-empty" class="hidden text-tertiary" style="padding:12px">No model data for this period</div>
+      </div>
+    </div>
+    <div class="card">
       <div class="card-header">
         <h2 class="card-title">Outcomes</h2>
         <div class="card-subtitle">Fleet-wide pass rates</div>
@@ -214,6 +224,19 @@ export const reportsScript = `
             + '<td>' + fmtCost(r.costUsd) + '</td>';
           fleetBody.appendChild(tr);
         }
+      }
+
+      const modelBody = document.getElementById('reports-model-body');
+      modelBody.innerHTML = '';
+      const models = data.byModel || [];
+      document.getElementById('reports-model-empty').classList.toggle('hidden', models.length > 0);
+      for (const m of models) {
+        const tr = document.createElement('tr');
+        const values = [m.stage, m.agent, m.provider, m.model, m.calls, m.failedCalls,
+          m.timedOutCalls, m.tokensIn, m.tokensOut, fmtCost(m.costUsd), m.jobs,
+          pct(m.oneShotPct), fmtPasses(m.avgPasses), m.avgDurationMs, m.stoppedJobs];
+        tr.innerHTML = values.map(v => '<td>' + window.esc(v == null ? '\u2014' : String(v)) + '</td>').join('');
+        modelBody.appendChild(tr);
       }
 
       const oneShotEl = document.getElementById('reports-oneshot');
