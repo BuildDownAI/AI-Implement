@@ -252,11 +252,9 @@ not report a finding claiming that one fails or will fail. CI is the proof of
 those results on the PR. Wrong behavior and a test that is missing or proves
 nothing remain reportable.
 
-The prompt explicitly limits this rule to TypeScript under `src/` and
-`scripts/fly-secrets-compare.ts`, which PR CI type-checks, including claims that
-code does not compile, that a type is not narrowed, or that an import does not
-resolve. The rule does not apply to other files under `scripts/`, `custom/` or
-`session/`, which do not have the same PR CI coverage.
+The rule covers TypeScript under `src/`, including claims that code does not
+compile, that a type is not narrowed, or that an import does not resolve. It
+does not cover `scripts/`, `custom/` or `session/`.
 
 The workflow loads the action from `main`, so this rule is in force only when
 the action file on `main` contains it, after promotion from `testing`.

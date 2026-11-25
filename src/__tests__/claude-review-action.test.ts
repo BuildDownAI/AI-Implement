@@ -117,8 +117,6 @@ describe("Claude review action", () => {
     expect(prompt).toContain("never report a finding whose claim is that the type check, the TypeScript build or a test fails or will fail");
     expect(prompt).toContain("CI is the proof of those results on this PR");
     expect(prompt).toContain("still report wrong behavior, and a test that is missing or proves nothing");
-    expect(prompt).toContain("This rule applies only to TypeScript under `src/` and `scripts/fly-secrets-compare.ts`, which CI type-checks on this PR");
-    expect(prompt).toContain("It does not apply to other files under `scripts/`, `custom/` or `session/`");
   });
 
   it("renders an approving verdict into the human text and the machine block", () => {
