@@ -3202,3 +3202,105 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
     });
   });
 });
+
+describe("orchestrator Claude review starts", () => {
+  const stamped = { owner: "org", repo: "repo", branch: "testing", runningCommit: null };
+  const payload = (action = "opened", draft = false, headRepo = "org/repo", login = "alice") => ({
+    action, repository: { full_name: "org/repo" }, sender: { login },
+    pull_request: { number: 42, html_url: "https://github.com/org/repo/pull/42", draft, head: { repo: { full_name: headRepo } } },
+  });
+  async function deliver(body: unknown, target: typeof stamped | undefined = stamped, appId: string | undefined = "app", key: string | undefined = "key") {
+    const { req, res } = makeRequest(SECRET, "pull_request", body);
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, appId, key, target);
+    expect(res.statusCode).toBe(200);
+    return JSON.parse(res.body);
+  }
+  function api(reply: Reply = { status: 204 }) {
+    return fakeFetch({ "POST /repos/org/repo/actions/workflows/claude-review.yml/dispatches": reply }).install();
+  }
+  it.each(["opened", "synchronize", "ready_for_review"])("starts %s on the deploy branch", async (action) => {
+    const fake = api();
+    await deliver(payload(action));
+    expect(fake.calls).toHaveLength(1);
+    expect(JSON.parse(fake.calls[0].body)).toEqual({ ref: "testing", inputs: { pr_number: "42" } });
+  });
+  it("uses the watched policy before the build stamp", async () => {
+    const policy = await import("../deploy-policy.js");
+    policy.setDeployPolicy({ watchedRepo: "org/repo", watchedRef: "watched" });
+    const fake = api();
+    await deliver(payload());
+    expect(JSON.parse(fake.calls[0].body).ref).toBe("watched");
+  });
+  it("falls back to main for a mapped repository without a target", async () => {
+    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
+    const fake = api();
+    const { req, res } = makeRequest(SECRET, "pull_request", payload());
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key");
+    expect(fake.calls).toHaveLength(1);
+    expect(JSON.parse(fake.calls[0].body).ref).toBe("main");
+  });
+  it("skips an unmapped repository without a target", async () => {
+    const { req, res } = makeRequest(SECRET, "pull_request", payload());
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key");
+    expect(unrouted.calls).toHaveLength(0);
+  });
+  it("skips another repository even when mapped", async () => {
+    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
+    await deliver(payload(), { ...stamped, repo: "other" });
+    expect(unrouted.calls).toHaveLength(0);
+  });
+  it.each([
+    payload("opened", false, "fork/repo"),
+    payload("synchronize", true),
+    payload("opened", true, "org/repo", "ai-implement-orchestrator-bot[bot]"),
+    { action: "opened", repository: { full_name: "org/repo" } },
+    { action: "opened", pull_request: { number: 42 } },
+  ])("skips ineligible or incomplete payloads %#", async (body) => {
+    await deliver(body);
+    expect(unrouted.calls).toHaveLength(0);
+  });
+  it("reviews a draft synchronized by the orchestrator bot", async () => {
+    const fake = api();
+    await deliver(payload("synchronize", true, "org/repo", "ai-implement-orchestrator-bot[bot]"));
+    expect(fake.calls).toHaveLength(1);
+  });
+  it.each(["app", "key"])("does no policy read or fetch with missing %s", async (missing) => {
+    const policy = await import("../deploy-policy.js");
+    const spy = vi.spyOn(policy, "getDeployPolicy");
+    const { req, res } = makeRequest(SECRET, "pull_request", payload());
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET,
+      missing === "app" ? undefined : "app", missing === "key" ? undefined : "key", stamped);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    expect(unrouted.calls).toHaveLength(0);
+  });
+  it.each(["opened", "synchronize", "ready_for_review"])("preserves the %s response after a failed start", async (action) => {
+    api({ status: 404, json: { message: "Not Found" } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await deliver(payload(action));
+    expect(result).toEqual(action === "synchronize" ? { ignored: true, reason: "no matching dispatch" } : { ignored: true });
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+  it.each([204, 404])("starts before a KG early response (HTTP %s)", async (status) => {
+    const fake = api(status === 204 ? { status } : { status, json: { message: "Not Found" } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { req, res } = makeRequest(SECRET, "pull_request", payload());
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key", stamped, {
+      kgSourceRepo: "org/source", kgBaseRepo: "org/repo",
+      enqueueDryRun: vi.fn(),
+    });
+    expect(fake.calls).toHaveLength(1);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "base_repo_pr" });
+    expect(warn).toHaveBeenCalledTimes(status === 204 ? 0 : 1);
+    warn.mockRestore();
+  });
+  it("preserves the response when authentication throws", async () => {
+    hoisted.getInstallationToken.mockRejectedValueOnce(new Error("auth unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await deliver(payload())).toEqual({ ignored: true });
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+    expect(unrouted.calls).toHaveLength(0);
+  });
+});

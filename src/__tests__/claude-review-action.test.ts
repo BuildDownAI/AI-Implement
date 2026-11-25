@@ -234,3 +234,35 @@ describe("Claude review action", () => {
     expect(result.postedBody).toBeUndefined();
   });
 });
+
+
+describe("Claude review workflow dispatch", () => {
+  it("loads trusted code and publishes only the explicit review check on the PR head", () => {
+    const workflow = parse(readFileSync(".github/workflows/claude-review.yml", "utf8"));
+    expect(workflow.on.workflow_dispatch.inputs.pr_number).toMatchObject({ required: true, type: "string" });
+    expect(workflow.on.pull_request_target).toBeUndefined();
+    expect(workflow.on.issue_comment).toEqual({ types: ["created"] });
+    expect(workflow.permissions.checks).toBe("write");
+    const job = workflow.jobs["claude-review"];
+    expect(job.name).toBe("PR review run");
+    expect(job.name).not.toMatch(/claude|review-plugin|^review$/i);
+    expect(job.concurrency.group).toContain("format('claude-review-dispatch-{0}', inputs.pr_number)");
+    const find = (name: string) => job.steps.find((step: { name?: string }) => step.name === name);
+    expect(find("Checkout trusted composite action").with.ref).toBeUndefined();
+    expect(find("Resolve PR head SHA").with.script).toContain("context.payload.inputs.pr_number");
+    const create = find("Create review check run");
+    expect(create.id).toBe("check");
+    expect(create.env.HEAD_SHA).toBe("${{ steps.pr.outputs.sha }}");
+    expect(create.with.script).toContain("name: 'claude-review'");
+    expect(create.with.script).toContain("started_at: new Date().toISOString()");
+    expect(create.with.script).toContain("core.setOutput('id', check.data.id)");
+    expect(find("Run Claude review").id).toBe("review");
+    const complete = find("Complete review check run");
+    expect(complete.if).toBe("always() && steps.check.outputs.id != ''");
+    expect(complete.env.REVIEW_OUTCOME).toBe("${{ steps.review.outcome }}");
+    expect(complete.with.script).toContain("process.env.REVIEW_OUTCOME === 'success' ? 'success' : 'failure'");
+    expect(complete.with.script).toContain("completed_at: new Date().toISOString()");
+    expect(action.runs.steps.find((step: { name: string }) => step.name === "Run Claude review").with.track_progress)
+      .toBe("${{ github.event_name != 'workflow_dispatch' }}");
+  });
+});
