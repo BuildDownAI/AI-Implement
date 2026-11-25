@@ -245,6 +245,21 @@ so it cannot tell which code changed after an earlier review.
 default branch, `main`. The rule therefore reaches PRs only after `testing` is
 promoted to `main`.
 
+## Predicted type check, build or test failures
+
+Claude cannot run the type check, TypeScript build or tests, so the review does
+not report a finding claiming that one fails or will fail for TypeScript code
+under `src/`. CI is the proof of those results on the PR, and a failed CI check
+already blocks the merge. Wrong behavior and a test that is missing or proves
+nothing remain reportable.
+
+The rule covers TypeScript under `src/`, including claims that code does not
+compile, that a type is not narrowed, or that an import does not resolve. It
+does not cover `scripts/`, `custom/` or `session/`.
+
+The workflow loads the action from `main`, so this rule is in force only when
+the action file on `main` contains it, after promotion from `testing`.
+
 ## When the in-run step reads the outside verdict
 
 The `post-push-review` step starts its outside-review wait after the internal
