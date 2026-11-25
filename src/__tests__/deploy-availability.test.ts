@@ -7,7 +7,7 @@ import { fakeFetch } from "./helpers/fake-fetch.js";
 // Both dependencies exist only to reach GitHub; what matters here is what they
 // return, so each is replaced by a spy exposing the functions we call.
 vi.mock("../github-app-auth.js", () => ({ mintSourceTokenOrJwt: vi.fn() }));
-vi.mock("../github.js", () => ({ getRefSha: vi.fn(), compareCommits: vi.fn() }));
+vi.mock("../github.js", () => ({ getRefSha: vi.fn(), compareCommits: vi.fn(), defaultFetchSignal: vi.fn(() => AbortSignal.timeout(60_000)) }));
 
 const RUNNING = "1111111111111111111111111111111111111111";
 const HEAD = "2222222222222222222222222222222222222222";
@@ -149,6 +149,93 @@ describe("resolveDeployTarget", () => {
 
   it("returns null when stamped is null and no override is set", () => {
     expect(availability.resolveDeployTarget(null, { watchedRepo: null, watchedRef: null })).toBeNull();
+  });
+});
+
+describe("anonymousImageReadable", () => {
+  const IMAGE = "ghcr.io/builddownai/ai-implement-orchestrator:testing-2222222";
+  const TOKEN = "GET /token";
+  const MANIFEST = "HEAD /v2/builddownai/ai-implement-orchestrator/manifests/testing-2222222";
+  // GHCR's answer to an anonymous token request for a private or missing package, as it sends it.
+  const DENIED = { status: 403, json: { errors: [{ code: "DENIED", message: "requested access to the resource is denied" }] } };
+
+  it("reads the manifest with an anonymous pull token, as another Fly organization pulls the image", async () => {
+    const ghcr = fakeFetch({ [TOKEN]: { json: { token: "anonymous-token" } }, [MANIFEST]: { status: 200 } });
+
+    expect(await availability.anonymousImageReadable(IMAGE, ghcr.fetch)).toBe(true);
+
+    const [token, manifest] = ghcr.calls;
+    expect(token.url.searchParams.get("scope")).toBe("repository:builddownai/ai-implement-orchestrator:pull");
+    expect(token.headers.has("authorization")).toBe(false);
+    expect(manifest.headers.get("authorization")).toBe("Bearer anonymous-token");
+    // A push can store an image index or a single manifest, in OCI or Docker media types.
+    for (const type of ["application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.docker.distribution.manifest.v2+json"]) {
+      expect(manifest.headers.get("accept")).toContain(type);
+    }
+    for (const call of ghcr.calls) expect(call.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("is false for a tag the public package does not have", async () => {
+    const ghcr = fakeFetch({ [TOKEN]: { json: { token: "anonymous-token" } }, [MANIFEST]: { status: 404 } });
+
+    expect(await availability.anonymousImageReadable(IMAGE, ghcr.fetch)).toBe(false);
+  });
+
+  it("is false, reading no manifest, when GHCR refuses a token for a private or missing package", async () => {
+    const ghcr = fakeFetch({ [TOKEN]: DENIED });
+
+    expect(await availability.anonymousImageReadable(IMAGE, ghcr.fetch)).toBe(false);
+    expect(ghcr.calls).toHaveLength(1);
+  });
+
+  it.each([[TOKEN, 502], [MANIFEST, 503]] as const)("throws with the status when %s answers %i, so a retry can clear it", async (route, status) => {
+    const ghcr = fakeFetch({ [TOKEN]: route === TOKEN ? { status } : { json: { token: "anonymous-token" } }, [MANIFEST]: { status } });
+
+    await expect(availability.anonymousImageReadable(IMAGE, ghcr.fetch)).rejects.toMatchObject({ status });
+  });
+
+  it("throws for an image outside GHCR, which no anonymous read can settle", async () => {
+    await expect(availability.anonymousImageReadable("registry.fly.io/owned-images:testing-2222222", fakeFetch({}).fetch)).rejects.toThrow("not a GHCR image");
+  });
+});
+
+describe("publishedImageReadiness", () => {
+  const GHCR = "ghcr.io/builddownai/ai-implement-orchestrator:testing-2222222";
+  const reads = (published: boolean, readable: boolean) => ({ published: vi.fn(async () => published), readable: vi.fn(async () => readable) });
+
+  it("is not-published, reading no image, when the publication status is not success", async () => {
+    const r = reads(false, true);
+
+    expect(await availability.publishedImageReadiness(GHCR, r)).toBe("not-published");
+    expect(r.readable).not.toHaveBeenCalled();
+  });
+
+  it("is not-pullable when the status is success but the public image cannot be read anonymously", async () => {
+    const r = reads(true, false);
+
+    expect(await availability.publishedImageReadiness(GHCR, r)).toBe("not-pullable");
+    expect(r.readable).toHaveBeenCalledExactlyOnceWith(GHCR);
+  });
+
+  it("is ready when the status is success and the public image reads", async () => {
+    expect(await availability.publishedImageReadiness(GHCR, reads(true, true))).toBe("ready");
+  });
+
+  it("reads no image on Fly's registry, where a control-plane image app keeps it and no anonymous read applies", async () => {
+    const r = reads(true, false);
+
+    expect(await availability.publishedImageReadiness("registry.fly.io/owned-images:testing-2222222", r)).toBe("ready");
+    expect(r.readable).not.toHaveBeenCalled();
+  });
+});
+
+describe("publishedImage", () => {
+  it("names the public image in the lowercased owner's GHCR namespace", () => {
+    expect(availability.publishedImage("BuildDownAI", "testing", HEAD)).toBe("ghcr.io/builddownai/ai-implement-orchestrator:testing-2222222");
+  });
+
+  it("names a control-plane machine's image in its Fly image app", () => {
+    expect(availability.publishedImage("BuildDownAI", "main", HEAD, "owned-images")).toBe("registry.fly.io/owned-images:main-2222222");
   });
 });
 

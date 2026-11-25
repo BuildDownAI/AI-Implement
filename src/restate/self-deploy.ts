@@ -3,15 +3,12 @@ import * as restate from "@restatedev/restate-sdk";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import { resolveDeployTarget } from "../deploy-availability.js";
+import { publishedImage, publishedImageReadiness, resolveDeployTarget } from "../deploy-availability.js";
 import type { DeployPolicy } from "../deploy-policy.js";
 import { deployArgs } from "../deploy.js";
 import type { Machine, MachineConfig } from "../fly-machines.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 import { RestateDrainCoordinator, type RestateDrainProbes } from "./drain.js";
-
-import { mintSourceTokenOrJwt } from "../github-app-auth.js";
-import { defaultFetchSignal, srcHeaders } from "../github.js";
 
 const INGRESS_TIMEOUT_MS = 15_000;
 
@@ -40,6 +37,8 @@ export interface SelfDeployDeps {
   head(target: { owner: string; repo: string }, branch: "testing" | "main"): Promise<string | null>;
   /** Publication marker read inside the target lookup effect. */
   imagePublished(target: { owner: string; repo: string }, commit: string): Promise<boolean>;
+  /** An anonymous read of a public image, inside the target lookup effect. */
+  imageReadable(image: string): Promise<boolean>;
   fly: {
     listMachines(token: string, app: string): Promise<Machine[]>;
     getMachine(token: string, app: string, id: string): Promise<Machine>;
@@ -116,10 +115,12 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
       if (!commit) return { reason: "head-unknown" };
       const source = config.kgSourceRepo ? "built" : "published";
       const image = source === "built" ? `registry.fly.io/${ctx.key}:deploy-${commit.slice(0, 7)}`
-        : `registry.fly.io/${config.imageApp ?? "builddown-orchestrator-image"}:${input.branch}-${commit.slice(0, 7)}`;
+        : publishedImage(target.owner, input.branch, commit, config.imageApp);
       if (source === "published") {
         try {
-          if (!await deps.imagePublished(target, commit)) return { reason: "image-not-published" };
+          const readiness = await publishedImageReadiness(image, { published: () => deps.imagePublished(target, commit), readable: (ref) => deps.imageReadable(ref) });
+          if (readiness === "not-pullable") ctx.console.warn(`[self-deploy] ${image} cannot be pulled anonymously. Make its GHCR package public.`);
+          if (readiness !== "ready") return { reason: "image-not-published" };
         } catch (error) {
           const status = (error as { status?: number }).status;
           if (status !== 401 && status !== 403) throw error;
@@ -295,26 +296,6 @@ export const selfDeployRecovery = restate.service({
       ctx.objectClient<SelfDeployDefinition>({ name: "SelfDeploy" }, input.key).releaseUnownedHold()),
   },
 });
-
-/** GitHub returns statuses newest first; the first matching context is authoritative. */
-export async function githubImagePublished(appId: string, privateKey: string, target: { owner: string; repo: string }, commit: string): Promise<boolean> {
-  const { token } = await mintSourceTokenOrJwt(appId, privateKey, target.owner, {
-    permissions: { statuses: "read" }, repositories: [target.repo],
-  });
-  for (let page = 1; ; page++) {
-    const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/commits/${encodeURIComponent(commit)}/statuses?per_page=100&page=${page}`, {
-      headers: srcHeaders(token), signal: defaultFetchSignal(),
-    });
-    if (!response.ok) {
-      if (response.status === 404) return false;
-      throw Object.assign(new Error(`Image publication status read failed HTTP ${response.status}`), { status: response.status });
-    }
-    const statuses = await response.json() as { context: string; state: string }[];
-    const publication = statuses.find(status => status.context === "orchestrator-image/published");
-    if (publication) return publication.state === "success";
-    if (statuses.length < 100) return false;
-  }
-}
 
 export type SelfDeployDefinition = ReturnType<typeof createSelfDeploy>;
 

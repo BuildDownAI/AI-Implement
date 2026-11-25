@@ -208,9 +208,10 @@ describe("self-deploy drain exclusion", () => {
     const auth = await import("../github-app-auth.js");
     const mint = vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
     const mod = await import("../restate/self-deploy.js");
+    const { githubImagePublished } = await import("../deploy-availability.js");
     const statuses = [{ context: "unrelated", state: "success" }, ...(state ? [{ context: "orchestrator-image/published", state }] : [])];
     const fake = fakeFetch({ "GET /repos/watched/source/commits/full-commit/statuses": { json: statuses } }).install();
-    expect(await mod.githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit")).toBe(state === "success");
+    expect(await githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit")).toBe(state === "success");
     expect(mint).toHaveBeenCalledWith("app", "key", "watched", { permissions: { statuses: "read" }, repositories: ["source"] });
     expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0].headers.get("authorization")).toBe("Bearer installation-token");
@@ -221,7 +222,7 @@ describe("self-deploy drain exclusion", () => {
   it("paginates and uses the latest publication status", async () => {
     const auth = await import("../github-app-auth.js");
     vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
-    const { githubImagePublished } = await import("../restate/self-deploy.js");
+    const { githubImagePublished } = await import("../deploy-availability.js");
     const fetchSpy = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(Response.json(Array.from({ length: 100 }, () => ({ context: "ci", state: "success" }))))
       .mockResolvedValueOnce(Response.json([{ context: "orchestrator-image/published", state: "pending" }, { context: "orchestrator-image/published", state: "success" }]));
@@ -232,7 +233,7 @@ describe("self-deploy drain exclusion", () => {
   it("reads public statuses and propagates permission failures", async () => {
     const auth = await import("../github-app-auth.js");
     const mint = vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: null, authMode: "public" });
-    const { githubImagePublished } = await import("../restate/self-deploy.js");
+    const { githubImagePublished } = await import("../deploy-availability.js");
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json([{ context: "orchestrator-image/published", state: "success" }]));
     const check = () => githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit");
     expect(await check()).toBe(true);

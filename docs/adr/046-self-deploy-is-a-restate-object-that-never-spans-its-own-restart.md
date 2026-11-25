@@ -31,3 +31,13 @@ Only a human orchestrator admin, the control plane's deploy-scoped token, and in
 - The `SelfDeploy` journal must stay compatible across versions, because a retried `apply` runs on the new code. A journal snapshot test (`src/__tests__/restate/self-deploy-journal.restate.test.ts`) guards it.
 - A change to the VM size or the mount needs `applyFlyToml`, or a manual `fly deploy`.
 - Follow-on: load the knowledge graph at runtime, so that one image serves every orchestrator.
+
+## Amendment (2026-11-24): the published image is on GHCR, and `start` checks that anyone can pull it
+
+**The published image is the watched repository owner's GHCR image** ([AII-1837](https://linear.app/eudoxus/issue/AII-1837)). An orchestrator with no knowledge graph applies `ghcr.io/<owner, lowercased>/ai-implement-orchestrator:<branch>-<sha7>`, where the owner is the watched repository's, so the publication status `start` reads and the image it applies always name the same repository. A machine with `FLY_IMAGE_APP` keeps `registry.fly.io/<FLY_IMAGE_APP>:<branch>-<sha7>`: the control plane created it in the Fly organization that owns that image app. The rule's first form named only Fly's registry, which only the owning organization can pull from, so every self-hosted orchestrator without a knowledge graph failed at `apply`, after its drain.
+
+**`start` refuses an image nobody can pull, before the hold.** Inside the existing "find target" step, after the publication status, `start` reads a GHCR image the way another Fly organization pulls it: a pull token requested with no credentials, then the manifest. A refusal there is the existing `image-not-published`, with a log line naming the image. The step's name, its result and the refusal codes are unchanged, so the journal stays compatible (Consequences above). This is not the registry check AII-1645 replaced with the publication status: that one needed access to BuildDown's Fly registry, which tenants do not have, while an anonymous read needs no credential.
+
+**What the publication status means.** `orchestrator-image/published` now says the image can be pulled anonymously from GHCR, and, on BuildDown's own repository, that the Fly image app holds it too. The publish job builds the image once on its runner, refuses one that could hold a private knowledge graph, pushes it to GHCR, reads that copy anonymously, pushes it to Fly's registry, and sets the status last. A new GHCR package is private, so its owner makes it public once ([deployment.md](../deployment.md) § Self-deploy, "Publishing shared images").
+
+**The rejected alternatives, re-checked** (standing rule 3). "Build from source when no published image exists" still holds: the published path applies only an image CI built. The other two are unaffected.
