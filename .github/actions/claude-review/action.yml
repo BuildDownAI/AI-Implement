@@ -73,6 +73,9 @@ runs:
           those results on this PR, and a failed CI check already blocks the merge.
           This rule does not limit your other findings: still report wrong behavior,
           and a test that is missing or proves nothing.
+          This rule applies only to TypeScript under `src/` and
+          `scripts/fly-secrets-compare.ts`, which CI type-checks on this PR. It does
+          not apply to other files under `scripts/`, `custom/` or `session/`.
 
           Read the change and its description (`gh pr diff`, `gh pr view`), then every
           changed file in full, not only its hunks, and follow each change to the code it
