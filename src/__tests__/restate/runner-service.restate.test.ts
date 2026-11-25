@@ -171,14 +171,7 @@ async function registerRunner(env: RestateEnvironment, services: DeploymentServi
     session.once("close", () => sessions.delete(session));
   });
   const port = await listen(server);
-  try {
-    const id = await registerDeployment(env, `http://${RUNNER_HOST}:${port}`, normalizedServices.map((service) => service.name), "the runner deployment");
-    deployments.push({ env, id });
-  } catch (error) {
-    server.close();
-    throw error;
-  }
-  return {
+  const endpoint: RunnerEndpoint = {
     port,
     server,
     close: async () => {
@@ -188,6 +181,16 @@ async function registerRunner(env: RestateEnvironment, services: DeploymentServi
       });
     },
   };
+  try {
+    const id = await registerDeployment(env, `http://${RUNNER_HOST}:${port}`, normalizedServices.map((service) => service.name), "the runner deployment");
+    deployments.push({ env, id });
+  } catch (error) {
+    // Discovery can leave an HTTP/2 session open even when registration fails.
+    // Close it too, since this endpoint will never reach the afterEach list.
+    await endpoint.close();
+    throw error;
+  }
+  return endpoint;
 }
 
 /** Observe ingress without awaiting it: restart may disconnect an otherwise durable call. */
@@ -462,6 +465,31 @@ function implementationWorkflow(seams: Partial<ImplementationRunDependencies> = 
 }
 
 describe("runner deployment registration", () => {
+  it("closes discovery sessions when registration rejects a stale deployment", async () => {
+    let client: http2.ClientHttp2Session | undefined;
+    const post = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const { uri } = JSON.parse(String(init?.body)) as { uri: string };
+      client = http2.connect(uri);
+      await new Promise<void>((resolve, reject) => {
+        const request = client!.request({ ":path": "/discover" });
+        request.on("error", reject);
+        request.resume();
+        request.on("end", resolve);
+        request.end();
+      });
+      return Response.json({ id: "old-deployment", services: [{ name: "OldRunner" }] });
+    });
+    try {
+      const service = createRunnerService({ runId: randomUUID(), runAutonomous: fakePipeline(fakeState()) });
+      await expect(registerRunner(envs.get("strict")!, service)).rejects.toThrow("Deployment old-deployment");
+      await eventually(() => client?.destroyed, Boolean, { label: "failed registration discovery session to close" });
+      expect(post).toHaveBeenCalledTimes(1);
+    } finally {
+      client?.destroy();
+      post.mockRestore();
+    }
+  });
+
   it("rejects a stale deployment on the first OK response, including a partial service match", async () => {
     const post = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
       id: "old-deployment", services: [{ name: "RunnerA" }],
