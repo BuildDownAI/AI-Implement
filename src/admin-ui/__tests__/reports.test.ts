@@ -255,15 +255,18 @@ describe("reports page render", () => {
 });
 
  it("renders model columns safely and tolerates older reports", async () => {
-  const report = { ...baseReport, byModel: [{ stage: "implementation", agent: "codex", provider: "<provider>", model: "model<x>", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: null, costUsd: 0, estimatedCostUsd: 99, jobs: 1, oneShotPct: 1, avgPasses: 1, avgDurationMs: 50, stoppedJobs: 0 }] };
+  const report = { ...baseReport, byModel: [{ stage: "implementation", agent: "codex", provider: "<provider>", model: "model<x>", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: null, costUsd: 0, estimatedCostUsd: 99, jobs: 1, approvedJobs: 0, approvalPct: 0, oneShotPct: 1, avgPasses: 1, avgDurationMs: 50, stoppedJobs: 0 }] };
   const { win, doc } = mountPage(report);
   await win.loadReports();
   const row = doc.querySelector("#reports-model-body tr")!;
-  expect(row.querySelectorAll("td").length).toBe(15);
+  expect(row.querySelectorAll("td").length).toBe(17);
   expect(row.textContent).toContain("<provider>model<x>");
   expect(row.querySelector("provider")).toBeNull();
   expect(row.textContent).toContain("—$0.00");
   expect(row.textContent).not.toContain("99");
+  expect(row.querySelectorAll("td")[11].textContent).toBe("0");
+  expect(row.querySelectorAll("td")[12].textContent).toBe("0.0%");
+  expect(row.querySelectorAll("td")[8].textContent).toBe("—");
   delete (report as Partial<FleetReport>).byModel;
   await win.loadReports();
   expect(doc.querySelectorAll("#reports-model-body tr").length).toBe(0);

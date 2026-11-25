@@ -227,11 +227,18 @@ excludes `test-org/%` repos. The response has:
   joined to jobs in the same window. Includes `calls`, `failedCalls`, `timedOutCalls`,
   `tokensIn`, `tokensOut`, `costUsd` (reported costs only), `estimatedCostUsd`
   (estimates only for unavailable costs using the current model price list), and `jobs`.
-  Missing token/cost measurements and absent estimates are `null`. Implementation entries
-  also have `oneShotPct` (eligible jobs), `avgPasses` (known passes), `avgDurationMs`
-  (jobs with both timestamps), and `stoppedJobs` (timed out or concluded
-  `ended_without_callback`/`workflow_cancelled`); these four are `null` for other stages.
-  Jobs with multiple implementation models count in each entry. Empty windows return `[]`.
+  Missing token/cost measurements and absent estimates are `null`. Each entry has
+  `approvedJobs` (distinct jobs with a durable approval mark or approved step result),
+  `approvalPct` (approvedJobs / jobs, including stopped jobs in the denominator), and
+  `stoppedJobs` (timed out or concluded `ended_without_callback`,
+  `workflow_cancelled`, `operator_cancelled`, or `destroyed-by-admin`).
+  Implementation entries also have `oneShotPct` (eligible jobs), `avgPasses`
+  (known passes), and `avgDurationMs` (jobs with both timestamps); these three
+  are `null` for other stages. Jobs using several models count once in each
+  matching entry, so approval describes the job outcome, not a model's causal contribution.
+  Stopped jobs without call records appear under their stored phase with agent,
+  provider and model all `unknown`, zero calls and unknown usage/cost. Current
+  defaults are never used to infer their model. Empty windows return `[]`.
 * `oneShotPct` and `eventualPct`: first-pass approval per eligible implementation
   dispatch and eventual approval per distinct implementation issue.
 * `planning`: `planned` and `unplanned` cohorts, each with `jobs`, `oneShotPct`,

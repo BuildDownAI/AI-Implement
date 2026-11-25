@@ -667,7 +667,7 @@ export function updateJobStatus(
       isTerminal ? 1 : 0,
       jobId,
     );
-  if (status === "timed_out" || conclusion === "ended_without_callback" || conclusion === "workflow_cancelled") {
+  if (isTerminal) {
     cancelRunningSteps(jobId);
   }
   if (prUrl) linkJobPullRequest(jobId, prUrl);
@@ -679,13 +679,15 @@ export function updateJobStatus(
  * gate run that was parked here while a decision was made cannot leave the badge behind. Returns whether the row changed.
  */
 export function markJobAwaitingDecision(jobId: number): boolean {
-  return getDb()
+  const changed = getDb()
     .prepare(
       `UPDATE dispatch_log
        SET status = 'completed', conclusion = 'awaiting_decision', completed_at = ?
        WHERE id = ? AND status = 'running' AND conclusion IS NULL`,
     )
     .run(Date.now(), jobId).changes > 0;
+  if (changed) cancelRunningSteps(jobId);
+  return changed;
 }
 
 /** The conclusion a resumed kg-refresh run stamps on its `running` row when it takes it back from the decision gate. */
@@ -726,6 +728,7 @@ export function stampJobApproved(jobId: number, prUrl: string): void {
        WHERE id = ?`,
     )
     .run(prUrl, Date.now(), jobId);
+  cancelRunningSteps(jobId);
   if (prUrl) linkJobPullRequest(jobId, prUrl);
 }
 
@@ -758,11 +761,13 @@ export function recordLateReviewEnding(rowId: number, ending: string): boolean {
  * record their real outcome. Returns the number of rows finalized.
  */
 export function completeOrphanedPlanningJobs(issueId: string): number {
+  const jobs = getDb().prepare("SELECT id FROM dispatch_log WHERE issue_id = ? AND phase = 'planning' AND status = 'unknown'").all(issueId) as Array<{ id: number }>;
   const result = getDb()
     .prepare(
       "UPDATE dispatch_log SET status = 'completed', conclusion = COALESCE(conclusion, 'inferred_from_plan_approval'), completed_at = COALESCE(completed_at, ?) WHERE issue_id = ? AND phase = 'planning' AND status = 'unknown'",
     )
     .run(Date.now(), issueId);
+  for (const job of jobs) cancelRunningSteps(job.id);
   return result.changes;
 }
 

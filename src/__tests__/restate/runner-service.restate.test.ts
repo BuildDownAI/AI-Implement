@@ -670,6 +670,8 @@ describe("Runner_<runId> Restate service (AII-2034)", () => {
     const env = envs.get(label)!;
     const dispatchId = randomUUID();
     seedFinishedDispatch(dispatchId);
+    // This scenario reports a live step; terminal jobs now close delayed starts.
+    getDb().prepare("UPDATE dispatch_log SET status = 'running', completed_at = NULL WHERE dispatch_id = ?").run(dispatchId);
     const finish = gate("finish step after restart");
     let starts = 0;
     const step = { id: "child", type: "custom" as const, status: "running" as const,

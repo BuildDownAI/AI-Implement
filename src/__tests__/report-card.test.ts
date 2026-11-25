@@ -1144,16 +1144,28 @@ describe("fleet model grouping", () => {
     for (const dispatch of ["orphan", "other", "test", "old"]) call(dispatch, "excluded", {});
     const prices = [{ model: "C", inputUsd: "0.1", outputUsd: "0.2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
     const report = rc.getFleetReport({}, prices);
-    expect({ ...report, byModel: [] }).toEqual(before);
+    expect({ ...report, byModel: [] }).toEqual({ ...before, byModel: [] });
     const [modelA, modelB, modelC, missing] = report.byModel;
-    expect(modelA).toEqual({ stage: "implementation", agent: "codex", provider: "openai", model: "A", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: 1, estimatedCostUsd: null, jobs: 1, oneShotPct: 1, avgPasses: 1, avgDurationMs: 500, stoppedJobs: 0 });
-    expect(modelB).toEqual({ ...modelA, model: "B", calls: 2, failedCalls: 0, timedOutCalls: 1, tokensIn: 30, tokensOut: 6, costUsd: 3, jobs: 2, oneShotPct: 0.5, avgPasses: 2, stoppedJobs: 1 });
-    expect(modelC).toEqual({ ...modelA, stage: "planning", model: "C", calls: 1, failedCalls: 0, costUsd: null, estimatedCostUsd: 1.4, oneShotPct: null, avgPasses: null, avgDurationMs: null, stoppedJobs: null });
+    expect(modelA).toEqual({ stage: "implementation", agent: "codex", provider: "openai", model: "A", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: 1, estimatedCostUsd: null, jobs: 1, approvedJobs: 1, approvalPct: 1, oneShotPct: 1, avgPasses: 1, avgDurationMs: 500, stoppedJobs: 0 });
+    expect(modelB).toEqual({ ...modelA, model: "B", calls: 2, failedCalls: 0, timedOutCalls: 1, tokensIn: 30, tokensOut: 6, costUsd: 3, jobs: 2, approvedJobs: 1, approvalPct: 0.5, oneShotPct: 0.5, avgPasses: 2, stoppedJobs: 1 });
+    expect(modelC).toEqual({ ...modelA, stage: "planning", model: "C", calls: 1, failedCalls: 0, costUsd: null, estimatedCostUsd: 1.4, oneShotPct: null, avgPasses: null, avgDurationMs: null, stoppedJobs: 0 });
     expect(missing).toEqual({ ...modelA, model: "missing", calls: 1, failedCalls: 0, tokensIn: null, tokensOut: null, costUsd: null });
     expect(rc.getFleetReport().byModel[2].estimatedCostUsd).toBeNull();
     expect(rc.getFleetReport({}, []).byModel[2].estimatedCostUsd).toBeNull();
     expect(rc.getFleetReport({ repo: "other/repo" }).byModel.map(m => m.model)).toEqual(["excluded"]);
     expect(rc.getFleetReport({ days: 0 }).byModel).toEqual([]);
+  });
+
+  it("retains stopped jobs without calls under an unknown model", () => {
+    insertDispatch({ repo: "acme/repo", dispatchId: "no-calls", status: "timed_out" });
+    insertDispatch({ repo: "acme/repo", conclusion: "operator_cancelled" });
+    insertDispatch({ repo: "test-org/repo", status: "timed_out" });
+    expect(rc.getFleetReport().byModel).toEqual([expect.objectContaining({
+      stage: "implementation", agent: "unknown", provider: "unknown", model: "unknown",
+      calls: 0, jobs: 2, stoppedJobs: 2, approvedJobs: 0, approvalPct: 0,
+      tokensIn: null, costUsd: null,
+    })]);
+    expect(rc.getFleetReport({ repo: "other/repo" }).byModel).toEqual([]);
   });
 
   it("includes the exact cutoff, stopped conclusions, unknown statistics and measured zero", () => {
@@ -1182,8 +1194,8 @@ describe("fleet model grouping", () => {
       const prices = [{ model: "another-model", inputUsd: "1", outputUsd: "2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
       const report = rc.getFleetReport({}, prices);
       expect(report.byModel).toEqual([
-        { stage: "implementation", agent: "codex", provider: "openai", model: "zero", calls: 3, failedCalls: 0, timedOutCalls: 0, tokensIn: 0, tokensOut: 0, costUsd: 0, estimatedCostUsd: null, jobs: 3, oneShotPct: 1, avgPasses: 2, avgDurationMs: null, stoppedJobs: 2 },
-        { stage: "implementation", agent: "codex", provider: "openai", model: "unpriced", calls: 1, failedCalls: 0, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: null, estimatedCostUsd: null, jobs: 1, oneShotPct: null, avgPasses: 3, avgDurationMs: null, stoppedJobs: 1 },
+        { stage: "implementation", agent: "codex", provider: "openai", model: "zero", calls: 3, failedCalls: 0, timedOutCalls: 0, tokensIn: 0, tokensOut: 0, costUsd: 0, estimatedCostUsd: null, jobs: 3, approvedJobs: 2, approvalPct: 2 / 3, oneShotPct: 1, avgPasses: 2, avgDurationMs: null, stoppedJobs: 2 },
+        { stage: "implementation", agent: "codex", provider: "openai", model: "unpriced", calls: 1, failedCalls: 0, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: null, estimatedCostUsd: null, jobs: 1, approvedJobs: 0, approvalPct: 0, oneShotPct: null, avgPasses: 3, avgDurationMs: null, stoppedJobs: 1 },
       ]);
     } finally {
       clock.mockRestore();

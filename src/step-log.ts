@@ -37,35 +37,50 @@ export function initStepLogTable(): void {
 
 export function upsertStepRecord(jobId: number, step: Step): void {
   const db = getDb();
-  // Shared Restate handlers may deliver a start after completion; guard in the
-  // write itself so concurrent deliveries cannot erase terminal progress.
-  db.prepare(`
-    INSERT INTO step_log
-      (job_id, step_id, step_type, status, started_at, ended_at, parent_step_id, inputs_json, outputs_json, logs_url)
-    VALUES
-      (@jobId, @stepId, @stepType, @status, @startedAt, @endedAt, @parentStepId, @inputsJson, @outputsJson, @logsUrl)
-    ON CONFLICT (job_id, step_id) DO UPDATE SET
-      status         = excluded.status,
-      ended_at       = excluded.ended_at,
-      outputs_json   = excluded.outputs_json,
-      logs_url       = excluded.logs_url
-    WHERE step_log.status = 'running' OR excluded.status <> 'running'
-  `).run({
-    jobId,
-    stepId: step.id,
-    stepType: step.type,
-    status: step.status,
-    startedAt: step.started_at,
-    endedAt: step.ended_at,
-    parentStepId: step.parent_step_id,
-    inputsJson: JSON.stringify(step.inputs),
-    outputsJson: JSON.stringify(step.outputs),
-    logsUrl: step.logs_url,
-  });
+  db.transaction(() => {
+    if (step.status === "running") {
+      const job = db.prepare("SELECT status, completed_at FROM dispatch_log WHERE id = ?").get(jobId) as
+        { status: string; completed_at: number | null } | undefined;
+      if (job && ["completed", "review_failed", "failed", "timed_out", "dispatch-failed"].includes(job.status)) {
+        // Keep completed details; retain an unseen late start as a closed row.
+        if (getStepRecord(jobId, step.id)) return;
+        step = { ...step, status: "cancelled",
+          ended_at: new Date(job.completed_at ?? Date.now()).toISOString() };
+      }
+    }
+    // Shared Restate handlers may deliver a start after completion; guard in the
+    // write itself so concurrent deliveries cannot erase terminal progress.
+    db.prepare(`
+      INSERT INTO step_log
+        (job_id, step_id, step_type, status, started_at, ended_at, parent_step_id, inputs_json, outputs_json, logs_url)
+      VALUES
+        (@jobId, @stepId, @stepType, @status, @startedAt, @endedAt, @parentStepId, @inputsJson, @outputsJson, @logsUrl)
+      ON CONFLICT (job_id, step_id) DO UPDATE SET
+        status         = excluded.status,
+        ended_at       = excluded.ended_at,
+        outputs_json   = excluded.outputs_json,
+        logs_url       = excluded.logs_url
+      WHERE step_log.status = 'running' OR excluded.status <> 'running'
+    `).run({
+      jobId,
+      stepId: step.id,
+      stepType: step.type,
+      status: step.status,
+      startedAt: step.started_at,
+      endedAt: step.ended_at,
+      parentStepId: step.parent_step_id,
+      inputsJson: JSON.stringify(step.inputs),
+      outputsJson: JSON.stringify(step.outputs),
+      logsUrl: step.logs_url,
+    });
+  })();
 }
 
 export function cancelRunningSteps(jobId: number): void {
-  getDb().prepare(`
+  const db = getDb();
+  // A minimal/older database may have jobs but no step reports yet.
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'step_log'").get()) return;
+  db.prepare(`
     UPDATE step_log SET status = 'cancelled', ended_at = ?
     WHERE job_id = ? AND status = 'running'
   `).run(new Date().toISOString(), jobId);

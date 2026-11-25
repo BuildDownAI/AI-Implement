@@ -86,6 +86,7 @@ describe("recorded get_fleet_report exchanges", () => {
     seedFleet();
     const recorded = await recordExchange("get_fleet_report", { args }, { objectClient: () => ({ current: async () => ({ prices: [] }) }) });
     expect(payload(recorded).byModel).toHaveLength(1);
+    expect(payload(recorded).byModel[0]).toMatchObject({ approvedJobs: 0, approvalPct: 0 });
     expect(payload(recorded).byRepo).toEqual([{
       repo: "acme/widgets", jobs, issues: jobs, completed: 1, failed: jobs - 1,
       merged: 0, avgPasses: null, costUsd: null,

@@ -134,6 +134,11 @@ afterEach(() => vi.useRealTimers());
 
 describe("closing steps when a job stops without a report", () => {
   it.each([
+    ["completed", null],
+    ["review_failed", null],
+    ["dispatch-failed", null],
+    ["failed", "operator_cancelled"],
+    ["failed", "failure"],
     ["timed_out", null],
     ["failed", "ended_without_callback"],
     ["failed", "workflow_cancelled"],
@@ -166,18 +171,28 @@ describe("closing steps when a job stops without a report", () => {
     expect(stepLog.getStepsByJobId(jobId)).toEqual(closed);
   });
 
-  it.each([
-    ["completed", null],
-    ["failed", "failure"],
-    ["failed", "operator_cancelled"],
-    ["failed", "destroyed-by-admin"],
-    ["failed", "exit_1"],
-  ] as const)("keeps running steps for %s / %s", (status, conclusion) => {
-    const jobId = log.appendLog({ issueId: "live" });
+  it("closes unseen delayed starts and decision-gate steps, allowing later results", () => {
+    const jobId = log.appendLog({ issueId: "gate" });
+    log.updateJobStatus(jobId, "running");
     stepLog.upsertStepRecord(jobId, makeStep());
-    const before = stepLog.getStepsByJobId(jobId);
-    log.updateJobStatus(jobId, status, conclusion);
-    expect(stepLog.getStepsByJobId(jobId)).toEqual(before);
+    expect(log.markJobAwaitingDecision(jobId)).toBe(true);
+    expect(stepLog.getStepRecord(jobId, "clone")?.status).toBe("cancelled");
+    stepLog.upsertStepRecord(jobId, makeStep({ id: "late" }));
+    expect(stepLog.getStepRecord(jobId, "late")).toMatchObject({ status: "cancelled", endedAt: expect.any(String) });
+    stepLog.upsertStepRecord(jobId, makeStep({ id: "late", status: "passed", outputs: { done: true } }));
+    expect(stepLog.getStepRecord(jobId, "late")?.outputsJson).toBe('{"done":true}');
+  });
+
+  it("closes steps when approval or orphaned planning finalizes a job", () => {
+    const approved = log.appendLog({ issueId: "approved" });
+    stepLog.upsertStepRecord(approved, makeStep());
+    log.stampJobApproved(approved, "https://github.com/acme/repo/pull/1");
+    expect(stepLog.getStepRecord(approved, "clone")?.status).toBe("cancelled");
+    const orphan = log.appendLog({ issueId: "orphan", phase: "planning" });
+    log.updateJobStatus(orphan, "unknown");
+    stepLog.upsertStepRecord(orphan, makeStep());
+    expect(log.completeOrphanedPlanningJobs("orphan")).toBe(1);
+    expect(stepLog.getStepRecord(orphan, "clone")?.status).toBe("cancelled");
   });
 
   it("uses incoming arguments even when the stored conclusion is preserved", () => {
@@ -202,6 +217,13 @@ describe("closing steps when a job stops without a report", () => {
     expect(stepLog.getStepRecord(jobId, "clone")).toMatchObject({
       status: "passed", endedAt, outputsJson: JSON.stringify({ result: "finished" }),
     });
+  });
+
+  it("can finalize a job before the step table exists", async () => {
+    const { getDb } = await import("../dedup.js");
+    const jobId = log.appendLog({ issueId: "minimal-schema" });
+    getDb().exec("DROP TABLE step_log");
+    expect(() => log.updateJobStatus(jobId, "completed")).not.toThrow();
   });
 
   it("can stop a job with no step reports", () => {

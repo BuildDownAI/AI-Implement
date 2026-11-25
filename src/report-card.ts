@@ -70,6 +70,9 @@ export interface ModelAggregate {
   costUsd: number | null;
   estimatedCostUsd: number | null;
   jobs: number;
+  /** Distinct jobs with stored approval evidence; denominator is jobs, including stopped runs. */
+  approvedJobs: number;
+  approvalPct: number | null;
   oneShotPct: number | null;
   avgPasses: number | null;
   avgDurationMs: number | null;
@@ -440,6 +443,7 @@ export function getIssueReportCard(identifier: string, prices: readonly ModelPri
 // ---- getFleetReport helpers ----
 
 interface FleetDispatchRow {
+  approved: number;
   dispatch_id: string | null;
   completed_at: number | null;
   conclusion: string | null;
@@ -608,7 +612,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
 
   const dispatches = db
     .prepare(
-      `SELECT id, issue_id, issue_identifier, repo, dispatched_at, phase, status, dispatch_id, completed_at, conclusion
+      `SELECT id, issue_id, issue_identifier, repo, dispatched_at, phase, status, dispatch_id, completed_at, conclusion, approved
        FROM dispatch_log
        WHERE dispatched_at >= ?
          AND repo IS NOT NULL
@@ -632,7 +636,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
       group = { dispatchIds: new Set(), entry: {
         stage: row.stage, agent: row.agent, provider: row.provider, model: row.model,
         calls: 0, failedCalls: 0, timedOutCalls: 0, tokensIn: null, tokensOut: null,
-        costUsd: null, estimatedCostUsd: null, jobs: 0, oneShotPct: null,
+        costUsd: null, estimatedCostUsd: null, jobs: 0, approvedJobs: 0, approvalPct: null, oneShotPct: null,
         avgPasses: null, avgDurationMs: null, stoppedJobs: null,
       } };
       groups.set(key, group);
@@ -648,18 +652,36 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
     if (call.costStatus === "reported") a.costUsd = addCost(a.costUsd, call.costUsd);
     else a.estimatedCostUsd = addCost(a.estimatedCostUsd, estimateCallCostUsd(call, prices));
   }
-  const byModel = Array.from(groups.values(), ({ entry, dispatchIds }) => {
-    const jobs = dispatches.filter(d => d.dispatch_id !== null && dispatchIds.has(d.dispatch_id));
+  const isStopped = (d: FleetDispatchRow) => d.status === "timed_out"
+    || ["ended_without_callback", "workflow_cancelled", "operator_cancelled", "destroyed-by-admin"].includes(d.conclusion ?? "");
+  const jobsWithCalls = new Set(calls.map(c => c.dispatch_id));
+  // No model evidence survives some stopped non-serve runs. Never substitute
+  // current configuration for the model that actually ran.
+  const unknownJobs = dispatches.filter(d => isStopped(d) && (!d.dispatch_id || !jobsWithCalls.has(d.dispatch_id)));
+  const byModel = Array.from(groups.values(), ({ entry, dispatchIds }) => ({
+    entry, jobs: dispatches.filter(d => d.dispatch_id !== null && dispatchIds.has(d.dispatch_id)),
+  }));
+  for (const stage of new Set(unknownJobs.map(d => d.phase))) {
+    byModel.push({ jobs: unknownJobs.filter(d => d.phase === stage), entry: {
+      stage, agent: "unknown", provider: "unknown", model: "unknown",
+      calls: 0, failedCalls: 0, timedOutCalls: 0, tokensIn: null, tokensOut: null,
+      costUsd: null, estimatedCostUsd: null, jobs: 0, approvedJobs: 0, approvalPct: null,
+      oneShotPct: null, avgPasses: null, avgDurationMs: null, stoppedJobs: null,
+    } });
+  }
+  const modelAggregates = byModel.map(({ entry, jobs }) => {
     entry.jobs = jobs.length;
+    const stats = jobs.map(d => jobPassStats(db, d.id));
+    entry.approvedJobs = jobs.filter((d, i) => d.approved === 1 || d.conclusion === "runner_approved" || stats[i]?.approved === true).length;
+    entry.approvalPct = jobs.length ? entry.approvedJobs / jobs.length : null;
+    entry.stoppedJobs = jobs.filter(isStopped).length;
     if (entry.stage === "implementation") {
-      const stats = jobs.map(d => jobPassStats(db, d.id));
       const eligible = stats.filter(s => s != null && s.oneShot !== null);
       const passes = stats.filter(s => s != null && s.passesKnown);
       const durations = jobs.filter(d => d.completed_at !== null);
       entry.oneShotPct = eligible.length ? eligible.filter(s => s!.oneShot).length / eligible.length : null;
       entry.avgPasses = passes.length ? passes.reduce((sum, s) => sum + s!.passes, 0) / passes.length : null;
       entry.avgDurationMs = durations.length ? durations.reduce((sum, d) => sum + d.completed_at! - d.dispatched_at, 0) / durations.length : null;
-      entry.stoppedJobs = jobs.filter(d => d.status === "timed_out" || d.conclusion === "ended_without_callback" || d.conclusion === "workflow_cancelled").length;
     }
     return entry;
   });
@@ -930,7 +952,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
 
   return {
     byRepo,
-    byModel,
+    byModel: modelAggregates,
     oneShotPct,
     eventualPct,
     planning: { planned: cohortFor(true), unplanned: cohortFor(false) },
