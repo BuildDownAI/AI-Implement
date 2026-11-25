@@ -1,6 +1,6 @@
 import { loadStoredSnapshot } from "./agent-run-preparation.js";
 import { estimateCallCostUsd, type ModelPriceRates } from "./model-price-estimate.js";
-import { toInvocation } from "./job-accounting.js";
+import { cut, toInvocation } from "./job-accounting.js";
 import { getDb } from "./dedup.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 
@@ -629,6 +629,10 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
   `).all(since, repoFilter, repoFilter) as Parameters<typeof toInvocation>[0][];
   const groups = new Map<string, { entry: ModelAggregate; dispatchIds: Set<string> }>();
   const modelGroup = (selection: Pick<ModelAggregate, "stage" | "agent" | "provider" | "model">) => {
+    selection = {
+      stage: cut(selection.stage), agent: cut(selection.agent),
+      provider: cut(selection.provider), model: cut(selection.model),
+    };
     const key = JSON.stringify([selection.stage, selection.agent, selection.provider, selection.model]);
     let group = groups.get(key);
     if (!group) {

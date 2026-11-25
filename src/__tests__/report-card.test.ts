@@ -1135,6 +1135,19 @@ describe("fleet model grouping", () => {
         JSON.stringify({ orchestratorDefault: revision, project: revision }));
   }
 
+  it.each(["model", "m".repeat(1999)])("sanitizes model labels before grouping (%#)", (model) => {
+    const dirtyModel = model === "model" ? "mo\u0000del" : model + "\u0000😀tail";
+    insertDispatch({ repo: "acme/repo", dispatchId: "dirty-call" });
+    insertDispatch({ repo: "acme/repo", dispatchId: "dirty-snapshot", status: "timed_out" });
+    storeSnapshot("dirty-snapshot", "model");
+    dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES ('dirty', 'dirty-call', 'implementation', 'profile', 1, 'codex', 'openai', ?, 'api-key', 'succeeded', 1, '{}')`).run(dirtyModel);
+    const groups = rc.getFleetReport().byModel;
+    expect(groups).toHaveLength(model === "model" ? 1 : 2);
+    expect(groups[0]).toMatchObject({ model, calls: 1, jobs: model === "model" ? 2 : 1 });
+  });
+
   it("attributes call-free stopped jobs to frozen implementation models within the dispatch filters", () => {
     const now = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
