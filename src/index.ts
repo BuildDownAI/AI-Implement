@@ -1,5 +1,6 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { reconcileClosedIssues } from "./closed-issue-reconcile.js";
 import { handleKgPackageUpload } from "./kg-package-upload.js";
 import { DATA_ROOT as KG_PACKAGE_DATA_ROOT } from "./kg-refresh.js";
 import { resolveKgRefreshSource, setBootKgRefreshSource, kgRefreshRunRepo, getBootKgRefreshSource } from "./kg-refresh-source.js";
@@ -1054,6 +1055,11 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
 
   // Process any pending reconciliation jobs triggered by merged PRs
   await processReconciliations(config, registry);
+  try {
+    await reconcileClosedIssues({ getMappings, providerFor: (mapping) => registry.forMapping(mapping) });
+  } catch (err) {
+    console.error("[closed-issue-reconcile] Sweep failed:", err);
+  }
 
   // Recover a missed close webhook for an active Restate owner. Cancellation
   // remains durable during deploy hold; unknown GitHub state leaves authority
