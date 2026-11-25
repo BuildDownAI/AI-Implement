@@ -255,15 +255,21 @@ describe("reports page render", () => {
 });
 
  it("renders model columns safely and tolerates older reports", async () => {
-  const report = { ...baseReport, byModel: [{ stage: "implementation", agent: "codex", provider: "<provider>", model: "model<x>", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: null, costUsd: 0, estimatedCostUsd: 99, jobs: 1, oneShotPct: 1, avgPasses: 1, avgDurationMs: 50, stoppedJobs: 0 }] };
+  const report = { ...baseReport, byModel: [{ stage: "implementation", agent: "codex", provider: "<provider>", model: "model<x>", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: null, costUsd: 0, estimatedCostUsd: 99, jobs: 1, oneShotPct: 1, approvedJobs: 1, approvedPct: 0.5, avgPasses: 1, avgDurationMs: 50, stoppedJobs: 0 }] };
   const { win, doc } = mountPage(report);
   await win.loadReports();
   const row = doc.querySelector("#reports-model-body tr")!;
-  expect(row.querySelectorAll("td").length).toBe(15);
+  expect(row.querySelectorAll("td").length).toBe(17);
+  expect(Array.from(doc.querySelectorAll("#reports-model-body")[0]!.previousElementSibling!.querySelectorAll("th")).slice(11, 15).map(cell => cell.textContent)).toEqual(["One-shot", "Approved jobs", "Approved", "Avg passes"]);
+  expect(Array.from(row.querySelectorAll("td")).slice(11, 15).map(cell => cell.textContent)).toEqual(["100.0%", "1", "50.0%", "1.0"]);
   expect(row.textContent).toContain("<provider>model<x>");
   expect(row.querySelector("provider")).toBeNull();
   expect(row.textContent).toContain("—$0.00");
   expect(row.textContent).not.toContain("99");
+  const nullableReport: FleetReport = { ...report, byModel: [{ ...report.byModel[0]!, approvedJobs: null, approvedPct: null }] };
+  const nullable = mountPage(nullableReport);
+  await nullable.win.loadReports();
+  expect(Array.from(nullable.doc.querySelectorAll("#reports-model-body td")).slice(12, 14).map(cell => cell.textContent)).toEqual(["—", "—"]);
   delete (report as Partial<FleetReport>).byModel;
   await win.loadReports();
   expect(doc.querySelectorAll("#reports-model-body tr").length).toBe(0);

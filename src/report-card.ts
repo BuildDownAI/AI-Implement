@@ -72,6 +72,8 @@ export interface ModelAggregate {
   estimatedCostUsd: number | null;
   jobs: number;
   oneShotPct: number | null;
+  approvedJobs: number | null;
+  approvedPct: number | null;
   avgPasses: number | null;
   avgDurationMs: number | null;
   stoppedJobs: number | null;
@@ -633,7 +635,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
       group = { dispatchIds: new Set(), entry: {
         stage: selection.stage, agent: selection.agent, provider: selection.provider, model: selection.model,
         calls: 0, failedCalls: 0, timedOutCalls: 0, tokensIn: null, tokensOut: null,
-        costUsd: null, estimatedCostUsd: null, jobs: 0, oneShotPct: null,
+        costUsd: null, estimatedCostUsd: null, jobs: 0, oneShotPct: null, approvedJobs: null, approvedPct: null,
         avgPasses: null, avgDurationMs: null, stoppedJobs: null,
       } };
       groups.set(key, group);
@@ -669,6 +671,9 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
     entry.jobs = jobs.length;
     if (entry.stage === "implementation") {
       const stats = jobs.map(d => jobPassStats(db, d.id));
+      const measured = stats.filter(s => s != null);
+      entry.approvedJobs = measured.filter(s => s.approved).length;
+      entry.approvedPct = measured.length ? entry.approvedJobs / measured.length : null;
       const eligible = stats.filter(s => s != null && s.oneShot !== null);
       const passes = stats.filter(s => s != null && s.passesKnown);
       const durations = jobs.filter(d => d.completed_at !== null);
