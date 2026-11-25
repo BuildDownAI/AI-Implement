@@ -1117,6 +1117,79 @@ describe("getReviewerScorecard", () => {
 });
 
 describe("fleet model grouping", () => {
+  function storeSnapshot(dispatchId: string, model = "frozen", malformed = false) {
+    const stages = Object.fromEntries(["planning", "implementation", "review"].map(stage => [stage, {
+      agent: "codex", provider: "openai", model: stage === "implementation" ? model : stage,
+      accountProfileId: "profile", invocationTimeoutMs: 1000,
+    }]));
+    const sources = Object.fromEntries(Object.entries(stages).map(([stage, selection]) =>
+      [stage, Object.fromEntries(Object.keys(selection).map(field => [field, "project"]))]));
+    const profiles = Object.fromEntries(Object.keys(stages).map(stage => [stage, {
+      id: "profile", identity: "profile", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key",
+    }]));
+    const revision = { configRevisionId: "revision", revision: 1 };
+    dedup.getDb().prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'project', ?, ?, ?, 1)`).run(dispatchId, dispatchId,
+        malformed ? "{" : JSON.stringify({ stages, profiles }), JSON.stringify(sources),
+        JSON.stringify({ orchestratorDefault: revision, project: revision }));
+  }
+
+  it("attributes call-free stopped jobs to frozen implementation models within the dispatch filters", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const before = rc.getFleetReport();
+      const cutoff = now - 30 * 86400000;
+      for (const [i, conclusion] of [undefined, "ended_without_callback", "workflow_cancelled"].entries()) {
+        const dispatchId = `stopped-${i}`;
+        const job = insertDispatch({ repo: "acme/repo", dispatchId, status: i === 0 ? "timed_out" : "failed", conclusion, dispatchedAt: cutoff });
+        dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = dispatched_at + 500 WHERE id = ?").run(job);
+        storeSnapshot(dispatchId, i === 2 ? "separate" : "frozen");
+      }
+      for (const [dispatchId, options] of [
+        ["other", { repo: "other/repo" }], ["test", { repo: "test-org/repo" }],
+        ["old", { dispatchedAt: cutoff - 1 }], ["malformed", {}], ["missing", {}],
+      ] as Array<[string, Parameters<typeof insertDispatch>[0]]>) {
+        insertDispatch({ repo: "acme/repo", status: "timed_out", dispatchId, ...options });
+        if (dispatchId !== "missing") storeSnapshot(dispatchId, "excluded", dispatchId === "malformed");
+      }
+      insertDispatch({ repo: "acme/repo", status: "timed_out" });
+      insertDispatch({ repo: "acme/repo", dispatchId: "completed" });
+      storeSnapshot("completed", "excluded");
+      const report = rc.getFleetReport({ repo: "acme/repo" });
+      const empty = { stage: "implementation", agent: "codex", provider: "openai", calls: 0, failedCalls: 0,
+        timedOutCalls: 0, tokensIn: null, tokensOut: null, costUsd: null, estimatedCostUsd: null,
+        oneShotPct: null, avgPasses: null, avgDurationMs: 500 };
+      expect(report.byModel).toEqual([
+        { ...empty, model: "frozen", jobs: 2, stoppedJobs: 2 },
+        { ...empty, model: "separate", jobs: 1, stoppedJobs: 1 },
+      ]);
+      expect(rc.getFleetReport({ repo: "other/repo" }).byModel).toMatchObject([{ model: "excluded", jobs: 1, stoppedJobs: 1 }]);
+      expect(before.byModel).toEqual([]);
+    } finally { clock.mockRestore(); }
+  });
+
+  it("keeps actual calls authoritative over snapshots, including calls in other stages", () => {
+    for (const dispatchId of ["actual", "planning-only"]) {
+      insertDispatch({ repo: "acme/repo", dispatchId, status: "timed_out" });
+      storeSnapshot(dispatchId);
+    }
+    const before = rc.getFleetReport();
+    const insert = dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, ?, 'profile', 1, 'codex', 'openai', 'actual-model', 'api-key', 'failed', 1, '{}')`);
+    insert.run("a", "actual", "implementation");
+    insert.run("b", "actual", "implementation");
+    insert.run("c", "planning-only", "planning");
+    const report = rc.getFleetReport();
+    expect(report.byModel).toMatchObject([
+      { model: "actual-model", calls: 2, jobs: 1, stoppedJobs: 1 },
+      { stage: "planning", calls: 1, jobs: 1, stoppedJobs: null },
+    ]);
+    expect({ ...report, byModel: [] }).toEqual({ ...before, byModel: [] });
+  });
+
   it("deduplicates jobs, separates outcomes and measured costs, and filters dispatches", () => {
     const now = Date.now();
     const a = insertDispatch({ repo: "acme/repo", dispatchId: "a", dispatchedAt: now - 1000 });
