@@ -6,11 +6,11 @@ import { decideAvailabilityAction } from "../../deploy-policy.js";
 import * as restate from "@restatedev/restate-sdk";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, type SelfDeployRecord, type SelfDeployStartResult, type SelfDeployStatus, type SelfDeploySetOptionsResult } from "../../restate/self-deploy.js";
+import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, type SelfDeployConfig, type SelfDeployRecord, type SelfDeployStartResult, type SelfDeployStatus, type SelfDeploySetOptionsResult } from "../../restate/self-deploy.js";
 import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, setObjectState, startRetryEnabled, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
 import * as githubAuth from "../../github-app-auth.js";
-import { githubImagePublished } from "../../restate/self-deploy.js";
-import { fakeFetch } from "../helpers/fake-fetch.js";
+import { anonymousImageReadable, githubImagePublished } from "../../deploy-availability.js";
+import { fakeFetch, type Routes } from "../helpers/fake-fetch.js";
 import * as notify from "../../notify.js";
 import { COMMIT, deployFixture } from "./self-deploy-fixture.js";
 
@@ -157,7 +157,8 @@ describe("SelfDeploy durable phase machine", () => {
     f.deps.getDeployPolicy = vi.fn(() => watchedPolicy);
     f.config.kgSourceRepo = "owner/kg";
     vi.mocked(f.deps.head).mockImplementation(async (target, requestedBranch) => target.owner === "fork-owner" && target.repo === "AI-Implement" && requestedBranch === branch ? watchedHead : COMMIT);
-    const poll = { configured: true, available: true, headCommit: watchedHead, held: false, policy: watchedPolicy, lastActedCommit: null as string | null };
+    // A KG orchestrator builds its image, so the poll finds the head deployable at once.
+    const poll = { configured: true, available: true, headCommit: watchedHead, held: false, policy: watchedPolicy, lastActedCommit: null as string | null, imageReady: true };
     expect(decideAvailabilityAction(poll)).toBe("deploy");
     const result = await call<SelfDeployStartResult>(env, "start", { branch, requestedBy: "auto-deploy" });
     expect(result).toMatchObject({ commit: watchedHead, alreadyActive: false });
@@ -177,17 +178,89 @@ describe("SelfDeploy durable phase machine", () => {
     const commit = "fedcba9876543210fedcba9876543210fedcba98";
     f.deps.getDeployPolicy = vi.fn(() => ({ watchedRepo: "fork-owner/AI-Implement", watchedRef: "testing" }));
     f.state.head = commit;
-    const image = `registry.fly.io/builddown-orchestrator-image:${branch}-fedcba9`;
-    expect(await call<SelfDeployStartResult>(env, "start", { branch, requestedBy: "owner" })).toMatchObject({ commit, image, alreadyActive: false });
-    expect(f.deps.imagePublished).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ owner: "fork-owner", repo: "AI-Implement" }), commit);
-    expect((await read(env))?.target).toEqual({ repo: "fork-owner/AI-Implement", branch, commit, image, source: "published" });
-    await call(env, "cancel", { requestedBy: "owner" });
+    // The status and the image name the same repository: the fork's publish job pushes to the fork owner's namespace.
+    const image = `ghcr.io/fork-owner/ai-implement-orchestrator:${branch}-fedcba9`;
+    try {
+      expect(await call<SelfDeployStartResult>(env, "start", { branch, requestedBy: "owner" })).toMatchObject({ commit, image, alreadyActive: false });
+      expect(f.deps.imagePublished).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ owner: "fork-owner", repo: "AI-Implement" }), commit, "orchestrator-image/public");
+      expect((await read(env))?.target).toEqual({ repo: "fork-owner/AI-Implement", branch, commit, image, source: "published" });
+    } finally {
+      // A failure above must not leave a draining deploy on the shared key for the tests after it.
+      await call(env, "cancel", { requestedBy: "owner" });
+    }
+  });
+  it.each(VARIANTS)("resolves the image each kind of orchestrator applies (%s)", async label => {
+    const env = envs.get(label)!;
+    // Each kind deploys its own app: the object key and flyOrchestratorApp are both FLY_APP_NAME in production, and a built image is named after it.
+    const kinds: { key: string; config: Partial<SelfDeployConfig>; image: string; source: "published" | "built" }[] = [
+      // Any Fly organization can pull the public GHCR image, and registry repository names are lowercase.
+      { key: "self-hosted", config: { selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement" } }, image: "ghcr.io/builddownai/ai-implement-orchestrator:testing-abcdef0", source: "published" },
+      { key: "self-hosted-with-kg", config: { kgSourceRepo: "owner/kg" }, image: "registry.fly.io/self-hosted-with-kg:deploy-abcdef0", source: "built" },
+      { key: "control-plane", config: { imageApp: "owned-images" }, image: "registry.fly.io/owned-images:testing-abcdef0", source: "published" },
+    ];
+    for (const { key, config, image, source } of kinds) {
+      f = deployFixture(); Object.assign(f.config, { flyOrchestratorApp: key }, config);
+      try {
+        expect(await callObject(env.baseUrl(), "SelfDeploy", key, "start", { branch: "testing", requestedBy: "owner" }), key).toMatchObject({ commit: COMMIT, image, alreadyActive: false });
+        expect((await callObject<SelfDeployStatus>(env.baseUrl(), "SelfDeploy", key, "status", {})).deploy?.target, key).toMatchObject({ commit: COMMIT, image, source });
+        // Only the public image is read anonymously: a built image needs no publication, and Fly's registry no anonymous read.
+        expect(vi.mocked(f.deps.imageReadable).mock.calls, key).toEqual(key === "self-hosted" ? [[image]] : []);
+      } finally {
+        await callObject(env.baseUrl(), "SelfDeploy", key, "cancel", { requestedBy: "owner" });
+      }
+    }
+  });
+  it.each(VARIANTS)("refuses a published image nobody can pull before the hold, naming the image (%s)", async label => {
+    f = deployFixture(); const env = envs.get(label)!;
+    const previous = await read(env);
+    f.state.readable = false;
+    const warnings = vi.spyOn(console, "warn");
+    try {
+      expect(await start(env)).toEqual({ reason: "image-not-published" });
+      const image = "ghcr.io/owner/ai-implement-orchestrator:testing-abcdef0";
+      expect(f.deps.imageReadable).toHaveBeenCalledExactlyOnceWith(image);
+      expect(warnings.mock.calls.flat().join("\n")).toContain(`[self-deploy] ${image} cannot be pulled anonymously`);
+      expect(await read(env)).toEqual(previous);
+      expect(f.deps.setHold).not.toHaveBeenCalled();
+      for (const flyCall of Object.values(f.deps.fly)) expect(flyCall).not.toHaveBeenCalled();
+    } finally {
+      warnings.mockRestore();
+      // A deploy this test started by mistake must not hold the shared key for the tests after it.
+      await call(env, "cancel", { requestedBy: "owner" });
+    }
+  });
+  it.each(VARIANTS)("reads the public image through the real GHCR client before the hold (%s)", async label => {
+    const env = envs.get(label)!;
+    const realFetch = globalThis.fetch;
+    const manifest = "HEAD /v2/owner/ai-implement-orchestrator/manifests/testing-abcdef0";
+    // index.ts wires imageReadable to anonymousImageReadable, which reaches GHCR through the global fetch.
+    const startThroughGhcr = async (routes: Routes) => {
+      f = deployFixture();
+      f.deps.imageReadable = vi.fn(image => anonymousImageReadable(image));
+      const ghcr = fakeFetch(routes);
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => String(input).startsWith("https://ghcr.io/") ? ghcr.fetch(input, init) : realFetch(input, init));
+      try { return { result: await start(env), ghcr }; } finally { fetchSpy.mockRestore(); }
+    };
+    // A private or missing package: GHCR refuses the anonymous token, with the body it sends.
+    const refused = await startThroughGhcr({ "GET /token": { status: 403, json: { errors: [{ code: "DENIED", message: "requested access to the resource is denied" }] } } });
+    expect(refused.result).toEqual({ reason: "image-not-published" });
+    expect(refused.ghcr.calls.map(c => `${c.method} ${c.path}`)).toEqual(["GET /token"]);
+    expect(f.deps.setHold).not.toHaveBeenCalled();
+    // A public tag: the token, then the manifest, and only then the hold.
+    const readable = await startThroughGhcr({ "GET /token": { json: { token: "anonymous-token" } }, [manifest]: { status: 200 } });
+    try {
+      expect(readable.result).toMatchObject({ image: "ghcr.io/owner/ai-implement-orchestrator:testing-abcdef0", alreadyActive: false });
+      expect(readable.ghcr.calls.map(c => `${c.method} ${c.path}`)).toEqual(["GET /token", manifest]);
+      expect(f.deps.setHold).toHaveBeenCalledWith(true);
+    } finally {
+      await call(env, "cancel", { requestedBy: "owner" });
+    }
   });
   it("reads successful public image publication without an Authorization header", async () => {
     const mint = vi.spyOn(githubAuth, "mintSourceTokenOrJwt").mockResolvedValue({ token: null, authMode: "public" });
     const github = fakeFetch({ "GET /repos/owner/repo/commits/abcdef0123456789/statuses": { json: [{ context: "orchestrator-image/published", state: "success" }] } }).install();
     try {
-      expect(await githubImagePublished("app", "key", { owner: "owner", repo: "repo" }, "abcdef0123456789")).toBe(true);
+      expect(await githubImagePublished("app", "key", { owner: "owner", repo: "repo" }, "abcdef0123456789", "orchestrator-image/published")).toBe(true);
       expect(github.calls).toHaveLength(1);
       expect(github.calls[0].headers.has("authorization")).toBe(false);
     } finally { mint.mockRestore(); }
@@ -199,7 +272,7 @@ describe("SelfDeploy durable phase machine", () => {
     const github = fakeFetch({ "GET /repos/owner/repo/commits/abcdef0123456789/statuses": { json: [{ context: "ci", state: "success" }] } });
     const realFetch = globalThis.fetch;
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => String(input).startsWith("https://api.github.com/") ? github.fetch(input, init) : realFetch(input, init));
-    f.deps.imagePublished = vi.fn((target, commit) => githubImagePublished("app", "key", target, commit));
+    f.deps.imagePublished = vi.fn((target, commit, context) => githubImagePublished("app", "key", target, commit, context));
     try {
       expect(await start(env)).toEqual({ reason: "image-not-published" });
       expect(github.calls).toHaveLength(1);
@@ -208,6 +281,34 @@ describe("SelfDeploy durable phase machine", () => {
       for (const flyCall of Object.values(f.deps.fly)) expect(flyCall).not.toHaveBeenCalled();
       expect(f.deps.flyctl).not.toHaveBeenCalled();
     } finally { fetchSpy.mockRestore(); mint.mockRestore(); }
+  });
+  it.each(VARIANTS)("deploys an image only on its own copy's status, so a fork's GHCR-only publish never drains a control-plane machine (%s)", async label => {
+    const env = envs.get(label)!;
+    const realFetch = globalThis.fetch;
+    const mint = vi.spyOn(githubAuth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
+    // The head's statuses as GitHub returns them, through the real status read index.ts wires in.
+    const startWithStatuses = async (contexts: string[], config: Partial<SelfDeployConfig> = {}) => {
+      f = deployFixture(); Object.assign(f.config, config);
+      f.deps.imagePublished = vi.fn((target, commit, context) => githubImagePublished("app", "key", target, commit, context));
+      const github = fakeFetch({ "GET /repos/owner/repo/commits/abcdef0123456789/statuses": { json: contexts.map(context => ({ context, state: "success" })) } });
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => String(input).startsWith("https://api.github.com/") ? github.fetch(input, init) : realFetch(input, init));
+      try { return await start(env); } finally { fetchSpy.mockRestore(); }
+    };
+    try {
+      // A fork's publish without FLY_IMAGE_PUSH_TOKEN: its GHCR copy is public, and the Fly image app never received the image.
+      expect(await startWithStatuses(["orchestrator-image/public"], { imageApp: "owned-images" })).toEqual({ reason: "image-not-published" });
+      expect(f.deps.setHold).not.toHaveBeenCalled();
+      // A commit only Fly's image app holds, as the publish job before GHCR left it.
+      expect(await startWithStatuses(["orchestrator-image/published"])).toEqual({ reason: "image-not-published" });
+      expect(f.deps.setHold).not.toHaveBeenCalled();
+      // Each copy's own status starts a deploy of that copy.
+      expect(await startWithStatuses(["orchestrator-image/published"], { imageApp: "owned-images" })).toMatchObject({ image: "registry.fly.io/owned-images:testing-abcdef0", alreadyActive: false });
+      await call(env, "cancel", { requestedBy: "owner" });
+      expect(await startWithStatuses(["orchestrator-image/public"])).toMatchObject({ image: "ghcr.io/owner/ai-implement-orchestrator:testing-abcdef0", alreadyActive: false });
+    } finally {
+      mint.mockRestore();
+      await call(env, "cancel", { requestedBy: "owner" });
+    }
   });
   it.each(VARIANTS)("refuses missing images/auth, unknown head and missing configuration without hold or Fly (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
@@ -219,6 +320,8 @@ describe("SelfDeploy durable phase machine", () => {
     }
     for (const status of [401, 403]) expect(warnings.mock.calls.flat().join("\n")).toContain(`image check unauthorized HTTP ${status}`);
     warnings.mockRestore();
+    // The status is read first, so an unpublished commit's image is never read.
+    expect(f.deps.imageReadable).not.toHaveBeenCalled();
     f.state.head = null;
     expect(await start(env)).toEqual({ reason: "head-unknown" });
     f.config.flyDeployToken = undefined;
@@ -539,7 +642,7 @@ describe("SelfDeploy durable phase machine", () => {
     await start(env); await terminal(env, f, "succeeded");
     await setOptions(env, false);
     expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
-    expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), ["deploy", "--image", "registry.fly.io/builddown-orchestrator-image:testing-abcdef0", "--detach", "--app", "test-app"], "secret-fly", expect.any(AbortSignal));
+    expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), ["deploy", "--image", "ghcr.io/owner/ai-implement-orchestrator:testing-abcdef0", "--detach", "--app", "test-app"], "secret-fly", expect.any(AbortSignal));
   });
   it.each(VARIANTS)("setOptions defaults off, persists across a restart and is refused when the control plane owns the machine (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
@@ -556,7 +659,7 @@ describe("SelfDeploy durable phase machine", () => {
   });
   it.each(VARIANTS)("already-target machines need no update (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!; f.state.work = false;
-    f.machine.config.image = "registry.fly.io/builddown-orchestrator-image:testing-abcdef0";
+    f.machine.config.image = "ghcr.io/owner/ai-implement-orchestrator:testing-abcdef0";
     await start(env); await terminal(env, f, "succeeded");
     expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
   });

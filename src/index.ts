@@ -49,11 +49,11 @@ import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSn
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, onSelfDeployOutcome, postAvailableNotice, postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
-import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
+import { anonymousImageReadable, availableHeadDeployable, githubImagePublished, refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, createRestateDrainProbes, readKgSourceRepo, parseKgSourceRepo, runSelfDeployFlyctl } from "./deploy.js";
-import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, githubImagePublished, type SelfDeployClient } from "./restate/self-deploy.js";
+import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, type SelfDeployClient } from "./restate/self-deploy.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import { finalizeImplementation } from "./implementation-finalize.js";
@@ -532,6 +532,16 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
       const resolvedConfig = { ...config, selfDeployTarget: resolvedPollTarget };
       const availability = getAvailability();
       const head = availability?.headCommit ?? null;
+      const imageReady = await availableHeadDeployable({
+        availability,
+        target: resolvedPollTarget,
+        kgSourceRepo: config.kgSourceRepo,
+        imageApp: process.env.FLY_IMAGE_APP || undefined,
+        reads: {
+          published: (commit, context) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, resolvedPollTarget, commit, context),
+          readable: (image) => anonymousImageReadable(image),
+        },
+      });
 
       const action = decideAvailabilityAction({
         configured: canSelfDeploy(resolvedConfig),
@@ -540,6 +550,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
         held: isDeployHeld(),
         policy: getDeployPolicy(),
         lastActedCommit: getLastActedCommit(),
+        imageReady,
       });
 
       if (action !== "none" && head) {
@@ -5572,7 +5583,8 @@ async function main(): Promise<void> {
       return getRefSha(token, target.owner, target.repo, branch);
     },
     getDeployPolicy,
-    imagePublished: (target, commit) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, target, commit),
+    imagePublished: (target, commit, context) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, target, commit, context),
+    imageReadable: (image) => anonymousImageReadable(image),
     fly: { listMachines, getMachine, updateMachine },
     flyctl: async (record, args, token, signal) => {
       const [owner, repo] = record.target.repo.split("/");

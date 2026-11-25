@@ -208,9 +208,10 @@ describe("self-deploy drain exclusion", () => {
     const auth = await import("../github-app-auth.js");
     const mint = vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
     const mod = await import("../restate/self-deploy.js");
+    const { githubImagePublished } = await import("../deploy-availability.js");
     const statuses = [{ context: "unrelated", state: "success" }, ...(state ? [{ context: "orchestrator-image/published", state }] : [])];
     const fake = fakeFetch({ "GET /repos/watched/source/commits/full-commit/statuses": { json: statuses } }).install();
-    expect(await mod.githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit")).toBe(state === "success");
+    expect(await githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit", "orchestrator-image/published")).toBe(state === "success");
     expect(mint).toHaveBeenCalledWith("app", "key", "watched", { permissions: { statuses: "read" }, repositories: ["source"] });
     expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0].headers.get("authorization")).toBe("Bearer installation-token");
@@ -218,23 +219,34 @@ describe("self-deploy drain exclusion", () => {
     expect(readFileSync(new URL("../restate/self-deploy.ts", import.meta.url), "utf8")).not.toContain("registryHead");
   });
 
+  it("reads only the context it is asked for, so one registry copy's status never stands for the other's", async () => {
+    const auth = await import("../github-app-auth.js");
+    vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
+    const { githubImagePublished } = await import("../deploy-availability.js");
+    fakeFetch({ "GET /repos/watched/source/commits/full-commit/statuses": { json: [{ context: "orchestrator-image/published", state: "success" }] } }).install();
+    const read = (context: string) => githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit", context);
+
+    expect(await read("orchestrator-image/public")).toBe(false);
+    expect(await read("orchestrator-image/published")).toBe(true);
+  });
+
   it("paginates and uses the latest publication status", async () => {
     const auth = await import("../github-app-auth.js");
     vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
-    const { githubImagePublished } = await import("../restate/self-deploy.js");
+    const { githubImagePublished } = await import("../deploy-availability.js");
     const fetchSpy = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(Response.json(Array.from({ length: 100 }, () => ({ context: "ci", state: "success" }))))
       .mockResolvedValueOnce(Response.json([{ context: "orchestrator-image/published", state: "pending" }, { context: "orchestrator-image/published", state: "success" }]));
-    expect(await githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit")).toBe(false);
+    expect(await githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit", "orchestrator-image/published")).toBe(false);
     expect(fetchSpy.mock.calls[1][0]).toContain("page=2");
   });
 
   it("reads public statuses and propagates permission failures", async () => {
     const auth = await import("../github-app-auth.js");
     const mint = vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: null, authMode: "public" });
-    const { githubImagePublished } = await import("../restate/self-deploy.js");
+    const { githubImagePublished } = await import("../deploy-availability.js");
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json([{ context: "orchestrator-image/published", state: "success" }]));
-    const check = () => githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit");
+    const check = () => githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit", "orchestrator-image/published");
     expect(await check()).toBe(true);
     expect(fetchSpy).toHaveBeenCalledOnce();
     mint.mockRejectedValueOnce(Object.assign(new Error("forbidden"), { status: 403 }));
