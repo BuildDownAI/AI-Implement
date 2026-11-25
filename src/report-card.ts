@@ -657,6 +657,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
   // Any real call remains authoritative, even when it belongs to another stage.
   const calledDispatchIds = new Set(calls.map(row => row.dispatch_id));
   for (const dispatch of dispatches) {
+    if (dispatch.phase !== "implementation") continue;
     if (dispatch.dispatch_id === null || calledDispatchIds.has(dispatch.dispatch_id)) continue;
     if (!(dispatch.status === "timed_out" || dispatch.conclusion === "ended_without_callback" || dispatch.conclusion === "workflow_cancelled")) continue;
     const snapshot = loadStoredSnapshot(dispatch.dispatch_id);

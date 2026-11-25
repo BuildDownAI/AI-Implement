@@ -1170,6 +1170,21 @@ describe("fleet model grouping", () => {
     } finally { clock.mockRestore(); }
   });
 
+  it.each(["planning", "kg-refresh"])("does not attribute call-free stopped %s dispatches to implementation models", (phase) => {
+    for (const [i, conclusion] of [undefined, "ended_without_callback", "workflow_cancelled"].entries()) {
+      const dispatchId = `${phase}-${i}`;
+      insertDispatch({ repo: "acme/repo", phase, dispatchId, status: i === 0 ? "timed_out" : "failed", conclusion });
+      storeSnapshot(dispatchId);
+    }
+    expect(rc.getFleetReport().byModel).toEqual([]);
+
+    insertDispatch({ repo: "acme/repo", dispatchId: "implementation", status: "timed_out" });
+    storeSnapshot("implementation");
+    expect(rc.getFleetReport().byModel).toMatchObject([
+      { stage: "implementation", model: "frozen", calls: 0, jobs: 1, stoppedJobs: 1 },
+    ]);
+  });
+
   it("keeps actual calls authoritative over snapshots, including calls in other stages", () => {
     for (const dispatchId of ["actual", "planning-only"]) {
       insertDispatch({ repo: "acme/repo", dispatchId, status: "timed_out" });
