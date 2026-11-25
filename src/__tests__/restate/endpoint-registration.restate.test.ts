@@ -278,7 +278,7 @@ describe("runner deployment registration and removal against a real 1.7.10 admin
     };
     const uri = `http://127.0.0.1:${runnerEndpointPort}`;
 
-    const result = await registerRunnerDeployment(uri, { adminBaseUrl: env.adminAPIBaseUrl(), fetchImpl });
+    const result = await registerRunnerDeployment(uri, runnerDeploymentProbe.name, { adminBaseUrl: env.adminAPIBaseUrl(), fetchImpl });
 
     expect(result).toEqual({ ok: true, deploymentId: expect.stringMatching(/^dp_/) });
     if (!result.ok) throw new Error("registration unexpectedly failed");
@@ -304,7 +304,7 @@ describe("runner deployment registration and removal against a real 1.7.10 admin
       return fetch(input, init);
     };
 
-    const result = await registerRunnerDeployment(`http://127.0.0.1:${port}`, {
+    const result = await registerRunnerDeployment(`http://127.0.0.1:${port}`, runnerDeploymentProbe.name, {
       adminBaseUrl: env.adminAPIBaseUrl(),
       fetchImpl,
     });
@@ -336,6 +336,40 @@ describe("runner deployment registration and removal against a real 1.7.10 admin
     expect(new URL(calls[1].url).searchParams.get("force")).toBe("true");
   });
 
+  it.each([undefined, null, "RunnerNew", [], [null, "RunnerNew", { name: "RunnerOld" }]])(
+    "removes a deployment whose services do not list the expected name: %j",
+    async services => {
+      const fake = fakeFetch({
+        "POST /deployments": { status: 200, json: { id: "dp_old", services } },
+        "DELETE /deployments/dp_old": { status: 404 },
+      });
+      await expect(registerRunnerDeployment("http://runner.test", "RunnerNew", {
+        adminBaseUrl: "http://admin.test", fetchImpl: fake.fetch,
+      })).resolves.toEqual({ ok: false, reason: "unreachable" });
+      expect(fake.calls.map(call => call.method)).toEqual(["POST", "DELETE"]);
+      expect(JSON.parse(fake.calls[0]!.body)).toEqual({ uri: "http://runner.test" });
+      expect(fake.calls[1]!.url.searchParams.get("force")).toBe("true");
+    },
+  );
+
+  it("does not accept a mismatched deployment when removal fails", async () => {
+    const fake = fakeFetch({
+      "POST /deployments": { status: 200, json: { id: "dp_old", services: [] } },
+      "DELETE /deployments/dp_old": { status: 500 },
+    });
+    await expect(registerRunnerDeployment("http://runner.test", "RunnerNew", {
+      adminBaseUrl: "http://admin.test", fetchImpl: fake.fetch,
+    })).rejects.toThrow("HTTP 500");
+  });
+
+  it("rejects an OK response without a deployment id", async () => {
+    const fake = fakeFetch({ "POST /deployments": { status: 200, json: { services: [{ name: "RunnerNew" }] } } });
+    await expect(registerRunnerDeployment("http://runner.test", "RunnerNew", {
+      adminBaseUrl: "http://admin.test", fetchImpl: fake.fetch,
+    })).resolves.toEqual({ ok: false, reason: "rejected", status: 200 });
+    expect(fake.calls).toHaveLength(1);
+  });
+
   it("rejects other refusals with their status, including a non-JSON response", async () => {
     const fake = fakeFetch({
       "POST /deployments": [
@@ -346,12 +380,12 @@ describe("runner deployment registration and removal against a real 1.7.10 admin
     });
     const deps = { adminBaseUrl: "http://admin.test", fetchImpl: fake.fetch };
 
-    await expect(registerRunnerDeployment("http://127.0.0.1:1", deps)).resolves.toEqual({
+    await expect(registerRunnerDeployment("http://127.0.0.1:1", runnerDeploymentProbe.name, deps)).resolves.toEqual({
       ok: false,
       reason: "rejected",
       status: 500,
     });
-    await expect(registerRunnerDeployment("http://127.0.0.1:2", deps)).resolves.toEqual({
+    await expect(registerRunnerDeployment("http://127.0.0.1:2", runnerDeploymentProbe.name, deps)).resolves.toEqual({
       ok: false,
       reason: "rejected",
       status: 403,

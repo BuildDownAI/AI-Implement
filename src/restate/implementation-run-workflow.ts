@@ -486,6 +486,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         if (!deps.runnerRegistration) throw new restate.TerminalError("runner registration requires readers");
         const registered = await registerRunnerDeploymentWithRetry(ctx, {
           ...deps.runnerRegistration(input, jobId),
+          expectedServiceName: `Runner_${dispatchId}`,
           bootstrapDeadlineAt: Math.min(bootstrapDeadlineAt, totalDeadlineAt),
           sleepMs: tickMs,
         });
