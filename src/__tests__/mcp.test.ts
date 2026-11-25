@@ -1988,7 +1988,7 @@ describe("handleMcpRequest", () => {
       const args = { codeRepo: "owner/kg", graphLabel: "Knowledge graph" };
       vi.mocked(toolsClientMock.callTool).mockResolvedValueOnce({
         status: "ok",
-        content: [{ type: "text", text: JSON.stringify({ saved: true, ...args }) }],
+        content: [{ type: "text", text: JSON.stringify({ saved: true, ...args, restartNeeded: true }) }],
       });
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -2006,7 +2006,7 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).not.toBe(true);
       expect(JSON.parse(parsed.result.content[0].text)).toMatchObject({
-        saved: true, codeRepo: args.codeRepo, graphLabel: args.graphLabel,
+        saved: true, codeRepo: args.codeRepo, graphLabel: args.graphLabel, restartNeeded: true,
       });
       expect(toolsClientMock.callTool).toHaveBeenCalledExactlyOnceWith(
         "set_kg_base_settings", args,

@@ -125,6 +125,17 @@ derives the Stardog dataset. The sidecar reads Namespace and Graph name when it
 starts. Select the graph source again, or restart the orchestrator, to apply a
 change to them. A change to KG code repo or Graph label applies at the next orchestrator restart.
 The admin page and the admin MCP tool `set_kg_base_settings` both write these two rows.
+Through `/mcp`, an admin can call `set_kg_base_settings` with
+`{ "codeRepo": "owner/repo", "graphLabel": "My knowledge graph" }`.
+Omit either argument to preserve it; send `null` or an empty string to clear it.
+An empty argument object reads the settings without writing. Both values are
+validated before either is saved, using the same validators as the admin page.
+The response includes `restartNeeded`, comparing the resolved configuration with
+the source captured at boot, and `missing`, listing absent base values. Customer
+mode (`KG_SOURCE_REPO`) takes precedence and reports no base-settings restart
+requirement. The tool never restarts the orchestrator or starts a refresh;
+restart remains a separate operator step. Namespace, graph name and Stardog
+database are outside this tool's write scope.
 Names accept letters, digits, underscores and hyphens, beginning with a letter
 or digit; namespaces and endpoint/console/platform values must be absolute
 HTTP(S) URLs without userinfo. Empty fields clear their rows, and partial updates
