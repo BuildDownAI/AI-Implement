@@ -1,3 +1,4 @@
+import { loadStoredSnapshot } from "./agent-run-preparation.js";
 import { estimateCallCostUsd, type ModelPriceRates } from "./model-price-estimate.js";
 import { toInvocation } from "./job-accounting.js";
 import { getDb } from "./dedup.js";
@@ -625,18 +626,22 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
       AND (? IS NULL OR d.repo = ?)) ORDER BY a.rowid
   `).all(since, repoFilter, repoFilter) as Parameters<typeof toInvocation>[0][];
   const groups = new Map<string, { entry: ModelAggregate; dispatchIds: Set<string> }>();
-  for (const row of calls) {
-    const key = JSON.stringify([row.stage, row.agent, row.provider, row.model]);
+  const modelGroup = (selection: Pick<ModelAggregate, "stage" | "agent" | "provider" | "model">) => {
+    const key = JSON.stringify([selection.stage, selection.agent, selection.provider, selection.model]);
     let group = groups.get(key);
     if (!group) {
       group = { dispatchIds: new Set(), entry: {
-        stage: row.stage, agent: row.agent, provider: row.provider, model: row.model,
+        stage: selection.stage, agent: selection.agent, provider: selection.provider, model: selection.model,
         calls: 0, failedCalls: 0, timedOutCalls: 0, tokensIn: null, tokensOut: null,
         costUsd: null, estimatedCostUsd: null, jobs: 0, oneShotPct: null,
         avgPasses: null, avgDurationMs: null, stoppedJobs: null,
       } };
       groups.set(key, group);
     }
+    return group;
+  };
+  for (const row of calls) {
+    const group = modelGroup(row);
     group.dispatchIds.add(row.dispatch_id);
     const a = group.entry;
     const call = toInvocation(row);
@@ -647,6 +652,17 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
     a.tokensOut = addCost(a.tokensOut, call.tokensOut);
     if (call.costStatus === "reported") a.costUsd = addCost(a.costUsd, call.costUsd);
     else a.estimatedCostUsd = addCost(a.estimatedCostUsd, estimateCallCostUsd(call, prices));
+  }
+  // A frozen implementation selection can attribute a stopped job before its first call.
+  // Any real call remains authoritative, even when it belongs to another stage.
+  const calledDispatchIds = new Set(calls.map(row => row.dispatch_id));
+  for (const dispatch of dispatches) {
+    if (dispatch.phase !== "implementation") continue;
+    if (dispatch.dispatch_id === null || calledDispatchIds.has(dispatch.dispatch_id)) continue;
+    if (!(dispatch.status === "timed_out" || dispatch.conclusion === "ended_without_callback" || dispatch.conclusion === "workflow_cancelled")) continue;
+    const snapshot = loadStoredSnapshot(dispatch.dispatch_id);
+    if (!snapshot) continue;
+    modelGroup({ stage: "implementation", ...snapshot.stages.implementation }).dispatchIds.add(dispatch.dispatch_id);
   }
   const byModel = Array.from(groups.values(), ({ entry, dispatchIds }) => {
     const jobs = dispatches.filter(d => d.dispatch_id !== null && dispatchIds.has(d.dispatch_id));
