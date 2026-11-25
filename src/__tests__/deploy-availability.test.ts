@@ -3,7 +3,7 @@ import type * as DeployAvailabilityModule from "../deploy-availability.js";
 import type * as GithubAppAuthModule from "../github-app-auth.js";
 import type * as GithubModule from "../github.js";
 import { GitHubApiError } from "../github-errors.js";
-import { fakeFetch } from "./helpers/fake-fetch.js";
+import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 
 // Both dependencies exist only to reach GitHub; what matters here is what they
 // return, so each is replaced by a spy exposing the functions we call.
@@ -201,6 +201,15 @@ describe("anonymousImageReadable", () => {
     await expect(availability.anonymousImageReadable(IMAGE, ghcr.fetch)).rejects.toMatchObject({ status });
   });
 
+  it("bounds the whole read, token and manifest, by one 10-second budget", async () => {
+    const timeout = stubAbortTimeout(10_000);
+    const ghcr = fakeFetch({ [TOKEN]: { json: { token: "anonymous-token" } }, [MANIFEST]: hangUntilAborted });
+
+    await expect(availability.anonymousImageReadable(IMAGE, ghcr.fetch)).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(timeout).toHaveBeenCalledOnce();
+    expect(ghcr.calls[1].signal).toBe(ghcr.calls[0].signal);
+  });
+
   it("throws for an image outside GHCR, which no anonymous read can settle", async () => {
     await expect(availability.anonymousImageReadable("registry.fly.io/owned-images:testing-2222222", fakeFetch({}).fetch)).rejects.toThrow("not a GHCR image");
   });
@@ -272,12 +281,12 @@ describe("availableHeadDeployable", () => {
 
     expect(await check({ reads: r })).toBe(false);
     expect(r.readable).toHaveBeenCalledExactlyOnceWith(IMAGE);
-    expect(availability.getPublishedImageReadiness(HEAD)).toBe("not-pullable");
+    expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBe("not-pullable");
   });
 
   it("is deployable once both hold", async () => {
     expect(await check()).toBe(true);
-    expect(availability.getPublishedImageReadiness(HEAD)).toBe("ready");
+    expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBe("ready");
   });
 
   it("judges a control-plane machine's Fly image by its status alone", async () => {
@@ -292,7 +301,7 @@ describe("availableHeadDeployable", () => {
 
     expect(await check({ kgSourceRepo: "BuildDownAI/knowledge-graph", reads: r })).toBe(true);
     expect(r.published).not.toHaveBeenCalled();
-    expect(availability.getPublishedImageReadiness(HEAD)).toBeNull();
+    expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBeNull();
   });
 
   it.each([
@@ -323,8 +332,27 @@ describe("availableHeadDeployable", () => {
 
     expect(await check({ availability: { ...moved, headCommit: next }, reads: r })).toBe(false);
     expect(r.published).toHaveBeenCalledExactlyOnceWith(next);
-    expect(availability.getPublishedImageReadiness(HEAD)).toBeNull();
-    expect(availability.getPublishedImageReadiness(next)).toBe("not-published");
+    expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBeNull();
+    expect(availability.getPublishedImageReadiness(target, next, undefined)).toBe("not-published");
+  });
+
+  it("reads another repository's own status at the same commit, rather than reusing the first one's ready image", async () => {
+    expect(await check()).toBe(true);
+    // A watched source moved to another repository of the same owner names the same GHCR image, but its own status.
+    const mirror = { ...target, repo: "AI-Implement-mirror" };
+    const r = reads(false);
+
+    expect(await check({ target: mirror, reads: r })).toBe(false);
+    expect(r.published).toHaveBeenCalledExactlyOnceWith(HEAD);
+  });
+
+  it("answers the status route only for the repository, commit and image the poll read", async () => {
+    expect(await check()).toBe(true);
+
+    expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBe("ready");
+    expect(availability.getPublishedImageReadiness({ ...target, branch: "main" }, HEAD, undefined)).toBeNull();
+    expect(availability.getPublishedImageReadiness({ ...target, repo: "AI-Implement-mirror" }, HEAD, undefined)).toBeNull();
+    expect(availability.getPublishedImageReadiness(target, HEAD, "owned-images")).toBeNull();
   });
 
   // The real status read, as the poll calls it.
@@ -341,7 +369,7 @@ describe("availableHeadDeployable", () => {
     const readable = vi.fn(async (_image: string) => true);
 
     expect(await check({ reads: { published: statusRead, readable } })).toBe(false);
-    expect(availability.getPublishedImageReadiness(HEAD)).toBe("status-unreadable");
+    expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBe("status-unreadable");
     expect(readable).not.toHaveBeenCalled();
 
     fakeFetch({ [STATUSES]: { json: [{ context: "orchestrator-image/published", state: "success" }] } }).install();
@@ -352,7 +380,7 @@ describe("availableHeadDeployable", () => {
     fakeFetch({ [STATUSES]: { status: 502 } }).install();
 
     await expect(check({ reads: { published: statusRead, readable: vi.fn(async () => true) } })).rejects.toThrow("HTTP 502");
-    expect(availability.getPublishedImageReadiness(HEAD)).toBeNull();
+    expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBeNull();
   });
 });
 

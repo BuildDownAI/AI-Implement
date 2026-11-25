@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
+import { MANIFEST_TYPES } from "../deploy-availability.js";
 
 const workflow = parse(readFileSync(".github/workflows/publish-orchestrator-image.yml", "utf8"));
 
@@ -52,6 +53,12 @@ describe("overlapping orchestrator publications", () => {
       expect(step(chain[i]).if).toBe(`\${{ always() && steps.${chain[i - 1]}.outcome == 'success' }}`);
     }
     expect(workflow.jobs.publish.permissions).toMatchObject({ contents: "read", statuses: "write", packages: "write" });
+  });
+
+  it("reads the GHCR copy accepting exactly the manifest types SelfDeploy.start's own read accepts", () => {
+    // GHCR answers an OCI image index with 404 unless the request accepts that type, and the runner's push stores one.
+    const readable = workflow.jobs.publish.steps.find((step: { id?: string }) => step.id === "readable");
+    expect(readable.run).toContain(`accept='${MANIFEST_TYPES}'`);
   });
 
   it("publishes the validated commit even if a dispatched branch advances", () => {

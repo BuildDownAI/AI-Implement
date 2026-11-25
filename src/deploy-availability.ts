@@ -96,12 +96,16 @@ export function publishedImage(owner: string, branch: string, commit: string, im
 
 // Every manifest a push can store: an image index or a single image, in OCI or Docker media types.
 // GHCR answers an OCI image index with 404 unless the request accepts that type, so a missing type reads as no image.
-const MANIFEST_TYPES = [
+// The publish workflow's own read sends the same list.
+export const MANIFEST_TYPES = [
   "application/vnd.oci.image.index.v1+json",
   "application/vnd.oci.image.manifest.v1+json",
   "application/vnd.docker.distribution.manifest.list.v2+json",
   "application/vnd.docker.distribution.manifest.v2+json",
 ].join(", ");
+
+// One budget for the whole read, as the runner channel lookup bounds its own (resolveChannelCommit), since the poll waits on it before tracker work.
+const ANONYMOUS_READ_TIMEOUT_MS = 10_000;
 
 /**
  * Whether anyone can pull a GHCR image, read the way another Fly organization pulls it: an anonymous token, then the manifest.
@@ -112,14 +116,15 @@ export async function anonymousImageReadable(image: string, fetchImpl: typeof fe
   if (!match) throw new Error(`not a GHCR image reference: ${image}`);
   const [, name, tag] = match;
   const refused = (status: number) => status === 401 || status === 403 || status === 404;
-  const tokenResponse = await fetchImpl(`https://ghcr.io/token?scope=repository:${name}:pull`, { signal: defaultFetchSignal() });
+  const signal = AbortSignal.timeout(ANONYMOUS_READ_TIMEOUT_MS);
+  const tokenResponse = await fetchImpl(`https://ghcr.io/token?scope=repository:${name}:pull`, { signal });
   if (refused(tokenResponse.status)) return false;
   if (!tokenResponse.ok) throw Object.assign(new Error(`GHCR token request failed HTTP ${tokenResponse.status}`), { status: tokenResponse.status });
   const { token } = (await tokenResponse.json()) as { token: string };
   const manifest = await fetchImpl(`https://ghcr.io/v2/${name}/manifests/${encodeURIComponent(tag)}`, {
     method: "HEAD",
     headers: { Authorization: `Bearer ${token}`, Accept: MANIFEST_TYPES },
-    signal: defaultFetchSignal(),
+    signal,
   });
   if (refused(manifest.status)) return false;
   if (!manifest.ok) throw Object.assign(new Error(`GHCR manifest read failed HTTP ${manifest.status}`), { status: manifest.status });
@@ -143,8 +148,13 @@ export type PublishedImageReadiness = "ready" | "not-published" | "not-pullable"
 /** The poll's read of the head's image: its readiness, or "status-unreadable" when GitHub refuses the publication status read. */
 export type HeadImageReadiness = PublishedImageReadiness | "status-unreadable";
 
-// The last readiness read, for one commit's image. Only "ready" is reused; anything else is read again.
-let lastReadiness: { commit: string; image: string; readiness: HeadImageReadiness } | null = null;
+// The last readiness read, for one head's image. Only "ready" is reused; anything else is read again.
+let lastReadiness: { key: string; readiness: HeadImageReadiness } | null = null;
+
+/** Identifies a readiness read: the watched repository, whose publication status answers it, the commit and the image it names. */
+function readinessKey(target: SelfDeployTarget, commit: string, imageApp: string | undefined): string {
+  return `${target.owner}/${target.repo} ${commit} ${publishedImage(target.owner, target.branch, commit, imageApp)}`;
+}
 
 /**
  * Whether the poll may act on the head an availability refresh found: always on the built path or when there is no new head;
@@ -160,7 +170,8 @@ export async function availableHeadDeployable(input: {
   const head = input.availability?.headCommit ?? null;
   if (input.kgSourceRepo || !head || input.availability?.available !== true) return true;
   const image = publishedImage(input.target.owner, input.target.branch, head, input.imageApp);
-  if (lastReadiness?.commit === head && lastReadiness.image === image && lastReadiness.readiness === "ready") return true;
+  const key = readinessKey(input.target, head, input.imageApp);
+  if (lastReadiness?.key === key && lastReadiness.readiness === "ready") return true;
   let readiness: HeadImageReadiness;
   try {
     readiness = await publishedImageReadiness(image, { published: () => input.reads.published(head), readable: input.reads.readable });
@@ -169,13 +180,13 @@ export async function availableHeadDeployable(input: {
     if ((error as { status?: number }).status !== 403) throw error;
     readiness = "status-unreadable";
   }
-  lastReadiness = { commit: head, image, readiness };
+  lastReadiness = { key, readiness };
   return readiness === "ready";
 }
 
-/** The readiness last read for a commit's published image, or null when none was read for it. */
-export function getPublishedImageReadiness(commit: string | null): HeadImageReadiness | null {
-  return commit !== null && lastReadiness?.commit === commit ? lastReadiness.readiness : null;
+/** The readiness the poll last read for this target's head and its image, or null when it read none for them. */
+export function getPublishedImageReadiness(target: SelfDeployTarget, commit: string | null, imageApp: string | undefined): HeadImageReadiness | null {
+  return commit !== null && lastReadiness?.key === readinessKey(target, commit, imageApp) ? lastReadiness.readiness : null;
 }
 
 /** GitHub returns statuses newest first; the first matching context is authoritative. */

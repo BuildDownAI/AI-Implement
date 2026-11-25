@@ -5476,20 +5476,45 @@ describe("GET /api/deployment-status", () => {
     const head = "5555555555555555555555555555555555555555";
     availabilityMock.mockReturnValue({ available: true, runningCommit: running, headCommit: head, checkedAt: 1_700_000_000_000, isDowngrade: false });
     const token = await login("secret");
+    // The poll and the route both resolve config.selfDeployTarget, as production passes it to each.
+    const target = { owner: "BuildDownAI", repo: "AI-Implement", branch: "testing", runningCommit: running };
+    const deps = { selfDeployTarget: target };
     // No poll has read this head's image yet.
-    expect((await statusRequest(token)).body.imageReadiness).toBe("unchecked");
+    expect((await statusRequest(token, deps)).body.imageReadiness).toBe("unchecked");
     // The poll's read, through the same module the route reads it from.
     const deployAvailability = await import("../deploy-availability.js");
     await deployAvailability.availableHeadDeployable({
       availability: { available: true, runningCommit: running, headCommit: head, checkedAt: 1_700_000_000_000, isDowngrade: false },
-      target: { owner: "BuildDownAI", repo: "AI-Implement", branch: "testing", runningCommit: running },
+      target,
       kgSourceRepo: null,
       imageApp: undefined,
       reads: { published: async () => false, readable: async () => true },
     });
-    expect((await statusRequest(token)).body.imageReadiness).toBe("not-published");
+    expect((await statusRequest(token, deps)).body.imageReadiness).toBe("not-published");
+    // A watched source moved since then is a head the poll has not read.
+    expect((await statusRequest(token, { selfDeployTarget: { ...target, repo: "AI-Implement-mirror" } })).body.imageReadiness).toBe("unchecked");
     // A KG orchestrator builds its own image, so nothing is published to wait for.
     expect((await statusRequest(token, {}, { kgSourceRepo: "BuildDownAI/knowledge-graph" })).body.imageReadiness).toBeNull();
+  });
+
+  it("reports a control-plane machine's readiness for its Fly image, the one its poll reads", async () => {
+    const running = "4444444444444444444444444444444444444444";
+    const head = "5555555555555555555555555555555555555555";
+    const moved = { available: true, runningCommit: running, headCommit: head, checkedAt: 1_700_000_000_000, isDowngrade: false };
+    availabilityMock.mockReturnValue(moved);
+    const target = { owner: "BuildDownAI", repo: "AI-Implement", branch: "testing", runningCommit: running };
+    const deployAvailability = await import("../deploy-availability.js");
+    await deployAvailability.availableHeadDeployable({
+      availability: moved, target, kgSourceRepo: null, imageApp: "owned-images",
+      reads: { published: async () => true, readable: async () => false },
+    });
+    const token = await login("secret");
+    vi.stubEnv("FLY_IMAGE_APP", "owned-images");
+    try {
+      expect((await statusRequest(token, { selfDeployTarget: target })).body.imageReadiness).toBe("ready");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("keeps a resolved false distinct from unknown", async () => {

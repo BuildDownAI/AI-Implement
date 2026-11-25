@@ -2455,6 +2455,10 @@ async function handleDeploymentStatus(
   const availability = getAvailability();
   const policy = getDeployPolicy();
   const target = resolveDeployTarget(deps.selfDeployTarget ?? null, policy);
+  // Whether the head's published image can be deployed yet, as the poll read it for this target, and "unchecked" until it has.
+  // A KG orchestrator builds its own image, so null.
+  const head = availability?.headCommit ?? null;
+  const imageReadiness = config.kgSourceRepo ? null : ((target && getPublishedImageReadiness(target, head, process.env.FLY_IMAGE_APP || undefined)) ?? "unchecked");
   // A Restate fault must not take the whole page down: the rest of the status is local.
   let selfDeploy: unknown = null;
   if (deps.selfDeploy) {
@@ -2474,8 +2478,7 @@ async function handleDeploymentStatus(
     runningCommit: availability?.runningCommit ?? null,
     headCommit: availability?.headCommit ?? null,
     isDowngrade: availability?.isDowngrade ?? null,
-    // Whether the head's published image can be deployed yet, "unchecked" until a poll reads it. A KG orchestrator builds its own, so null.
-    imageReadiness: config.kgSourceRepo ? null : (getPublishedImageReadiness(availability?.headCommit ?? null) ?? "unchecked"),
+    imageReadiness,
     repo: target ? `${target.owner}/${target.repo}` : null,
     branch: target?.branch ?? null,
     ...policy,
