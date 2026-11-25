@@ -2,12 +2,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DeployAvailabilityModule from "../deploy-availability.js";
 import type * as GithubAppAuthModule from "../github-app-auth.js";
 import type * as GithubModule from "../github.js";
+import { GitHubApiError } from "../github-errors.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 
 // Both dependencies exist only to reach GitHub; what matters here is what they
 // return, so each is replaced by a spy exposing the functions we call.
 vi.mock("../github-app-auth.js", () => ({ mintSourceTokenOrJwt: vi.fn() }));
-vi.mock("../github.js", () => ({ getRefSha: vi.fn(), compareCommits: vi.fn(), defaultFetchSignal: vi.fn(() => AbortSignal.timeout(60_000)) }));
+vi.mock("../github.js", async (importOriginal) => ({
+  getRefSha: vi.fn(),
+  compareCommits: vi.fn(),
+  defaultFetchSignal: vi.fn(() => AbortSignal.timeout(60_000)),
+  // Pure, so the status read keeps its real headers.
+  srcHeaders: (await importOriginal<typeof GithubModule>()).srcHeaders,
+}));
 
 const RUNNING = "1111111111111111111111111111111111111111";
 const HEAD = "2222222222222222222222222222222222222222";
@@ -236,6 +243,116 @@ describe("publishedImage", () => {
 
   it("names a control-plane machine's image in its Fly image app", () => {
     expect(availability.publishedImage("BuildDownAI", "main", HEAD, "owned-images")).toBe("registry.fly.io/owned-images:main-2222222");
+  });
+});
+
+describe("availableHeadDeployable", () => {
+  const target: DeployAvailabilityModule.SelfDeployTarget = { owner: "BuildDownAI", repo: "AI-Implement", branch: "testing", runningCommit: RUNNING };
+  // The record refreshAvailability writes when the watched branch has moved past the running commit.
+  const moved: DeployAvailabilityModule.DeploymentAvailability = { available: true, runningCommit: RUNNING, headCommit: HEAD, checkedAt: 1_700_000_000_000, isDowngrade: false };
+  const IMAGE = "ghcr.io/builddownai/ai-implement-orchestrator:testing-2222222";
+  const reads = (published: boolean, readable = true) => ({
+    published: vi.fn(async (_commit: string) => published),
+    readable: vi.fn(async (_image: string) => readable),
+  });
+  type Input = Parameters<typeof DeployAvailabilityModule.availableHeadDeployable>[0];
+  const check = (over: Partial<Input> = {}) =>
+    availability.availableHeadDeployable({ availability: moved, target, kgSourceRepo: null, imageApp: undefined, reads: reads(true), ...over });
+
+  it("waits on the published path until the head's publication status is success", async () => {
+    const r = reads(false);
+
+    expect(await check({ reads: r })).toBe(false);
+    expect(r.published).toHaveBeenCalledExactlyOnceWith(HEAD);
+    expect(r.readable).not.toHaveBeenCalled();
+  });
+
+  it("then waits until the public image can be pulled anonymously", async () => {
+    const r = reads(true, false);
+
+    expect(await check({ reads: r })).toBe(false);
+    expect(r.readable).toHaveBeenCalledExactlyOnceWith(IMAGE);
+    expect(availability.getPublishedImageReadiness(HEAD)).toBe("not-pullable");
+  });
+
+  it("is deployable once both hold", async () => {
+    expect(await check()).toBe(true);
+    expect(availability.getPublishedImageReadiness(HEAD)).toBe("ready");
+  });
+
+  it("judges a control-plane machine's Fly image by its status alone", async () => {
+    const r = reads(true, false);
+
+    expect(await check({ imageApp: "owned-images", reads: r })).toBe(true);
+    expect(r.readable).not.toHaveBeenCalled();
+  });
+
+  it("gates nothing on the built path, which needs no publication", async () => {
+    const r = reads(false);
+
+    expect(await check({ kgSourceRepo: "BuildDownAI/knowledge-graph", reads: r })).toBe(true);
+    expect(r.published).not.toHaveBeenCalled();
+    expect(availability.getPublishedImageReadiness(HEAD)).toBeNull();
+  });
+
+  it.each([
+    ["the head is the running commit", { ...moved, available: false, headCommit: RUNNING }],
+    ["availability is unknown", { ...moved, available: null, runningCommit: null, isDowngrade: null }],
+    ["nothing was refreshed yet", null],
+  ] as const)("reads nothing when %s, since there is no new deployment to gate", async (_label, record) => {
+    const r = reads(false);
+
+    expect(await check({ availability: record, reads: r })).toBe(true);
+    expect(r.published).not.toHaveBeenCalled();
+  });
+
+  it("reads a waiting image again on each call, and remembers a ready one for its commit", async () => {
+    expect(await check({ reads: reads(false) })).toBe(false);
+    const second = reads(true);
+    expect(await check({ reads: second })).toBe(true);
+    expect(second.published).toHaveBeenCalledOnce();
+    const third = reads(false);
+    expect(await check({ reads: third })).toBe(true);
+    expect(third.published).not.toHaveBeenCalled();
+  });
+
+  it("reads again once the head moves past the commit it remembers", async () => {
+    expect(await check()).toBe(true);
+    const next = "3333333333333333333333333333333333333333";
+    const r = reads(false);
+
+    expect(await check({ availability: { ...moved, headCommit: next }, reads: r })).toBe(false);
+    expect(r.published).toHaveBeenCalledExactlyOnceWith(next);
+    expect(availability.getPublishedImageReadiness(HEAD)).toBeNull();
+    expect(availability.getPublishedImageReadiness(next)).toBe("not-published");
+  });
+
+  // The real status read, as the poll calls it.
+  const statusRead = (commit: string) => availability.githubImagePublished("app-1", "private-key", target, commit);
+  const STATUSES = `GET /repos/BuildDownAI/AI-Implement/commits/${HEAD}/statuses`;
+
+  it("records a status read GitHub refuses as unreadable instead of failing the poll, and reads it again next time", async () => {
+    // An installation without Commit statuses: the mint refuses before any read, as intersectPermissions does.
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockRejectedValueOnce(new GitHubApiError({
+      status: 403,
+      path: "/app/installations/1/access_tokens",
+      message: 'GitHub App installation for owner "BuildDownAI" grants none of the requested permissions: statuses: read',
+    }));
+    const readable = vi.fn(async (_image: string) => true);
+
+    expect(await check({ reads: { published: statusRead, readable } })).toBe(false);
+    expect(availability.getPublishedImageReadiness(HEAD)).toBe("status-unreadable");
+    expect(readable).not.toHaveBeenCalled();
+
+    fakeFetch({ [STATUSES]: { json: [{ context: "orchestrator-image/published", state: "success" }] } }).install();
+    expect(await check({ reads: { published: statusRead, readable } })).toBe(true);
+  });
+
+  it("still fails the poll on any other status read failure, so nothing is recorded for the commit", async () => {
+    fakeFetch({ [STATUSES]: { status: 502 } }).install();
+
+    await expect(check({ reads: { published: statusRead, readable: vi.fn(async () => true) } })).rejects.toThrow("HTTP 502");
+    expect(availability.getPublishedImageReadiness(HEAD)).toBeNull();
   });
 });
 

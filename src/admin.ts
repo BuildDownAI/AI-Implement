@@ -90,7 +90,7 @@ import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { getStardogValues, setStardogValues, validateStardogValues } from "./kg-graph-source.js";
 import { isRemoteKgStore } from "./kg-sidecar.js";
 import { getDeployOutcome } from "./deploy-notify.js";
-import { getAvailability, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
+import { getAvailability, getPublishedImageReadiness, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
 import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
 import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
@@ -2474,6 +2474,8 @@ async function handleDeploymentStatus(
     runningCommit: availability?.runningCommit ?? null,
     headCommit: availability?.headCommit ?? null,
     isDowngrade: availability?.isDowngrade ?? null,
+    // Whether the head's published image can be deployed yet, "unchecked" until a poll reads it. A KG orchestrator builds its own, so null.
+    imageReadiness: config.kgSourceRepo ? null : (getPublishedImageReadiness(availability?.headCommit ?? null) ?? "unchecked"),
     repo: target ? `${target.owner}/${target.repo}` : null,
     branch: target?.branch ?? null,
     ...policy,

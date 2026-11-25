@@ -140,6 +140,43 @@ export async function publishedImageReadiness(
 }
 
 export type PublishedImageReadiness = "ready" | "not-published" | "not-pullable";
+/** The poll's read of the head's image: its readiness, or "status-unreadable" when GitHub refuses the publication status read. */
+export type HeadImageReadiness = PublishedImageReadiness | "status-unreadable";
+
+// The last readiness read, for one commit's image. Only "ready" is reused; anything else is read again.
+let lastReadiness: { commit: string; image: string; readiness: HeadImageReadiness } | null = null;
+
+/**
+ * Whether the poll may act on the head an availability refresh found: always on the built path or when there is no new head;
+ * on the published path, once the head's image can be deployed, the check SelfDeploy.start makes again before its hold.
+ */
+export async function availableHeadDeployable(input: {
+  availability: DeploymentAvailability | null;
+  target: SelfDeployTarget;
+  kgSourceRepo: string | null | undefined;
+  imageApp: string | undefined;
+  reads: { published(commit: string): Promise<boolean>; readable(image: string): Promise<boolean> };
+}): Promise<boolean> {
+  const head = input.availability?.headCommit ?? null;
+  if (input.kgSourceRepo || !head || input.availability?.available !== true) return true;
+  const image = publishedImage(input.target.owner, input.target.branch, head, input.imageApp);
+  if (lastReadiness?.commit === head && lastReadiness.image === image && lastReadiness.readiness === "ready") return true;
+  let readiness: HeadImageReadiness;
+  try {
+    readiness = await publishedImageReadiness(image, { published: () => input.reads.published(head), readable: input.reads.readable });
+  } catch (error) {
+    // An installation without Commit statuses refuses every read, so it is recorded rather than thrown each poll. SelfDeploy.start refuses it too.
+    if ((error as { status?: number }).status !== 403) throw error;
+    readiness = "status-unreadable";
+  }
+  lastReadiness = { commit: head, image, readiness };
+  return readiness === "ready";
+}
+
+/** The readiness last read for a commit's published image, or null when none was read for it. */
+export function getPublishedImageReadiness(commit: string | null): HeadImageReadiness | null {
+  return commit !== null && lastReadiness?.commit === commit ? lastReadiness.readiness : null;
+}
 
 /** GitHub returns statuses newest first; the first matching context is authoritative. */
 export async function githubImagePublished(appId: string, privateKey: string, target: { owner: string; repo: string }, commit: string): Promise<boolean> {

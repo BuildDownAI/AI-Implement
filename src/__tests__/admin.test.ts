@@ -5385,10 +5385,11 @@ describe("GET /api/deployment-status", () => {
   async function statusRequest(
     token: string,
     deps: AdminModule.AdminDeps = {},
+    configOverrides: Partial<Parameters<typeof admin.handleAdminRequest>[2]> = {},
   ): Promise<{ statusCode: number; body: Record<string, unknown> }> {
     const req = new MockRequest("/api/deployment-status", "GET", { authorization: `Bearer ${token}` });
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    admin.handleAdminRequest(req as never, res as never, { ...adminConfig("secret"), ...configOverrides }, makeFakeRegistry(provider), deps);
     await res.done;
     return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
   }
@@ -5468,6 +5469,27 @@ describe("GET /api/deployment-status", () => {
       headCommit: "def5678",
       checkedAt: 1_700_000_000_000,
     });
+  });
+
+  it("reports whether the head's image can be deployed on the published path, and null on the built path", async () => {
+    const running = "4444444444444444444444444444444444444444";
+    const head = "5555555555555555555555555555555555555555";
+    availabilityMock.mockReturnValue({ available: true, runningCommit: running, headCommit: head, checkedAt: 1_700_000_000_000, isDowngrade: false });
+    const token = await login("secret");
+    // No poll has read this head's image yet.
+    expect((await statusRequest(token)).body.imageReadiness).toBe("unchecked");
+    // The poll's read, through the same module the route reads it from.
+    const deployAvailability = await import("../deploy-availability.js");
+    await deployAvailability.availableHeadDeployable({
+      availability: { available: true, runningCommit: running, headCommit: head, checkedAt: 1_700_000_000_000, isDowngrade: false },
+      target: { owner: "BuildDownAI", repo: "AI-Implement", branch: "testing", runningCommit: running },
+      kgSourceRepo: null,
+      imageApp: undefined,
+      reads: { published: async () => false, readable: async () => true },
+    });
+    expect((await statusRequest(token)).body.imageReadiness).toBe("not-published");
+    // A KG orchestrator builds its own image, so nothing is published to wait for.
+    expect((await statusRequest(token, {}, { kgSourceRepo: "BuildDownAI/knowledge-graph" })).body.imageReadiness).toBeNull();
   });
 
   it("keeps a resolved false distinct from unknown", async () => {

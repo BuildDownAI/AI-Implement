@@ -157,7 +157,8 @@ describe("SelfDeploy durable phase machine", () => {
     f.deps.getDeployPolicy = vi.fn(() => watchedPolicy);
     f.config.kgSourceRepo = "owner/kg";
     vi.mocked(f.deps.head).mockImplementation(async (target, requestedBranch) => target.owner === "fork-owner" && target.repo === "AI-Implement" && requestedBranch === branch ? watchedHead : COMMIT);
-    const poll = { configured: true, available: true, headCommit: watchedHead, held: false, policy: watchedPolicy, lastActedCommit: null as string | null };
+    // A KG orchestrator builds its image, so the poll finds the head deployable at once.
+    const poll = { configured: true, available: true, headCommit: watchedHead, held: false, policy: watchedPolicy, lastActedCommit: null as string | null, imageReady: true };
     expect(decideAvailabilityAction(poll)).toBe("deploy");
     const result = await call<SelfDeployStartResult>(env, "start", { branch, requestedBy: "auto-deploy" });
     expect(result).toMatchObject({ commit: watchedHead, alreadyActive: false });

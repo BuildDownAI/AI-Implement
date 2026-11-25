@@ -49,7 +49,7 @@ import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSn
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, onSelfDeployOutcome, postAvailableNotice, postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
-import { anonymousImageReadable, githubImagePublished, refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
+import { anonymousImageReadable, availableHeadDeployable, githubImagePublished, refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, createRestateDrainProbes, readKgSourceRepo, parseKgSourceRepo, runSelfDeployFlyctl } from "./deploy.js";
@@ -532,6 +532,16 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
       const resolvedConfig = { ...config, selfDeployTarget: resolvedPollTarget };
       const availability = getAvailability();
       const head = availability?.headCommit ?? null;
+      const imageReady = await availableHeadDeployable({
+        availability,
+        target: resolvedPollTarget,
+        kgSourceRepo: config.kgSourceRepo,
+        imageApp: process.env.FLY_IMAGE_APP || undefined,
+        reads: {
+          published: (commit) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, resolvedPollTarget, commit),
+          readable: (image) => anonymousImageReadable(image),
+        },
+      });
 
       const action = decideAvailabilityAction({
         configured: canSelfDeploy(resolvedConfig),
@@ -540,6 +550,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
         held: isDeployHeld(),
         policy: getDeployPolicy(),
         lastActedCommit: getLastActedCommit(),
+        imageReady,
       });
 
       if (action !== "none" && head) {
