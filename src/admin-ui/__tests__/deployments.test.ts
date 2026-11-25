@@ -67,7 +67,7 @@ describe("deployments page", () => {
     // so the not-configured banner is the whole page.
     expect(deploymentsScript).toContain("getElementById('deployments-kpis').hidden = !configured");
     expect(deploymentsScript).toContain("getElementById('deployments-cta').hidden =");
-    expect(deploymentsScript).toContain("!configured || held || (available !== true && !troubled)");
+    expect(deploymentsScript).toContain("!configured || held || (!deployable && !troubled)");
   });
 
   it("shows the deploy-status tile only while a deploy holds", () => {
@@ -389,7 +389,7 @@ describe("deployments page", () => {
     // control on availability alone hid the only thing that fixes it. Widening that one
     // condition beats a button in the alert — the confirm gate, the disable-in-finally and
     // the caption all already live on the existing control and would need duplicating.
-    expect(deploymentsScript).toContain("!configured || held || (available !== true && !troubled)");
+    expect(deploymentsScript).toContain("!configured || held || (!deployable && !troubled)");
     expect(deploymentsScript).not.toContain("alert-actions");
 
     // Exactly one place in the markup starts a deploy.
@@ -797,5 +797,60 @@ describe("self-deploy panel", () => {
     expect(cancelled.el("kpi-deploy-outcome-badge").textContent).toContain("Cancelled");
     expect(cancelled.el("deployments-outcome-alert").className).not.toContain("fail");
     expect(cancelled.el("deployments-outcome-alert").textContent).toContain("cancelled");
+  });
+});
+
+describe("a new commit waits on its image on the published path", () => {
+  const RUNNING = "1111111111111111111111111111111111111111";
+  const HEAD = "2222222222222222222222222222222222222222";
+  // Every field GET /api/deployment-status sends (handleDeploymentStatus), for a new head on testing with no deploy running.
+  const status = (imageReadiness: string | null) => ({
+    configured: true, available: true, held: false, deployStartedAt: null, inFlight: [],
+    checkedAt: 1_700_000_000_000, runningCommit: RUNNING, headCommit: HEAD, isDowngrade: false, imageReadiness,
+    repo: "BuildDownAI/AI-Implement", branch: "testing",
+    autoDeploy: false, notifyAvailable: true, watchedRepo: null, watchedRef: null,
+    notifyConfigured: false, lastActedCommit: null, lastDeployOutcome: null,
+    selfDeploy: { deploy: null, options: { applyFlyToml: false } }, applyFlyTomlAllowed: true,
+  });
+  async function render(imageReadiness: string | null) {
+    const api = async (url: string) => ({ ok: true, status: 200, json: async () => (url === "/api/deployment-status" ? status(imageReadiness) : { reservations: [] }) });
+    // The sidebar's count for this page, as sidebar.ts renders it.
+    const navCount = '<span class="nav-count" data-count="deploy-available" hidden>0</span>';
+    const { win, doc } = mountAdminPage({ html: navCount + deploymentsHtml, script: deploymentsScript, route: "deployments", api });
+    await win.loadDeployments();
+    const el = (id: string) => doc.getElementById(id) as HTMLElement;
+    return Object.assign(el, { navCount: () => doc.querySelector('[data-count="deploy-available"]') as HTMLElement });
+  }
+
+  it.each([
+    ["not-published", "Publishing image"],
+    ["not-pullable", "Image not public"],
+    ["status-unreadable", "Image status unreadable"],
+    ["unchecked", "Checking image"],
+  ])("offers no deploy while the image is %s, and names the commit it waits on", async (readiness, label) => {
+    const el = await render(readiness);
+    expect(el("deployments-cta").hidden).toBe(true);
+    expect(el("kpi-deploy-badge").textContent).toBe(label);
+    expect(el("kpi-deploy-image").hidden).toBe(false);
+    expect(el("kpi-deploy-image").textContent).toContain(HEAD.slice(0, 7));
+    expect(el.navCount().hidden).toBe(true);
+  });
+
+  it("names the fix when the image cannot be pulled anonymously", async () => {
+    const el = await render("not-pullable");
+    expect(el("kpi-deploy-image").textContent).toContain("GHCR package public");
+  });
+
+  it("names the missing permission when GitHub refuses the publication status read", async () => {
+    const el = await render("status-unreadable");
+    expect(el("kpi-deploy-image").textContent).toContain("Commit statuses permission");
+  });
+
+  it.each([["ready"], [null]])("offers the deploy once the image can be deployed, and on the built path (%s)", async (readiness) => {
+    const el = await render(readiness);
+    expect(el("deployments-cta").hidden).toBe(false);
+    expect(el("kpi-deploy-badge").textContent).toBe("Available");
+    expect(el("kpi-deploy-image").hidden).toBe(true);
+    expect(el.navCount().hidden).toBe(false);
   });
 });

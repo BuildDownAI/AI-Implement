@@ -17,6 +17,7 @@ export const deploymentsHtml = `
         <div class="kpi-label">Availability <span class="badge neutral" id="kpi-deploy-badge">—</span></div>
         <div class="kpi-value"><span id="kpi-deploy-commit">—</span><span class="kpi-unit" id="kpi-deploy-checked"></span></div>
         <div class="kpi-trend" id="kpi-deploy-source"></div>
+        <div class="kpi-trend text-secondary" id="kpi-deploy-image" hidden></div>
       </div>
       <div class="kpi" id="deployments-last-outcome">
         <div class="kpi-label">Last deploy <span class="badge neutral" id="kpi-deploy-outcome-badge">—</span></div>
@@ -162,6 +163,16 @@ export const deploymentsHtml = `
 export const deploymentsScript = `
 (function () {
   function short(sha) { return sha ? sha.slice(0, 7) : ''; }
+
+  // A new commit on the published path that cannot be deployed yet, named by the route's image readiness.
+  const IMAGE_WAIT_LABELS = { 'not-published': 'Publishing image', 'not-pullable': 'Image not public', 'status-unreadable': 'Image status unreadable', unchecked: 'Checking image' };
+  function imageWaitText(readiness, commit) {
+    const image = 'The image for ' + short(commit);
+    if (readiness === 'not-pullable') return image + ' cannot be pulled anonymously. Make its GHCR package public.';
+    if (readiness === 'not-published') return image + ' is still being published. Deploy appears once it is.';
+    if (readiness === 'status-unreadable') return image + ' cannot be checked: GitHub refused to show its publication status. Grant the GitHub App the Commit statuses permission.';
+    return image + ' has not been checked yet. The next poll checks it.';
+  }
 
   function plural(count, noun) {
     return count + '\\u00a0' + noun + (count === 1 ? '' : 's');
@@ -455,6 +466,9 @@ export const deploymentsScript = `
 
     const configured = !!data.configured;
     const available = data.available;
+    // On the published path a new commit is offered once its image can be deployed. The built path reports no readiness.
+    const imageReadiness = data.imageReadiness;
+    const deployable = available === true && (imageReadiness == null || imageReadiness === 'ready');
     const held = !!data.held;
     const inFlight = Array.isArray(data.inFlight) ? data.inFlight : [];
 
@@ -470,7 +484,7 @@ export const deploymentsScript = `
     const outcome = data.lastDeployOutcome;
     const troubled = configured && !held && !!outcome && outcome.kind !== 'deployed-ok';
     document.getElementById('deployments-cta').hidden =
-      !configured || held || (available !== true && !troubled);
+      !configured || held || (!deployable && !troubled);
 
     // The policy card follows the tiles: meaningless on an orchestrator that cannot
     // deploy itself, where the banner below is the whole story.
@@ -654,8 +668,14 @@ export const deploymentsScript = `
     // Availability is the least of the three signals here, so it rides in the label as
     // a tag. The commits it was derived from are the value.
     const badgeEl = document.getElementById('kpi-deploy-badge');
-    if (available === true) {
+    const imageLine = document.getElementById('kpi-deploy-image');
+    imageLine.hidden = !(available === true && !deployable);
+    imageLine.textContent = imageLine.hidden ? '' : imageWaitText(imageReadiness, data.headCommit);
+    if (deployable) {
       window.setStatusBadge(badgeEl, 'warn', 'Available');
+    } else if (available === true) {
+      const setupFault = imageReadiness === 'not-pullable' || imageReadiness === 'status-unreadable';
+      window.setStatusBadge(badgeEl, setupFault ? 'fail' : 'neutral', IMAGE_WAIT_LABELS[imageReadiness] || IMAGE_WAIT_LABELS.unchecked);
     } else if (available === false) {
       window.setStatusBadge(badgeEl, 'success', 'Up to date');
     } else {
@@ -682,7 +702,7 @@ export const deploymentsScript = `
     // Nav indicator — shown only when a deployment is confirmed available
     const navCount = document.querySelector('[data-count="deploy-available"]');
     if (navCount) {
-      if (available === true) {
+      if (deployable) {
         navCount.textContent = '1';
         navCount.hidden = false;
       } else {

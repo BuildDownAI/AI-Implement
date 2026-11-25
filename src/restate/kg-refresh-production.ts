@@ -27,7 +27,7 @@ import {
 import { readServedStamp, type KgRailDeps } from "../kg-refresh-rail.js";
 import { KG_DIR, getServedNamespace } from "../kg-sidecar.js";
 import { parseKgSourceRepo } from "../deploy.js";
-import { RUN_TITLE_PREFIX, defaultFetchSignal } from "../github.js";
+import { RUN_TITLE_PREFIX, listWorkflowDispatchRuns } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { buildKgRefreshRunConfig } from "../run-config.js";
 import { readBackendRun, stopBackendRun } from "../backend-run.js";
@@ -60,20 +60,16 @@ import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 export const KG_REFRESH_WORKFLOW_FILE = "claude-implement.yml";
 
 /** Looks a kg-refresh run up by its exact title. `null` means only "GitHub answered, and no run has this
- *  title"; an HTTP error throws, so the workflow retries the lookup rather than dispatching a second run. */
+ *  title", a 404 included (`listWorkflowDispatchRuns`); any other HTTP error throws, so the workflow retries the
+ *  lookup rather than dispatching a second run. */
 export function createKgFindRunByTitle(opts: {
   owner: string;
   repo: string;
   getToken: () => Promise<string>;
 }): KgRefreshWorkflowDependencies["findRunByTitle"] {
   return async (title) => {
-    const res = await fetch(
-      `https://api.github.com/repos/${opts.owner}/${opts.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=20`,
-      { headers: { Authorization: `Bearer ${await opts.getToken()}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal() },
-    );
-    if (!res.ok) throw new Error(`findRunByTitle: workflow runs lookup answered HTTP ${res.status}`);
-    const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string; html_url?: string }> };
-    const match = data.workflow_runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
+    const runs = await listWorkflowDispatchRuns(await opts.getToken(), opts.owner, opts.repo, KG_REFRESH_WORKFLOW_FILE);
+    const match = runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
     if (!match) return null;
     // A read only: the workflow projects the found run onto the row in its own `record-reconcile` step.
     return { runId: match.id, ...(match.html_url ? { logsUrl: match.html_url } : {}) };
