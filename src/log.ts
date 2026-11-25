@@ -7,6 +7,7 @@ import { markCommentGapfillRunTerminal, requeueGapfillAfterPushFailure } from ".
 import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { read as readAdmission, release as releaseAdmission } from "./dispatch-admission.js";
 import { REVIEW_FIX_EVIDENCE_RETENTION_MS } from "./review-fix-evidence.js";
+import { cancelRunningSteps } from "./step-log.js";
 
 const MAX_LOG_ENTRIES = 500;
 /** A finished dispatch_log row is never pruned for this long, so its accounting record can be pulled. */
@@ -666,6 +667,9 @@ export function updateJobStatus(
       isTerminal ? 1 : 0,
       jobId,
     );
+  if (status === "timed_out" || conclusion === "ended_without_callback" || conclusion === "workflow_cancelled") {
+    cancelRunningSteps(jobId);
+  }
   if (prUrl) linkJobPullRequest(jobId, prUrl);
 }
 

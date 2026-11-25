@@ -64,6 +64,13 @@ export function upsertStepRecord(jobId: number, step: Step): void {
   });
 }
 
+export function cancelRunningSteps(jobId: number): void {
+  getDb().prepare(`
+    UPDATE step_log SET status = 'cancelled', ended_at = ?
+    WHERE job_id = ? AND status = 'running'
+  `).run(new Date().toISOString(), jobId);
+}
+
 export function getStepsByJobId(jobId: number): StepRecord[] {
   const db = getDb();
   return db
