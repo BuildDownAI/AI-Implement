@@ -3173,4 +3173,21 @@ describe("set_kg_base_settings", () => {
     expect((await invoke({ codeRepo: "owner/name" }, "user")).isError).toBe(true);
     expect((await read()).codeRepo).toBeNull();
   });
+  it("changes only the two base rows and leaves the running source unchanged", async () => {
+    const graph = await import("../kg-graph-source.js");
+    graph.setStardogValues({ namespace: "https://example.org/", graphName: "graph", db: "db" });
+    graph.setKgGraphSource("stardog_run");
+    const before = graph.getStardogValues();
+    const boot = source.getBootKgRefreshSource();
+    const setter = vi.spyOn(settings, "setOrchestratorSetting");
+
+    expect(await read({ codeRepo: "owner/base", graphLabel: "Base graph" })).toMatchObject({
+      saved: true, missing: [], restartNeeded: true,
+    });
+
+    expect(setter.mock.calls).toEqual([["kgCodeRepo", "owner/base"], ["kgGraphLabel", "Base graph"]]);
+    expect(graph.getStardogValues()).toEqual(before);
+    expect(graph.getKgGraphSource()).toBe("stardog_run");
+    expect(source.getBootKgRefreshSource()).toEqual(boot);
+  });
 });
