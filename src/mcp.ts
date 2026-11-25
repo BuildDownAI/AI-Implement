@@ -112,6 +112,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "kg_repo_history",
   "trigger_kg_refresh",
   "decide_kg_refresh",
+  "set_kg_base_settings",
   "set_kg_graph_source",
   "set_runner_mode",
   "set_fly_machine_profile",
@@ -140,6 +141,7 @@ const RESTATE_TOOL_NAMES = new Set([
 export const RESTATE_WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "decide_kg_refresh",
+  "set_kg_base_settings",
   "set_kg_graph_source",
   "set_runner_mode",
   "set_fly_machine_profile",
