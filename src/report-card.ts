@@ -57,8 +57,28 @@ export interface PlanningCohort {
   mergedPct: number | null;
 }
 
+export interface ModelAggregate {
+  stage: string;
+  agent: string;
+  provider: string;
+  model: string;
+  calls: number;
+  failedCalls: number;
+  timedOutCalls: number;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  costUsd: number | null;
+  estimatedCostUsd: number | null;
+  jobs: number;
+  oneShotPct: number | null;
+  avgPasses: number | null;
+  avgDurationMs: number | null;
+  stoppedJobs: number | null;
+}
+
 export interface FleetReport {
   byRepo: RepoAggregate[];
+  byModel: ModelAggregate[];
   oneShotPct: number | null;
   eventualPct: number | null;
   planning: {
@@ -420,6 +440,9 @@ export function getIssueReportCard(identifier: string, prices: readonly ModelPri
 // ---- getFleetReport helpers ----
 
 interface FleetDispatchRow {
+  dispatch_id: string | null;
+  completed_at: number | null;
+  conclusion: string | null;
   id: number;
   issue_id: string;
   issue_identifier: string | null;
@@ -577,7 +600,7 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
 
 // ---- getFleetReport ----
 
-export function getFleetReport(opts: { days?: number; repo?: string } = {}): FleetReport {
+export function getFleetReport(opts: { days?: number; repo?: string } = {}, prices: readonly ModelPriceRates[] = []): FleetReport {
   const days = opts.days ?? 30;
   const since = Date.now() - days * 24 * 60 * 60 * 1000;
   const repoFilter = opts.repo ?? null;
@@ -585,7 +608,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
 
   const dispatches = db
     .prepare(
-      `SELECT id, issue_id, issue_identifier, repo, dispatched_at, phase, status
+      `SELECT id, issue_id, issue_identifier, repo, dispatched_at, phase, status, dispatch_id, completed_at, conclusion
        FROM dispatch_log
        WHERE dispatched_at >= ?
          AND repo IS NOT NULL
@@ -594,6 +617,52 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
        ORDER BY dispatched_at ASC`,
     )
     .all(since, repoFilter, repoFilter) as FleetDispatchRow[];
+
+  // Select calls through the same dispatch window, excluding orphan and legacy calls.
+  const calls = db.prepare(`SELECT a.* FROM model_invocation_attribution a
+    WHERE EXISTS (SELECT 1 FROM dispatch_log d WHERE d.dispatch_id = a.dispatch_id
+      AND d.dispatched_at >= ? AND d.repo IS NOT NULL AND d.repo NOT LIKE 'test-org/%'
+      AND (? IS NULL OR d.repo = ?)) ORDER BY a.rowid
+  `).all(since, repoFilter, repoFilter) as Parameters<typeof toInvocation>[0][];
+  const groups = new Map<string, { entry: ModelAggregate; dispatchIds: Set<string> }>();
+  for (const row of calls) {
+    const key = JSON.stringify([row.stage, row.agent, row.provider, row.model]);
+    let group = groups.get(key);
+    if (!group) {
+      group = { dispatchIds: new Set(), entry: {
+        stage: row.stage, agent: row.agent, provider: row.provider, model: row.model,
+        calls: 0, failedCalls: 0, timedOutCalls: 0, tokensIn: null, tokensOut: null,
+        costUsd: null, estimatedCostUsd: null, jobs: 0, oneShotPct: null,
+        avgPasses: null, avgDurationMs: null, stoppedJobs: null,
+      } };
+      groups.set(key, group);
+    }
+    group.dispatchIds.add(row.dispatch_id);
+    const a = group.entry;
+    const call = toInvocation(row);
+    a.calls++;
+    if (row.status === "failed") a.failedCalls++;
+    if (row.status === "timed_out") a.timedOutCalls++;
+    a.tokensIn = addCost(a.tokensIn, call.tokensIn);
+    a.tokensOut = addCost(a.tokensOut, call.tokensOut);
+    if (call.costStatus === "reported") a.costUsd = addCost(a.costUsd, call.costUsd);
+    else a.estimatedCostUsd = addCost(a.estimatedCostUsd, estimateCallCostUsd(call, prices));
+  }
+  const byModel = Array.from(groups.values(), ({ entry, dispatchIds }) => {
+    const jobs = dispatches.filter(d => d.dispatch_id !== null && dispatchIds.has(d.dispatch_id));
+    entry.jobs = jobs.length;
+    if (entry.stage === "implementation") {
+      const stats = jobs.map(d => jobPassStats(db, d.id));
+      const eligible = stats.filter(s => s != null && s.oneShot !== null);
+      const passes = stats.filter(s => s != null && s.passesKnown);
+      const durations = jobs.filter(d => d.completed_at !== null);
+      entry.oneShotPct = eligible.length ? eligible.filter(s => s!.oneShot).length / eligible.length : null;
+      entry.avgPasses = passes.length ? passes.reduce((sum, s) => sum + s!.passes, 0) / passes.length : null;
+      entry.avgDurationMs = durations.length ? durations.reduce((sum, d) => sum + d.completed_at! - d.dispatched_at, 0) / durations.length : null;
+      entry.stoppedJobs = jobs.filter(d => d.status === "timed_out" || d.conclusion === "ended_without_callback" || d.conclusion === "workflow_cancelled").length;
+    }
+    return entry;
+  });
 
   // --- Per-repo aggregates ---
 
@@ -861,6 +930,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
 
   return {
     byRepo,
+    byModel,
     oneShotPct,
     eventualPct,
     planning: { planned: cohortFor(true), unplanned: cohortFor(false) },

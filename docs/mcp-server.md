@@ -223,6 +223,15 @@ excludes `test-org/%` repos. The response has:
 
 * `byRepo`: per-repo `repo`, `jobs`, `issues`, `completed`, `failed`, `merged`,
   `avgPasses`, and `costUsd` (USD).
+* `byModel`: one entry per stored `stage`, `agent`, `provider`, `model` combination
+  joined to jobs in the same window. Includes `calls`, `failedCalls`, `timedOutCalls`,
+  `tokensIn`, `tokensOut`, `costUsd` (reported costs only), `estimatedCostUsd`
+  (estimates only for unavailable costs using the current model price list), and `jobs`.
+  Missing token/cost measurements and absent estimates are `null`. Implementation entries
+  also have `oneShotPct` (eligible jobs), `avgPasses` (known passes), `avgDurationMs`
+  (jobs with both timestamps), and `stoppedJobs` (timed out or concluded
+  `ended_without_callback`/`workflow_cancelled`); these four are `null` for other stages.
+  Jobs with multiple implementation models count in each entry. Empty windows return `[]`.
 * `oneShotPct` and `eventualPct`: first-pass approval per eligible implementation
   dispatch and eventual approval per distinct implementation issue.
 * `planning`: `planned` and `unplanned` cohorts, each with `jobs`, `oneShotPct`,

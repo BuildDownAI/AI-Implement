@@ -164,6 +164,7 @@ const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
 // the Restate tier (tools.restate.test.ts's alwaysReplay counter fixture).
 // AII-683: the kg-refresh handlers call the KgRepo object / KgRefresh workflow natively; these
 // fakes stand in for both clients. Reset in beforeEach.
+let fleetPrices: { model: string; inputUsd: string; outputUsd: string; cacheReadUsd: string; cacheWriteUsd: string }[] = [];
 let kgTriggerFake: ((opts: { actorEmail?: string }) => Promise<unknown>) | null = null;
 
 function fakeRestateContext(handlerName: string): restate.Context {
@@ -171,7 +172,7 @@ function fakeRestateContext(handlerName: string): restate.Context {
     request: () => ({ target: { handler: handlerName } }),
     // SetupChecks has its own client: get_tenant_health reads the stored run, and none has run yet.
     objectClient: (definition: { name: string }) => (definition.name === "SetupChecks" ? { get: async () => null } : {
-      current: async () => ({ prices: [] }),
+      current: async () => ({ prices: fleetPrices }),
       trigger: (opts: { actorEmail?: string }) => kgTriggerFake!(opts),
       status: async () => null,
       get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }),
@@ -413,6 +414,7 @@ beforeEach(async () => {
   setKgMemoryProvider(null);
   setKgRefreshToolDeps(null);
   kgTriggerFake = null;
+  fleetPrices = [];
 
   (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
   (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(null);
@@ -2723,6 +2725,7 @@ describe("handleMcpRequest", () => {
     });
 
     it("get_fleet_report threads `days` through /mcp and returns the report verbatim", async () => {
+      fleetPrices = [{ model: "fleet-model", inputUsd: "1", outputUsd: "2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
       (getFleetReport as ReturnType<typeof vi.fn>).mockReturnValue({ byRepo: [], oneShotPct: 1, eventualPct: 1, planning: {}, escapeRate: 0, runaways: [] });
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -2733,7 +2736,7 @@ describe("handleMcpRequest", () => {
         JSON.stringify({ jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "get_fleet_report", arguments: { days: 7 } } }),
       );
       expect(result.statusCode).toBe(200);
-      expect(getFleetReport).toHaveBeenCalledWith({ days: 7 });
+      expect(getFleetReport).toHaveBeenCalledWith({ days: 7 }, fleetPrices);
       const parsed = JSON.parse(result.body);
       expect(Object.keys(JSON.parse(parsed.result.content[0].text)).sort()).toEqual(["byRepo", "escapeRate", "eventualPct", "oneShotPct", "planning", "runaways"]);
     });

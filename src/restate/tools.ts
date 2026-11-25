@@ -726,7 +726,7 @@ export const getIssueReportCardTool = tool(
 );
 
 export const GET_FLEET_REPORT_DESCRIPTION =
-  "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.";
+  "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, byModel call usage, reported and estimated costs and implementation outcomes grouped by stage/agent/provider/model, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.";
 
 export const GetFleetReportArgsSchema = z.object({ days: z.number().optional() });
 
@@ -736,9 +736,10 @@ export const getFleetReportTool = tool(
     input: GetFleetReportArgsSchema,
     role: "user",
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     const days = typeof input.args.days === "number" ? input.args.days : undefined;
-    const result = getFleetReport({ days });
+    const { prices } = await ctx.objectClient(modelPrices, "builddown").current();
+    const result = getFleetReport({ days }, prices);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
