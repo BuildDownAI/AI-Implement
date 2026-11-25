@@ -11,6 +11,7 @@ import { callObject, callService, killInvocation, gate, eventually, queryInvocat
 import * as githubAuth from "../../github-app-auth.js";
 import { anonymousImageReadable, githubImagePublished } from "../../deploy-availability.js";
 import { fakeFetch, type Routes } from "../helpers/fake-fetch.js";
+import { makeAppPrivateKey } from "../helpers/builders.js";
 import * as notify from "../../notify.js";
 import { COMMIT, deployFixture } from "./self-deploy-fixture.js";
 
@@ -264,6 +265,33 @@ describe("SelfDeploy durable phase machine", () => {
       expect(github.calls).toHaveLength(1);
       expect(github.calls[0].headers.has("authorization")).toBe(false);
     } finally { mint.mockRestore(); }
+  });
+  it.each(VARIANTS)("reads a watched owner the App is not installed on through the real mint, with a token from an account it is installed on (%s)", async label => {
+    const env = envs.get(label)!;
+    f = deployFixture();
+    githubAuth.clearTokenCache();
+    // A client's own App: installed on the client's organization, never on the watched owner. The key signs, as the mint needs.
+    const appKey = makeAppPrivateKey();
+    f.deps.imagePublished = vi.fn((target, commit, context) => githubImagePublished("app", appKey, target, commit, context));
+    const github = fakeFetch({
+      "GET /orgs/owner/installation": { status: 404, json: { message: "Not Found" } },
+      "GET /users/owner/installation": { status: 404, json: { message: "Not Found" } },
+      "GET /app/installations": { json: [{ id: 9, account: { login: "client-org", type: "Organization" }, repository_selection: "selected", permissions: { contents: "write", metadata: "read" }, target_type: "Organization" }] },
+      "GET /orgs/client-org/installation": { json: { id: 9, repository_selection: "selected", permissions: { contents: "write", metadata: "read" } } },
+      "POST /app/installations/9/access_tokens": { status: 201, json: { token: "client-installation-token", expires_at: "2099-01-01T00:00:00Z" } },
+      "GET /repos/owner/repo/commits/abcdef0123456789/statuses": { json: [{ context: "orchestrator-image/public", state: "success" }] },
+    });
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => String(input).startsWith("https://api.github.com/") ? github.fetch(input, init) : realFetch(input, init));
+    try {
+      expect(await start(env)).toMatchObject({ image: "ghcr.io/owner/ai-implement-orchestrator:testing-abcdef0", alreadyActive: false });
+      const statuses = github.calls.filter(call => call.path === "/repos/owner/repo/commits/abcdef0123456789/statuses");
+      expect(statuses.map(call => call.headers.get("authorization"))).toEqual(["Bearer client-installation-token"]);
+    } finally {
+      fetchSpy.mockRestore();
+      githubAuth.clearTokenCache();
+      await call(env, "cancel", { requestedBy: "owner" });
+    }
   });
   it.each(VARIANTS)("refuses success in an unrelated status context without hold or Fly (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;

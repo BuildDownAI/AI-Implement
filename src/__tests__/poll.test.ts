@@ -127,6 +127,36 @@ describe("a poll cycle's automatic deploy on the published path", () => {
     await index.poll(deployable(), registry);
     expect(starts()).toHaveLength(1);
   });
+
+  it("reads a watched owner the App is not installed on with a token from an account it is installed on, then starts the deploy once", async () => {
+    // A client's own App: installed on the client's organization, never on BuildDownAI, whose public repository the orchestrator watches.
+    policy.setDeployPolicy({ autoDeploy: true });
+    const fake = fakeFetch({
+      ...EVERY_CYCLE,
+      "GET /app": { json: { slug: "client-app" } },
+      "GET /orgs/BuildDownAI/installation": { status: 404, json: { message: "Not Found" } },
+      "GET /users/BuildDownAI/installation": { status: 404, json: { message: "Not Found" } },
+      "GET /app/installations": { json: [{ id: 9, account: { login: "client-org", type: "Organization" }, repository_selection: "selected", permissions: { contents: "write", metadata: "read" }, target_type: "Organization" }] },
+      "GET /orgs/client-org/installation": { json: { id: 9, repository_selection: "selected", permissions: { contents: "write", metadata: "read" } } },
+      "POST /app/installations/9/access_tokens": { status: 201, json: { token: "client-installation-token", expires_at: "2099-01-01T00:00:00Z" } },
+      "GET /repos/BuildDownAI/AI-Implement/commits": { json: [{ sha: HEAD }] },
+      [`GET /repos/BuildDownAI/AI-Implement/compare/${RUNNING}...${HEAD}`]: { json: { status: "ahead", ahead_by: 1, behind_by: 0 } },
+      "POST /SetupChecks/orchestrator/get": { json: null },
+      [`GET /repos/BuildDownAI/AI-Implement/commits/${HEAD}/statuses`]: [{ json: [] }, { json: [{ context: "orchestrator-image/public", state: "success" }] }],
+      "GET /token": { json: { token: "anonymous-token" } },
+      "HEAD /v2/builddownai/ai-implement-orchestrator/manifests/testing-2222222": { status: 200 },
+      "POST /SelfDeploy/orchestrator/start": { json: { deployId: "deploy-1", commit: HEAD, image: IMAGE, alreadyActive: false } },
+    }).install();
+    const registry = makeRegistry({ provider: makeProvider() });
+
+    await index.poll(deployable(), registry);
+    await index.poll(deployable(), registry);
+
+    const repositoryReads = fake.calls.filter((call) => call.path.startsWith("/repos/BuildDownAI/AI-Implement/"));
+    expect(repositoryReads.length).toBeGreaterThan(0);
+    expect(repositoryReads.map((call) => call.headers.get("authorization"))).toEqual(repositoryReads.map(() => "Bearer client-installation-token"));
+    expect(fake.calls.filter((call) => call.path === "/SelfDeploy/orchestrator/start")).toHaveLength(1);
+  });
 });
 
 describe("the late-review hook", () => {

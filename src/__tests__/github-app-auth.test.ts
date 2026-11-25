@@ -785,22 +785,70 @@ describe("mintSourceTokenOrJwt", () => {
     expect(result.authMode).toBe("installation");
   });
 
-  it("falls back to unauthenticated (public) mode when the App is not installed on the owner (404)", async () => {
-    // Both org and user installation endpoints return 404 → not installed → public fallback.
-    // App JWTs are rejected by GitHub on /repos/... content endpoints; no token is returned.
+  // The App is not installed on the watched owner, which both installation endpoints answer with 404.
+  const notInstalledOnBuildDown = { [orgInstallation("BuildDownAI")]: notFound, [userInstallation("BuildDownAI")]: notFound };
+  // GET /app/installations as GitHub answers it, one installation on the client's own organization.
+  const appInstallations = (...logins: string[]): ReplyInit => ({
+    json: logins.map((login, i) => ({
+      id: 7 + i,
+      account: { login, type: "Organization" },
+      repository_selection: "selected",
+      permissions: { contents: "write", metadata: "read" },
+      target_type: "Organization",
+    })),
+  });
+
+  it("reads another owner's public repository with a token from an account the App is installed on, metadata only and unscoped", async () => {
     const api = fakeFetch({
-      [orgInstallation("BuildDownAI")]: notFound,
-      [userInstallation("BuildDownAI")]: notFound,
+      ...notInstalledOnBuildDown,
+      "GET /app/installations": appInstallations("client-org"),
+      [orgInstallation("client-org")]: installation(7),
+      [mint(7)]: token("ghs_own"),
     }).install();
+
+    const result = await mintSourceTokenOrJwt(APP_ID, privateKey, "BuildDownAI", {
+      permissions: { statuses: "read" }, repositories: ["AI-Implement"],
+    });
+
+    expect(result).toEqual({ token: "ghs_own", authMode: "public" });
+    // GitHub refuses a mint naming a repository outside the installation (422), and a public repository needs no permission but metadata.
+    const minted = api.calls.find((call) => `${call.method} ${call.path}` === mint(7))!;
+    expect(JSON.parse(minted.body)).toEqual({ permissions: { metadata: "read" } });
+  });
+
+  it("reuses that installation's token on the next read", async () => {
+    const api = fakeFetch({
+      ...notInstalledOnBuildDown,
+      "GET /app/installations": appInstallations("client-org"),
+      [orgInstallation("client-org")]: installation(7),
+      [mint(7)]: token("ghs_own"),
+    }).install();
+    const mints = () => api.calls.filter((call) => `${call.method} ${call.path}` === mint(7)).length;
+
+    await mintSourceTokenOrJwt(APP_ID, privateKey, "BuildDownAI", { permissions: { contents: "read" }, repositories: ["AI-Implement"] });
+    const again = await mintSourceTokenOrJwt(APP_ID, privateKey, "BuildDownAI", { permissions: { statuses: "read" }, repositories: ["AI-Implement"] });
+
+    expect(again.token).toBe("ghs_own");
+    expect(mints()).toBe(1);
+  });
+
+  it("reads with no token only when the App is installed nowhere", async () => {
+    const api = fakeFetch({ ...notInstalledOnBuildDown, "GET /app/installations": appInstallations() }).install();
 
     const result = await mintSourceTokenOrJwt(APP_ID, privateKey, "BuildDownAI", {
       permissions: { contents: "read" }, repositories: ["AI-Implement"],
     });
 
-    expect(result.token).toBeNull();
-    expect(result.authMode).toBe("public");
-    // No further network requests after the two 404s — no JWT mint, no token exchange.
-    expect(api.calls).toHaveLength(2);
+    expect(result).toEqual({ token: null, authMode: "public" });
+    expect(api.calls.map((call) => `${call.method} ${call.path}`)).toEqual([orgInstallation("BuildDownAI"), userInstallation("BuildDownAI"), "GET /app/installations"]);
+  });
+
+  it("rethrows a failed installation listing rather than reading with no token", async () => {
+    fakeFetch({ ...notInstalledOnBuildDown, "GET /app/installations": githubError(500, "Internal Server Error") }).install();
+
+    await expect(
+      mintSourceTokenOrJwt(APP_ID, privateKey, "BuildDownAI", { permissions: { contents: "read" } }),
+    ).rejects.toMatchObject({ status: 500 });
   });
 
   it("rethrows non-404 mint errors without falling back", async () => {
