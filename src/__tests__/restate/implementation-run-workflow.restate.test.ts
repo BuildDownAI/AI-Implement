@@ -198,9 +198,9 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
       return {
         readUri: () => sc.runnerUri ?? null,
         readContainerState: () => sc.status,
-        register: async uri => {
+        register: async (uri, name) => {
           if (sc.registrationRejected) return { ok: false, reason: "rejected", status: 400 };
-          const result = await registerRunnerDeployment(uri, { adminBaseUrl: sc.adminUrl });
+          const result = await registerRunnerDeployment(uri, name, { adminBaseUrl: sc.adminUrl });
           if (result.ok) sc.deploymentId = result.deploymentId;
           return result;
         },

@@ -30,7 +30,7 @@ interface FixtureInput {
 interface FixtureScript {
   readUri: () => string | null | Promise<string | null>;
   readState: () => BackendRunState | Promise<BackendRunState>;
-  register: (uri: string) => Promise<RegisterRunnerDeploymentResult>;
+  register: (uri: string, expectedServiceName: string) => Promise<RegisterRunnerDeploymentResult>;
   readUriCalls: number;
   readStateCalls: number;
   registerCalls: number;
@@ -46,19 +46,15 @@ const fixture = restate.workflow({
       if (!script) throw new Error(`no runner registration script for ${ctx.key}`);
       const startedAt = await ctx.date.now();
       return registerRunnerDeploymentWithRetry(ctx, {
+        expectedServiceName: "RunnerRegistrationProbe",
         readUri: () => script.readUri(),
         readContainerState: () => script.readState(),
         bootstrapDeadlineAt: startedAt + input.bootstrapInMs,
         sleepMs: input.sleepMs,
-        register: (uri) => script.register(uri),
+        register: (uri, name) => script.register(uri, name),
       });
     },
   },
-});
-
-const runnerRegistrationProbe = restate.service({
-  name: "RunnerRegistrationProbe",
-  handlers: { ping: async (_ctx: restate.Context) => "pong" },
 });
 
 interface RunnerEndpoint {
@@ -67,8 +63,8 @@ interface RunnerEndpoint {
   sessions: Set<http2.ServerHttp2Session>;
 }
 
-async function startRunnerEndpoint(port = 0): Promise<RunnerEndpoint> {
-  const server = http2.createServer(createEndpointHandler({ services: [runnerRegistrationProbe] }));
+async function startRunnerEndpoint(port = 0, name = "RunnerRegistrationProbe"): Promise<RunnerEndpoint> {
+  const server = http2.createServer(createEndpointHandler({ services: [restate.service({ name, handlers: { ping: async (_ctx: restate.Context) => "pong" } })] }));
   const sessions = new Set<http2.ServerHttp2Session>();
   server.on("session", (session) => {
     sessions.add(session);
@@ -124,7 +120,7 @@ function makeScript(overrides: Partial<{
   };
   if (overrides.readUri) script.readUri = () => { script.readUriCalls++; return overrides.readUri!(); };
   if (overrides.readState) script.readState = () => { script.readStateCalls++; return overrides.readState!(); };
-  if (overrides.register) script.register = (uri) => { script.registerCalls++; return overrides.register!(uri); };
+  if (overrides.register) script.register = (uri, name) => { script.registerCalls++; return overrides.register!(uri, name); };
   return script;
 }
 
@@ -188,13 +184,39 @@ describe("registerRunnerDeploymentWithRetry (Restate)", () => {
     return { key, done };
   }
 
+  it.each(VARIANTS.map(([label]) => label))("replaces an old deployment at the same URI (%s)", async (label) => {
+    const env = envFor(label);
+    const oldEndpoint = await startRunnerEndpoint(0, "RunnerRegistrationOld");
+    endpoints.push(oldEndpoint);
+    const uri = `http://127.0.0.1:${oldEndpoint.port}`;
+    const old = await registerRunnerDeployment(uri, "RunnerRegistrationOld", { adminBaseUrl: env.adminAPIBaseUrl() });
+    if (!old.ok) throw new Error("initial registration failed");
+    deployments.push({ env, deploymentId: old.deploymentId });
+    await stopRunnerEndpoint(oldEndpoint);
+    endpoints.splice(endpoints.indexOf(oldEndpoint), 1);
+    endpoints.push(await startRunnerEndpoint(oldEndpoint.port, "RunnerRegistrationProbe"));
+    const script = makeScript({ uri, register: (uri, name) => registerRunnerDeployment(uri, name, { adminBaseUrl: env.adminAPIBaseUrl() }) });
+    const { key, done } = callFixture(label, script, { bootstrapInMs: 5_000, sleepMs: 20 });
+    const result = await done;
+    if (!result.ok) throw new Error("replacement registration failed");
+    deployments.push({ env, deploymentId: result.deploymentId });
+    expect(result.deploymentId).not.toBe(old.deploymentId);
+    expect((await fetch(`${env.adminAPIBaseUrl()}/deployments/${old.deploymentId}`)).status).toBe(404);
+    const deployment = await (await fetch(`${env.adminAPIBaseUrl()}/deployments/${result.deploymentId}`)).json();
+    expect(deployment.services).toEqual(expect.arrayContaining([expect.objectContaining({ name: "RunnerRegistrationProbe" })]));
+    const commands = await journalCommands(env, key);
+    expect(registerSteps(commands).map(command => command.name)).toEqual(["register-1", "register-2"]);
+    expect(stateSteps(commands).map(command => command.name)).toEqual(["state-1"]);
+    expect(sleepSteps(commands).map(command => command.name)).toEqual(["sleep-1"]);
+  });
+
   it.each(VARIANTS.map(([label]) => label))("returns the deployment id on the first attempt (%s)", async (label) => {
     const env = envFor(label);
     const endpoint = await startRunnerEndpoint();
     endpoints.push(endpoint);
     const script = makeScript({
       uri: `http://127.0.0.1:${endpoint.port}`,
-      register: (uri) => registerRunnerDeployment(uri, { adminBaseUrl: env.adminAPIBaseUrl() }),
+      register: (uri, name) => registerRunnerDeployment(uri, name, { adminBaseUrl: env.adminAPIBaseUrl() }),
     });
 
     const { key, done } = callFixture(label, script, { bootstrapInMs: 5_000, sleepMs: 20 });
@@ -222,7 +244,7 @@ describe("registerRunnerDeploymentWithRetry (Restate)", () => {
         await stateGate.wait();
         return "started" as BackendRunState;
       },
-      register: (uri) => registerRunnerDeployment(uri, { adminBaseUrl: env.adminAPIBaseUrl() }),
+      register: (uri, name) => registerRunnerDeployment(uri, name, { adminBaseUrl: env.adminAPIBaseUrl() }),
     });
 
     const { key, done } = callFixture(label, script, { bootstrapInMs: 5_000, sleepMs: 20 });

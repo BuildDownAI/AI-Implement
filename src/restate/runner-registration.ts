@@ -19,9 +19,12 @@ import {
 /** One registration attempt. The default is `registerRunnerDeployment`. */
 export type RegisterRunnerDeploymentAttempt = (
   uri: string,
+  expectedServiceName: string,
 ) => Promise<RegisterRunnerDeploymentResult>;
 
 export interface RunnerDeploymentRegistrationOptions {
+  /** Service this run will call; must be listed by the registered deployment. */
+  expectedServiceName: string;
   /**
    * The runner's Restate URI, or `null` while the backend has no address for the
    * runner yet.
@@ -80,7 +83,7 @@ export async function registerRunnerDeploymentWithRetry(
           // attempt too.
           const uri = await opts.readUri();
           if (uri === null) return { ok: false, reason: "unreachable" };
-          return await register(uri);
+          return await register(uri, opts.expectedServiceName);
         } catch {
           // A throwing URI read or register call is one unreachable attempt, not a
           // reason to retry this step. The URI reader can throw (for example

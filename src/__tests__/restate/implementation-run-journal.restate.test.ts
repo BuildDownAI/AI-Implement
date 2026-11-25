@@ -89,7 +89,7 @@ for (const { backend, prefix, dispatchId } of CASES) {
       // Production supplies these for every backend; their presence must not enable serve mode.
       runnerRegistration: () => {
         if (backend !== "fly-machines") throw new Error("legacy run registered a runner");
-        return { readUri: () => runnerUri, readContainerState: () => "started", register: uri => registerRunnerDeployment(uri, { adminBaseUrl: envs.get("strict")!.adminAPIBaseUrl() }) };
+        return { readUri: () => runnerUri, readContainerState: () => "started", register: (uri, name) => registerRunnerDeployment(uri, name, { adminBaseUrl: envs.get("strict")!.adminAPIBaseUrl() }) };
       },
       markStarted: () => { if (backend !== "fly-machines") throw new Error("legacy run used serve started evidence"); },
       removeRunnerDeployment: async () => {},

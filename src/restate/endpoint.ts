@@ -343,6 +343,7 @@ export type RegisterRunnerDeploymentResult =
  */
 export async function registerRunnerDeployment(
   uri: string,
+  expectedServiceName: string,
   deps: Pick<RegisterDeps, "adminBaseUrl" | "fetchImpl"> = {},
 ): Promise<RegisterRunnerDeploymentResult> {
   const adminBaseUrl = deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL;
@@ -353,6 +354,13 @@ export async function registerRunnerDeployment(
     const body = await safeJson(response);
     const deploymentId = typeof body?.id === "string" ? body.id : undefined;
     if (!deploymentId) return { ok: false, reason: "rejected", status: response.status };
+    if (!Array.isArray(body?.services) || !body.services.some(
+      service => service !== null && typeof service === "object" && service.name === expectedServiceName,
+    )) {
+      await removeDeployment(deploymentId, { adminBaseUrl, fetchImpl });
+      console.error(`[restate] removed old runner deployment ${deploymentId}; expected service ${expectedServiceName}`);
+      return { ok: false, reason: "unreachable" };
+    }
     return { ok: true, deploymentId };
   }
 
