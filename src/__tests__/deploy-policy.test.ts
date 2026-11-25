@@ -124,6 +124,8 @@ describe("decideAvailabilityAction", () => {
     held: false,
     policy: { autoDeploy: false, notifyAvailable: true, watchedRepo: null, watchedRef: null },
     lastActedCommit: null as string | null,
+    // True on the built path; on the published path, once the head's image can be deployed.
+    imageReady: true,
   });
 
   it("deploys when automatic deploying is on and the commit is new", () => {
@@ -154,6 +156,7 @@ describe("decideAvailabilityAction", () => {
     ["the head commit is unresolved", { headCommit: null }],
     ["a deploy already holds", { held: true }],
     ["this commit was already acted on", { lastActedCommit: "def5678" }],
+    ["the head's image cannot be deployed yet", { imageReady: false }],
   ])("does nothing when %s", (_label, patch) => {
     // Each of these is checked with automatic deploying ON, so a regression that drops
     // the guard shows up as an unattended deploy rather than a silent no-op.
@@ -164,6 +167,12 @@ describe("decideAvailabilityAction", () => {
   it("acts again once the head moves past the last acted commit", () => {
     const input = { ...base(), headCommit: "aaa1111", lastActedCommit: "def5678" };
     expect(policy.decideAvailabilityAction(input)).toBe("notify");
+  });
+
+  it("announces a new commit only once its image can be deployed", () => {
+    // A notice ahead of the image offers a deploy that start would refuse with image-not-published.
+    expect(policy.decideAvailabilityAction({ ...base(), imageReady: false })).toBe("none");
+    expect(policy.decideAvailabilityAction(base())).toBe("notify");
   });
 
   it("holds suppress the announcement too, not just the deploy", () => {

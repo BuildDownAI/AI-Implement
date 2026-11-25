@@ -26,6 +26,7 @@ export interface AvailabilityDecisionInput {
   held: boolean;
   policy: DeployPolicy;
   lastActedCommit: string | null;
+  imageReady: boolean; // False on the published path until the head's image can be deployed (`availableHeadDeployable`).
 }
 
 /**
@@ -33,7 +34,7 @@ export interface AvailabilityDecisionInput {
  * poll loop's only job is to gather them and carry out the verdict.
  */
 export function decideAvailabilityAction(input: AvailabilityDecisionInput): AvailabilityAction {
-  const { configured, available, headCommit, held, policy, lastActedCommit } = input;
+  const { configured, available, headCommit, held, policy, lastActedCommit, imageReady } = input;
 
   // Nothing is actionable on an orchestrator that cannot deploy itself
   if (!configured) return "none";
@@ -41,6 +42,10 @@ export function decideAvailabilityAction(input: AvailabilityDecisionInput): Avai
   // Only a confirmed new deployment is actionable. `null` is unknown, and acting on
   // unknown would deploy an orchestrator that may already be current.
   if (available !== true || !headCommit) return "none";
+
+  // A commit whose image is not deployable yet is not acted on, so it is not recorded either,
+  // and the poll that finds its image ready acts on it then.
+  if (!imageReady) return "none";
 
   // A deploy already holds. The starter would refuse it anyway, and announcing a
   // deployment that is already being built is noise rather than news.

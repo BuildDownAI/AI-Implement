@@ -87,7 +87,7 @@ import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-gra
 import type { SelfDeployClient } from "./restate/self-deploy.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
-import { getAvailability, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
+import { getAvailability, getPublishedImageReadiness, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
 import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
 import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
@@ -2349,6 +2349,10 @@ async function handleDeploymentStatus(
   const availability = getAvailability();
   const policy = getDeployPolicy();
   const target = resolveDeployTarget(deps.selfDeployTarget ?? null, policy);
+  // Whether the head's published image can be deployed yet, as the poll read it for this target, and "unchecked" until it has.
+  // A KG orchestrator builds its own image, so null.
+  const head = availability?.headCommit ?? null;
+  const imageReadiness = config.kgSourceRepo ? null : ((target && getPublishedImageReadiness(target, head, process.env.FLY_IMAGE_APP || undefined)) ?? "unchecked");
   // A Restate fault must not take the whole page down: the rest of the status is local.
   let selfDeploy: unknown = null;
   if (deps.selfDeploy) {
@@ -2368,6 +2372,7 @@ async function handleDeploymentStatus(
     runningCommit: availability?.runningCommit ?? null,
     headCommit: availability?.headCommit ?? null,
     isDowngrade: availability?.isDowngrade ?? null,
+    imageReadiness,
     repo: target ? `${target.owner}/${target.repo}` : null,
     branch: target?.branch ?? null,
     ...policy,

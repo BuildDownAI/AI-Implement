@@ -5,7 +5,7 @@ export const COMMIT = "abcdef0123456789";
 export function deployFixture() {
   const config: SelfDeployConfig = { flyDeployToken: "secret-fly", flyOrchestratorApp: "test-app", selfDeployTarget: { owner: "owner", repo: "repo" } };
   const machine: Machine = { id: "m1", name: "orchestrator", state: "started", region: "ams", created_at: "", updated_at: "", config: { image: "old", env: { KEEP: "yes" }, guest: { cpu_kind: "shared", cpus: 2, memory_mb: 4096 }, restart: { policy: "always" } } };
-  const state = { held: false, work: true, commit: COMMIT, status: "success" as string | null, head: COMMIT as string | null, outcomes: [] as SelfDeployRecord[], reads: 0 };
+  const state = { held: false, work: true, commit: COMMIT, status: "success" as string | null, readable: true, head: COMMIT as string | null, outcomes: [] as SelfDeployRecord[], reads: 0 };
   const deps: SelfDeployDeps = {
     config: () => config,
     getDeployPolicy: vi.fn(() => ({ watchedRepo: null, watchedRef: null })),
@@ -14,6 +14,7 @@ export function deployFixture() {
       if (state.status === "401" || state.status === "403") throw Object.assign(new Error("Unauthorized"), { status: Number(state.status) });
       return state.status === "success";
     }),
+    imageReadable: vi.fn(async () => state.readable),
     fly: {
       listMachines: vi.fn(async () => [machine]),
       getMachine: vi.fn(async () => structuredClone(machine)),
