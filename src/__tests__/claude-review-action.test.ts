@@ -114,8 +114,9 @@ describe("Claude review action", () => {
   it("tells Claude not to report predicted type check, build or test failures", () => {
     const prompt = getStep("Run Claude review").with?.prompt?.replace(/\s+/g, " ");
 
-    expect(prompt).toContain("never report a finding whose claim is that the type check, the TypeScript build or a test fails or will fail");
+    expect(prompt).toContain("never report a finding whose claim is that the type check, the TypeScript build or a test fails or will fail for TypeScript code under `src/`");
     expect(prompt).toContain("CI is the proof of those results on this PR");
+    expect(prompt).toContain("it does not cover files under `scripts/`, `custom/` or `session/`");
     expect(prompt).toContain("still report wrong behavior, and a test that is missing or proves nothing");
   });
 

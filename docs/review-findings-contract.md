@@ -248,8 +248,9 @@ promoted to `main`.
 ## Predicted type check, build or test failures
 
 Claude cannot run the type check, TypeScript build or tests, so the review does
-not report a finding claiming that one fails or will fail. CI is the proof of
-those results on the PR. Wrong behavior and a test that is missing or proves
+not report a finding claiming that one fails or will fail for TypeScript code
+under `src/`. CI is the proof of those results on the PR, and a failed CI check
+already blocks the merge. Wrong behavior and a test that is missing or proves
 nothing remain reportable.
 
 The rule covers TypeScript under `src/`, including claims that code does not
