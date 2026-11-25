@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type * as StepLogModule from "../step-log.js";
 import type * as LogModule from "../log.js";
 import type { Step } from "../pipeline/types.js";
@@ -126,5 +126,87 @@ describe("step_log table", () => {
     const record = stepLog.getStepRecord(jobId, "clone")!;
     expect(JSON.parse(record.inputsJson)).toEqual({ model: "claude-opus-4-7", iteration: 2 });
     expect(JSON.parse(record.outputsJson)).toEqual({ approved: true, tokensUsed: 12400 });
+  });
+});
+
+
+afterEach(() => vi.useRealTimers());
+
+describe("closing steps when a job stops without a report", () => {
+  it.each([
+    ["timed_out", null],
+    ["failed", "ended_without_callback"],
+    ["failed", "workflow_cancelled"],
+  ] as const)("closes only running rows for %s / %s", (status, conclusion) => {
+    const jobId = log.appendLog({ issueId: "stopped" });
+    const otherJobId = log.appendLog({ issueId: "other" });
+    stepLog.upsertStepRecord(jobId, makeStep());
+    stepLog.upsertStepRecord(jobId, makeStep({ id: "review.1", parent_step_id: "review" }));
+    for (const terminal of ["passed", "failed", "skipped", "cancelled"] as const) {
+      stepLog.upsertStepRecord(jobId, makeStep({ id: terminal, status: terminal,
+        ended_at: "2025-01-01T00:01:00.000Z", outputs: { result: terminal } }));
+    }
+    stepLog.upsertStepRecord(otherJobId, makeStep());
+    const terminalBefore = stepLog.getStepsByJobId(jobId).slice(2);
+    const otherBefore = stepLog.getStepsByJobId(otherJobId);
+    vi.useFakeTimers();
+    const endedAt = "2026-11-25T12:00:00.000Z";
+    vi.setSystemTime(new Date(endedAt));
+
+    log.updateJobStatus(jobId, status, conclusion);
+
+    for (const stepId of ["clone", "review.1"]) {
+      expect(stepLog.getStepRecord(jobId, stepId)).toMatchObject({ status: "cancelled", endedAt });
+    }
+    expect(stepLog.getStepsByJobId(jobId).slice(2)).toEqual(terminalBefore);
+    expect(stepLog.getStepsByJobId(otherJobId)).toEqual(otherBefore);
+    const closed = stepLog.getStepsByJobId(jobId);
+    vi.setSystemTime(new Date("2026-11-25T13:00:00.000Z"));
+    log.updateJobStatus(jobId, status, conclusion);
+    expect(stepLog.getStepsByJobId(jobId)).toEqual(closed);
+  });
+
+  it.each([
+    ["completed", null],
+    ["failed", "failure"],
+    ["failed", "operator_cancelled"],
+    ["failed", "destroyed-by-admin"],
+    ["failed", "exit_1"],
+  ] as const)("keeps running steps for %s / %s", (status, conclusion) => {
+    const jobId = log.appendLog({ issueId: "live" });
+    stepLog.upsertStepRecord(jobId, makeStep());
+    const before = stepLog.getStepsByJobId(jobId);
+    log.updateJobStatus(jobId, status, conclusion);
+    expect(stepLog.getStepsByJobId(jobId)).toEqual(before);
+  });
+
+  it("uses incoming arguments even when the stored conclusion is preserved", () => {
+    const jobId = log.appendLog({ issueId: "stopped" });
+    log.updateJobStatus(jobId, "failed", "operator_cancelled");
+    stepLog.upsertStepRecord(jobId, makeStep());
+    log.updateJobStatus(jobId, "failed", "ended_without_callback");
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
+    expect(stepLog.getStepRecord(jobId, "clone")?.status).toBe("cancelled");
+  });
+
+  it("accepts a later final report without allowing a delayed start to reopen a row", () => {
+    const jobId = log.appendLog({ issueId: "stopped" });
+    stepLog.upsertStepRecord(jobId, makeStep());
+    log.updateJobStatus(jobId, "timed_out");
+    const closed = stepLog.getStepRecord(jobId, "clone");
+    stepLog.upsertStepRecord(jobId, makeStep());
+    expect(stepLog.getStepRecord(jobId, "clone")).toEqual(closed);
+    const endedAt = "2026-11-25T13:00:00.000Z";
+    stepLog.upsertStepRecord(jobId, makeStep({ status: "passed", ended_at: endedAt,
+      outputs: { result: "finished" } }));
+    expect(stepLog.getStepRecord(jobId, "clone")).toMatchObject({
+      status: "passed", endedAt, outputsJson: JSON.stringify({ result: "finished" }),
+    });
+  });
+
+  it("can stop a job with no step reports", () => {
+    const jobId = log.appendLog({ issueId: "no-steps" });
+    expect(() => log.updateJobStatus(jobId, "timed_out")).not.toThrow();
+    expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
   });
 });

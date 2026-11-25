@@ -56,6 +56,7 @@ import { getFlySessionsConfig, refreshRunnerBackendCache, resetRunnerBackendCach
 import { runnerBackend, type FlyMachinesBackendState } from "../../restate/runner-backend.js";
 import { initMappingsTable } from "../../config.js";
 import { initLogTable, appendLog, updateJobStatus } from "../../log.js";
+import { initStepLogTable } from "../../step-log.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { getInFlightWork } from "../../in-flight-work.js";
 import { defaultLoadLastRefresh, defaultPersistLastRefresh, runKgRefreshPreflight, type RefreshOutcome } from "../../kg-refresh.js";
@@ -143,6 +144,7 @@ function ensureCompose(): void {
   composeReady = true;
   getDb();
   initLogTable();
+  initStepLogTable();
   initMappingsTable();
   initSettingsTable();
   getDb().prepare(`
