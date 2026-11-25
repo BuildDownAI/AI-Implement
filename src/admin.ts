@@ -1,3 +1,4 @@
+import { validateKgCodeRepo, validateKgGraphLabel } from "./kg-refresh-source.js";
 import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "./fly-machine-sizing.js";
 import { readKeyBinding } from "./key-bindings.js";
 import type { KeyBindOutcome } from "./restate/key-binding.js";
@@ -3223,40 +3224,13 @@ async function handlePostSettings(
   }
 
   let kgCodeRepo: string | null | undefined;
-  if ("kg_code_repo" in body) {
-    const raw = body.kg_code_repo;
-    if (raw !== null && typeof raw !== "string") {
-      json(res, 400, { error: "kg_code_repo must be a string or null" });
-      return;
-    }
-    const trimmed = typeof raw === "string" ? raw.trim() : "";
-    if (trimmed && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,100}$/.test(trimmed)) {
-      json(res, 400, { error: "kg_code_repo must be an owner/name GitHub repository" });
-      return;
-    }
-    kgCodeRepo = trimmed || null;
-  }
-
   let kgGraphLabel: string | null | undefined;
-  if ("kg_graph_label" in body) {
-    const raw = body.kg_graph_label;
-    if (raw !== null && typeof raw !== "string") {
-      json(res, 400, { error: "kg_graph_label must be a string or null" });
-      return;
-    }
-    const value = typeof raw === "string" ? raw : "";
-    // Validate the raw value: trimming must not hide a control character or shorten an
-    // over-length label into an accepted one.
-    if (value.length > 200) {
-      json(res, 400, { error: "kg_graph_label must be 200 characters or fewer" });
-      return;
-    }
-    if (/[\x00-\x1f\x7f]/.test(value)) {
-      json(res, 400, { error: "kg_graph_label must not contain control characters" });
-      return;
-    }
-    const trimmed = value.trim();
-    kgGraphLabel = trimmed || null;
+  try {
+    if ("kg_code_repo" in body) kgCodeRepo = validateKgCodeRepo(body.kg_code_repo);
+    if ("kg_graph_label" in body) kgGraphLabel = validateKgGraphLabel(body.kg_graph_label);
+  } catch (err) {
+    json(res, 400, { error: (err as Error).message });
+    return;
   }
 
   let runnerImagePrefixes: string | null | undefined;
