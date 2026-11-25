@@ -107,7 +107,7 @@ describe("a poll cycle's automatic deploy on the published path", () => {
       [`GET /repos/BuildDownAI/AI-Implement/compare/${RUNNING}...${HEAD}`]: { json: { status: "ahead", ahead_by: 1, behind_by: 0 } },
       "POST /SetupChecks/orchestrator/get": { json: null },
       // The status lands after the push: none on the first cycle, success on the second.
-      [`GET /repos/BuildDownAI/AI-Implement/commits/${HEAD}/statuses`]: [{ json: [] }, { json: [{ context: "orchestrator-image/published", state: "success" }] }],
+      [`GET /repos/BuildDownAI/AI-Implement/commits/${HEAD}/statuses`]: [{ json: [] }, { json: [{ context: "orchestrator-image/public", state: "success" }] }],
       "GET /token": { json: { token: "anonymous-token" } },
       "HEAD /v2/builddownai/ai-implement-orchestrator/manifests/testing-2222222": { status: 200 },
       "POST /SelfDeploy/orchestrator/start": { json: { deployId: "deploy-1", commit: HEAD, image: IMAGE, alreadyActive: false } },

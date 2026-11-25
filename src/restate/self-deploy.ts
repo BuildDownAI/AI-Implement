@@ -35,8 +35,8 @@ export interface SelfDeployDeps {
   config(): SelfDeployConfig;
   getDeployPolicy(): Pick<DeployPolicy, "watchedRepo" | "watchedRef">;
   head(target: { owner: string; repo: string }, branch: "testing" | "main"): Promise<string | null>;
-  /** Publication marker read inside the target lookup effect. */
-  imagePublished(target: { owner: string; repo: string }, commit: string): Promise<boolean>;
+  /** Publication marker read inside the target lookup effect, in the status context of the copy the image names. */
+  imagePublished(target: { owner: string; repo: string }, commit: string, context: string): Promise<boolean>;
   /** An anonymous read of a public image, inside the target lookup effect. */
   imageReadable(image: string): Promise<boolean>;
   fly: {
@@ -118,7 +118,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
         : publishedImage(target.owner, input.branch, commit, config.imageApp);
       if (source === "published") {
         try {
-          const readiness = await publishedImageReadiness(image, { published: () => deps.imagePublished(target, commit), readable: (ref) => deps.imageReadable(ref) });
+          const readiness = await publishedImageReadiness(image, { published: (context) => deps.imagePublished(target, commit, context), readable: (ref) => deps.imageReadable(ref) });
           if (readiness === "not-pullable") ctx.console.warn(`[self-deploy] ${image} cannot be pulled anonymously. Make its GHCR package public.`);
           if (readiness !== "ready") return { reason: "image-not-published" };
         } catch (error) {

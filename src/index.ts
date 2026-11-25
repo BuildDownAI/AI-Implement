@@ -538,7 +538,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
         kgSourceRepo: config.kgSourceRepo,
         imageApp: process.env.FLY_IMAGE_APP || undefined,
         reads: {
-          published: (commit) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, resolvedPollTarget, commit),
+          published: (commit, context) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, resolvedPollTarget, commit, context),
           readable: (image) => anonymousImageReadable(image),
         },
       });
@@ -5583,7 +5583,7 @@ async function main(): Promise<void> {
       return getRefSha(token, target.owner, target.repo, branch);
     },
     getDeployPolicy,
-    imagePublished: (target, commit) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, target, commit),
+    imagePublished: (target, commit, context) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, target, commit, context),
     imageReadable: (image) => anonymousImageReadable(image),
     fly: { listMachines, getMachine, updateMachine },
     flyctl: async (record, args, token, signal) => {

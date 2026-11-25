@@ -94,6 +94,14 @@ export function publishedImage(owner: string, branch: string, commit: string, im
   return imageApp ? `registry.fly.io/${imageApp}:${tag}` : `ghcr.io/${owner.toLowerCase()}/ai-implement-orchestrator:${tag}`;
 }
 
+/**
+ * The commit status the publish job sets once an image's copy is in place, one per registry, so neither copy's status stands for the other:
+ * the GHCR copy's once anyone can pull it, the Fly image app's (a control-plane machine's) once it is pushed there.
+ */
+export function publicationContext(image: string): "orchestrator-image/public" | "orchestrator-image/published" {
+  return image.startsWith("ghcr.io/") ? "orchestrator-image/public" : "orchestrator-image/published";
+}
+
 // Every manifest a push can store: an image index or a single image, in OCI or Docker media types.
 // GHCR answers an OCI image index with 404 unless the request accepts that type, so a missing type reads as no image.
 // The publish workflow's own read sends the same list.
@@ -132,14 +140,14 @@ export async function anonymousImageReadable(image: string, fetchImpl: typeof fe
 }
 
 /**
- * Whether a published commit's image can be deployed: its publication status first, then an anonymous read of an image on GHCR.
+ * Whether a published commit's image can be deployed: its copy's publication status first, then an anonymous read of an image on GHCR.
  * An image on Fly's registry belongs to a control-plane image app, where no anonymous read applies.
  */
 export async function publishedImageReadiness(
   image: string,
-  reads: { published(): Promise<boolean>; readable(image: string): Promise<boolean> },
+  reads: { published(context: string): Promise<boolean>; readable(image: string): Promise<boolean> },
 ): Promise<PublishedImageReadiness> {
-  if (!(await reads.published())) return "not-published";
+  if (!(await reads.published(publicationContext(image)))) return "not-published";
   if (image.startsWith("ghcr.io/") && !(await reads.readable(image))) return "not-pullable";
   return "ready";
 }
@@ -165,7 +173,7 @@ export async function availableHeadDeployable(input: {
   target: SelfDeployTarget;
   kgSourceRepo: string | null | undefined;
   imageApp: string | undefined;
-  reads: { published(commit: string): Promise<boolean>; readable(image: string): Promise<boolean> };
+  reads: { published(commit: string, context: string): Promise<boolean>; readable(image: string): Promise<boolean> };
 }): Promise<boolean> {
   const head = input.availability?.headCommit ?? null;
   if (input.kgSourceRepo || !head || input.availability?.available !== true) return true;
@@ -174,7 +182,7 @@ export async function availableHeadDeployable(input: {
   if (lastReadiness?.key === key && lastReadiness.readiness === "ready") return true;
   let readiness: HeadImageReadiness;
   try {
-    readiness = await publishedImageReadiness(image, { published: () => input.reads.published(head), readable: input.reads.readable });
+    readiness = await publishedImageReadiness(image, { published: (context) => input.reads.published(head, context), readable: input.reads.readable });
   } catch (error) {
     // An installation without Commit statuses refuses every read, so it is recorded rather than thrown each poll. SelfDeploy.start refuses it too.
     if ((error as { status?: number }).status !== 403) throw error;
@@ -189,8 +197,8 @@ export function getPublishedImageReadiness(target: SelfDeployTarget, commit: str
   return commit !== null && lastReadiness?.key === readinessKey(target, commit, imageApp) ? lastReadiness.readiness : null;
 }
 
-/** GitHub returns statuses newest first; the first matching context is authoritative. */
-export async function githubImagePublished(appId: string, privateKey: string, target: { owner: string; repo: string }, commit: string): Promise<boolean> {
+/** Whether the commit's latest status in `context` is success. GitHub returns statuses newest first, so the first in the context is authoritative. */
+export async function githubImagePublished(appId: string, privateKey: string, target: { owner: string; repo: string }, commit: string, context: string): Promise<boolean> {
   const { token } = await mintSourceTokenOrJwt(appId, privateKey, target.owner, {
     permissions: { statuses: "read" }, repositories: [target.repo],
   });
@@ -203,7 +211,7 @@ export async function githubImagePublished(appId: string, privateKey: string, ta
       throw Object.assign(new Error(`Image publication status read failed HTTP ${response.status}`), { status: response.status });
     }
     const statuses = await response.json() as { context: string; state: string }[];
-    const publication = statuses.find(status => status.context === "orchestrator-image/published");
+    const publication = statuses.find(status => status.context === context);
     if (publication) return publication.state === "success";
     if (statuses.length < 100) return false;
   }

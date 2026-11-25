@@ -54,6 +54,7 @@ jobs:
       SOURCE_BRANCH: ${{ inputs.branch || github.ref_name }}
     steps:
       - name: Check the branch and the Fly image push token
+        id: check
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_IMAGE_PUSH_TOKEN }}
         run: |
@@ -63,7 +64,9 @@ jobs:
           esac
           # Control-plane machines deploy BuildDown's Fly image, so this repository cannot publish without it.
           # A fork publishes its public GHCR image alone.
-          if [ -z "$FLY_API_TOKEN" ] && [ "$GITHUB_REPOSITORY" = "BuildDownAI/AI-Implement" ]; then
+          if [ -n "$FLY_API_TOKEN" ]; then
+            echo "fly=true" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REPOSITORY" = "BuildDownAI/AI-Implement" ]; then
             echo '::error::FLY_IMAGE_PUSH_TOKEN is required: configure a deploy token scoped to builddown-orchestrator-image.'
             exit 1
           fi
@@ -164,36 +167,51 @@ jobs:
             *) echo "::error::GHCR answered HTTP $manifest_status to the anonymous manifest read of $GHCR_IMAGE. Re-run this job once GHCR recovers."; exit 1 ;;
           esac
 
-      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+      # Each registry's copy gets its own status, set only once that copy is in place, so neither stands for the other.
+      # SelfDeploy.start reads the one for the image it applies: this one for the GHCR copy.
+      - name: Record the public GHCR image
+        id: public
         if: ${{ always() && steps.readable.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ steps.meta.outputs.commit }}
+          GHCR_IMAGE: ${{ steps.meta.outputs.ghcr }}
+        run: |
+          echo "Public image: \`$GHCR_IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_COMMIT" \
+            -f state=success \
+            -f context=orchestrator-image/public \
+            -f "description=$GHCR_IMAGE" \
+            -f "target_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      # Without the token, as in a fork, the Fly push is skipped rather than passed, so no Fly status follows.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+        if: ${{ always() && steps.public.outcome == 'success' && steps.check.outputs.fly == 'true' }}
 
       - name: Push to Fly's registry
         id: push-fly
-        if: ${{ always() && steps.readable.outcome == 'success' }}
+        if: ${{ always() && steps.public.outcome == 'success' && steps.check.outputs.fly == 'true' }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_IMAGE_PUSH_TOKEN }}
           FLY_IMAGE: ${{ steps.meta.outputs.fly }}
         run: |
-          if [ -z "$FLY_API_TOKEN" ]; then
-            echo 'No FLY_IMAGE_PUSH_TOKEN, so only the GHCR image is published.'
-            exit 0
-          fi
           flyctl auth docker
           docker tag orchestrator-publish "$FLY_IMAGE"
           docker push "$FLY_IMAGE"
 
-      - name: Record published image
+      # The status every release before GHCR reads, and control-plane machines still do: the Fly copy is in the image app.
+      - name: Record the Fly image
         # The job and bookkeeping both remain eligible during cancellation.
         if: ${{ always() && steps.push-fly.outcome == 'success' }}
         id: published
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_COMMIT: ${{ steps.meta.outputs.commit }}
-          GHCR_IMAGE: ${{ steps.meta.outputs.ghcr }}
+          FLY_IMAGE: ${{ steps.meta.outputs.fly }}
         run: |
-          echo "Published image: \`$GHCR_IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fly image: \`$FLY_IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
           gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_COMMIT" \
             -f state=success \
             -f context=orchestrator-image/published \
-            -f "description=$GHCR_IMAGE" \
+            -f "description=$FLY_IMAGE" \
             -f "target_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

@@ -243,6 +243,16 @@ describe("publishedImageReadiness", () => {
     expect(await availability.publishedImageReadiness("registry.fly.io/owned-images:testing-2222222", r)).toBe("ready");
     expect(r.readable).not.toHaveBeenCalled();
   });
+
+  it("reads the status of the copy it would deploy: the public GHCR copy's, or a control-plane machine's Fly copy's", async () => {
+    const ghcr = reads(true, true);
+    await availability.publishedImageReadiness(GHCR, ghcr);
+    expect(ghcr.published).toHaveBeenCalledExactlyOnceWith("orchestrator-image/public");
+
+    const fly = reads(true, true);
+    await availability.publishedImageReadiness("registry.fly.io/owned-images:testing-2222222", fly);
+    expect(fly.published).toHaveBeenCalledExactlyOnceWith("orchestrator-image/published");
+  });
 });
 
 describe("publishedImage", () => {
@@ -272,7 +282,7 @@ describe("availableHeadDeployable", () => {
     const r = reads(false);
 
     expect(await check({ reads: r })).toBe(false);
-    expect(r.published).toHaveBeenCalledExactlyOnceWith(HEAD);
+    expect(r.published).toHaveBeenCalledExactlyOnceWith(HEAD, "orchestrator-image/public");
     expect(r.readable).not.toHaveBeenCalled();
   });
 
@@ -331,7 +341,7 @@ describe("availableHeadDeployable", () => {
     const r = reads(false);
 
     expect(await check({ availability: { ...moved, headCommit: next }, reads: r })).toBe(false);
-    expect(r.published).toHaveBeenCalledExactlyOnceWith(next);
+    expect(r.published).toHaveBeenCalledExactlyOnceWith(next, "orchestrator-image/public");
     expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBeNull();
     expect(availability.getPublishedImageReadiness(target, next, undefined)).toBe("not-published");
   });
@@ -343,7 +353,7 @@ describe("availableHeadDeployable", () => {
     const r = reads(false);
 
     expect(await check({ target: mirror, reads: r })).toBe(false);
-    expect(r.published).toHaveBeenCalledExactlyOnceWith(HEAD);
+    expect(r.published).toHaveBeenCalledExactlyOnceWith(HEAD, "orchestrator-image/public");
   });
 
   it("answers the status route only for the repository, commit and image the poll read", async () => {
@@ -356,7 +366,7 @@ describe("availableHeadDeployable", () => {
   });
 
   // The real status read, as the poll calls it.
-  const statusRead = (commit: string) => availability.githubImagePublished("app-1", "private-key", target, commit);
+  const statusRead = (commit: string, context: string) => availability.githubImagePublished("app-1", "private-key", target, commit, context);
   const STATUSES = `GET /repos/BuildDownAI/AI-Implement/commits/${HEAD}/statuses`;
 
   it("records a status read GitHub refuses as unreadable instead of failing the poll, and reads it again next time", async () => {
@@ -372,7 +382,7 @@ describe("availableHeadDeployable", () => {
     expect(availability.getPublishedImageReadiness(target, HEAD, undefined)).toBe("status-unreadable");
     expect(readable).not.toHaveBeenCalled();
 
-    fakeFetch({ [STATUSES]: { json: [{ context: "orchestrator-image/published", state: "success" }] } }).install();
+    fakeFetch({ [STATUSES]: { json: [{ context: "orchestrator-image/public", state: "success" }] } }).install();
     expect(await check({ reads: { published: statusRead, readable } })).toBe(true);
   });
 
