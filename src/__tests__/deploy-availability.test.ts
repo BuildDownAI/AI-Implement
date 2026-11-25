@@ -505,11 +505,50 @@ describe("refreshAvailability", () => {
 
     expect(state.isDowngrade).toBeNull();
   });
+
+  it("compares nothing when the head is the running commit", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(RUNNING);
+
+    const state = await availability.refreshAvailability(input());
+
+    expect(state.isDowngrade).toBe(false);
+    expect(github.compareCommits).not.toHaveBeenCalled();
+  });
+
+  it("compares a running commit and head once, since their ancestry never changes", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
+    vi.mocked(github.compareCommits).mockResolvedValue({ behindBy: 3 });
+
+    await availability.refreshAvailability(input());
+    const again = await availability.refreshAvailability(input());
+
+    expect(again.isDowngrade).toBe(true);
+    expect(github.compareCommits).toHaveBeenCalledTimes(1);
+  });
+
+  it("compares again for a new head", async () => {
+    const NEXT = "3333333333333333333333333333333333333333";
+    vi.mocked(github.getRefSha).mockResolvedValueOnce(HEAD).mockResolvedValueOnce(NEXT);
+
+    await availability.refreshAvailability(input());
+    await availability.refreshAvailability(input());
+
+    expect(vi.mocked(github.compareCommits).mock.calls.map((call) => call[4])).toEqual([HEAD, NEXT]);
+  });
+
+  it("compares again after a comparison GitHub could not make", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
+    vi.mocked(github.compareCommits).mockResolvedValueOnce(null).mockResolvedValueOnce({ behindBy: 0 });
+
+    await availability.refreshAvailability(input());
+    const again = await availability.refreshAvailability(input());
+
+    expect(again.isDowngrade).toBe(false);
+    expect(github.compareCommits).toHaveBeenCalledTimes(2);
+  });
 });
 
-// Mocked tests cannot detect the credential defect class (JWT-vs-null / header presence).
-// Live verification: the deploy-refs smoke on the feature branch confirms unauthenticated
-// reads succeed for public repos and 401s do not appear.
+// What the mint answers is stubbed here. poll.test.ts drives the same reads through the real mint and pins the token each one carries.
 describe("refreshAvailability — public mode (no App installation)", () => {
   const COMMITS = "GET /repos/BuildDownAI/AI-Implement/commits";
 
@@ -582,6 +621,18 @@ describe("refreshAvailability — public mode (no App installation)", () => {
     expect(api.calls[1].headers.get("if-none-match")).toBe('"v1"');
     expect(state2.headCommit).toBe(HEAD);
     expect(state2.available).toBe(true);
+  });
+
+  it("reads the head with a token from an account the App is installed on, keeping the ETag so an unchanged head costs nothing", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({ token: "ghs_installed_elsewhere", authMode: "public" });
+    const api = fakeFetch({ [COMMITS]: [{ json: [{ sha: HEAD }], headers: { ETag: '"v1"' } }, { status: 304 }] }).install();
+
+    await availability.refreshAvailability(input());
+    const state = await availability.refreshAvailability(input());
+
+    expect(api.calls.map((call) => call.headers.get("authorization"))).toEqual(["Bearer ghs_installed_elsewhere", "Bearer ghs_installed_elsewhere"]);
+    expect(api.calls[1].headers.get("if-none-match")).toBe('"v1"');
+    expect(state.headCommit).toBe(HEAD);
   });
 });
 
