@@ -1160,7 +1160,7 @@ describe("fleet model grouping", () => {
       const report = rc.getFleetReport({ repo: "acme/repo" });
       const empty = { stage: "implementation", agent: "codex", provider: "openai", calls: 0, failedCalls: 0,
         timedOutCalls: 0, tokensIn: null, tokensOut: null, costUsd: null, estimatedCostUsd: null,
-        oneShotPct: null, avgPasses: null, avgDurationMs: 500 };
+        oneShotPct: null, approvedJobs: 0, approvedPct: null, avgPasses: null, avgDurationMs: 500 };
       expect(report.byModel).toEqual([
         { ...empty, model: "frozen", jobs: 2, stoppedJobs: 2 },
         { ...empty, model: "separate", jobs: 1, stoppedJobs: 1 },
@@ -1234,14 +1234,38 @@ describe("fleet model grouping", () => {
     const report = rc.getFleetReport({}, prices);
     expect({ ...report, byModel: [] }).toEqual(before);
     const [modelA, modelB, modelC, missing] = report.byModel;
-    expect(modelA).toEqual({ stage: "implementation", agent: "codex", provider: "openai", model: "A", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: 1, estimatedCostUsd: null, jobs: 1, oneShotPct: 1, avgPasses: 1, avgDurationMs: 500, stoppedJobs: 0 });
-    expect(modelB).toEqual({ ...modelA, model: "B", calls: 2, failedCalls: 0, timedOutCalls: 1, tokensIn: 30, tokensOut: 6, costUsd: 3, jobs: 2, oneShotPct: 0.5, avgPasses: 2, stoppedJobs: 1 });
-    expect(modelC).toEqual({ ...modelA, stage: "planning", model: "C", calls: 1, failedCalls: 0, costUsd: null, estimatedCostUsd: 1.4, oneShotPct: null, avgPasses: null, avgDurationMs: null, stoppedJobs: null });
+    expect(modelA).toEqual({ stage: "implementation", agent: "codex", provider: "openai", model: "A", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: 1, estimatedCostUsd: null, jobs: 1, oneShotPct: 1, approvedJobs: 1, approvedPct: 1, avgPasses: 1, avgDurationMs: 500, stoppedJobs: 0 });
+    expect(modelB).toEqual({ ...modelA, model: "B", calls: 2, failedCalls: 0, timedOutCalls: 1, tokensIn: 30, tokensOut: 6, costUsd: 3, jobs: 2, oneShotPct: 0.5, approvedJobs: 1, approvedPct: 0.5, avgPasses: 2, stoppedJobs: 1 });
+    expect(modelC).toEqual({ ...modelA, stage: "planning", model: "C", calls: 1, failedCalls: 0, costUsd: null, estimatedCostUsd: 1.4, approvedJobs: null, approvedPct: null, oneShotPct: null, avgPasses: null, avgDurationMs: null, stoppedJobs: null });
     expect(missing).toEqual({ ...modelA, model: "missing", calls: 1, failedCalls: 0, tokensIn: null, tokensOut: null, costUsd: null });
     expect(rc.getFleetReport().byModel[2].estimatedCostUsd).toBeNull();
     expect(rc.getFleetReport({}, []).byModel[2].estimatedCostUsd).toBeNull();
     expect(rc.getFleetReport({ repo: "other/repo" }).byModel.map(m => m.model)).toEqual(["excluded"]);
     expect(rc.getFleetReport({ days: 0 }).byModel).toEqual([]);
+  });
+
+  it("distinguishes later approval and includes every non-null statistic in approval rates", () => {
+    const insert = dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', ?, 'test', 'succeeded', 1, '{}')`);
+    for (const model of ["later", "never"]) {
+      const job = insertDispatch({ repo: "acme/repo", dispatchId: model });
+      insertFeedbackLoopStep(job, { approved: model === "later", iterations: 2, terminationReason: model === "later" ? "approved" : "stopped", passes: [
+        { iteration: 1, implementOutcome: "success", reviewApproved: false, costUsd: null },
+        { iteration: 2, implementOutcome: "success", reviewApproved: model === "later", costUsd: null },
+      ] });
+      insert.run(model, model, model);
+    }
+    expect(rc.getFleetReport().byModel).toMatchObject([
+      { model: "later", oneShotPct: 0, approvedJobs: 1, approvedPct: 1 },
+      { model: "never", oneShotPct: 0, approvedJobs: 0, approvedPct: 0 },
+    ]);
+    for (const [dispatchId, approved] of [["unknown-approved", true], ["unknown-rejected", false], ["no-stats", null]] as const) {
+      const job = insertDispatch({ repo: "acme/repo", dispatchId });
+      if (approved !== null) insertSubStep(job, "post-push-review.1", "custom", { approved, telemetry: { costUsd: 0.1 } });
+      insert.run(dispatchId, dispatchId, "later");
+    }
+    expect(rc.getFleetReport().byModel[0]).toMatchObject({ jobs: 4, oneShotPct: 0, avgPasses: 2, approvedJobs: 2, approvedPct: 2 / 3 });
   });
 
   it("includes the exact cutoff, stopped conclusions, unknown statistics and measured zero", () => {
@@ -1270,8 +1294,8 @@ describe("fleet model grouping", () => {
       const prices = [{ model: "another-model", inputUsd: "1", outputUsd: "2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
       const report = rc.getFleetReport({}, prices);
       expect(report.byModel).toEqual([
-        { stage: "implementation", agent: "codex", provider: "openai", model: "zero", calls: 3, failedCalls: 0, timedOutCalls: 0, tokensIn: 0, tokensOut: 0, costUsd: 0, estimatedCostUsd: null, jobs: 3, oneShotPct: 1, avgPasses: 2, avgDurationMs: null, stoppedJobs: 2 },
-        { stage: "implementation", agent: "codex", provider: "openai", model: "unpriced", calls: 1, failedCalls: 0, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: null, estimatedCostUsd: null, jobs: 1, oneShotPct: null, avgPasses: 3, avgDurationMs: null, stoppedJobs: 1 },
+        { stage: "implementation", agent: "codex", provider: "openai", model: "zero", calls: 3, failedCalls: 0, timedOutCalls: 0, tokensIn: 0, tokensOut: 0, costUsd: 0, estimatedCostUsd: null, jobs: 3, oneShotPct: 1, approvedJobs: 2, approvedPct: 2 / 3, avgPasses: 2, avgDurationMs: null, stoppedJobs: 2 },
+        { stage: "implementation", agent: "codex", provider: "openai", model: "unpriced", calls: 1, failedCalls: 0, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: null, estimatedCostUsd: null, jobs: 1, oneShotPct: null, approvedJobs: 0, approvedPct: 0, avgPasses: 3, avgDurationMs: null, stoppedJobs: 1 },
       ]);
     } finally {
       clock.mockRestore();
