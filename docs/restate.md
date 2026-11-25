@@ -393,7 +393,7 @@ Each attempt is its own `register-N` step: it reads the URI and makes one regist
 
 The result is one of `{ ok: true, deploymentId }`, `{ ok: false, reason: "exited" }`, `{ ok: false, reason: "bootstrap timeout" }`, or `{ ok: false, reason: "rejected", status }`. The unique `register-N`, `state-N` and `sleep-N` names keep the journal readable; no step contains the retry loop, so the `alwaysReplay` variant's zero-second inactivity timeout cannot interrupt a long attempt.
 
-### SelfDeploy object (AII-1609; no production callers yet)
+### SelfDeploy object ([AII-1609](https://linear.app/eudoxus/issue/AII-1609/add-the-selfdeploy-restate-object-with-no-callers-yet))
 
 `createSelfDeploy` (`src/restate/self-deploy.ts`) defines an app-keyed Virtual Object. It stores the deploy target and phase under `deploy`, holds dispatch during drain, and advances through short `checkDrain`, `apply` and `verify` invocations using delayed sends. It never sleeps: a sleeping deploy invocation would block its own drain and boot registration. The quiet probe excludes only its own invocation ID through the optional argument to `createRestateDrainProbes` / `queryNonCompletedInvocations`; registration supplies no exclusion. Send headers carry the deploy ID so a cancelled deploy's outstanding timer cannot advance a later deploy.
 

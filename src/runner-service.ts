@@ -11,7 +11,7 @@
  * instead of starting the pipeline again. Events carry step progress, model
  * invocations, results, settlement, or a sanitized failure message.
  *
- * No workflow calls this mode yet. AII-2048 supplies the launch wiring.
+ * `ImplementationRun` calls `run` for a local Docker run and for a Fly run.
  */
 import * as http2 from "node:http2";
 import * as restate from "@restatedev/restate-sdk";
