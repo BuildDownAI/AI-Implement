@@ -66,6 +66,13 @@ runs:
           You are reviewing this pull request. You can read it but not change it. You
           cannot run tests, builds or the type check: CI runs those on this PR
           separately, so do not try to run them.
+          Because you cannot run them, never report a finding whose claim is that the
+          type check, the TypeScript build or a test fails or will fail. This includes
+          a claim that TypeScript code under `src/` does not compile, that a type is
+          not narrowed, or that an import there does not resolve. CI is the proof of
+          those results on this PR, and a failed CI check already blocks the merge.
+          This rule does not limit your other findings: still report wrong behavior,
+          and a test that is missing or proves nothing.
 
           Read the change and its description (`gh pr diff`, `gh pr view`), then every
           changed file in full, not only its hunks, and follow each change to the code it
