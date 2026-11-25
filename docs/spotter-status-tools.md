@@ -91,6 +91,8 @@ For noncompleted issues, the deciding label is first in `raw.labels`, followed b
 
 ### Jira
 
+The poll writes `Merged` to closed Jira issues that still read `PR Ready`, at most 5 per poll, never for a paused project, and with no comment.
+
 [src/providers/jira.ts](../src/providers/jira.ts) combines the mapping's JQL with a nonempty AI-Implement status field. `Merged`, `Planning Failed`, and `Implementation Failed` require an update within seven days. An issue closed in Jira (native status category `done`) also requires an update within seven days and reports `merged` with a null phase, unless its AI-Implement status is `Planning Failed` or `Implementation Failed`, which retain their failure state and phase. Other issues have no age cutoff. Results must also match the repository field value the mapping resolves to: its Repo Field Value, or its repository as `owner/repo` when that is blank ([ticketing-providers.md](ticketing-providers.md#choosing-a-provider-per-mapping)). The table below maps the custom AI-Implement field before the native closed-status override.
 
 | AI-Implement status | State | Phase |

@@ -1,3 +1,4 @@
+import { ClosedIssueReconcileError } from "./types.js";
 import type {
   JiraFieldOptions,
   JiraJqlResult,
@@ -498,6 +499,33 @@ export class JiraProvider implements TicketingProvider {
       issues,
       pageInfo: { hasNextPage: !!res.nextPageToken, endCursor: res.nextPageToken ?? null },
     };
+  }
+
+  async reconcileClosedPrReady(mapping: RepoMapping, limit: number): Promise<string[]> {
+    const cfg = mapping.ticketingConfig;
+    if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
+    const scopeKey = mapping.teamKey;
+    if (!scopeKey) throw new TrackerUnavailableError("mapping carries no team key");
+    if (limit <= 0) return [];
+    const ids = await this.fields(scopeKey);
+    const result = await this.client.searchJqlPage(
+      `(${cfg.jql}) AND ${jqlFieldRef(ids.statusFieldId)} = "PR Ready" AND statusCategory = Done`,
+      [ids.statusFieldId, ids.repoFieldId],
+    );
+    const expectedRepo = resolveRepoFieldValue(mapping);
+    const written: string[] = [];
+    for (const raw of result.issues) {
+      if (written.length >= limit) break;
+      if (readRepoFieldValue(raw.fields[ids.repoFieldId]) !== expectedRepo) continue;
+      try {
+        await this.setStatus(raw.id, scopeKey, STATUS_VALUES.MERGED);
+      } catch (err) {
+        throw new ClosedIssueReconcileError(written.length + 1, err);
+      }
+      written.push(raw.key);
+      console.log(`[jira] Set ${raw.key} to Merged: closed in Jira while PR Ready`);
+    }
+    return written;
   }
 
   async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {

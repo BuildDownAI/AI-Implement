@@ -311,6 +311,9 @@ export interface TicketingProvider {
    *  throws on any read it cannot complete: never returns a partial list. Optional so a fork's
    *  custom provider still compiles. */
   listIssueStatuses?(mapping: RepoMapping): Promise<IssueStatusRecord[]>;
+  /** Writes Merged to closed, in-scope PR Ready issues, at most limit. Posts no comment.
+   * Returns identifiers written. Optional for custom providers. */
+  reconcileClosedPrReady?(mapping: RepoMapping, limit: number): Promise<string[]>;
   /** The facts the setup checks judge for these projects, read without any write. A Linear project's key is its team's key. Optional so a fork's custom provider still compiles. */
   fetchSetupFacts?(projectKeys: string[]): Promise<TrackerSetupFacts>;
 }
@@ -339,5 +342,13 @@ export class MissingProviderConfigError extends Error {
   constructor(provider: string, key: string) {
     super(`Provider "${provider}" requires config field "${key}"`);
     this.name = "MissingProviderConfigError";
+  }
+}
+
+/** Preserves consumed write budget when a reconciliation write fails, including an
+ * uncertain failed request that Jira may have accepted. */
+export class ClosedIssueReconcileError extends Error {
+  constructor(public readonly writesAttempted: number, cause: unknown) {
+    super("Closed issue reconciliation write failed", { cause });
   }
 }
