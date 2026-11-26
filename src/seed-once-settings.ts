@@ -1,3 +1,9 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { parse } from "yaml";
+import { KG_DIR } from "./kg-sidecar.js";
+import { validateKgCodeRepo, validateKgGraphLabel } from "./kg-refresh-source.js";
+
 /**
  * Settings an environment variable writes once, when no row exists. From then on the row is the
  * authority and the variable is inert (ADR 022); `main()` seeds from this list and the setup checks
@@ -39,8 +45,15 @@ export interface SeedOnceSetting {
 
 const trimmed = (raw: string | undefined): string | null => raw?.trim() || null;
 
+const validated = (validate: (raw: unknown) => string | null): SeedOnceSetting["seedValue"] => raw => {
+  try { return validate(raw ?? null); }
+  catch (error) { return { error: (error as Error).message }; }
+};
+
 /** In the order `main()` seeds them. */
 export const SEED_ONCE_SETTINGS: readonly SeedOnceSetting[] = [
+  { variable: "KG_CODE_REPO", key: "kg_code_repo", page: "/admin#kg-pipelines", seedValue: validated(validateKgCodeRepo) },
+  { variable: "KG_GRAPH_LABEL", key: "kg_graph_label", page: "/admin#kg-pipelines", seedValue: validated(validateKgGraphLabel) },
   { variable: "KG_BACKEND", key: KG_GRAPH_SOURCE_SETTING_KEY, page: "/admin#kg-pipelines", seedValue: (raw) => raw === "stardog_run" ? raw : null },
   ...[
     ["KG_STARDOG_DB", "kg_stardog_db"],
@@ -83,7 +96,7 @@ export const SEED_ONCE_SETTINGS: readonly SeedOnceSetting[] = [
  * The token has no setting row, so a successful store or clear writes its non-secret marker instead; a
  * failed store writes neither, leaving the next boot free to retry.
  */
-export function seedSettingsFromEnv(env: Readonly<Record<string, string | undefined>> = process.env): void {
+export function seedSettingsFromEnv(env: Readonly<Record<string, string | undefined>> = process.env, kgDir: string = KG_DIR): void {
   const db = getDb();
   if (env.KG_STARDOG_RUN_TOKEN &&
       !db.prepare("SELECT 1 FROM settings WHERE key = ?").get(KG_STARDOG_RUN_TOKEN_HANDLED_SETTING_KEY) &&
@@ -105,5 +118,15 @@ export function seedSettingsFromEnv(env: Readonly<Record<string, string | undefi
     } else {
       console.warn(`[settings] ${setting.variable} is invalid (${seed.error}), so it was not seeded`);
     }
+  }
+  if (!db.prepare("SELECT 1 FROM settings WHERE key = ?").get("kg_code_repo")) {
+    let codeRepo: string | null = null;
+    try {
+      const sources = parse(readFileSync(join(kgDir, "sources.yml"), "utf8"));
+      codeRepo = validateKgCodeRepo(sources?.code_repo?.slug ?? null);
+    } catch {
+      // Optional image carry-over: absent, unreadable or invalid sources must not stop boot.
+    }
+    if (codeRepo) db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("kg_code_repo", codeRepo);
   }
 }

@@ -3144,7 +3144,7 @@ describe("set_kg_base_settings", () => {
   it("reads without writes, preserves omitted values and clears supplied values", async () => {
     const setter = vi.spyOn(settings, "setOrchestratorSetting");
     expect(await read()).toMatchObject({ saved: false, codeRepo: null, graphLabel: null,
-      missing: ["kg_code_repo", "kg_namespace", "kg_graph_name", "kg_graph_label", "kg_stardog_db"], restartNeeded: false });
+      missing: ["kg_code_repo", "kg_namespace", "kg_graph_name", "kg_stardog_db"], restartNeeded: false });
     expect(setter).not.toHaveBeenCalled();
     expect(await read({ codeRepo: " owner/name ", graphLabel: " Label " })).toMatchObject({ saved: true, codeRepo: "owner/name", graphLabel: "Label" });
     expect(await read({ graphLabel: "x" })).toMatchObject({ codeRepo: "owner/name", graphLabel: "x" });

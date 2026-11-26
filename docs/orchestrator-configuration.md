@@ -92,6 +92,8 @@ The sign-in allowlist is a fifth shape, closest to the second: the environment a
 |---|---|---|---|
 | `LINEAR_PICKUP_LABEL` | `settings` row `linear_pickup_label` | Row (trimmed, non-empty) > `AI-Implement` | `/admin#settings` |
 | `RUNNER_IMAGE_ALLOWED_PREFIXES` | `settings` row `runner_image_allowed_prefixes` | Row > no extra prefixes | `/admin#settings` |
+| `KG_CODE_REPO` | `settings` row `kg_code_repo` | Row > unset; boot seeds env before local `sources.yml` carry-over | `/admin#kg-pipelines` |
+| `KG_GRAPH_LABEL` | `settings` row `kg_graph_label` | Nonempty row > code repo name in base mode | `/admin#kg-pipelines` |
 | `KG_BASE_REPO` | `settings` row `kg_base_repo` | Row > unset | `/admin#settings` |
 | `KG_MATERIALIZE_DIRECT` | `settings` row `kg_materialize_direct` | Row > off (rdflib) | Materialize control on `/admin#kg-pipelines` |
 | `KG_EXECUTION_MODE` | `settings` row `kg_execution_mode` | Row > Fly when configured, else GitHub Actions | Backend control on `/admin#kg-pipelines` |
@@ -110,15 +112,19 @@ Some `settings` rows have no environment counterpart at all, such as the retry p
 
 | Variable | Writes | Seeds when | What the variable must be |
 |---|---|---|---|
+| `KG_CODE_REPO` | `kg_code_repo` | Valid non-blank variable and no row | `owner/name` GitHub repository; invalid input warns and seeds nothing |
+| `KG_GRAPH_LABEL` | `kg_graph_label` | Valid non-blank variable and no row | At most 200 characters with no control characters, validated before trimming; invalid input warns and seeds nothing |
 | `KG_BASE_REPO` | `kg_base_repo` | Variable non-blank and no row | Any non-blank string; stored trimmed |
 | `KG_MATERIALIZE_DIRECT` | `kg_materialize_direct` | Variable non-blank and no row | Exactly `true` seeds on; any other non-blank value seeds off |
 | `KG_EXECUTION_MODE` | `kg_execution_mode` | Variable is `github-actions` or `fly-machines` (after trimming) and no row | Any other value seeds nothing |
 | `LINEAR_PICKUP_LABEL` | `linear_pickup_label` | Variable non-blank and no row | Any non-blank string; stored trimmed |
 | `RUNNER_IMAGE_ALLOWED_PREFIXES` | `runner_image_allowed_prefixes` | Variable non-blank, no row, and `validateRunnerImagePrefixes` accepts it | Comma-separated prefixes, each ending in `/` with a path after the host, no empty path segments, only letters, digits and `. _ : / @ -`, at most 1000 characters; invalid input seeds nothing, and warns only while no row exists |
 
-A sixth seed, `seedRunnerBackends`, writes the Restate object rather than a row and is covered under "The Fly sessions app and region".
+Another seed, `seedRunnerBackends`, writes the Restate object rather than a row and is covered under "The Fly sessions app and region".
 
-**"Seeds once" means "seeds whenever no row exists", not "only on the first boot".** The seed checks for a row on every boot. For the three keys whose admin save can delete the row, that matters: saving `linear_pickup_label` blank, or the Settings page's Reset to default (which sends `null`), or saving `runner_image_allowed_prefixes` or `kg_base_repo` as blank, deletes the row through `setOrchestratorSetting(key, null)`. If the variable is still set, the next boot seeds it again. To return one of these to its default for good, remove the variable as well. The two KG seeds have no such path: their admin routes always write a value, so once a row exists it stays.
+**"Seeds once" means "seeds whenever no row exists", not "only on the first boot".** The seed checks for a row on every boot. For the three keys whose admin save can delete the row, that matters: saving `linear_pickup_label` blank, or the Settings page's Reset to default (which sends `null`), or saving `runner_image_allowed_prefixes` or `kg_base_repo` as blank, deletes the row through `setOrchestratorSetting(key, null)`. If the variable is still set, the next boot seeds it again. To return one of these to its default for good, remove the variable as well. The KG identity and remote-store seeds have no such path: their admin routes always write a value, so once a row exists it stays.
+
+After the list, boot carries over a valid `code_repo.slug` from local `KG_DIR/sources.yml` (`/app/kg` by default) only when `kg_code_repo` still has no row. Missing, unreadable or invalid YAML and invalid slugs are ignored. An environment seed wins over the file; an existing row, including an empty row, always wins. This must run on the customer image before switching to a base image that lacks the file.
 
 The seed does not apply every check an admin route applies. `POST /api/settings` refuses a pickup label longer than 100 characters or containing control characters; the seed only trims. The prefix seed and the prefix route share `validateRunnerImagePrefixes`.
 
