@@ -117,13 +117,20 @@ an empty `kg_stardog_run_console` uses `https://console.stardog.run`. There is n
 import-host environment variable; the row default is enough.
 
 The page's **Graph source** card sets the namespace and graph name, plus two
-rows that have no environment seed: `kg_code_repo` (an `owner/name` GitHub
+rows seeded once by `KG_CODE_REPO` and `KG_GRAPH_LABEL`: `kg_code_repo` (an `owner/name` GitHub
 repository) and `kg_graph_label` (free text, at most 200 characters). Namespace
 and graph name use the shared `kg_namespace` and `kg_graph_name` rows;
 `KG_NAMESPACE` seeds `kg_namespace` at first boot, and a stored graph name
 derives the Stardog dataset. The sidecar reads Namespace and Graph name when it
 starts. Select the graph source again, or restart the orchestrator, to apply a
 change to them. A change to KG code repo or Graph label applies at the next orchestrator restart.
+When no code repo row exists, boot first tries `KG_CODE_REPO`, then carries over
+`code_repo.slug` from the local image's `/app/kg/sources.yml`. Invalid or absent
+files and slugs are ignored. This carry-over must happen on a customer image
+before switching to a base image, where the file is absent. Existing rows,
+including empty rows, always win. In base mode an empty Graph label defaults to
+the code repository name (`owner/name` → `name`) without writing a label row.
+With `KG_SOURCE_REPO` set, refresh remains in customer mode and these rows are inert.
 The admin page and the admin MCP tool `set_kg_base_settings` both write these two rows.
 Through `/mcp`, an admin can call `set_kg_base_settings` with
 `{ "codeRepo": "owner/repo", "graphLabel": "My knowledge graph" }`.

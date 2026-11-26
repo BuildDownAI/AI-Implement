@@ -13,11 +13,11 @@ export type KgRefreshSource =
 
 export function resolveKgRefreshSource(kgSourceRepo: string | null | undefined, base: KgBaseSettings): KgRefreshSource {
   if (kgSourceRepo?.trim()) return { mode: "customer", runRepo: kgSourceRepo.trim() };
-  const names = { kgCodeRepo: "kg_code_repo", kgNamespace: "kg_namespace", kgGraphName: "kg_graph_name", kgGraphLabel: "kg_graph_label", kgStardogDb: "kg_stardog_db" } as const;
+  const names = { kgCodeRepo: "kg_code_repo", kgNamespace: "kg_namespace", kgGraphName: "kg_graph_name", kgStardogDb: "kg_stardog_db" } as const;
   const missing = (Object.keys(names) as Array<keyof typeof names>).filter(k => !base[k]?.trim());
   if (missing.length) return { mode: "unavailable", reason: `KG_SOURCE_REPO is unset; missing base-mode values: ${missing.map(k => names[k]).join(", ")}` };
   const values = Object.fromEntries(Object.keys(names).map(k => [k, base[k as keyof KgBaseSettings]!.trim()])) as Required<{ [K in keyof KgBaseSettings]: string }>;
-  return { mode: "base", runRepo: values.kgCodeRepo, ...values };
+  return { mode: "base", runRepo: values.kgCodeRepo, ...values, kgGraphLabel: base.kgGraphLabel?.trim() || values.kgCodeRepo.split("/")[1] };
 }
 
 let bootSource: KgRefreshSource | undefined;

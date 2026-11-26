@@ -1992,7 +1992,7 @@ export const setKgBaseSettingsTool = tool(
       const base = { ...rows, kgNamespace: graph.namespace, kgGraphName: graph.graphName, kgStardogDb: graph.db };
       const source = resolveKgRefreshSource(process.env.KG_SOURCE_REPO, base);
       const bootSource = getBootKgRefreshSource() ?? { mode: "unavailable" as const, reason: "KG refresh source has not been initialized" };
-      const names = { kgCodeRepo: "kg_code_repo", kgNamespace: "kg_namespace", kgGraphName: "kg_graph_name", kgGraphLabel: "kg_graph_label", kgStardogDb: "kg_stardog_db" } as const;
+      const names = { kgCodeRepo: "kg_code_repo", kgNamespace: "kg_namespace", kgGraphName: "kg_graph_name", kgStardogDb: "kg_stardog_db" } as const;
       const missing = source.mode === "customer" ? [] : Object.entries(names).filter(([key]) => !base[key as keyof typeof names]?.trim()).map(([, name]) => name);
       return {
         saved: codeRepo !== undefined || graphLabel !== undefined,

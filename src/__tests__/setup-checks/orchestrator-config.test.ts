@@ -179,6 +179,19 @@ describe("env.breaker-threshold", () => {
 });
 
 describe("settings.seeded", () => {
+  it.each([
+    ["KG_CODE_REPO", "kg_code_repo", "owner/name", "bad"],
+    ["KG_GRAPH_LABEL", "kg_graph_label", "My graph", "bad\n"],
+  ])("checks the %s seed and its admin page", async (variable, key, value, invalid) => {
+    expect(await run("settings.seeded", { env: { [variable]: value }, readSetting: rows({ [key]: value }) })).toMatchObject([{ state: "pass" }]);
+    for (const saved of [undefined, "different"]) {
+      const outcomes = await run("settings.seeded", { env: { [variable]: value }, readSetting: rows(saved === undefined ? {} : { [key]: saved }) });
+      expect(outcomes).toMatchObject([{ state: "warn", detail: expect.stringContaining(variable) }]);
+      if (saved !== undefined) expect(outcomes[0].detail).toContain("/admin#kg-pipelines");
+    }
+    expect(await run("settings.seeded", { env: { [variable]: invalid } })).toMatchObject([{ state: "warn", detail: expect.stringContaining(variable) }]);
+  });
+
   it("passes with no seed-once variable set, or one the seed would skip", async () => {
     expect(await run("settings.seeded")).toMatchObject([{ state: "pass" }]);
     expect(await run("settings.seeded", { env: { KG_EXECUTION_MODE: "bogus", LINEAR_PICKUP_LABEL: "  " } })).toMatchObject([{ state: "pass" }]);

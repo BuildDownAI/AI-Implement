@@ -6,9 +6,12 @@ describe("refresh source", () => {
     expect(resolveKgRefreshSource(null, base)).toEqual({ mode: "base", runRepo: "acme/code", ...base });
   });
   it("customer configuration takes precedence", () => {
-    expect(resolveKgRefreshSource("acme/kg", {})).toEqual({ mode: "customer", runRepo: "acme/kg" });
+    expect(resolveKgRefreshSource("acme/kg", base)).toEqual({ mode: "customer", runRepo: "acme/kg" });
   });
-  it.each(Object.keys(base) as Array<keyof KgBaseSettings>)("names missing %s and KG_SOURCE_REPO", key => {
+  it.each([undefined, null, "", "   "])("defaults an empty label (%j) to the repository name", kgGraphLabel => {
+    expect(resolveKgRefreshSource(null, { ...base, kgGraphLabel })).toEqual({ mode: "base", runRepo: "acme/code", ...base, kgGraphLabel: "code" });
+  });
+  it.each(Object.keys(base).filter(k => k !== "kgGraphLabel") as Array<keyof KgBaseSettings>)("names missing %s and KG_SOURCE_REPO", key => {
     const resolved = resolveKgRefreshSource(null, { ...base, [key]: "" });
     expect(resolved.mode).toBe("unavailable");
     if (resolved.mode === "unavailable") {

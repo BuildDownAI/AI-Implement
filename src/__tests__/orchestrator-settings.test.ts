@@ -1,3 +1,6 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { testDir } from "./helpers/test-dir.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as SeedOnceSettingsModule from "../seed-once-settings.js";
@@ -530,5 +533,42 @@ describe("seedSettingsFromEnv", () => {
       { key: "linear_pickup_label", value: "Pick me" },
       { key: "runner_image_allowed_prefixes", value: "ghcr.io/acme/" },
     ]));
+  });
+});
+
+describe("KG identity boot seeds", () => {
+  const row = (key: string) => dedup.getDb().prepare("SELECT value FROM settings WHERE key = ?").get(key);
+  it("seeds both validated values", () => {
+    seeds.seedSettingsFromEnv({ KG_CODE_REPO: " owner/name ", KG_GRAPH_LABEL: " My graph " });
+    expect(row("kg_code_repo")).toEqual({ value: "owner/name" });
+    expect(row("kg_graph_label")).toEqual({ value: "My graph" });
+  });
+  it.each(["", "saved/value"])("preserves an existing row (%j), even against invalid environment values and carry-over", value => {
+    const dir = testDir();
+    writeFileSync(join(dir, "sources.yml"), "code_repo:\n  slug: owner/file");
+    for (const key of ["kg_code_repo", "kg_graph_label"]) dedup.getDb().prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run(key, value);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    seeds.seedSettingsFromEnv({ KG_CODE_REPO: "bad", KG_GRAPH_LABEL: "bad\n" }, dir);
+    expect(row("kg_code_repo")).toEqual({ value });
+    expect(row("kg_graph_label")).toEqual({ value });
+    expect(warn).not.toHaveBeenCalled();
+  });
+  it.each([["KG_CODE_REPO", "bad", "kg_code_repo"], ["KG_GRAPH_LABEL", "bad\n", "kg_graph_label"], ["KG_GRAPH_LABEL", "x".repeat(201), "kg_graph_label"]])("rejects invalid %s", (variable, value, key) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(() => seeds.seedSettingsFromEnv({ [variable]: value }, testDir())).not.toThrow();
+    expect(row(key)).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(`[settings] ${variable} is invalid (`));
+  });
+  it.each([false, true])("carries over a local slug, with environment precedence: %s", useEnv => {
+    const dir = testDir();
+    writeFileSync(join(dir, "sources.yml"), "code_repo:\n  slug: owner/file");
+    seeds.seedSettingsFromEnv(useEnv ? { KG_CODE_REPO: "owner/env" } : {}, dir);
+    expect(row("kg_code_repo")).toEqual({ value: useEnv ? "owner/env" : "owner/file" });
+  });
+  it.each([undefined, "[invalid", "namespace: test", "code_repo: null", "code_repo: {slug: 42}", "code_repo: {slug: bad}"])("ignores absent or unusable sources (%j)", content => {
+    const dir = testDir();
+    if (content !== undefined) writeFileSync(join(dir, "sources.yml"), content);
+    expect(() => seeds.seedSettingsFromEnv({}, dir)).not.toThrow();
+    expect(row("kg_code_repo")).toBeUndefined();
   });
 });
