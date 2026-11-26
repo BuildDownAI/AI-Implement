@@ -414,7 +414,7 @@ See [ADR 028](adr/028-the-fixing-agent-dispositions-each-finding-and-may-defer-o
 - **The queue holds one row per PR**, so a burst of feedback produces one run. Read `review_fix_events` to see everything that contributed.
 - **Findings from a review on a PR the orchestrator did not dispatch are ignored**, since every path requires a matching dispatch record.
 - **`review_findings` has no retention policy.** Rows persist for merged and closed PRs alike.
-- **The orchestrator starts the Claude review on its resolved deploy branch**, or on `main` for a mapped repository when the deploy target is unknown. The workflow and composite action use that trusted branch. The maintainer `/claude-review` comment trigger still uses `main`. If a start fails, the PR head has no review check; the post-push gate reads that as "no reviewer" and can approve when an internal review satisfies its gates. A maintainer can post `/claude-review` to start the review by hand.
+- **Claude review starts have a durable record and poll repair.** See [Durable Claude review starts](#durable-claude-review-starts) for the trusted ref, `head_sha` contract and known limits.
 - **A 503 from the webhook route is recovered by `src/webhook-redelivery.ts`**, which redelivers the App's failed deliveries (the four review-related events) at the next Restate registration. The KG PR-check route (`handleKgPrCheckWebhook`) and the three review handlers for every mapped repository, regardless of stored lifecycle (AII-1184, AII-1773) answer 503 while Restate is unavailable. A delivery older than 24 hours needs a manual redelivery from the App's Advanced tab.
 - **Renaming a review job name is a silent gate change.** If no check matches the configured or default names, the gate fails open (logs a warning, then approves). Use `reviewCheckNames` in `.ai-implement/config.yml` to pin the expected name and make mismatches visible rather than silently bypassed.
 
@@ -442,3 +442,34 @@ GitHub-only; machine identities can bind and reach terminal completion without
 granting result-based approval.
 
 Closed finding keys persist across runs in versioned `<!-- ai-implement closed-findings v1 ... -->` markers on fix-pass PR comments. `rejected` (`invalid`) and `deferred` (`follow-up`) close keys; a later `fixed` reopens them. At step start, the runner reads all issue-comment pages oldest first; the newest disposition wins. The trust check accepts markers only from the login read from this run's newly posted start comment. Foreign-author markers warn and are ignored; unreadable identity or history seeds nothing. No dispatch-envelope field is needed.
+
+### Durable Claude review starts
+
+The orchestrator sends review starts to the exclusive `ClaudeReviewStart` Restate
+object, keyed by `owner/repo#prNumber`. It records the head after an accepted
+start or a final HTTP 404/422 rejection. Duplicate events for that head therefore
+do not dispatch again. The webhook sends with the GitHub delivery id as its
+idempotency key; the poll repairs missed webhooks and transient start failures.
+Both paths use the trusted deploy target and branch, or mapped repositories with
+`main` when no target resolves. The `.github/workflows/claude-review.yml` workflow
+and composite action come from that trusted branch; the maintainer comment
+trigger still uses `main`. Dispatch includes `pr_number` and `head_sha`.
+The workflow skips a dispatch if that named head is no longer current, uses the
+named head for checkout and the check run, and never cancels dispatch runs.
+An older orchestrator may omit `head_sha`; that run uses the current PR head.
+
+Known limits:
+
+- **First deploy:** no head is recorded yet. The first poll starts one review for
+  every non-draft open PR in the selected repositories, once per durable head.
+- **Drafts:** the poll does not repair a lost webhook or failed draft start. The
+  next eligible PR event, or becoming ready for review, repairs it.
+- **No check after an accepted start:** an accepted start that never creates its
+  check is not repaired automatically. A maintainer can use `/claude-review`.
+- **Old heads:** a review of an old head runs to completion. Its check stays on
+  that old head and does not affect the new head.
+- **Fallback to `main`:** until `main` has the optional `head_sha` workflow input,
+  GitHub returns 422 and that head gets no orchestrator review. Deploy targets
+  are not affected by this fallback limitation.
+- **Gate:** the gate still approves on `absent` if no start happened before the
+  internal review ended. Changing that merge rule is outside this start repair.

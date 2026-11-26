@@ -240,16 +240,28 @@ describe("Claude review workflow dispatch", () => {
   it("loads trusted code and publishes only the explicit review check on the PR head", () => {
     const workflow = parse(readFileSync(".github/workflows/claude-review.yml", "utf8"));
     expect(workflow.on.workflow_dispatch.inputs.pr_number).toMatchObject({ required: true, type: "string" });
+    expect(workflow.on.workflow_dispatch.inputs.head_sha).toMatchObject({ required: false, type: "string" });
     expect(workflow.on.pull_request_target).toBeUndefined();
     expect(workflow.on.issue_comment).toEqual({ types: ["created"] });
     expect(workflow.permissions.checks).toBe("write");
     const job = workflow.jobs["claude-review"];
     expect(job.name).toBe("PR review run");
     expect(job.name).not.toMatch(/claude|review-plugin|^review$/i);
-    expect(job.concurrency.group).toContain("format('claude-review-dispatch-{0}', inputs.pr_number)");
+    expect(job.concurrency.group).toContain("format('claude-review-dispatch-{0}-{1}', inputs.pr_number, inputs.head_sha)");
+    expect(job.concurrency["cancel-in-progress"]).toBe("${{ github.event_name != 'workflow_dispatch' }}");
+    for (const step of job.steps.filter((s: { uses?: string; name?: string }) =>
+      s.uses === "actions/checkout@v4" || ["Create review check run", "Run Claude review"].includes(s.name ?? ""))) {
+      expect(step.if).toBe("steps.pr.outputs.eligible == 'true'");
+    }
     const find = (name: string) => job.steps.find((step: { name?: string }) => step.name === name);
     expect(find("Checkout trusted composite action").with.ref).toBeUndefined();
     expect(find("Resolve PR head SHA").with.script).toContain("context.payload.inputs.pr_number");
+    const resolve = find("Resolve PR head SHA").with.script;
+    expect(resolve).toContain("context.payload.inputs.head_sha");
+    expect(resolve).toContain("!requested || requested === pr.data.head.sha");
+    expect(resolve).toContain("core.setOutput('sha', requested || pr.data.head.sha)");
+    expect(resolve).not.toContain("${{ inputs.head_sha }}");
+    expect(job.steps.find((s: { uses?: string }) => s.uses === "actions/checkout@v4").with.ref).toBe("${{ steps.pr.outputs.sha }}");
     const create = find("Create review check run");
     expect(create.id).toBe("check");
     expect(create.env.HEAD_SHA).toBe("${{ steps.pr.outputs.sha }}");

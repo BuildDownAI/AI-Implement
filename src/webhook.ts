@@ -14,9 +14,9 @@ import { isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
-import { addCommentReaction, listPullRequestFiles, postPrComment, postWorkflowDispatch } from "./github.js";
-import { refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
-import { getDeployPolicy } from "./deploy-policy.js";
+import { addCommentReaction, listPullRequestFiles, postPrComment } from "./github.js";
+import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import { claudeReviewRepositories, type ClaudeReviewStartCaller } from "./claude-review-start.js";
 import type { KgDryRunReportTarget } from "./kg-refresh.js";
 import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
 
@@ -69,6 +69,8 @@ async function startClaudeReview(
   appId?: string,
   privateKey?: string,
   selfDeploy?: SelfDeployTarget,
+  caller?: ClaudeReviewStartCaller,
+  deliveryId?: string,
 ): Promise<void> {
   if (!appId || !privateKey) return;
   const prNumber = payload.pull_request?.number;
@@ -78,21 +80,16 @@ async function startClaudeReview(
   if (payload.pull_request?.draft && !(payload.action === "synchronize" &&
       payload.sender?.login === "ai-implement-orchestrator-bot[bot]")) return;
 
+  if (!caller?.canStartWork()) return;
   try {
-    const target = resolveDeployTarget(selfDeploy ?? null, getDeployPolicy());
-    if (target ? `${target.owner}/${target.repo}` !== fullName
-      : !Object.values(getMappings()).some((m) => `${m.owner}/${m.repo}` === fullName)) return;
-    const [owner, repo] = fullName.split("/");
-    const ref = target?.branch ?? "main";
-    const token = await getInstallationToken(appId, privateKey, owner);
-    const result = await postWorkflowDispatch({
-      token, owner, repo, workflowFile: "claude-review.yml", ref,
-      inputs: { pr_number: String(prNumber) },
-    });
-    if (!result.success) throw new Error(result.error ?? `HTTP ${result.status}`);
-    console.log(`[webhook] started Claude review for ${fullName}#${prNumber} on ${ref}`);
-  } catch (err) {
-    console.warn(`[webhook] failed to start Claude review for ${fullName}#${prNumber}: ${err instanceof Error ? err.message : String(err)}`);
+    const target = claudeReviewRepositories(selfDeploy).find(t => `${t.owner}/${t.repo}` === fullName);
+    if (!target) return;
+    const allowDraft = payload.action === "synchronize" && payload.sender?.login === "ai-implement-orchestrator-bot[bot]";
+    void caller.send(`${target.owner}/${target.repo}#${prNumber}`, { ref: target.ref, allowDraft },
+      deliveryId ? { idempotencyKey: deliveryId } : undefined)
+      .catch(() => console.warn(`[webhook] Claude review send failed for ${fullName}#${prNumber}`));
+  } catch {
+    console.warn(`[webhook] Claude review send failed for ${fullName}#${prNumber}`);
   }
 }
 
@@ -383,6 +380,7 @@ export async function handleGitHubWebhook(
   kgPrCheck?: KgPrCheckConfig,
   onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
   reviewFixIngress?: ReviewFixIngressClient,
+  claudeReviewStart?: ClaudeReviewStartCaller,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -432,10 +430,10 @@ export async function handleGitHubWebhook(
   }
 
   if (payload.action === "opened" || payload.action === "synchronize") {
-    await startClaudeReview(payload, appId, privateKey, selfDeploy);
+    await startClaudeReview(payload, appId, privateKey, selfDeploy, claudeReviewStart, deliveryId);
   }
   if (payload.action === "ready_for_review") {
-    await startClaudeReview(payload, appId, privateKey, selfDeploy);
+    await startClaudeReview(payload, appId, privateKey, selfDeploy, claudeReviewStart, deliveryId);
   }
 
   if (payload.action === "opened" || payload.action === "synchronize") {
