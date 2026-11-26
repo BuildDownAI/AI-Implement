@@ -1285,7 +1285,10 @@ describe("orchestratorTools (Restate)", () => {
     const missing = JSON.parse(cleared.content[0].text).missing;
     expect(missing).not.toContain("kg_graph_label");
     expect(missing).toEqual(expect.arrayContaining(["kg_namespace", "kg_graph_name", "kg_stardog_db"]));
-    const invocations = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'set_kg_base_settings'");
+    // Authorization scenarios also invoke this handler; their journals have no write step.
+    // Select this save explicitly rather than relying on the admin query's row order.
+    const invocations = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'set_kg_base_settings' AND idempotency_key = 'base-settings'");
+    expect(invocations).toHaveLength(1);
     const entries = await journalEntries(env.adminAPIBaseUrl(), String(invocations[0].id));
     expect(journalText(entries)).toContain("set-kg-base-settings");
   });
