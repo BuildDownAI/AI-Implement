@@ -3205,102 +3205,80 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
 
 describe("orchestrator Claude review starts", () => {
   const stamped = { owner: "org", repo: "repo", branch: "testing", runningCommit: null };
+  const send = vi.fn().mockResolvedValue(undefined);
   const payload = (action = "opened", draft = false, headRepo = "org/repo", login = "alice") => ({
     action, repository: { full_name: "org/repo" }, sender: { login },
-    pull_request: { number: 42, html_url: "https://github.com/org/repo/pull/42", draft, head: { repo: { full_name: headRepo } } },
+    pull_request: { number: 42, draft, head: { ref: "untrusted", repo: { full_name: headRepo } } },
   });
-  async function deliver(body: unknown, target: typeof stamped | undefined = stamped, appId: string | undefined = "app", key: string | undefined = "key") {
+  beforeEach(async () => {
+    send.mockClear();
+    const { setRestateStatus } = await import("../restate/status.js");
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+  });
+  async function deliver(body: unknown, target: typeof stamped | undefined = stamped, delivery: string | undefined = "delivery") {
+    const { restateCanStartWork } = await import("../restate/status.js");
     const { req, res } = makeRequest(SECRET, "pull_request", body);
-    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, appId, key, target);
+    if (delivery) req.headers["x-github-delivery"] = delivery;
+    else delete req.headers["x-github-delivery"];
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key", target,
+      undefined, undefined, undefined, { canStartWork: restateCanStartWork, send });
     expect(res.statusCode).toBe(200);
-    return JSON.parse(res.body);
   }
-  function api(reply: Reply = { status: 204 }) {
-    return fakeFetch({ "POST /repos/org/repo/actions/workflows/claude-review.yml/dispatches": reply }).install();
-  }
-  it.each(["opened", "synchronize", "ready_for_review"])("starts %s on the deploy branch", async (action) => {
-    const fake = api();
+  it.each(["opened", "synchronize", "ready_for_review"])("sends %s using trusted configuration and delivery key", async action => {
     await deliver(payload(action));
-    expect(fake.calls).toHaveLength(1);
-    expect(JSON.parse(fake.calls[0].body)).toEqual({ ref: "testing", inputs: { pr_number: "42" } });
+    expect(send).toHaveBeenCalledExactlyOnceWith("org/repo#42", { ref: "testing", allowDraft: false }, { idempotencyKey: "delivery" });
   });
-  it("uses the watched policy before the build stamp", async () => {
-    const policy = await import("../deploy-policy.js");
-    policy.setDeployPolicy({ watchedRepo: "org/repo", watchedRef: "watched" });
-    const fake = api();
+  it("uses watched policy ahead of the build stamp", async () => {
+    const { setDeployPolicy } = await import("../deploy-policy.js");
+    setDeployPolicy({ watchedRepo: "org/repo", watchedRef: "watched" });
     await deliver(payload());
-    expect(JSON.parse(fake.calls[0].body).ref).toBe("watched");
+    expect(send).toHaveBeenCalledWith("org/repo#42", { ref: "watched", allowDraft: false }, expect.anything());
   });
-  it("falls back to main for a mapped repository without a target", async () => {
+  it("uses main for a mapped repository without a target", async () => {
     hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
-    const fake = api();
+    const { restateCanStartWork } = await import("../restate/status.js");
     const { req, res } = makeRequest(SECRET, "pull_request", payload());
-    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key");
-    expect(fake.calls).toHaveLength(1);
-    expect(JSON.parse(fake.calls[0].body).ref).toBe("main");
-  });
-  it("skips an unmapped repository without a target", async () => {
-    const { req, res } = makeRequest(SECRET, "pull_request", payload());
-    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key");
-    expect(unrouted.calls).toHaveLength(0);
-  });
-  it("skips another repository even when mapped", async () => {
-    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
-    await deliver(payload(), { ...stamped, repo: "other" });
-    expect(unrouted.calls).toHaveLength(0);
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key", undefined,
+      undefined, undefined, undefined, { canStartWork: restateCanStartWork, send });
+    expect(send).toHaveBeenCalledWith("org/repo#42", { ref: "main", allowDraft: false }, { idempotencyKey: req.headers["x-github-delivery"] });
   });
   it.each([
-    payload("opened", false, "fork/repo"),
-    payload("synchronize", true),
+    payload("opened", false, "fork/repo"), payload("synchronize", true),
     payload("opened", true, "org/repo", "ai-implement-orchestrator-bot[bot]"),
-    { action: "opened", repository: { full_name: "org/repo" } },
+    payload("closed"), { action: "opened", repository: { full_name: "org/repo" } },
     { action: "opened", pull_request: { number: 42 } },
-  ])("skips ineligible or incomplete payloads %#", async (body) => {
+  ])("skips ineligible events %#", async body => {
     await deliver(body);
-    expect(unrouted.calls).toHaveLength(0);
+    expect(send).not.toHaveBeenCalled();
   });
-  it("reviews a draft synchronized by the orchestrator bot", async () => {
-    const fake = api();
+  it("skips unmapped repositories when no deploy target resolves", async () => {
+    const { restateCanStartWork } = await import("../restate/status.js");
+    const { req, res } = makeRequest(SECRET, "pull_request", payload());
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key", undefined,
+      undefined, undefined, undefined, { canStartWork: restateCanStartWork, send });
+    expect(send).not.toHaveBeenCalled();
+  });
+  it("skips other repositories even when mapped", async () => {
+    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
+    await deliver(payload(), { ...stamped, repo: "other" });
+    expect(send).not.toHaveBeenCalled();
+  });
+  it("allows only bot synchronizations to start drafts", async () => {
     await deliver(payload("synchronize", true, "org/repo", "ai-implement-orchestrator-bot[bot]"));
-    expect(fake.calls).toHaveLength(1);
+    expect(send).toHaveBeenCalledWith("org/repo#42", { ref: "testing", allowDraft: true }, expect.anything());
   });
-  it.each(["app", "key"])("does no policy read or fetch with missing %s", async (missing) => {
-    const policy = await import("../deploy-policy.js");
-    const spy = vi.spyOn(policy, "getDeployPolicy");
-    const { req, res } = makeRequest(SECRET, "pull_request", payload());
-    await webhook.handleGitHubWebhook(req as never, res as never, SECRET,
-      missing === "app" ? undefined : "app", missing === "key" ? undefined : "key", stamped);
-    expect(spy).not.toHaveBeenCalled();
-    spy.mockRestore();
-    expect(unrouted.calls).toHaveLength(0);
+  it("does nothing while Restate cannot start work", async () => {
+    const { setRestateStatus } = await import("../restate/status.js");
+    setRestateStatus({ sidecar: { state: "starting" } });
+    await deliver(payload());
+    expect(send).not.toHaveBeenCalled();
   });
-  it.each(["opened", "synchronize", "ready_for_review"])("preserves the %s response after a failed start", async (action) => {
-    api({ status: 404, json: { message: "Not Found" } });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const result = await deliver(payload(action));
-    expect(result).toEqual(action === "synchronize" ? { ignored: true, reason: "no matching dispatch" } : { ignored: true });
-    expect(warn).toHaveBeenCalledTimes(1);
-    warn.mockRestore();
-  });
-  it.each([204, 404])("starts before a KG early response (HTTP %s)", async (status) => {
-    const fake = api(status === 204 ? { status } : { status, json: { message: "Not Found" } });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { req, res } = makeRequest(SECRET, "pull_request", payload());
-    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key", stamped, {
-      kgSourceRepo: "org/source", kgBaseRepo: "org/repo",
-      enqueueDryRun: vi.fn(),
-    });
-    expect(fake.calls).toHaveLength(1);
-    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "base_repo_pr" });
-    expect(warn).toHaveBeenCalledTimes(status === 204 ? 0 : 1);
-    warn.mockRestore();
-  });
-  it("preserves the response when authentication throws", async () => {
-    hoisted.getInstallationToken.mockRejectedValueOnce(new Error("auth unavailable"));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(await deliver(payload())).toEqual({ ignored: true });
-    expect(warn).toHaveBeenCalledTimes(1);
-    warn.mockRestore();
-    expect(unrouted.calls).toHaveLength(0);
+  it("acknowledges without awaiting the handler and omits an absent delivery key", async () => {
+    let release!: () => void;
+    send.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    try {
+      await deliver(payload(), stamped, "");
+      expect(send).toHaveBeenCalledWith("org/repo#42", { ref: "testing", allowDraft: false }, undefined);
+    } finally { release(); }
   });
 });

@@ -771,3 +771,13 @@ invocations and waits at most 75 minutes, including runner time; import attempts
 stay below the twenty-minute invocation abort timeout. `package-cleanup` removes
 the entire Stardog package root on final base outcomes, preserving only packages
 handed off to a hold. Tokens are read inside client calls and never journaled.
+
+### ClaudeReviewStart
+
+`ClaudeReviewStart` is an exclusive object keyed by `owner/repo#prNumber`, composed
+in `src/index.ts`. Its `start({ ref, allowDraft })` handler reads fresh PR eligibility
+and records the head after accepted dispatches or final 404/422 responses.
+Transient failures store nothing and retry on the next poll. Webhook delivery ids
+provide send idempotency; the record deduplicates webhook and poll calls together.
+Only the head is stored; tokens are minted inside journaled operations and never
+returned by them. See [review start limits](review-fix-rail.md#durable-claude-review-starts).

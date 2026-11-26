@@ -102,6 +102,7 @@ describe("a poll cycle's automatic deploy on the published path", () => {
       "GET /app": { json: { slug: "ai-implement" } },
       "GET /orgs/BuildDownAI/installation": { json: { id: 1, permissions: { contents: "read", statuses: "read" } } },
       "POST /app/installations/1/access_tokens": { json: { token: "installation-token", expires_at: "2099-01-01T00:00:00Z" } },
+      "GET /repos/BuildDownAI/AI-Implement/pulls": { json: [] },
       "GET /repos/BuildDownAI/AI-Implement/commits": { json: [{ sha: HEAD }] },
       // The head is one commit past the running one, as GitHub's compare answers it.
       [`GET /repos/BuildDownAI/AI-Implement/compare/${RUNNING}...${HEAD}`]: { json: { status: "ahead", ahead_by: 1, behind_by: 0 } },
@@ -141,4 +142,27 @@ describe("the late-review hook", () => {
     expect(await index.lateExternalReviewSubmitHook(input)).toBe(true);
     expect(fake.calls.map((call) => call.path)).toEqual(["/LateExternalReview/dispatch-2/run/send"]);
   });
+});
+
+it("shares the PR list between review repair and link sweep, freshly each poll", async () => {
+  config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", paused: true }));
+  const fake = fakeFetch({
+    ...EVERY_CYCLE,
+    "GET /app": { json: { slug: "ai-implement" } },
+    "GET /orgs/org/installation": { json: { id: 1 } },
+    "POST /app/installations/1/access_tokens": { json: { token: "token", expires_at: "2099-01-01T00:00:00Z" } },
+    "POST /SetupChecks/orchestrator/get": { json: null },
+    "GET /repos/org/repo/pulls": { json: [{ number: 42, html_url: "https://github.com/org/repo/pull/42",
+      user: { login: "alice" }, head: { ref: "topic", sha: "head" }, base: { ref: "main" },
+      draft: false, title: "PR", created_at: "2026-01-01T00:00:00Z" }] },
+    "POST /ClaudeReviewStart/org%2Frepo%2342/start": { json: "same" },
+  }).install();
+  const app = makeAppConfig({ githubAppPrivateKey: makeAppPrivateKey() });
+  const registry = makeRegistry({ provider: makeProvider() });
+  await index.poll(app, registry);
+  await index.poll(app, registry);
+  expect(fake.calls.filter(c => c.path === "/repos/org/repo/pulls")).toHaveLength(2);
+  const calls = fake.calls.filter(c => c.path.startsWith("/ClaudeReviewStart/"));
+  expect(calls).toHaveLength(1);
+  expect(JSON.parse(calls[0].body)).toEqual({ ref: "main", allowDraft: false });
 });

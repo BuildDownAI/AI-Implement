@@ -14,6 +14,10 @@ on:
         description: Pull request to review
         required: true
         type: string
+      head_sha:
+        description: Head to review (defaults to the current PR head)
+        required: false
+        type: string
   issue_comment:
     types: [created]
 
@@ -37,12 +41,12 @@ jobs:
        (github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'COLLABORATOR'))
-    # Cancel superseded reviews only after the job's authorization condition passes.
+    # Dispatch runs never cancel another head's review.
     # Keep dispatch separate from the old main-branch trigger during rollout, so
     # the two reviews cannot cancel each other before main is promoted.
     concurrency:
-      group: ${{ github.event_name == 'workflow_dispatch' && format('claude-review-dispatch-{0}', inputs.pr_number) || format('claude-review-{0}', github.event.issue.number) }}
-      cancel-in-progress: true
+      group: ${{ github.event_name == 'workflow_dispatch' && format('claude-review-dispatch-{0}-{1}', inputs.pr_number, inputs.head_sha) || format('claude-review-{0}', github.event.issue.number) }}
+      cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR head SHA
@@ -57,7 +61,9 @@ jobs:
                 ? context.payload.inputs.pr_number
                 : context.payload.issue.number,
             });
-            core.setOutput('sha', pr.data.head.sha);
+            const requested = context.eventName === 'workflow_dispatch' ? context.payload.inputs.head_sha : '';
+            core.setOutput('eligible', !requested || requested === pr.data.head.sha);
+            core.setOutput('sha', requested || pr.data.head.sha);
             core.setOutput('number', pr.data.number);
 
       # Checkout PR head with credentials persisted — the claude-code-action
@@ -74,7 +80,8 @@ jobs:
       # into an empty root first, then adding trusted-actions/ afterward, avoids
       # this — the trusted-actions checkout's own default clean only touches its
       # own (empty) subdirectory.
-      - uses: actions/checkout@v4
+      - if: steps.pr.outputs.eligible == 'true'
+        uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr.outputs.sha }}
           fetch-depth: 0
@@ -87,11 +94,13 @@ jobs:
       # Keep this checkout at a distinct path from the PR-head checkout above,
       # and after it (see note above).
       - name: Checkout trusted composite action
+        if: steps.pr.outputs.eligible == 'true'
         uses: actions/checkout@v4
         with:
           path: trusted-actions
 
       - name: Create review check run
+        if: steps.pr.outputs.eligible == 'true'
         id: check
         uses: actions/github-script@v7
         env:
@@ -109,6 +118,7 @@ jobs:
             core.setOutput('id', check.data.id);
 
       - name: Run Claude review
+        if: steps.pr.outputs.eligible == 'true'
         id: review
         uses: ./trusted-actions/.github/actions/claude-review
         with:
