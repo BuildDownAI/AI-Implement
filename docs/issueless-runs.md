@@ -8,7 +8,7 @@ The `kg-refresh` rail (AII-493–521) is the sole concrete implementation; this 
 
 ## 1. Mental model
 
-Refresh identity is resolved once at boot. `KG_SOURCE_REPO` selects customer mode. Without it, the stored `kg_code_repo`, `kg_namespace`, `kg_graph_name`, `kg_graph_label` and `kg_stardog_db` must all be set; missing values are named in the availability diagnostic. Base mode uses the code repo's project mapping for the lock, tokens, schedules, callbacks and dispatch row. It always targets Stardog and never changes the sidecar graph. Changes to these values apply at the next restart.
+Refresh identity is resolved once at boot. `KG_SOURCE_REPO` selects customer mode. Without it, the stored `kg_code_repo`, `kg_namespace`, `kg_graph_name` and `kg_stardog_db` must all be set; an empty `kg_graph_label` defaults to the code repository name (`owner/name` → `name`); missing required values are named in the availability diagnostic. Base mode uses the code repo's project mapping for the lock, tokens, schedules, callbacks and dispatch row. It always targets Stardog and never changes the sidecar graph. Changes to these values apply at the next restart.
 
 A normal implementation run is anchored to a tracker issue: the dispatch creates a dedup entry keyed on the issue's UUID, the runner token encodes that UUID, and every callback writes to the issue (labels, comments, Done state). The issue is both the tracking record and the authority on lifecycle.
 

@@ -40,9 +40,9 @@ export interface OrchestratorSettings {
   kgRefreshReportIssue: string | null;
   /** owner/repo of the base template repo the KG PR-triggered dry-run check watches (AII-633). Seeded once from KG_BASE_REPO. */
   kgBaseRepo: string | null;
-  /** owner/name of the KG code repo shown with the graph details (AII-1991). No environment seed. */
+  /** owner/name of the KG code repo. Seeded once from KG_CODE_REPO, then local sources.yml. */
   kgCodeRepo: string | null;
-  /** Human-readable label for the graph (AII-1991). No environment seed. */
+  /** Optional graph label, seeded once from KG_GRAPH_LABEL; base mode defaults to the repo name. */
   kgGraphLabel: string | null;
   /** Linear label the provider polls for pickup (AII-694). Seeded once from LINEAR_PICKUP_LABEL. */
   linearPickupLabel: string | null;

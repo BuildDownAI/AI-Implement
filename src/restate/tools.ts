@@ -1,4 +1,5 @@
-import { kgRefreshRunRepo, getBootKgRefreshSource } from "../kg-refresh-source.js";
+import { isDeepStrictEqual } from "node:util";
+import { kgRefreshRunRepo, getBootKgRefreshSource, resolveKgRefreshSource, validateKgCodeRepo, validateKgGraphLabel } from "../kg-refresh-source.js";
 import { listParked, unpark } from "../dispatch-breaker.js";
 import { resolveDefaultRunnerImage } from "../repo-image.js";
 import { STAGE_NAMES } from "../agent-config.js";
@@ -63,7 +64,7 @@ import { RunnerBackend } from "./runner-backend.js";
 import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import { KG_GRAPH_SOURCE_SWITCH_REPO_KEY, type KgRefreshDefinition, type KgRepoDefinition } from "./kg-refresh-types.js";
-import { getOrchestratorSettings, getFlySessionsConfig, getRunnerBackendSource, getLinearPickupLabel } from "../orchestrator-settings.js";
+import { getOrchestratorSettings, setOrchestratorSetting, getFlySessionsConfig, getRunnerBackendSource, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
@@ -1973,6 +1974,37 @@ function kgGraphSourceError(error: string, message?: string): ToolResponse {
   };
 }
 
+export const setKgBaseSettingsTool = tool(
+  {
+    description: "Store the base-mode KG code repository and graph label. Null or empty clears a value; omitted fields stay unchanged. Reports missing settings and whether an orchestrator restart is needed; does not restart.",
+    input: z.object({ codeRepo: z.string().nullable().optional(), graphLabel: z.string().nullable().optional() }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    // Validate both fields before entering the write step: a bad label must not save a repo.
+    const codeRepo = input.args.codeRepo === undefined ? undefined : validateKgCodeRepo(input.args.codeRepo);
+    const graphLabel = input.args.graphLabel === undefined ? undefined : validateKgGraphLabel(input.args.graphLabel);
+    const result = await ctx.run("set-kg-base-settings", () => {
+      if (codeRepo !== undefined) setOrchestratorSetting("kgCodeRepo", codeRepo);
+      if (graphLabel !== undefined) setOrchestratorSetting("kgGraphLabel", graphLabel);
+      const rows = getOrchestratorSettings();
+      const graph = getStardogValues();
+      const base = { ...rows, kgNamespace: graph.namespace, kgGraphName: graph.graphName, kgStardogDb: graph.db };
+      const source = resolveKgRefreshSource(process.env.KG_SOURCE_REPO, base);
+      const bootSource = getBootKgRefreshSource() ?? { mode: "unavailable" as const, reason: "KG refresh source has not been initialized" };
+      const names = { kgCodeRepo: "kg_code_repo", kgNamespace: "kg_namespace", kgGraphName: "kg_graph_name", kgStardogDb: "kg_stardog_db" } as const;
+      const missing = source.mode === "customer" ? [] : Object.entries(names).filter(([key]) => !base[key as keyof typeof names]?.trim()).map(([, name]) => name);
+      return {
+        saved: codeRepo !== undefined || graphLabel !== undefined,
+        codeRepo: rows.kgCodeRepo, graphLabel: rows.kgGraphLabel, missing, bootSource,
+        restartNeeded: source.mode !== "customer" && !isDeepStrictEqual(source, bootSource),
+      };
+    });
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+  },
+);
+
 export const setKgGraphSourceTool = tool(
   {
     description: SET_KG_GRAPH_SOURCE_DESCRIPTION,
@@ -2086,6 +2118,7 @@ export const orchestratorTools = restate.service({
     kg_repo_history: kgRepoHistory,
     trigger_kg_refresh: triggerKgRefreshTool,
     decide_kg_refresh: decideKgRefreshTool,
+    set_kg_base_settings: setKgBaseSettingsTool,
     set_kg_graph_source: setKgGraphSourceTool,
     set_runner_mode: setRunnerModeTool,
     set_fly_machine_profile: setFlyMachineProfileTool,

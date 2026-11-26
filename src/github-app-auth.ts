@@ -166,6 +166,19 @@ export async function getAppInstallation(appId: string, privateKey: string, owne
   }
 }
 
+/** The user or organization the App's first listed installation is on, which need not be the App's owner, or null when it is installed nowhere. */
+async function firstInstallationAccount(appId: string, privateKey: string): Promise<string | null> {
+  const headers = githubAppHeaders(createAppJwt(appId, privateKey.replace(/\\n/g, "\n")));
+  const path = "/app/installations?per_page=1";
+  const res = await fetch(`https://api.github.com${path}`, { headers, signal: defaultFetchSignal() });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new GitHubApiError({ status: res.status, path, bodyText: body, message: `Failed to list the App's installations (${res.status}): ${body}` });
+  }
+  const installations = (await res.json()) as { account: { login: string } | null }[];
+  return installations[0]?.account?.login ?? null;
+}
+
 const PERMISSION_RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
 
 /** `owner|permission` pairs already warned about; cleared by clearTokenCache(). */
@@ -464,15 +477,16 @@ export function appCredentialsRefused(read: Pick<AppIdentityRead, "status">): bo
 
 export interface SourceTokenResult {
   token: string | null;
+  /** "public" when the App is not installed on the owner: the token is then from an account the App is installed on, or null when it is installed nowhere. */
   authMode: "installation" | "public";
 }
 
 /**
  * Mints a scoped installation token for the given source-repo owner.
- * When the App is not installed on that owner (404 from both endpoints), falls back to
- * unauthenticated (public) reads — no token is returned. GitHub rejects App JWTs on
- * /repos/... content endpoints; unauthenticated reads work for public repos.
- * Logs which auth path was taken. Any non-404 error from the mint is rethrown unchanged.
+ * When the App is not installed on that owner (404 from both endpoints), the owner's public repositories are read with a token from an account the App is installed on:
+ * GitHub serves public resources to any installation token without the permissions a private one needs, at that installation's rate limit,
+ * where a read with no token shares 60 an hour with every client behind the same address.
+ * Only an App installed nowhere reads with no token. Logs which path was taken. Any other error is rethrown unchanged.
  */
 export async function mintSourceTokenOrJwt(
   appId: string,
@@ -484,14 +498,17 @@ export async function mintSourceTokenOrJwt(
     const { token } = await getScopedInstallationToken(appId, privateKey, owner, options);
     return { token, authMode: "installation" };
   } catch (err) {
-    if (err instanceof GitHubApiError && err.status === 404) {
-      console.log(
-        `[deploy] App not installed on "${owner}"; falling back to unauthenticated reads for public repos (auth=public)`,
-      );
-      return { token: null, authMode: "public" };
-    }
-    throw err;
+    if (!(err instanceof GitHubApiError && err.status === 404)) throw err;
   }
+  const installedAccount = await firstInstallationAccount(appId, privateKey);
+  if (installedAccount === null) {
+    console.log(`[deploy] App not installed on "${owner}" and has no installation. Reading public repositories without a token (auth=public)`);
+    return { token: null, authMode: "public" };
+  }
+  // A mint cannot name a repository outside its installation (GitHub answers 422), and a public one needs only metadata.
+  const { token } = await getScopedInstallationToken(appId, privateKey, installedAccount, { permissions: { metadata: "read" } });
+  console.log(`[deploy] App not installed on "${owner}". Reading its public repositories with the App's installation on "${installedAccount}" (auth=public)`);
+  return { token, authMode: "public" };
 }
 
 /**

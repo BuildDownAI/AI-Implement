@@ -2836,10 +2836,10 @@ describe("model administration acceptance through shared actions", () => {
     const declarations = readFileSync("src/restate/tools.ts", "utf8");
     const writes = [...declarations.matchAll(/= tool\(\s*\{([\s\S]*?)\n  async \(/g)]
       .filter(([, options]) => options.includes('role: "admin"') && !options.includes('operation: "read"')).length;
-    expect(writes).toBe(20);
-    expect(RESTATE_WRITE_TOOL_NAMES.size).toBe(19);
-    expect(docs).toContain("twenty declared write handlers");
-    expect(docs).toContain("nineteen are in `RESTATE_WRITE_TOOL_NAMES`");
+    expect(writes).toBe(21);
+    expect(RESTATE_WRITE_TOOL_NAMES.size).toBe(20);
+    expect(docs).toContain("twenty-one declared write handlers");
+    expect(docs).toContain("twenty are in `RESTATE_WRITE_TOOL_NAMES`");
   });
 });
 
@@ -3121,5 +3121,75 @@ describe("unpark_issue (AII-2018)", () => {
     expect(parse(await call({ identifier: "Con-146" })).issueId).toBe("newest");
     db.prepare("UPDATE dispatch_log SET dispatched_at = 200 WHERE id = ?").run(older);
     expect(parse(await call({ identifier: "Con-146" })).issueId).toBe("older");
+  });
+});
+
+describe("set_kg_base_settings", () => {
+  const caller: Caller = { kind: "human", email: "admin@example.com", role: "admin", grants: [] };
+  let api: typeof import("../restate/tools.js");
+  let source: typeof import("../kg-refresh-source.js");
+  let settings: typeof import("../orchestrator-settings.js");
+  const invoke = (args: { codeRepo?: string | null; graphLabel?: string | null }, role: "admin" | "user" = "admin") =>
+    api.setKgBaseSettingsTool(fakeContext("set_kg_base_settings"), { caller: { ...caller, role }, args });
+  const read = async (args = {}) => JSON.parse((await invoke(args)).content[0].text);
+  beforeEach(async () => {
+    const fixture = await testDb({ modules: {
+      api: () => import("../restate/tools.js"), source: () => import("../kg-refresh-source.js"),
+      settings: () => import("../orchestrator-settings.js"), runner: () => import("../runner-mode.js"),
+    } });
+    ({ api, source, settings } = fixture.modules);
+    fixture.modules.runner.initSettingsTable();
+    vi.stubEnv("KG_SOURCE_REPO", "");
+    source.setBootKgRefreshSource(source.resolveKgRefreshSource(null, {}));
+  });
+  afterEach(() => vi.unstubAllEnvs());
+  it("reads without writes, preserves omitted values and clears supplied values", async () => {
+    const setter = vi.spyOn(settings, "setOrchestratorSetting");
+    expect(await read()).toMatchObject({ saved: false, codeRepo: null, graphLabel: null,
+      missing: ["kg_code_repo", "kg_namespace", "kg_graph_name", "kg_stardog_db"], restartNeeded: false });
+    expect(setter).not.toHaveBeenCalled();
+    expect(await read({ codeRepo: " owner/name ", graphLabel: " Label " })).toMatchObject({ saved: true, codeRepo: "owner/name", graphLabel: "Label" });
+    expect(await read({ graphLabel: "x" })).toMatchObject({ codeRepo: "owner/name", graphLabel: "x" });
+    expect(settings.getOrchestratorSettings()).toMatchObject({ kgCodeRepo: "owner/name", kgGraphLabel: "x" });
+    expect(await read({ codeRepo: null, graphLabel: "" })).toMatchObject({ codeRepo: null, graphLabel: null });
+  });
+  it.each([{ codeRepo: "bad", graphLabel: "valid" }, ...["x".repeat(201), "\ntext", "text\x7f"].map(graphLabel => ({ codeRepo: "owner/name", graphLabel }))])("rejects all fields before writing: %j", async args => {
+    const result = await invoke(args);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain(args.codeRepo === "bad" ? "kg_code_repo" : "kg_graph_label");
+    expect(await read()).toMatchObject({ codeRepo: null, graphLabel: null });
+  });
+  it("reports complete sources, unchanged boot identity and customer mode", async () => {
+    const graph = await import("../kg-graph-source.js");
+    graph.setStardogValues({ namespace: "https://example.org/", graphName: "graph", db: "db" });
+    const boot = source.getBootKgRefreshSource();
+    expect(await read({ codeRepo: "owner/name", graphLabel: "x".repeat(200) })).toMatchObject({ missing: [], restartNeeded: true, bootSource: boot });
+    expect(source.getBootKgRefreshSource()).toEqual(boot);
+    source.setBootKgRefreshSource(source.resolveKgRefreshSource(null, { ...settings.getOrchestratorSettings(), kgNamespace: "https://example.org/", kgGraphName: "graph", kgStardogDb: "db" }));
+    expect(await read()).toMatchObject({ restartNeeded: false });
+    expect(await read({ graphLabel: "changed" })).toMatchObject({ restartNeeded: true });
+    vi.stubEnv("KG_SOURCE_REPO", "customer/repo");
+    expect(await read({ codeRepo: null })).toMatchObject({ missing: [], restartNeeded: false });
+  });
+  it("refuses a user", async () => {
+    expect((await invoke({ codeRepo: "owner/name" }, "user")).isError).toBe(true);
+    expect((await read()).codeRepo).toBeNull();
+  });
+  it("changes only the two base rows and leaves the running source unchanged", async () => {
+    const graph = await import("../kg-graph-source.js");
+    graph.setStardogValues({ namespace: "https://example.org/", graphName: "graph", db: "db" });
+    graph.setKgGraphSource("stardog_run");
+    const before = graph.getStardogValues();
+    const boot = source.getBootKgRefreshSource();
+    const setter = vi.spyOn(settings, "setOrchestratorSetting");
+
+    expect(await read({ codeRepo: "owner/base", graphLabel: "Base graph" })).toMatchObject({
+      saved: true, missing: [], restartNeeded: true,
+    });
+
+    expect(setter.mock.calls).toEqual([["kgCodeRepo", "owner/base"], ["kgGraphLabel", "Base graph"]]);
+    expect(graph.getStardogValues()).toEqual(before);
+    expect(graph.getKgGraphSource()).toBe("stardog_run");
+    expect(source.getBootKgRefreshSource()).toEqual(boot);
   });
 });

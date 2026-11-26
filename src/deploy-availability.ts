@@ -226,11 +226,23 @@ export function decideAvailability(
 }
 
 let current: DeploymentAvailability | null = null;
-// ETag from the last public-mode poll; paired with the SHA it was received with.
-// Sent as If-None-Match on subsequent polls so 304s do not consume the unauthenticated
-// rate limit (60 req/hour per IP) when the branch tip is stable.
+// ETag from the last public-mode poll, paired with the SHA it was received with, and sent as If-None-Match on the next poll.
 let etag: string | null = null;
 let etagSha: string | null = null;
+// The last comparison GitHub made, keyed by its two commits: their ancestry never changes, so a poll that finds the same pair reuses it.
+let lastComparison: { key: string; behindBy: number } | null = null;
+
+/** Whether the head is behind the running commit: false for the same commit, null when GitHub cannot compare them. */
+async function headIsBehind(token: string | null, owner: string, repo: string, runningCommit: string, headCommit: string): Promise<boolean | null> {
+  if (runningCommit === headCommit) return false;
+  const key = `${runningCommit}...${headCommit}`;
+  if (lastComparison?.key !== key) {
+    const comparison = await compareCommits(token, owner, repo, runningCommit, headCommit);
+    if (comparison === null) return null;
+    lastComparison = { key, behindBy: comparison.behindBy };
+  }
+  return lastComparison.behindBy > 0;
+}
 
 /** Last computed availability, or null before the first poll of this process. */
 export function getAvailability(): DeploymentAvailability | null {
@@ -239,8 +251,8 @@ export function getAvailability(): DeploymentAvailability | null {
 
 export async function refreshAvailability(input: AvailabilityInput): Promise<DeploymentAvailability> {
   const { appId, privateKey, owner, repo, branch, runningCommit } = input;
-  // Scoped to the single repository whose branch this reads. Falls back to unauthenticated
-  // when the App is not installed on the source repo's owner, enabling public-repo reads.
+  // Scoped to the single repository whose branch this reads. When the App is not installed on the source repo's owner,
+  // the public repository is read with a token from an account the App is installed on (mintSourceTokenOrJwt).
   // On the installation path the options match the deploy path's mint exactly, so the
   // two share one cache entry.
   const sourceAuth = await mintSourceTokenOrJwt(appId, privateKey, owner, {
@@ -250,13 +262,9 @@ export async function refreshAvailability(input: AvailabilityInput): Promise<Dep
 
   let headCommit: string | null;
   if (sourceAuth.authMode === "public") {
-    // Unauthenticated reads are 60/hour per IP. Send If-None-Match so 304s do not
-    // consume the budget when the branch tip is stable between polls.
-    const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "ai-implement",
-    };
+    // GitHub does not count a 304 answering a request that carries a token, so the ETag makes each unchanged poll free.
+    // Without a token (an App installed nowhere) a 304 still counts.
+    const headers = srcHeaders(sourceAuth.token);
     if (etag) headers["If-None-Match"] = etag;
     const url = `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(branch)}&per_page=1`;
     const refRes = await fetch(url, { headers });
@@ -278,11 +286,7 @@ export async function refreshAvailability(input: AvailabilityInput): Promise<Dep
     headCommit = await getRefSha(sourceAuth.token, owner, repo, branch);
   }
 
-  let isDowngrade: boolean | null = null;
-  if (runningCommit && headCommit) {
-    const comparison = await compareCommits(sourceAuth.token, owner, repo, runningCommit, headCommit);
-    isDowngrade = comparison !== null ? comparison.behindBy > 0 : null;
-  }
+  const isDowngrade = runningCommit && headCommit ? await headIsBehind(sourceAuth.token, owner, repo, runningCommit, headCommit) : null;
 
   current = {
     available: decideAvailability(runningCommit, headCommit),

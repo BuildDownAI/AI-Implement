@@ -48,6 +48,7 @@ import {
   importEnvironmentCredentialTool,
   addProjectTool,
   setProjectExecutionModeTool,
+  setKgBaseSettingsTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
   listDispatchReservationsTool,
@@ -129,6 +130,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   import_environment_credential: importEnvironmentCredentialTool,
   add_project: addProjectTool,
   set_project_execution_mode: setProjectExecutionModeTool,
+  set_kg_base_settings: setKgBaseSettingsTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
   clear_dispatch_dedup: clearDispatchDedupTool,
   list_dispatch_reservations: listDispatchReservationsTool,
@@ -147,6 +149,7 @@ const WRITE_TOOL_NAMES = new Set([
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
   "set_project_execution_mode",
+  "set_kg_base_settings",
   "release_dispatch_reservation",
 ]);
 const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]);
@@ -1595,6 +1598,7 @@ describe("handleMcpRequest", () => {
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
         "release_dispatch_reservation",
+        "set_kg_base_settings",
       ]));
     });
 
@@ -1618,6 +1622,7 @@ describe("handleMcpRequest", () => {
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
         "release_dispatch_reservation",
+        "set_kg_base_settings",
       ]) {
         expect(names).not.toContain(writeTool);
       }
@@ -1980,6 +1985,38 @@ describe("handleMcpRequest", () => {
   });
 
   describe("tools/call — write tier (set_runner_mode, pause_project, add_project, trigger_workflow_sync, clear_dispatch_dedup)", () => {
+    it("set_kg_base_settings: forwards admin arguments and the caller-scoped idempotency key", async () => {
+      mockRole("admin");
+      const args = { codeRepo: "owner/kg", graphLabel: "Knowledge graph" };
+      vi.mocked(toolsClientMock.callTool).mockResolvedValueOnce({
+        status: "ok",
+        content: [{ type: "text", text: JSON.stringify({ saved: true, ...args, restartNeeded: true }) }],
+      });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0", id: 60, method: "tools/call",
+          params: { name: "set_kg_base_settings", arguments: args, _meta: { idempotencyKey: "kg-base-1" } },
+        }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toMatchObject({
+        saved: true, codeRepo: args.codeRepo, graphLabel: args.graphLabel, restartNeeded: true,
+      });
+      expect(toolsClientMock.callTool).toHaveBeenCalledExactlyOnceWith(
+        "set_kg_base_settings", args,
+        expect.objectContaining({ kind: "human", email: "user@example.com", role: "admin" }),
+        { idempotencyKey: "user@example.com:kg-base-1" },
+      );
+    });
+
     it("set_project_execution_mode: as admin, forwards the team key and mode with an idempotency key", async () => {
       mockRole("admin");
       vi.mocked(setProjectExecutionModeAction).mockReturnValue({ ok: true, teamKey: "AII", executionMode: "github-actions" });
