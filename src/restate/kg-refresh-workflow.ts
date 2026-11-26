@@ -67,6 +67,9 @@ export const KG_REFRESH_WATCH_INTERVAL_MS = 60 * 1000;
 /** How long a held snapshot waits for a `decide` before the run closes the PR and records `decision_timeout`. Fixed by decision, not a setting. */
 export const KG_REFRESH_DECISION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
+/** Allow a slow Stardog Run endpoint to start before risking the non-repeatable upload. */
+export const STARDOG_READY_BUDGET_MS = 10 * 60 * 1000;
+
 /** Keep the fixed poll interval explicit: the SDK otherwise caps it at ten seconds. */
 export function stardogWaitOptions(pollMs: number, maxRetryDuration = 20 * 60 * 1000) {
   return { maxRetryDuration, initialRetryInterval: pollMs, maxRetryInterval: pollMs, retryIntervalFactor: 1 };
@@ -326,6 +329,8 @@ export interface KgRefreshWorkflowDependencies {
   stardogPollMs?: number;
   /** Test seam for deterministic budget exhaustion; production uses twenty minutes. */
   stardogWaitBudgetMs?: number;
+  /** Test seam for readiness exhaustion; production uses ten minutes. */
+  stardogReadyBudgetMs?: number;
   rail: KgRailDeps;
   kgSourceRepo: string;
   mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
@@ -1042,6 +1047,18 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (resume) ctx.set("holdConsumed", true);
         let importStartedSuccessfully = false;
         try {
+          ctx.set("step", "stardog-ready");
+          await ctx.run("stardog-ready", async () => {
+            if (!deps.stardog) throw new restate.TerminalError("Stardog client is not configured");
+            try {
+              await deps.stardog.ready();
+            } catch (err) {
+              if (err instanceof Error && err.message === "Stardog Run token is not set") {
+                throw new restate.TerminalError(err.message);
+              }
+              throw err;
+            }
+          }, stardogWaitOptions(deps.stardogPollMs ?? 30_000, deps.stardogReadyBudgetMs ?? STARDOG_READY_BUDGET_MS));
           ctx.set("step", "stardog-import");
           const imported = await ctx.run("stardog-import", async () => {
             if (!deps.stardog) throw new Error("Stardog client is not configured");

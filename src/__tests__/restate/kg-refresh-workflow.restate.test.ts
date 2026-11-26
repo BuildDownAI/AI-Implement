@@ -140,7 +140,8 @@ describe("KgRefresh durable workflow", () => {
       expect(existsSync(join(state.dataRoot, "stardog"))).toBe(false);
       const entries = await journalEntries(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
       const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
-      for (const name of ["stardog-import", "stardog-wait", "stardog-verify", "baseline"]) expect(names).toContain(name);
+      for (const name of ["stardog-ready", "stardog-import", "stardog-wait", "stardog-verify", "baseline"]) expect(names).toContain(name);
+      expect(names.indexOf("stardog-ready")).toBeLessThan(names.indexOf("stardog-import"));
       expect(names.indexOf("stardog-import")).toBeLessThan(names.indexOf("stardog-wait"));
       expect(names.indexOf("stardog-wait")).toBeLessThan(names.indexOf("stardog-verify"));
       expect(names.indexOf("stardog-verify")).toBeLessThan(names.indexOf("baseline"));
@@ -204,6 +205,52 @@ describe("KgRefresh durable workflow", () => {
       expect(names).not.toContain("baseline");
       expect(await readBaseline(env)).toEqual(prior);
     }
+  });
+
+  it("base readiness retries twice before one import and exposes the waiting step", async () => {
+    const env = baseEnvFor("alwaysReplay");
+    const triggerId = newTriggerId();
+    packageFixture(triggerId);
+    const held = gate("Stardog readiness");
+    stardog.ready.mockRejectedValueOnce(new Error("starting"))
+      .mockRejectedValueOnce(new Error("starting"))
+      .mockImplementationOnce(async () => { await held.wait(); });
+    const done = runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
+      hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+    } });
+    await held.reached();
+    try {
+      expect(await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "status")).toMatchObject({ step: "stardog-ready" });
+      expect(stardog.ready).toHaveBeenCalledTimes(3);
+      expect(stardog.startImport).not.toHaveBeenCalled();
+    } finally { held.release(); }
+    expect(await done).toMatchObject({ ok: true });
+    expect(stardog.startImport).toHaveBeenCalledTimes(1);
+    expect(await readBaseline(env)).toMatchObject({ triggerId, parts: { issues: 42 } });
+    const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+    const ordered = ["stardog-ready", "stardog-import", "stardog-wait", "stardog-verify", "baseline"];
+    for (let i = 1; i < ordered.length; i++) expect(names.indexOf(ordered[i - 1])).toBeLessThan(names.indexOf(ordered[i]));
+  });
+
+  it.each(["exhausted", "token", "client"] as const)("base readiness fails before upload: %s", async failure => {
+    const env = baseEnvFor("alwaysReplay");
+    const prior = { parts: { prior: 99 }, at: 123, triggerId: "prior-success" };
+    await callObject(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "seedBaseline", prior);
+    const triggerId = newTriggerId();
+    packageFixture(triggerId);
+    state.stardogReadyBudgetMs = failure === "exhausted" ? 0 : undefined;
+    state.stardogMissing = failure === "client";
+    const message = failure === "token" ? "Stardog Run token is not set" : "starting";
+    stardog.ready.mockRejectedValue(new Error(message));
+    const outcome = await runWorkflow(env.baseUrl(), triggerId, { baseMode: true, resume: {
+      hold: { triggerId, dispatchId: triggerId, decideBy: 0, steps: [], stardogTarget: frozenTarget, report: { ok: false, partCounts: { issues: 42 } } }, action: "accept",
+    } });
+    expect(outcome).toMatchObject({ ok: false, conclusion: "stardog-import-failed" });
+    expect(outcome.detail).toContain(failure === "client" ? "Stardog client is not configured" : message);
+    expect(outcome.detail).not.toContain("no good graph");
+    expect(stardog.ready).toHaveBeenCalledTimes(failure === "client" ? 0 : 1);
+    expect(stardog.startImport).not.toHaveBeenCalled();
+    expect(await readBaseline(env)).toEqual(prior);
   });
 
   it("base wait exhausts the retry budget under alwaysReplay without another import", async () => {

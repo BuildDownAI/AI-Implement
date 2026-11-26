@@ -214,6 +214,8 @@ export function createKgRefreshFixture() {
     configuredTarget: { db: "original-db", graphName: "original-graph" },
     beforeImportGate: undefined as Gate | undefined,
     stardogWaitBudgetMs: undefined as number | undefined,
+    stardogReadyBudgetMs: undefined as number | undefined,
+    stardogMissing: false,
     baseMode: false,
     dataRoot: "",
     tarball: Buffer.alloc(0) as Buffer,
@@ -612,6 +614,7 @@ export function createKgRefreshFixture() {
 
   const stardogTokensUsed: string[] = [];
   const stardog = {
+    ready: vi.fn(async () => {}),
     startImport: vi.fn(async (_dir: string, _files: string[], _target: import("../../stardog-client.js").StardogTarget) => ({ kitId: "kit-test", publishId: "publish-test" })),
     readEvents: vi.fn<import("../../stardog-client.js").StardogClient["readEvents"]>(async () => "done"),
     countTriples: vi.fn(async (_target?: import("../../stardog-client.js").StardogTarget) => 42),
@@ -624,6 +627,9 @@ export function createKgRefreshFixture() {
       stardogTokensUsed.push("SENTINEL-stardog-token");
       return { kitId: "kit-test", publishId: "publish-test" };
     });
+    stardog.ready.mockReset().mockResolvedValue(undefined);
+    state.stardogReadyBudgetMs = undefined;
+    state.stardogMissing = false;
     stardog.readEvents.mockReset().mockResolvedValue("done");
     stardog.countTriples.mockReset().mockResolvedValue(42);
     state.baseMode = false;
@@ -692,6 +698,8 @@ export function createKgRefreshFixture() {
 
   const workflow = createKgRefreshWorkflow({
     ...workflowDeps,
+    get stardog() { return state.stardogMissing ? undefined : stardog; },
+    get stardogReadyBudgetMs() { return state.stardogReadyBudgetMs; },
     get stardogWaitBudgetMs() { return state.stardogWaitBudgetMs; },
     bootstrapDeadlineMs: 30_000,
     totalDeadlineMs: 60_000,
