@@ -174,7 +174,7 @@ describe("the late-review hook", () => {
   });
 });
 
-it("shares the PR list between review repair and link sweep, freshly each poll", async () => {
+it.each([false, true])("shares the PR list and retries a failed review start on the next poll (failure: %s)", async failFirst => {
   config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", paused: true }));
   const fake = fakeFetch({
     ...EVERY_CYCLE,
@@ -185,7 +185,9 @@ it("shares the PR list between review repair and link sweep, freshly each poll",
     "GET /repos/org/repo/pulls": { json: [{ number: 42, html_url: "https://github.com/org/repo/pull/42",
       user: { login: "alice" }, head: { ref: "topic", sha: "head" }, base: { ref: "main" },
       draft: false, title: "PR", created_at: "2026-01-01T00:00:00Z" }] },
-    "POST /ClaudeReviewStart/org%2Frepo%2342/start": { json: "same" },
+    "POST /ClaudeReviewStart/org%2Frepo%2342/start": failFirst
+      ? [() => { throw new Error("review start request failed"); }, { json: "same" }]
+      : { json: "same" },
   }).install();
   const app = makeAppConfig({ githubAppPrivateKey: makeAppPrivateKey() });
   const registry = makeRegistry({ provider: makeProvider() });
@@ -193,6 +195,10 @@ it("shares the PR list between review repair and link sweep, freshly each poll",
   await index.poll(app, registry);
   expect(fake.calls.filter(c => c.path === "/repos/org/repo/pulls")).toHaveLength(2);
   const calls = fake.calls.filter(c => c.path.startsWith("/ClaudeReviewStart/"));
-  expect(calls).toHaveLength(1);
-  expect(JSON.parse(calls[0].body)).toEqual({ ref: "main", allowDraft: false });
+  expect(calls).toHaveLength(failFirst ? 2 : 1);
+  for (const call of calls) {
+    expect(call.path).toBe("/ClaudeReviewStart/org%2Frepo%2342/start");
+    expect(call.signal).toBeInstanceOf(AbortSignal);
+    expect(JSON.parse(call.body)).toEqual({ ref: "main", allowDraft: false });
+  }
 });

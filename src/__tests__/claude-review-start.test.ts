@@ -29,6 +29,15 @@ describe("Claude review poll", () => {
     await poll(deps); await poll(deps);
     expect(call).toHaveBeenCalledTimes(2);
   });
+  it("continues to the second PR when the first call throws", async () => {
+    const call = vi.fn().mockRejectedValueOnce(new Error("request failed")).mockResolvedValue("same");
+    await createClaudeReviewPoll()({ selfDeploy: target, canStartWork: () => true,
+      listRepoPulls: vi.fn().mockResolvedValue([pull, { ...pull, number: 2 }]), call });
+    expect(call.mock.calls).toEqual([
+      ["trusted/repo#1", { ref: "testing", allowDraft: false }],
+      ["trusted/repo#2", { ref: "testing", allowDraft: false }],
+    ]);
+  });
   it("ignores drafts and does not list while unavailable", async () => {
     const poll = createClaudeReviewPoll();
     const deps = { selfDeploy: target, canStartWork: () => false,

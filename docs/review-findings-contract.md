@@ -256,8 +256,18 @@ The workflow skips a dispatch if that named head is no longer current, uses the
 named head for checkout and the check run, and never cancels dispatch runs.
 An older orchestrator may omit `head_sha`; that run uses the current PR head.
 
+Both client calls (send and call) have a 5000 ms (five-second) HTTP request limit.
+This bounds one request; it does not cancel the durable invocation or add a retry.
+The poll logs a failed call and tries the same head again on the next poll,
+without an idempotency key that could retain a failed answer.
+
 Known limits:
 
+- **Calls during an outage:** while the object does not answer, each poll adds
+  one more call for each non-draft open PR. When the object answers again, each
+  waiting call ends with `same` or one start; no second review starts for one head.
+- **Poll delay:** while the object does not answer, one poll can wait five seconds
+  for each non-draft open PR before continuing with the rest of the poll.
 - **First deploy:** no head is recorded yet. The first poll starts one review for
   every non-draft open PR in the selected repositories, once per durable head.
 - **Drafts:** the poll does not repair a lost webhook or failed draft start. The

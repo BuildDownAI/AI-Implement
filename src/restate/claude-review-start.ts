@@ -8,6 +8,8 @@ import { getClaudeReviewPullRequest, postWorkflowDispatch } from "../github.js";
 import type { ClaudeReviewStartInput, ClaudeReviewStartResult } from "../claude-review-start.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
+const CLAUDE_REVIEW_START_TIMEOUT_MS = 5000;
+
 export interface ClaudeReviewStartDeps {
   appId: string;
   privateKey: string;
@@ -56,8 +58,9 @@ export function claudeReviewStartClient() {
   return {
     send: async (key: string, input: ClaudeReviewStartInput, opts?: { idempotencyKey?: string }) =>
       ingress.objectSendClient<ClaudeReviewStartDefinition>({ name: "ClaudeReviewStart" }, key)
-        .start(input, clients.rpc.sendOpts(opts ?? {})),
+        .start(input, clients.rpc.sendOpts({ ...opts, timeout: CLAUDE_REVIEW_START_TIMEOUT_MS })),
     call: async (key: string, input: ClaudeReviewStartInput) =>
-      ingress.objectClient<ClaudeReviewStartDefinition>({ name: "ClaudeReviewStart" }, key).start(input),
+      ingress.objectClient<ClaudeReviewStartDefinition>({ name: "ClaudeReviewStart" }, key)
+        .start(input, clients.rpc.opts({ timeout: CLAUDE_REVIEW_START_TIMEOUT_MS })),
   };
 }
