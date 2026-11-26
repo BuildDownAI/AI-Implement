@@ -26,3 +26,22 @@ export function getBootKgRefreshSource(): KgRefreshSource | undefined { return b
 export function kgRefreshRunRepo(customerRepo?: string | null): string | null {
   return bootSource ? (bootSource.mode === "unavailable" ? null : bootSource.runRepo) : customerRepo ?? null;
 }
+
+/** Shared settings-page/MCP validation; errors retain the settings API field names. */
+export function validateKgCodeRepo(raw: unknown): string | null {
+  if (raw !== null && typeof raw !== "string") throw new Error("kg_code_repo must be a string or null");
+  const value = raw?.trim() ?? "";
+  if (value && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,100}$/.test(value)) {
+    throw new Error("kg_code_repo must be an owner/name GitHub repository");
+  }
+  return value || null;
+}
+
+export function validateKgGraphLabel(raw: unknown): string | null {
+  if (raw !== null && typeof raw !== "string") throw new Error("kg_graph_label must be a string or null");
+  const value = raw ?? "";
+  // Validate before trim so whitespace cannot hide controls or excessive length.
+  if (value.length > 200) throw new Error("kg_graph_label must be 200 characters or fewer");
+  if (/[\x00-\x1f\x7f]/.test(value)) throw new Error("kg_graph_label must not contain control characters");
+  return value.trim() || null;
+}

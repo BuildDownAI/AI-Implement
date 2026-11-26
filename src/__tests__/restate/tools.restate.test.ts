@@ -1267,6 +1267,25 @@ describe("orchestratorTools (Restate)", () => {
     }
   });
 
+  it("journals base settings without refresh dependencies and exposes them on the settings API", async () => {
+    const env = environments.get("strict")!;
+    const input = { caller: SYSTEM, args: { codeRepo: "owner/base", graphLabel: "Base label" } };
+    const first = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_kg_base_settings", input, { "idempotency-key": "base-settings" });
+    expect(JSON.parse(first.content[0].text)).toMatchObject({ saved: true, codeRepo: "owner/base", graphLabel: "Base label" });
+    const second = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_kg_base_settings", { caller: SYSTEM, args: { codeRepo: null } }, { "idempotency-key": "base-settings" });
+    expect(second).toEqual(first);
+    let status = 0;
+    let body = "";
+    handleAdminRequest({ url: "/api/settings", method: "GET", headers: { authorization: `Bearer ${createSession()}` } } as never,
+      { writeHead: (code: number) => { status = code; }, end: (data: string) => { body = data; } } as never,
+      { adminAccessCode: "test" } as never, {} as never);
+    expect(status).toBe(200);
+    expect(JSON.parse(body)).toMatchObject({ kg_code_repo: "owner/base", kg_graph_label: "Base label" });
+    const invocations = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'set_kg_base_settings'");
+    const entries = await journalEntries(env.adminAPIBaseUrl(), String(invocations[0].id));
+    expect(journalText(entries)).toContain("set-kg-base-settings");
+  });
+
   it("pause_project: a second ingress call with the same idempotency key attaches to the first result instead of running pauseProjectAction again", async () => {
     const env = environments.get("strict");
     if (!env) throw new Error('environment "strict" did not start');
