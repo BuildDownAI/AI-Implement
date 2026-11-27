@@ -169,6 +169,7 @@ async function invokeConfiguredPlanning(input: ConfiguredPlanningInput): Promise
         workspaceDir,
         legacy: new ClaudeCliExecutor(workspaceDir, "summary", false, guardedSpawn),
         logLevel: "summary",
+        planningSkillNames: skills?.skillNames ?? [],
       });
       result = await executor.invoke({
         prompt,

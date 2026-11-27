@@ -913,6 +913,8 @@ describe("app-server trusted view (AII-1002)", () => {
 
     it("copies the skills read-only, logs a count, and removes the view afterward", async () => {
       const skills = mkSkills();
+      mkdirSync(join(skills, "stale"));
+      writeFileSync(join(skills, "stale", "SKILL.md"), "unselected");
       const outside = mkdtempSync(join(tmpdir(), "synthetic-outside-"));
       writeFileSync(join(outside, "secret.txt"), "outside-content");
       symlinkSync(join(outside, "secret.txt"), join(skills, "a", "link-file"));
@@ -922,6 +924,7 @@ describe("app-server trusted view (AII-1002)", () => {
       const log: Spawned[] = [];
       const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
         const dest = join(log[0].env.HOME, ".agents", "skills");
+        expect(existsSync(join(dest, "stale"))).toBe(false);
         let leaked = false;
         for (const l of ["link-file", "link-dir"]) {
           try {
@@ -941,7 +944,7 @@ describe("app-server trusted view (AII-1002)", () => {
           root: dirname(log[0].env.HOME),
         };
         return okResult();
-      }, { trustedSkillsDir: skills });
+      }, { trustedSkillNames: ["a"], trustedSkillsDir: skills });
       try {
         await executor.invoke(base);
         expect(seen!.content).toBe("synthetic skill a");
@@ -1025,7 +1028,7 @@ describe("app-server trusted view (AII-1002)", () => {
         root = dirname(log[0].env.HOME);
         return new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve({ ...okResult(), stopReason: null })));
       };
-      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, halting, { trustedSkillsDir: skills });
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, halting, { trustedSkillNames: ["a"], trustedSkillsDir: skills });
       try {
         const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
         expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
@@ -1039,7 +1042,7 @@ describe("app-server trusted view (AII-1002)", () => {
     it("removes the view when the spawn fails with skills present", async () => {
       const skills = mkSkills();
       const before = new Set(viewDirs());
-      const { executor } = run([{ error: Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }) }], [], async () => okResult(), { trustedSkillsDir: skills });
+      const { executor } = run([{ error: Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }) }], [], async () => okResult(), { trustedSkillNames: ["a"], trustedSkillsDir: skills });
       try {
         await executor.invoke(base).catch(() => undefined);
         expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
@@ -1057,7 +1060,7 @@ describe("app-server trusted view (AII-1002)", () => {
         root = dirname(log[0].env.HOME);
         ctl.abort();
         return okResult();
-      }, { trustedSkillsDir: skills, cancelSignal: ctl.signal });
+      }, { trustedSkillNames: ["a"], trustedSkillsDir: skills, cancelSignal: ctl.signal });
       try {
         await executor.invoke(base).catch(() => undefined);
         expect(root).not.toBe("");
@@ -1602,7 +1605,7 @@ describe("ChatGPT plan token expiry resume", () => {
           return seen.length === 1 ? expiredResult() : result({ tokens: [6, 3] });
         },
       };
-      const planned = makePlan([{ hang: true, dieOn: ["SIGTERM"] }], { protocolDriver: driver, trustedSkillsDir: skills });
+      const planned = makePlan([{ hang: true, dieOn: ["SIGTERM"] }], { protocolDriver: driver, trustedSkillNames: ["a"], trustedSkillsDir: skills });
       try {
         const out = await planned.executor.invoke({ ...base, agentStage: "planning", invocationTimeoutMs: 60_000 });
         expect(out.failure).toBeUndefined();

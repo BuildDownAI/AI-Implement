@@ -9,9 +9,8 @@ Operator procedures: [model-account-operations.md](model-account-operations.md).
 
 ## PR #1730 acceptance status
 
-**Incomplete; this integration must not be treated as completing AII-1289.** Review finding
-`37362678e748d559875f041c3c1299fdcfa43528a31738372e326c746243d1ea` correctly identifies
-missing Codex/Restate acceptance. The native Claude skills proof below and Codex skill discovery without a turn
+**Incomplete; this integration must not be treated as completing AII-1289.** The [PR review](https://github.com/BuildDownAI/AI-Implement/pull/1730#issuecomment-7228186477)
+requires checkable evidence for the remaining Codex/Restate acceptance matrix. The native Claude skills proof below and Codex skill discovery without a turn
 cannot satisfy it. Keep the parent open until the remaining matrix and backend/recovery gates have accepted evidence.
 
 ### October 17 operator-reported milestones

@@ -110,6 +110,8 @@ interface PostPushReviewOutputs extends Record<string, unknown> {
    *  prefix, so run-autonomous.ts can add it to the ticket-facing "Total cost" and agree with
    *  the report card (BAC-27201). */
   costUsd: number | null;
+  /** Invocations whose cost was unavailable, even when other invocations reported a cost. */
+  costUnreported?: number;
   /** Every finding disposition read from the fix agent's dispositions file across every
    *  fix-pass push in this run, deduplicated by findingKey with the last one read winning. */
   findingDispositions: FindingDisposition[];
@@ -1263,6 +1265,8 @@ interface SelectedReviewerPassResult {
   incompleteReviews: IncompleteReviewerResult[];
   telemetry?: RunTelemetry;
   costUsd: number | null;
+  /** Invocations whose cost was unavailable, even when other invocations reported a cost. */
+  costUnreported?: number;
   failure?: FailureRecord;
   terminationReason?: PostPushReviewTerminationReason;
   priorLlmFailure?: boolean;
@@ -1655,6 +1659,7 @@ async function runSelectedInternalReviewers(params: {
   let approved = true;
   let aggregateTelemetry: RunTelemetry | undefined;
   let costUsd: number | null = null;
+  let costUnreported = 0;
   const incompleteReviews: IncompleteReviewerResult[] = [];
   let firstGatingFailure: FailureRecord | undefined;
   let firstTerminationReason: PostPushReviewTerminationReason | undefined;
@@ -1776,6 +1781,7 @@ async function runSelectedInternalReviewers(params: {
         outputs: { failure: reviewStageClassified, maxTurns, telemetry: reviewResult.telemetry },
         logs_url: null,
       });
+      costUnreported += reviewResult.telemetry?.costUsd == null ? 1 : 0;
       costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
       await params.sleep(computeBackoffMs(reviewStageAttempt, params.retryPolicy));
       reviewStageAttempt++;
@@ -1796,6 +1802,7 @@ async function runSelectedInternalReviewers(params: {
       reviewStageClassified = undefined;
     }
     if (invocationThrew) continue;
+    costUnreported += reviewResult.telemetry?.costUsd == null ? 1 : 0;
     costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
     if (legacy) aggregateTelemetry = reviewResult.telemetry;
 
@@ -1927,6 +1934,7 @@ async function runSelectedInternalReviewers(params: {
     incompleteReviews,
     telemetry: aggregateTelemetry,
     costUsd,
+    costUnreported,
     ...(firstGatingFailure ? { failure: firstGatingFailure } : {}),
     ...(firstTerminationReason ? { terminationReason: firstTerminationReason } : {}),
     ...(priorLlmFailure ? { priorLlmFailure } : {}),
@@ -2042,6 +2050,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     // invocation this step runs, summed — mirrors report-card.ts's extraCostUsd so the
     // ticket-facing total (run-autonomous.ts) can agree with the report card (BAC-27201).
     let costUsd: number | null = null;
+    let costUnreported = 0;
     // Set to true when a real LLM failure (non-zero exit) occurs. A benign terminal
     // (PrMergedError or OperatorCancelledError) thrown afterward while posting the failure
     // comment is suppressed so the genuine failure conclusion surfaces rather than being masked.
@@ -2207,6 +2216,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         model,
         sleep,
       });
+      costUnreported += selectedReviewerResult.costUnreported ?? 0;
       costUsd = addExtraCost(costUsd, selectedReviewerResult.costUsd);
       if (selectedReviewerResult.failure) reviewerFailure = selectedReviewerResult.failure;
       if (selectedReviewerResult.priorLlmFailure) priorLlmFailure = true;
@@ -2664,6 +2674,7 @@ ${externalFindingsFixBlock}
         agentStage: "implementation",
         expectsStructuredOutput: false,
       });
+      costUnreported += fixResult.telemetry?.costUsd == null ? 1 : 0;
       costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);
       if (fixResult.exitCode !== 0) {
         priorLlmFailure = true;
@@ -2893,7 +2904,7 @@ ${externalFindingsFixBlock}
             `[post-push-review] PR #${prNumber} was closed by operator while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, costUnreported, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         // No prior genuine failure — the operator cancel is the sole anomaly.
         terminationReason = "operator_cancelled";
@@ -2908,11 +2919,11 @@ ${externalFindingsFixBlock}
             `[post-push-review] PR #${prNumber} was merged while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, costUnreported, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         terminationReason = "pr_merged";
         console.warn(`[post-push-review] PR #${prNumber} was merged under the run — exiting as pr_merged`);
-        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, findingDispositions: [...findingDispositionsByKey.values()] };
+        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, costUnreported, findingDispositions: [...findingDispositionsByKey.values()] };
       }
       throw err;
     }
@@ -2924,6 +2935,7 @@ ${externalFindingsFixBlock}
       forcePushedRevisions: forcePushed,
       terminationReason,
       costUsd,
+      costUnreported,
       findingDispositions: [...findingDispositionsByKey.values()],
       ...(reviewerFailure ? { failure: reviewerFailure } : {}),
       ...(terminationReason === "external_review_pending" && reviewedHeadSha ? { reviewedHeadSha } : {}),

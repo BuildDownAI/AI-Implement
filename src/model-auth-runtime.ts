@@ -168,9 +168,18 @@ export function createAgentConfigAdminDeps(config: RuntimeConfig): AgentConfigAd
     sessionSnapshot: (profileId) => runtime.ownership.snapshot(profileId),
     inspectReadiness(request, candidate) {
       const [owner, repo] = request.workflowRepository.split("/");
+      const deps = runtime.preparationDeps({ owner: owner!, repo: repo!, projectKey: request.projectKey });
+      // Only this read-only admin inspection may use an unpublished opt-in. Dispatch keeps persisted trust.
+      const readinessDeps = candidate ? {
+        ...deps,
+        async getRepoTrust(repository: string): Promise<RepoTrust> {
+          const trust = await deps.getRepoTrust(repository);
+          return { ...trust, trustedForSubscription: trust.visibility === "private" && candidate.mode === "configured" };
+        },
+      } : deps;
       return inspectAgentReadiness(
         { ...request, dispatchId: `admin-readiness-${randomUUID()}` },
-        runtime.preparationDeps({ owner: owner!, repo: repo!, projectKey: request.projectKey }),
+        readinessDeps,
         candidate,
       );
     },

@@ -117,6 +117,32 @@ describe("getRepoTrust", () => {
     });
   });
 
+  it("inspects a first opt-in without publishing it or changing dispatch trust", async () => {
+    vi.stubGlobal("fetch", fetchImpl);
+    try {
+      const { createModelSessionKeyProvider } = await import("../model-session-keys.js");
+      const { createModelSessionStore } = await import("../model-session-store.js");
+      const writer = createModelSessionStore({
+        keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: SECRET }),
+        verifyOwner: () => false, authorizeOperator: () => true, db: () => dedup.getDb(),
+      });
+      expect(writer.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: planRecord(), operator: "op" }).ok).toBe(true);
+      const admin = mod.createAgentConfigAdminDeps(CONFIG);
+      const request = { projectKey: "AII", backend: "local-docker" as const, workflowRepository: "acme/app", workflowFile: "claude-implement.yml", repositories: ["acme/app"] };
+      const candidate = { version: 1 as const, mode: "configured" as const };
+      expect(store.getProjectOptIn("AII")).toBe(false);
+      expect(await admin.inspectReadiness!(request, candidate)).toMatchObject({ status: "ready" });
+      expect(store.getProjectOptIn("AII")).toBe(false);
+      expect(await deps().getRepoTrust("acme/app")).toMatchObject({ trustedForSubscription: false });
+      for (const visibility of ["public", "internal"]) {
+        repoResponse = { status: 200, body: { visibility } };
+        expect(await admin.inspectReadiness!(request, candidate)).toMatchObject({ status: "not-ready", code: visibility === "public" ? "repository_public" : "repository_not_trusted" });
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("trusts only a private repo of an opted-in project", async () => {
     store.setProjectOptIn("AII", true);
     expect(await deps().getRepoTrust("acme/app")).toEqual({ visibility: "private", trustedForSubscription: true });

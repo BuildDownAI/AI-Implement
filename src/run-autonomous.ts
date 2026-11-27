@@ -831,6 +831,7 @@ export interface ConfiguredSyntheticProviderOptions {
 }
 
 export interface ConfiguredExecutorArgs {
+  planningSkillNames?: readonly string[];
   workspaceDir: string;
   /** Test seam: also used as the Claude executor so an injected double still serves Claude stages. */
   legacy?: LLMExecutor;
@@ -1101,6 +1102,7 @@ function buildConfiguredRun(
         auth,
         logLevel: args.logLevel,
         activityReporting: args.activityReporting,
+        codexOptions: { trustedSkillNames: args.planningSkillNames ?? [] },
         ...(args.legacy ? { createClaude: () => args.legacy as LLMExecutor } : {}),
         ...(options.createCodex ? { createCodex: options.createCodex } : {}),
       });
@@ -1478,7 +1480,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       // Components that ran but reported no cost: a superseded retry attempt without telemetry
       // (feedback-loop) or a post-push review that ran without a numeric cost.
       const fbUnreported = typeof fbOutputs.extraCostUnreported === "number" ? fbOutputs.extraCostUnreported : 0;
-      const extraCostUnreported = fbUnreported + (postPushReviewRequired && postPushReviewCostUsd == null ? 1 : 0);
+      const extraCostUnreported = fbUnreported + (postPushReviewRequired
+        ? (typeof postPushReviewOutputs.costUnreported === "number" ? postPushReviewOutputs.costUnreported : postPushReviewCostUsd == null ? 1 : 0)
+        : 0);
       const extraCostUsd = fbExtraCostUsd == null && postPushReviewCostUsd == null
         ? null
         : (fbExtraCostUsd ?? 0) + (postPushReviewCostUsd ?? 0);

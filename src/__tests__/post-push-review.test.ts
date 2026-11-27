@@ -2040,6 +2040,54 @@ describe("postPushReviewStep", () => {
     // 0.30 (review 1) + 0.15 (fix 1) + 0.05 (review 2) — every invocation this step ran.
     expect(out.costUsd).toBeCloseTo(0.50);
   });
+  it("retains missing cost alongside reported costs across review and fix passes", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 };
+    const approved = { approved: true, blocking_issues: [], feedback: "lgtm", score: 90, progress_delta: 100 };
+
+    const reviewResult1 = { ...structuredReviewResult(notApproved), telemetry: { outcome: "success" as const, numTurns: 3, durationMs: 10, costUsd: 0.30, tokensIn: 1, tokensOut: 1 } };
+    const fixResult1 = { stdout: '{"fixed":["fixed the bug"],"testing":[],"notes":""}', exitCode: 0, tokensUsed: 0, telemetry: { outcome: "success" as const, numTurns: 2, durationMs: 5, costUsd: null, tokensIn: 1, tokensOut: 1 } };
+    const reviewResult2 = { ...structuredReviewResult(approved), telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 5, costUsd: 0.05, tokensIn: 1, tokensOut: 1 } };
+
+    const invoke = vi.fn()
+      .mockResolvedValueOnce(reviewResult1)
+      .mockResolvedValueOnce(fixResult1)
+      .mockResolvedValueOnce(reviewResult2);
+
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tfile.ts\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+
+    const report = vi.fn(async () => undefined);
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report },
+    );
+
+    expect(out.approved).toBe(true);
+    const calls = report.mock.calls.map((c: any) => c[0]);
+    const review1 = calls.find((s: any) => s.id === "post-push-review.1");
+    const fix1 = calls.find((s: any) => s.id === "post-push-review.fix-1");
+    const review2 = calls.find((s: any) => s.id === "post-push-review.2");
+    expect(review1).toBeDefined();
+    expect(fix1).toBeDefined();
+    expect(review2).toBeDefined();
+    expect(review1.outputs.telemetry?.costUsd).toBeCloseTo(0.30);
+    expect(fix1.outputs.telemetry?.costUsd).toBeNull();
+    expect(review2.outputs.telemetry?.costUsd).toBeCloseTo(0.05);
+    // 0.30 (review 1) + 0.15 (fix 1) + 0.05 (review 2) — every invocation this step ran.
+    expect(out.costUsd).toBeCloseTo(0.35);
+    expect(out.costUnreported).toBe(1);
+  });
   it("reports a transient review attempt superseded by a retry as its own row, and sums both attempts' cost (BAC-27201)", async () => {
     const approved = { approved: true, blocking_issues: [], feedback: "lgtm", score: 90, progress_delta: 100 };
     const transientResult = {

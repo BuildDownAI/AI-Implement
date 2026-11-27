@@ -145,6 +145,8 @@ export interface CodexExecutorOptions {
    * CODEX_HOME or a forbidden root.
    */
   trustedSkillsDir?: string;
+  /** Explicit installed names; an empty list exposes no host skills. */
+  trustedSkillNames?: readonly string[];
 }
 
 const SKILLS_REJECTED = "The trusted skills directory is not allowed in the planning view";
@@ -711,7 +713,14 @@ export class CodexExecutor implements LLMExecutor {
     if (existsSync(dest)) return;
     mkdirSync(join(dest, ".."), { mode: 0o700, recursive: true });
     // Symbolic links are dropped, not followed or recreated: no outside content stays reachable through the copy.
-    cpSync(real, dest, { recursive: true, dereference: false, filter: (src) => !lstatSync(src).isSymbolicLink() });
+    const names = this.options.trustedSkillNames ?? [];
+    mkdirSync(dest, { mode: 0o700, recursive: true });
+    for (const name of names) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) throw new Error(SKILLS_REJECTED);
+      const source = join(real, name);
+      if (!existsSync(source) || lstatSync(source).isSymbolicLink() || !lstatSync(source).isDirectory()) continue;
+      cpSync(source, join(dest, name), { recursive: true, dereference: false, filter: (src) => !lstatSync(src).isSymbolicLink() });
+    }
     lockTree(dest);
     const count = readdirSync(dest).filter((n) => lstatSync(join(dest, n)).isDirectory()).length;
     console.log(`[codex] planning skills copied=${count}`);

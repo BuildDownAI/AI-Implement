@@ -191,6 +191,7 @@ const SECRET_FAILURES: Record<ProtectedSecretFailure, string> = {
 /** A key is one line; a trailing newline from `echo` or a heredoc is dropped, nothing else is trimmed. */
 function parseSecretInput(raw: string): string | Record<string, unknown> {
   const text = raw.replace(/\r?\n$/, "");
+  if (text.trimStart().startsWith("[")) throw new CliError(SECRET_FAILURES.invalid_value);
   return parseJsonObject(text) ?? text;
 }
 

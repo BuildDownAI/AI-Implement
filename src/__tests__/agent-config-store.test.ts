@@ -350,3 +350,23 @@ describe("config references and frozen snapshots", () => {
     expect(frozen.p.revision).toBe(before.project.revision);
   });
 });
+
+
+describe("project readiness fingerprints", () => {
+  it("ignores unrelated project permissions but tracks this project's membership", () => {
+    store.saveAccountProfileRevision(claudeProfile({ allowedProjectKeys: ["AII", "OTHER"] }));
+    const first = store.readStageInputsFingerprint("AII");
+    dedup.getDb().prepare("UPDATE model_account_profile_project_permissions SET status = 'disabled' WHERE project_key = 'OTHER'").run();
+    expect(store.readStageInputsFingerprint("AII")).toBe(first);
+    dedup.getDb().prepare("UPDATE model_account_profile_project_permissions SET status = 'disabled' WHERE project_key = 'AII'").run();
+    expect(store.readStageInputsFingerprint("AII")).not.toBe(first);
+  });
+
+  it("is stable when SQLite reverses unordered scans", () => {
+    store.saveAccountProfileRevision(claudeProfile());
+    store.saveAccountProfileRevision(codexProfile());
+    const first = store.readStageInputsFingerprint("AII");
+    dedup.getDb().pragma("reverse_unordered_selects = ON");
+    expect(store.readStageInputsFingerprint("AII")).toBe(first);
+  });
+});

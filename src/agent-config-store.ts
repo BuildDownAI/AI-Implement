@@ -426,7 +426,7 @@ function appendConfig(
 
 /** Current profile heads as resolver input; `disabled` reflects head status and permissions come from `allowed` rows. */
 function loadProfiles(db: Database.Database, probeProject?: string): AccountProfile[] {
-  const heads = db.prepare("SELECT profile_id, current_profile_revision, status FROM model_account_profiles").all() as HeadRow[];
+  const heads = db.prepare("SELECT profile_id, current_profile_revision, status FROM model_account_profiles ORDER BY profile_id").all() as HeadRow[];
   const profiles: AccountProfile[] = [];
   for (const head of heads) {
     const rev = getRevisionRow(db, head.profile_id, head.current_profile_revision);
@@ -505,7 +505,7 @@ function inputsFingerprint(db: Database.Database, projectKey: string): string {
   return JSON.stringify({
     defaults: currentDefaults(db)?.config_revision_id ?? null,
     project: latestConfigRow(db, "project", projectKey)?.config_revision_id ?? null,
-    profiles: loadProfiles(db).map((p) => [p.id, p.revision, p.disabled, [...(p.allowedProjectKeys ?? [])].sort()]),
+    profiles: loadProfiles(db).map((p) => [p.id, p.revision, p.disabled, (p.allowedProjectKeys ?? []).includes(projectKey)]),
   });
 }
 

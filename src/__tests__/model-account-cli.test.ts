@@ -304,6 +304,7 @@ describe("secret-import / secret-delete", () => {
       [["secret-import", "--ref", `model-account:${"a".repeat(200)}`], KEY],
       [["secret-import", "--ref", "model-account:a/b"], KEY],
       [["secret-import", "--ref", REF], ""],
+      [["secret-import", "--ref", REF], '["mistaken-key"]'],
       [["secret-import", "--ref", REF], JSON.stringify({ region: B.region, accessKeyId: B.accessKeyId })],
       [["secret-import", "--ref", REF], JSON.stringify({ ...B, extra: "SENTINEL-EXTRA" })],
       [["secret-import", "--ref", REF], KEY, {}],
