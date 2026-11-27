@@ -297,10 +297,12 @@ async function startImport(fetchImpl: typeof fetch, packageDir: string, files: s
   }, "import", signal);
   const kitId = stringField(body, "kit_id", "import");
   const publishId = stringField(body, "publish_id", "import");
-  for (const id of [kitId, publishId]) {
-    if (!/^[A-Za-z0-9_-]+$/.test(id) || [auth.apiToken, auth.bearer].some(secret => id.includes(secret))) {
-      throw new Error("Stardog Run import returned an invalid identifier");
-    }
+  for (const [field, id] of [["kit_id", kitId], ["publish_id", publishId]]) {
+    let reason: string | undefined;
+    if (id.length > 256) reason = "too long";
+    else if (/[\s\p{Cc}]/u.test(id)) reason = "control or whitespace character";
+    else if ([auth.apiToken, auth.bearer].some(secret => id.includes(secret))) reason = "contains a credential";
+    if (reason) throw new Error(`Stardog Run import returned an invalid ${field}: ${reason}`);
   }
   return { kitId, publishId };
 }
