@@ -371,6 +371,7 @@ function applyNormalWiring(step: YamlStep, options?: LoadPipelineOptions): StepD
           reviewerDefinitions: ctx.getOutputs("install").reviewers,
           trustedConfigReviewerDefinitions: ctx.getOutputs("install").trustedConfigReviewers,
           pushedSha: ctx.getOutputs("push").commitSha ?? undefined,
+          referenceRepoResults: (ctx.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] }).results,
         }),
         skip: shouldSkipPostPushReview,
       };

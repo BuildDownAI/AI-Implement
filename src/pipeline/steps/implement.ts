@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
 import { classifyLlmResult, isLlmResultFailure, type FailureRecord } from "../failure-classification.js";
-import { describeReferenceRepoCause, type ReferenceRepoResult } from "../../reference-repos.js";
+import { buildReferenceReposSection, type ReferenceRepoResult } from "../../reference-repos.js";
 import { DEFAULT_MODEL } from "../default-model.js";
 
 interface ImplementInputs extends Record<string, unknown> {
@@ -32,36 +32,6 @@ interface ImplementOutputs extends Record<string, unknown> {
   invocationFailure?: FailureRecord;
 }
 
-function buildReferenceReposSection(results: ReferenceRepoResult[]): string {
-  const arrived = results.filter((r) => r.arrived);
-  const missed = results.filter((r) => !r.arrived);
-  const lines: string[] = ["## Reference Repositories"];
-
-  if (arrived.length > 0) {
-    lines.push(
-      "",
-      "The following repositories are available in the workspace as read-only reference material. Read them for context and do not modify them.",
-      "",
-    );
-    for (const r of arrived) {
-      lines.push(`- \`${r.repo}\` — available at \`${r.path}\``);
-    }
-  }
-
-  if (missed.length > 0) {
-    lines.push(
-      "",
-      "The following repositories were declared but could not be cloned. Do not assert anything about their contents — treat them as unavailable.",
-      "",
-    );
-    for (const r of missed) {
-      lines.push(`- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
 export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
   async run(
     context: PipelineContext,
@@ -78,7 +48,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     }
 
     if (referenceRepoResults && referenceRepoResults.length > 0) {
-      fullPrompt += `\n\n${buildReferenceReposSection(referenceRepoResults)}`;
+      fullPrompt += `\n\n${buildReferenceReposSection(referenceRepoResults, "implementation")}`;
     }
 
     const { retryPolicy } = context.data;

@@ -40,6 +40,7 @@ import {
   type FindingDisposition,
 } from "../finding-dispositions.js";
 import { READ_ONLY_TOOL_PARAMS } from "./read-only-tools.js";
+import { buildReferenceReposSection, type ReferenceRepoResult } from "../../reference-repos.js";
 import { resolveReviewProcess, type ReviewProcessDefinition, type ReviewProcessId, type ReviewVerdictResult } from "../../review-process.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
 import { isChecksPermissionError } from "../../checks-permission.js";
@@ -85,6 +86,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
    * the ls-remote-right-before-push behavior.
    */
   pushedSha?: string;
+  referenceRepoResults?: ReferenceRepoResult[];
 }
 
 type ExternalReviewState = "skipped" | "absent" | "running" | "completed" | "permission-denied" | "no-real-verdict";
@@ -1716,6 +1718,7 @@ async function runSelectedInternalReviewers(params: {
   humanComments?: string;
   model: string;
   sleep: (ms: number) => Promise<void>;
+  referenceRepoResults?: readonly ReferenceRepoResult[];
 }): Promise<SelectedReviewerPassResult> {
   const findings: PostPushReviewLedgerFinding[] = [];
   const feedbackParts: string[] = [];
@@ -1786,6 +1789,9 @@ async function runSelectedInternalReviewers(params: {
         previousFindings: params.previousFindings,
         humanComments: params.humanComments,
       });
+      if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
+        prompt += `\n\n${buildReferenceReposSection(params.referenceRepoResults, "review")}`;
+      }
       prompt += isTimeBudget
         ? `\n\nYou have a time budget of ${reviewBudgetLabel.replace(/^timeout /, "")} for this review. Finish within the time budget and reserve time for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`
         : `\n\nYou have a maximum of ${reviewBudgetLabel} for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
@@ -2240,6 +2246,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         humanComments,
         model,
         sleep,
+        referenceRepoResults: inputs.referenceRepoResults,
       });
       costUsd = addExtraCost(costUsd, selectedReviewerResult.costUsd);
       if (selectedReviewerResult.failure) reviewerFailure = selectedReviewerResult.failure;
@@ -2744,6 +2751,9 @@ a required repair plan.`;
       const dispositionFixBlock = hasGatingExternalFindings
         ? `\n\n${buildDispositionInstructions()}\n\nIssue requirements (the scope for every disposition):\n${context.data.issueDescription}`
         : "";
+      const referenceFixBlock = inputs.referenceRepoResults && inputs.referenceRepoResults.length > 0
+        ? `\n\n${buildReferenceReposSection(inputs.referenceRepoResults, "implementation")}`
+        : "";
 
       const fixPrompt = `You are fixing reviewer feedback on PR #${prNumber} for issue ${context.data.issueIdentifier}: ${context.data.issueTitle}.
 
@@ -2775,7 +2785,7 @@ ${issueList}
 Summary:
 ${feedback}
 ${externalFindingsFixBlock}
-</reviewer_feedback>${dispositionFixBlock}`;
+</reviewer_feedback>${dispositionFixBlock}${referenceFixBlock}`;
 
       // Snapshot before this cycle's invoke/commit/push mutate `leaseSha` below — this is the
       // commit the fix pass started from, reported as the cycle summary's `inputCommit`.

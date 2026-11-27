@@ -1177,6 +1177,54 @@ describe("postPushReviewStep", () => {
     expect(calls.map((call) => call[0].maxTurns)).toEqual([45, 45]);
   });
 
+  describe("reference repositories", () => {
+    const referenceRepoResults = [{ repo: "https://github.com/acme/orchestrator", path: "orchestrator-source", ref: "v2.0.1", arrived: true }];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const approved = { approved: true, findings: [], summary: "Checked the change.", checks: [{ check: "Scope", result: "passed", evidence: "The diff matches the requested scope." }] };
+
+    it("tells each selected reviewer where they are and how to rate a contradicted claim", async () => {
+      const invoke = vi.fn(async () => structuredReviewResult(approved));
+      await runReview(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], referenceRepoResults },
+        { report: vi.fn(async () => undefined) },
+      );
+      for (const index of [0, 1]) {
+        const prompt = invokePrompt(invoke, index);
+        expect(prompt).toContain("`https://github.com/acme/orchestrator` at `v2.0.1` — available at `orchestrator-source`");
+        expect(prompt).toContain("rate it minor if it only describes");
+      }
+    });
+
+    it("gives the fix pass the repositories without the reviewers' rating rule", async () => {
+      const withBlocker = { ...approved, findings: [{ severity: "blocking", body: "Escape quoted user input" }] };
+      const invoke = vi.fn(async () => structuredReviewResult(withBlocker));
+      await runReview(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), referenceRepoResults },
+        { report: vi.fn(async () => undefined) },
+      );
+      const fixPrompt = invokePrompt(invoke, 2);
+      expect(fixPrompt).toMatch(/^You are fixing reviewer feedback/);
+      expect(fixPrompt).toContain("confirm the claim against its checkout");
+      expect(fixPrompt).not.toContain("rate it");
+    });
+
+    it("adds no reference section when the run declared no reference repository", async () => {
+      const invoke = vi.fn(async () => structuredReviewResult(approved));
+      // The loader skips the reference-repos step then, so the results arrive undefined.
+      await runReview(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], referenceRepoResults: undefined },
+        { report: vi.fn(async () => undefined) },
+      );
+      expect(invokePrompt(invoke, 0)).not.toContain("## Reference Repositories");
+    });
+  });
+
   describe("PR comments from trusted people", () => {
     type HumanCommentInput = { humanComments?: string };
     type HumanCommentSpawnResult = { stdout?: string; exitCode: number; stderr?: string } | undefined;
