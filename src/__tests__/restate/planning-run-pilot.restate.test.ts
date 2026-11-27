@@ -126,6 +126,7 @@ import { JiraApiError } from "../../providers/jira-client.js";
 import { initDispatchBreakerTable, isParked, recordDispatchFailure } from "../../dispatch-breaker.js";
 import { acquire, read as readAdmission, releaseHeldReservation, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
 import { appendLog, getJobByDispatchId, getStuckAttempts, initLogTable, updateJobStatus } from "../../log.js";
+import { initStepLogTable } from "../../step-log.js";
 import { planningSessionName } from "../../planning-launch.js";
 import { PLANNING_RUN_TITLE_PREFIX, createProductionPlanningRunServices } from "../../restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "../../restate/planning-run-client.js";
@@ -254,6 +255,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   beforeAll(async () => {
     getDb();
     initLogTable();
+    initStepLogTable();
     initMappingsTable();
     initDispatchBreakerTable();
     getDb().prepare(`

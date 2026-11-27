@@ -3202,3 +3202,103 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
     });
   });
 });
+
+describe("orchestrator Claude review starts", () => {
+  const stamped = { owner: "org", repo: "repo", branch: "testing", runningCommit: null };
+  const send = vi.fn().mockResolvedValue(undefined);
+  const payload = (action = "opened", draft = false, headRepo = "org/repo", login = "alice") => ({
+    action, repository: { full_name: "org/repo" }, sender: { login },
+    pull_request: { number: 42, draft, head: { ref: "untrusted", repo: { full_name: headRepo } } },
+  });
+  beforeEach(async () => {
+    send.mockClear();
+    const { setRestateStatus } = await import("../restate/status.js");
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+  });
+  async function deliver(body: unknown, target: typeof stamped | undefined = stamped, delivery: string | undefined = "delivery") {
+    const { req, res } = makeRequest(SECRET, "pull_request", body);
+    if (delivery) req.headers["x-github-delivery"] = delivery;
+    else delete req.headers["x-github-delivery"];
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key", target,
+      undefined, undefined, undefined, { send });
+    expect(res.statusCode).toBe(200);
+  }
+  it.each(["opened", "synchronize", "ready_for_review"])("sends %s using trusted configuration and delivery key", async action => {
+    await deliver(payload(action));
+    expect(send).toHaveBeenCalledExactlyOnceWith("org/repo#42", { ref: "testing", allowDraft: false }, { idempotencyKey: "delivery" });
+  });
+  it("uses watched policy ahead of the build stamp", async () => {
+    const { setDeployPolicy } = await import("../deploy-policy.js");
+    setDeployPolicy({ watchedRepo: "org/repo", watchedRef: "watched" });
+    await deliver(payload());
+    expect(send).toHaveBeenCalledWith("org/repo#42", { ref: "watched", allowDraft: false }, expect.anything());
+  });
+  it("uses main for a mapped repository without a target", async () => {
+    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
+    const { req, res } = makeRequest(SECRET, "pull_request", payload());
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key", undefined,
+      undefined, undefined, undefined, { send });
+    expect(send).toHaveBeenCalledWith("org/repo#42", { ref: "main", allowDraft: false }, { idempotencyKey: req.headers["x-github-delivery"] });
+  });
+  it.each([
+    payload("opened", false, "fork/repo"), payload("synchronize", true),
+    payload("opened", true, "org/repo", "ai-implement-orchestrator-bot[bot]"),
+    payload("closed"), { action: "opened", repository: { full_name: "org/repo" } },
+    { action: "opened", pull_request: { number: 42 } },
+  ])("skips ineligible events %#", async body => {
+    await deliver(body);
+    expect(send).not.toHaveBeenCalled();
+  });
+  it("skips unmapped repositories when no deploy target resolves", async () => {
+    const { req, res } = makeRequest(SECRET, "pull_request", payload());
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app", "key", undefined,
+      undefined, undefined, undefined, { send });
+    expect(send).not.toHaveBeenCalled();
+  });
+  it("skips other repositories even when mapped", async () => {
+    hoisted.getMappings.mockReturnValue({ AII: makeMapping({ owner: "org", repo: "repo" }) });
+    await deliver(payload(), { ...stamped, repo: "other" });
+    expect(send).not.toHaveBeenCalled();
+  });
+  it("allows only bot synchronizations to start drafts", async () => {
+    await deliver(payload("synchronize", true, "org/repo", "ai-implement-orchestrator-bot[bot]"));
+    expect(send).toHaveBeenCalledWith("org/repo#42", { ref: "testing", allowDraft: true }, expect.anything());
+  });
+  it("sends while Restate cannot start work", async () => {
+    const { setRestateStatus } = await import("../restate/status.js");
+    setRestateStatus({ sidecar: { state: "starting" } });
+    await deliver(payload());
+    expect(send).toHaveBeenCalledExactlyOnceWith("org/repo#42", { ref: "testing", allowDraft: false }, { idempotencyKey: "delivery" });
+  });
+  it("sends an opened event during a deploy hold using the delivery key", async () => {
+    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
+    setDeployHold();
+    try {
+      await deliver(payload("opened"));
+      expect(send).toHaveBeenCalledExactlyOnceWith("org/repo#42", { ref: "testing", allowDraft: false }, { idempotencyKey: "delivery" });
+    } finally {
+      clearDeployHold();
+    }
+  });
+  it.each(["rejects", "throws"])("acknowledges and logs one warning when send %s", async failure => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    send.mockImplementationOnce(() => {
+      if (failure === "throws") throw new Error("ingress unavailable");
+      return Promise.reject(new Error("ingress unavailable"));
+    });
+    try {
+      await deliver(payload());
+      expect(warn).toHaveBeenCalledExactlyOnceWith("[webhook] Claude review send failed for org/repo#42");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+  it("acknowledges without awaiting the handler and omits an absent delivery key", async () => {
+    let release!: () => void;
+    send.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    try {
+      await deliver(payload(), stamped, "");
+      expect(send).toHaveBeenCalledWith("org/repo#42", { ref: "testing", allowDraft: false }, undefined);
+    } finally { release(); }
+  });
+});

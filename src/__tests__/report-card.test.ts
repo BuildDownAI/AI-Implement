@@ -1115,3 +1115,203 @@ describe("getReviewerScorecard", () => {
     }
   });
 });
+
+describe("fleet model grouping", () => {
+  function storeSnapshot(dispatchId: string, model = "frozen", malformed = false) {
+    const stages = Object.fromEntries(["planning", "implementation", "review"].map(stage => [stage, {
+      agent: "codex", provider: "openai", model: stage === "implementation" ? model : stage,
+      accountProfileId: "profile", invocationTimeoutMs: 1000,
+    }]));
+    const sources = Object.fromEntries(Object.entries(stages).map(([stage, selection]) =>
+      [stage, Object.fromEntries(Object.keys(selection).map(field => [field, "project"]))]));
+    const profiles = Object.fromEntries(Object.keys(stages).map(stage => [stage, {
+      id: "profile", identity: "profile", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key",
+    }]));
+    const revision = { configRevisionId: "revision", revision: 1 };
+    dedup.getDb().prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'project', ?, ?, ?, 1)`).run(dispatchId, dispatchId,
+        malformed ? "{" : JSON.stringify({ stages, profiles }), JSON.stringify(sources),
+        JSON.stringify({ orchestratorDefault: revision, project: revision }));
+  }
+
+  it.each(["model", "m".repeat(1999)])("sanitizes model labels before grouping (%#)", (model) => {
+    const dirtyModel = model === "model" ? "mo\u0000del" : model + "\u0000😀tail";
+    insertDispatch({ repo: "acme/repo", dispatchId: "dirty-call" });
+    insertDispatch({ repo: "acme/repo", dispatchId: "dirty-snapshot", status: "timed_out" });
+    storeSnapshot("dirty-snapshot", "model");
+    dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES ('dirty', 'dirty-call', 'implementation', 'profile', 1, 'codex', 'openai', ?, 'api-key', 'succeeded', 1, '{}')`).run(dirtyModel);
+    const groups = rc.getFleetReport().byModel;
+    expect(groups).toHaveLength(model === "model" ? 1 : 2);
+    expect(groups[0]).toMatchObject({ model, calls: 1, jobs: model === "model" ? 2 : 1 });
+  });
+
+  it("attributes call-free stopped jobs to frozen implementation models within the dispatch filters", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const before = rc.getFleetReport();
+      const cutoff = now - 30 * 86400000;
+      for (const [i, conclusion] of [undefined, "ended_without_callback", "workflow_cancelled"].entries()) {
+        const dispatchId = `stopped-${i}`;
+        const job = insertDispatch({ repo: "acme/repo", dispatchId, status: i === 0 ? "timed_out" : "failed", conclusion, dispatchedAt: cutoff });
+        dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = dispatched_at + 500 WHERE id = ?").run(job);
+        storeSnapshot(dispatchId, i === 2 ? "separate" : "frozen");
+      }
+      for (const [dispatchId, options] of [
+        ["other", { repo: "other/repo" }], ["test", { repo: "test-org/repo" }],
+        ["old", { dispatchedAt: cutoff - 1 }], ["malformed", {}], ["missing", {}],
+      ] as Array<[string, Parameters<typeof insertDispatch>[0]]>) {
+        insertDispatch({ repo: "acme/repo", status: "timed_out", dispatchId, ...options });
+        if (dispatchId !== "missing") storeSnapshot(dispatchId, "excluded", dispatchId === "malformed");
+      }
+      insertDispatch({ repo: "acme/repo", status: "timed_out" });
+      insertDispatch({ repo: "acme/repo", dispatchId: "completed" });
+      storeSnapshot("completed", "excluded");
+      const report = rc.getFleetReport({ repo: "acme/repo" });
+      const empty = { stage: "implementation", agent: "codex", provider: "openai", calls: 0, failedCalls: 0,
+        timedOutCalls: 0, tokensIn: null, tokensOut: null, costUsd: null, estimatedCostUsd: null,
+        oneShotPct: null, approvedJobs: 0, approvedPct: null, avgPasses: null, avgDurationMs: 500 };
+      expect(report.byModel).toEqual([
+        { ...empty, model: "frozen", jobs: 2, stoppedJobs: 2 },
+        { ...empty, model: "separate", jobs: 1, stoppedJobs: 1 },
+      ]);
+      expect(rc.getFleetReport({ repo: "other/repo" }).byModel).toMatchObject([{ model: "excluded", jobs: 1, stoppedJobs: 1 }]);
+      expect(before.byModel).toEqual([]);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(["planning", "kg-refresh"])("does not attribute call-free stopped %s dispatches to implementation models", (phase) => {
+    for (const [i, conclusion] of [undefined, "ended_without_callback", "workflow_cancelled"].entries()) {
+      const dispatchId = `${phase}-${i}`;
+      insertDispatch({ repo: "acme/repo", phase, dispatchId, status: i === 0 ? "timed_out" : "failed", conclusion });
+      storeSnapshot(dispatchId);
+    }
+    expect(rc.getFleetReport().byModel).toEqual([]);
+
+    insertDispatch({ repo: "acme/repo", dispatchId: "implementation", status: "timed_out" });
+    storeSnapshot("implementation");
+    expect(rc.getFleetReport().byModel).toMatchObject([
+      { stage: "implementation", model: "frozen", calls: 0, jobs: 1, stoppedJobs: 1 },
+    ]);
+  });
+
+  it("keeps actual calls authoritative over snapshots, including calls in other stages", () => {
+    for (const dispatchId of ["actual", "planning-only"]) {
+      insertDispatch({ repo: "acme/repo", dispatchId, status: "timed_out" });
+      storeSnapshot(dispatchId);
+    }
+    const before = rc.getFleetReport();
+    const insert = dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, ?, 'profile', 1, 'codex', 'openai', 'actual-model', 'api-key', 'failed', 1, '{}')`);
+    insert.run("a", "actual", "implementation");
+    insert.run("b", "actual", "implementation");
+    insert.run("c", "planning-only", "planning");
+    const report = rc.getFleetReport();
+    expect(report.byModel).toMatchObject([
+      { model: "actual-model", calls: 2, jobs: 1, stoppedJobs: 1 },
+      { stage: "planning", calls: 1, jobs: 1, stoppedJobs: null },
+    ]);
+    expect({ ...report, byModel: [] }).toEqual({ ...before, byModel: [] });
+  });
+
+  it("deduplicates jobs, separates outcomes and measured costs, and filters dispatches", () => {
+    const now = Date.now();
+    const a = insertDispatch({ repo: "acme/repo", dispatchId: "a", dispatchedAt: now - 1000 });
+    const b = insertDispatch({ repo: "acme/repo", dispatchId: "b", status: "timed_out", dispatchedAt: now - 2000 });
+    insertDispatch({ repo: "other/repo", dispatchId: "other" });
+    insertDispatch({ repo: "test-org/repo", dispatchId: "test" });
+    insertDispatch({ repo: "acme/repo", dispatchId: "old", dispatchedAt: now - 40 * 86400000 });
+    insertDispatch({ repo: "acme/repo" }); // legacy job has no calls
+    dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = dispatched_at + 500 WHERE id = ?").run(a);
+    insertFeedbackLoopStep(a, { approved: true, iterations: 1, terminationReason: "approved", passes: [{ iteration: 1, implementOutcome: "success", reviewApproved: true, costUsd: 1 }] });
+    insertFeedbackLoopStep(b, { approved: false, iterations: 3, terminationReason: "timeout", passes: [{ iteration: 1, implementOutcome: "success", reviewApproved: false, costUsd: 3 }] });
+    const before = rc.getFleetReport();
+    const insert = dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, ?, 'test', 1, 'codex', 'openai', ?, 'test', ?, 1, ?)`);
+    let id = 0;
+    const call = (dispatch: string, model: string, usage: object, status = "succeeded", stage = "implementation") =>
+      insert.run(`call-${id++}`, dispatch, stage, model, status, JSON.stringify(usage));
+    call("a", "A", { tokensIn: 10, tokensOut: 2, costUsd: 1, costStatus: "reported" });
+    call("a", "A", { tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" }, "failed");
+    call("b", "B", { tokensIn: 20, tokensOut: 4, costUsd: 3, costStatus: "reported" }, "timed_out");
+    call("a", "B", { tokensIn: 10, tokensOut: 2 }); // same job, second model
+    call("a", "C", { tokensIn: 10, tokensOut: 2, costUsd: 999, costStatus: "unavailable" }, "succeeded", "planning");
+    call("a", "missing", {});
+    for (const dispatch of ["orphan", "other", "test", "old"]) call(dispatch, "excluded", {});
+    const prices = [{ model: "C", inputUsd: "0.1", outputUsd: "0.2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
+    const report = rc.getFleetReport({}, prices);
+    expect({ ...report, byModel: [] }).toEqual(before);
+    const [modelA, modelB, modelC, missing] = report.byModel;
+    expect(modelA).toEqual({ stage: "implementation", agent: "codex", provider: "openai", model: "A", calls: 2, failedCalls: 1, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: 1, estimatedCostUsd: null, jobs: 1, oneShotPct: 1, approvedJobs: 1, approvedPct: 1, avgPasses: 1, avgDurationMs: 500, stoppedJobs: 0 });
+    expect(modelB).toEqual({ ...modelA, model: "B", calls: 2, failedCalls: 0, timedOutCalls: 1, tokensIn: 30, tokensOut: 6, costUsd: 3, jobs: 2, oneShotPct: 0.5, approvedJobs: 1, approvedPct: 0.5, avgPasses: 2, stoppedJobs: 1 });
+    expect(modelC).toEqual({ ...modelA, stage: "planning", model: "C", calls: 1, failedCalls: 0, costUsd: null, estimatedCostUsd: 1.4, approvedJobs: null, approvedPct: null, oneShotPct: null, avgPasses: null, avgDurationMs: null, stoppedJobs: null });
+    expect(missing).toEqual({ ...modelA, model: "missing", calls: 1, failedCalls: 0, tokensIn: null, tokensOut: null, costUsd: null });
+    expect(rc.getFleetReport().byModel[2].estimatedCostUsd).toBeNull();
+    expect(rc.getFleetReport({}, []).byModel[2].estimatedCostUsd).toBeNull();
+    expect(rc.getFleetReport({ repo: "other/repo" }).byModel.map(m => m.model)).toEqual(["excluded"]);
+    expect(rc.getFleetReport({ days: 0 }).byModel).toEqual([]);
+  });
+
+  it("distinguishes later approval and includes every non-null statistic in approval rates", () => {
+    const insert = dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', ?, 'test', 'succeeded', 1, '{}')`);
+    for (const model of ["later", "never"]) {
+      const job = insertDispatch({ repo: "acme/repo", dispatchId: model });
+      insertFeedbackLoopStep(job, { approved: model === "later", iterations: 2, terminationReason: model === "later" ? "approved" : "stopped", passes: [
+        { iteration: 1, implementOutcome: "success", reviewApproved: false, costUsd: null },
+        { iteration: 2, implementOutcome: "success", reviewApproved: model === "later", costUsd: null },
+      ] });
+      insert.run(model, model, model);
+    }
+    expect(rc.getFleetReport().byModel).toMatchObject([
+      { model: "later", oneShotPct: 0, approvedJobs: 1, approvedPct: 1 },
+      { model: "never", oneShotPct: 0, approvedJobs: 0, approvedPct: 0 },
+    ]);
+    for (const [dispatchId, approved] of [["unknown-approved", true], ["unknown-rejected", false], ["no-stats", null]] as const) {
+      const job = insertDispatch({ repo: "acme/repo", dispatchId });
+      if (approved !== null) insertSubStep(job, "post-push-review.1", "custom", { approved, telemetry: { costUsd: 0.1 } });
+      insert.run(dispatchId, dispatchId, "later");
+    }
+    expect(rc.getFleetReport().byModel[0]).toMatchObject({ jobs: 4, oneShotPct: 0, avgPasses: 2, approvedJobs: 2, approvedPct: 2 / 3 });
+  });
+
+  it("includes the exact cutoff, stopped conclusions, unknown statistics and measured zero", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const cutoff = now - 30 * 86400000;
+      const approved = insertDispatch({ repo: "acme/repo", dispatchId: "cutoff", dispatchedAt: cutoff });
+      insertFeedbackLoopStep(approved, { approved: true, iterations: 1, terminationReason: "approved", passes: [
+        { iteration: 1, implementOutcome: "success", reviewApproved: true, costUsd: 0 },
+      ] });
+      const unknown = insertDispatch({ repo: "acme/repo", dispatchId: "unknown", conclusion: "ended_without_callback" });
+      // Known passes but no first-pass approval measurement.
+      insertFeedbackLoopStep(unknown, { approved: false, iterations: 3, terminationReason: "stopped", passes: [] });
+      const ppr = insertDispatch({ repo: "acme/repo", dispatchId: "ppr", conclusion: "workflow_cancelled" });
+      // This invokes jobPassStats' passesKnown:false fallback.
+      insertSubStep(ppr, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.4 } });
+      insertDispatch({ repo: "acme/repo", dispatchId: "outside", dispatchedAt: cutoff - 1 });
+      const insert = dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+        (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+        VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', ?, 'test', 'succeeded', 1, ?)`);
+      for (const dispatch of ["cutoff", "unknown", "ppr", "outside"]) {
+        insert.run(dispatch, dispatch, "zero", JSON.stringify({ tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" }));
+      }
+      insert.run("unpriced", "unknown", "unpriced", JSON.stringify({ tokensIn: 10, tokensOut: 2, costStatus: "unavailable" }));
+      const prices = [{ model: "another-model", inputUsd: "1", outputUsd: "2", cacheReadUsd: "0", cacheWriteUsd: "0" }];
+      const report = rc.getFleetReport({}, prices);
+      expect(report.byModel).toEqual([
+        { stage: "implementation", agent: "codex", provider: "openai", model: "zero", calls: 3, failedCalls: 0, timedOutCalls: 0, tokensIn: 0, tokensOut: 0, costUsd: 0, estimatedCostUsd: null, jobs: 3, oneShotPct: 1, approvedJobs: 2, approvedPct: 2 / 3, avgPasses: 2, avgDurationMs: null, stoppedJobs: 2 },
+        { stage: "implementation", agent: "codex", provider: "openai", model: "unpriced", calls: 1, failedCalls: 0, timedOutCalls: 0, tokensIn: 10, tokensOut: 2, costUsd: null, estimatedCostUsd: null, jobs: 1, oneShotPct: null, approvedJobs: 0, approvedPct: 0, avgPasses: 3, avgDurationMs: null, stoppedJobs: 1 },
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});

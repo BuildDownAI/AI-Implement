@@ -16,6 +16,7 @@ import { resolveWorkflowContract, type WorkflowContract } from "./workflow-probe
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
 import { addCommentReaction, listPullRequestFiles, postPrComment } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import { claudeReviewRepositories, type ClaudeReviewStartCaller } from "./claude-review-start.js";
 import type { KgDryRunReportTarget } from "./kg-refresh.js";
 import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
 
@@ -47,17 +48,49 @@ function verifySignature(secret: string, body: Buffer, signature: string | undef
 }
 
 interface PullRequestPayload {
+  sender?: { login?: string };
   action?: string;
   pull_request?: {
     number?: number;
     merged?: boolean;
+    draft?: boolean;
     html_url?: string;
-    head?: { ref?: string; sha?: string };
+    head?: { ref?: string; sha?: string; repo?: { full_name?: string } };
     merge_commit_sha?: string;
   };
   repository?: {
     full_name?: string;
   };
+}
+
+/** Best-effort start from trusted deploy configuration, never a PR-provided ref. */
+async function startClaudeReview(
+  payload: PullRequestPayload,
+  appId?: string,
+  privateKey?: string,
+  selfDeploy?: SelfDeployTarget,
+  caller?: ClaudeReviewStartCaller,
+  deliveryId?: string,
+): Promise<void> {
+  if (!appId || !privateKey) return;
+  const prNumber = payload.pull_request?.number;
+  const fullName = payload.repository?.full_name;
+  if (!prNumber || !fullName) return;
+  if (payload.pull_request?.head?.repo?.full_name !== fullName) return;
+  if (payload.pull_request?.draft && !(payload.action === "synchronize" &&
+      payload.sender?.login === "ai-implement-orchestrator-bot[bot]")) return;
+
+  if (!caller) return;
+  try {
+    const target = claudeReviewRepositories(selfDeploy).find(t => `${t.owner}/${t.repo}` === fullName);
+    if (!target) return;
+    const allowDraft = payload.action === "synchronize" && payload.sender?.login === "ai-implement-orchestrator-bot[bot]";
+    void caller.send(`${target.owner}/${target.repo}#${prNumber}`, { ref: target.ref, allowDraft },
+      deliveryId ? { idempotencyKey: deliveryId } : undefined)
+      .catch(() => console.warn(`[webhook] Claude review send failed for ${fullName}#${prNumber}`));
+  } catch {
+    console.warn(`[webhook] Claude review send failed for ${fullName}#${prNumber}`);
+  }
 }
 
 export interface KgPrCheckConfig {
@@ -347,6 +380,7 @@ export async function handleGitHubWebhook(
   kgPrCheck?: KgPrCheckConfig,
   onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
   reviewFixIngress?: ReviewFixIngressClient,
+  claudeReviewStart?: ClaudeReviewStartCaller,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -393,6 +427,13 @@ export async function handleGitHubWebhook(
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;
+  }
+
+  if (payload.action === "opened" || payload.action === "synchronize") {
+    await startClaudeReview(payload, appId, privateKey, selfDeploy, claudeReviewStart, deliveryId);
+  }
+  if (payload.action === "ready_for_review") {
+    await startClaudeReview(payload, appId, privateKey, selfDeploy, claudeReviewStart, deliveryId);
   }
 
   if (payload.action === "opened" || payload.action === "synchronize") {

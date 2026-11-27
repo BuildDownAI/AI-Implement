@@ -1,5 +1,8 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { buildClaudeReviewRepairInput } from "./claude-review-start.js";
+import { createClaudeReviewRepair, claudeReviewRepairClient } from "./restate/claude-review-repair.js";
+import { createClaudeReviewStart, claudeReviewStartClient } from "./restate/claude-review-start.js";
 import { handleKgPackageUpload } from "./kg-package-upload.js";
 import { DATA_ROOT as KG_PACKAGE_DATA_ROOT } from "./kg-refresh.js";
 import { resolveKgRefreshSource, setBootKgRefreshSource, kgRefreshRunRepo, getBootKgRefreshSource } from "./kg-refresh-source.js";
@@ -37,7 +40,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, listAllOpenPullRequests, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, getClaudeReviewPullRequest, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, listAllOpenPullRequests, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { breakerSetupChecks, surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -192,7 +195,7 @@ import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
 import { MAX_PUBLICATION_BYTES, createPostPushReviewPublication, createProductionPostPushReviewPublicationDependencies } from "./restate/post-push-review-publication.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
-import { getRestateStatus, restateCanServe, setRestateStatus } from "./restate/status.js";
+import { getRestateStatus, restateCanServe, restateCanStartWork, setRestateStatus } from "./restate/status.js";
 import type { RestateStatus, RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
@@ -487,6 +490,10 @@ async function reviewFixAccounting(
   const provider = await registry.forMapping(mapping).catch(() => null);
   return trackerAccounting(mapping, provider, { id: fix.issueId, identifier: fix.issueIdentifier });
 }
+
+const claudeReviewRepair = createClaudeReviewRepair();
+const reviewRepairClient = claudeReviewRepairClient();
+const claudeReviewClient = claudeReviewStartClient();
 
 export async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const cycle = beginCycle();
@@ -994,6 +1001,24 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     );
   }
 
+  // Share list promises (including failures) between both sweeps for this poll only.
+  const reviewPullLists = new Map<string, ReturnType<typeof listAllOpenPullRequests>>();
+  const listReviewPulls = (owner: string, repo: string) => {
+    const key = `${owner}/${repo}`;
+    let listed = reviewPullLists.get(key);
+    if (!listed) {
+      listed = getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner)
+        .then(token => listAllOpenPullRequests(token, owner, repo));
+      reviewPullLists.set(key, listed);
+    }
+    return listed;
+  };
+  const reviewRepairInput = await buildClaudeReviewRepairInput(config.selfDeployTarget ?? undefined, listReviewPulls);
+  if (restateCanStartWork() && reviewRepairInput.repositories.length > 0) {
+    try { await reviewRepairClient.send(reviewRepairInput); }
+    catch { console.warn("[claude-review-repair] send failed"); }
+  }
+
   // Bounded cleanup of Restate review-fix pilot evidence (AII-795): purges activity/cycle
   // rows past the 7-day-since-completion retention floor, skipping any attempt whose
   // ownership is still unresolved (active reservation, result conflict, or unbound
@@ -1015,9 +1040,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
       mappings: getMappings(),
       appBotLogin,
       providerFor: (mapping) => registry.forMapping(mapping),
-      listRepoPulls: async (owner, repo) => listAllOpenPullRequests(
-        await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner), owner, repo,
-      ),
+      listRepoPulls: listReviewPulls,
     });
   } catch (err) {
     console.error("[poll] PR link sweep failed:", err);
@@ -4687,7 +4710,7 @@ export function startServer(
         githubAppPrivateKey: config.githubAppPrivateKey,
         enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateCanServe),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
+      }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient, { send: claudeReviewClient.send }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -5601,8 +5624,11 @@ async function main(): Promise<void> {
     // Only the notification/outcome copy carries diagnostic text; the durable record stays stable.
     onOutcome: createSelfDeployOutcomeHandler(config),
   })];
+  const claudeReviewStart = createClaudeReviewStart({ appId: config.githubAppId,
+    privateKey: config.githubAppPrivateKey, getInstallationToken,
+    getPullRequest: getClaudeReviewPullRequest, postWorkflowDispatch });
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...kgSwitchLockServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, claudeReviewStart, claudeReviewRepair, ...reviewFixServices, ...kgServices, ...kgSwitchLockServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
       // Boot settles as serving only once this hook returns, and the first poll waits for that.

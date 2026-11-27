@@ -36,7 +36,7 @@ beforeEach(async () => {
 
 const SENT = { json: { invocationId: "inv_1", status: "Accepted" } };
 // Every cycle refreshes the runner backend cache from Restate first.
-const EVERY_CYCLE: Routes = { "POST /RunnerBackend/fly-machines/get": { json: null } };
+const EVERY_CYCLE: Routes = { "POST /ClaudeReviewRepair/orchestrator/tick/send": SENT, "POST /RunnerBackend/fly-machines/get": { json: null } };
 const cycle = () => index.poll(makeAppConfig(), makeRegistry({ provider: makeProvider() }));
 const setupCheckPaths = (calls: Array<{ path: string }>) => calls.map((call) => call.path).filter((path) => path.startsWith("/SetupChecks/"));
 
@@ -102,6 +102,7 @@ describe("a poll cycle's automatic deploy on the published path", () => {
       "GET /app": { json: { slug: "ai-implement" } },
       "GET /orgs/BuildDownAI/installation": { json: { id: 1, permissions: { contents: "read", statuses: "read" } } },
       "POST /app/installations/1/access_tokens": { json: { token: "installation-token", expires_at: "2099-01-01T00:00:00Z" } },
+      "GET /repos/BuildDownAI/AI-Implement/pulls": { json: [] },
       "GET /repos/BuildDownAI/AI-Implement/commits": { json: [{ sha: HEAD }] },
       // The head is one commit past the running one, as GitHub's compare answers it.
       [`GET /repos/BuildDownAI/AI-Implement/compare/${RUNNING}...${HEAD}`]: { json: { status: "ahead", ahead_by: 1, behind_by: 0 } },
@@ -171,4 +172,49 @@ describe("the late-review hook", () => {
     expect(await index.lateExternalReviewSubmitHook(input)).toBe(true);
     expect(fake.calls.map((call) => call.path)).toEqual(["/LateExternalReview/dispatch-2/run/send"]);
   });
+});
+
+it.each([false, true])("shares the PR list and sends a repair snapshot each poll (failure: %s)", async failFirst => {
+  config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", paused: true }));
+  const fake = fakeFetch({
+    ...EVERY_CYCLE,
+    "GET /app": { json: { slug: "ai-implement" } },
+    "GET /orgs/org/installation": { json: { id: 1 } },
+    "POST /app/installations/1/access_tokens": { json: { token: "token", expires_at: "2099-01-01T00:00:00Z" } },
+    "POST /SetupChecks/orchestrator/get": { json: null },
+    "GET /repos/org/repo/pulls": { json: [{ number: 42, html_url: "https://github.com/org/repo/pull/42",
+      user: { login: "alice" }, head: { ref: "topic", sha: "head" }, base: { ref: "main" },
+      draft: false, title: "PR", created_at: "2026-01-01T00:00:00Z" }] },
+    "POST /ClaudeReviewRepair/orchestrator/tick/send": failFirst
+      ? [() => { throw new Error("review start request failed"); }, SENT]
+      : SENT,
+  }).install();
+  const app = makeAppConfig({ githubAppPrivateKey: makeAppPrivateKey() });
+  const registry = makeRegistry({ provider: makeProvider() });
+  await index.poll(app, registry);
+  await index.poll(app, registry);
+  expect(fake.calls.filter(c => c.path === "/repos/org/repo/pulls")).toHaveLength(2);
+  expect(fake.calls.filter(c => c.path.startsWith("/ClaudeReviewStart/"))).toHaveLength(0);
+  const calls = fake.calls.filter(c => c.path.startsWith("/ClaudeReviewRepair/"));
+  expect(calls).toHaveLength(2);
+  for (const call of calls) {
+    expect(call.path).toBe("/ClaudeReviewRepair/orchestrator/tick/send");
+    expect(call.signal).toBeInstanceOf(AbortSignal);
+    expect(JSON.parse(call.body)).toEqual({ repositories: [{ repository: "org/repo", ref: "main", pulls: [{ number: 42, headSha: "head" }] }] });
+  }
+});
+
+it.each(["unavailable", "hold", "empty"])("does not send repair while %s", async reason => {
+  if (reason !== "empty") config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", paused: true }));
+  if (reason === "unavailable") status.setRestateStatus({ registration: { state: "unreachable" } });
+  if (reason === "hold") (await import("../deploy-hold.js")).setDeployHold();
+  const fake = fakeFetch({ ...EVERY_CYCLE,
+    "POST /SetupChecks/orchestrator/get": { json: null },
+    "GET /app": { json: { slug: "ai-implement" } },
+    "GET /orgs/org/installation": { json: { id: 1 } },
+    "POST /app/installations/1/access_tokens": { json: { token: "token", expires_at: "2099-01-01T00:00:00Z" } },
+    "GET /repos/org/repo/pulls": { json: [] },
+  }).install();
+  await cycle();
+  expect(fake.calls.filter(c => c.path.startsWith("/ClaudeReviewRepair/"))).toHaveLength(0);
 });

@@ -22,6 +22,8 @@ export interface DispatchInputs {
   dependencies?: string;
   /** When set, the workflow checks out the existing PR branch (gap-fill run). */
   pr_number?: string;
+  /** Pin a Claude review to this head. */
+  head_sha?: string;
   /**
    * Base branch the runner clones and the child PR targets. Only forwarded when it
    * differs from the workflow's declared default (feature-branch grouping); omitted
@@ -1162,6 +1164,25 @@ export async function findPrForRun(
 
   const prs = (await prRes.json()) as Array<{ html_url: string }>;
   return prs.length > 0 ? prs[0].html_url : null;
+}
+
+/** Fresh eligibility read for the durable Claude review start owner. */
+export async function getClaudeReviewPullRequest(
+  token: string, owner: string, repo: string, prNumber: number,
+): Promise<{ state: "open" | "closed"; headSha: string; draft: boolean; sameRepository: boolean } | null> {
+  try {
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+      headers: ghHeaders(token), signal: defaultFetchSignal(),
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as { state?: string; draft?: boolean;
+      head?: { sha?: string; repo?: { full_name?: string } | null };
+      base?: { repo?: { full_name?: string } } };
+    if (!data.head?.sha || !["open", "closed"].includes(data.state ?? "") ||
+        typeof data.draft !== "boolean" || !data.base?.repo?.full_name) return null;
+    return { state: data.state as "open" | "closed", headSha: data.head.sha, draft: data.draft,
+      sameRepository: data.head.repo?.full_name === data.base.repo.full_name };
+  } catch { return null; }
 }
 
 export async function getPullRequestState(

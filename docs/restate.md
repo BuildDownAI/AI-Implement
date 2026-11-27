@@ -373,7 +373,7 @@ Restate scopes an idempotency key by (service, handler, key) and keeps the keyed
 
 `register()` (`src/restate/endpoint.ts`) posts the deployment without `force` at boot: an unchanged endpoint answers 200/201, and a changed service set at the same URI answers a `META0004` conflict. `force: true` overrides the deployment but "can lead inflight invocations to an unrecoverable error state" (Restate's own guidance), so it is used only after confirming zero non-completed invocations on the deployment it would replace. Never force a registration to get past a conflict.
 
-**Admission while registration is declined (AII-1281).** A `declined-conflict` registration leaves the old deployment serving. A tool call that starts there and reaches a handler the old deployment lacks (for example a handler that now calls a newly added service) fails with `RT0018`, and Restate retries it forever. Those retrying invocations count as non-completed, so the drain never reaches zero and registration can never go through. The deploy hold does not cover this: the new process clears it at boot, while registration is still declined. So `callTool()` (and `callToolAsSystem()`) answer `unavailable` without contacting the ingress unless the sidecar is `ready` and registration is `registered` (`restateCanServe`, `src/restate/status.ts`, the one definition every such gate shares); the doors map that to 503 `restate-unavailable`, the same as planning today. Result and cancel delivery (result, cancel, report, progress) and `Operator` stay ungated: no `Operator` handler calls another service, so it cannot cause this deadlock, and a gate would block `/mcp` sign-in and token refresh for the whole window. `decide_kg_refresh` is exempt only from the deploy hold (`DEPLOY_HOLD_ALLOWED_TOOLS`); the `restateReady()` check still applies, so it answers `unavailable` while registration is declined (only the tool answers so; `/mcp` sign-in keeps working). Two entry points are ungated on purpose: the webhook `ReviewFixPR.feedback` forward (`src/webhook.ts`) and `KgRepo.enqueueDryRun` (`src/index.ts`), because GitHub does not redeliver a refused webhook, so a gate could lose an event. PlanningRun submit, the review-fix nudge and the LateExternalReview submit are already gated on ready and registered.
+**Admission while registration is declined (AII-1281).** A `declined-conflict` registration leaves the old deployment serving. A tool call that starts there and reaches a handler the old deployment lacks (for example a handler that now calls a newly added service) fails with `RT0018`, and Restate retries it forever. Those retrying invocations count as non-completed, so the drain never reaches zero and registration can never go through. The deploy hold does not cover this: the new process clears it at boot, while registration is still declined. So `callTool()` (and `callToolAsSystem()`) answer `unavailable` without contacting the ingress unless the sidecar is `ready` and registration is `registered` (`restateCanServe`, `src/restate/status.ts`, the one definition every such gate shares); the doors map that to 503 `restate-unavailable`, the same as planning today. Result and cancel delivery (result, cancel, report, progress) and `Operator` stay ungated: no `Operator` handler calls another service, so it cannot cause this deadlock, and a gate would block `/mcp` sign-in and token refresh for the whole window. `decide_kg_refresh` is exempt only from the deploy hold (`DEPLOY_HOLD_ALLOWED_TOOLS`); the `restateReady()` check still applies, so it answers `unavailable` while registration is declined (only the tool answers so; `/mcp` sign-in keeps working). Three entry points are ungated on purpose: the webhook `ReviewFixPR.feedback` forward and `ClaudeReviewStart.start` send (`src/webhook.ts`), and `KgRepo.enqueueDryRun` (`src/index.ts`), because GitHub does not redeliver a refused webhook, so a gate could lose an event. The `ClaudeReviewStart.start` handler calls no other service, so its webhook send cannot cause this deadlock. PlanningRun submit, the review-fix nudge and the LateExternalReview submit are already gated on ready and registered.
 
 Residual gaps, not fixed here: an invocation already in flight when the process restarts, or a delayed scheduled send (for example `ReviewFixPR.check`), can still hit `RT0018` on the old deployment. A bounded retry policy on reads does not help: the server reads the policy from the registered deployment, which during the declined window is the old one.
 
@@ -437,7 +437,7 @@ The `RestateSidecar`'s own readiness poll (`_pollReadiness`, `RESTATE_HEALTH_URL
 
 ### A call or send that starts an invocation waits out a deploy hold
 
-A self-deploy sets the deploy hold (`isDeployHeld`, `src/deploy-hold.ts`) when it starts draining and clears it when the deploy ends, and its drain moves on only once nothing is in flight and no invocation on the old deployment is open (`queryNonCompletedInvocations`). An invocation started during the drain can be cut off when the machine is replaced, and retried on code that lacks its handler (AII-1281). So a call or send that starts an invocation checks `restateCanStartWork()` (`src/restate/status.ts`), which is false while Restate cannot serve or a deploy holds new work back, and is refused or waits for a later chance, as `checkPipelineSchedules` does. A read of a shared handler checks only `restateCanServe()`. Work that must still run once the hold clears waits for it with `whenDeployHoldClears()` (`src/deploy-hold.ts`) rather than taking an exemption, as boot's setup-check run does, since a boot after a self-deploy runs while that deploy is still verifying. A sender reached only through a caller that already checks the hold, or from inside a handler, whose invocation the drain already counts, needs no check of its own. The one exemption is `callTool`'s `DEPLOY_HOLD_ALLOWED_TOOLS` (`src/restate/tools-client.ts`): two reads, the decision a held KG refresh waits on, which lets the drain finish, and `start_deploy`, which answers a retry during the drain. Senders written before this rule have not all been checked against it.
+A self-deploy sets the deploy hold (`isDeployHeld`, `src/deploy-hold.ts`) when it starts draining and clears it when the deploy ends, and its drain moves on only once nothing is in flight and no invocation on the old deployment is open (`queryNonCompletedInvocations`). An invocation started during the drain can be cut off when the machine is replaced, and retried on code that lacks its handler (AII-1281). So a call or send that starts an invocation checks `restateCanStartWork()` (`src/restate/status.ts`), which is false while Restate cannot serve or a deploy holds new work back, and is refused or waits for a later chance, as `checkPipelineSchedules` does. A read of a shared handler checks only `restateCanServe()`. Work that must still run once the hold clears waits for it with `whenDeployHoldClears()` (`src/deploy-hold.ts`) rather than taking an exemption, as boot's setup-check run does, since a boot after a self-deploy runs while that deploy is still verifying. A sender reached only through a caller that already checks the hold, or from inside a handler, whose invocation the drain already counts, needs no check of its own. The webhook `ClaudeReviewStart.start` send is exempt: GitHub does not redeliver, and its short handler calls no other service. The drain counts it and waits for it; Restate retries it after boot if interrupted by machine replacement. The other exemption is `callTool`'s `DEPLOY_HOLD_ALLOWED_TOOLS` (`src/restate/tools-client.ts`): two reads, the decision a held KG refresh waits on, which lets the drain finish, and `start_deploy`, which answers a retry during the drain. Senders written before this rule have not all been checked against it.
 
 ### Every side effect in a handler goes inside `ctx.run`, and a tool handler never retries
 
@@ -776,3 +776,36 @@ invocations and waits at most 75 minutes, including runner time; import attempts
 stay below the twenty-minute invocation abort timeout. `package-cleanup` removes
 the entire Stardog package root on final base outcomes, preserving only packages
 handed off to a hold. Tokens are read inside client calls and never journaled.
+
+### ClaudeReviewStart
+
+`ClaudeReviewStart` is an exclusive object keyed by `owner/repo#prNumber`, composed
+in `src/index.ts`. Its `start({ ref, allowDraft })` handler reads fresh PR eligibility
+and records the head after accepted dispatches or final 404/422 responses.
+Transient failures store nothing; the next `ClaudeReviewRepair.tick` calls again. Webhook delivery ids
+provide send idempotency; the record deduplicates webhook and repair tick calls together.
+Only the head is stored; tokens are minted inside journaled operations and never
+returned by them. See [review start limits](review-fix-rail.md#durable-claude-review-starts).
+
+### ClaudeReviewRepair
+
+`ClaudeReviewRepair` has production key `orchestrator` and one exclusive `tick`.
+Its strict input is `{ repositories: [{ repository, ref, pulls: [{ number, headSha }] }] }`,
+where repository is `owner/repo`. Its sole state key `heads` is a
+`Record<string, string>` mapping `owner/repo#prNumber` to the message head SHA.
+Tick reads the old map and builds an empty replacement. Unchanged heads are
+copied; other heads call `ClaudeReviewStart.start({ ref, allowDraft: false })`
+through `ctx.objectClient`. Only `started` and `same` are retained. Non-cancellation
+terminal errors log one warning and continue; cancellation and other errors
+propagate. The replacement removes omitted PRs and repositories.
+
+The handler has no sleep, no delayed send, and no `ctx.run`. The poll remains the
+clock and lister: it sends one bounded ingress message after checking readiness,
+reusing the existing PR list. The object has no dependencies, GitHub requests or tokens.
+There is no Restate timer: a due timer at boot counts as non-completed work and
+can delay registration by the 60-second retry interval, or block it indefinitely
+on rollback to an image without this object. Listing stays in the poll to avoid
+another token, GitHub request each minute, and a long-step time limit.
+An open tick still holds deploy drain; a hard restart during it retains the
+known registration gap. See [review start limits](review-fix-rail.md#durable-claude-review-starts)
+for sequential-call delays, omitted-list retries, drafts and stale snapshot limits.

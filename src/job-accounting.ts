@@ -219,9 +219,9 @@ function placeholders(n: number): string {
 }
 
 /** Removes every NUL, then cuts text to RECORD_TEXT_MAX without leaving half a surrogate pair at the end. */
-function cut(v: string): string;
-function cut(v: string | null): string | null;
-function cut(v: string | null): string | null {
+export function cut(v: string): string;
+export function cut(v: string | null): string | null;
+export function cut(v: string | null): string | null {
   if (v === null) return v;
   v = v.replaceAll("\u0000", "");
   if (v.length <= RECORD_TEXT_MAX) return v;

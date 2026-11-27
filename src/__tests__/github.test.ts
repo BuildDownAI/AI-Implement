@@ -1,5 +1,5 @@
 import { describe, it, expect, onTestFinished, vi } from "vitest";
-import { listAllOpenPullRequests, dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedRunStepJob, CONTAINER_INIT_STEP, APP_TOKEN_STEP, readPublicRepository, readRepositoryFacts, listWorkflowDispatchRuns } from "../github.js";
+import { getClaudeReviewPullRequest, listAllOpenPullRequests, dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedRunStepJob, CONTAINER_INIT_STEP, APP_TOKEN_STEP, readPublicRepository, readRepositoryFacts, listWorkflowDispatchRuns } from "../github.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { decodeRunConfig } from "../run-config.js";
@@ -1546,5 +1546,21 @@ describe("listWorkflowDispatchRuns", () => {
   it.each([403, 429, 500, 502])("throws on HTTP %i", async (status) => {
     fakeFetch({ [RUNS]: { status, text: "boom" } }).install();
     await expect(listWorkflowDispatchRuns("t", "owner", "repo", "claude-plan.yml")).rejects.toThrow(`HTTP ${status}`);
+  });
+});
+
+
+describe("getClaudeReviewPullRequest", () => {
+  it.each([true, false])("reads head and eligibility (same repository: %s)", async same => {
+    fakeFetch({ "GET /repos/o/r/pulls/7": { json: { state: "open", draft: true,
+      head: { sha: "sha", repo: { full_name: same ? "o/r" : "fork/r" } },
+      base: { repo: { full_name: "o/r" } } } } }).install();
+    expect(await getClaudeReviewPullRequest("token", "o", "r", 7)).toEqual({
+      state: "open", draft: true, headSha: "sha", sameRepository: same,
+    });
+  });
+  it.each([{ status: 404 }, { json: {} }, () => { throw new Error("network"); }])("returns null for unreadable PRs %#", async reply => {
+    fakeFetch({ "GET /repos/o/r/pulls/7": reply }).install();
+    expect(await getClaudeReviewPullRequest("token", "o", "r", 7)).toBeNull();
   });
 });
