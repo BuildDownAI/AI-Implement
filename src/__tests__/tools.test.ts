@@ -977,6 +977,11 @@ describe("migrated read handlers (AII-711)", () => {
         expect(status.stage).toBe("serving");
       });
 
+      it("exposes stardog-ready while sign-in waits", async () => {
+        const status = await stageFor({ inFlight, step: "stardog-ready" });
+        expect(status.currentRun).toEqual({ triggerId: "t1", step: "stardog-ready", decisions: [], held: null });
+      });
+
       it("in flight before the gate: currentRun is set with no decisions", async () => {
         const status = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "kg-ingest", status: "running" } });
         expect(status.currentRun).toEqual({ triggerId: "t1", step: "await-progress", decisions: [], held: null });

@@ -748,11 +748,16 @@ The boot-resolved refresh identity uses the code repo's `KgRepo` key in base mod
 ### Base refresh Stardog steps
 
 `KgRefresh` shares one cancellation commit point before merge or Stardog import.
+`stardog-ready` signs in only, retrying every 30 seconds for up to ten minutes
+to let a slow Stardog Run endpoint start before the upload. Missing credentials
+or an unconfigured client fail immediately. The workflow exposes `step: "stardog-ready"`
+while waiting.
 `stardog-import` uses `maxRetryAttempts: 1`: it checks the manifest, metadata and
 listed files and posts `kit.yaml` followed by each `data` entry's `file`, in list
 order. The `kit.yaml` `data` list contains objects with a string `file` field:
 `ontology.ttl` or `data/[A-Za-z0-9._-]+\.nt`, with no `..`. Plain string entries
 are rejected. The step leaves `graph` fields for Stardog to read from `kit.yaml`.
+Import identifiers must be nonempty strings of at most 256 characters, contain no control or whitespace characters, and contain neither the API token nor the bearer; all other values are accepted.
 Its saved result contains `{ kitId, publishId, expectedTriples, target }`. A lost acknowledgement
 across a restart can repeat the POST; `replace=true` replaces the earlier import.
 `stardog-wait` reads at most four minutes per attempt and throws when no terminal
