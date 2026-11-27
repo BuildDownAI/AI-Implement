@@ -256,18 +256,29 @@ The workflow skips a dispatch if that named head is no longer current, uses the
 named head for checkout and the check run, and never cancels dispatch runs.
 An older orchestrator may omit `head_sha`; that run uses the current PR head.
 
-Both client calls (send and call) have a 5000 ms (five-second) HTTP request limit.
-This bounds one request; it does not cancel the durable invocation or add a retry.
-The poll logs a failed call and tries the same head again on the next poll,
-without an idempotency key that could retain a failed answer.
+The poll reuses its shared open-PR lists to build one snapshot of repositories,
+trusted refs and non-draft PR numbers and heads. It sends one
+`ClaudeReviewRepair/orchestrator/tick` message each poll, even when no head changed.
+The send has a 5000 ms HTTP request limit and no idempotency key; the poll logs a
+send failure and continues. This limit bounds acceptance, not the durable work.
+The exclusive `tick` keeps a durable head map and calls `ClaudeReviewStart` inside
+Restate only for unrecorded heads. It retains only `started` and `same` results,
+and replaces the map with the PRs of that message.
 
 Known limits:
 
-- **Calls during an outage:** while the object does not answer, each poll adds
-  one more call for each non-draft open PR. When the object answers again, each
-  waiting call ends with `same` or one start; no second review starts for one head.
-- **Poll delay:** while the object does not answer, one poll can wait five seconds
-  for each non-draft open PR before continuing with the rest of the poll.
+- No repair pass starts during a deploy hold or declined registration. The first
+  poll after readiness sends again.
+- A `skipped` PR (for example a fork) receives one call each pass.
+- The child start call has no time limit of its own. A slow start holds `tick`
+  open, delaying subsequent PRs and queuing later messages; it also holds deploy drain.
+- A failed repository list omits that repository. The next successful pass calls
+  every open PR there again; already recorded starts answer `same`.
+- Every poll sends a tick, including when no head changed.
+- Tick records the message head when start answers `same` based on its own fresh
+  read. If the list sees a new head but that read still sees the old head, repair
+  does not start the new review. Its webhook can still start it. The former local
+  map had the same race, but a restart cleared it.
 - **First deploy:** no head is recorded yet. The first poll starts one review for
   every non-draft open PR in the selected repositories, once per durable head.
 - **Drafts:** the poll does not repair a lost webhook or failed draft start. The

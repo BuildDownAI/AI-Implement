@@ -59,8 +59,5 @@ export function claudeReviewStartClient() {
     send: async (key: string, input: ClaudeReviewStartInput, opts?: { idempotencyKey?: string }) =>
       ingress.objectSendClient<ClaudeReviewStartDefinition>({ name: "ClaudeReviewStart" }, key)
         .start(input, clients.rpc.sendOpts({ ...opts, timeout: CLAUDE_REVIEW_START_TIMEOUT_MS })),
-    call: async (key: string, input: ClaudeReviewStartInput) =>
-      ingress.objectClient<ClaudeReviewStartDefinition>({ name: "ClaudeReviewStart" }, key)
-        .start(input, clients.rpc.opts({ timeout: CLAUDE_REVIEW_START_TIMEOUT_MS })),
   };
 }

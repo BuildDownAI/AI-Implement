@@ -1,6 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
-import { createClaudeReviewPoll } from "./claude-review-start.js";
+import { buildClaudeReviewRepairInput } from "./claude-review-start.js";
+import { createClaudeReviewRepair, claudeReviewRepairClient } from "./restate/claude-review-repair.js";
 import { createClaudeReviewStart, claudeReviewStartClient } from "./restate/claude-review-start.js";
 import { handleKgPackageUpload } from "./kg-package-upload.js";
 import { DATA_ROOT as KG_PACKAGE_DATA_ROOT } from "./kg-refresh.js";
@@ -490,7 +491,8 @@ async function reviewFixAccounting(
   return trackerAccounting(mapping, provider, { id: fix.issueId, identifier: fix.issueIdentifier });
 }
 
-const pollClaudeReviews = createClaudeReviewPoll();
+const claudeReviewRepair = createClaudeReviewRepair();
+const reviewRepairClient = claudeReviewRepairClient();
 const claudeReviewClient = claudeReviewStartClient();
 
 export async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
@@ -1011,8 +1013,11 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     }
     return listed;
   };
-  await pollClaudeReviews({ selfDeploy: config.selfDeployTarget ?? undefined,
-    canStartWork: restateCanStartWork, listRepoPulls: listReviewPulls, call: claudeReviewClient.call });
+  const reviewRepairInput = await buildClaudeReviewRepairInput(config.selfDeployTarget ?? undefined, listReviewPulls);
+  if (restateCanStartWork() && reviewRepairInput.repositories.length > 0) {
+    try { await reviewRepairClient.send(reviewRepairInput); }
+    catch { console.warn("[claude-review-repair] send failed"); }
+  }
 
   // Bounded cleanup of Restate review-fix pilot evidence (AII-795): purges activity/cycle
   // rows past the 7-day-since-completion retention floor, skipping any attempt whose
@@ -5623,7 +5628,7 @@ async function main(): Promise<void> {
     privateKey: config.githubAppPrivateKey, getInstallationToken,
     getPullRequest: getClaudeReviewPullRequest, postWorkflowDispatch });
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, claudeReviewStart, ...reviewFixServices, ...kgServices, ...kgSwitchLockServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, claudeReviewStart, claudeReviewRepair, ...reviewFixServices, ...kgServices, ...kgSwitchLockServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
       // Boot settles as serving only once this hook returns, and the first poll waits for that.
