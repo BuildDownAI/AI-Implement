@@ -7,7 +7,7 @@ import { extractReviewFindingsBlock } from "../pipeline/review-ledger.js";
 import { testDir } from "./helpers/test-dir.js";
 
 const action = parse(readFileSync(".github/actions/claude-review/action.yml", "utf8"));
-const steps = action.runs.steps as Array<{ name: string; id?: string; run?: string; with?: { claude_args?: string } }>;
+const steps = action.runs.steps as Array<{ name: string; id?: string; run?: string; with?: { claude_args?: string; prompt?: string } }>;
 
 function getStep(name: string) {
   const step = steps.find((candidate) => candidate.name === name);
@@ -99,6 +99,25 @@ describe("Claude review action", () => {
     expect(Object.keys(schema.properties).at(-1)).toBe("summary");
     expect(schema.required.at(-1)).toBe("summary");
     expect(schema.required).toEqual(expect.arrayContaining(["verdict", "findings", "summary"]));
+  });
+
+  it("tells Claude to suppress repeated minor findings but repeat blocking findings", () => {
+    const prompt = getStep("Run Claude review").with?.prompt?.replace(/\s+/g, " ");
+
+    expect(prompt).toContain("gh pr view --comments");
+    expect(prompt).toContain("Do not report a `minor` finding again");
+    expect(prompt).toContain("already reported it and it still applies");
+    expect(prompt).toContain("Report each `blocking` finding on every pass while it applies");
+    expect(prompt).not.toContain("unless the code changed");
+  });
+
+  it("tells Claude not to report predicted type check, build or test failures", () => {
+    const prompt = getStep("Run Claude review").with?.prompt?.replace(/\s+/g, " ");
+
+    expect(prompt).toContain("never report a finding whose claim is that the type check, the TypeScript build or a test fails or will fail for TypeScript code under `src/`");
+    expect(prompt).toContain("CI is the proof of those results on this PR");
+    expect(prompt).toContain("it does not cover files under `scripts/`, `custom/` or `session/`");
+    expect(prompt).toContain("still report wrong behavior, and a test that is missing or proves nothing");
   });
 
   it("renders an approving verdict into the human text and the machine block", () => {
@@ -213,5 +232,49 @@ describe("Claude review action", () => {
     expect(result.stdout).toContain("structured_output did not match review-findings/v1");
     expect(result.ghArgs).toBeUndefined();
     expect(result.postedBody).toBeUndefined();
+  });
+});
+
+
+describe("Claude review workflow dispatch", () => {
+  it("loads trusted code and publishes only the explicit review check on the PR head", () => {
+    const workflow = parse(readFileSync(".github/workflows/claude-review.yml", "utf8"));
+    expect(workflow.on.workflow_dispatch.inputs.pr_number).toMatchObject({ required: true, type: "string" });
+    expect(workflow.on.workflow_dispatch.inputs.head_sha).toMatchObject({ required: false, type: "string" });
+    expect(workflow.on.pull_request_target).toBeUndefined();
+    expect(workflow.on.issue_comment).toEqual({ types: ["created"] });
+    expect(workflow.permissions.checks).toBe("write");
+    const job = workflow.jobs["claude-review"];
+    expect(job.name).toBe("PR review run");
+    expect(job.name).not.toMatch(/claude|review-plugin|^review$/i);
+    expect(job.concurrency.group).toContain("format('claude-review-dispatch-{0}-{1}', inputs.pr_number, inputs.head_sha)");
+    expect(job.concurrency["cancel-in-progress"]).toBe("${{ github.event_name != 'workflow_dispatch' }}");
+    for (const step of job.steps.filter((s: { uses?: string; name?: string }) =>
+      s.uses === "actions/checkout@v4" || ["Create review check run", "Run Claude review"].includes(s.name ?? ""))) {
+      expect(step.if).toBe("steps.pr.outputs.eligible == 'true'");
+    }
+    const find = (name: string) => job.steps.find((step: { name?: string }) => step.name === name);
+    expect(find("Checkout trusted composite action").with.ref).toBeUndefined();
+    expect(find("Resolve PR head SHA").with.script).toContain("context.payload.inputs.pr_number");
+    const resolve = find("Resolve PR head SHA").with.script;
+    expect(resolve).toContain("context.payload.inputs.head_sha");
+    expect(resolve).toContain("!requested || requested === pr.data.head.sha");
+    expect(resolve).toContain("core.setOutput('sha', requested || pr.data.head.sha)");
+    expect(resolve).not.toContain("${{ inputs.head_sha }}");
+    expect(job.steps.find((s: { uses?: string }) => s.uses === "actions/checkout@v4").with.ref).toBe("${{ steps.pr.outputs.sha }}");
+    const create = find("Create review check run");
+    expect(create.id).toBe("check");
+    expect(create.env.HEAD_SHA).toBe("${{ steps.pr.outputs.sha }}");
+    expect(create.with.script).toContain("name: 'claude-review'");
+    expect(create.with.script).toContain("started_at: new Date().toISOString()");
+    expect(create.with.script).toContain("core.setOutput('id', check.data.id)");
+    expect(find("Run Claude review").id).toBe("review");
+    const complete = find("Complete review check run");
+    expect(complete.if).toBe("always() && steps.check.outputs.id != ''");
+    expect(complete.env.REVIEW_OUTCOME).toBe("${{ steps.review.outcome }}");
+    expect(complete.with.script).toContain("process.env.REVIEW_OUTCOME === 'success' ? 'success' : 'failure'");
+    expect(complete.with.script).toContain("completed_at: new Date().toISOString()");
+    expect(action.runs.steps.find((step: { name: string }) => step.name === "Run Claude review").with.track_progress)
+      .toBe("${{ github.event_name != 'workflow_dispatch' }}");
   });
 });

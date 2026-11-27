@@ -58,7 +58,7 @@ runs:
         use_bedrock: ${{ inputs.use_bedrock }}
         use_vertex: ${{ inputs.use_vertex }}
         github_token: ${{ inputs.github_token }}
-        track_progress: true
+        track_progress: ${{ github.event_name != 'workflow_dispatch' }}
         prompt: |
           REPO: ${{ github.repository }}
           PR NUMBER: ${{ inputs.pr_number }}
@@ -66,6 +66,15 @@ runs:
           You are reviewing this pull request. You can read it but not change it. You
           cannot run tests, builds or the type check: CI runs those on this PR
           separately, so do not try to run them.
+          Because you cannot run them, never report a finding whose claim is that
+          the type check, the TypeScript build or a test fails or will fail for
+          TypeScript code under `src/`. This includes a claim that such code does
+          not compile, that a type is not narrowed, or that an import there does not
+          resolve. CI is the proof of those results on this PR, and a failed CI
+          check already blocks the merge. This rule covers only files that CI
+          checks: it does not cover files under `scripts/`, `custom/` or `session/`.
+          It does not limit your other findings: still report wrong behavior, and a
+          test that is missing or proves nothing.
 
           Read the change and its description (`gh pr diff`, `gh pr view`), then every
           changed file in full, not only its hunks, and follow each change to the code it
@@ -76,9 +85,13 @@ runs:
           - Style consistency with the rest of the codebase (see CLAUDE.md)
           - Test coverage gaps
 
-          Review the PR's current head against its base branch. Earlier review comments on
-          this PR may describe older commits: derive every finding from the current diff,
-          and never carry one forward from a comment without confirming it still applies.
+          Review the PR's current head against its base branch. Read earlier review comments
+          on this PR with `gh pr view --comments`; they may describe older commits. Derive
+          every finding from the current diff, and never carry one forward from a comment
+          without confirming it still applies. Do not report a `minor` finding again when an
+          earlier review comment on this PR already reported it and it still applies. Report
+          each `blocking` finding on every pass while it applies, because the merge gate needs
+          it.
 
           Do not post any comment yourself — a later workflow step renders and posts the
           review from your structured output. Return the review as that structured
