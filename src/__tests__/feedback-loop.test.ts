@@ -264,6 +264,23 @@ describe("feedbackLoopStep — planning context routing", () => {
     expect(mockReviewRun.mock.calls[1][1]).toMatchObject({ acceptanceBar: expectedBar, reviewRubric });
   });
 
+  it("sends the reference repository results to implement and review on every pass", async () => {
+    const ctx = makeContext();
+    const referenceRepoResults = [{ repo: "https://github.com/acme/orchestrator", path: "orchestrator-source", ref: "v2.0.1", arrived: true }];
+    mockReviewRun
+      .mockResolvedValueOnce(REVIEW_REJECTED)
+      .mockResolvedValueOnce(REVIEW_APPROVED);
+    await feedbackLoopStep.run(
+      ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", referenceRepoResults, maxIterations: 2 },
+      { report: vi.fn(async () => undefined) },
+    );
+    for (const pass of [0, 1]) {
+      expect(mockImplementRun.mock.calls[pass][1]).toMatchObject({ referenceRepoResults });
+      expect(mockReviewRun.mock.calls[pass][1]).toMatchObject({ referenceRepoResults });
+    }
+  });
+
   it("sends wrapped mapSection (with security guard) to implement on pass 2 with new-format context", async () => {
     const ctx = makeContext();
     mockReviewRun

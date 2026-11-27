@@ -326,6 +326,9 @@ describe("implementStep", () => {
       expect(call.prompt).toContain("https://github.com/a/b");
       expect(call.prompt).toContain("refs/b");
       expect(call.prompt).toContain("read-only reference material");
+      // The implementer is asked to check its claims, and is not handed the reviewer's rating rule.
+      expect(call.prompt).toContain("confirm the claim against its checkout");
+      expect(call.prompt).not.toContain("rate it");
     });
 
     it("appends section with cause phrase when entry did not arrive", async () => {

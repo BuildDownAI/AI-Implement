@@ -418,6 +418,25 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.trustedConfigReviewerDefinitions).toBe(trustedConfigReviewerDefinitions);
   });
 
+  it("wires the reference-repos step's results into both the feedback loop and post-push review", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const ctx = makeContext();
+    const results = [{ repo: "https://github.com/acme/orchestrator", path: "orchestrator-source", ref: "v2.0.1", arrived: true }];
+    ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("install", {});
+    ctx.setOutputs("reference-repos", { results });
+    ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
+
+    for (const id of ["feedback-loop", "post-push-review"]) {
+      const step = pipeline.steps.find((s) => s.id === id)!;
+      expect(ctx.resolveInputs(step.inputs).referenceRepoResults).toBe(results);
+    }
+  });
+
   it("wires the push step's commitSha through as post-push-review's pushedSha lease seed", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,

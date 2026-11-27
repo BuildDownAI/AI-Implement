@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { StageName } from "./agent-config.js";
 
 /** Why a declared reference repository did not arrive in the workspace. */
 export type ReferenceRepoResultCause =
@@ -40,6 +41,39 @@ const CAUSE_PHRASES: Record<ReferenceRepoResultCause, string> = {
 
 export function describeReferenceRepoCause(cause: ReferenceRepoResultCause | undefined): string {
   return cause ? CAUSE_PHRASES[cause] : "an unknown error prevented the clone";
+}
+
+/** The prompt section naming each declared repository. Every stage confirms its claims against them; a reviewer also rates a contradicted one by its effect. */
+export function buildReferenceReposSection(results: readonly ReferenceRepoResult[], agentStage: Exclude<StageName, "planning">): string {
+  const arrived = results.filter((r) => r.arrived);
+  const missed = results.filter((r) => !r.arrived);
+  const lines: string[] = ["## Reference Repositories"];
+
+  if (arrived.length > 0) {
+    lines.push(
+      "",
+      "The following repositories are available in the workspace as read-only reference material, each at the ref shown. Do not modify them.",
+      "When the work states how one of them behaves, confirm the claim against its checkout.",
+      ...(agentStage === "review" ? ["When you report a claim its checkout contradicts, rate it minor if it only describes, and blocking if acting on it fails: a call the code refuses, a value it never sets, or a step that cannot succeed."] : []),
+      "",
+    );
+    for (const r of arrived) {
+      lines.push(`- \`${r.repo}\` at ${r.ref ? `\`${r.ref}\`` : "its default branch"} — available at \`${r.path}\``);
+    }
+  }
+
+  if (missed.length > 0) {
+    lines.push(
+      "",
+      "The following repositories were declared but could not be cloned. Do not assert anything about their contents — treat them as unavailable.",
+      "",
+    );
+    for (const r of missed) {
+      lines.push(`- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`);
+    }
+  }
+
+  return lines.join("\n");
 }
 
 /** Returns null for both absent and empty, so the column stores one "unset" value. */

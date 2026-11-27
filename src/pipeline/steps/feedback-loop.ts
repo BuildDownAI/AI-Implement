@@ -438,6 +438,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
               acceptanceBar: args.acceptanceBar,
               reviewRubric: args.reviewRubric,
               installFailed: inputs.installFailed === true,
+              referenceRepoResults: inputs.referenceRepoResults,
             },
             reporter,
           ),

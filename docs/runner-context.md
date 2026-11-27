@@ -138,7 +138,7 @@ Both pass the credential through `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_0` / `GIT_
 
 After each clone the destination is appended to `.git/info/exclude`, so the directory cannot be staged by `git add -A` or swept into a commit by the push step.
 
-**What it reports, and to whom.** The step returns one result per declared entry carrying the repository, the path, the resolved ref, whether it arrived, and — when it did not — one of five causes:
+**What it reports, and to whom.** The step returns one result per declared entry carrying the repository, the path, the declared ref (none for the default branch, never a resolved commit), whether it arrived, and — when it did not — one of five causes:
 
 | Cause | What happened | What an operator can do |
 |-------|---------------|-------------------------|
@@ -148,11 +148,11 @@ After each clone the destination is appended to `.git/info/exclude`, so the dire
 | `clone-error` | A network or git error prevented the clone | Usually transient; re-dispatch |
 | `path-invalid` | The declared path failed re-validation, or collides with another entry | Correct the `path` in the mapping |
 
-Those results reach two readers. The implement step appends a `## Reference Repositories` section to the prompt at invocation time and on every feedback-loop iteration, naming each repository that arrived with its path, and naming each one that did not with its cause plus an instruction to assert nothing about it. The terminal callback carries the same results to the orchestrator, which comments on the ticket only when something is missing — a run where everything arrived says nothing, because a report nobody needs is noise on a surface where noise costs attention.
+Those results reach two readers: the agents, through their prompts, and the orchestrator. Every pass that writes or judges the change gets a `## Reference Repositories` section, built by `buildReferenceReposSection` (`src/reference-repos.ts`): the implement step at invocation and on every feedback-loop iteration, the in-loop review, the post-push reviewers (every selected reviewer, built-in or from config) and the post-push fix pass. It names each repository that arrived with its ref and path, and asks for any claim the work makes about how one behaves to be confirmed against its checkout. A reviewer is also told how to rate a claim the checkout contradicts: minor when it only describes, blocking when acting on it fails. Each repository that did not arrive is named with its cause, plus an instruction to assert nothing about it. A roll-up review-only run skips every step but `clone` and `feedback-loop`, so its reviewers get no section. The terminal callback carries the same results to the orchestrator, which comments on the ticket only when something is missing — a run where everything arrived says nothing, because a report nobody needs is noise on a surface where noise costs attention.
 
 A missing repository never fails the run or changes its classification. That is the whole design: a silently absent source tree is the worst available outcome, because the agent falls back to transcribing the issue and the run looks identical to a successful one.
 
-**What enabling it costs.** Exposure to whatever the declared repositories contain, for the length of the run. The credential itself is narrow — read-only, and limited to the repositories named — so this does not widen what a run can reach beyond what the operator chose. The reviewer is the gap worth knowing about: it works in the same workspace and can open the files, but it receives no reference-repositories section, so it is not told they are there.
+**What enabling it costs.** Exposure to whatever the declared repositories contain, for the length of the run. The credential itself is narrow — read-only, and limited to the repositories named — so this does not widen what a run can reach beyond what the operator chose. It also costs turns: each pass that checks a claim against a checkout reads it, and the post-push reviewers spend that from their turn budget.
 
 **What omitting it costs.** The agent improvises from the target repository alone. For an issue that turns on how a sibling repository actually behaves, that produces confident output which may be wrong in exactly the way automated review cannot catch — since the reviewer has no more access to the truth than the implementer did.
 

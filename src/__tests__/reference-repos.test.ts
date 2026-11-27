@@ -1,5 +1,48 @@
 import { describe, it, expect } from "vitest";
-import { githubRepoParts, normalizeGitHubRepo, normalizeReferenceRepos } from "../reference-repos.js";
+import {
+  buildReferenceReposSection,
+  githubRepoParts,
+  normalizeGitHubRepo,
+  normalizeReferenceRepos,
+  type ReferenceRepoResult,
+} from "../reference-repos.js";
+
+describe("buildReferenceReposSection", () => {
+  const arrived: ReferenceRepoResult = { repo: "https://github.com/acme/orchestrator", path: "orchestrator-source", ref: "v2.0.1", arrived: true };
+  const missed: ReferenceRepoResult = { repo: "https://github.com/acme/private", path: "private-source", ref: "main", arrived: false, cause: "no-auth" };
+
+  it("names each arrived repository's path and the ref it was cloned at", () => {
+    const section = buildReferenceReposSection([arrived], "implementation");
+    expect(section).toContain("`https://github.com/acme/orchestrator` at `v2.0.1`");
+    expect(section).toContain("`orchestrator-source`");
+  });
+
+  it("names the default branch for an entry that declares no ref", () => {
+    // No `ref` key at all, as normalizeReferenceRepos stores an entry that declares none.
+    const section = buildReferenceReposSection([{ repo: arrived.repo, path: arrived.path, arrived: true }], "implementation");
+    expect(section).toContain("`https://github.com/acme/orchestrator` at its default branch");
+  });
+
+  it("asks every stage to confirm a claim about an arrived repository against its checkout", () => {
+    for (const stage of ["implementation", "review"] as const) {
+      expect(buildReferenceReposSection([arrived], stage)).toContain("confirm the claim against its checkout");
+    }
+  });
+
+  it("tells only a reviewer how to rate a contradicted claim: minor when it only describes, blocking when acting on it fails", () => {
+    const review = buildReferenceReposSection([arrived], "review");
+    expect(review).toContain("rate it minor if it only describes");
+    expect(review).toContain("blocking if acting on it fails");
+    expect(buildReferenceReposSection([arrived], "implementation")).not.toContain("rate it");
+  });
+
+  it("names a repository that did not arrive with its cause, and asks for nothing to be confirmed against it", () => {
+    const section = buildReferenceReposSection([missed], "review");
+    expect(section).toContain("`https://github.com/acme/private`: the repository is private");
+    expect(section).toContain("Do not assert anything");
+    expect(section).not.toContain("confirm the claim");
+  });
+});
 
 describe("githubRepoParts", () => {
   it("reads the owner and name from a stored URL, as normalizeGitHubRepo stores it", () => {

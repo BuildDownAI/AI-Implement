@@ -62,6 +62,25 @@ describe("reviewStep", () => {
     }
   });
 
+  it("names the reference repositories and how to rate a contradicted claim, before the diff", async () => {
+    const invoke = vi.fn(async (_input: { prompt: string }) => reviewResult());
+    await reviewStep.run(makeCtx(invoke), {
+      diff: "diff", issueTitle: "T", issueDescription: "D", iteration: 1,
+      referenceRepoResults: [{ repo: "https://github.com/acme/orchestrator", path: "orchestrator-source", ref: "v2.0.1", arrived: true }],
+    }, { report: vi.fn() });
+    const prompt = invoke.mock.calls[0][0].prompt;
+    expect(prompt).toContain("`https://github.com/acme/orchestrator` at `v2.0.1` — available at `orchestrator-source`");
+    expect(prompt).toContain("rate it minor if it only describes");
+    expect(prompt.indexOf("## Reference Repositories")).toBeLessThan(prompt.indexOf("## Implementation Diff"));
+  });
+
+  it("adds no reference section when the run declared no reference repository", async () => {
+    const invoke = vi.fn(async (_input: { prompt: string }) => reviewResult());
+    // The loader skips the reference-repos step then, so the results arrive undefined.
+    await reviewStep.run(makeCtx(invoke), { diff: "diff", iteration: 1, referenceRepoResults: undefined }, { report: vi.fn() });
+    expect(invoke.mock.calls[0][0].prompt).not.toContain("## Reference Repositories");
+  });
+
   it("omits acceptance bar framing when acceptanceBar is absent", async () => {
     let capturedPrompt = "";
     const ctx = makeCtx(vi.fn(async ({ prompt }: { prompt: string }) => {
