@@ -6189,10 +6189,22 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect((await call("/api/model-accounts/nope", "PATCH", t, { status: "disabled" })).status).toBe(404);
   });
 
+  it("rejects stale defaults saves without appending a revision", async () => {
+    const t = await seed();
+    const original = (await call("/api/agent-defaults", "GET", t)).json;
+    const first = await call("/api/agent-defaults", "PUT", t, { mode: "legacy", stages: original.stages, configRevisionId: original.configRevisionId });
+    expect(first.status).toBe(200);
+    const revs = count("stage_agent_config_revisions");
+    expect((await call("/api/agent-defaults", "PUT", t, { ...defaults, configRevisionId: original.configRevisionId })).status).toBe(409);
+    expect((await call("/api/agent-defaults", "PUT", t, defaults)).status).toBe(409);
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+    expect((await call("/api/agent-defaults", "GET", t)).json.configRevisionId).toBe(first.json.configRevisionId);
+  });
+
   it("validates defaults atomically", async () => {
     const t = await seed();
     const revs = count("stage_agent_config_revisions");
-    const bad = { mode: "configured", stages: { planning: { agent: "codex", provider: "openai", model: "m", accountProfileId: "missing", invocationTimeoutMs: 1000 } } };
+    const bad = { configRevisionId: (await call("/api/agent-defaults", "GET", t)).json.configRevisionId, mode: "configured", stages: { planning: { agent: "codex", provider: "openai", model: "m", accountProfileId: "missing", invocationTimeoutMs: 1000 } } };
     expect((await call("/api/agent-defaults", "PUT", t, bad)).status).toBe(400);
     expect((await call("/api/agent-defaults", "PUT", t, { ...defaults, extra: 1 })).status).toBe(400);
     expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy", stages: { planning: { model: 5 } } })).status).toBe(400);

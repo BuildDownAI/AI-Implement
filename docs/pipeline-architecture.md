@@ -361,3 +361,12 @@ operator-reported deployments. Here, managed projects are rejected before review
 in `src/restate/review-fix-production.ts`. The reported TEST-5 GHA milestone does not establish Fly/local managed
 Restate support or recovery in this tree. AII-1289 remains incomplete pending the full acceptance matrix; native
 Claude skills tests and Codex discovery without a turn do not close its Codex/Restate requirements.
+
+### Concurrent administration of stage defaults
+
+`PUT /api/agent-defaults` replaces the global stage defaults. Clients must include
+`configRevisionId` from their last GET (null for the first save). The store checks
+that revision inside the write transaction; stale or missing revisions against
+existing defaults return HTTP 409 without appending a revision. Reload the defaults
+and reconcile edits before saving again. Both administration forms send the revision
+associated with the stages they submit.

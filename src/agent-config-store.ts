@@ -469,11 +469,14 @@ function assertNonEmptyProjectKey(projectKey: string): void {
   assertNonEmptyString(projectKey, "project key");
 }
 
-export function setOrchestratorDefaults(config: StageAgentConfigurationV1, createdBy: string | null = null): StoredStageConfig {
+export function setOrchestratorDefaults(config: StageAgentConfigurationV1, createdBy: string | null = null, expectedRevision?: string | null): StoredStageConfig {
   assertConfigShape(config, "orchestratorDefaults");
   const db = getDb();
   return db
     .transaction(() => {
+      if (expectedRevision !== undefined && (currentDefaults(db)?.config_revision_id ?? null) !== expectedRevision) {
+        throw new StaleStageInputsError();
+      }
       if (config.mode === "configured") {
         // Complete, compatible and enabled for every stage; permissions are checked per project.
         resolveStageAgentConfig({

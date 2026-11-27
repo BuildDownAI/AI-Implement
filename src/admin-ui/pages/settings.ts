@@ -240,7 +240,7 @@ export const settingsScript = `
       var cur = await window.api('/api/agent-defaults');
       if (!cur.ok) { adShowError(await adErrorText(cur, 'Failed to read current stage defaults')); return; }
       var current = await cur.json();
-      var res = await window.api('/api/agent-defaults', { method: 'PUT', body: JSON.stringify({ mode: mode, stages: current.stages || {} }) });
+      var res = await window.api('/api/agent-defaults', { method: 'PUT', body: JSON.stringify({ mode: mode, stages: current.stages || {}, configRevisionId: current.configRevisionId || null }) });
       if (!res.ok) { adShowError(await adErrorText(res, 'Failed to save agent defaults')); return; }
       adDirty = false;
       await loadAgentDefaults();

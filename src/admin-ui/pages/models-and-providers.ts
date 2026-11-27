@@ -330,7 +330,7 @@ export const modelsAndProvidersScript = `(function () {
     try {
       const res = await window.api('/api/agent-defaults', {
         method: 'PUT',
-        body: JSON.stringify({ mode: mpDefaults.mode === 'configured' ? 'configured' : 'legacy', stages: form.stages }),
+        body: JSON.stringify({ mode: mpDefaults.mode === 'configured' ? 'configured' : 'legacy', stages: form.stages, configRevisionId: mpDefaults.configRevisionId || null }),
       });
       if (!res.ok) {
         mpShowStageError(await mpErrorText(res, 'Failed to save stage defaults'));

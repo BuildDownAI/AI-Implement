@@ -100,7 +100,7 @@ describe("models page stage defaults", () => {
   });
 
   it("saves the full stages object with null for cleared fields", async () => {
-    const stub = await bootModels(true, { configured: true, mode: "configured", stages: { planning: { agent: "claude" } } });
+    const stub = await bootModels(true, { configRevisionId: "defaults-1", configured: true, mode: "configured", stages: { planning: { agent: "claude" } } });
     field("review", "agent").value = "codex";
     field("review", "agent").dispatchEvent(new Event("change", { bubbles: true }));
     field("review", "model").value = "m1";
@@ -110,6 +110,7 @@ describe("models page stage defaults", () => {
     const put = stub.calls.find((c) => c.method === "PUT")!;
     expect(put.url).toBe("/api/agent-defaults");
     expect(put.body.mode).toBe("configured");
+    expect(put.body.configRevisionId).toBe("defaults-1");
     expect(put.body.stages.planning).toEqual({ agent: "claude", provider: null, model: null, accountProfileId: null, invocationTimeoutMs: null });
     expect(put.body.stages.review).toMatchObject({ agent: "codex", model: "m1", invocationTimeoutMs: 60000, provider: null });
     expect(put.body.stages.implementation.agent).toBeNull();
@@ -159,7 +160,7 @@ describe("settings agent defaults card", () => {
   async function bootSettings(admin: boolean, put?: Stub["put"]) {
     document.body.innerHTML = settingsHtml;
     const stub: Stub = { calls: [], put };
-    stubFetch(stub, { configured: true, mode: "configured", stages: { review: { agent: "codex" } } });
+    stubFetch(stub, { configRevisionId: "defaults-2", configured: true, mode: "configured", stages: { review: { agent: "codex" } } });
     const base = w.api;
     w.api = async (url: string, opts?: any) => (url === "/api/settings" || url === "/api/global-secrets" ? { ok: true, status: 200, json: async () => (url === "/api/settings" ? { flySessionsApp: {}, flySessionsRegion: {}, linearPickupLabel: { value: null, effective: "x" } } : []) } : base(url, opts));
     w.esc = (s: string) => s;
@@ -180,7 +181,7 @@ describe("settings agent defaults card", () => {
     w.saveAgentDefaultsMode();
     await tick(); await tick();
     const put = stub.calls.find((c) => c.method === "PUT")!;
-    expect(put.body).toEqual({ mode: "legacy", stages: { review: { agent: "codex" } } });
+    expect(put.body).toEqual({ configRevisionId: "defaults-2", mode: "legacy", stages: { review: { agent: "codex" } } });
   });
 
   it("shows a server error and keeps the selection", async () => {

@@ -84,6 +84,19 @@ function seed(): void {
   store.setOrchestratorDefaults(defaults());
 }
 
+it("compares the defaults revision atomically, including first creation", () => {
+  const config = { version: 1 as const, mode: "legacy" as const };
+  const first = store.setOrchestratorDefaults(config, "admin-a", null);
+  const before = dump();
+  expect(() => store.setOrchestratorDefaults(config, "admin-b", null)).toThrow(store.StaleStageInputsError);
+  expect(dump()).toBe(before);
+  const second = store.setOrchestratorDefaults(config, "admin-a", first.configRevisionId);
+  expect(second.revision).toBe(first.revision + 1);
+  const saved = dump();
+  expect(() => store.setOrchestratorDefaults(config, "admin-b", first.configRevisionId)).toThrow(store.StaleStageInputsError);
+  expect(dump()).toBe(saved);
+});
+
 describe("profiles", () => {
   it.each([
     ["claude", "anthropic", "anthropic-api-key"],

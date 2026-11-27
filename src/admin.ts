@@ -3960,7 +3960,7 @@ function validateStagesBody(stages: unknown): string | null {
 async function handlePutAgentDefaults(req: http.IncomingMessage, res: http.ServerResponse, actor: string | null): Promise<void> {
   const body = await readJsonObject(req, res);
   if (!body) return;
-  const extra = unsupportedKeys(body, ["mode", "stages"]);
+  const extra = unsupportedKeys(body, ["mode", "stages", "configRevisionId"]);
   if (extra.length > 0) {
     json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}` });
     return;
@@ -3976,14 +3976,19 @@ async function handlePutAgentDefaults(req: http.IncomingMessage, res: http.Serve
       return;
     }
   }
+  if (body.configRevisionId !== undefined && body.configRevisionId !== null && typeof body.configRevisionId !== "string") {
+    json(res, 400, { error: "configRevisionId must be a string or null" });
+    return;
+  }
   try {
     const stored = setOrchestratorDefaults(
       { version: STAGE_AGENT_CONFIG_VERSION, mode: body.mode, ...(body.stages !== undefined ? { stages: body.stages as StageAgentConfigurationV1["stages"] } : {}) },
       actor,
+      (body.configRevisionId as string | null | undefined) ?? null,
     );
     json(res, 200, { configured: true, ...storedConfigView(stored) });
   } catch (err) {
-    json(res, 400, { error: err instanceof Error ? err.message : "invalid defaults" });
+    json(res, err instanceof StaleStageInputsError ? 409 : 400, { error: err instanceof StaleStageInputsError ? "Stage defaults changed; reload before saving again" : err instanceof Error ? err.message : "invalid defaults" });
   }
 }
 
