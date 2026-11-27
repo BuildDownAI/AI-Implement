@@ -152,7 +152,8 @@ Projects drawer. Operator procedures, including the protected CLI steps, are in
 credentials anywhere. Existing Codex local-login users re-sign in through `chatgpt-plan-login`; the
 orchestrator does not read or copy an `auth.json`. Support is provisional: see
 [docs/codex-parity-validation.md](docs/codex-parity-validation.md) for what is verified and what is
-still pending.
+still pending. PR #1730 does not complete AII-1289: the full live matrix and managed Restate
+backend/recovery acceptance remain blocked, even with the reported GHA milestone.
 
 ### Exercise planning and implementation separately
 
