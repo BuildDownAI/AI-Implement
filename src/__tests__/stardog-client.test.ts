@@ -45,6 +45,27 @@ afterEach(() => {
 });
 
 describe("Stardog client", () => {
+  it("ready signs in only with one shared 30-second deadline", async () => {
+    const { modules } = await fixture();
+    const deadline = vi.spyOn(AbortSignal, "timeout");
+    const fake = routes().install();
+    expect(await modules.client.createStardogClient().ready()).toBeUndefined();
+    expect(fake.calls.map(c => `${c.method} ${c.path}`)).toEqual([
+      "GET /api/cli/endpoints", "POST /api/token", "POST /edge/token",
+    ]);
+    expect(deadline).toHaveBeenCalledExactlyOnceWith(30_000);
+    expect(new Set(fake.calls.map(c => c.signal)).size).toBe(1);
+    expect(fake.calls[0].signal).toBeDefined();
+  });
+
+  it("ready bounds a stalled sign-in with the shared deadline", async () => {
+    const { modules } = await fixture();
+    stubAbortTimeout(30_000);
+    const fake = routes({ "GET /api/cli/endpoints": hangUntilAborted }).install();
+    await expect(modules.client.createStardogClient().ready()).rejects.toThrow("/api/cli/endpoints timed out after 30000 ms");
+    expect(fake.calls).toHaveLength(1);
+  });
+
   it("signs in through the console and edge and counts triples", async () => {
     const { modules } = await fixture();
     const fake = routes().install();

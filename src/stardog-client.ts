@@ -31,6 +31,8 @@ export interface StardogTarget {
 }
 
 export interface StardogClient {
+  /** Signs in only; safe to repeat before starting an import. */
+  ready(): Promise<void>;
   startImport(packageDir: string, files: string[], target: StardogTarget): Promise<{ kitId: string; publishId: string }>;
   readEvents(kitId: string, publishId: string, options: { maxMs: number }): Promise<StardogImportEvent>;
   /** Signs in and runs one COUNT query. An explicit target freezes identity; credentials are read on every call. */
@@ -361,6 +363,9 @@ async function readEvents(fetchImpl: typeof fetch, kitId: string, publishId: str
 export function createStardogClient(deps: StardogClientDeps = {}): StardogClient {
   const fetchImpl = deps.fetchImpl ?? fetch;
   return {
+    ready: async () => {
+      await signIn(fetchImpl, AbortSignal.timeout(STARDOG_REQUEST_TIMEOUT_MS));
+    },
     countTriples: (target) => countTriples(fetchImpl, target),
     startImport: (dir, files, target) => startImport(fetchImpl, dir, files, target),
     readEvents: (kit, publish, options) => readEvents(fetchImpl, kit, publish, options),

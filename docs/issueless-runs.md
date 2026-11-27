@@ -377,7 +377,7 @@ The callback is verify-only: it checks the signature and row but never consumes 
 ## 6. Lifecycle
 
 In base mode, the cancellation commit point precedes `stardog-import`. The saved
-steps are `stardog-import` → `stardog-wait` → `stardog-verify` → `baseline`;
+steps are `stardog-ready` → `stardog-import` → `stardog-wait` → `stardog-verify` → `baseline`;
 merge and the four sidecar gates do not run. Every final base-mode outcome runs
 `package-cleanup`, removing `<dataRoot>/stardog/` before releasing the lock.
 A gate ending `awaiting_decision` preserves the package for the decision run.
