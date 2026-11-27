@@ -80,7 +80,7 @@ async function startClaudeReview(
   if (payload.pull_request?.draft && !(payload.action === "synchronize" &&
       payload.sender?.login === "ai-implement-orchestrator-bot[bot]")) return;
 
-  if (!caller?.canStartWork()) return;
+  if (!caller) return;
   try {
     const target = claudeReviewRepositories(selfDeploy).find(t => `${t.owner}/${t.repo}` === fullName);
     if (!target) return;

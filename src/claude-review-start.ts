@@ -8,7 +8,6 @@ export interface ClaudeReviewStartInput { ref: string; allowDraft: boolean }
 export type ClaudeReviewStartResult = "started" | "same" | "skipped" | "failed";
 export type ClaudeReviewStartSender = (key: string, input: ClaudeReviewStartInput, opts?: { idempotencyKey?: string }) => Promise<unknown>;
 export interface ClaudeReviewStartCaller {
-  canStartWork(): boolean;
   send: ClaudeReviewStartSender;
 }
 

@@ -4710,7 +4710,7 @@ export function startServer(
         githubAppPrivateKey: config.githubAppPrivateKey,
         enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateCanServe),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient, { canStartWork: restateCanStartWork, send: claudeReviewClient.send }).catch((err) => {
+      }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient, { send: claudeReviewClient.send }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

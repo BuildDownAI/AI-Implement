@@ -449,7 +449,9 @@ The orchestrator sends review starts to the exclusive `ClaudeReviewStart` Restat
 object, keyed by `owner/repo#prNumber`. It records the head after an accepted
 start or a final HTTP 404/422 rejection. Duplicate events for that head therefore
 do not dispatch again. The webhook sends with the GitHub delivery id as its
-idempotency key; the poll repairs missed webhooks and transient start failures.
+idempotency key, with no deploy-hold or Restate-readiness gate. The send is not
+awaited by the webhook response and has a 5000 ms ingress limit; failures log a
+warning. The poll repairs missed webhooks and transient start failures.
 Both paths use the trusted deploy target and branch, or mapped repositories with
 `main` when no target resolves. The `.github/workflows/claude-review.yml` workflow
 and composite action come from that trusted branch; the maintainer comment
@@ -469,6 +471,9 @@ and replaces the map with the PRs of that message.
 
 Known limits:
 
+- A start is still lost if the orchestrator cannot receive the webhook (for
+  example during machine replacement) or Restate does not answer. The repair
+  tick covers non-draft PRs.
 - No repair pass starts during a deploy hold or declined registration. The first
   poll after readiness sends again.
 - A `skipped` PR (for example a fork) receives one call each pass.
@@ -492,5 +497,10 @@ Known limits:
 - **Fallback to `main`:** until `main` has the optional `head_sha` workflow input,
   GitHub returns 422 and that head gets no orchestrator review. Deploy targets
   are not affected by this fallback limitation.
-- **Gate:** the gate still approves on `absent` if no start happened before the
-  internal review ended. Changing that merge rule is outside this start repair.
+- **Gate:** the gate still approves on `absent` when no default-named review
+  check is on the head. This merge rule is unchanged.
+- **No real verdict:** when a default-named review check is on the head with no
+  real conclusion (in this repository `code-review-plugin` is `skipped` for a bot
+  PR), the gate reads `no-real-verdict`. While no `claude-review` check with a
+  verdict exists on that head, a run reaching the gate ends `invalid_review`
+  and a person must act; the gate does not approve.
