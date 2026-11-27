@@ -36,7 +36,7 @@ beforeEach(async () => {
 
 const SENT = { json: { invocationId: "inv_1", status: "Accepted" } };
 // Every cycle refreshes the runner backend cache from Restate first.
-const EVERY_CYCLE: Routes = { "POST /RunnerBackend/fly-machines/get": { json: null } };
+const EVERY_CYCLE: Routes = { "POST /ClaudeReviewRepair/orchestrator/tick/send": SENT, "POST /RunnerBackend/fly-machines/get": { json: null } };
 const cycle = () => index.poll(makeAppConfig(), makeRegistry({ provider: makeProvider() }));
 const setupCheckPaths = (calls: Array<{ path: string }>) => calls.map((call) => call.path).filter((path) => path.startsWith("/SetupChecks/"));
 
@@ -174,7 +174,7 @@ describe("the late-review hook", () => {
   });
 });
 
-it.each([false, true])("shares the PR list and retries a failed review start on the next poll (failure: %s)", async failFirst => {
+it.each([false, true])("shares the PR list and sends a repair snapshot each poll (failure: %s)", async failFirst => {
   config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", paused: true }));
   const fake = fakeFetch({
     ...EVERY_CYCLE,
@@ -185,20 +185,36 @@ it.each([false, true])("shares the PR list and retries a failed review start on 
     "GET /repos/org/repo/pulls": { json: [{ number: 42, html_url: "https://github.com/org/repo/pull/42",
       user: { login: "alice" }, head: { ref: "topic", sha: "head" }, base: { ref: "main" },
       draft: false, title: "PR", created_at: "2026-01-01T00:00:00Z" }] },
-    "POST /ClaudeReviewStart/org%2Frepo%2342/start": failFirst
-      ? [() => { throw new Error("review start request failed"); }, { json: "same" }]
-      : { json: "same" },
+    "POST /ClaudeReviewRepair/orchestrator/tick/send": failFirst
+      ? [() => { throw new Error("review start request failed"); }, SENT]
+      : SENT,
   }).install();
   const app = makeAppConfig({ githubAppPrivateKey: makeAppPrivateKey() });
   const registry = makeRegistry({ provider: makeProvider() });
   await index.poll(app, registry);
   await index.poll(app, registry);
   expect(fake.calls.filter(c => c.path === "/repos/org/repo/pulls")).toHaveLength(2);
-  const calls = fake.calls.filter(c => c.path.startsWith("/ClaudeReviewStart/"));
-  expect(calls).toHaveLength(failFirst ? 2 : 1);
+  expect(fake.calls.filter(c => c.path.startsWith("/ClaudeReviewStart/"))).toHaveLength(0);
+  const calls = fake.calls.filter(c => c.path.startsWith("/ClaudeReviewRepair/"));
+  expect(calls).toHaveLength(2);
   for (const call of calls) {
-    expect(call.path).toBe("/ClaudeReviewStart/org%2Frepo%2342/start");
+    expect(call.path).toBe("/ClaudeReviewRepair/orchestrator/tick/send");
     expect(call.signal).toBeInstanceOf(AbortSignal);
-    expect(JSON.parse(call.body)).toEqual({ ref: "main", allowDraft: false });
+    expect(JSON.parse(call.body)).toEqual({ repositories: [{ repository: "org/repo", ref: "main", pulls: [{ number: 42, headSha: "head" }] }] });
   }
+});
+
+it.each(["unavailable", "hold", "empty"])("does not send repair while %s", async reason => {
+  if (reason !== "empty") config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", paused: true }));
+  if (reason === "unavailable") status.setRestateStatus({ registration: { state: "unreachable" } });
+  if (reason === "hold") (await import("../deploy-hold.js")).setDeployHold();
+  const fake = fakeFetch({ ...EVERY_CYCLE,
+    "POST /SetupChecks/orchestrator/get": { json: null },
+    "GET /app": { json: { slug: "ai-implement" } },
+    "GET /orgs/org/installation": { json: { id: 1 } },
+    "POST /app/installations/1/access_tokens": { json: { token: "token", expires_at: "2099-01-01T00:00:00Z" } },
+    "GET /repos/org/repo/pulls": { json: [] },
+  }).install();
+  await cycle();
+  expect(fake.calls.filter(c => c.path.startsWith("/ClaudeReviewRepair/"))).toHaveLength(0);
 });

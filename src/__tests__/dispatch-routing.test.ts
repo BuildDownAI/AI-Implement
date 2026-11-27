@@ -1560,7 +1560,7 @@ describe("poll implementation submission — ImplementationRun for every project
   const config = makeAppConfig({ ...CALLBACK_CONFIG, runnerTokenSecret: "TOKEN_SENTINEL" });
   const ctx = { backend: "github-actions" as const, runnerMode: "default", baseBranch: "feature/group", baseBranchFieldValue: null as string | null };
   // What every poll cycle reads from Restate before its own work: the runner backend cache, and the stored setup-check run until one read answers.
-  const POLL_CYCLE_ROUTES = { "POST /RunnerBackend/fly-machines/get": { json: {} }, "POST /SetupChecks/orchestrator/get": { json: null } } as const;
+  const POLL_CYCLE_ROUTES = { "POST /ClaudeReviewRepair/orchestrator/tick/send": { json: { invocationId: "inv_repair", status: "Accepted" } }, "POST /RunnerBackend/fly-machines/get": { json: {} }, "POST /SetupChecks/orchestrator/get": { json: null } } as const;
   let indexModule: typeof import("../index.js");
   let dedup: typeof DedupModule;
   let status: typeof import("../restate/status.js");

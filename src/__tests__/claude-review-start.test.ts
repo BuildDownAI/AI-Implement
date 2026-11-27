@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createClaudeReviewPoll, claudeReviewRepositories } from "../claude-review-start.js";
+import { buildClaudeReviewRepairInput } from "../claude-review-start.js";
 import type { OpenPullRequest } from "../github.js";
 const { mappings, policy } = vi.hoisted(() => ({ mappings: vi.fn(), policy: vi.fn() }));
 vi.mock("../config.js", () => ({ getMappings: mappings }));
@@ -8,51 +8,29 @@ const target = { owner: "trusted", repo: "repo", branch: "testing", runningCommi
 const pull: OpenPullRequest = { number: 1, headSha: "head", draft: false, author: "alice",
   url: "https://github.com/trusted/repo/pull/1", base: "main", head: "topic", title: "PR", createdAt: 0 };
 beforeEach(() => { mappings.mockReturnValue({}); policy.mockReturnValue({}); });
-describe("Claude review poll", () => {
-  it.each(["started", "same"] as const)("caches %s until the head changes", async result => {
-    const poll = createClaudeReviewPoll();
-    const call = vi.fn().mockResolvedValue(result);
-    const listRepoPulls = vi.fn().mockResolvedValue([pull]);
-    const deps = { selfDeploy: target, canStartWork: () => true, listRepoPulls, call };
-    await poll(deps); await poll(deps);
-    expect(call).toHaveBeenCalledExactlyOnceWith("trusted/repo#1", { ref: "testing", allowDraft: false });
-    listRepoPulls.mockResolvedValue([{ ...pull, headSha: "next" }]);
-    await poll(deps);
-    expect(call).toHaveBeenCalledTimes(2);
-    await createClaudeReviewPoll()(deps);
-    expect(call).toHaveBeenCalledTimes(3);
+describe("Claude review repair snapshot", () => {
+  it("uses the target branch and excludes drafts", async () => {
+    const list = vi.fn().mockResolvedValue([pull, { ...pull, number: 2, draft: true }]);
+    expect(await buildClaudeReviewRepairInput(target, list)).toEqual({ repositories: [
+      { repository: "trusted/repo", ref: "testing", pulls: [{ number: 1, headSha: "head" }] },
+    ] });
+    expect(list).toHaveBeenCalledExactlyOnceWith("trusted", "repo");
   });
-  it.each(["skipped", "failed"])("retries %s on the next poll", async result => {
-    const poll = createClaudeReviewPoll();
-    const call = vi.fn().mockResolvedValue(result);
-    const deps = { selfDeploy: target, canStartWork: () => true, listRepoPulls: vi.fn().mockResolvedValue([pull]), call };
-    await poll(deps); await poll(deps);
-    expect(call).toHaveBeenCalledTimes(2);
-  });
-  it("continues to the second PR when the first call throws", async () => {
-    const call = vi.fn().mockRejectedValueOnce(new Error("request failed")).mockResolvedValue("same");
-    await createClaudeReviewPoll()({ selfDeploy: target, canStartWork: () => true,
-      listRepoPulls: vi.fn().mockResolvedValue([pull, { ...pull, number: 2 }]), call });
-    expect(call.mock.calls).toEqual([
-      ["trusted/repo#1", { ref: "testing", allowDraft: false }],
-      ["trusted/repo#2", { ref: "testing", allowDraft: false }],
-    ]);
-  });
-  it("ignores drafts and does not list while unavailable", async () => {
-    const poll = createClaudeReviewPoll();
-    const deps = { selfDeploy: target, canStartWork: () => false,
-      listRepoPulls: vi.fn().mockResolvedValue([{ ...pull, draft: true }]), call: vi.fn() };
-    await poll(deps);
-    expect(deps.listRepoPulls).not.toHaveBeenCalled();
-    await poll({ ...deps, canStartWork: () => true });
-    expect(deps.call).not.toHaveBeenCalled();
-  });
-  it("deduplicates mapped repositories and isolates list failures", async () => {
+  it("lists each mapped repository once with main", async () => {
     mappings.mockReturnValue({ a: { owner: "a", repo: "repo" }, b: { owner: "a", repo: "repo" }, c: { owner: "b", repo: "repo" } });
-    expect(claudeReviewRepositories()).toHaveLength(2);
-    const listRepoPulls = vi.fn().mockRejectedValueOnce(new Error("list failed")).mockResolvedValue([pull]);
-    const call = vi.fn().mockResolvedValue("same");
-    await createClaudeReviewPoll()({ canStartWork: () => true, listRepoPulls, call });
-    expect(call).toHaveBeenCalledExactlyOnceWith("b/repo#1", { ref: "main", allowDraft: false });
+    const list = vi.fn().mockResolvedValue([]);
+    expect(await buildClaudeReviewRepairInput(undefined, list)).toEqual({ repositories: [
+      { repository: "a/repo", ref: "main", pulls: [] }, { repository: "b/repo", ref: "main", pulls: [] },
+    ] });
+    expect(list.mock.calls).toEqual([["a", "repo"], ["b", "repo"]]);
+  });
+  it("omits a failed repository and retains the other", async () => {
+    mappings.mockReturnValue({ a: { owner: "a", repo: "repo" }, b: { owner: "b", repo: "repo" } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const list = vi.fn().mockRejectedValueOnce(new Error("failed")).mockResolvedValue([pull]);
+    expect(await buildClaudeReviewRepairInput(undefined, list)).toEqual({ repositories: [
+      { repository: "b/repo", ref: "main", pulls: [{ number: 1, headSha: "head" }] },
+    ] });
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });

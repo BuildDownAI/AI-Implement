@@ -19,30 +19,23 @@ export function claudeReviewRepositories(selfDeploy?: SelfDeployTarget) {
     [`${owner}/${repo}`, { owner, repo, ref: "main" }] as const)).values()];
 }
 
-/** Only settled successes are cached locally; durable ownership remains in the object. */
-export function createClaudeReviewPoll() {
-  const settled = new Map<string, string>();
-  return async (deps: {
-    selfDeploy?: SelfDeployTarget;
-    canStartWork(): boolean;
-    listRepoPulls(owner: string, repo: string): Promise<OpenPullRequest[]>;
-    call(key: string, input: ClaudeReviewStartInput): Promise<ClaudeReviewStartResult>;
-  }): Promise<void> => {
-    if (!deps.canStartWork()) return;
-    for (const { owner, repo, ref } of claudeReviewRepositories(deps.selfDeploy)) {
-      const repository = `${owner}/${repo}`;
-      try {
-        const pulls = await deps.listRepoPulls(owner, repo);
-        for (const pull of pulls) {
-          if (!deps.canStartWork()) return;
-          const key = `${repository}#${pull.number}`;
-          if (pull.draft || settled.get(key) === pull.headSha) continue;
-          try {
-            const result = await deps.call(key, { ref, allowDraft: false });
-            if (result === "started" || result === "same") settled.set(key, pull.headSha);
-          } catch { console.warn(`[claude-review-start] ${key}: call failed`); }
-        }
-      } catch { console.warn(`[claude-review-start] ${repository}: list failed`); }
-    }
-  };
+export interface ClaudeReviewRepairInput {
+  repositories: { repository: string; ref: string; pulls: { number: number; headSha: string }[] }[];
+}
+
+/** Build one repair snapshot using the poll's shared PR lists. */
+export async function buildClaudeReviewRepairInput(
+  selfDeploy: SelfDeployTarget | undefined,
+  listRepoPulls: (owner: string, repo: string) => Promise<OpenPullRequest[]>,
+): Promise<ClaudeReviewRepairInput> {
+  const repositories: ClaudeReviewRepairInput["repositories"] = [];
+  for (const { owner, repo, ref } of claudeReviewRepositories(selfDeploy)) {
+    const repository = `${owner}/${repo}`;
+    try {
+      const pulls = await listRepoPulls(owner, repo);
+      repositories.push({ repository, ref, pulls: pulls.filter(p => !p.draft)
+        .map(({ number, headSha }) => ({ number, headSha })) });
+    } catch { console.warn(`[claude-review-repair] ${repository}: list failed`); }
+  }
+  return { repositories };
 }

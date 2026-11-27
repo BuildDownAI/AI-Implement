@@ -777,7 +777,30 @@ handed off to a hold. Tokens are read inside client calls and never journaled.
 `ClaudeReviewStart` is an exclusive object keyed by `owner/repo#prNumber`, composed
 in `src/index.ts`. Its `start({ ref, allowDraft })` handler reads fresh PR eligibility
 and records the head after accepted dispatches or final 404/422 responses.
-Transient failures store nothing and retry on the next poll. Webhook delivery ids
-provide send idempotency; the record deduplicates webhook and poll calls together.
+Transient failures store nothing; the next `ClaudeReviewRepair.tick` calls again. Webhook delivery ids
+provide send idempotency; the record deduplicates webhook and repair tick calls together.
 Only the head is stored; tokens are minted inside journaled operations and never
 returned by them. See [review start limits](review-fix-rail.md#durable-claude-review-starts).
+
+### ClaudeReviewRepair
+
+`ClaudeReviewRepair` has production key `orchestrator` and one exclusive `tick`.
+Its strict input is `{ repositories: [{ repository, ref, pulls: [{ number, headSha }] }] }`,
+where repository is `owner/repo`. Its sole state key `heads` is a
+`Record<string, string>` mapping `owner/repo#prNumber` to the message head SHA.
+Tick reads the old map and builds an empty replacement. Unchanged heads are
+copied; other heads call `ClaudeReviewStart.start({ ref, allowDraft: false })`
+through `ctx.objectClient`. Only `started` and `same` are retained. Non-cancellation
+terminal errors log one warning and continue; cancellation and other errors
+propagate. The replacement removes omitted PRs and repositories.
+
+The handler has no sleep, no delayed send, and no `ctx.run`. The poll remains the
+clock and lister: it sends one bounded ingress message after checking readiness,
+reusing the existing PR list. The object has no dependencies, GitHub requests or tokens.
+There is no Restate timer: a due timer at boot counts as non-completed work and
+can delay registration by the 60-second retry interval, or block it indefinitely
+on rollback to an image without this object. Listing stays in the poll to avoid
+another token, GitHub request each minute, and a long-step time limit.
+An open tick still holds deploy drain; a hard restart during it retains the
+known registration gap. See [review start limits](review-fix-rail.md#durable-claude-review-starts)
+for sequential-call delays, omitted-list retries, drafts and stale snapshot limits.
