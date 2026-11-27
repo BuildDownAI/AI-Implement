@@ -252,6 +252,66 @@ describe("Stardog import client", () => {
     expect(call.body).not.toContain("old.nt");
   });
 
+  it("accepts Stardog identifiers and percent-encodes each events path segment", async () => {
+    const { modules } = await fixture();
+    const dir = testDir("stardog-identifiers");
+    writeFileSync(join(dir, "kit.yaml"), "data: []");
+    const path = "/voicebox/kits/builddown-kg%3A0.2.0/publish/a1b2%2Fc3.d4%40x%2By/events";
+    const fake = routes({
+      "POST /voicebox/kits/import": { json: { kit_id: "builddown-kg:0.2.0", publish_id: "a1b2/c3.d4@x+y" } },
+      [`GET ${path}`]: { text: 'data: {"type":"done"}\n\n' },
+    });
+    const client = modules.client.createStardogClient({ fetchImpl: fake.fetch });
+    const handle = await client.startImport(dir, ["kit.yaml"], { db: "builddown-kg", graphName: "builddown-kg" });
+    expect(handle).toEqual({ kitId: "builddown-kg:0.2.0", publishId: "a1b2/c3.d4@x+y" });
+    expect(await client.readEvents(handle.kitId, handle.publishId, { maxMs: 1000 })).toBe("done");
+    expect(fake.calls.at(-1)!.path).toBe(path);
+  });
+
+  it("accepts identifiers at the 256-character limit", async () => {
+    const { modules } = await fixture();
+    const dir = testDir("stardog-identifiers");
+    writeFileSync(join(dir, "kit.yaml"), "data: []");
+    const id = "a".repeat(256);
+    const fake = routes({ "POST /voicebox/kits/import": { json: { kit_id: id, publish_id: id } } });
+    expect(await modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml"], { db: "builddown-kg", graphName: "builddown-kg" }))
+      .toEqual({ kitId: id, publishId: id });
+  });
+
+  describe.each(["kit_id", "publish_id"] as const)("unsafe %s", field => {
+    it.each([
+      ["newline", "bad\nid", "control or whitespace character"],
+      ["space", "bad id", "control or whitespace character"],
+      ["tab", "bad\tid", "control or whitespace character"],
+      ["NUL", "bad\u0000id", "control or whitespace character"],
+      ["DEL", "bad\u007fid", "control or whitespace character"],
+      ["C1 control", "bad\u0085id", "control or whitespace character"],
+      ["Unicode whitespace", "bad\u2003id", "control or whitespace character"],
+      ["too long", "a".repeat(257), "too long"],
+      ["API token", `prefix-${TOKEN}-suffix`, "contains a credential"],
+      ["bearer", `prefix-${BEARER}-suffix`, "contains a credential"],
+    ])("rejects %s without exposing the value", async (_label, value, reason) => {
+      const { modules } = await fixture();
+      const dir = testDir("stardog-identifiers");
+      writeFileSync(join(dir, "kit.yaml"), "data: []");
+      const fake = routes({ "POST /voicebox/kits/import": { json: { kit_id: "kit-1", publish_id: "pub-1", [field]: value } } });
+      const result = modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml"], { db: "builddown-kg", graphName: "builddown-kg" });
+      await expect(result).rejects.toThrow(`Stardog Run import returned an invalid ${field}: ${reason}`);
+      const error = await result.catch((err: Error) => err);
+      expect(error).toBeInstanceOf(Error);
+      for (const secret of [value, TOKEN, BEARER]) expect((error as Error).message).not.toContain(secret);
+    });
+
+    it.each(["", null, 123])("rejects a missing or non-string identifier (%s)", async value => {
+      const { modules } = await fixture();
+      const dir = testDir("stardog-identifiers");
+      writeFileSync(join(dir, "kit.yaml"), "data: []");
+      const fake = routes({ "POST /voicebox/kits/import": { json: { kit_id: "kit-1", publish_id: "pub-1", [field]: value } } });
+      await expect(modules.client.createStardogClient({ fetchImpl: fake.fetch }).startImport(dir, ["kit.yaml"], { db: "builddown-kg", graphName: "builddown-kg" }))
+        .rejects.toThrow(field);
+    });
+  });
+
   it.each(["done", "failed"])("parses chunked replayed SSE ending in %s and redacts failures", async type => {
     const { modules } = await fixture();
     const payload = `data: {"type":"progress"}\r\n\r\ndata: ${JSON.stringify({ type, error: `bad ${TOKEN} ${BEARER} Authorization: Bearer secret` })}\r\n\r\n`;
