@@ -1,3 +1,4 @@
+import { ClosedIssueReconcileError } from "./types.js";
 import type {
   JiraFieldOptions,
   JiraJqlResult,
@@ -500,6 +501,33 @@ export class JiraProvider implements TicketingProvider {
     };
   }
 
+  async reconcileClosedPrReady(mapping: RepoMapping, limit: number): Promise<string[]> {
+    const cfg = mapping.ticketingConfig;
+    if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
+    const scopeKey = mapping.teamKey;
+    if (!scopeKey) throw new TrackerUnavailableError("mapping carries no team key");
+    if (limit <= 0) return [];
+    const ids = await this.fields(scopeKey);
+    const result = await this.client.searchJqlPage(
+      `(${cfg.jql}) AND ${jqlFieldRef(ids.statusFieldId)} = "PR Ready" AND statusCategory = Done`,
+      [ids.statusFieldId, ids.repoFieldId],
+    );
+    const expectedRepo = resolveRepoFieldValue(mapping);
+    const written: string[] = [];
+    for (const raw of result.issues) {
+      if (written.length >= limit) break;
+      if (readRepoFieldValue(raw.fields[ids.repoFieldId]) !== expectedRepo) continue;
+      try {
+        await this.setStatus(raw.id, scopeKey, STATUS_VALUES.MERGED);
+      } catch (err) {
+        throw new ClosedIssueReconcileError(written.length + 1, err);
+      }
+      written.push(raw.key);
+      console.log(`[jira] Set ${raw.key} to Merged: closed in Jira while PR Ready`);
+    }
+    return written;
+  }
+
   async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {
     const cfg = mapping.ticketingConfig;
     if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
@@ -510,7 +538,7 @@ export class JiraProvider implements TicketingProvider {
     const status = jqlFieldRef(fieldIds.statusFieldId);
     const terminal = [STATUS_VALUES.MERGED, STATUS_VALUES.PLANNING_FAILED, STATUS_VALUES.IMPLEMENTATION_FAILED]
       .map((value) => JSON.stringify(value)).join(",");
-    const jql = `(${cfg.jql}) AND ${status} is not EMPTY AND (${status} not in (${terminal}) OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`;
+    const jql = `(${cfg.jql}) AND ${status} is not EMPTY AND ((${status} not in (${terminal}) AND statusCategory != Done) OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`;
     const states = new Map<string, Pick<IssueStatusRecord, "state" | "phase">>([
       [STATUS_VALUES.READY, { state: "ready", phase: null }],
       [STATUS_VALUES.PLANNING, { state: "planning", phase: null }],
@@ -527,17 +555,21 @@ export class JiraProvider implements TicketingProvider {
     let nextPageToken: string | undefined;
     for (let page = 0; page < 20; page++) {
       const result = await this.client.searchJqlPage(
-        jql, ["summary", "updated", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
+        jql, ["summary", "updated", "status", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
       );
       for (const raw of result.issues) {
         if (readRepoFieldValue(raw.fields[fieldIds.repoFieldId]) !== expectedRepo) continue;
         const workflowState = readStatusValue(raw.fields, fieldIds.statusFieldId);
+        const normalized = states.get(workflowState);
+        const nativeDone = isTerminalStatus(raw.fields);
         issues.push({
           id: raw.id,
           identifier: raw.key,
           title: (raw.fields.summary as string | null) ?? null,
           url: this.issueUrl({ identifier: raw.key } as TicketIssue),
-          ...(states.get(workflowState) ?? { state: "unknown", phase: null }),
+          ...(nativeDone && normalized?.state !== "failed"
+            ? { state: "merged" as const, phase: null }
+            : normalized ?? { state: "unknown", phase: null }),
           labels: [],
           workflowState,
           updatedAt: Date.parse(raw.fields.updated as string),

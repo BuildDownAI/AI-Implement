@@ -5,7 +5,7 @@ import type * as IssueStatusesModule from "../../issue-statuses.js";
 import type * as MergeUpModule from "../../merge-up.js";
 import { JiraProvider, adfToPlainText, createJiraProviderFromConfig } from "../../providers/jira.js";
 import { JiraApiError, JiraClient, type JiraIssue } from "../../providers/jira-client.js";
-import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
+import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
 import { validateTicketingConfig } from "../../providers/ticketing-config.js";
 import { validateIssueBaseBranch } from "../../base-branch.js";
@@ -2150,9 +2150,11 @@ describe("JiraProvider.listIssueStatuses", () => {
   });
   const provider = () => makeProvider({ cacheScope: "statuses", mappings: { "status-team": mapping() } });
   const updated = "2026-11-15T12:00:00.000Z";
-  const issue = (status = "Ready", repo: unknown = { value: "acme/x" }): JiraIssue => ({
+  const issue = (status = "Ready", repo: unknown = { value: "acme/x" }, category?: string): JiraIssue => ({
     id: "10001", key: "P-1",
-    fields: { summary: "A task", updated, customfield_10100: { value: status }, customfield_10101: repo },
+    fields: { summary: "A task", updated, customfield_10100: { value: status }, customfield_10101: repo,
+      ...(category ? { status: { statusCategory: { key: category } } } : {}),
+    },
   });
 
   it.each([
@@ -2174,12 +2176,28 @@ describe("JiraProvider.listIssueStatuses", () => {
     }]);
   });
 
+  it.each([
+    ["PR Ready", "done", "merged", null],
+    ["PR Ready", "indeterminate", "pr-ready", null],
+    ["Merged", "new", "merged", null],
+    ["Planning Failed", "done", "failed", "planning"],
+    ["Implementation Failed", "done", "failed", "implementation"],
+    ["Unexpected", "done", "merged", null],
+    ["Unexpected", "indeterminate", "unknown", null],
+  ])("normalizes %s with native category %s", async (status, category, state, phase) => {
+    fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [issue(status!, undefined, category!)] }) }).install();
+    expect(await provider().listIssueStatuses(mapping())).toEqual([{
+      id: "10001", identifier: "P-1", title: "A task", url: "https://x/browse/P-1",
+      state, phase, labels: [], workflowState: status, updatedAt: Date.parse(updated),
+    }]);
+  });
+
   it("uses scoped field overrides and the mapping JQL with recent terminal statuses", async () => {
     const fake = fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/ }) }).install();
     await provider().listIssueStatuses(mapping());
     expect(searchBodies(fake)[0]).toEqual({
-      jql: `(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`,
-      fields: ["summary", "updated", "customfield_10100", "customfield_10101"],
+      jql: `(project = P OR project = Q) AND cf[10100] is not EMPTY AND ((cf[10100] not in ("Merged","Planning Failed","Implementation Failed") AND statusCategory != Done) OR updated >= -7d)`,
+      fields: ["summary", "updated", "status", "customfield_10100", "customfield_10101"],
       maxResults: 100,
     });
   });
@@ -2191,7 +2209,7 @@ describe("JiraProvider.listIssueStatuses", () => {
     expect(await provider().listIssueStatuses(mapping())).toHaveLength(2);
   });
 
-  it.each(["Won't Do", "Cancelled", "CANCELED", "Duplicate"])("keeps custom-status state and phase for native resolution %s", async (resolution) => {
+  it.each(["Won't Do", "Cancelled", "CANCELED", "Duplicate"])("uses native category and preserves explicit failures regardless of resolution %s", async (resolution) => {
     const nativeIssue = (category: string, name: string | null, customStatus = "Ready"): JiraIssue => {
       const raw = issue(customStatus);
       return { ...raw, fields: { ...raw.fields,
@@ -2210,13 +2228,13 @@ describe("JiraProvider.listIssueStatuses", () => {
     ] }) }).install();
     expect((await provider().listIssueStatuses(mapping())).map(({ workflowState, state, phase }) => ({ workflowState, state, phase })))
       .toEqual([
-        { workflowState: "Ready", state: "ready", phase: null },
+        { workflowState: "Ready", state: "merged", phase: null },
         { workflowState: "Merged", state: "merged", phase: null },
         { workflowState: "Planning Failed", state: "failed", phase: "planning" },
         { workflowState: "Implementation Failed", state: "failed", phase: "implementation" },
         { workflowState: "Merged", state: "merged", phase: null },
         { workflowState: "Ready", state: "ready", phase: null },
-        { workflowState: "Ready", state: "ready", phase: null },
+        { workflowState: "Ready", state: "merged", phase: null },
       ]);
   });
 
@@ -2488,5 +2506,49 @@ describe("JiraProvider reads for a project saved without a Repo Field Value", ()
     if (created) await expect(result).resolves.toEqual({ id: "child", identifier: "P-2" });
     else await expect(result).rejects.toThrow("Jira parent Repo does not match the mapping");
     expect(fake.calls.filter((c) => c.method === "POST")).toHaveLength(created ? 1 : 0);
+  });
+});
+
+describe("JiraProvider.reconcileClosedPrReady", () => {
+  beforeEach(() => clearFieldCache());
+  const mapping = () => ({ ...jiraMapping({ ...ALL_OVERRIDES, jql: "project = P OR project = Q" }), teamKey: "closed" });
+  const provider = (m = mapping()) => makeProvider({ cacheScope: "closed", mappings: { closed: m } });
+  const issue = (id: string, repo = "acme/x"): JiraIssue => ({ id, key: `P-${id}`, fields: { customfield_10100: { value: "PR Ready" }, customfield_10101: { value: repo } } });
+
+  it("searches one page of closed PR Ready issues, writes Merged and posts no comment", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const fake = fakeFetch({ [SEARCH]: { json: { issues: [issue("10001")], nextPageToken: "more", isLast: false } }, [STATUS_WRITE]: { status: 204 } }).install();
+      expect(await provider().reconcileClosedPrReady(mapping(), 5)).toEqual(["P-10001"]);
+      expect(searchBodies(fake)).toEqual([{
+        jql: '(project = P OR project = Q) AND cf[10100] = "PR Ready" AND statusCategory = Done',
+        fields: ["customfield_10100", "customfield_10101"], maxResults: 100,
+      }]);
+      expect(fake.calls.map((c) => c.method)).toEqual(["POST", "PUT"]);
+      expect(JSON.parse(String(fake.calls[1].body))).toEqual({ fields: { customfield_10100: { value: "Merged" } } });
+      expect(log).toHaveBeenCalledWith("[jira] Set P-10001 to Merged: closed in Jira while PR Ready");
+    } finally { log.mockRestore(); }
+  });
+
+  it("filters repositories before applying the limit, honoring a repo override", async () => {
+    const m = { ...mapping(), owner: "different", repo: "repository" };
+    const fake = fakeFetch({ [SEARCH]: { json: { issues: [issue("other", "acme/other"), issue("10001"), issue("excess")], isLast: true } }, [STATUS_WRITE]: { status: 204 } }).install();
+    expect(await provider(m).reconcileClosedPrReady(m, 1)).toEqual(["P-10001"]);
+    expect(fake.calls.filter((c) => c.method === "PUT")).toHaveLength(1);
+  });
+
+  it("preserves the consumed budget when a later write fails", async () => {
+    const fake = fakeFetch({
+      [SEARCH]: { json: { issues: [issue("10001"), issue("10002")], isLast: true } },
+      [STATUS_WRITE]: { status: 204 },
+      [`PUT ${API}/issue/10002`]: { status: 403, json: {} },
+    }).install();
+    await expect(provider().reconcileClosedPrReady(mapping(), 5)).rejects.toMatchObject({ writesAttempted: 2 });
+    expect(fake.calls.filter((c) => c.method === "PUT")).toHaveLength(2);
+  });
+
+  it("rejects mappings without Jira config or a team key", async () => {
+    await expect(provider().reconcileClosedPrReady(makeMapping(), 5)).rejects.toBeInstanceOf(TrackerUnavailableError);
+    await expect(provider().reconcileClosedPrReady({ ...mapping(), teamKey: undefined }, 5)).rejects.toBeInstanceOf(TrackerUnavailableError);
   });
 });
