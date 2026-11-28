@@ -727,7 +727,7 @@ export const getIssueReportCardTool = tool(
 );
 
 export const GET_FLEET_REPORT_DESCRIPTION =
-  "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, byModel call usage, reported and estimated costs and implementation outcomes grouped by stage/agent/provider/model, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.";
+  "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, byModel call usage, reported and estimated costs and implementation outcomes grouped by stage/agent/provider/model, abTest first/second groups per stored project with issue counts and moved issues excluded from implementation outcome and cost comparisons, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.";
 
 export const GetFleetReportArgsSchema = z.object({ days: z.number().optional() });
 
@@ -1716,7 +1716,7 @@ export const SetProjectStageArgsSchema = z.object({
   fallbackModel: z.string().nullable().optional(),
   accountProfileId: z.string().nullable().optional(),
   invocationTimeoutMs: z.number().int().positive().nullable().optional(),
-  preferOpenModel: z.boolean().optional(),
+  abTest: z.boolean().optional(),
 }).strict();
 
 export const addModelAccountTool = tool(

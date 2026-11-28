@@ -27,20 +27,41 @@ The Projects Agents tab has no mode control. It shows the project mode and names
 
 `PUT /api/mappings/:key/agent-config` inspects readiness for a configured project, so a new configured project receives `409` when saving stage overrides until its workflow sync pull request merges.
 
-### Open-model preference (inactive stub)
+### A/B test toggle
 
-Project settings may store an optional boolean `preferOpenModel` in the
+Project settings may store an optional boolean `abTest` in the
 `implementation` stage only. Absent means false. Other types (including null),
 other stages, and orchestrator defaults reject this field.
 
-The project Agents tab exposes “Use the open model for implementation” and saves
-it with **Save agent settings**, including for legacy projects. It is not active:
-no run reads it, and it does not change resolved selections, account lists or
-execution snapshot fields. There is no setting to choose an open model yet.
+The project Agents tab exposes “A/B test: divide issues between row 1 and row 2 of the account list”
+and saves it with **Save agent settings**, including for legacy projects.
+The admin-only `set_project_stage` tool can also set `abTest`.
+Managed runs participate when the stored project toggle is true, an admission record
+exists and is not planning, a tracker issue is found, no implementation model override
+is set on the issue, and the runtime provides the ModelAbTest ingress client.
+Issue admission scopes supply the tracker issue id directly. PR scopes use the stored
+pull request link’s tracker issue id; a pull request with no stored link is not in the test.
+ModelAbTest alone assigns the row for the project and issue. If the object does not
+answer, preparation holds with `preparation_failed`; it never guesses a row.
+An issue that started before the toggle was on gets its row at its next run.
+Preparation receives the assigned row and tracker issue id.
+Row `first` uses ordinary resolution. Row `second` starts implementation at entry 2,
+with blank models inherited from entry 1 before selection; entry 1 is excluded from
+selection and fallbacks, and a project account override is not mandatory for this row.
+Planning and review are unchanged. If second-row resolution fails, its chosen provider
+and model equal entry 1 (including an inherited blank model), or its credential is
+not ready, preparation uses row `first` with reason `no-second-row`.
+Operational database failures still fail preparation.
 
-Before rolling back this feature, remove the `preferOpenModel` key entirely from
-every stored project config that contains it. Unchecking stores false and does
-not remove the key; setting null also does not remove it. Older code rejects the
+The immutable `resolved_config_json` stores `abTest: { stage: "implementation", row,
+issueId }`, plus `reason: "no-second-row"` when reverted. Retries reuse that record;
+`loadStoredAbTest` reads it with the project key. Without an explicit row there is no
+new key. An implementation issue-model override ignores A/B input and writes no key.
+Historical `preferOpenModel` metadata is discarded on read and omitted on the next save.
+
+Before rolling back this feature, remove the `abTest` key entirely from every
+stored project config that contains it. Unchecking stores false and does not
+remove the key; setting null also does not remove it. Older code rejects the
 unknown key during shape validation.
 
 ## Run preparation and the snapshot

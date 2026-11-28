@@ -10,7 +10,7 @@ import {
   STAGE_NAMES,
   STORED_STAGE_SELECTION_FIELDS,
   validateFallbackModel,
-  validatePreferOpenModel,
+  validateAbTest,
   validateDefaultAccounts,
   validateAccounts,
   inspectStageAccounts,
@@ -197,7 +197,7 @@ function assertConfigShape(config: StageAgentConfigurationV1, name: string): voi
       if (name === "projectConfig") throw new Error("accounts is only supported in orchestrator defaults");
       validateAccounts(patch.accounts, stage);
     }
-    validatePreferOpenModel(patch, stage, name === "projectConfig");
+    validateAbTest(patch, stage, name === "projectConfig");
     validateFallbackModel(patch.fallbackModel, stage);
     if (Object.keys(patch).some((f) => !(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(f))) {
       throw new Error(`${name}.stages.${stage} contains unknown key(s)`);
@@ -352,11 +352,19 @@ function latestConfigRow(db: Database.Database, scopeKind: "orchestrator" | "pro
     .get(scopeKind, scopeKey) as ConfigRow | undefined;
 }
 
+/** Discard retired metadata on read without rewriting historical revisions. */
+function removeRetiredStageFields(config: StageAgentConfigurationV1): StageAgentConfigurationV1 {
+  for (const stage of Object.values(config.stages ?? {})) {
+    if (stage && typeof stage === "object") delete (stage as Record<string, unknown>).preferOpenModel;
+  }
+  return config;
+}
+
 function toStored(row: ConfigRow): StoredStageConfig {
   return {
     configRevisionId: row.config_revision_id,
     revision: row.revision,
-    config: JSON.parse(row.config_json) as StageAgentConfigurationV1,
+    config: removeRetiredStageFields(JSON.parse(row.config_json) as StageAgentConfigurationV1),
     createdAt: row.created_at,
     createdBy: row.created_by,
     supersedesRevisionId: row.supersedes_revision_id,
@@ -407,7 +415,7 @@ function currentDefaults(db: Database.Database): ConfigRow | undefined {
 }
 
 function parseConfig(row: ConfigRow | undefined): StageAgentConfigurationV1 | null {
-  return row ? (JSON.parse(row.config_json) as StageAgentConfigurationV1) : null;
+  return row ? removeRetiredStageFields(JSON.parse(row.config_json) as StageAgentConfigurationV1) : null;
 }
 
 /** Throws unless a configured project config resolves against the stored defaults, profiles. */
@@ -544,8 +552,8 @@ export function clearProjectStageField(
   assertNonEmptyProjectKey(projectKey);
   if (!(STAGE_NAMES as readonly string[]).includes(stage)) throw new Error("unknown stage");
   if (!(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) throw new Error("unknown stage field");
-  if (field === "preferOpenModel" && stage !== "implementation") {
-    throw new Error("preferOpenModel is only supported in project implementation settings");
+  if (field === "abTest" && stage !== "implementation") {
+    throw new Error("abTest is only supported in project implementation settings");
   }
   const db = getDb();
   return db
@@ -556,7 +564,7 @@ export function clearProjectStageField(
         ...current,
         stages: { ...current.stages, [stage]: { ...current.stages?.[stage], [field]: null } },
       };
-      if (field === "preferOpenModel") delete next.stages![stage]!.preferOpenModel;
+      if (field === "abTest") delete next.stages![stage]!.abTest;
       assertConfigShape(next, "projectConfig");
       if (next.mode === "configured") assertProjectResolves(db, next);
       return appendConfig(db, "project", projectKey, next, createdBy);
@@ -590,7 +598,7 @@ export function setProjectConfigured(projectKey: string, configured: boolean, cr
  * Resolves a project's stage configuration from current heads. Legacy (no row or mode=legacy) resolves as such;
  * a disabled, archived, or unknown profile throws.
  */
-export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: number, checkAccount?: ResolveStageAgentConfigInput["checkAccount"]): ProjectStageResolution {
+export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: number, checkAccount?: ResolveStageAgentConfigInput["checkAccount"], abTestRow?: ResolveStageAgentConfigInput["abTestRow"]): ProjectStageResolution {
   assertNonEmptyProjectKey(projectKey);
   const db = getDb();
   return db.transaction(() => {
@@ -602,6 +610,7 @@ export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: n
       accountProfiles: loadProfiles(db),
       remainingJobMs,
       checkAccount,
+      abTestRow,
     });
     if (resolution.mode !== "configured") return { resolution, configRevisionIds: [] };
     if (!defaultsRow || !projectRow) throw new Error("configured resolution requires orchestrator and project config rows");

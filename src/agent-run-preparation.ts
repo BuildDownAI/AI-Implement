@@ -47,7 +47,7 @@ import {
   type StageAgentConfigurationV1,
   type StageName,
 } from "./agent-config.js";
-import { isProjectConfigured, resolveCandidateProjectStageConfig, resolveProjectStageConfig } from "./agent-config-store.js";
+import { getAccountProfile, isProjectConfigured, resolveCandidateProjectStageConfig, resolveProjectStageConfig } from "./agent-config-store.js";
 import type { ExecutionBackend } from "./runner-mode.js";
 import {
   MODEL_AUTH_AUDIENCE,
@@ -124,6 +124,7 @@ export interface AgentRunPreparationDeps extends AgentReadinessDeps {
 
 export interface AgentRunRequest {
   issueModels?: IssueModels | null;
+  abTest?: { row: "first" | "second"; issueId: string };
   /** Stable identity of this attempt. A replacement attempt must use a new one. */
   dispatchId: string;
   projectKey: string;
@@ -262,7 +263,19 @@ export function loadStoredFallbackModels(dispatchId: string): Partial<Record<Sta
   return row ? fallbackModelsFromRow(row) : {};
 }
 
-type SelectionMetadata = Pick<ConfiguredStageResolution, "selection" | "accountFallbacks">;
+interface StoredAbTest { stage: "implementation"; row: "first" | "second"; issueId: string; reason?: "no-second-row" }
+
+export function loadStoredAbTest(dispatchId: string): (Omit<StoredAbTest, "stage"> & { projectKey: string }) | undefined {
+  const row = readSnapshotRow(dispatchId);
+  if (!row) return undefined;
+  try {
+    const abTest = JSON.parse(row.resolved_config_json).abTest;
+    if (abTest?.stage !== "implementation" || !["first", "second"].includes(abTest.row) || typeof abTest.issueId !== "string") return undefined;
+    return { row: abTest.row, issueId: abTest.issueId, reason: abTest.reason, projectKey: row.project_key };
+  } catch { return undefined; }
+}
+
+type SelectionMetadata = Pick<ConfiguredStageResolution, "selection" | "accountFallbacks"> & { abTest?: StoredAbTest };
 function metadataFromRow(row: SnapshotRow): SelectionMetadata {
   const parsed = JSON.parse(row.resolved_config_json);
   return { selection: parsed.selection ?? {}, accountFallbacks: parsed.accountFallbacks ?? {} };
@@ -288,10 +301,36 @@ function resolutionFailure(err: unknown): ConfigurationErrorCode {
   return err instanceof StageAccountError ? err.code : isOperationalFault(err) ? "resolution_unavailable" : "resolution_failed";
 }
 
-function resolveCurrent(request: AgentRunRequest, candidate?: StageAgentConfigurationV1): Resolved {
+function resolveCurrent(request: AgentRunRequest, deps: AgentReadinessDeps, candidate?: StageAgentConfigurationV1): Resolved {
+  let abTest: StoredAbTest | undefined = request.abTest && request.issueModels?.implementation === undefined
+    ? { stage: "implementation", ...request.abTest } : undefined;
   let projection;
   try {
-    projection = candidate
+    if (abTest?.row === "second" && !candidate) {
+      let usable = false;
+      try {
+        projection = resolveProjectStageConfig(request.projectKey, request.remainingJobMs,
+          entry => request.backend !== "github-actions" && entry.authMode === "bedrock" ? "unsupported_combination" : null, "second");
+        if (projection.resolution.mode === "configured") {
+          const resolution = projection.resolution;
+          const chosen = resolution.stages.implementation;
+          const first = resolution.accountEntries?.implementation?.[0];
+          const profile = resolution.profiles.implementation;
+          if (first && (chosen.model !== first.model || chosen.provider !== getAccountProfile(first.accountProfileId)?.provider)) {
+            const credential = { profileId: profile.id, revision: profile.revision, provider: profile.provider, authMode: profile.authMode };
+            const result = reservesModelAccount(profile.authMode) ? getCredentialStatus(credential, deps.credentials) : resolveModelCredential(credential, deps.credentials);
+            usable = "ok" in result ? result.ok : !result.failure;
+          }
+        }
+      } catch (err) {
+        if (isOperationalFault(err)) throw err;
+      }
+      if (!usable) {
+        projection = undefined;
+        abTest = { ...abTest, row: "first", reason: "no-second-row" };
+      }
+    }
+    projection ??= candidate
       ? resolveCandidateProjectStageConfig(request.projectKey, candidate, request.remainingJobMs, entry => request.backend !== "github-actions" && entry.authMode === "bedrock" ? "unsupported_combination" : null)
       : resolveProjectStageConfig(request.projectKey, request.remainingJobMs, entry => request.backend !== "github-actions" && entry.authMode === "bedrock" ? "unsupported_combination" : null);
   } catch (err) {
@@ -325,14 +364,14 @@ function resolveCurrent(request: AgentRunRequest, candidate?: StageAgentConfigur
       sources: resolution.sources,
       profiles: resolution.profiles,
     });
-    return { kind: "snapshot", snapshot, stored: false, fallbackModels: resolution.fallbackModels, metadata: { selection: resolution.selection, accountFallbacks: resolution.accountFallbacks } };
+    return { kind: "snapshot", snapshot, stored: false, fallbackModels: resolution.fallbackModels, metadata: { selection: resolution.selection, accountFallbacks: resolution.accountFallbacks, ...(abTest ? { abTest } : {}) } };
   } catch {
     return { kind: "error", code: "snapshot_invalid" };
   }
 }
 
 /** Looks up the dispatch's stored snapshot, else (when opted in) resolves the current one without persisting. */
-function resolveForRequest(request: AgentRunRequest): Resolved {
+function resolveForRequest(request: AgentRunRequest, deps: AgentReadinessDeps): Resolved {
   const row = readSnapshotRow(request.dispatchId);
   if (row) {
     if (row.project_key !== request.projectKey) return { kind: "error", code: "project_mismatch" };
@@ -340,7 +379,7 @@ function resolveForRequest(request: AgentRunRequest): Resolved {
     return snapshot ? { kind: "snapshot", snapshot, stored: true, fallbackModels: fallbackModelsFromRow(row), metadata: metadataFromRow(row) } : { kind: "error", code: "snapshot_invalid" };
   }
   if (request.issueModels === undefined && !isProjectConfigured(request.projectKey)) return { kind: "legacy" };
-  return resolveCurrent(request);
+  return resolveCurrent(request, deps);
 }
 
 /** Persists the snapshot keyed by dispatch id; a concurrent writer's row wins and is what is returned. */
@@ -390,7 +429,7 @@ function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapsh
     snapshot.snapshotId,
     request.dispatchId,
     request.projectKey,
-    JSON.stringify({ stages: snapshot.stages, profiles: snapshot.profiles, ...(Object.keys(metadata.selection).length ? metadata : {}), ...(Object.keys(fallbackModels).length ? { fallbackModels } : {}), ...(dropped.length ? { droppedAccountFallbacks: dropped.map(entry => ({ ...entry, reason: entry.reason ?? "binding_budget_full" })) } : {}) }),
+    JSON.stringify({ stages: snapshot.stages, profiles: snapshot.profiles, ...(Object.keys(metadata.selection).length ? metadata : {}), ...(metadata.abTest ? { abTest: metadata.abTest } : {}), ...(Object.keys(fallbackModels).length ? { fallbackModels } : {}), ...(dropped.length ? { droppedAccountFallbacks: dropped.map(entry => ({ ...entry, reason: entry.reason ?? "binding_budget_full" })) } : {}) }),
     JSON.stringify(snapshot.sources),
     JSON.stringify(snapshot.configRevisions),
     Date.now(),
@@ -500,7 +539,7 @@ export async function inspectAgentReadiness(
   let resolved: Resolved;
   try {
     // A candidate is an uncommitted project config: it is resolved in place of the stored head and nothing is stored.
-    resolved = candidate ? resolveCurrent(request, candidate) : resolveForRequest(request);
+    resolved = candidate ? resolveCurrent({ ...request, abTest: undefined }, deps, candidate) : resolveForRequest({ ...request, abTest: undefined }, deps);
   } catch (err) {
     return { status: "not-ready", code: resolutionFailure(err) };
   }
@@ -664,7 +703,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
 
   let resolved: Resolved;
   try {
-    resolved = resolveForRequest(request);
+    resolved = resolveForRequest(request, deps);
     if (resolved.kind === "snapshot" && !resolved.stored) {
       resolved = persistSnapshot(request, resolved.snapshot, resolved.fallbackModels, resolved.metadata, deps);
       if (resolved.kind === "snapshot") for (const stage of STAGE_NAMES) {

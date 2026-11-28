@@ -121,7 +121,7 @@ Writes, declared:
 | `import_environment_credential` | admin | Import the orchestrator environment credential as an account profile; leaves stage defaults unchanged. |
 | `pause_project` | admin | Same as the `paused` update of `PATCH /api/mappings/<teamKey>`. |
 | `add_model_account` | admin | Strict args: profileId, identity, agent, provider, authMode. Creates an active profile using the admin API validation. No extra fields or credentials; set keys with **Set key** on /admin#models. |
-| `set_project_stage` | admin | Strict args: teamKey, stage (planning, implementation, review), optional nullable agent, provider, model, fallbackModel, accountProfileId, invocationTimeoutMs, and optional implementation-only preferOpenModel. Overlays one stage, preserving other stages and mode; uses the PUT route's lock, readiness checks and stale_inputs refusal. |
+| `set_project_stage` | admin | Strict args: teamKey, stage (planning, implementation, review), optional nullable agent, provider, model, fallbackModel, accountProfileId, invocationTimeoutMs, and optional implementation-only abTest. Overlays one stage, preserving other stages and mode; uses the PUT route's lock, readiness checks and stale_inputs refusal. |
 | `set_project_agent_mode` | admin | Arguments: `{ teamKey: string, mode: "configured" \| "legacy" }` (strict). Changes the project mode without inspection. Success text: JSON `{ teamKey, agentMode }`. Refusals: `isError: true` with bare text `mapping-not-found` or `resolution-failed`. |
 | `set_project_execution_mode` | admin | Arguments: `{ teamKey: string, mode: "fly-machines" \| "github-actions" }` (strict). Changes only the project's `execution_mode`; every other mapping field, Extra Env included, is left as stored. Success text: JSON `{ teamKey, executionMode }`. Refusals: `isError: true` with bare text `mapping-not-found`, or `fly-not-eligible: <reason>` when Fly cannot run the project (no sessions app, a bedrock provider, or the GitHub-Actions-only full-access opt-in). Runs in flight keep their backend; the next dispatch uses the new mode. |
 | `add_project` | admin | Same as `POST /api/mappings`: create or update a project mapping, the upsert behind the admin UI's New project stepper. |
@@ -236,6 +236,18 @@ excludes `test-org/%` repos. The response has:
   `ended_without_callback`/`workflow_cancelled`); these six are `null` for other stages.
   A stopped implementation job with no call rows is counted in `jobs` and `stoppedJobs` of the implementation model in its stored agent snapshot (`loadStoredSnapshot`), and adds no calls, tokens or cost.
   Jobs with multiple implementation models count in each entry. Empty windows return `[]`.
+* `abTest`: one entry per stored A/B project (`projectKey`), with `first` and
+  `second` groups. Each has stored implementation `provider` and `model` (null
+  for empty groups, invalid snapshots, or differing selections), distinct `issues`,
+  and `movedIssues`. Issue identity comes from stored `abTest.issueId`, including
+  review-fix jobs; `no-second-row` belongs to `first`. An implementation call on
+  another model marks its issue moved within that group. All jobs and calls of
+  moved issues are excluded from comparison figures: `jobs`, `oneShotPct`,
+  `approvedJobs`, `approvedPct`, `avgPasses`, `avgDurationMs`, `stoppedJobs`,
+  `costUsd`, `estimatedCostUsd`, `tokensIn`, `tokensOut`. Calculations match
+  `byModel`; usage and costs include implementation calls only. Invalid snapshots
+  cannot establish movement; their labels are null. Empty windows or windows
+  without stored A/B metadata return `[]`.
 * `oneShotPct` and `eventualPct`: first-pass approval per eligible implementation
   dispatch and eventual approval per distinct implementation issue.
 * `planning`: `planned` and `unplanned` cohorts, each with `jobs`, `oneShotPct`,

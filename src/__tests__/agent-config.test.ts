@@ -671,17 +671,17 @@ it.each([false, true])("checks fallback model collisions with a passing project 
   expect(() => resolve("default-backup")).toThrow("planning.fallbackModel must differ from model");
 });
 
-describe("preferOpenModel stored stub", () => {
+describe("A/B test stored toggle", () => {
   const resolve = (patch: Record<string, unknown>) => resolveStageAgentConfig({
     orchestratorDefaults, accountProfiles,
     projectConfig: { version: 1, mode: "configured", stages: { implementation: patch } } as StageAgentConfigurationV1,
   });
 
   it.each([true, false, undefined])("accepts project implementation value %s without changing resolution", (value) => {
-    expect(resolve(value === undefined ? {} : { preferOpenModel: value })).toEqual(resolve({}));
+    expect(resolve(value === undefined ? {} : { abTest: value })).toEqual(resolve({}));
   });
   it("resolves true and false identically, including account selections and fallbacks", () => {
-    const resolveWithAccounts = (preferOpenModel: boolean) => resolveStageAgentConfig({
+    const resolveWithAccounts = (abTest: boolean) => resolveStageAgentConfig({
       orchestratorDefaults: {
         ...orchestratorDefaults,
         stages: {
@@ -696,30 +696,55 @@ describe("preferOpenModel stored stub", () => {
         },
       },
       accountProfiles,
-      projectConfig: { version: 1, mode: "configured", stages: { implementation: { preferOpenModel } } },
+      projectConfig: { version: 1, mode: "configured", stages: { implementation: { abTest } } },
     });
     const enabled = resolveWithAccounts(true);
     expect(enabled).toEqual(resolveWithAccounts(false));
     expect(enabled.mode).toBe("configured");
     if (enabled.mode === "configured") {
       expect(enabled.accountFallbacks.implementation).toHaveLength(1);
-      expect(enabled.stages.implementation).not.toHaveProperty("preferOpenModel");
-      expect(enabled.sources.implementation).not.toHaveProperty("preferOpenModel");
+      expect(enabled.stages.implementation).not.toHaveProperty("abTest");
+      expect(enabled.sources.implementation).not.toHaveProperty("abTest");
     }
   });
   it.each([null, "true", 1, {}, []])("rejects nonboolean %s", (value) => {
-    expect(() => resolve({ preferOpenModel: value })).toThrow("must be a boolean");
+    expect(() => resolve({ abTest: value })).toThrow("must be a boolean");
   });
   it.each(["planning", "review"] as const)("rejects project %s presence", (stage) => {
     expect(() => resolveStageAgentConfig({
       orchestratorDefaults, accountProfiles,
-      projectConfig: { version: 1, mode: "configured", stages: { [stage]: { preferOpenModel: false } } },
+      projectConfig: { version: 1, mode: "configured", stages: { [stage]: { abTest: false } } },
     })).toThrow("only supported");
   });
   it.each(["planning", "implementation", "review"] as const)("rejects defaults %s presence", (stage) => {
     expect(() => resolveStageAgentConfig({
-      orchestratorDefaults: { ...orchestratorDefaults, stages: { ...orchestratorDefaults.stages, [stage]: { preferOpenModel: false } } },
+      orchestratorDefaults: { ...orchestratorDefaults, stages: { ...orchestratorDefaults.stages, [stage]: { abTest: false } } },
       accountProfiles, projectConfig: { version: 1, mode: "configured" },
     })).toThrow("only supported");
   });
+});
+
+
+it("rebases second-row indexes and bypasses mandatory project accounts only in implementation", () => {
+  const defaults = structuredClone(orchestratorDefaults);
+  defaults.stages!.implementation = { invocationTimeoutMs: 60_000, accounts: [
+    { accountProfileId: "openai-api", model: "second" },
+    { accountProfileId: "claude-bedrock", model: "third" },
+  ] };
+  const input = { orchestratorDefaults: defaults, accountProfiles,
+    projectConfig: { version: 1 as const, mode: "configured" as const, stages: {
+      implementation: { agent: "claude" as const, provider: "anthropic" as const, accountProfileId: "claude-api", model: "first" },
+    } } };
+  const baseline = resolveStageAgentConfig(input);
+  const result = resolveStageAgentConfig({ ...input, abTestRow: "second" });
+  if (result.mode !== "configured" || baseline.mode !== "configured") throw new Error("expected configured");
+  expect(result.stages.implementation.accountProfileId).toBe("openai-api");
+  expect(result.selection.implementation).toEqual({ chosen: 1, skipped: [] });
+  expect(result.stages.planning).toEqual(baseline.stages.planning);
+  expect(result.stages.review).toEqual(baseline.stages.review);
+  const skipped = resolveStageAgentConfig({ ...input, abTestRow: "second", checkAccount: entry => entry.accountProfileId === "openai-api" ? "unsupported_combination" : null });
+  if (skipped.mode !== "configured") throw new Error("expected configured");
+  expect(skipped.selection.implementation).toEqual({ chosen: 2, skipped: [{ index: 1, accountProfileId: "openai-api", reason: "unsupported_combination" }] });
+  expect(resolveStageAgentConfig({ ...input, abTestRow: "first" })).toEqual(baseline);
+  expect(resolveStageAgentConfig({ ...input, abTestRow: undefined })).toEqual(baseline);
 });

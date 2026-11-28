@@ -45,7 +45,8 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // comment-gapfill-drain.ts is the gap-fill submission door (AII-1554): ingress and readiness only.
   // runner-service.ts is the local runner's own SDK endpoint door (AII-2034): it serves one
   // per-run Restate service and imports no orchestrator service graph.
-  const ALLOWLIST = new Set(["src/comment-gapfill-drain.ts", "src/health-body.ts", "src/model-account-cli.ts", "src/orchestrator-settings.ts", "src/mcp.ts", "src/mcp-oauth.ts", "src/oauth/routes.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/runner-service.ts", "src/webhook.ts"]);
+  // model-auth-runtime.ts reaches ModelAbTest through the ingress client only.
+  const ALLOWLIST = new Set(["src/comment-gapfill-drain.ts", "src/health-body.ts", "src/model-account-cli.ts", "src/model-auth-runtime.ts", "src/orchestrator-settings.ts", "src/mcp.ts", "src/mcp-oauth.ts", "src/oauth/routes.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/runner-service.ts", "src/webhook.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -130,7 +131,7 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
   it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/comment-gapfill-drain.ts", "src/deploy.ts", "src/health-body.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/model-account-cli.ts", "src/oauth/routes.ts", "src/orchestrator-settings.ts", "src/reaper.ts", "src/runner-callback.ts", "src/runner-service.ts", "src/webhook.ts"]);
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/comment-gapfill-drain.ts", "src/deploy.ts", "src/health-body.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/model-account-cli.ts", "src/model-auth-runtime.ts", "src/oauth/routes.ts", "src/orchestrator-settings.ts", "src/reaper.ts", "src/runner-callback.ts", "src/runner-service.ts", "src/webhook.ts"]);
   });
 });
 
