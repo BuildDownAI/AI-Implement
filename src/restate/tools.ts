@@ -1716,7 +1716,7 @@ export const SetProjectStageArgsSchema = z.object({
   fallbackModel: z.string().nullable().optional(),
   accountProfileId: z.string().nullable().optional(),
   invocationTimeoutMs: z.number().int().positive().nullable().optional(),
-  preferOpenModel: z.boolean().optional(),
+  abTest: z.boolean().optional(),
 }).strict();
 
 export const addModelAccountTool = tool(

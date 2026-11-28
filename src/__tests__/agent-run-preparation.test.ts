@@ -1014,3 +1014,18 @@ describe("ordered account preparation", () => {
     expect(secretReads).toContain("model-account:api");
   });
 });
+
+
+it("A/B test toggle leaves resolved selections and stored model records unchanged", async () => {
+  // API accounts allow two independent dispatches without session ownership conflicts.
+  useStages(["api", "claude", "anthropic"], ["api", "claude", "anthropic"]);
+  const prepare = async (abTest: boolean) => {
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { implementation: { abTest } } });
+    const dispatchId = `ab-test-${abTest}`;
+    const result = ready(await prep.prepareAgentRun(request({ dispatchId }), deps));
+    const row = dedup.getDb().prepare("SELECT resolved_config_json FROM run_agent_config_snapshots WHERE dispatch_id = ?")
+      .get(dispatchId) as { resolved_config_json: string };
+    return { selections: result.snapshot.stages, selection: result.selection, stored: JSON.parse(row.resolved_config_json) };
+  };
+  expect(await prepare(true)).toEqual(await prepare(false));
+});

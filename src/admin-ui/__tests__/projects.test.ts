@@ -754,13 +754,13 @@ describe("projects page agents tab", () => {
     expect((m.doc.querySelector("#md-tabs [data-md-tab].active") as HTMLElement).dataset.mdTab).toBe("provider");
   });
 
-  it.each(["legacy", "configured"])("saves and reloads the open-model checkbox in %s mode", async (mode) => {
+  it.each(["legacy", "configured"])("saves and reloads the A/B test checkbox in %s mode", async (mode) => {
     const stored: Mapping = { mode, stages: {} };
     const m = mountAgents({ stored });
     await open(m);
-    const checkbox = () => m.doc.querySelector<HTMLInputElement>("#md-agents-open-model")!;
-    expect(m.doc.querySelectorAll("#md-agents-open-model")).toHaveLength(1);
-    expect(checkbox().closest("label")!.textContent).toContain("Use the open model for implementation");
+    const checkbox = () => m.doc.querySelector<HTMLInputElement>("#md-agents-ab-test")!;
+    expect(m.doc.querySelectorAll("#md-agents-ab-test")).toHaveLength(1);
+    expect(checkbox().closest("label")!.textContent).toContain("A/B test: divide issues between row 1 and row 2 of the account list");
     expect(checkbox().parentElement!.nextElementSibling!.textContent).toBe("Not active yet. The value is saved, and no run uses it.");
     expect(checkbox().checked).toBe(false);
     expect(m.doc.getElementById("md-agents-save")!.textContent).toBe("Save agent settings");
@@ -770,9 +770,9 @@ describe("projects page agents tab", () => {
       // A normal stage rerender must retain the checkbox draft.
       fire(m.doc, field(m.doc, "mode", "review", "model"));
       expect(checkbox().checked).toBe(value);
-      stored.stages = { implementation: { preferOpenModel: value } };
+      stored.stages = { implementation: { abTest: value } };
       await m.win.saveAgentConfig();
-      expect(puts(m).at(-1)!.body).toEqual({ stages: { implementation: { preferOpenModel: value } } });
+      expect(puts(m).at(-1)!.body).toEqual({ stages: { implementation: { abTest: value } } });
       await open(m);
       expect(checkbox().checked).toBe(value);
     }
