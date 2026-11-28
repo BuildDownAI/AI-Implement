@@ -69,6 +69,7 @@ describe("reports page", () => {
 
 const baseReport: FleetReport = {
   byModel: [],
+  abTest: [],
   byRepo: [
     { repo: "org/repo-a", jobs: 10, issues: 8, completed: 7, failed: 2, merged: 5, avgPasses: 1.5, costUsd: 12.34 },
   ],
@@ -273,4 +274,24 @@ describe("reports page render", () => {
     await win.loadReports();
     expect(doc.querySelectorAll("#reports-model-body tr").length).toBe(0);
   });
+});
+
+
+it("renders adjacent escaped A/B groups and clears the section on refresh", async () => {
+  const group = { provider: "<provider>", model: "<model>", issues: 4, movedIssues: 1,
+    jobs: 3, oneShotPct: 1, approvedJobs: 3, approvedPct: 1, avgPasses: 1,
+    avgDurationMs: 100, stoppedJobs: 0, costUsd: 2, estimatedCostUsd: null, tokensIn: 10, tokensOut: 2 };
+  const report: FleetReport = { ...baseReport, abTest: [{ projectKey: "<project>", first: group, second: group }] };
+  const { win, doc } = mountPage(report);
+  await win.loadReports();
+  const rows = doc.querySelectorAll('#reports-ab-test-body tr');
+  expect(rows).toHaveLength(2);
+  expect(rows[0]!.textContent).toContain('<project>first<provider><model>41');
+  expect(rows[1]!.textContent).toContain('<project>second');
+  expect(rows[0]!.querySelector('provider')).toBeNull();
+  expect(doc.getElementById('reports-ab-test')!.classList.contains('hidden')).toBe(false);
+  report.abTest = [];
+  await win.loadReports();
+  expect(doc.querySelectorAll('#reports-ab-test-body tr')).toHaveLength(0);
+  expect(doc.getElementById('reports-ab-test')!.classList.contains('hidden')).toBe(true);
 });

@@ -40,6 +40,14 @@ export const reportsHtml = `
         <div id="reports-model-empty" class="hidden text-tertiary" style="padding:12px">No model data for this period</div>
       </div>
     </div>
+    <div class="card hidden" id="reports-ab-test">
+      <div class="card-header"><h2 class="card-title">A/B test</h2>
+        <div class="card-subtitle">Moved issues stay in their group and are excluded from comparison figures.</div></div>
+      <div class="card-body tight"><table class="tbl">
+        <thead><tr><th>Project</th><th>Group</th><th>Provider</th><th>Model</th><th>Issues</th><th>Moved issues</th><th>Jobs</th><th>One-shot</th><th>Approved jobs</th><th>Approved</th><th>Avg passes</th><th>Avg duration (ms)</th><th>Stopped jobs</th><th>Cost (USD)</th><th>Estimated cost (USD)</th><th>Tokens in</th><th>Tokens out</th></tr></thead>
+        <tbody id="reports-ab-test-body"></tbody>
+      </table></div>
+    </div>
     <div class="card">
       <div class="card-header">
         <h2 class="card-title">Outcomes</h2>
@@ -237,6 +245,22 @@ export const reportsScript = `
           pct(m.oneShotPct), m.approvedJobs, pct(m.approvedPct), fmtPasses(m.avgPasses), m.avgDurationMs, m.stoppedJobs];
         tr.innerHTML = values.map(v => '<td>' + window.esc(v == null ? '\u2014' : String(v)) + '</td>').join('');
         modelBody.appendChild(tr);
+      }
+
+      const abBody = document.getElementById('reports-ab-test-body');
+      abBody.innerHTML = '';
+      const abTest = data.abTest || [];
+      document.getElementById('reports-ab-test').classList.toggle('hidden', abTest.length === 0);
+      for (const project of abTest) {
+        for (const group of ['first', 'second']) {
+          const m = project[group];
+          const values = [project.projectKey, group, m.provider, m.model, m.issues, m.movedIssues,
+            m.jobs, pct(m.oneShotPct), m.approvedJobs, pct(m.approvedPct), fmtPasses(m.avgPasses),
+            m.avgDurationMs, m.stoppedJobs, fmtCost(m.costUsd), fmtCost(m.estimatedCostUsd), m.tokensIn, m.tokensOut];
+          const tr = document.createElement('tr');
+          tr.innerHTML = values.map(v => '<td>' + window.esc(v == null ? '\u2014' : String(v)) + '</td>').join('');
+          abBody.appendChild(tr);
+        }
       }
 
       const oneShotEl = document.getElementById('reports-oneshot');

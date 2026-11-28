@@ -1,4 +1,4 @@
-import { loadStoredSnapshot } from "./agent-run-preparation.js";
+import { loadStoredAbTest, loadStoredSnapshot } from "./agent-run-preparation.js";
 import { estimateCallCostUsd, type ModelPriceRates } from "./model-price-estimate.js";
 import { cut, toInvocation } from "./job-accounting.js";
 import { getDb } from "./dedup.js";
@@ -79,7 +79,15 @@ export interface ModelAggregate {
   stoppedJobs: number | null;
 }
 
+export interface AbTestGroup extends Pick<ModelAggregate, "jobs" | "oneShotPct" | "approvedJobs" | "approvedPct" | "avgPasses" | "avgDurationMs" | "stoppedJobs" | "costUsd" | "estimatedCostUsd" | "tokensIn" | "tokensOut"> {
+  provider: string | null;
+  model: string | null;
+  issues: number;
+  movedIssues: number;
+}
+
 export interface FleetReport {
+  abTest: Array<{ projectKey: string; first: AbTestGroup; second: AbTestGroup }>;
   byRepo: RepoAggregate[];
   byModel: ModelAggregate[];
   oneShotPct: number | null;
@@ -601,6 +609,33 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
   };
 }
 
+function implementationMetrics(db: Db, jobs: FleetDispatchRow[]) {
+  const result = { jobs: jobs.length, approvedJobs: 0, approvedPct: null as number | null,
+    oneShotPct: null as number | null, avgPasses: null as number | null,
+    avgDurationMs: null as number | null, stoppedJobs: 0 };
+  const stats = jobs.map(d => jobPassStats(db, d.id));
+  const measured = stats.filter(s => s != null);
+  result.approvedJobs = measured.filter(s => s.approved).length;
+  result.approvedPct = measured.length ? result.approvedJobs / measured.length : null;
+  const eligible = stats.filter(s => s != null && s.oneShot !== null);
+  const passes = stats.filter(s => s != null && s.passesKnown);
+  const durations = jobs.filter(d => d.completed_at !== null);
+  result.oneShotPct = eligible.length ? eligible.filter(s => s!.oneShot).length / eligible.length : null;
+  result.avgPasses = passes.length ? passes.reduce((sum, s) => sum + s!.passes, 0) / passes.length : null;
+  result.avgDurationMs = durations.length ? durations.reduce((sum, d) => sum + d.completed_at! - d.dispatched_at, 0) / durations.length : null;
+  result.stoppedJobs = jobs.filter(d => d.status === "timed_out" || d.conclusion === "ended_without_callback" || d.conclusion === "workflow_cancelled").length;
+  return result;
+}
+
+type CallTotals = Pick<ModelAggregate, "tokensIn" | "tokensOut" | "costUsd" | "estimatedCostUsd">;
+function addCallTotals(totals: CallTotals, row: Parameters<typeof toInvocation>[0], prices: readonly ModelPriceRates[]) {
+  const call = toInvocation(row);
+  totals.tokensIn = addCost(totals.tokensIn, call.tokensIn);
+  totals.tokensOut = addCost(totals.tokensOut, call.tokensOut);
+  if (call.costStatus === "reported") totals.costUsd = addCost(totals.costUsd, call.costUsd);
+  else totals.estimatedCostUsd = addCost(totals.estimatedCostUsd, estimateCallCostUsd(call, prices));
+}
+
 // ---- getFleetReport ----
 
 export function getFleetReport(opts: { days?: number; repo?: string } = {}, prices: readonly ModelPriceRates[] = []): FleetReport {
@@ -650,14 +685,10 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
     const group = modelGroup(row);
     group.dispatchIds.add(row.dispatch_id);
     const a = group.entry;
-    const call = toInvocation(row);
     a.calls++;
     if (row.status === "failed") a.failedCalls++;
     if (row.status === "timed_out") a.timedOutCalls++;
-    a.tokensIn = addCost(a.tokensIn, call.tokensIn);
-    a.tokensOut = addCost(a.tokensOut, call.tokensOut);
-    if (call.costStatus === "reported") a.costUsd = addCost(a.costUsd, call.costUsd);
-    else a.estimatedCostUsd = addCost(a.estimatedCostUsd, estimateCallCostUsd(call, prices));
+    addCallTotals(a, row, prices);
   }
   // A frozen implementation selection can attribute a stopped job before its first call.
   // Any real call remains authoritative, even when it belongs to another stage.
@@ -674,19 +705,48 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
     const jobs = dispatches.filter(d => d.dispatch_id !== null && dispatchIds.has(d.dispatch_id));
     entry.jobs = jobs.length;
     if (entry.stage === "implementation") {
-      const stats = jobs.map(d => jobPassStats(db, d.id));
-      const measured = stats.filter(s => s != null);
-      entry.approvedJobs = measured.filter(s => s.approved).length;
-      entry.approvedPct = measured.length ? entry.approvedJobs / measured.length : null;
-      const eligible = stats.filter(s => s != null && s.oneShot !== null);
-      const passes = stats.filter(s => s != null && s.passesKnown);
-      const durations = jobs.filter(d => d.completed_at !== null);
-      entry.oneShotPct = eligible.length ? eligible.filter(s => s!.oneShot).length / eligible.length : null;
-      entry.avgPasses = passes.length ? passes.reduce((sum, s) => sum + s!.passes, 0) / passes.length : null;
-      entry.avgDurationMs = durations.length ? durations.reduce((sum, d) => sum + d.completed_at! - d.dispatched_at, 0) / durations.length : null;
-      entry.stoppedJobs = jobs.filter(d => d.status === "timed_out" || d.conclusion === "ended_without_callback" || d.conclusion === "workflow_cancelled").length;
+      Object.assign(entry, implementationMetrics(db, jobs));
     }
     return entry;
+  });
+
+  const projects = new Map<string, Record<"first" | "second", Array<{
+    job: FleetDispatchRow; issueId: string; selection: { provider: string; model: string } | null;
+  }>>>();
+  const implementationCalls = calls.filter(call => call.stage === "implementation");
+  const callsByDispatch = new Map<string, typeof calls>();
+  for (const call of implementationCalls) {
+    const rows = callsByDispatch.get(call.dispatch_id) ?? [];
+    rows.push(call);
+    callsByDispatch.set(call.dispatch_id, rows);
+  }
+  for (const job of dispatches) {
+    if (!job.dispatch_id) continue;
+    const stored = loadStoredAbTest(job.dispatch_id);
+    if (!stored) continue;
+    let project = projects.get(stored.projectKey);
+    if (!project) { project = { first: [], second: [] }; projects.set(stored.projectKey, project); }
+    const selection = loadStoredSnapshot(job.dispatch_id)?.stages.implementation ?? null;
+    project[stored.reason === "no-second-row" ? "first" : stored.row].push({ job, issueId: stored.issueId, selection });
+  }
+  const abTest = Array.from(projects, ([projectKey, project]) => {
+    const aggregate = (rows: typeof project.first): AbTestGroup => {
+      const moved = new Set(rows.filter(({ job, selection }) => selection &&
+        (callsByDispatch.get(job.dispatch_id!) ?? []).some(call => call.model !== selection.model))
+        .map(row => row.issueId));
+      const jobs = rows.filter(row => !moved.has(row.issueId)).map(row => row.job);
+      const totals: CallTotals = { costUsd: null, estimatedCostUsd: null, tokensIn: null, tokensOut: null };
+      const ids = new Set(jobs.map(job => job.dispatch_id));
+      for (const id of ids) for (const call of callsByDispatch.get(id!) ?? []) addCallTotals(totals, call, prices);
+      const labels = (field: "provider" | "model") => {
+        const values = new Set(rows.map(row => row.selection?.[field] ?? null));
+        return values.size === 1 ? cut([...values][0] ?? "") || null : null;
+      };
+      return { provider: labels("provider"), model: labels("model"),
+        issues: new Set(rows.map(row => row.issueId)).size, movedIssues: moved.size,
+        ...implementationMetrics(db, jobs), ...totals };
+    };
+    return { projectKey, first: aggregate(project.first), second: aggregate(project.second) };
   });
 
   // --- Per-repo aggregates ---
@@ -956,6 +1016,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}, pric
   return {
     byRepo,
     byModel,
+    abTest,
     oneShotPct,
     eventualPct,
     planning: { planned: cohortFor(true), unplanned: cohortFor(false) },
