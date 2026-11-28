@@ -36,7 +36,15 @@ other stages, and orchestrator defaults reject this field.
 The project Agents tab exposes “A/B test: divide issues between row 1 and row 2 of the account list”
 and saves it with **Save agent settings**, including for legacy projects.
 The admin-only `set_project_stage` tool can also set `abTest`.
-No caller reads the toggle yet. Preparation accepts an explicit optional A/B row and issue id.
+Managed runs participate when the stored project toggle is true, an admission record
+exists and is not planning, a tracker issue is found, no implementation model override
+is set on the issue, and the runtime provides the ModelAbTest ingress client.
+Issue admission scopes supply the tracker issue id directly. PR scopes use the stored
+pull request link’s tracker issue id; a pull request with no stored link is not in the test.
+ModelAbTest alone assigns the row for the project and issue. If the object does not
+answer, preparation holds with `preparation_failed`; it never guesses a row.
+An issue that started before the toggle was on gets its row at its next run.
+Preparation receives the assigned row and tracker issue id.
 Row `first` uses ordinary resolution. Row `second` starts implementation at entry 2,
 with blank models inherited from entry 1 before selection; entry 1 is excluded from
 selection and fallbacks, and a project account override is not mandatory for this row.
