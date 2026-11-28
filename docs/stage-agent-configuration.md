@@ -27,20 +27,22 @@ The Projects Agents tab has no mode control. It shows the project mode and names
 
 `PUT /api/mappings/:key/agent-config` inspects readiness for a configured project, so a new configured project receives `409` when saving stage overrides until its workflow sync pull request merges.
 
-### Open-model preference (inactive stub)
+### A/B test toggle
 
-Project settings may store an optional boolean `preferOpenModel` in the
+Project settings may store an optional boolean `abTest` in the
 `implementation` stage only. Absent means false. Other types (including null),
 other stages, and orchestrator defaults reject this field.
 
-The project Agents tab exposes “Use the open model for implementation” and saves
-it with **Save agent settings**, including for legacy projects. It is not active:
-no run reads it, and it does not change resolved selections, account lists or
-execution snapshot fields. There is no setting to choose an open model yet.
+The project Agents tab exposes “A/B test: divide issues between row 1 and row 2 of the account list”
+and saves it with **Save agent settings**, including for legacy projects.
+The admin-only `set_project_stage` tool can also set `abTest`.
+No run reads it until a later issue: it does not change resolved selections,
+account lists or execution snapshot fields.
+Historical `preferOpenModel` metadata is discarded on read and omitted on the next save.
 
-Before rolling back this feature, remove the `preferOpenModel` key entirely from
-every stored project config that contains it. Unchecking stores false and does
-not remove the key; setting null also does not remove it. Older code rejects the
+Before rolling back this feature, remove the `abTest` key entirely from every
+stored project config that contains it. Unchecking stores false and does not
+remove the key; setting null also does not remove it. Older code rejects the
 unknown key during shape validation.
 
 ## Run preparation and the snapshot

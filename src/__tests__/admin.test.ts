@@ -7415,20 +7415,39 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(patch.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
   });
 
-  it.each([false, true])("saves the inactive preference for configured=%s and rejects invalid scope/types", async (configured) => {
+  it.each([false, true])("reads and saves historical preferOpenModel without retaining it (configured=%s)", async (configured) => {
+    const t = await seed();
+    const saved = modules.agentConfigStore.setProjectStageConfig("APP", { version: 1, mode: configured ? "configured" : "legacy", stages: {} });
+    const historical = { ...saved.config, stages: { ...saved.config.stages, implementation: { model: "historical", preferOpenModel: true } } };
+    dedup.getDb().prepare("UPDATE stage_agent_config_revisions SET config_json = ? WHERE config_revision_id = ?")
+      .run(JSON.stringify(historical), saved.configRevisionId);
+    const deps = readyDeps();
+    const read = await call("/api/mappings/APP/agent-config", "GET", t, undefined, deps);
+    expect(read.status).toBe(200);
+    expect(read.json.stages.implementation).toEqual({ model: "historical" });
+    const write = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { implementation: { abTest: true } } }, deps);
+    expect(write.status).toBe(200);
+    const latest = modules.agentConfigStore.getProjectStageConfig("APP")!;
+    const row = dedup.getDb().prepare("SELECT config_json FROM stage_agent_config_revisions WHERE config_revision_id = ?")
+      .get(latest.configRevisionId) as { config_json: string };
+    expect(JSON.parse(row.config_json).stages.implementation).toEqual({ model: "historical", abTest: true });
+    expect(row.config_json).not.toContain("preferOpenModel");
+  });
+
+  it.each([false, true])("saves the inactive A/B test toggle for configured=%s and rejects invalid scope/types", async (configured) => {
     const t = await seed();
     modules.agentConfigStore.setProjectConfigured("APP", configured);
     const deps = readyDeps();
-    for (const preferOpenModel of [true, false]) {
-      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { implementation: { preferOpenModel } } }, deps)).status).toBe(200);
-      expect((await call("/api/mappings/APP/agent-config", "GET", t, undefined, deps)).json.stages.implementation.preferOpenModel).toBe(preferOpenModel);
+    for (const abTest of [true, false]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { implementation: { abTest } } }, deps)).status).toBe(200);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t, undefined, deps)).json.stages.implementation.abTest).toBe(abTest);
     }
     const revs = count("stage_agent_config_revisions");
     for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
-      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { [stage as string]: { preferOpenModel: value } } }, deps)).status).toBe(400);
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { [stage as string]: { abTest: value } } }, deps)).status).toBe(400);
     }
     for (const stage of ["planning", "implementation", "review"]) {
-      expect((await call("/api/agent-defaults", "PUT", t, { mode: "configured", stages: { [stage]: { preferOpenModel: false } } })).status).toBe(400);
+      expect((await call("/api/agent-defaults", "PUT", t, { mode: "configured", stages: { [stage]: { abTest: false } } })).status).toBe(400);
     }
     expect(count("stage_agent_config_revisions")).toBe(revs);
   });

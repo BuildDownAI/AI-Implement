@@ -2664,14 +2664,14 @@ describe("model administration tools", () => {
       },
     }, "seed");
     const result = await admin.putProjectAgentConfigAction("AII", {}, "operator", {
-      stages: { implementation: { model: "new", fallbackModel: null, preferOpenModel: true } },
+      stages: { implementation: { model: "new", fallbackModel: null, abTest: true } },
     });
     expect(result.status).toBe(200);
     const after = store.getProjectStageConfig("AII")!;
     expect(after.config.mode).toBe(before.config.mode);
     expect(after.config.stages?.planning).toEqual(before.config.stages?.planning);
     expect(after.config.stages?.review).toEqual(before.config.stages?.review);
-    expect(after.config.stages?.implementation).toMatchObject({ model: "new", fallbackModel: null, preferOpenModel: true });
+    expect(after.config.stages?.implementation).toMatchObject({ model: "new", fallbackModel: null, abTest: true });
     expect((await admin.putProjectAgentConfigAction("missing", {}, null, {})).status).toBe(404);
     expect((await admin.putProjectAgentConfigAction("AII", {}, null, { stages: { unknown: {} } })).status).toBe(400);
   });
@@ -2804,7 +2804,7 @@ describe("model administration acceptance through shared actions", () => {
       planning: { model: "plan" }, review: { model: "review" },
       implementation: { ...makeStageAgentDefaults().stages!.implementation, fallbackModel: "fallback" },
     } }, "seed");
-    const patch = { agent: null, provider: null, model: null, fallbackModel: null, accountProfileId: null, invocationTimeoutMs: null, preferOpenModel: true };
+    const patch = { agent: null, provider: null, model: null, fallbackModel: null, accountProfileId: null, invocationTimeoutMs: null, abTest: true };
     const calls: RunCall[] = [];
     const result = await invokeModelTool(tools.setProjectStageTool, "set_project_stage", { teamKey: "AII", stage: "implementation", ...patch }, calls);
     expect(result.isError).toBeUndefined();
@@ -2818,7 +2818,7 @@ describe("model administration acceptance through shared actions", () => {
   it.each([
     { stage: "unknown" }, { stage: "review", key: "secret" },
     { model: 42 }, { invocationTimeoutMs: 0 }, { invocationTimeoutMs: 1.5 },
-    { preferOpenModel: null },
+    { abTest: null },
   ])("rejects malformed stage input %j before writing", async patch => {
     const { store, tools } = await setup();
     const before = store.setProjectStageConfig("AII", { version: 1, mode: "legacy" }, "seed");
@@ -2830,8 +2830,8 @@ describe("model administration acceptance through shared actions", () => {
 
   it.each([
     { teamKey: "missing", stage: "implementation" },
-    { teamKey: "AII", stage: "review", preferOpenModel: true },
-    { teamKey: "AII", stage: "planning", preferOpenModel: false },
+    { teamKey: "AII", stage: "review", abTest: true },
+    { teamKey: "AII", stage: "planning", abTest: false },
     { teamKey: "AII", stage: "implementation", model: " " },
   ])("matches route validation refusal without writing: %j", async args => {
     const { admin, store, tools, deps } = await setup();

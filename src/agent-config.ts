@@ -2,7 +2,7 @@ export const STAGE_AGENT_CONFIG_VERSION = 1;
 export const STAGE_NAMES = ["planning", "implementation", "review"] as const;
 export const STAGE_SELECTION_FIELDS = ["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"] as const;
 
-export const STORED_STAGE_SELECTION_FIELDS = [...STAGE_SELECTION_FIELDS, "fallbackModel", "accounts", "preferOpenModel"] as const;
+export const STORED_STAGE_SELECTION_FIELDS = [...STAGE_SELECTION_FIELDS, "fallbackModel", "accounts", "abTest"] as const;
 export type StoredStageSelectionField = (typeof STORED_STAGE_SELECTION_FIELDS)[number];
 
 export type StageName = (typeof STAGE_NAMES)[number];
@@ -39,7 +39,7 @@ export interface StageSelection {
 
 export type StageSelectionPatch = {
   [K in StageSelectionField]?: StageSelection[K] | null;
-} & { fallbackModel?: string | null; accounts?: AccountEntry[]; preferOpenModel?: boolean };
+} & { fallbackModel?: string | null; accounts?: AccountEntry[]; abTest?: boolean };
 
 export interface AccountEntry { accountProfileId: string; model: string }
 export interface StageAccount extends AccountEntry {
@@ -157,13 +157,13 @@ export function validateFallbackModel(value: unknown, stage: string): void {
 }
 
 /** Stored project metadata only; execution selection deliberately excludes this field. */
-export function validatePreferOpenModel(patch: object, stage: string, project: boolean): void {
-  if (!Object.prototype.hasOwnProperty.call(patch, "preferOpenModel")) return;
+export function validateAbTest(patch: object, stage: string, project: boolean): void {
+  if (!Object.prototype.hasOwnProperty.call(patch, "abTest")) return;
   if (!project || stage !== "implementation") {
-    throw new Error("preferOpenModel is only supported in project implementation settings");
+    throw new Error("abTest is only supported in project implementation settings");
   }
-  if (typeof (patch as Record<string, unknown>).preferOpenModel !== "boolean") {
-    throw new Error("implementation.preferOpenModel must be a boolean");
+  if (typeof (patch as Record<string, unknown>).abTest !== "boolean") {
+    throw new Error("implementation.abTest must be a boolean");
   }
 }
 
@@ -187,7 +187,7 @@ function validateConfigShape(config: StageAgentConfigurationV1, name: string): v
       if (name === "projectConfig") throw new Error("accounts is only supported in orchestrator defaults");
       validateAccounts(patch.accounts, stage);
     }
-    validatePreferOpenModel(patch, stage, name === "projectConfig");
+    validateAbTest(patch, stage, name === "projectConfig");
     validateFallbackModel(patch.fallbackModel, stage);
     assertKnownKeys(patch, STORED_STAGE_SELECTION_FIELDS, `${name}.stages.${stage}`);
   }

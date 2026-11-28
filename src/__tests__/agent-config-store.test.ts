@@ -479,15 +479,15 @@ it("refuses a historical incompatible profile without writing", () => {
   expect(dump()).toBe(before);
 });
 
-describe("stored open-model preference", () => {
+describe("stored A/B test toggle", () => {
   it.each(["legacy", "configured"] as const)("clears optional implementation metadata in %s mode", (mode) => {
     seed();
-    for (const preferOpenModel of [true, false]) {
+    for (const abTest of [true, false]) {
       const saved = store.setProjectStageConfig("AII", {
-        version: 1, mode, stages: { implementation: { model: "custom-model", preferOpenModel }, review: { model: "review-model" } },
+        version: 1, mode, stages: { implementation: { model: "custom-model", abTest }, review: { model: "review-model" } },
       });
       const beforeResolution = store.resolveProjectStageConfig("AII").resolution;
-      const cleared = store.clearProjectStageField("AII", "implementation", "preferOpenModel");
+      const cleared = store.clearProjectStageField("AII", "implementation", "abTest");
       expect(cleared.revision).toBe(saved.revision + 1);
       expect(cleared.supersedesRevisionId).toBe(saved.configRevisionId);
       expect(cleared.config).toEqual({
@@ -499,18 +499,18 @@ describe("stored open-model preference", () => {
   });
   it.each(["legacy", "configured"] as const)("rejects clearing metadata in invalid stages atomically in %s mode", (mode) => {
     seed();
-    store.setProjectStageConfig("AII", { version: 1, mode, stages: { implementation: { preferOpenModel: true } } });
+    store.setProjectStageConfig("AII", { version: 1, mode, stages: { implementation: { abTest: true } } });
     const before = dump();
     for (const stage of ["planning", "review"] as const) {
-      expect(() => store.clearProjectStageField("AII", stage, "preferOpenModel")).toThrow("only supported in project implementation");
+      expect(() => store.clearProjectStageField("AII", stage, "abTest")).toThrow("only supported in project implementation");
       expect(dump()).toBe(before);
     }
-    expect(() => store.clearProjectStageField("AII", "unknown" as never, "preferOpenModel")).toThrow("unknown stage");
+    expect(() => store.clearProjectStageField("AII", "unknown" as never, "abTest")).toThrow("unknown stage");
     expect(dump()).toBe(before);
   });
   it.each(["legacy", "configured"] as const)("round-trips booleans and old configs in %s mode", (mode) => {
     seed();
-    for (const patch of [{}, { preferOpenModel: true }, { preferOpenModel: false }]) {
+    for (const patch of [{}, { abTest: true }, { abTest: false }]) {
       const config: StageAgentConfigurationV1 = { version: 1, mode, stages: { implementation: patch } };
       store.setProjectStageConfig("AII", config);
       expect(store.getProjectStageConfig("AII")!.config).toEqual(config);
@@ -521,7 +521,7 @@ describe("stored open-model preference", () => {
     const before = dump();
     for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
       expect(() => store.setProjectStageConfig("AII", {
-        version: 1, mode, stages: { [stage as string]: { preferOpenModel: value } },
+        version: 1, mode, stages: { [stage as string]: { abTest: value } },
       } as StageAgentConfigurationV1)).toThrow();
       expect(dump()).toBe(before);
     }
@@ -530,8 +530,28 @@ describe("stored open-model preference", () => {
     seed();
     const before = dump();
     expect(() => store.setOrchestratorDefaults({
-      ...defaults(), stages: { ...defaults().stages, [stage]: { preferOpenModel: false } },
+      ...defaults(), stages: { ...defaults().stages, [stage]: { abTest: false } },
     })).toThrow("only supported");
     expect(dump()).toBe(before);
   });
+});
+
+
+it.each(["legacy", "configured"] as const)("discards preferOpenModel from every stage in both read paths (%s)", (mode) => {
+  seed();
+  const config: StageAgentConfigurationV1 = {
+    version: 1, mode, stages: { planning: { model: "plan" }, implementation: { abTest: true }, review: { model: "review" } },
+  };
+  const saved = store.setProjectStageConfig("AII", config);
+  const historical = JSON.parse(JSON.stringify(config));
+  for (const stage of Object.values(historical.stages) as Record<string, unknown>[]) stage.preferOpenModel = "retired";
+  dedup.getDb().prepare("UPDATE stage_agent_config_revisions SET config_json = ? WHERE config_revision_id = ?")
+    .run(JSON.stringify(historical), saved.configRevisionId);
+  expect(store.getProjectStageConfig("AII")!.config).toEqual(config);
+  // setProjectConfigured uses parseConfig and preserves unrelated metadata.
+  store.setProjectConfigured("AII", mode !== "configured");
+  const expected = { ...config, mode: mode === "configured" ? "legacy" : "configured" };
+  expect(store.getProjectStageConfig("AII")!.config).toEqual(expected);
+  const row = dedup.getDb().prepare("SELECT config_json FROM stage_agent_config_revisions ORDER BY rowid DESC LIMIT 1").get() as { config_json: string };
+  expect(row.config_json).not.toContain("preferOpenModel");
 });
