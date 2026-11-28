@@ -236,6 +236,18 @@ excludes `test-org/%` repos. The response has:
   `ended_without_callback`/`workflow_cancelled`); these six are `null` for other stages.
   A stopped implementation job with no call rows is counted in `jobs` and `stoppedJobs` of the implementation model in its stored agent snapshot (`loadStoredSnapshot`), and adds no calls, tokens or cost.
   Jobs with multiple implementation models count in each entry. Empty windows return `[]`.
+* `abTest`: one entry per stored A/B project (`projectKey`), with `first` and
+  `second` groups. Each has stored implementation `provider` and `model` (null
+  for empty groups, invalid snapshots, or differing selections), distinct `issues`,
+  and `movedIssues`. Issue identity comes from stored `abTest.issueId`, including
+  review-fix jobs; `no-second-row` belongs to `first`. An implementation call on
+  another model marks its issue moved within that group. All jobs and calls of
+  moved issues are excluded from comparison figures: `jobs`, `oneShotPct`,
+  `approvedJobs`, `approvedPct`, `avgPasses`, `avgDurationMs`, `stoppedJobs`,
+  `costUsd`, `estimatedCostUsd`, `tokensIn`, `tokensOut`. Calculations match
+  `byModel`; usage and costs include implementation calls only. Invalid snapshots
+  cannot establish movement; their labels are null. Empty windows or windows
+  without stored A/B metadata return `[]`.
 * `oneShotPct` and `eventualPct`: first-pass approval per eligible implementation
   dispatch and eventual approval per distinct implementation issue.
 * `planning`: `planned` and `unplanned` cohorts, each with `jobs`, `oneShotPct`,

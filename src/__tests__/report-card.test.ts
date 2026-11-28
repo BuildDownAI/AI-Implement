@@ -1116,25 +1116,25 @@ describe("getReviewerScorecard", () => {
   });
 });
 
-describe("fleet model grouping", () => {
-  function storeSnapshot(dispatchId: string, model = "frozen", malformed = false) {
-    const stages = Object.fromEntries(["planning", "implementation", "review"].map(stage => [stage, {
-      agent: "codex", provider: "openai", model: stage === "implementation" ? model : stage,
-      accountProfileId: "profile", invocationTimeoutMs: 1000,
-    }]));
-    const sources = Object.fromEntries(Object.entries(stages).map(([stage, selection]) =>
-      [stage, Object.fromEntries(Object.keys(selection).map(field => [field, "project"]))]));
-    const profiles = Object.fromEntries(Object.keys(stages).map(stage => [stage, {
-      id: "profile", identity: "profile", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key",
-    }]));
-    const revision = { configRevisionId: "revision", revision: 1 };
-    dedup.getDb().prepare(`INSERT INTO run_agent_config_snapshots
-      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
-      VALUES (?, ?, 'project', ?, ?, ?, 1)`).run(dispatchId, dispatchId,
-        malformed ? "{" : JSON.stringify({ stages, profiles }), JSON.stringify(sources),
-        JSON.stringify({ orchestratorDefault: revision, project: revision }));
-  }
+function storeSnapshot(dispatchId: string, model = "frozen", malformed = false, abTest?: { row: "first" | "second"; issueId: string; reason?: "no-second-row" }) {
+  const stages = Object.fromEntries(["planning", "implementation", "review"].map(stage => [stage, {
+    agent: "codex", provider: "openai", model: stage === "implementation" ? model : stage,
+    accountProfileId: "profile", invocationTimeoutMs: 1000,
+  }]));
+  const sources = Object.fromEntries(Object.entries(stages).map(([stage, selection]) =>
+    [stage, Object.fromEntries(Object.keys(selection).map(field => [field, "project"]))]));
+  const profiles = Object.fromEntries(Object.keys(stages).map(stage => [stage, {
+    id: "profile", identity: "profile", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key",
+  }]));
+  const revision = { configRevisionId: "revision", revision: 1 };
+  dedup.getDb().prepare(`INSERT INTO run_agent_config_snapshots
+    (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+    VALUES (?, ?, 'project', ?, ?, ?, 1)`).run(dispatchId, dispatchId,
+      malformed ? "{" : JSON.stringify({ stages, profiles, ...(abTest ? { abTest: { stage: "implementation", ...abTest } } : {}) }), JSON.stringify(sources),
+      JSON.stringify({ orchestratorDefault: revision, project: revision }));
+}
 
+describe("fleet model grouping", () => {
   it.each(["model", "m".repeat(1999)])("sanitizes model labels before grouping (%#)", (model) => {
     const dirtyModel = model === "model" ? "mo\u0000del" : model + "\u0000😀tail";
     insertDispatch({ repo: "acme/repo", dispatchId: "dirty-call" });
@@ -1313,5 +1313,70 @@ describe("fleet model grouping", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+});
+
+describe("fleet A/B comparison", () => {
+  it("uses stored issue identity, excludes whole moved issues, and shares model denominators", () => {
+    const db = dedup.getDb();
+    const call = db.prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, ?, 'test', 1, 'codex', 'openai', ?, 'test', 'succeeded', 1, ?)`);
+    const fixtures: Array<{ row: "first" | "second"; issue: number; passes: number; approved: boolean; duration: number; cost: number; tokens: number }> = [];
+    for (const row of ["first", "second"] as const) {
+      for (let issue = 0; issue < 4; issue++) {
+        for (let repeat = 0; repeat < (issue < 2 ? 2 : 1); repeat++) {
+          const f = { row, issue, passes: issue + 1, approved: issue % 2 === 0, duration: (issue + 1) * 100, cost: issue + 0.5, tokens: issue * 10 };
+          fixtures.push(f);
+          const dispatchId = `${row}-${issue}-${repeat}`;
+          // Review-fix rows deliberately have no tracker identifier and share an unrelated job issue id.
+          const id = insertDispatch({ repo: "acme/repo", dispatchId, phase: repeat ? "review-fix" : "implementation" });
+          db.prepare("UPDATE dispatch_log SET completed_at = dispatched_at + ? WHERE id = ?").run(f.duration, id);
+          insertFeedbackLoopStep(id, { approved: f.approved, iterations: f.passes, terminationReason: "done", passes: [{ iteration: 1, implementOutcome: "success", reviewApproved: issue === 2, costUsd: 999 }] });
+          storeSnapshot(dispatchId, row, false, { row, issueId: `${row}-issue-${issue}` });
+          call.run(dispatchId, dispatchId, "implementation", issue === 0 && repeat ? "fallback" : row,
+            JSON.stringify({ tokensIn: f.tokens, tokensOut: 2, costUsd: f.cost, costStatus: issue === 3 ? "unavailable" : "reported" }));
+          call.run(`${dispatchId}-review`, dispatchId, "review", "different-review", JSON.stringify({ costUsd: 100, costStatus: "reported" }));
+        }
+      }
+    }
+    const prices = ["first", "second"].map(model => ({ model, inputUsd: "0.01", outputUsd: "0.02", cacheReadUsd: "0", cacheWriteUsd: "0" }));
+    const baseline = rc.getFleetReport({}, prices);
+    for (const row of ["first", "second"] as const) {
+      const eligible = fixtures.filter(f => f.row === row && f.issue !== 0);
+      const group = baseline.abTest[0]![row];
+      expect(group).toEqual({ provider: "openai", model: row, issues: 4, movedIssues: 1,
+        jobs: eligible.length, oneShotPct: eligible.filter(f => f.issue === 2).length / eligible.length,
+        approvedJobs: eligible.filter(f => f.approved).length,
+        approvedPct: eligible.filter(f => f.approved).length / eligible.length,
+        avgPasses: eligible.reduce((n, f) => n + f.passes, 0) / eligible.length,
+        avgDurationMs: eligible.reduce((n, f) => n + f.duration, 0) / eligible.length,
+        stoppedJobs: 0, costUsd: eligible.filter(f => f.issue !== 3).reduce((n, f) => n + f.cost, 0),
+        estimatedCostUsd: eligible.filter(f => f.issue === 3).reduce((n, f) => n + (f.tokens + 2 * 2) / 100, 0),
+        tokensIn: eligible.reduce((n, f) => n + f.tokens, 0), tokensOut: eligible.length * 2 });
+    }
+    db.prepare("DELETE FROM run_agent_config_snapshots").run();
+    const without = rc.getFleetReport({}, prices);
+    expect(without.abTest).toEqual([]);
+    expect({ ...baseline, abTest: [] }).toEqual(without);
+    expect(rc.getFleetReport({ days: 0 }).abTest).toEqual([]);
+    expect(rc.getFleetReport({ repo: "missing" }).abTest).toEqual([]);
+  });
+
+  it("counts no-second-row and call-free stopped jobs, preserving unknown measurements", () => {
+    insertDispatch({ repo: "acme/repo", dispatchId: "only", status: "timed_out" });
+    storeSnapshot("only", "chosen", false, { row: "second", issueId: "stored", reason: "no-second-row" });
+    for (const [dispatchId, repo, dispatchedAt] of [
+      ["old-ab", "acme/repo", Date.now() - 40 * 86400000],
+      ["test-ab", "test-org/repo", Date.now()],
+      ["other-ab", "other/repo", Date.now()],
+    ] as const) {
+      insertDispatch({ repo, dispatchId, dispatchedAt });
+      storeSnapshot(dispatchId, "excluded", false, { row: "first", issueId: dispatchId });
+    }
+    const [project] = rc.getFleetReport({ repo: "acme/repo" }).abTest;
+    expect(project!.first).toMatchObject({ issues: 1, jobs: 1, movedIssues: 0, stoppedJobs: 1,
+      approvedJobs: 0, oneShotPct: null, avgPasses: null, avgDurationMs: null, costUsd: null, tokensIn: null });
+    expect(project!.second).toMatchObject({ issues: 0, jobs: 0, provider: null, model: null });
   });
 });

@@ -76,6 +76,33 @@ function seedFleet() {
       VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', 'model-a', 'test', 'succeeded', 1, ?)`)
       .run(`call-${age}`, `dispatch-${age}`, JSON.stringify({ tokensIn: 100, tokensOut: 10, costUsd: 0.5, costStatus: "reported" }));
   }
+  for (const [row, model, issue] of [["first", "model-a", "a"], ["second", "model-b", "b"], ["first", "fallback", "moved"]] as const) {
+    const dispatchId = `ab-${issue}`;
+    dedup.getDb().prepare(`INSERT INTO dispatch_log
+      (issue_id, repo, dispatched_at, phase, status, dispatch_id, completed_at)
+      VALUES (?, 'acme/experiment', ?, 'implementation', 'completed', ?, ?)`)
+      .run(issue, NOW - DAY, dispatchId, NOW - DAY + 500);
+    const stages = Object.fromEntries(["planning", "implementation", "review"].map(stage => [stage, {
+      agent: "codex", provider: "openai", model: row === "first" ? "model-a" : "model-b",
+      accountProfileId: "profile", invocationTimeoutMs: 1000,
+    }]));
+    const sources = Object.fromEntries(Object.entries(stages).map(([stage, selection]) =>
+      [stage, Object.fromEntries(Object.keys(selection).map(field => [field, "project"]))]));
+    const profiles = Object.fromEntries(Object.keys(stages).map(stage => [stage, {
+      id: "profile", identity: "profile", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key",
+    }]));
+    const revision = { configRevisionId: "revision", revision: 1 };
+    dedup.getDb().prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'experiment', ?, ?, ?, ?)`)
+      .run(dispatchId, dispatchId, JSON.stringify({ stages, profiles, abTest: { stage: "implementation", row, issueId: issue } }),
+        JSON.stringify(sources), JSON.stringify({ orchestratorDefault: revision, project: revision }), NOW - DAY);
+    dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'profile', 1, 'codex', 'openai', ?, 'test', 'succeeded', ?, ?)`)
+      .run(dispatchId, dispatchId, model, NOW - DAY, JSON.stringify({ tokensIn: 100, tokensOut: 10, costUsd: 1, costStatus: "reported" }));
+  }
+
 }
 
 describe("recorded get_fleet_report exchanges", () => {
@@ -85,11 +112,12 @@ describe("recorded get_fleet_report exchanges", () => {
   ])("$scenario", async ({ scenario, args, jobs }) => {
     seedFleet();
     const recorded = await recordExchange("get_fleet_report", { args }, { objectClient: () => ({ current: async () => ({ prices: [] }) }) });
-    expect(payload(recorded).byModel).toHaveLength(1);
+    expect(payload(recorded).byModel).toHaveLength(3);
+    expect(payload(recorded).abTest).toMatchObject([{ projectKey: "experiment", first: { issues: 2, movedIssues: 1, jobs: 1, costUsd: 1 }, second: { issues: 1, movedIssues: 0, jobs: 1, costUsd: 1 } }]);
     expect(payload(recorded).byRepo).toEqual([{
       repo: "acme/widgets", jobs, issues: jobs, completed: 1, failed: jobs - 1,
       merged: 0, avgPasses: null, costUsd: null,
-    }]);
+    }, { repo: "acme/experiment", jobs: 3, issues: 3, completed: 3, failed: 0, merged: 0, avgPasses: null, costUsd: null }]);
     checkExchange("get_fleet_report", scenario, recorded);
   });
 
