@@ -9,8 +9,8 @@ import { fakeFetch, hangUntilAborted, type Reply } from "./helpers/fake-fetch.js
 // only catches it in endpoint.restate.test.ts — this is the fast, no-Docker half of that
 // same regression.
 describe("RESTATE_SERVICES", () => {
-  it("names exactly KeyBinding, Operator, orchestratorTools, RunnerBackend, ChatGptPlanAccount, AccessBinding, ModelPrices and SetupChecks", () => {
-    expect(RESTATE_SERVICES.map((service) => service.name)).toEqual(["KeyBinding", "Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount", "AccessBinding", "ModelPrices", "SetupChecks"]);
+  it("names exactly KeyBinding, Operator, orchestratorTools, RunnerBackend, ChatGptPlanAccount, AccessBinding, ModelPrices, SetupChecks and ModelAbTest", () => {
+    expect(RESTATE_SERVICES.map((service) => service.name)).toEqual(["KeyBinding", "Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount", "AccessBinding", "ModelPrices", "SetupChecks", "ModelAbTest"]);
   });
 });
 
@@ -20,7 +20,7 @@ describe("production review-fix services", () => {
       runnerCallbackBaseUrl: null, runnerTokenSecret: null, sessionImage: "ghcr.io/x/runner:latest", runnerImageExplicit: false },
       makeRegistry());
     expect([...RESTATE_SERVICES, ...services].map((service) => service.name)).toEqual([
-      "KeyBinding", "Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount", "AccessBinding", "ModelPrices", "SetupChecks", "ReviewFixPR", "ReviewFixAttempt",
+      "KeyBinding", "Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount", "AccessBinding", "ModelPrices", "SetupChecks", "ModelAbTest", "ReviewFixPR", "ReviewFixAttempt",
     ]);
   });
 });
