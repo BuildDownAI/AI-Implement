@@ -26,9 +26,12 @@ import type { ModelSessionStore } from "./model-session-store.js";
 import { resolveSessionImage } from "./repo-image.js";
 import type { AppConfig } from "./index.js";
 
+import { assignModelAbTestRow } from "./restate/model-ab-test.js";
+
 type RuntimeConfig = Pick<AppConfig, "githubAppId" | "githubAppPrivateKey" | "sessionImage">;
 
 export interface ModelAuthRuntime {
+  assignModelAbTestRow?: (projectKey: string, issueId: string) => Promise<"first" | "second">;
   /** Shared with the routes. */
   sessionStore: ModelSessionStore;
   /** Shared with the routes and the adapter. */
@@ -76,6 +79,7 @@ export function createModelAuthRuntime(input: {
   }
 
   return {
+    assignModelAbTestRow,
     sessionStore,
     ownership,
     credentials,

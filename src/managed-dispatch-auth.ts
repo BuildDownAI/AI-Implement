@@ -10,9 +10,11 @@
  * `JSON.stringify` and structured logging never see. Refusal text is fixed and built from `kind`, `category`
  * and `code` only.
  */
+import { read as readAdmission } from "./dispatch-admission.js";
+import { findLinkByPr } from "./pr-links.js";
 import type { IssueModels } from "./issue-config.js";
 import type { StageName } from "./agent-config.js";
-import { isProjectConfigured, resolveProjectStageConfig } from "./agent-config-store.js";
+import { getProjectStageConfig, isProjectConfigured, resolveProjectStageConfig } from "./agent-config-store.js";
 import {
   loadStoredSnapshot,
   prepareAgentRun,
@@ -91,6 +93,21 @@ export async function prepareManagedDispatch(
   const repository = `${req.owner}/${req.repo}`;
   let result;
   try {
+    let abTest;
+    if (runtime.assignModelAbTestRow && req.issueModels?.implementation === undefined
+      && getProjectStageConfig(req.projectKey)?.config.stages?.implementation?.abTest === true) {
+      const admission = readAdmission(req.dispatchId);
+      if (admission && admission.kind !== "planning") {
+        const scope = admission.scope;
+        const issueId = scope.kind === "issue"
+          ? scope.issueId
+          : findLinkByPr(scope.repository, scope.prNumber)?.issue.trackerIssueId;
+        if (issueId) {
+          const row = await runtime.assignModelAbTestRow(req.projectKey, issueId);
+          abTest = { row, issueId };
+        }
+      }
+    }
     result = await prepareAgentRun(
       {
         dispatchId: req.dispatchId,
@@ -99,6 +116,7 @@ export async function prepareManagedDispatch(
         workflowRepository: repository,
         workflowFile: req.workflowFile,
         issueModels: req.issueModels,
+        ...(abTest ? { abTest } : {}),
       },
       runtime.preparationDeps({ owner: req.owner, repo: req.repo, projectKey: req.projectKey }),
     );

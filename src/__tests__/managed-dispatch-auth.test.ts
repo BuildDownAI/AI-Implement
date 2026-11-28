@@ -497,3 +497,118 @@ it("carries preparation fallbacks and pairs managed envelope fields", async () =
   expect(adapter.managedRunConfigFields({ kind: "legacy" })).toEqual({});
   expect(adapter.managedRunConfigFields(undefined)).toEqual({});
 });
+
+describe("managed A/B assignment", () => {
+  async function admit(dispatchId = "d1", pr = false, planning = false) {
+    const { acquire } = await import("../dispatch-admission.js");
+    expect(acquire({
+      dispatchId, mappingKey: "AII", backend: "fly-machines", cap: 10,
+      lifecycleOwner: { kind: "legacy" },
+      kind: planning ? "planning" : pr ? "gap-fill" : "implementation",
+      scope: pr
+        ? { kind: "pr", issueId: "not-the-tracker-id", installationId: "1", repository: "acme/app", prNumber: 42 }
+        : { kind: "issue", issueScope: "AII", issueId: "tracker-id" },
+    }).ok).toBe(true);
+  }
+
+  function toggle(abTest = true) {
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { implementation: { abTest } } });
+  }
+
+  function payload(dispatchId = "d1") {
+    const row = dedup.getDb().prepare("SELECT resolved_config_json FROM run_agent_config_snapshots WHERE dispatch_id = ?")
+      .get(dispatchId) as { resolved_config_json: string };
+    return JSON.parse(row.resolved_config_json);
+  }
+
+  it("assigns issue and linked PR runs by the same tracker identity and freezes the row", async () => {
+    toggle();
+    store.saveAccountProfileRevision({
+      profileId: "cdx2", identity: "Cdx2", revision: 1, agent: "codex", provider: "openai", authMode: "codex-subscription",
+    });
+    expect(sessions.writePlanRecord({ profileId: "cdx2", expectedSequence: null, sessionData: serializeChatGptPlanRecord(makeChatGptPlanRecord()) }).ok).toBe(true);
+    const config = store.getOrchestratorDefaults()!.config;
+    config.stages!.implementation = { invocationTimeoutMs: 60_000, accounts: [
+      { accountProfileId: "cdx", model: "first-model" },
+      { accountProfileId: "cdx2", model: "second-model" },
+    ] };
+    store.setOrchestratorDefaults(config);
+    const assign = vi.fn(async () => "second" as const);
+    runtime.assignModelAbTestRow = assign;
+    const prepare = vi.spyOn(prepMod, "prepareAgentRun");
+    await admit();
+    launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+    expect(prepare.mock.calls[0][0].abTest).toEqual({ row: "second", issueId: "tracker-id" });
+    expect(payload().abTest).toEqual({ stage: "implementation", row: "second", issueId: "tracker-id" });
+    const frozen = payload();
+    expect(await adapter.prepareManagedDispatch(req(), runtime)).toEqual({ kind: "hold", code: "bootstrap_consumed" });
+    expect(payload()).toEqual(frozen);
+    const { linkPullRequest } = await import("../pr-links.js");
+    linkPullRequest({
+      repository: "acme/app", number: 42, url: "https://github.com/acme/app/pull/42",
+      role: "implementation", source: "result",
+      issue: { trackerKind: "linear", mappingKey: "AII", trackerIssueId: "tracker-id", identifier: null, title: null, url: null },
+    });
+    await admit("later", true);
+    launchOf(await adapter.prepareManagedDispatch(req({ dispatchId: "later" }), runtime));
+    expect(assign.mock.calls).toEqual(Array(3).fill(["AII", "tracker-id"]));
+    expect(payload("later").abTest).toEqual(frozen.abTest);
+  });
+
+  it.each(["no admission", "unlinked PR", "planning", "toggle off", "override", "no function"])(
+    "skips assignment and metadata for %s", async (reason) => {
+      toggle(reason !== "toggle off");
+      if (reason !== "no admission") await admit("d1", reason === "unlinked PR", reason === "planning");
+      const assign = vi.fn(async () => "second" as const);
+      if (reason !== "no function") runtime.assignModelAbTestRow = assign;
+      const decision = await adapter.prepareManagedDispatch(req(reason === "override" ? { issueModels: { implementation: "m" } } : {}), runtime);
+      launchOf(decision);
+      expect(assign).not.toHaveBeenCalled();
+      expect(payload()).not.toHaveProperty("abTest");
+    },
+  );
+
+  it("leaves decisions and all stored preparation records unchanged with the toggle off", async () => {
+    toggle(false);
+    await admit();
+    const db = dedup.getDb();
+    const crypto = await import("node:crypto");
+    vi.spyOn(crypto.default, "randomUUID").mockReturnValue("11111111-1111-4111-8111-111111111111");
+    vi.spyOn(crypto.default, "randomBytes").mockImplementation((() => Buffer.alloc(32, 7)) as typeof crypto.default.randomBytes);
+    vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    db.exec("SAVEPOINT baseline");
+    const before = launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+    const tables = ["run_agent_config_snapshots", "model_credential_grants", "model_profile_reservations"];
+    const records = () => tables.map(table => db.prepare(`SELECT * FROM ${table}`).all());
+    const baseline = records();
+    db.exec("ROLLBACK TO baseline");
+    const assign = vi.fn(async () => "second" as const);
+    runtime.assignModelAbTestRow = assign;
+    const after = launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+    expect({ ...after, takeBootstrap: undefined }).toEqual({ ...before, takeBootstrap: undefined });
+    expect(records()).toEqual(baseline);
+    expect(assign).not.toHaveBeenCalled();
+    db.exec("RELEASE baseline");
+    vi.restoreAllMocks();
+  });
+
+  it("holds without preparing or storing a snapshot when assignment fails", async () => {
+    toggle();
+    await admit();
+    runtime.assignModelAbTestRow = vi.fn(async () => { throw new Error("unavailable"); });
+    const prepare = vi.spyOn(prepMod, "prepareAgentRun");
+    expect(await adapter.prepareManagedDispatch(req(), runtime)).toEqual({ kind: "hold", code: "preparation_failed" });
+    expect(prepare).not.toHaveBeenCalled();
+    expect(prepMod.loadStoredSnapshot("d1")).toBeNull();
+  });
+
+  it("binds the production runtime directly to the ModelAbTest ingress client", async () => {
+    const { createModelAuthRuntime } = await import("../model-auth-runtime.js");
+    const { assignModelAbTestRow } = await import("../restate/model-ab-test.js");
+    const production = createModelAuthRuntime({
+      config: { githubAppId: "1", githubAppPrivateKey: "synthetic", sessionImage: "synthetic-image" },
+      env: { RUNNER_TOKEN_SECRET: "synthetic-managed-secret" },
+    });
+    expect(production.assignModelAbTestRow).toBe(assignModelAbTestRow);
+  });
+});
