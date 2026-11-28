@@ -992,7 +992,7 @@ export const projectsScript = `
           + '<label class="field-label" style="margin:0">' + window.esc(AG_LABELS[field]) + '</label>' + sel
           + '<div>' + agValueControl(stage, field) + (field === 'fallbackModel' ? '<div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div>' : '') + '<div class="field-hint" data-ag-preview="' + window.escAttr(stage + '.' + field) + '">' + window.esc(agPreviewText(stage, field)) + '</div></div></div>';
       }).join('');
-      if (stage === 'implementation') rows += '<label><input type="checkbox" id="md-agents-ab-test"' + (agentState.abTest ? ' checked' : '') + '> A/B test: divide issues between row 1 and row 2 of the account list</label><div class="field-hint">Not active yet. The value is saved, and no run uses it.</div>';
+      if (stage === 'implementation') rows += '<label><input type="checkbox" id="md-agents-ab-test"' + (agentState.abTest ? ' checked' : '') + '> A/B test: divide issues between row 1 and row 2 of the account list</label><div class="field-hint">Active. New issues of this project go to row 1 and row 2 in turn. Each later run of an issue keeps its row.</div>';
       var problem = agStageProblem(stage);
       return '<div style="margin-bottom:14px"><div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:8px">' + window.esc(stage) + '</div>' + rows
         + (problem ? '<div class="field-hint" data-ag-problem="' + window.escAttr(stage) + '">' + window.esc(problem) + '</div>' : '') + '</div>';
