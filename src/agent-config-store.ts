@@ -598,7 +598,7 @@ export function setProjectConfigured(projectKey: string, configured: boolean, cr
  * Resolves a project's stage configuration from current heads. Legacy (no row or mode=legacy) resolves as such;
  * a disabled, archived, or unknown profile throws.
  */
-export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: number, checkAccount?: ResolveStageAgentConfigInput["checkAccount"]): ProjectStageResolution {
+export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: number, checkAccount?: ResolveStageAgentConfigInput["checkAccount"], abTestRow?: ResolveStageAgentConfigInput["abTestRow"]): ProjectStageResolution {
   assertNonEmptyProjectKey(projectKey);
   const db = getDb();
   return db.transaction(() => {
@@ -610,6 +610,7 @@ export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: n
       accountProfiles: loadProfiles(db),
       remainingJobMs,
       checkAccount,
+      abTestRow,
     });
     if (resolution.mode !== "configured") return { resolution, configRevisionIds: [] };
     if (!defaultsRow || !projectRow) throw new Error("configured resolution requires orchestrator and project config rows");

@@ -36,8 +36,19 @@ other stages, and orchestrator defaults reject this field.
 The project Agents tab exposes “A/B test: divide issues between row 1 and row 2 of the account list”
 and saves it with **Save agent settings**, including for legacy projects.
 The admin-only `set_project_stage` tool can also set `abTest`.
-No run reads it until a later issue: it does not change resolved selections,
-account lists or execution snapshot fields.
+No caller reads the toggle yet. Preparation accepts an explicit optional A/B row and issue id.
+Row `first` uses ordinary resolution. Row `second` starts implementation at entry 2,
+with blank models inherited from entry 1 before selection; entry 1 is excluded from
+selection and fallbacks, and a project account override is not mandatory for this row.
+Planning and review are unchanged. If second-row resolution fails, its chosen provider
+and model equal entry 1 (including an inherited blank model), or its credential is
+not ready, preparation uses row `first` with reason `no-second-row`.
+Operational database failures still fail preparation.
+
+The immutable `resolved_config_json` stores `abTest: { stage: "implementation", row,
+issueId }`, plus `reason: "no-second-row"` when reverted. Retries reuse that record;
+`loadStoredAbTest` reads it with the project key. Without an explicit row there is no
+new key. An implementation issue-model override ignores A/B input and writes no key.
 Historical `preferOpenModel` metadata is discarded on read and omitted on the next save.
 
 Before rolling back this feature, remove the `abTest` key entirely from every

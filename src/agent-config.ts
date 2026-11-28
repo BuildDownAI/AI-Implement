@@ -130,6 +130,7 @@ export interface ConfiguredStageResolution {
 export type StageConfigResolution = LegacyStageResolution | ConfiguredStageResolution;
 
 export interface ResolveStageAgentConfigInput {
+  abTestRow?: "first" | "second";
   orchestratorDefaults: StageAgentConfigurationV1;
   projectConfig?: StageAgentConfigurationV1 | null;
   accountProfiles: readonly AccountProfile[];
@@ -384,9 +385,17 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       fallbackModels[stage] = fallback;
       fallbackModelSources[stage] = projectFallback != null ? "project" : "orchestrator-default";
     }
-    const choice = chooseStageAccount(entries, check);
+    const secondRow = stage === "implementation" && input.abTestRow === "second";
+    const candidates = secondRow
+      ? entries.map(entry => ({ ...entry, model: entry.model.trim() ? entry.model : entries[0].model })).slice(1)
+      : entries;
+    const choice = chooseStageAccount(candidates, check);
+    if (secondRow && choice.chosen) {
+      choice.chosen.index += 1;
+      for (const skipped of choice.skipped) skipped.index += 1;
+    }
     // A project account is mandatory; appended defaults are runtime fallbacks.
-    if (input.projectConfig.stages?.[stage]?.accountProfileId != null &&
+    if (!secondRow && input.projectConfig.stages?.[stage]?.accountProfileId != null &&
         (!choice.chosen || choice.chosen.index !== 0)) {
       throw new StageAccountError(stage, choice.chosen ? choice.skipped[0].reason : choice.failure);
     }

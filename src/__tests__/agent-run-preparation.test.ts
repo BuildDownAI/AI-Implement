@@ -976,6 +976,7 @@ describe("ordered account preparation", () => {
             inserted = true;
             const winner = [...args];
             const payload = JSON.parse(winner[3] as string);
+            payload.abTest = { stage: "implementation", row: "first", issueId: "winner", reason: "no-second-row" };
             payload.selection = winnerSelection;
             payload.accountFallbacks = winnerFallbacks;
             winner[3] = JSON.stringify(payload);
@@ -989,6 +990,7 @@ describe("ordered account preparation", () => {
     try {
       const result = ready(await prep.prepareAgentRun(request(), deps));
       const stored = JSON.parse(rows("run_agent_config_snapshots")[0].resolved_config_json as string);
+      expect(prep.loadStoredAbTest("d1")).toEqual({ row: "first", issueId: "winner", reason: "no-second-row", projectKey: "AII" });
       expect(stored.selection).toEqual(winnerSelection);
       expect(stored.accountFallbacks).toEqual(winnerFallbacks);
       expect(result.selection).toEqual(stored.selection);
@@ -1028,4 +1030,56 @@ it("A/B test toggle leaves resolved selections and stored model records unchange
     return { selections: result.snapshot.stages, selection: result.selection, stored: JSON.parse(row.resolved_config_json) };
   };
   expect(await prepare(true)).toEqual(await prepare(false));
+});
+
+
+describe("explicit A/B rows", () => {
+  function configure(accounts = [{ accountProfileId: "api", model: "first" }, { accountProfileId: "brk", model: "second" }, { accountProfileId: "sub", model: "third" }]) {
+    const config = store.getOrchestratorDefaults()!.config;
+    config.stages!.implementation = { invocationTimeoutMs: 60_000, accounts };
+    store.setOrchestratorDefaults(config);
+    optIn();
+  }
+  function payload(dispatchId: string) {
+    return JSON.parse((dedup.getDb().prepare("SELECT resolved_config_json FROM run_agent_config_snapshots WHERE dispatch_id = ?") .get(dispatchId) as { resolved_config_json: string }).resolved_config_json);
+  }
+  it("selects and freezes the second entry with only later fallbacks", async () => {
+    configure();
+    const baseline = ready(await prep.prepareAgentRun(request({ dispatchId: "base" }), deps));
+    const result = ready(await prep.prepareAgentRun(request({ abTest: { row: "second", issueId: "issue" } }), deps));
+    expect(result.snapshot.stages.implementation).toMatchObject({ accountProfileId: "brk", provider: "bedrock", model: "second" });
+    expect(result.snapshot.sources.implementation).toMatchObject({ accountProfileId: "orchestrator-default", agent: "orchestrator-default", provider: "orchestrator-default" });
+    expect(result.selection.implementation).toEqual({ chosen: 1, skipped: [] });
+    expect(result.accountFallbacks!.implementation!.map(x => x.accountProfileId)).toEqual(["sub"]);
+    for (const stage of ["planning", "review"] as const) expect(result.snapshot.stages[stage]).toEqual(baseline.snapshot.stages[stage]);
+    expect(payload("d1").abTest).toEqual({ stage: "implementation", row: "second", issueId: "issue" });
+    const frozen = payload("d1");
+    ready(await prep.prepareAgentRun(request({ abTest: { row: "first", issueId: "other" } }), deps));
+    expect(payload("d1")).toEqual(frozen);
+    expect(prep.loadStoredAbTest("d1")).toEqual({ row: "second", issueId: "issue", projectKey: "AII", reason: undefined });
+    expect(prep.loadStoredAbTest("base")).toBeUndefined();
+  });
+  it("first differs only by metadata and implementation issue models ignore the row", async () => {
+    configure();
+    ready(await prep.prepareAgentRun(request({ dispatchId: "base" }), deps));
+    ready(await prep.prepareAgentRun(request({ abTest: { row: "first", issueId: "issue" } }), deps));
+    const { abTest, ...rest } = payload("d1");
+    expect(rest).toEqual(payload("base"));
+    expect(abTest.row).toBe("first");
+    (files as Record<string, string>)[".github/workflows/claude-implement.yml"] += "# ai-implement-capability: issue-models-v1\n";
+    ready(await prep.prepareAgentRun(request({ dispatchId: "override", issueModels: { implementation: "first" }, abTest: { row: "second", issueId: "issue" } }), deps));
+    expect(payload("override").abTest).toBeUndefined();
+  });
+  it.each(["singleton", "identical", "unsupported", "missing", "throwing"])("falls back safely for %s", async kind => {
+    if (kind === "identical") store.saveAccountProfileRevision({ profileId: "api2", identity: "Api2", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" } });
+    configure(kind === "singleton" ? [{ accountProfileId: "api", model: "first" }] :
+      kind === "identical" ? [{ accountProfileId: "api", model: "first" }, { accountProfileId: "api2", model: "" }] :
+      [{ accountProfileId: "api", model: "first" }, { accountProfileId: "brk", model: "second" }]);
+    if (kind === "missing") secrets.delete("model-account:brk");
+    if (kind === "throwing") { const original = deps.credentials.resolveProtectedSecret; deps.credentials.resolveProtectedSecret = ref => { if (ref === "model-account:brk") throw new Error("unavailable"); return original!(ref); }; }
+    deps.checkRunnerCapability = async () => true;
+    ready(await prep.prepareAgentRun(request({ backend: kind === "unsupported" ? "local-docker" : "github-actions", abTest: { row: "second", issueId: "issue" } }), deps));
+    expect(payload("d1").stages.implementation.accountProfileId).toBe("api");
+    expect(prep.loadStoredAbTest("d1")).toMatchObject({ row: "first", reason: "no-second-row" });
+  });
 });

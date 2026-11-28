@@ -723,3 +723,28 @@ describe("A/B test stored toggle", () => {
     })).toThrow("only supported");
   });
 });
+
+
+it("rebases second-row indexes and bypasses mandatory project accounts only in implementation", () => {
+  const defaults = structuredClone(orchestratorDefaults);
+  defaults.stages!.implementation = { invocationTimeoutMs: 60_000, accounts: [
+    { accountProfileId: "openai-api", model: "second" },
+    { accountProfileId: "claude-bedrock", model: "third" },
+  ] };
+  const input = { orchestratorDefaults: defaults, accountProfiles,
+    projectConfig: { version: 1 as const, mode: "configured" as const, stages: {
+      implementation: { agent: "claude" as const, provider: "anthropic" as const, accountProfileId: "claude-api", model: "first" },
+    } } };
+  const baseline = resolveStageAgentConfig(input);
+  const result = resolveStageAgentConfig({ ...input, abTestRow: "second" });
+  if (result.mode !== "configured" || baseline.mode !== "configured") throw new Error("expected configured");
+  expect(result.stages.implementation.accountProfileId).toBe("openai-api");
+  expect(result.selection.implementation).toEqual({ chosen: 1, skipped: [] });
+  expect(result.stages.planning).toEqual(baseline.stages.planning);
+  expect(result.stages.review).toEqual(baseline.stages.review);
+  const skipped = resolveStageAgentConfig({ ...input, abTestRow: "second", checkAccount: entry => entry.accountProfileId === "openai-api" ? "unsupported_combination" : null });
+  if (skipped.mode !== "configured") throw new Error("expected configured");
+  expect(skipped.selection.implementation).toEqual({ chosen: 2, skipped: [{ index: 1, accountProfileId: "openai-api", reason: "unsupported_combination" }] });
+  expect(resolveStageAgentConfig({ ...input, abTestRow: "first" })).toEqual(baseline);
+  expect(resolveStageAgentConfig({ ...input, abTestRow: undefined })).toEqual(baseline);
+});
