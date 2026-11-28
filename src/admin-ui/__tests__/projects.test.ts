@@ -761,7 +761,7 @@ describe("projects page agents tab", () => {
     const checkbox = () => m.doc.querySelector<HTMLInputElement>("#md-agents-ab-test")!;
     expect(m.doc.querySelectorAll("#md-agents-ab-test")).toHaveLength(1);
     expect(checkbox().closest("label")!.textContent).toContain("A/B test: divide issues between row 1 and row 2 of the account list");
-    expect(checkbox().parentElement!.nextElementSibling!.textContent).toBe("Not active yet. The value is saved, and no run uses it.");
+    expect(checkbox().parentElement!.nextElementSibling!.textContent).toBe("Active. New issues of this project go to row 1 and row 2 in turn. Each later run of an issue keeps its row.");
     expect(checkbox().checked).toBe(false);
     expect(m.doc.getElementById("md-agents-save")!.textContent).toBe("Save agent settings");
     for (const value of [true, false]) {

@@ -7434,7 +7434,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(row.config_json).not.toContain("preferOpenModel");
   });
 
-  it.each([false, true])("saves the inactive A/B test toggle for configured=%s and rejects invalid scope/types", async (configured) => {
+  it.each([false, true])("saves the A/B test toggle for configured=%s and rejects invalid scope/types", async (configured) => {
     const t = await seed();
     modules.agentConfigStore.setProjectConfigured("APP", configured);
     const deps = readyDeps();

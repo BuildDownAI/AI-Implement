@@ -157,7 +157,7 @@ export function validateFallbackModel(value: unknown, stage: string): void {
   }
 }
 
-/** Stored project metadata only; execution selection deliberately excludes this field. */
+/** Project toggle of the A/B test; `prepareManagedDispatch` reads it. */
 export function validateAbTest(patch: object, stage: string, project: boolean): void {
   if (!Object.prototype.hasOwnProperty.call(patch, "abTest")) return;
   if (!project || stage !== "implementation") {
