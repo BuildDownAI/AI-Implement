@@ -254,13 +254,6 @@ export const kgPipelinesScript = `
     } catch (e) { card.hidden = true; }
   }
 
-  // A held snapshot is reported as a coded failure, so its push step reads failed; show held.
-  function stepLabel(step, outcome) {
-    if (outcome && outcome.held && step.id === 'kg-snapshot-push' && step.status === 'failed') return 'held';
-    return step.status;
-  }
-  window.kgStepLabel = stepLabel;
-
   function renderKgLastSteps(last) {
     const el = document.getElementById('kg-last-steps');
     el.textContent = '';
@@ -268,7 +261,7 @@ export const kgPipelinesScript = `
     el.hidden = steps.length === 0;
     steps.forEach(function (st) {
       const row = document.createElement('div');
-      row.textContent = st.id + ': ' + stepLabel(st, last);
+      row.textContent = st.id + ': ' + st.status;
       el.appendChild(row);
     });
   }

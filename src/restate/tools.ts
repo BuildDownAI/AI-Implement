@@ -816,7 +816,7 @@ export const startDeployTool = tool(
 );
 
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), or [\"cancel\"] for a blocked hold (held.acceptBlocked), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. In lastRefresh.steps, a held run's kg-snapshot-push step reads held instead of failed; the stored runner record is unchanged. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), or [\"cancel\"] for a blocked hold (held.acceptBlocked), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
@@ -1004,7 +1004,16 @@ export const getKgStatusTool = tool(
     }
     const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
     const flyProfile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
-    const lastRefresh = toolDeps.readStatusRecord();
+    const storedLastRefresh = toolDeps.readStatusRecord();
+    const lastRefresh: KgRefreshStatus["lastRefresh"] = storedLastRefresh?.held === true && storedLastRefresh.steps
+      ? {
+          ...storedLastRefresh,
+          steps: storedLastRefresh.steps.map((step) =>
+            step.id === "kg-snapshot-push" && step.status === "failed"
+              ? { ...step, status: "held" }
+              : step),
+        }
+      : storedLastRefresh;
     let recordStamp = lastRefresh ? (lastRefresh.ok ? lastRefresh.stampAfter : lastRefresh.stampBefore) : null;
     if (!recordStamp) {
       // A failure before the rail leaves no stamp on the record while a graph still serves.

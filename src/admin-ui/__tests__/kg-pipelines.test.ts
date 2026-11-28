@@ -698,14 +698,13 @@ describe("kg current run card (AII-1260)", () => {
       expect(text(g)).toBe('Last refresh: failed at gate "staging" \u2014 git push failed (exit 128)');
     });
 
-    it("a held outcome's kg-snapshot-push step renders held; otherwise failed", async () => {
-      const steps = [{ id: "kg-snapshot-push", status: "failed", startedAt: "x", endedAt: null, durationMs: null }];
-      const h = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, held: true, steps } });
-      await h.win.loadKgStatus();
-      expect(h.doc.getElementById("kg-last-steps")?.textContent).toBe("kg-snapshot-push: held");
-      const n = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, steps } });
-      await n.win.loadKgStatus();
-      expect(n.doc.getElementById("kg-last-steps")?.textContent).toBe("kg-snapshot-push: failed");
+    it.each([
+      ["held", true], ["failed", true], ["failed", false],
+    ])("renders the answered push status %s when held=%s", async (status, held) => {
+      const steps = [{ id: "kg-snapshot-push", status, startedAt: "x", endedAt: null, durationMs: null }];
+      const m = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, held, steps } });
+      await m.win.loadKgStatus();
+      expect(m.doc.getElementById("kg-last-steps")?.textContent).toBe("kg-snapshot-push: " + status);
     });
   });
 

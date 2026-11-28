@@ -199,7 +199,10 @@ export interface KgRefreshStatus {
   kgUnavailable: boolean;
   sidecar: SidecarHealth;
   servedStamp: string | null;
-  lastRefresh: RefreshOutcome | null;
+  /** Answer-only status projection; persisted outcomes retain runner step statuses. */
+  lastRefresh: (Omit<RefreshOutcome, "steps"> & {
+    steps?: Array<Omit<KgRefreshStepRecord, "status"> & { status: StepStatus | "held" }>;
+  }) | null;
   stage: KgRefreshStage;
   /** The in-flight run's step and open decisions; `null` with no run in flight. */
   currentRun: {

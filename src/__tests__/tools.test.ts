@@ -1087,6 +1087,46 @@ describe("migrated read handlers (AII-711)", () => {
       expect((withSteps.lastRefresh as { steps?: unknown }).steps).toEqual(steps);
     });
 
+    it.each([true, false])("answers a held push as held without changing storage (ok=%s)", async (success) => {
+      const last: RefreshOutcome = {
+        ...ok, ok: success, held: true,
+        steps: [
+          { id: "kg-snapshot-push", status: "failed", startedAt: "t0", endedAt: "t1", durationMs: 42 },
+          { id: "kg-ingest", status: "failed", startedAt: "t0", endedAt: "t1", durationMs: 7 },
+          { id: "clone", status: "passed", startedAt: "t0", endedAt: "t1", durationMs: 1 },
+        ],
+      };
+      const stored = structuredClone(last);
+      const status = await stageFor({ last });
+      expect(status.lastRefresh).toEqual({
+        ...stored,
+        steps: stored.steps!.map((step) => step.id === "kg-snapshot-push" ? { ...step, status: "held" } : step),
+      });
+      expect(last).toEqual(stored);
+    });
+
+    it.each([undefined, false])("keeps a failed push when held=%s", async (held) => {
+      const last: RefreshOutcome = {
+        ...ok, ...(held === undefined ? {} : { held }),
+        steps: [{ id: "kg-snapshot-push", status: "failed", startedAt: "t0", endedAt: null, durationMs: null }],
+      };
+      expect((await stageFor({ last })).lastRefresh).toEqual(last);
+    });
+
+    it.each(["running", "passed", "skipped", "cancelled"] as const)("keeps a held push's %s status", async (status) => {
+      const last: RefreshOutcome = {
+        ...ok, held: true,
+        steps: [{ id: "kg-snapshot-push", status, startedAt: "t0", endedAt: null, durationMs: null }],
+      };
+      expect((await stageFor({ last })).lastRefresh).toEqual(last);
+    });
+
+    it("keeps null and held outcomes without steps", async () => {
+      expect((await stageFor({})).lastRefresh).toBeNull();
+      const last = { ...ok, held: true };
+      expect((await stageFor({ last })).lastRefresh).toEqual(last);
+    });
+
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
